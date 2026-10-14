@@ -1,5 +1,5 @@
 use crate::kms::render::{
-    backend::KmsBackend,
+    backend::{XBackend, seam::Platform},
     target::{Dst, Src},
 };
 use std::io;
@@ -7,14 +7,14 @@ use yserver_core::backend::{
     Backend as _, CursorHandle, FontHandle, OriginContext, PictureHandle, PixmapHandle,
 };
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     /// Stage 3f.8: allocate the default cursor sprite (16×16 black
     /// triangle, hotspot (0,0)) as a Pixmap-kind Drawable + upload
     /// the pixel data via `engine.put_image`. Registers the result
     /// on `SceneCompositor` so `build_scene` appends it at top of
     /// z. One-time setup; subsequent `define_cursor` flows (Stage 4)
     /// can replace the entry.
-    pub(in crate::kms::render::backend) fn init_cursor_sprite(&mut self) -> io::Result<()> {
+    pub(crate) fn init_cursor_sprite(&mut self) -> io::Result<()> {
         // Stage 5 Phase A: bake the default-arrow record into the
         // canonical cursor maps so any DefineCursor that resolves to
         // None / unknown can fall back to it. The sprite Pixmap +
@@ -141,7 +141,7 @@ impl KmsBackend {
         let storage =
             match self
                 .platform
-                .gpu
+                .gpu()
                 .allocate_drawable_storage(record.width, record.height, 32)
             {
                 Ok(s) => s,
@@ -170,7 +170,7 @@ impl KmsBackend {
         };
         if let Err(e) = self.engine.put_image(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             Dst::server_internal(id),
             ash::vk::Offset2D::default(),
             ash::vk::Extent2D {
@@ -219,7 +219,7 @@ impl KmsBackend {
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CursorDepth1);
         match self.engine.get_image(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             Src::server_internal(id),
             rect,
             1,
@@ -259,7 +259,7 @@ impl KmsBackend {
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CursorBgra);
         match self.engine.get_image(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             Src::server_internal(id),
             rect,
             32,
@@ -465,17 +465,7 @@ impl KmsBackend {
         self.cursor_hidden = hidden;
         if hidden {
             self.scene.clear_cursor();
-            if self.scanout_m2.active() {
-                for output_idx in 0..self.platform.outputs.len() {
-                    if let Err(error) = self.platform.cursor_plane_hide_on_crtc(output_idx) {
-                        log::warn!(
-                            "scanout_m2: cursor hide failed on output {output_idx}: {error}; unflipping"
-                        );
-                        self.request_direct_unflip("cursor_hide_failed");
-                        return;
-                    }
-                }
-            }
+            P::hide_cursor_under_direct_scanout(self);
             return;
         }
         let Some(xid) = self.effective_cursor_xid else {
@@ -485,11 +475,11 @@ impl KmsBackend {
         // Under direct scanout nothing composes, and the scene's cursor
         // mode may still read Hidden, so `display_cursor_by_handle` can
         // skip the plane. Rebind it directly.
-        if self.scanout_m2.active()
+        if P::direct_scanout_owns_frame(self)
             && let Some(record) = self.cursor_records.get(&xid).cloned()
-            && !self.refresh_direct_cursor_on_all_outputs(&record)
+            && !P::refresh_direct_cursor(self, &record)
         {
-            self.request_direct_unflip("cursor_show_failed");
+            P::request_direct_unflip(self, "cursor_show_failed");
         }
     }
 
@@ -527,7 +517,7 @@ impl KmsBackend {
     /// (spec "Frame tick"). One advance per call — a stale deadline
     /// after a blank advances a single frame, never fast-forwards.
     pub(crate) fn tick_cursor_animation(&mut self) {
-        if !self.kms_outputs_active || !self.scanout_allowed() {
+        if !self.kms_outputs_active || !P::scanout_allowed(self) {
             return;
         }
         let now = std::time::Instant::now();
@@ -561,8 +551,10 @@ impl KmsBackend {
 
     /// Deadline for `next_wakeup`: the animation's next frame, only
     /// while it could actually be displayed (same gates as the tick).
-    pub(super) fn cursor_anim_deadline(&self) -> Option<std::time::Instant> {
-        if !self.kms_outputs_active || !self.scanout_allowed() {
+    pub(in crate::kms::render::backend) fn cursor_anim_deadline(
+        &self,
+    ) -> Option<std::time::Instant> {
+        if !self.kms_outputs_active || !P::scanout_allowed(self) {
             return None;
         }
         self.active_cursor_anim.as_ref().map(|st| st.next_frame)
@@ -637,7 +629,8 @@ impl KmsBackend {
         // Notify every device even while all outputs are temporarily using SW;
         // record version/pixel-only animation changes intentionally do not
         // reset the per-CRTC backoff.
-        self.platform.cursor_plane_note_sprite_hotspot(
+        P::note_cursor_sprite(
+            self,
             record.width,
             record.height,
             record.hot_x,
@@ -676,12 +669,12 @@ impl KmsBackend {
             // cursor planes in place; if any output rejects the operation,
             // fall through to the scene state machine and unwind M2 so its
             // ordinary per-output retry/fallback can retire safely.
-            if self.scanout_m2.active() && self.refresh_direct_cursor_on_all_outputs(&record) {
+            if P::direct_scanout_owns_frame(self) && P::refresh_direct_cursor(self, &record) {
                 return;
             }
             let refreshes_hw_binding = self.scene.queue_steady_state_cursor_upload(record.version);
-            if refreshes_hw_binding && self.scanout_m2.active() {
-                self.request_direct_unflip("direct_cursor_refresh_failed");
+            if refreshes_hw_binding && P::direct_scanout_owns_frame(self) {
+                P::request_direct_unflip(self, "direct_cursor_refresh_failed");
             }
         }
         // The scene blit ordering: register_cursor already marks
@@ -690,7 +683,7 @@ impl KmsBackend {
     }
 }
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     pub(in crate::kms::render::backend) fn backend_cursor_create_cursor(
         &mut self,
         _origin: Option<OriginContext>,
@@ -864,7 +857,7 @@ impl KmsBackend {
             self.engine
                 .put_image(
                     &mut self.store,
-                    &mut self.platform.gpu,
+                    self.platform.gpu_mut(),
                     Dst::server_internal(pixmap_id),
                     ash::vk::Offset2D::default(),
                     ash::vk::Extent2D {

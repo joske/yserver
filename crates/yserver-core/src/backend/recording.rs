@@ -543,6 +543,10 @@ pub struct RecordingBackend {
     >,
     /// Whether this recording backend should exercise VT lifecycle dispatch.
     pub vt_switching_armed: bool,
+    /// `on_platform_event` calls seen.
+    pub platform_events: usize,
+    /// Returned by `glx_available`.
+    pub glx_available: bool,
     /// Whether the test backend simulates queueing the input pause barrier.
     pub vt_release_pause_queued: bool,
     /// Set when the release has crossed the test backend's yield boundary.
@@ -662,6 +666,8 @@ impl RecordingBackend {
             device_config_cancel_tokens: Vec::new(),
             device_config_start_results: VecDeque::new(),
             vt_switching_armed: false,
+            platform_events: 0,
+            glx_available: true,
             vt_release_pause_queued: false,
             vt_release_finished: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
@@ -801,6 +807,10 @@ impl Backend for RecordingBackend {
         self.vt_switching_armed
     }
 
+    fn on_platform_event(&mut self, _state: &mut crate::server::ServerState) {
+        self.platform_events += 1;
+    }
+
     fn begin_vt_release(&mut self) -> bool {
         self.vt_release_pause_queued
     }
@@ -920,6 +930,10 @@ impl Backend for RecordingBackend {
 
     fn dri3_capabilities(&self) -> crate::backend::Dri3Caps {
         self.dri3_caps
+    }
+
+    fn glx_available(&self) -> bool {
+        self.glx_available
     }
 
     fn dri3_import_syncobj(

@@ -2826,13 +2826,17 @@ fn rmlvo_reload_resyncs_the_lock_leds() {
     let mut b = KmsBackend::for_tests();
     let _ = b.cook_host_key(caps_key(true));
     let _ = b.cook_host_key(caps_key(false));
-    assert_eq!(b.leds_sent, input::Led::CAPSLOCK.bits(), "precondition");
+    assert_eq!(
+        b.pstate.leds_sent,
+        input::Led::CAPSLOCK.bits(),
+        "precondition"
+    );
     assert!(
         b.set_keymap_rmlvo("evdev", "pc105", "de", "", None)
             .is_some()
     );
     assert_eq!(b.current_led_bits(), 0, "fresh state");
-    assert_eq!(b.leds_sent, 0, "LEDs resynced by the reload");
+    assert_eq!(b.pstate.leds_sent, 0, "LEDs resynced by the reload");
 }
 
 /// An edit carries Caps Lock across, but when the edit takes away the
@@ -2842,16 +2846,24 @@ fn keymap_edit_resyncs_the_lock_leds() {
     let mut b = KmsBackend::for_tests();
     let _ = b.cook_host_key(caps_key(true));
     let _ = b.cook_host_key(caps_key(false));
-    assert_eq!(b.leds_sent, input::Led::CAPSLOCK.bits(), "precondition");
+    assert_eq!(
+        b.pstate.leds_sent,
+        input::Led::CAPSLOCK.bits(),
+        "precondition"
+    );
 
     // Same description: Caps Lock and its LED stay on.
     let same = b.core.xkb_desc.clone();
     b.install_desc(same).expect("compiles");
-    assert_eq!(b.leds_sent, input::Led::CAPSLOCK.bits(), "lock carried");
+    assert_eq!(
+        b.pstate.leds_sent,
+        input::Led::CAPSLOCK.bits(),
+        "lock carried"
+    );
 
     caps_as_control(&mut b);
     assert_eq!(b.current_led_bits(), 0, "no key locks Lock any more");
-    assert_eq!(b.leds_sent, 0, "LEDs resynced by the edit");
+    assert_eq!(b.pstate.leds_sent, 0, "LEDs resynced by the edit");
 }
 
 /// GetKbdByName for the base layout after an edit reloads it (Xorg

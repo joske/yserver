@@ -1,4 +1,6 @@
-use crate::kms::render::backend::{KmsBackend, LockFilterPriv, XKB_SA_LOCK_NO_UNLOCK};
+use crate::kms::render::backend::{
+    LockFilterPriv, XBackend, XKB_SA_LOCK_NO_UNLOCK, seam::Platform,
+};
 use std::collections::HashSet;
 use yserver_core::{
     backend::Backend,
@@ -7,7 +9,7 @@ use yserver_core::{
     server::ServerState,
 };
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     fn stamp_host_key_without_master_transition(
         &self,
         raw: HostKeyEvent,
@@ -402,7 +404,7 @@ impl KmsBackend {
     }
 }
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     pub(in crate::kms::render::backend) fn backend_devices_on_host_input(
         &mut self,
         state: &mut ServerState,
@@ -485,9 +487,9 @@ impl KmsBackend {
                         let delta = motion_delta.unwrap_or([f64::from(dx), f64::from(dy)]);
                         (
                             (current.0 + delta[0] as f32)
-                                .clamp(0.0, self.platform.fb_w.saturating_sub(1) as f32),
+                                .clamp(0.0, self.platform.fb_size().0.saturating_sub(1) as f32),
                             (current.1 + delta[1] as f32)
-                                .clamp(0.0, self.platform.fb_h.saturating_sub(1) as f32),
+                                .clamp(0.0, self.platform.fb_size().1.saturating_sub(1) as f32),
                         )
                     } else {
                         (x as f32, y as f32)

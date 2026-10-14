@@ -2,8 +2,9 @@ use crate::kms::{
     cpu_types::Rectangle16,
     render::{
         backend::{
-            KmsBackend, SharedBackingMoveSource, WindowGeometry, order_pieces_for_in_place_move,
+            SharedBackingMoveSource, WindowGeometry, XBackend, order_pieces_for_in_place_move,
             portable::{clip::intersect_rect_with_clip, draw::compute_copy_area_dst_rects},
+            seam::Platform,
             shared_backing_move_pieces,
         },
         engine::decode_x11_pixel_for_storage,
@@ -14,15 +15,15 @@ use crate::kms::{
 };
 use yserver_core::host_x11::HostSubwindowConfig;
 
-impl KmsBackend {
-    pub(in crate::kms::render::backend) fn init_root_storage(&mut self) {
+impl<P: Platform> XBackend<P> {
+    pub(crate) fn init_root_storage(&mut self) {
         let root_xid = self.core.window_id;
         if self.store.lookup(root_xid).is_some() {
             return;
         }
-        let width = self.platform.fb_w.max(1);
-        let height = self.platform.fb_h.max(1);
-        let storage = match self.platform.gpu.allocate_drawable_storage_as(
+        let width = self.platform.fb_size().0.max(1);
+        let height = self.platform.fb_size().1.max(1);
+        let storage = match self.platform.gpu().allocate_drawable_storage_as(
             width,
             height,
             32,
@@ -60,7 +61,7 @@ impl KmsBackend {
         };
         if let Err(e) = self.engine.fill_rect(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             Dst::server_internal(id),
             rect,
             decode_x11_pixel_for_storage(
@@ -70,7 +71,7 @@ impl KmsBackend {
                 24,
                 GpuCore::format_for_depth(24),
             ),
-        ) && self.platform.gpu.vk.is_some()
+        ) && self.platform.gpu().vk.is_some()
         {
             log::warn!("render init_root_storage: initial root fill failed: {e:?}");
         }
@@ -115,7 +116,7 @@ impl KmsBackend {
             .collect();
         if let Err(e) = self.engine.stamp_opaque_alpha(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             target.dst(),
             &rects16,
         ) {
@@ -603,7 +604,7 @@ impl KmsBackend {
             };
             if let Err(e) = self.engine.copy_area(
                 &mut self.store,
-                &mut self.platform.gpu,
+                self.platform.gpu_mut(),
                 Src::server_internal(backing),
                 Dst::server_internal(backing),
                 src_rect,

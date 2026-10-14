@@ -162,3 +162,47 @@ jobs:
             cargo clippy --all-targets -- -D warnings
             cargo clippy --all-targets --features xdmcp -- -D warnings
             cargo test --all-targets --features xdmcp --locked
+  macos:
+    # KosmicKrisp (Mesa Vulkan on Metal) needs macOS 26+; Apple Silicon only.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install packages
+        run: brew install mesa vulkan-loader vulkan-tools shaderc libxkbcommon fontconfig freetype pkgconf
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          components: clippy
+          toolchain: stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Vulkan environment
+        # The loader and the KosmicKrisp ICD come from Homebrew, off dyld's
+        # default search path.
+        run: |
+          prefix=$(brew --prefix)
+          echo "DYLD_FALLBACK_LIBRARY_PATH=$prefix/lib" >> "$GITHUB_ENV"
+          echo "VK_ICD_FILENAMES=$prefix/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json" >> "$GITHUB_ENV"
+      - name: Probe for a Vulkan device
+        # Hosted runners are VMs and may expose no Metal device. Logged,
+        # never fatal; the ignored (GPU) suite below runs only if it finds one.
+        id: probe
+        run: |
+          out=$(vulkaninfo --summary 2>&1) || true
+          echo "$out"
+          if echo "$out" | grep -q deviceName; then
+            echo "device=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "device=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build
+        run: cargo build --workspace --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run tests
+        run: cargo test --workspace --all-targets --locked
+      - name: Run Vulkan tests on KosmicKrisp
+        if: steps.probe.outputs.device == 'true'
+        env:
+          YSERVER_ALLOW_SOFTWARE_VULKAN: "1"
+        run: cargo test --workspace --locked --no-fail-fast -- --ignored

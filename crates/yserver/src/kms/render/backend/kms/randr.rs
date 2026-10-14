@@ -223,7 +223,7 @@ impl KmsBackend {
             .map(|layout| layout.key.clone())
             .collect();
         for key in &live_keys {
-            let _ = self.randr_id_alloc.ids_for(key);
+            let _ = self.pstate.randr_id_alloc.ids_for(key);
         }
 
         // Keep a lightweight all-connector pass for disconnected connector
@@ -251,7 +251,7 @@ impl KmsBackend {
         for (device_key, connectors) in probes {
             for connector in connectors {
                 let key = OutputKey::new(*device_key, connector.connector_name.clone());
-                let _ = self.randr_id_alloc.ids_for(&key);
+                let _ = self.pstate.randr_id_alloc.ids_for(&key);
             }
         }
         // Entries seen only by cached inventory remain default-disconnected.
@@ -275,7 +275,7 @@ impl KmsBackend {
             })
             .collect();
         for (key, config) in live_configs {
-            let entry = self.randr_id_alloc.entry_mut(&key);
+            let entry = self.pstate.randr_id_alloc.entry_mut(&key);
             if entry.connected && !entry.modes.is_empty() {
                 entry.config = config;
                 entry.crtc_associated = true;
@@ -307,7 +307,7 @@ impl KmsBackend {
                 .iter()
                 .find(|route| &route.key == key)
                 .cloned();
-            let entry = self.randr_id_alloc.entry_mut(key);
+            let entry = self.pstate.randr_id_alloc.entry_mut(key);
             if connected_keys.contains(key) {
                 // Physically connected but no longer usable by the live CRTC
                 // (for example, its current mode vanished). The connected
@@ -357,7 +357,7 @@ impl KmsBackend {
             entry.mm_height = 0;
         }
         for snapshot in connected {
-            let entry = self.randr_id_alloc.entry_mut(&snapshot.key);
+            let entry = self.pstate.randr_id_alloc.entry_mut(&snapshot.key);
             let config_changed = !entry.connected || entry.modes != snapshot.modes;
             let output_changed = config_changed
                 || entry.edid != snapshot.edid
@@ -397,7 +397,7 @@ impl KmsBackend {
         let mut config_changed = false;
         for (device_key, connectors) in probes {
             let delta =
-                reconcile_connector_probe(&mut self.randr_id_alloc, *device_key, connectors);
+                reconcile_connector_probe(&mut self.pstate.randr_id_alloc, *device_key, connectors);
             changed_keys.extend(delta.changed_keys);
             config_changed |= delta.config_changed;
         }
@@ -413,7 +413,8 @@ impl KmsBackend {
             let changed_ids: HashSet<_> = changed_keys
                 .iter()
                 .filter_map(|key| {
-                    self.randr_id_alloc
+                    self.pstate
+                        .randr_id_alloc
                         .entry(key)
                         .map(|entry| entry.ids.output_id)
                 })
@@ -471,7 +472,10 @@ impl KmsBackend {
         &self,
         provider_id: u32,
     ) -> Option<RandrProviderEndpoint> {
-        let endpoint = self.randr_id_alloc.provider_endpoint_for_id(provider_id)?;
+        let endpoint = self
+            .pstate
+            .randr_id_alloc
+            .provider_endpoint_for_id(provider_id)?;
         self.randr_provider_endpoints()
             .contains(&endpoint)
             .then_some(endpoint)
@@ -491,7 +495,7 @@ impl KmsBackend {
             return false;
         };
         let sink = RandrProviderEndpoint::Kms(kms_device_key);
-        source == sink || self.provider_output_sources.get(&kms_device_key) == Some(&source)
+        source == sink || self.pstate.provider_output_sources.get(&kms_device_key) == Some(&source)
     }
 
     /// Validate the routes committed during platform bring-up and initialize
@@ -545,7 +549,7 @@ impl KmsBackend {
             if sink == source {
                 continue;
             }
-            if let Some(&previous) = self.provider_output_sources.get(&device.key) {
+            if let Some(&previous) = self.pstate.provider_output_sources.get(&device.key) {
                 if previous != source {
                     return Err(io::Error::other(format!(
                         "automatic KMS sink {} has conflicting sources {previous:?} and {source:?}",
@@ -554,7 +558,9 @@ impl KmsBackend {
                 }
                 continue;
             }
-            self.provider_output_sources.insert(device.key, source);
+            self.pstate
+                .provider_output_sources
+                .insert(device.key, source);
             log::info!(
                 "PRIME Output Source: automatically associated sink {sink:?} -> source {source:?}",
             );
@@ -578,7 +584,7 @@ impl KmsBackend {
 
     fn reserve_randr_provider_ids(&mut self) {
         for endpoint in self.randr_provider_endpoints() {
-            let _ = self.randr_id_alloc.provider_id_for(endpoint);
+            let _ = self.pstate.randr_id_alloc.provider_id_for(endpoint);
         }
     }
 
@@ -642,11 +648,12 @@ impl KmsBackend {
             .iter()
             .copied()
             .map(|endpoint| {
-                let id = self.randr_id_alloc.provider_id_for(endpoint);
+                let id = self.pstate.randr_id_alloc.provider_id_for(endpoint);
                 (endpoint, id)
             })
             .collect();
         let kms_with_connector_inventory: HashSet<_> = self
+            .pstate
             .randr_id_alloc
             .entries()
             .map(|(key, _)| key.device_key)
@@ -656,7 +663,7 @@ impl KmsBackend {
             Vec<RandrProviderAssociation>,
         > = HashMap::new();
         if let Some(source) = selected_endpoint {
-            for (&sink_key, &configured_source) in &self.provider_output_sources {
+            for (&sink_key, &configured_source) in &self.pstate.provider_output_sources {
                 let sink = RandrProviderEndpoint::Kms(sink_key);
                 if configured_source != source
                     || sink == source
@@ -694,7 +701,7 @@ impl KmsBackend {
             let provider_id = provider_ids[&endpoint];
             let mut crtcs = Vec::new();
             let mut outputs = Vec::new();
-            for (key, entry) in self.randr_id_alloc.entries() {
+            for (key, entry) in self.pstate.randr_id_alloc.entries() {
                 if key.device_key != device.key {
                     continue;
                 }
@@ -764,20 +771,21 @@ impl KmsBackend {
             .outputs
             .iter()
             .filter(|layout| {
-                self.randr_id_alloc
+                self.pstate
+                    .randr_id_alloc
                     .entry(&layout.key)
                     .is_none_or(|entry| matches!(entry.config, ConnectorConfig::Enabled { .. }))
             })
             .map(|layout| layout.key.clone())
             .collect();
         let mut outs: Vec<RandrOutput> = Vec::with_capacity(
-            self.platform.outputs.len() + self.randr_id_alloc.known_connectors().len(),
+            self.platform.outputs.len() + self.pstate.randr_id_alloc.known_connectors().len(),
         );
         // Rebuild the per-output identity map (EDID + ConnectorType) each
         // projection so the output-property handlers serve current data.
-        self.output_identity_by_id.clear();
-        self.output_key_by_id.clear();
-        self.crtc_key_by_id.clear();
+        self.pstate.output_identity_by_id.clear();
+        self.pstate.output_key_by_id.clear();
+        self.pstate.crtc_key_by_id.clear();
         for layout in self
             .platform
             .outputs
@@ -786,10 +794,10 @@ impl KmsBackend {
         {
             let vrefresh = layout.output.picked.vrefresh;
             let output_key = layout.key.clone();
-            let registry_entry_exists = self.randr_id_alloc.entry(&output_key).is_some();
-            let ids = self.randr_id_alloc.ids_for(&output_key);
+            let registry_entry_exists = self.pstate.randr_id_alloc.entry(&output_key).is_some();
+            let ids = self.pstate.randr_id_alloc.ids_for(&output_key);
             let (connected, connector_modes, edid, mm_width, mm_height, connector_type) = {
-                let entry = self.randr_id_alloc.entry_mut(&output_key);
+                let entry = self.pstate.randr_id_alloc.entry_mut(&output_key);
                 // Production seeds every connected connector from a heavy
                 // snapshot before projection. Keep a defensive fallback for
                 // synthetic fixtures which construct ActiveOutput directly.
@@ -825,18 +833,20 @@ impl KmsBackend {
                     entry.connector_type.clone(),
                 )
             };
-            self.output_key_by_id
+            self.pstate
+                .output_key_by_id
                 .insert(ids.output_id, output_key.clone());
-            self.crtc_key_by_id.insert(ids.crtc_id, output_key);
-            let mode_id = self.randr_id_alloc.mode_id(&layout.output.picked);
+            self.pstate.crtc_key_by_id.insert(ids.crtc_id, output_key);
+            let mode_id = self.pstate.randr_id_alloc.mode_id(&layout.output.picked);
             if connected {
-                self.output_identity_by_id
+                self.pstate
+                    .output_identity_by_id
                     .insert(ids.output_id, (edid, connector_type));
             }
             let mut mode_ids = Vec::with_capacity(connector_modes.len());
             let mut num_preferred: u16 = 0;
             for mode in &connector_modes {
-                let mode_id = self.randr_id_alloc.mode_id(mode);
+                let mode_id = self.pstate.randr_id_alloc.mode_id(mode);
                 // A connector can advertise the same exact resource more
                 // than once. List each XID only once (issue #48).
                 if mode_ids.contains(&mode_id) {
@@ -870,6 +880,7 @@ impl KmsBackend {
         }
 
         let advertised_modes: Vec<crate::platform::drm::Mode> = self
+            .pstate
             .randr_id_alloc
             .entries()
             .flat_map(|(_, entry)| entry.modes.clone())
@@ -888,7 +899,7 @@ impl KmsBackend {
         let mut mode_identities = HashSet::new();
         for mode in current_modes.into_iter().chain(advertised_modes) {
             let identity = ModeIdentity::from(&mode);
-            let mode_id = self.randr_id_alloc.mode_id(&mode);
+            let mode_id = self.pstate.randr_id_alloc.mode_id(&mode);
             if mode_identities.insert(identity) {
                 modes.push(RandrMode {
                     mode_id,
@@ -911,6 +922,7 @@ impl KmsBackend {
         // Collect owned first to release the &self borrow before the
         // &mut self mode_id() allocations below.
         let not_live: Vec<NotLiveConnector> = self
+            .pstate
             .randr_id_alloc
             .entries()
             .filter(|(key, _)| !live_keys.contains(*key))
@@ -929,7 +941,7 @@ impl KmsBackend {
             let mut mode_ids = Vec::with_capacity(connector.modes.len());
             let mut num_preferred: u16 = 0;
             for mode in connector.modes {
-                let mode_id = self.randr_id_alloc.mode_id(&mode);
+                let mode_id = self.pstate.randr_id_alloc.mode_id(&mode);
                 // See the live-output loop: list each exact XID once.
                 if mode_ids.contains(&mode_id) {
                     continue;
@@ -939,12 +951,14 @@ impl KmsBackend {
                     num_preferred = num_preferred.saturating_add(1);
                 }
             }
-            self.output_key_by_id
+            self.pstate
+                .output_key_by_id
                 .insert(connector.ids.output_id, connector.key.clone());
-            self.crtc_key_by_id
+            self.pstate
+                .crtc_key_by_id
                 .insert(connector.ids.crtc_id, connector.key.clone());
             if connector.connected {
-                self.output_identity_by_id.insert(
+                self.pstate.output_identity_by_id.insert(
                     connector.ids.output_id,
                     (connector.edid, connector.connector_type),
                 );
@@ -1032,6 +1046,7 @@ impl KmsBackend {
         // CRTC transforms are client-owned, like the logical size below.
         state.randr.restore_crtc_transforms(prev_transforms);
         let associations = self
+            .pstate
             .randr_id_alloc
             .entries()
             .filter(|(_, entry)| entry.crtc_associated)
@@ -1121,7 +1136,7 @@ impl KmsBackend {
         // scanned. Active removals were quiesced (and M1 cleared) before this
         // method; retain the cache for all other publications.
         if rebuild_scene {
-            self.scanout_m1.clear("output topology changed");
+            self.pstate.scanout_m1.clear("output topology changed");
         }
 
         if rebuild_scene
@@ -1210,7 +1225,8 @@ impl KmsBackend {
         let registry_changed_ids: HashSet<_> = registry_changed_keys
             .iter()
             .filter_map(|key| {
-                self.randr_id_alloc
+                self.pstate
+                    .randr_id_alloc
                     .entry(key)
                     .map(|entry| entry.ids.output_id)
             })
@@ -1293,7 +1309,7 @@ impl KmsBackend {
         // an active direct frame. Snapshot that frame into its old COW and
         // request the synchronized replacement first. On failure, leave the
         // old dimensions and every storage owner/pin untouched.
-        if self.scanout_m2.active() {
+        if self.pstate.scanout_m2.active() {
             self.materialize_direct_shadow_for_unflip()?;
             self.request_direct_unflip("virtual_screen_extent_before_storage_reallocation");
         }
@@ -1557,6 +1573,7 @@ impl KmsBackend {
             .map(|layout| &layout.key)
             .collect();
         let mut reserved: Vec<_> = self
+            .pstate
             .randr_id_alloc
             .entries()
             .filter(|(key, _)| !live.contains(key))
@@ -1581,7 +1598,7 @@ impl KmsBackend {
     pub(in crate::kms::render::backend) fn take_relight_requests(&mut self) -> Vec<RelightRequest> {
         let mut restore: Vec<RelightRequest> = Vec::new();
         let mut stale: Vec<OutputKey> = Vec::new();
-        for (key, entry) in self.randr_id_alloc.entries() {
+        for (key, entry) in self.pstate.randr_id_alloc.entries() {
             let Some(route) = entry
                 .last_enabled
                 .and_then(ConnectorConfig::restorable_route)
@@ -1617,7 +1634,7 @@ impl KmsBackend {
                 key.connector_name,
                 key.device_key,
             );
-            self.randr_id_alloc.entry_mut(&key).last_enabled = None;
+            self.pstate.randr_id_alloc.entry_mut(&key).last_enabled = None;
         }
         // `entries()` walks a HashMap; relight in a deterministic order.
         restore.sort_by(|a, b| a.key.cmp(&b.key));
@@ -1695,7 +1712,7 @@ impl KmsBackend {
     /// restores a previous state, it does not record a new client intent, so
     /// the auto-layout stays free to move this output later.
     pub(in crate::kms::render::backend) fn commit_relit_route(&mut self, request: &RelightRequest) {
-        let entry = self.randr_id_alloc.entry_mut(&request.key);
+        let entry = self.pstate.randr_id_alloc.entry_mut(&request.key);
         entry.config = ConnectorConfig::Enabled {
             mode_w: request.mode.width,
             mode_h: request.mode.height,
@@ -1711,7 +1728,7 @@ impl KmsBackend {
         // Defer while VT-suspended: DRM master is dropped, so a rescan's
         // modeset ioctls would fail/wedge. (The old guard also required
         // VT switching drops DRM master, so gate rescans on `vt_state`.
-        if self.vt_state != crate::vt::state::VtState::Active {
+        if self.pstate.vt_state != crate::vt::state::VtState::Active {
             log::debug!("kms: display rescan skipped (VT not Active)");
             return;
         }
@@ -1751,8 +1768,8 @@ impl KmsBackend {
         // "Ordering inside `run_display_rescan` is load-bearing".
 
         // ── 1. Apply the physical snapshot (topology ownership only) ──────
-        let configured = self.randr_id_alloc.client_configured_keys();
-        let known_connected = self.randr_id_alloc.connected_keys();
+        let configured = self.pstate.randr_id_alloc.client_configured_keys();
+        let known_connected = self.pstate.randr_id_alloc.connected_keys();
         let rescan = self
             .platform
             .apply_connector_snapshot(snapshot, &known_connected);
@@ -1879,6 +1896,7 @@ impl KmsBackend {
         match self.live_crtc_and_gamma_size(output_key) {
             Ok(Some((_, _, size))) => size,
             Ok(None) => self
+                .pstate
                 .gamma_luts
                 .borrow()
                 .get(output_key)
@@ -1886,7 +1904,8 @@ impl KmsBackend {
                 .unwrap_or(256),
             Err(e) => {
                 log::warn!("kms gamma: {output_key:?} gamma-size query failed: {e}");
-                self.gamma_luts
+                self.pstate
+                    .gamma_luts
                     .borrow()
                     .get(output_key)
                     .map(|lut| u16::try_from(lut.len()).unwrap_or(u16::MAX))
@@ -1896,11 +1915,12 @@ impl KmsBackend {
     }
 
     fn cached_gamma(&self, output_key: &OutputKey) -> GammaLut {
-        if let Some(lut) = self.gamma_luts.borrow().get(output_key).cloned() {
+        if let Some(lut) = self.pstate.gamma_luts.borrow().get(output_key).cloned() {
             return lut;
         }
         let lut = GammaLut::identity(self.nominal_gamma_size(output_key));
-        self.gamma_luts
+        self.pstate
+            .gamma_luts
             .borrow_mut()
             .insert(output_key.clone(), lut.clone());
         lut
@@ -1912,7 +1932,8 @@ impl KmsBackend {
             return lut;
         }
         let resampled = lut.resampled(size);
-        self.gamma_luts
+        self.pstate
+            .gamma_luts
             .borrow_mut()
             .insert(output_key.clone(), resampled.clone());
         resampled
@@ -1959,7 +1980,8 @@ impl KmsBackend {
 
 impl KmsBackend {
     pub(in crate::kms::render::backend) fn backend_randr_crtc_gamma_size(&self, crtc: u32) -> u16 {
-        self.crtc_key_by_id
+        self.pstate
+            .crtc_key_by_id
             .get(&crtc)
             .map_or(0, |output_key| self.nominal_gamma_size(output_key))
     }
@@ -1971,12 +1993,17 @@ impl KmsBackend {
         green: &[u16],
         blue: &[u16],
     ) -> io::Result<()> {
-        let output_key = self.crtc_key_by_id.get(&crtc).cloned().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("unknown RANDR CRTC 0x{crtc:x}"),
-            )
-        })?;
+        let output_key = self
+            .pstate
+            .crtc_key_by_id
+            .get(&crtc)
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("unknown RANDR CRTC 0x{crtc:x}"),
+                )
+            })?;
         let expected = usize::from(self.crtc_gamma_size(crtc));
         if red.len() != expected || green.len() != expected || blue.len() != expected {
             return Err(io::Error::new(
@@ -1989,7 +2016,7 @@ impl KmsBackend {
                 ),
             ));
         }
-        self.gamma_luts.borrow_mut().insert(
+        self.pstate.gamma_luts.borrow_mut().insert(
             output_key.clone(),
             GammaLut {
                 red: red.to_vec(),
@@ -2004,7 +2031,7 @@ impl KmsBackend {
         &self,
         crtc: u32,
     ) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
-        let Some(output_key) = self.crtc_key_by_id.get(&crtc) else {
+        let Some(output_key) = self.pstate.crtc_key_by_id.get(&crtc) else {
             return (Vec::new(), Vec::new(), Vec::new());
         };
         let lut = match self.live_crtc_and_gamma_size(output_key) {
@@ -2031,7 +2058,7 @@ impl KmsBackend {
                 .map(|monitor| monitor.drain())
                 .unwrap_or(false);
             if saw_change {
-                self.hotplug_rescan_deadline =
+                self.pstate.hotplug_rescan_deadline =
                     Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
                 log::debug!("kms: display hotplug edge — rescan armed (+150ms)");
             }
@@ -2068,6 +2095,7 @@ impl KmsBackend {
             )));
         };
         let sink_has_connector_inventory = self
+            .pstate
             .randr_id_alloc
             .entries()
             .any(|(key, _)| key.device_key == sink_key);
@@ -2103,7 +2131,7 @@ impl KmsBackend {
             )));
         }
 
-        let current_source = self.provider_output_sources.get(&sink_key).copied();
+        let current_source = self.pstate.provider_output_sources.get(&sink_key).copied();
         let source_changes = requested_source != current_source;
         if !source_changes {
             return Ok(false);
@@ -2131,7 +2159,7 @@ impl KmsBackend {
 
         match requested_source {
             Some(source) => {
-                self.provider_output_sources.insert(sink_key, source);
+                self.pstate.provider_output_sources.insert(sink_key, source);
                 log::info!(
                     "PRIME Output Source: sink provider {provider} ({sink_endpoint:?}) -> source provider {} ({source:?})",
                     source_provider.expect("attached source has an XID"),
@@ -2141,7 +2169,7 @@ impl KmsBackend {
                 // Startup auto-association is one-shot. Absence therefore
                 // records the client's explicit detach for the rest of this
                 // backend lifetime; registry rebuilds never repopulate it.
-                self.provider_output_sources.remove(&sink_key);
+                self.pstate.provider_output_sources.remove(&sink_key);
                 log::info!(
                     "PRIME Output Source: detached sink provider {provider} ({sink_endpoint:?})"
                 );
@@ -2181,7 +2209,7 @@ impl KmsBackend {
             .map(|o| (o, o.crtc_transform()))
             .filter(|(_, t)| !t.is_identity())
             .filter_map(|(o, t)| {
-                let key = self.output_key_by_id.get(&o.output_id)?.clone();
+                let key = self.pstate.output_key_by_id.get(&o.output_id)?.clone();
                 Some((key, t))
             })
             .collect();

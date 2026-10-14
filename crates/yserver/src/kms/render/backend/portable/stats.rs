@@ -1,7 +1,7 @@
 use crate::kms::{
     core::PictureRecord,
     render::{
-        backend::KmsBackend,
+        backend::{XBackend, seam::Platform},
         store::{DrawableId, DrawableKind},
         submit_trace::{
             Flags as SubmitFlags, Op as SubmitOp, SrcClass, SubmitEvent, SubmitKind, TargetKind,
@@ -10,7 +10,7 @@ use crate::kms::{
     },
 };
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     /// Telemetry accessor — used by the acceptance harness to
     /// read lifetime counters after driving a test sequence.
     #[must_use]
@@ -124,7 +124,7 @@ impl KmsBackend {
     /// the dark (VT-away / DPMS-off) early returns: paint frames keep
     /// closing while dark, and `pending_flush_outcomes` has no cap, so an
     /// undrained dark period would grow it for as long as the display is off.
-    pub(in crate::kms::render::backend) fn drain_paint_submit_telemetry(&mut self) {
+    pub(crate) fn drain_paint_submit_telemetry(&mut self) {
         self.drain_render_telemetry();
         // Phase A Task 3.5: drain SubmitGroup flush outcomes and
         // route each to the matching telemetry counter.

@@ -920,7 +920,7 @@ fn anim_deadline_gated_on_outputs_active() {
     );
 
     // VT-away / master-drop uses the same scheduler suppression.
-    b.vt_state = VtState::Suspended;
+    b.pstate.vt_state = VtState::Suspended;
     b.active_cursor_anim.as_mut().unwrap().next_frame = Instant::now() - Duration::from_millis(1);
     assert!(
         b.next_wakeup().is_none_or(|w| w > Instant::now()),

@@ -684,7 +684,7 @@ fn xi_dynamic_reset_retires_kms_input_and_replays_inventory_on_the_runner_bounda
         0
     );
     assert_eq!(backend.current_led_bits(), 0);
-    assert_eq!(backend.leds_sent, 0);
+    assert_eq!(backend.pstate.leds_sent, 0);
     assert_eq!(led_relay.drain(), 0, "reset relays the fresh LED mask");
     assert_eq!(backend.core.xkb_rmlvo.layout, "us");
     assert!(backend.core.down_keys.is_empty());
@@ -741,12 +741,12 @@ fn set_dpms_power_is_skipped_while_suspended_and_failed_resume_stays_closed() {
     let mut b = KmsBackend::for_tests();
     let mut state = ServerState::new();
 
-    assert_eq!(b.vt_state, VtState::Active);
+    assert_eq!(b.pstate.vt_state, VtState::Active);
     assert!(b.kms_outputs_active, "outputs start on");
 
     // Switch away: master is dropped, scanout gate closes.
     b.inject_seat_event_for_test(&mut state, false);
-    assert_eq!(b.vt_state, VtState::Suspended);
+    assert_eq!(b.pstate.vt_state, VtState::Suspended);
     assert!(!b.scanout_allowed());
 
     // A blank arriving now must be a no-op, not a modeset attempt.
@@ -761,7 +761,7 @@ fn set_dpms_power_is_skipped_while_suspended_and_failed_resume_stays_closed() {
     // The synthetic DRM fd cannot be probed on resume. Do not reopen the
     // scanout gate merely because shutdown was requested asynchronously.
     b.inject_seat_event_for_test(&mut state, true);
-    assert_eq!(b.vt_state, VtState::Resuming);
+    assert_eq!(b.pstate.vt_state, VtState::Resuming);
     assert!(
         !b.scanout_allowed(),
         "failed resume must keep the gate closed"
@@ -836,7 +836,7 @@ fn vt_switch_disable_transitions_to_suspended_and_releases_held_input() {
     assert_ne!(b.core.button_mask, 0);
 
     // Precondition: starts Active with scanout allowed.
-    assert_eq!(b.vt_state, VtState::Active);
+    assert_eq!(b.pstate.vt_state, VtState::Active);
     assert!(
         b.scanout_allowed(),
         "scanout must be allowed before disable"
@@ -847,7 +847,7 @@ fn vt_switch_disable_transitions_to_suspended_and_releases_held_input() {
 
     // (a) State machine reached Suspended.
     assert_eq!(
-        b.vt_state,
+        b.pstate.vt_state,
         VtState::Suspended,
         "vt_state must be Suspended after Disable"
     );
@@ -911,13 +911,13 @@ fn vt_switch_enable_after_disable_returns_to_active() {
 
     // Drive Disable → Suspended.
     b.inject_seat_event_for_test(&mut state, false);
-    assert_eq!(b.vt_state, VtState::Suspended);
+    assert_eq!(b.pstate.vt_state, VtState::Suspended);
 
     // Drive Enable → Active through the valid headless resume path.
     b.inject_seat_event_for_test(&mut state, true);
 
     assert_eq!(
-        b.vt_state,
+        b.pstate.vt_state,
         VtState::Active,
         "vt_state must be Active after Enable completes"
     );
@@ -953,7 +953,7 @@ fn vt_switch_rapid_double_switch_never_passes_through_active() {
 
     // Step 1: normal Disable → Suspended.
     b.inject_seat_event_for_test(&mut state, false);
-    assert_eq!(b.vt_state, VtState::Suspended);
+    assert_eq!(b.pstate.vt_state, VtState::Suspended);
 
     // Simulate a Disable that arrives during the resume sequence by
     // pre-seeding `pending_disable`.  In production this would be set
@@ -961,7 +961,7 @@ fn vt_switch_rapid_double_switch_never_passes_through_active() {
     // (the coalesce arm in `VtState::on_event`).  We set it directly
     // here because the stub drives events synchronously and we cannot
     // interleave them mid-sequence without modifying the backend.
-    b.vt_pending = VtPending {
+    b.pstate.vt_pending = VtPending {
         pending_disable: true,
         pending_enable: false,
     };
@@ -971,7 +971,7 @@ fn vt_switch_rapid_double_switch_never_passes_through_active() {
     b.inject_seat_event_for_test(&mut state, true);
 
     assert_eq!(
-        b.vt_state,
+        b.pstate.vt_state,
         VtState::Suspended,
         "rapid double-switch must end in Suspended, never passing through Active"
     );
@@ -981,7 +981,7 @@ fn vt_switch_rapid_double_switch_never_passes_through_active() {
     );
     // pending_disable must have been consumed by resume_complete.
     assert!(
-        !b.vt_pending.pending_disable,
+        !b.pstate.vt_pending.pending_disable,
         "pending_disable must be cleared after resume_complete consumed it"
     );
 }
@@ -1001,7 +1001,7 @@ fn vt_switch_coalesced_enable_resumes_not_stranded_in_suspended() {
     let mut state = ServerState::new();
     make_vt_fixture_headless(&mut b);
 
-    b.vt_pending = VtPending {
+    b.pstate.vt_pending = VtPending {
         pending_enable: true,
         pending_disable: false,
     };
@@ -1009,12 +1009,12 @@ fn vt_switch_coalesced_enable_resumes_not_stranded_in_suspended() {
     b.inject_seat_event_for_test(&mut state, false);
 
     assert_eq!(
-        b.vt_state,
+        b.pstate.vt_state,
         VtState::Active,
         "a coalesced pending_enable must drive a resume after suspend, not strand in Suspended"
     );
     assert!(
-        !b.vt_pending.pending_enable,
+        !b.pstate.vt_pending.pending_enable,
         "pending_enable must be cleared once the consume-loop acts on it"
     );
 }
@@ -1033,9 +1033,9 @@ fn vt_switch_full_cycle_no_refcell_panic() {
     // Two full cycles — if any RefCell is double-borrowed this panics.
     for _ in 0..2 {
         b.inject_seat_event_for_test(&mut state, false);
-        assert_eq!(b.vt_state, VtState::Suspended);
+        assert_eq!(b.pstate.vt_state, VtState::Suspended);
         b.inject_seat_event_for_test(&mut state, true);
-        assert_eq!(b.vt_state, VtState::Active);
+        assert_eq!(b.pstate.vt_state, VtState::Active);
     }
 }
 
@@ -1068,7 +1068,7 @@ fn xi_source_removal_vt_suspend_releases_physical_state_once_and_resumes_same_fa
     let mut backend = KmsBackend::for_tests();
     let mut state = ServerState::new();
     make_vt_fixture_headless(&mut backend);
-    backend.vt_switching_armed = true;
+    backend.pstate.vt_switching_armed = true;
     let mut input_inventory = InputInventory::new();
     backend
         .core
@@ -1530,7 +1530,7 @@ fn xi_source_removal_vt_suspend_releases_unpublished_physical_source() {
     let mut backend = KmsBackend::for_tests();
     let mut state = ServerState::new();
     make_vt_fixture_headless(&mut backend);
-    backend.vt_switching_armed = true;
+    backend.pstate.vt_switching_armed = true;
     let mut input_inventory = InputInventory::new();
     let make_info = |source_id, keyboard, pointer| DeviceInfo {
         source_id,

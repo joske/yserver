@@ -312,6 +312,10 @@ pub enum Message {
     /// dumps the three are indistinguishable from the scanout alone.
     /// Diagnostic-only; no-op for backends that don't redirect.
     DumpDrawables,
+    /// The backend's platform has work for the core thread (a frame
+    /// retired, a window closed). No payload: the platform keeps its own
+    /// queue, drained in `Backend::on_platform_event`.
+    PlatformEvent,
 }
 
 #[derive(Debug)]

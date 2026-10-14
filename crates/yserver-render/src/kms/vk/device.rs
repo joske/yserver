@@ -145,6 +145,26 @@ impl DropWaitPolicy {
     }
 }
 
+/// What a context's consumer needs beyond the compositor core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VkContextOptions {
+    /// Request `VK_KHR_swapchain`; creation fails without it.
+    pub wants_present: bool,
+    /// Platform surface instance extension, requested with `VK_KHR_surface`.
+    pub surface_extension: Option<&'static CStr>,
+    /// Request the dma-buf / sync-fd / DRM-modifier device extensions.
+    pub wants_kms_interop: bool,
+}
+
+impl VkContextOptions {
+    /// The KMS backend: no WSI, full dma-buf interop.
+    pub const KMS: Self = Self {
+        wants_present: false,
+        surface_extension: None,
+        wants_kms_interop: true,
+    };
+}
+
 /// DRM endpoint the compositor wants its Vulkan renderer to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RequestedRenderDevice {
@@ -189,6 +209,11 @@ pub struct VkContext {
     /// through [`Self::semaphore_fd_ext`], which turns that into an error.
     pub external_semaphore_fd: Option<ash::khr::external_semaphore_fd::Device>,
     pub external_memory_fd: Option<ash::khr::external_memory_fd::Device>,
+    /// `VK_KHR_external_memory_fd` and `VK_EXT_external_memory_dma_buf` are
+    /// both enabled. Without them nothing can be exported as a dma-buf.
+    pub dmabuf_export: bool,
+    /// `VK_KHR_swapchain` is enabled (the context was built to present).
+    pub swapchain: bool,
     pub image_drm_format_modifier_ext: Option<ash::ext::image_drm_format_modifier::Device>,
     /// True when `VK_EXT_image_drm_format_modifier` is enabled on the
     /// device. Phase 4.2 DRI3 import needs this for non-LINEAR tilings;
@@ -254,10 +279,16 @@ pub struct VkContext {
 
 impl VkContext {
     pub fn new() -> Result<Arc<Self>, VkInitError> {
+        Self::new_with_options(VkContextOptions::KMS)
+    }
+
+    /// Automatic device selection for a consumer with explicit `options`.
+    pub fn new_with_options(options: VkContextOptions) -> Result<Arc<Self>, VkInitError> {
         Self::new_with_selection(
             PhysicalDeviceSelection::Automatic,
             DeviceProfile::Compositor,
             DropWaitPolicy::live(),
+            options,
         )
     }
 
@@ -277,6 +308,7 @@ impl VkContext {
             }),
             DeviceProfile::Compositor,
             DropWaitPolicy::live(),
+            VkContextOptions::KMS,
         )
     }
 
@@ -291,6 +323,7 @@ impl VkContext {
             PhysicalDeviceSelection::Exact(live.selected_device_selector),
             DeviceProfile::Compositor,
             DropWaitPolicy::disposable_probe(),
+            VkContextOptions::KMS,
         )
     }
 
@@ -308,6 +341,7 @@ impl VkContext {
             PhysicalDeviceSelection::Exact(selector),
             DeviceProfile::Transfer,
             DropWaitPolicy::live(),
+            VkContextOptions::KMS,
         )
     }
 
@@ -321,6 +355,7 @@ impl VkContext {
             PhysicalDeviceSelection::Exact(selector),
             DeviceProfile::Transfer,
             DropWaitPolicy::disposable_probe(),
+            VkContextOptions::KMS,
         )
     }
 
@@ -334,6 +369,7 @@ impl VkContext {
             PhysicalDeviceSelection::Exact(selector),
             DeviceProfile::Compositor,
             DropWaitPolicy::disposable_probe(),
+            VkContextOptions::KMS,
         )
     }
 
@@ -347,8 +383,9 @@ impl VkContext {
         selection: PhysicalDeviceSelection,
         profile: DeviceProfile,
         drop_wait_policy: DropWaitPolicy,
+        options: VkContextOptions,
     ) -> Result<Arc<Self>, VkInitError> {
-        let entry = unsafe { ash::Entry::load()? };
+        let entry = load_entry()?;
         let api_version_cap =
             std::env::var(api_level::API_VERSION_CAP_ENV)
                 .ok()
@@ -371,7 +408,30 @@ impl VkContext {
             .engine_name(c"yserver-kms")
             .api_version(instance_api_version);
 
-        let ext_cstrs = super::instance::required_instance_extensions();
+        let available_instance_exts =
+            unsafe { entry.enumerate_instance_extension_properties(None) }?;
+        let ext_cstrs = super::instance::filter_available(
+            &super::instance::wanted_instance_extensions(&options),
+            |name| {
+                available_instance_exts
+                    .iter()
+                    .any(|p| p.extension_name_as_c_str() == Ok(name))
+            },
+        );
+        if let Some(missing) = super::instance::required_instance_extensions(&options)
+            .into_iter()
+            .find(|name| !ext_cstrs.contains(name))
+        {
+            return Err(VkInitError::MissingRequiredExtension(
+                missing.to_string_lossy().into_owned(),
+            ));
+        }
+        let debug_utils_enabled = ext_cstrs.contains(&ash::ext::debug_utils::NAME);
+        let instance_flags = if ext_cstrs.contains(&ash::khr::portability_enumeration::NAME) {
+            vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
+        } else {
+            vk::InstanceCreateFlags::empty()
+        };
         let ext_ptrs: Vec<_> = ext_cstrs.iter().map(|c| c.as_ptr()).collect();
 
         // Validation layer in debug builds only, and only if the
@@ -406,6 +466,7 @@ impl VkContext {
         }
 
         let create_info = vk::InstanceCreateInfo::default()
+            .flags(instance_flags)
             .application_info(&app_info)
             .enabled_extension_names(&ext_ptrs)
             .enabled_layer_names(&layer_ptrs);
@@ -417,13 +478,14 @@ impl VkContext {
         // applies to debug messenger / device once they exist.
         let debug_utils_instance = ash::ext::debug_utils::Instance::new(&entry, &instance);
 
-        let debug_messenger = match create_debug_messenger(&debug_utils_instance) {
-            Ok(m) => m,
-            Err(e) => {
-                unsafe { instance.destroy_instance(None) };
-                return Err(e);
-            }
-        };
+        let debug_messenger =
+            match create_debug_messenger(&debug_utils_instance, debug_utils_enabled) {
+                Ok(m) => m,
+                Err(e) => {
+                    unsafe { instance.destroy_instance(None) };
+                    return Err(e);
+                }
+            };
 
         let PickedPhysicalDevice {
             physical_device,
@@ -460,9 +522,12 @@ impl VkContext {
         // function — `supported_modifiers` returns `[LINEAR]` per the
         // design §4 fallback matrix.
         //
-        // Intentionally NOT requested:
-        // - VK_KHR_swapchain — WSI is out of scope (design §1); KMS
-        //   pageflip is our presentation path.
+        // Only with `wants_kms_interop`; a presenting (surface) consumer
+        // shares no buffers with KMS or DRI3 clients.
+        //
+        // Intentionally NOT requested for KMS:
+        // - VK_KHR_swapchain — KMS pageflip is that presentation path;
+        //   only a `wants_present` context requests it, below.
         // - VK_KHR_dynamic_rendering_local_read — only Phase 4.1.4.6
         //   ShaderRMW PictOps need this; deferred until that lands.
         //
@@ -470,13 +535,18 @@ impl VkContext {
         // expose; on a healthy device every wanted extension makes
         // it through. The warning path remains as an early-fail signal
         // for misconfigured environments.
-        let wanted: &[&CStr] = &[
+        let kms_interop: &[&CStr] = &[
             ash::khr::external_memory_fd::NAME,
             ash::ext::external_memory_dma_buf::NAME,
             ash::khr::external_semaphore_fd::NAME,
             ash::ext::image_drm_format_modifier::NAME,
             ash::ext::queue_family_foreign::NAME,
         ];
+        let wanted: &[&CStr] = if options.wants_kms_interop {
+            kms_interop
+        } else {
+            &[]
+        };
         let supported_device_exts =
             match unsafe { instance.enumerate_device_extension_properties(physical_device) } {
                 Ok(v) => v,
@@ -495,6 +565,17 @@ impl VkContext {
                 .iter()
                 .any(|p| p.extension_name_as_c_str().is_ok_and(|s| s == name))
         };
+        if options.wants_present && !has_device_extension(ash::khr::swapchain::NAME) {
+            unsafe {
+                if let Some(m) = debug_messenger {
+                    debug_utils_instance.destroy_debug_utils_messenger(m, None);
+                }
+                instance.destroy_instance(None);
+            }
+            return Err(VkInitError::MissingRequiredExtension(
+                ash::khr::swapchain::NAME.to_string_lossy().into_owned(),
+            ));
+        }
         let api_path = match select_device_api_path(
             &instance,
             physical_device,
@@ -541,6 +622,13 @@ impl VkContext {
         // misleading warning costs more than the line it would save.
         let mut device_extension_names = device_extension_names;
         device_extension_names.extend_from_slice(api_path.required_extensions());
+        if options.wants_present {
+            device_extension_names.push(ash::khr::swapchain::NAME);
+        }
+        // The spec requires enabling it wherever it is advertised.
+        if has_device_extension(ash::khr::portability_subset::NAME) {
+            device_extension_names.push(ash::khr::portability_subset::NAME);
+        }
         let memory_budget = supported_device_exts.iter().any(|p| {
             p.extension_name_as_c_str()
                 .map(|s| s == crate::kms::vk::vram::REQUIRED_EXTENSION)
@@ -662,6 +750,9 @@ impl VkContext {
         } else {
             None
         };
+        let dmabuf_export = external_memory_fd_supported
+            && device_extension_names.contains(&ash::ext::external_memory_dma_buf::NAME);
+        let swapchain = device_extension_names.contains(&ash::khr::swapchain::NAME);
         let image_drm_format_modifier =
             device_extension_names.contains(&ash::ext::image_drm_format_modifier::NAME);
         let image_drm_format_modifier_ext = if image_drm_format_modifier {
@@ -709,6 +800,8 @@ impl VkContext {
             device,
             external_semaphore_fd,
             external_memory_fd,
+            dmabuf_export,
+            swapchain,
             image_drm_format_modifier_ext,
             image_drm_format_modifier,
             queue_family_foreign,
@@ -816,7 +909,7 @@ pub fn ensure_hardware_vulkan_for_scanout() -> Result<(), String> {
         return Ok(());
     }
 
-    let entry = match unsafe { ash::Entry::load() } {
+    let entry = match load_entry() {
         Ok(e) => e,
         Err(e) => {
             log::warn!("hw-Vulkan preflight: loader unavailable ({e}); deferring to full init");
@@ -897,7 +990,11 @@ fn validation_layer_present(entry: &ash::Entry, name: &CStr) -> bool {
 
 fn create_debug_messenger(
     debug_utils_instance: &ash::ext::debug_utils::Instance,
+    debug_utils_enabled: bool,
 ) -> Result<Option<vk::DebugUtilsMessengerEXT>, VkInitError> {
+    if !debug_utils_enabled {
+        return Ok(None);
+    }
     // Match the validation-layer enable rule from `VkContext::new`:
     // debug builds always install the messenger; release builds only
     // when `YSERVER_VK_VALIDATION` is set. Without the messenger the
@@ -966,6 +1063,8 @@ pub enum VkInitError {
     ConflictingRenderDevice(String),
     #[error("multiple Vulkan physical devices advertise DRM render node {0}")]
     DuplicateRenderNodeIdentity(String),
+    #[error("required Vulkan extension {0} is not available")]
+    MissingRequiredExtension(String),
     #[error("physical device lacks required Vulkan feature `{0}` (no fallback implemented for it)")]
     MissingRequiredFeature(&'static str),
     #[error(
@@ -1523,6 +1622,24 @@ unsafe extern "system" fn vk_debug_callback(
     }
     // INFO/VERBOSE intentionally suppressed — too noisy.
     vk::FALSE
+}
+
+/// Load the Vulkan loader. macOS's default dlopen paths miss Homebrew's
+/// prefix, where `vulkan-loader` installs `libvulkan.1.dylib`.
+fn load_entry() -> Result<ash::Entry, ash::LoadingError> {
+    let default = unsafe { ash::Entry::load() };
+    #[cfg(target_os = "macos")]
+    if default.is_err() {
+        for path in [
+            "/opt/homebrew/lib/libvulkan.1.dylib",
+            "/usr/local/lib/libvulkan.1.dylib",
+        ] {
+            if let Ok(entry) = unsafe { ash::Entry::load_from(path) } {
+                return Ok(entry);
+            }
+        }
+    }
+    default
 }
 
 #[cfg(test)]

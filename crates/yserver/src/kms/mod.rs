@@ -1,22 +1,26 @@
 pub(crate) mod backend;
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(kms)]
 pub mod console;
 pub(crate) mod core;
 pub use render::cpu_types;
 
-/// Cross-platform type alias for the optional console guard.
-/// On Linux/FreeBSD this is the real VT guard; elsewhere it's a unit placeholder.
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+/// The optional console (VT) guard of the KMS platform.
+#[cfg(kms)]
 pub(crate) type ConsoleGuardOpt = Option<console::ConsoleGuard>;
-#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-pub(crate) type ConsoleGuardOpt = Option<()>;
+#[cfg(kms)]
 pub(crate) mod cursor_plane;
 pub(crate) mod font_index;
+#[cfg(kms)]
 pub(crate) mod hotplug;
+#[cfg(kms)]
+pub(crate) mod outputs;
 pub mod render;
+#[cfg(kms)]
 pub(crate) mod render_node;
+#[cfg(kms)]
 pub(crate) mod scanout_route;
 pub mod vk;
 pub(super) mod xkb;
 pub(super) mod xkb_desc;
+#[cfg(kms)]
 pub(crate) mod xshmfence;

@@ -1,3 +1,4 @@
+pub mod anon_shm;
 pub mod backend;
 pub mod composite_redirects;
 pub mod core_loop;

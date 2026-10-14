@@ -3,13 +3,14 @@ use crate::kms::{
     cpu_types::Rectangle16,
     render::{
         backend::{
-            InferiorPiece, KmsBackend, WindowGeometry,
+            InferiorPiece, WindowGeometry, XBackend,
             portable::{
                 clip::{apply_subwindow_mode_clip, clip_rects16, intersect_rect_with_clip},
                 draw::{
                     blit_rows_4bpp, compute_copy_area_dst_rects, depth_plane_mask, vk_rects_bbox,
                 },
             },
+            seam::Platform,
         },
         store::DrawableId,
         target::PaintTarget,
@@ -18,7 +19,7 @@ use crate::kms::{
 use ash::vk;
 use yserver_core::backend::OriginContext;
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     /// Compute the destination window's RENDER clipList for one paint op
     /// in destination-window-local coordinates.
     pub(in crate::kms::render::backend) fn render_dst_cliplist_local(
@@ -300,7 +301,7 @@ impl KmsBackend {
             };
             match self.engine.get_image(
                 &mut self.store,
-                &mut self.platform.gpu,
+                self.platform.gpu_mut(),
                 piece.target.src_including_border(),
                 storage,
                 depth,
@@ -434,8 +435,8 @@ impl KmsBackend {
         host_xid: u32,
         rects: &[Rectangle16],
     ) -> Vec<(u32, Vec<Rectangle16>)> {
-        fn walk(
-            backend: &KmsBackend,
+        fn walk<P: Platform>(
+            backend: &XBackend<P>,
             parent_xid: u32,
             rects: &[Rectangle16],
             out: &mut Vec<(u32, Vec<Rectangle16>)>,

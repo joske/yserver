@@ -2689,6 +2689,7 @@ impl KmsCore {
     /// matching `KmsBackend::for_tests`'s synthetic output.
     #[doc(hidden)]
     #[must_use]
+    #[cfg(any(kms, test))]
     pub(crate) fn for_tests() -> Self {
         let xkb_context = XkbContext(xkbcommon::xkb::Context::new(
             xkbcommon::xkb::CONTEXT_NO_FLAGS,

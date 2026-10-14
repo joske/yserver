@@ -206,6 +206,21 @@ fn dri3_hidden_when_caps_unsupported() {
     );
 }
 
+#[test]
+fn glx_follows_backend_availability() {
+    let mut backend = RecordingBackend::new();
+    assert!(extension_query_reply("GLX", &mut backend).is_some());
+    assert!(advertised_extension_names(&mut backend).contains(&"GLX"));
+
+    backend.glx_available = false;
+    assert!(extension_query_reply("GLX", &mut backend).is_none());
+    let names = advertised_extension_names(&mut backend);
+    assert!(
+        !names.contains(&"GLX"),
+        "GLX must be hidden, got: {names:?}"
+    );
+}
+
 /// Build an ImportSyncobj request body: syncobj(4) + drawable(4), fd via
 /// SCM_RIGHTS (attached_fd).
 fn import_syncobj_body(syncobj: u32, drawable: u32) -> Vec<u8> {
@@ -845,8 +860,10 @@ fn mit_shm_put_image_honors_gc_clip_rectangles() {
         },
     );
 
-    let fd = unsafe { libc::memfd_create(c"mit-shm-put-image-test".as_ptr(), libc::MFD_CLOEXEC) };
-    assert!(fd >= 0, "memfd_create failed");
+    let fd = std::os::fd::IntoRawFd::into_raw_fd(
+        crate::anon_shm::create_anon_shm(c"mit-shm-put-image-test")
+            .expect("create_anon_shm failed"),
+    );
     assert_eq!(unsafe { libc::ftruncate(fd, 64) }, 0, "ftruncate failed");
     let mut segment = crate::server::MitShmSegment::from_fd(ClientId(CLIENT), fd, false)
         .expect("map test SHM segment");

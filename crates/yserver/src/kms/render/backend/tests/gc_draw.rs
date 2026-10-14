@@ -182,16 +182,20 @@ fn client_disconnected_does_not_own_syncobj_lifetime() {
     };
 
     let mut b = KmsBackend::for_tests();
-    b.dri3_syncobjs.insert(0x0040_0001, (ClientId(7), mk(1)));
-    b.dri3_syncobjs.insert(0x0040_0002, (ClientId(8), mk(1)));
+    b.pstate
+        .dri3_syncobjs
+        .insert(0x0040_0001, (ClientId(7), mk(1)));
+    b.pstate
+        .dri3_syncobjs
+        .insert(0x0040_0002, (ClientId(8), mk(1)));
 
     yserver_core::backend::Backend::client_disconnected(&mut b, ClientId(7));
     assert!(
-        b.dri3_syncobjs.contains_key(&0x0040_0002),
+        b.pstate.dri3_syncobjs.contains_key(&0x0040_0002),
         "another client's syncobj must survive the disconnect",
     );
     assert!(
-        b.dri3_syncobjs.contains_key(&0x0040_0001),
+        b.pstate.dri3_syncobjs.contains_key(&0x0040_0001),
         "the generic disconnect hook must not bypass core resource retention",
     );
 }
@@ -217,7 +221,8 @@ fn dri3_syncobj_owned_is_client_scoped() {
 
     let xid = 0x0040_0001_u32;
     let mut b = KmsBackend::for_tests();
-    b.dri3_syncobjs
+    b.pstate
+        .dri3_syncobjs
         .insert(xid, (ClientId(7), std::sync::Arc::new(imported)));
 
     assert!(

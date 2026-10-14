@@ -79,10 +79,10 @@ impl KmsBackend {
         id: crate::kms::render::store::DrawableId,
         backing: PixmapHandle,
     ) -> &mut ExportedBacking {
-        if !self.exported_dmabufs.contains_key(&id) {
+        if !self.pstate.exported_dmabufs.contains_key(&id) {
             // ONE lifetime ref per backing, released exactly once in teardown.
             let via_alias = self.take_backing_lifetime_ref(id, backing);
-            self.exported_dmabufs.insert(
+            self.pstate.exported_dmabufs.insert(
                 id,
                 ExportedBacking {
                     fd: None,
@@ -94,7 +94,8 @@ impl KmsBackend {
                 },
             );
         }
-        self.exported_dmabufs
+        self.pstate
+            .exported_dmabufs
             .get_mut(&id)
             .expect("entry just ensured")
     }
@@ -124,7 +125,7 @@ impl KmsBackend {
         let mut rows = Vec::new();
         for d in self.store.drawables() {
             let entry = mem_accounting::entry_of(d.storage.memory);
-            let export = self.exported_dmabufs.get(&d.id);
+            let export = self.pstate.exported_dmabufs.get(&d.id);
             let export_mem = matches!(
                 entry,
                 Some((_, MemCategory::RedirectExport | MemCategory::TfpExport))
@@ -156,7 +157,7 @@ impl KmsBackend {
                 redirect_of: redirect_of.get(&d.xid).copied().filter(|_| attached),
             });
         }
-        for (id, e) in &self.exported_dmabufs {
+        for (id, e) in &self.pstate.exported_dmabufs {
             if self.store.get(*id).is_none() {
                 rows.push(HolderRow {
                     host_xid: e.backing.as_raw(),
@@ -193,7 +194,7 @@ impl KmsBackend {
         let Some(id) = self.store.lookup(host_xid) else {
             return;
         };
-        if let Some(e) = self.exported_dmabufs.get_mut(&id) {
+        if let Some(e) = self.pstate.exported_dmabufs.get_mut(&id) {
             e.glx_refs = e.glx_refs.saturating_sub(1);
         }
         self.maybe_teardown_export(id);
@@ -209,18 +210,18 @@ impl KmsBackend {
         &mut self,
         id: crate::kms::render::store::DrawableId,
     ) {
-        let ready = matches!(self.exported_dmabufs.get(&id), Some(e) if e.glx_refs == 0);
+        let ready = matches!(self.pstate.exported_dmabufs.get(&id), Some(e) if e.glx_refs == 0);
         if !ready {
             return;
         }
-        if let Some(e) = self.exported_dmabufs.remove(&id) {
+        if let Some(e) = self.pstate.exported_dmabufs.remove(&id) {
             // Drop the store's parallel sync-fd dup so no write can be
             // routed through a torn-down export.
             self.store.clear_exported_sync_fd(id);
             // `e.fd` (our dup) closes on drop; the kernel buffer survives
             // while any GL consumer still holds its own fd.
             if e.lifetime_ref_held {
-                self.release_backing_lifetime_ref(&e);
+                self.release_backing_lifetime_ref(e.lifetime_via_alias, e.backing, e.backing_id);
             }
         }
     }
@@ -281,7 +282,7 @@ impl KmsBackend {
     pub fn has_export_entry(&self, host_xid: u32) -> bool {
         self.store
             .lookup(host_xid)
-            .is_some_and(|id| self.exported_dmabufs.contains_key(&id))
+            .is_some_and(|id| self.pstate.exported_dmabufs.contains_key(&id))
     }
 }
 
@@ -313,13 +314,14 @@ impl KmsBackend {
         core: &dyn Fn() -> yserver_core::backend::export_holders::CoreHolders,
     ) -> bool {
         let rows = self.export_holder_rows();
-        if !self.export_holders.observe(rows) {
+        if !self.pstate.export_holders.observe(rows) {
             return false;
         }
         let core = core();
-        for line in
-            crate::kms::render::export_holders::format_report(self.export_holders.rows(), &core)
-        {
+        for line in crate::kms::render::export_holders::format_report(
+            self.pstate.export_holders.rows(),
+            &core,
+        ) {
             log::info!(target: crate::RESOURCE_TELEMETRY_TARGET, "{line}");
         }
         true
@@ -700,6 +702,7 @@ impl KmsBackend {
         let backing = PixmapHandle::from_raw(host_xid)
             .ok_or_else(|| io::Error::other(format!("DRI3 export: bad xid 0x{host_xid:x}")))?;
         if self
+            .pstate
             .exported_dmabufs
             .get(&id)
             .is_none_or(|e| e.fd.is_none())
@@ -736,7 +739,8 @@ impl KmsBackend {
         // the fd really is a sync_file).
         use std::os::fd::AsFd as _;
         if let Some(mapping) = crate::kms::xshmfence::FenceMapping::map(fd.as_fd()) {
-            self.dri3_xshmfences
+            self.pstate
+                .dri3_xshmfences
                 .insert(fence_xid, std::sync::Arc::new(mapping));
             log::debug!("DRI3 FenceFromFD 0x{fence_xid:x}: imported as xshmfence");
             return Ok(());
@@ -755,7 +759,7 @@ impl KmsBackend {
         // Replacing an entry drops the previous Arc here; if no other
         // clone is outstanding, OwnedSemaphore::Drop calls
         // vkDestroySemaphore.
-        let _ = self.dri3_sync_resources.insert(fence_xid, owned);
+        let _ = self.pstate.dri3_sync_resources.insert(fence_xid, owned);
         Ok(())
     }
 
@@ -763,7 +767,7 @@ impl KmsBackend {
         &mut self,
         fence_xid: u32,
     ) -> io::Result<()> {
-        if let Some(mapping) = self.dri3_xshmfences.get(&fence_xid) {
+        if let Some(mapping) = self.pstate.dri3_xshmfences.get(&fence_xid) {
             mapping.trigger();
             return Ok(());
         }
@@ -780,7 +784,8 @@ impl KmsBackend {
         &self,
         fence_xid: u32,
     ) -> Option<bool> {
-        self.dri3_xshmfences
+        self.pstate
+            .dri3_xshmfences
             .get(&fence_xid)
             .map(|mapping| mapping.query() != 0)
     }
@@ -789,7 +794,7 @@ impl KmsBackend {
         &mut self,
         fence_xid: u32,
     ) {
-        if let Some(mapping) = self.dri3_xshmfences.get(&fence_xid) {
+        if let Some(mapping) = self.pstate.dri3_xshmfences.get(&fence_xid) {
             mapping.reset();
         }
     }
@@ -801,17 +806,18 @@ impl KmsBackend {
         // Xorg `miSyncShmScreenDestroyFence`: trigger, then unmap. A
         // deferred Present completion holding an Arc clone keeps the
         // mapping alive until it lets go.
-        if let Some(mapping) = self.dri3_xshmfences.remove(&fence_xid) {
+        if let Some(mapping) = self.pstate.dri3_xshmfences.remove(&fence_xid) {
             mapping.trigger();
         }
-        self.dri3_sync_resources.remove(&fence_xid);
+        self.pstate.dri3_sync_resources.remove(&fence_xid);
     }
 
     pub(in crate::kms::render::backend) fn backend_export_dri3_xshmfence_handle(
         &self,
         fence_xid: u32,
     ) -> Option<std::sync::Arc<dyn yserver_core::backend::XshmfenceHandle>> {
-        self.dri3_xshmfences
+        self.pstate
+            .dri3_xshmfences
             .get(&fence_xid)
             .cloned()
             .map(|arc| arc as std::sync::Arc<dyn yserver_core::backend::XshmfenceHandle>)
@@ -821,7 +827,8 @@ impl KmsBackend {
         &self,
         syncobj_xid: u32,
     ) -> Option<std::sync::Arc<dyn yserver_core::backend::SyncobjHandle>> {
-        self.dri3_syncobjs
+        self.pstate
+            .dri3_syncobjs
             .get(&syncobj_xid)
             .map(|(_, arc)| arc.clone())
             .map(|arc| arc as std::sync::Arc<dyn yserver_core::backend::SyncobjHandle>)
@@ -832,7 +839,8 @@ impl KmsBackend {
         client_id: yserver_protocol::x11::ClientId,
         syncobj_xid: u32,
     ) -> bool {
-        self.dri3_syncobjs
+        self.pstate
+            .dri3_syncobjs
             .get(&syncobj_xid)
             .is_some_and(|(owner, _)| *owner == client_id)
     }
@@ -842,6 +850,7 @@ impl KmsBackend {
         fence_xid: u32,
     ) -> io::Result<std::os::fd::OwnedFd> {
         let arc = self
+            .pstate
             .dri3_sync_resources
             .get(&fence_xid)
             .cloned()
@@ -871,7 +880,7 @@ impl KmsBackend {
             .ok_or_else(|| {
                 io::Error::other("DRI3 ImportSyncobj: render node not resolved at init")
             })?;
-        if self.dri3_syncobjs.contains_key(&syncobj_xid) {
+        if self.pstate.dri3_syncobjs.contains_key(&syncobj_xid) {
             return Err(io::Error::other(format!(
                 "DRI3 ImportSyncobj: syncobj 0x{syncobj_xid:x} already imported"
             )));
@@ -880,6 +889,7 @@ impl KmsBackend {
             crate::kms::render::imported_syncobj::ImportedSyncobj::import(render_node, fd.as_fd())?;
         // Arc Drop on any replaced entry destroys the previous handle.
         let _ = self
+            .pstate
             .dri3_syncobjs
             .insert(syncobj_xid, (client_id, std::sync::Arc::new(imported)));
         Ok(())
@@ -890,7 +900,7 @@ impl KmsBackend {
         client_id: yserver_protocol::x11::ClientId,
         syncobj_xid: u32,
     ) -> io::Result<()> {
-        let Some((owner, _)) = self.dri3_syncobjs.get(&syncobj_xid) else {
+        let Some((owner, _)) = self.pstate.dri3_syncobjs.get(&syncobj_xid) else {
             return Err(io::Error::other(format!(
                 "DRI3 FreeSyncobj: unknown syncobj 0x{syncobj_xid:x}"
             )));
@@ -904,7 +914,7 @@ impl KmsBackend {
         // Arc Drop destroys the DRM handle when the last reference goes away,
         // which may be later than this call: the deferred completion path
         // pins clones past FreeSyncobj.
-        let _ = self.dri3_syncobjs.remove(&syncobj_xid);
+        let _ = self.pstate.dri3_syncobjs.remove(&syncobj_xid);
         Ok(())
     }
 
@@ -916,6 +926,7 @@ impl KmsBackend {
         use yserver_core::backend::SyncobjHandle as _;
 
         let arc = self
+            .pstate
             .dri3_syncobjs
             .get(&syncobj_xid)
             .map(|(_, arc)| arc)

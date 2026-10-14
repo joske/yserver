@@ -513,7 +513,8 @@ fn silence_pair(transforms: [CrtcTransform; 2], root: (u16, u16)) -> (KmsBackend
     (state.randr.screen_width, state.randr.screen_height) = root;
     for i in 0..2 {
         let key = b.platform.outputs[i].key.clone();
-        b.output_key_by_id
+        b.pstate
+            .output_key_by_id
             .insert(10 + u32::try_from(i).unwrap(), key);
     }
     (b, state)
@@ -599,21 +600,24 @@ fn direct_scanout_unflips_and_stays_off_while_another_output_is_transformed() {
         [CrtcTransform::identity(), CrtcTransform::identity()],
         (5120, 1440),
     );
-    b.scanout_m2.cursor_bound_all = true;
+    b.pstate.scanout_m2.cursor_bound_all = true;
     let fallback = super::tests::seed_window(&mut b, 0x6a00, None, 0, 0);
     super::tests::install_direct_frame_for_target_test(&mut b, 0x6b00, fallback, true);
-    b.scanout_m2.hold_direct = true;
+    b.pstate.scanout_m2.hold_direct = true;
     Backend::randr_layout_changed(&mut b, &mut state);
     assert!(
-        !b.scanout_m2.unflip_requested,
+        !b.pstate.scanout_m2.unflip_requested,
         "identity keeps direct scanout"
     );
 
     state.randr.outputs[1].current_transform = scale(0x20000, Some(Filter::Bilinear));
     Backend::randr_layout_changed(&mut b, &mut state);
     assert!(b.platform.any_output_transformed());
-    assert!(b.scanout_m2.unflip_requested);
-    assert_eq!(b.scanout_m2.unflip_reason, Some("crtc_transform_changed"));
+    assert!(b.pstate.scanout_m2.unflip_requested);
+    assert_eq!(
+        b.pstate.scanout_m2.unflip_reason,
+        Some("crtc_transform_changed")
+    );
 }
 
 /// One RANDR request from client 5, through the core dispatcher.
@@ -657,7 +661,7 @@ fn a_root_read_right_after_a_transform_becomes_current_sees_the_root() {
     // automatic PRIME Output Source does.
     let sink = b.platform.outputs[1].key.device_key;
     let source = b.selected_render_provider_endpoint().expect("renderer");
-    b.provider_output_sources.insert(sink, source);
+    b.pstate.provider_output_sources.insert(sink, source);
     let mut state = ServerState::new();
     super::tests::install_client_for_render(&mut state, 5);
     b.rebuild_randr_state(&mut state, None, false);
@@ -883,7 +887,7 @@ fn set_crtc_config_rotates_the_right_hand_output() {
     }
     let sink = b.platform.outputs[1].key.device_key;
     let source = b.selected_render_provider_endpoint().expect("renderer");
-    b.provider_output_sources.insert(sink, source);
+    b.pstate.provider_output_sources.insert(sink, source);
     let mut state = ServerState::new();
     super::tests::install_client_for_render(&mut state, 5);
     b.rebuild_randr_state(&mut state, None, false);

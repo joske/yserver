@@ -3999,3 +3999,17 @@ fn held_key_repeats_at_the_set_controls_delay_and_interval() {
         .count();
     assert_eq!(repeats, 6, "a release + press pair per fire");
 }
+
+/// `Message::PlatformEvent` reaches `Backend::on_platform_event` once per
+/// message, on the core thread.
+#[test]
+fn platform_event_message_reaches_the_backend() {
+    let mut state = ServerState::new();
+    let mut backend = crate::backend::recording::RecordingBackend::new();
+    run_core_for_vt_test(&mut state, &mut backend, |sender, _requests| {
+        sender.send(Message::PlatformEvent).unwrap();
+        sender.send(Message::PlatformEvent).unwrap();
+        sender.send(Message::Shutdown).unwrap();
+    });
+    assert_eq!(backend.platform_events, 2);
+}

@@ -372,7 +372,7 @@ fn push_enabled_test_output(
     b.platform.scanout_pools.push(None);
     b.platform.bo_generations.push(Vec::new());
     b.platform.first_pageflip_logged.push(false);
-    let entry = b.randr_id_alloc.entry_mut(&key);
+    let entry = b.pstate.randr_id_alloc.entry_mut(&key);
     entry.connected = true;
     entry.modes = vec![mode];
     entry.config = crate::kms::render::backend::ConnectorConfig::Enabled {
@@ -924,7 +924,7 @@ fn retain_direct_frame_from_source_test(
         ust: 300,
         source: PresentClockSource::PageFlip,
     });
-    b.scanout_m2.current = Some(crate::kms::render::backend::DirectPresentFrame {
+    b.pstate.scanout_m2.current = Some(crate::kms::render::backend::DirectPresentFrame {
         source_pin,
         fallback_target_pin,
         source_id,
@@ -969,7 +969,7 @@ fn retain_direct_frame_from_source_test(
         completion_clock,
         awaiting_outputs: std::collections::HashSet::new(),
     });
-    b.scanout_m2.hold_direct = true;
+    b.pstate.scanout_m2.hold_direct = true;
 }
 
 fn dispatch_raw(
@@ -1209,11 +1209,11 @@ pub(super) fn install_direct_frame_for_target_test(
         },
     };
     if current {
-        b.scanout_m2.current = Some(frame);
+        b.pstate.scanout_m2.current = Some(frame);
     } else {
-        b.scanout_m2.pending = Some(frame);
+        b.pstate.scanout_m2.pending = Some(frame);
     }
-    b.scanout_m2.hold_direct = true;
+    b.pstate.scanout_m2.hold_direct = true;
     (source_id, fallback_id, source_pin, fallback_target_pin)
 }
 

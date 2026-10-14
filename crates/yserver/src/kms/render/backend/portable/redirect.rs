@@ -1,7 +1,8 @@
 use crate::kms::render::{
     backend::{
-        ExportedBacking, KmsBackend, SeedInferiorDraw,
+        SeedInferiorDraw, XBackend,
         portable::windows::{bordered_storage_extent, default_window_init_color},
+        seam::Platform,
     },
     store::{AllocError, DrawableId, DrawableKind, Storage},
     submit_trace::SubmitKind,
@@ -10,7 +11,7 @@ use crate::kms::render::{
 use std::io;
 use yserver_core::backend::{Backend as _, OriginContext, PixmapHandle, WindowHandle};
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     /// Stage 4c.2 — compute the screen-absolute rect for a window's
     /// `DrawableId`. Walks the `windows.parent` chain upward
     /// from `w_id`, accumulating each step's `(x, y)` offset; the
@@ -176,7 +177,7 @@ impl KmsBackend {
         // parent's backing in BACKING space (both handles privileged).
         if let Err(e) = self.engine.copy_area(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             parent_target.server_backing_src(),
             Dst::server_internal(b_id),
             src_rect,
@@ -286,7 +287,7 @@ impl KmsBackend {
             }];
             match self.engine.render_composite(
                 &mut self.store,
-                &mut self.platform.gpu,
+                self.platform.gpu_mut(),
                 OP_SRC,
                 // The planner already put this leaf's CONTENT origin
                 // into `src_x`/`src_y` (`push_inferior_rects`), so the
@@ -515,10 +516,10 @@ impl KmsBackend {
         id: crate::kms::render::store::DrawableId,
     ) -> crate::kms::render::store::RetireDecision {
         let engine = &mut self.engine;
-        let scanout_m1 = &mut self.scanout_m1;
-        self.store.decref(&mut self.platform.gpu, id, |dropped| {
+        let pstate = &mut self.pstate;
+        self.store.decref(self.platform.gpu_mut(), id, |dropped| {
             engine.notify_drawable_retired(dropped);
-            scanout_m1.remove(dropped);
+            P::note_drawable_retired(pstate, dropped);
         })
     }
 
@@ -596,19 +597,21 @@ impl KmsBackend {
     /// storage when its own refcount also hits zero.
     pub(in crate::kms::render::backend) fn release_backing_lifetime_ref(
         &mut self,
-        entry: &ExportedBacking,
+        via_alias: bool,
+        backing: PixmapHandle,
+        backing_id: DrawableId,
     ) {
-        if entry.lifetime_via_alias {
+        if via_alias {
             // Alias path: decref the registry (keyed by xid); on final ref
             // free the backing via the same store decref `free_pixmap` uses.
-            if self.core.alias_registry.decref(entry.backing) {
-                self.store_decref_with_invalidate(entry.backing_id);
+            if self.core.alias_registry.decref(backing) {
+                self.store_decref_with_invalidate(backing_id);
             }
         } else {
             // Plain path: drop the extra store ref taken at acquire time.
             // Use the captured DrawableId — the `by_xid` mapping may have
             // been detached by an intervening FreePixmap (PendingFence).
-            self.store_decref_with_invalidate(entry.backing_id);
+            self.store_decref_with_invalidate(backing_id);
         }
     }
 
@@ -620,16 +623,16 @@ impl KmsBackend {
     /// `Storage::destroy` runs.
     pub(crate) fn poll_pending_retire_with_invalidate(&mut self) {
         let engine = &mut self.engine;
-        let scanout_m1 = &mut self.scanout_m1;
+        let pstate = &mut self.pstate;
         self.store
-            .poll_pending_retire(&mut self.platform.gpu, |dropped| {
+            .poll_pending_retire(self.platform.gpu_mut(), |dropped| {
                 engine.notify_drawable_retired(dropped);
-                scanout_m1.remove(dropped);
+                P::note_drawable_retired(pstate, dropped);
             });
     }
 }
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     /// Stage 4c.4 — flip a window's scene-participation under
     /// COMPOSITE redirect. Delegates to `DrawableStore::
     /// set_scene_participating` (which clears unpresented
@@ -977,7 +980,7 @@ impl KmsBackend {
             self.free_pixmap(origin, backing.as_raw())?;
         } else if let Some(id) = export_id {
             // An alias left this backing: an export-only entry (glx_refs == 0) goes, as at FreePixmap.
-            self.maybe_teardown_export(id);
+            P::maybe_teardown_export(self, id);
         }
         Ok(())
     }
@@ -1080,7 +1083,7 @@ impl KmsBackend {
         // don't paint still get a stable handle).
         match self
             .platform
-            .gpu
+            .gpu()
             .allocate_drawable_storage(width, height, depth)
         {
             Ok(storage) => {
@@ -1124,7 +1127,7 @@ impl KmsBackend {
                         };
                         if let Err(e) = self.engine.fill_rect(
                             &mut self.store,
-                            &mut self.platform.gpu,
+                            self.platform.gpu_mut(),
                             Dst::server_internal(id),
                             rect,
                             color,
@@ -1138,7 +1141,7 @@ impl KmsBackend {
             }
             Err(vk_err)
                 if vk_err == ash::vk::Result::ERROR_INITIALIZATION_FAILED
-                    && self.platform.gpu.vk.is_none() =>
+                    && self.platform.gpu().vk.is_none() =>
             {
                 // Test fixture path — no Vk available.
                 self.log_render_gap("create_pixmap_no_vk");
@@ -1201,7 +1204,7 @@ impl KmsBackend {
                 self.store_decref_with_invalidate(id);
             }
             if let Some(id) = export_id {
-                self.maybe_teardown_export(id);
+                P::maybe_teardown_export(self, id);
             }
             return Ok(());
         }
@@ -1209,7 +1212,7 @@ impl KmsBackend {
             self.store_decref_with_invalidate(id);
         }
         if let Some(id) = export_id {
-            self.maybe_teardown_export(id);
+            P::maybe_teardown_export(self, id);
         }
         Ok(())
     }

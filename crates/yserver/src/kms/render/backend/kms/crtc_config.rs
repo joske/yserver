@@ -51,11 +51,16 @@ impl KmsBackend {
                     .and_then(Option::as_ref)
                     .is_some_and(|pool| pool.display_pool().has_pending_pageflip())
                     || self
+                        .pstate
                         .scanout_m2
                         .pending
                         .as_ref()
                         .is_some_and(|frame| frame.awaiting_outputs.contains(output_idx))
-                    || self.scanout_m2.unflip_awaiting_outputs.contains(output_idx)
+                    || self
+                        .pstate
+                        .scanout_m2
+                        .unflip_awaiting_outputs
+                        .contains(output_idx)
                     || self
                         .platform
                         .cursor_atomic_event_pending_for_output(*output_idx)
@@ -70,7 +75,7 @@ impl KmsBackend {
     ) -> io::Result<()> {
         self.bump_crtc_config_topology_epoch(context);
         let old_pending_pageflips = self.pending_pageflip_crtcs();
-        if self.scanout_m2.active() {
+        if self.pstate.scanout_m2.active() {
             if let Err(error) = self.teardown_direct_before_topology_requery(context) {
                 // This also covers failure to materialize the direct source's
                 // COW shadow. Consuming the topology event while retaining an
@@ -118,7 +123,7 @@ impl KmsBackend {
             self.request_exit();
             return Err(error);
         }
-        self.scanout_m1.clear(context);
+        self.pstate.scanout_m1.clear(context);
         Ok(())
     }
 
@@ -209,32 +214,38 @@ impl KmsBackend {
         &mut self,
         reason: &str,
     ) {
-        self.crtc_config_topology_epoch = self.crtc_config_topology_epoch.wrapping_add(1);
+        self.pstate.crtc_config_topology_epoch =
+            self.pstate.crtc_config_topology_epoch.wrapping_add(1);
 
-        let mut tokens: Vec<_> = self.pending_crtc_config_probes.keys().copied().collect();
+        let mut tokens: Vec<_> = self
+            .pstate
+            .pending_crtc_config_probes
+            .keys()
+            .copied()
+            .collect();
         tokens.sort_unstable_by_key(|token| token.0);
         let mut announced = false;
         for token in tokens {
-            if self.invalidated_crtc_config_probes.contains(&token) {
+            if self.pstate.invalidated_crtc_config_probes.contains(&token) {
                 continue;
             }
             // A completed worker result may already have been announced but
             // not yet consumed by finish. Replace it so a topology change can
             // never install that stale plan, while avoiding a duplicate wake.
-            let already_announced = self.ready_crtc_config_results.contains_key(&token);
-            if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
+            let already_announced = self.pstate.ready_crtc_config_results.contains_key(&token);
+            if let Some(executor) = self.pstate.crtc_config_probe_executor.as_mut() {
                 executor.cancel(token);
             }
-            self.ready_crtc_config_results.insert(
+            self.pstate.ready_crtc_config_results.insert(
                 token,
                 Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     format!("asynchronous CRTC configuration {token:?} invalidated by {reason}"),
                 )),
             );
-            self.invalidated_crtc_config_probes.insert(token);
+            self.pstate.invalidated_crtc_config_probes.insert(token);
             if !already_announced {
-                self.ready_crtc_config_announcements.push_back(token);
+                self.pstate.ready_crtc_config_announcements.push_back(token);
                 announced = true;
             }
         }
@@ -244,7 +255,7 @@ impl KmsBackend {
     }
 
     pub(super) fn wake_crtc_config_ready(&self) {
-        let Some(sender) = self.input_sender.as_ref() else {
+        let Some(sender) = self.pstate.input_sender.as_ref() else {
             return;
         };
         if let Err(error) = sender.send(yserver_core::core_loop::Message::CrtcConfigReady) {
@@ -253,16 +264,17 @@ impl KmsBackend {
     }
 
     fn remove_crtc_config_ready_announcement(&mut self, token: CrtcConfigToken) {
-        self.ready_crtc_config_announcements
+        self.pstate
+            .ready_crtc_config_announcements
             .retain(|announced| *announced != token);
     }
 
     fn next_crtc_config_token(&mut self) -> CrtcConfigToken {
         loop {
-            let token = CrtcConfigToken(self.next_crtc_config_token.max(1));
-            self.next_crtc_config_token = token.0.wrapping_add(1).max(1);
-            if !self.pending_crtc_config_probes.contains_key(&token)
-                && !self.ready_crtc_config_results.contains_key(&token)
+            let token = CrtcConfigToken(self.pstate.next_crtc_config_token.max(1));
+            self.pstate.next_crtc_config_token = token.0.wrapping_add(1).max(1);
+            if !self.pstate.pending_crtc_config_probes.contains_key(&token)
+                && !self.pstate.ready_crtc_config_results.contains_key(&token)
             {
                 return token;
             }
@@ -307,7 +319,7 @@ impl KmsBackend {
         prepared_output: crate::platform::drm::Output,
         route: ScanoutRoute,
     ) -> io::Result<CrtcConfigToken> {
-        if self.crtc_config_probe_executor.is_none() {
+        if self.pstate.crtc_config_probe_executor.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "no asynchronous CRTC probe executor installed",
@@ -367,19 +379,23 @@ impl KmsBackend {
             route,
             prepared_output: Some(prepared_output),
             topology_signature: self.crtc_config_topology_signature(),
-            topology_epoch: self.crtc_config_topology_epoch,
-            vt_state: self.vt_state,
+            topology_epoch: self.pstate.crtc_config_topology_epoch,
+            vt_state: self.pstate.vt_state,
             was_active: self.kms_outputs_active,
         };
-        self.pending_crtc_config_probes.insert(token, pending);
+        self.pstate
+            .pending_crtc_config_probes
+            .insert(token, pending);
         let enqueue_result = self
+            .pstate
             .crtc_config_probe_executor
             .as_mut()
             .expect("executor checked above")
             .enqueue(job);
         if let Err(error) = enqueue_result {
-            self.pending_crtc_config_probes.remove(&token);
-            self.crtc_config_probe_executor
+            self.pstate.pending_crtc_config_probes.remove(&token);
+            self.pstate
+                .crtc_config_probe_executor
                 .as_mut()
                 .expect("executor checked above")
                 .cancel(token);
@@ -395,7 +411,7 @@ impl KmsBackend {
         connector: &str,
     ) -> io::Result<crate::platform::drm::Output> {
         #[cfg(test)]
-        if let Some(output) = self.crtc_config_discovery_override.take() {
+        if let Some(output) = self.pstate.crtc_config_discovery_override.take() {
             return Ok(output);
         }
 
@@ -429,31 +445,31 @@ impl KmsBackend {
         if !self.scanout_allowed() {
             return Some(format!(
                 "VT/DRM-master state is {:?}, not Active",
-                self.vt_state
+                self.pstate.vt_state
             ));
         }
-        if self.vt_state != pending.vt_state {
+        if self.pstate.vt_state != pending.vt_state {
             return Some(format!(
                 "VT state changed from {:?} to {:?}",
-                pending.vt_state, self.vt_state
+                pending.vt_state, self.pstate.vt_state
             ));
         }
-        if self.crtc_config_topology_epoch != pending.topology_epoch {
+        if self.pstate.crtc_config_topology_epoch != pending.topology_epoch {
             return Some(format!(
                 "topology epoch changed from {} to {}",
-                pending.topology_epoch, self.crtc_config_topology_epoch
+                pending.topology_epoch, self.pstate.crtc_config_topology_epoch
             ));
         }
         if self.crtc_config_topology_signature() != pending.topology_signature {
             return Some("live output topology changed".to_string());
         }
-        if self.output_key_by_id.get(&pending.output_id) != Some(&pending.output_key) {
+        if self.pstate.output_key_by_id.get(&pending.output_id) != Some(&pending.output_key) {
             return Some(format!(
                 "RANDR output {} no longer names {:?}",
                 pending.output_id, pending.output_key
             ));
         }
-        let Some(entry) = self.randr_id_alloc.entry(&pending.output_key) else {
+        let Some(entry) = self.pstate.randr_id_alloc.entry(&pending.output_key) else {
             return Some(format!("connector {} left the registry", pending.connector));
         };
         if !entry.connected {
@@ -496,10 +512,10 @@ impl KmsBackend {
         &mut self,
         mut executor: Box<dyn CrtcConfigProbeExecutor>,
     ) {
-        if let Some(sender) = self.input_sender.as_ref() {
+        if let Some(sender) = self.pstate.input_sender.as_ref() {
             executor.set_core_sender(sender.clone_handle());
         }
-        self.crtc_config_probe_executor = Some(executor);
+        self.pstate.crtc_config_probe_executor = Some(executor);
     }
 }
 
@@ -521,13 +537,14 @@ impl KmsBackend {
                 .apply_crtc_config(output_id, connector, mode, x, y)
                 .map(CrtcConfigApply::Applied);
         };
-        if self.crtc_config_probe_executor.is_none() {
+        if self.pstate.crtc_config_probe_executor.is_none() {
             return self
                 .apply_crtc_config(output_id, connector, mode, x, y)
                 .map(CrtcConfigApply::Applied);
         }
 
         let output_key = self
+            .pstate
             .output_key_by_id
             .get(&output_id)
             .cloned()
@@ -544,10 +561,15 @@ impl KmsBackend {
         // was detached while another client was active.
         if !self.provider_output_source_allows(output_key.device_key) {
             let sink_endpoint = RandrProviderEndpoint::Kms(output_key.device_key);
-            let sink_provider = self.randr_id_alloc.providers.get(&sink_endpoint).copied();
+            let sink_provider = self
+                .pstate
+                .randr_id_alloc
+                .providers
+                .get(&sink_endpoint)
+                .copied();
             let selected_source = self.selected_render_provider_endpoint();
             let source_provider = selected_source
-                .and_then(|endpoint| self.randr_id_alloc.providers.get(&endpoint).copied());
+                .and_then(|endpoint| self.pstate.randr_id_alloc.providers.get(&endpoint).copied());
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -597,12 +619,12 @@ impl KmsBackend {
                  YSERVER_ALLOW_SOFTWARE_VULKAN=1 for a deliberate software-scanout setup"
             )));
         }
-        if self.vt_state != crate::vt::state::VtState::Active {
+        if self.pstate.vt_state != crate::vt::state::VtState::Active {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 format!(
                     "begin_crtc_config: cannot qualify {connector} while VT is {:?}",
-                    self.vt_state
+                    self.pstate.vt_state
                 ),
             ));
         }
@@ -672,24 +694,27 @@ impl KmsBackend {
         &mut self,
     ) -> Vec<CrtcConfigToken> {
         let completions = self
+            .pstate
             .crtc_config_probe_executor
             .as_mut()
             .map(|executor| executor.drain_ready())
             .unwrap_or_default();
         for completion in completions {
             if !self
+                .pstate
                 .pending_crtc_config_probes
                 .contains_key(&completion.token)
             {
                 // Cancellation may race worker completion. The result is
                 // resource-free, so dropping it is sufficient; still notify
                 // the executor so it can retire transport bookkeeping.
-                if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
+                if let Some(executor) = self.pstate.crtc_config_probe_executor.as_mut() {
                     executor.cancel(completion.token);
                 }
                 continue;
             }
             if self
+                .pstate
                 .ready_crtc_config_results
                 .contains_key(&completion.token)
             {
@@ -699,12 +724,17 @@ impl KmsBackend {
                 );
                 continue;
             }
-            self.ready_crtc_config_results
+            self.pstate
+                .ready_crtc_config_results
                 .insert(completion.token, completion.result);
-            self.ready_crtc_config_announcements
+            self.pstate
+                .ready_crtc_config_announcements
                 .push_back(completion.token);
         }
-        self.ready_crtc_config_announcements.drain(..).collect()
+        self.pstate
+            .ready_crtc_config_announcements
+            .drain(..)
+            .collect()
     }
 
     pub(in crate::kms::render::backend) fn backend_randr_finish_crtc_config(
@@ -712,10 +742,10 @@ impl KmsBackend {
         token: CrtcConfigToken,
     ) -> io::Result<bool> {
         self.remove_crtc_config_ready_announcement(token);
-        self.invalidated_crtc_config_probes.remove(&token);
-        let result = match self.ready_crtc_config_results.remove(&token) {
+        self.pstate.invalidated_crtc_config_probes.remove(&token);
+        let result = match self.pstate.ready_crtc_config_results.remove(&token) {
             Some(result) => result,
-            None if self.pending_crtc_config_probes.contains_key(&token) => {
+            None if self.pstate.pending_crtc_config_probes.contains_key(&token) => {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     format!("asynchronous CRTC configuration {token:?} is not ready"),
@@ -728,13 +758,13 @@ impl KmsBackend {
                 ));
             }
         };
-        let Some(mut pending) = self.pending_crtc_config_probes.remove(&token) else {
+        let Some(mut pending) = self.pstate.pending_crtc_config_probes.remove(&token) else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("orphaned asynchronous CRTC result for token {token:?}"),
             ));
         };
-        if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
+        if let Some(executor) = self.pstate.crtc_config_probe_executor.as_mut() {
             executor.cancel(token);
         }
 
@@ -783,7 +813,7 @@ impl KmsBackend {
         }
 
         {
-            let entry = self.randr_id_alloc.entry_mut(&pending.output_key);
+            let entry = self.pstate.randr_id_alloc.entry_mut(&pending.output_key);
             entry.config = ConnectorConfig::Enabled {
                 mode_w: pending.mode.width,
                 mode_h: pending.mode.height,
@@ -846,10 +876,10 @@ impl KmsBackend {
         token: CrtcConfigToken,
     ) {
         self.remove_crtc_config_ready_announcement(token);
-        self.invalidated_crtc_config_probes.remove(&token);
-        self.pending_crtc_config_probes.remove(&token);
-        self.ready_crtc_config_results.remove(&token);
-        if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
+        self.pstate.invalidated_crtc_config_probes.remove(&token);
+        self.pstate.pending_crtc_config_probes.remove(&token);
+        self.pstate.ready_crtc_config_results.remove(&token);
+        if let Some(executor) = self.pstate.crtc_config_probe_executor.as_mut() {
             executor.cancel(token);
         }
     }
@@ -863,6 +893,7 @@ impl KmsBackend {
         y: i32,
     ) -> io::Result<bool> {
         let output_key = self
+            .pstate
             .output_key_by_id
             .get(&output_id)
             .cloned()
@@ -895,10 +926,15 @@ impl KmsBackend {
         // distinct sink, while an explicit later detach remains persistent.
         if mode.is_some() && !self.provider_output_source_allows(output_key.device_key) {
             let sink_endpoint = RandrProviderEndpoint::Kms(output_key.device_key);
-            let sink_provider = self.randr_id_alloc.providers.get(&sink_endpoint).copied();
+            let sink_provider = self
+                .pstate
+                .randr_id_alloc
+                .providers
+                .get(&sink_endpoint)
+                .copied();
             let selected_source = self.selected_render_provider_endpoint();
             let source_provider = selected_source
-                .and_then(|endpoint| self.randr_id_alloc.providers.get(&endpoint).copied());
+                .and_then(|endpoint| self.pstate.randr_id_alloc.providers.get(&endpoint).copied());
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -949,7 +985,7 @@ impl KmsBackend {
             // touching the hardware. Return `false` = nothing changed, so the
             // handler skips the change-notify (Xorg RRTellChanged only fires
             // on a real change) — this is what breaks MATE's re-assert loop.
-            let entry = self.randr_id_alloc.entry_mut(&output_key);
+            let entry = self.pstate.randr_id_alloc.entry_mut(&output_key);
             entry.config = requested;
             // A client asserting a config is an explicit statement of intent
             // about this output, so it releases any remembered route (and
@@ -1047,7 +1083,7 @@ impl KmsBackend {
                 }
                 // Update registry: connector stays known, config → Off.
                 {
-                    let entry = self.randr_id_alloc.entry_mut(&output_key);
+                    let entry = self.pstate.randr_id_alloc.entry_mut(&output_key);
                     entry.config = ConnectorConfig::Off;
                     entry.crtc_associated = false;
                     // client_configured is set to record that a client
@@ -1114,7 +1150,7 @@ impl KmsBackend {
 
                 // Update registry.
                 {
-                    let entry = self.randr_id_alloc.entry_mut(&output_key);
+                    let entry = self.pstate.randr_id_alloc.entry_mut(&output_key);
                     entry.config = ConnectorConfig::Enabled {
                         mode_w: mode_spec.width,
                         mode_h: mode_spec.height,

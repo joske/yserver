@@ -1,4 +1,6 @@
-use crate::kms::render::backend::{InputOnlyPointerHost, KmsBackend, KmsButtonDiagnostic};
+use crate::kms::render::backend::{
+    InputOnlyPointerHost, KmsButtonDiagnostic, XBackend, seam::Platform,
+};
 use std::io;
 use yserver_core::{
     backend::{Backend as _, CursorHandle, OriginContext},
@@ -7,7 +9,7 @@ use yserver_core::{
 };
 use yserver_protocol::x11::ResourceId;
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     /// Deepest mapped window under the cursor. Walks
     /// `core.top_level_order` back-to-front for the topmost top-level
     /// match, then descends the sub-window tree picking the topmost
@@ -523,8 +525,10 @@ impl KmsBackend {
     pub(in crate::kms::render::backend) fn crtc_root_rects(
         &self,
     ) -> Vec<crate::kms::render::pointer_confine::CrtcRect> {
-        (0..self.platform.outputs.len())
-            .map(|idx| self.platform.output_root_rect(idx))
+        self.platform
+            .output_layouts()
+            .into_iter()
+            .map(|layout| layout.root_rect)
             .collect()
     }
 
@@ -587,8 +591,8 @@ impl KmsBackend {
         // pointer could never cross from output 0 onto a side-
         // adjacent output 1 — pinned by
         // `process_pointer_absolute_uses_union_fb_extent_for_multi_output`.
-        let fb_w = f32::from(self.platform.fb_w.max(1));
-        let fb_h = f32::from(self.platform.fb_h.max(1));
+        let fb_w = f32::from(self.platform.fb_size().0.max(1));
+        let fb_h = f32::from(self.platform.fb_size().1.max(1));
         let root_x = x.clamp(0.0, (fb_w - 1.0).max(0.0));
         let root_y = y.clamp(0.0, (fb_h - 1.0).max(0.0));
         // Then onto the CRTCs, before any hit-test or event (spec D5b).
@@ -635,46 +639,11 @@ impl KmsBackend {
                         )
                     })
                     .unwrap_or((0, 0, 0, 0));
-                if matches!(
+                let mixed = matches!(
                     cursor_mode,
                     crate::kms::render::scene::CursorPlaneMode::Mixed
-                ) {
-                    // Hardware and software cursor ownership may coexist on
-                    // arbitrary cards. Record/dispatch every visible HW plane
-                    // position and also repaint the SW outputs.
-                    match self.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
-                        Ok(outcome) => {
-                            self.handle_cursor_move_outcome(outcome);
-                        }
-                        Err(e) => log::debug!("render cursor mixed path: move failed: {e}"),
-                    }
-                    self.scene.wake_for_damage();
-                } else if !self.scanout_m2.active()
-                    && cw > 0
-                    && ch > 0
-                    && self
-                        .platform
-                        .cursor_crtc_membership_dirty(cx, cy, hot_x, hot_y, cw, ch)
-                {
-                    // The cursor footprint crossed onto/off a CRTC the
-                    // plane isn't bound to. The move-only fast path
-                    // can't rebind across CRTCs, so route this motion
-                    // through one compose tick — the scene's
-                    // `CursorAssignment` then issues the show/hide on
-                    // retire. Pre-#30 the continuous idle redraw loop
-                    // masked this; idle desktops now stop compositing,
-                    // so the seam crossing must be detected here or the
-                    // cursor stays frozen on the CRTC it was last bound
-                    // to (invisible on the screen it moved onto).
-                    self.scene.wake_for_damage();
-                } else {
-                    match self.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
-                        Ok(outcome) => {
-                            self.handle_cursor_move_outcome(outcome);
-                        }
-                        Err(e) => log::debug!("render cursor fast path: move failed: {e}"),
-                    }
-                }
+                );
+                P::move_hw_cursor(self, mixed, (cx, cy), (hot_x, hot_y), (cw, ch));
             } else {
                 // Software cursors need repaint; an all-Hidden cursor also
                 // needs a scene pass so motion back onto an output can be
@@ -874,7 +843,7 @@ impl KmsBackend {
     }
 }
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     pub(in crate::kms::render::backend) fn backend_pointer_warp_pointer_root(
         &mut self,
         state: &mut ServerState,

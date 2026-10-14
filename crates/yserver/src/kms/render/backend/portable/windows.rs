@@ -2,11 +2,12 @@ use crate::kms::{
     cpu_types::{Rectangle16, Repeat},
     render::{
         backend::{
-            KmsBackend, LeafContent, WindowGeometry,
+            LeafContent, WindowGeometry, XBackend,
             portable::{
                 clip::apply_subwindow_mode_clip,
                 draw::{compute_copy_area_dst_rects, depth_for_visual},
             },
+            seam::Platform,
         },
         engine::decode_x11_pixel_for_storage,
         gpu::GpuCore,
@@ -142,7 +143,7 @@ pub(in crate::kms::render::backend) fn border_ring_rects(
     .collect()
 }
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     pub(in crate::kms::render::backend) fn alloc_window_stack_rank(&mut self) -> u64 {
         let rank = self.next_window_stack_rank;
         self.next_window_stack_rank = self.next_window_stack_rank.saturating_add(1);
@@ -304,7 +305,7 @@ impl KmsBackend {
             }];
             match self.engine.render_composite(
                 &mut self.store,
-                &mut self.platform.gpu,
+                self.platform.gpu_mut(),
                 OP_SRC,
                 ResolvedSource::Drawable(SourceDrawable::whole(b_id)),
                 ResolvedSource::None,
@@ -498,14 +499,14 @@ impl KmsBackend {
             }
             LeafContent::Migrate => Some(old_id),
         };
-        let storage = match self.platform.gpu.allocate_drawable_storage_as(
+        let storage = match self.platform.gpu().allocate_drawable_storage_as(
             u16::try_from(storage_w).unwrap_or(u16::MAX),
             u16::try_from(storage_h).unwrap_or(u16::MAX),
             geom.depth,
             crate::kms::vk::mem_accounting::MemCategory::WindowStorage,
         ) {
             Ok(storage) => storage,
-            Err(_e) if self.platform.gpu.vk.is_none() => {
+            Err(_e) if self.platform.gpu().vk.is_none() => {
                 crate::kms::render::store::Storage::for_tests_null(
                     ash::vk::Extent2D {
                         width: storage_w,
@@ -568,7 +569,7 @@ impl KmsBackend {
                     );
                     if let Err(e) = self.engine.fill_rect(
                         &mut self.store,
-                        &mut self.platform.gpu,
+                        self.platform.gpu_mut(),
                         Dst::server_internal(id),
                         rect,
                         color,
@@ -617,7 +618,7 @@ impl KmsBackend {
                 // the ring gets its real colour in step 4 (P5).
                 if let Err(e) = self.engine.fill_rect(
                     &mut self.store,
-                    &mut self.platform.gpu,
+                    self.platform.gpu_mut(),
                     Dst::server_internal(id),
                     rect,
                     color,
@@ -707,7 +708,7 @@ impl KmsBackend {
         if let Some((src_rect, dst_pos)) = copy
             && let Err(e) = self.engine.copy_area(
                 &mut self.store,
-                &mut self.platform.gpu,
+                self.platform.gpu_mut(),
                 Src::server_internal(id),
                 Dst::server_internal(id),
                 src_rect,
@@ -812,7 +813,7 @@ impl KmsBackend {
         };
         if let Err(e) = self.engine.copy_area(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             Src::server_internal(old_id),
             Dst::server_internal(new_id),
             src_rect,
@@ -909,7 +910,7 @@ impl KmsBackend {
                 const OP_SRC: u8 = 1;
                 let composite_result = self.engine.render_composite(
                     &mut self.store,
-                    &mut self.platform.gpu,
+                    self.platform.gpu_mut(),
                     OP_SRC,
                     ResolvedSource::Drawable(SourceDrawable::whole(src)),
                     ResolvedSource::None,
@@ -1127,7 +1128,7 @@ impl KmsBackend {
         let color = decode_x11_pixel_for_storage(pixel, depth, format);
         if let Err(e) = self.engine.fill_rect_batch(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             target.server_backing_dst(),
             color,
             &rects,
@@ -1343,7 +1344,7 @@ impl KmsBackend {
         const OP_SRC: u8 = 1;
         let composite_result = self.engine.render_composite(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             OP_SRC,
             // Border pixmaps are pixmaps by protocol — whole storage.
             ResolvedSource::Drawable(SourceDrawable::whole(tile_id)),
@@ -1487,8 +1488,8 @@ impl KmsBackend {
             return;
         }
         let dst_extent = ash::vk::Extent2D {
-            width: u32::from(self.platform.fb_w.max(1)),
-            height: u32::from(self.platform.fb_h.max(1)),
+            width: u32::from(self.platform.fb_size().0.max(1)),
+            height: u32::from(self.platform.fb_size().1.max(1)),
         };
         let rects = [CompositeRect {
             src_x: 0,
@@ -1503,7 +1504,7 @@ impl KmsBackend {
         const OP_SRC: u8 = 1;
         let composite_result = self.engine.render_composite(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             OP_SRC,
             ResolvedSource::Drawable(SourceDrawable::whole(src)),
             ResolvedSource::None,
@@ -1601,7 +1602,7 @@ impl KmsBackend {
         // #133 step 3: the bordered extent, as Xorg `compAllocPixmap` (`compalloc.c:610`).
         let (storage_w, storage_h) =
             bordered_storage_extent(geom.width.max(1), geom.height.max(1), geom.border_width);
-        let storage = match self.platform.gpu.allocate_drawable_storage_as(
+        let storage = match self.platform.gpu().allocate_drawable_storage_as(
             u16::try_from(storage_w).unwrap_or(u16::MAX),
             u16::try_from(storage_h).unwrap_or(u16::MAX),
             geom.depth,
@@ -1609,7 +1610,7 @@ impl KmsBackend {
         ) {
             Ok(storage) => storage,
             Err(e)
-                if self.platform.gpu.vk.is_none()
+                if self.platform.gpu().vk.is_none()
                     && e == ash::vk::Result::ERROR_INITIALIZATION_FAILED =>
             {
                 // No Vk fixture (`for_tests`): track the geometry without storage.
@@ -1660,7 +1661,7 @@ impl KmsBackend {
         // PRIVILEGED backing write: the initial clear covers the whole allocation, ring included.
         if let Err(e) = self.engine.fill_rect(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             Dst::server_internal(id),
             rect,
             color,
@@ -1735,7 +1736,7 @@ pub(in crate::kms::render::backend) fn default_window_init_color(depth: u8) -> [
     }
 }
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     // ── Single-threaded core hooks ──────────────────────────────
 
     // Step 2 (DRIFT 2, findings 2026-06-18): the backend no longer
@@ -1781,7 +1782,7 @@ impl KmsBackend {
             }
             order.push(host);
         }
-        if self.core.top_level_order != order && !self.direct_frames_are_under_cow() {
+        if self.core.top_level_order != order && !P::direct_frames_are_under_cow(self) {
             // A direct frame bypasses the composed root scene. A real
             // top-level restack changes that scene even when the direct
             // Present target itself is untouched, so retire it through the
@@ -1793,7 +1794,7 @@ impl KmsBackend {
             // a restack beneath it cannot change the screen. A compositing
             // desktop restacks constantly (raises, tooltips, notifications),
             // and each needless unflip showed a stale frame on Cinnamon.
-            self.request_direct_unflip("top_level_stack_changed");
+            P::request_direct_unflip(self, "top_level_stack_changed");
         }
         self.core.top_level_order = order;
         self.scene.wake_for_damage();
@@ -1853,8 +1854,8 @@ impl KmsBackend {
         // not invalidate the compositor's authoritative root-stage Present:
         // Cinnamon will replace it with its next Present, and forcing an
         // intermediate composed frame exposes the retained pre-direct BO.
-        if self.direct_frame_references_host_drawable(host_xid) {
-            self.request_direct_unflip("destroy_direct_frame_drawable");
+        if P::direct_frame_references_host_drawable(self, host_xid) {
+            P::request_direct_unflip(self, "destroy_direct_frame_drawable");
         }
         if let Some(id) = self.store.lookup(host_xid) {
             self.store_decref_with_invalidate(id);
@@ -1882,8 +1883,8 @@ impl KmsBackend {
         _origin: Option<OriginContext>,
         host_xid: u32,
     ) -> io::Result<()> {
-        if self.direct_frame_references_host_drawable(host_xid) {
-            self.request_direct_unflip("map_direct_frame_drawable");
+        if P::direct_frame_references_host_drawable(self, host_xid) {
+            P::request_direct_unflip(self, "map_direct_frame_drawable");
         }
         if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.mapped = true;
@@ -1959,8 +1960,8 @@ impl KmsBackend {
         };
         geom.viewable = false;
         // A direct frame may still scan this leaf; its pins keep the image alive past the decref.
-        if self.direct_frame_references_host_drawable(host_xid) {
-            self.request_direct_unflip("release_direct_frame_drawable");
+        if P::direct_frame_references_host_drawable(self, host_xid) {
+            P::request_direct_unflip(self, "release_direct_frame_drawable");
         }
         if let Some(id) = self.store.lookup(host_xid) {
             // Detach first: a pinned leaf survives the decref but must not stay the window's.
@@ -1976,8 +1977,8 @@ impl KmsBackend {
         _origin: Option<OriginContext>,
         host_xid: u32,
     ) -> io::Result<()> {
-        if self.direct_frame_references_host_drawable(host_xid) {
-            self.request_direct_unflip("unmap_direct_frame_drawable");
+        if P::direct_frame_references_host_drawable(self, host_xid) {
+            P::request_direct_unflip(self, "unmap_direct_frame_drawable");
         }
         if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.mapped = false;
@@ -2000,8 +2001,8 @@ impl KmsBackend {
         // next root Present, so replacing direct scanout for every
         // ConfigureWindow only creates direct/composed churn. Unwind when the
         // mutation touches storage retained by the active direct frame.
-        if self.direct_frame_references_host_drawable(host_xid) {
-            self.request_direct_unflip("configure_direct_frame_drawable");
+        if P::direct_frame_references_host_drawable(self, host_xid) {
+            P::request_direct_unflip(self, "configure_direct_frame_drawable");
         }
         let move_source = self.shared_backing_move_source(host_xid, &config);
         let Some(geom) = self.windows.get_mut(&host_xid) else {
@@ -2383,8 +2384,8 @@ impl KmsBackend {
                     y: target.offset().1,
                 },
                 extent: ash::vk::Extent2D {
-                    width: u32::from(self.platform.fb_w.max(1)),
-                    height: u32::from(self.platform.fb_h.max(1)),
+                    width: u32::from(self.platform.fb_size().0.max(1)),
+                    height: u32::from(self.platform.fb_size().1.max(1)),
                 },
             };
             // L1 server-α invariant: root storage is depth-24, so
@@ -2402,7 +2403,7 @@ impl KmsBackend {
                 .unwrap_or_else(|| GpuCore::format_for_depth(depth));
             if let Err(e) = self.engine.fill_rect(
                 &mut self.store,
-                &mut self.platform.gpu,
+                self.platform.gpu_mut(),
                 target.dst(),
                 rect,
                 decode_x11_pixel_for_storage(pixel, depth, format),
@@ -2496,8 +2497,8 @@ impl KmsBackend {
         // fix cut 2b — the compose scheduler otherwise excludes it).
         // Input shape (2) only affects hit-testing — no redraw needed.
         if kind == 0 || kind == 1 {
-            if self.direct_frames_shaped_off_root() {
-                self.request_direct_unflip("shape_clips_direct_frame");
+            if P::direct_frames_shaped_off_root(self) {
+                P::request_direct_unflip(self, "shape_clips_direct_frame");
             }
             self.scene.wake_for_damage();
         }

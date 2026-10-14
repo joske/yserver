@@ -249,6 +249,13 @@ impl PresentCompletionSignal {
         std::mem::replace(&mut self.semaphore, vk::Semaphore::null())
     }
 
+    /// Whether [`Self::export_sync_file_fd`] can work: the semaphore was
+    /// created exportable because the device supports SYNC_FD.
+    #[must_use]
+    pub fn sync_file_exportable(&self) -> bool {
+        self.vk.supports_sync_fd()
+    }
+
     pub fn export_sync_file_fd(&self) -> Result<Option<OwnedFd>, vk::Result> {
         let info = vk::SemaphoreGetFdInfoKHR::default()
             .semaphore(self.semaphore)
@@ -258,12 +265,16 @@ impl PresentCompletionSignal {
     }
 }
 
+/// A plain semaphore without SYNC_FD support; its batch then polls.
 pub(super) fn create_present_completion_signal(
     vk: Arc<VkContext>,
 ) -> Result<PresentCompletionSignal, vk::Result> {
     let mut export_info = vk::ExportSemaphoreCreateInfo::default()
         .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
-    let create_info = vk::SemaphoreCreateInfo::default().push_next(&mut export_info);
+    let mut create_info = vk::SemaphoreCreateInfo::default();
+    if vk.supports_sync_fd() {
+        create_info = create_info.push_next(&mut export_info);
+    }
     let semaphore = unsafe { vk.device.create_semaphore(&create_info, None)? };
     Ok(PresentCompletionSignal { vk, semaphore })
 }

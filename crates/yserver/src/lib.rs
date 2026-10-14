@@ -1,20 +1,33 @@
 pub mod clock;
+#[cfg(kms)]
 pub mod drm;
+#[cfg(kms)]
 pub mod input;
+#[cfg(kms)]
 pub mod input_thread;
+#[cfg(kms)]
 #[doc(hidden)]
 pub mod internal_probe;
 pub mod kms;
 pub mod launch;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(kms)]
 pub(crate) mod platform;
+#[cfg(kms)]
 pub mod present;
+#[cfg(any(not(kms), test))]
+pub(crate) mod surface;
 pub mod version;
+#[cfg(kms)]
 mod vt;
 
 // `crate::vk_count!` call sites outside the render crate resolve through this.
 pub use yserver_render::vk_count;
 
-use std::{fs, io, path::PathBuf, thread};
+#[cfg(kms)]
+use std::{fs, path::PathBuf};
+use std::{io, thread};
 
 use nix::sys::signal::{SigSet, Signal};
 #[cfg(target_os = "linux")]
@@ -22,14 +35,15 @@ use nix::sys::signal::{SigmaskHow, sigprocmask};
 #[cfg(target_os = "linux")]
 use nix::sys::signalfd::SignalFd;
 
+use yserver_core::core_loop::{self, Message, ResetPolicy};
+// Moved into core (`backend::install_backend_root_bindings`) so the
+// server-reset generation boundary can re-run the identical binding step
+// against a freshly constructed `ServerState`. Imported under its own name
+// here so this crate's call sites and test read as before.
+#[cfg(kms)]
 use yserver_core::{
-    // Moved into core (`backend::install_backend_root_bindings`) so the
-    // server-reset generation boundary can re-run the identical binding
-    // step against a freshly constructed `ServerState`. Imported under
-    // its own name here so this crate's call sites and test read as
-    // before.
     backend::{Backend, BackendTopology, install_backend_root_bindings},
-    core_loop::{self, Message, ResetPolicy, poll_tokens::ClientIdAllocator},
+    core_loop::poll_tokens::ClientIdAllocator,
 };
 
 /// Refuse to start when libinput's initial seat enumeration opened zero
@@ -42,6 +56,7 @@ use yserver_core::{
 /// real keyboard/mouse are permission-denied, yet a lone non-usable node (e.g. a
 /// HID "System Control" collection) can still open — that must not satisfy the
 /// guard.
+#[cfg(kms)]
 fn ensure_input_devices_opened(opened: usize) -> io::Result<()> {
     if opened == 0 {
         return Err(io::Error::other(
@@ -56,6 +71,7 @@ fn ensure_input_devices_opened(opened: usize) -> io::Result<()> {
 
 /// What the startup path should do about input: spawn the input thread if a
 /// libinput context was created, or refuse to start if not.
+#[cfg(kms)]
 #[derive(Debug, PartialEq, Eq)]
 enum InputStartup {
     /// A live libinput context — spawn the input thread.
@@ -71,6 +87,7 @@ enum InputStartup {
 /// unavailable or every input device was permission-denied (not in the `input`
 /// group / not on the console). Extracted as a pure fn so the abort is
 /// unit-testable; `run()` itself is not.
+#[cfg(kms)]
 fn input_startup_action(has_input_ctx: bool) -> InputStartup {
     if has_input_ctx {
         InputStartup::DirectSpawn
@@ -272,9 +289,24 @@ fn bind_tcp_listener(_port: u16) -> io::Result<std::net::TcpListener> {
 /// which is a log you can keep.
 pub const RESOURCE_TELEMETRY_TARGET: &str = "yserver::resources";
 
+/// Run the server on macOS.
+#[cfg(all(not(kms), target_os = "macos"))]
 pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-    panic!("yserver only supports Linux and FreeBSD (DRM/KMS, libinput, evdev)");
+    macos::run(opts)
+}
+
+/// Run the server on a platform with neither KMS nor a window shell.
+#[cfg(all(not(kms), not(target_os = "macos")))]
+pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
+    surface::headless::run(opts)
+}
+
+/// Run the server on the DRM/KMS platform.
+#[cfg(kms)]
+pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
+    if opts.headless {
+        log::warn!("yserver: --headless is for platforms without KMS; ignored");
+    }
 
     // A dedicated target so the hardware recipes (which log at `warn` plus the
     // telemetry target) can keep the build hash in every log without enabling
@@ -669,10 +701,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // would otherwise kill the whole session when the user hits Ctrl-C
     // inside an X client. Skipped silently when not on a Linux VC (pty
     // under SSH or a graphical terminal emulator).
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     let console_guard = crate::kms::console::ConsoleGuard::acquire(opts.vt)?;
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-    let console_guard: Option<()> = None;
     let device_paths = crate::platform::drm::resolve_default_kms_devices()?;
     if device_paths.is_empty() {
         log::info!("yserver: no DRM devices to open; starting zero-card headless");
@@ -848,115 +877,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
         }
     }
 
-    // signalfd → Message bridge. yserver-core deliberately doesn't
-    // depend on nix; a tiny thread wraps the SignalFd read so run_core
-    // only sees channel-side messages. SIGINT/SIGTERM map to
-    // `Shutdown`; SIGUSR1/SIGUSR2 map to VT release/acquire messages
-    // (a no-op when VT switching is not armed).
-    //
-    // SIGUSR1 carries three distinct, non-conflicting meanings here:
-    // (1) the *inherited disposition* read once at startup
-    // (`sigusr1_was_ignored` above) drives the readiness handshake
-    // *to the parent* DM (`launch::signal_ready`); (2) masked-and-
-    // signalfd-consumed *delivery to self* drives the VT release/
-    // acquire handshake; (3) we *send* SIGUSR1 outward to the parent
-    // at readiness. Disposition-in, delivery-to-self, and signal-out
-    // are separate.
-    let signal_sender = sender.clone_handle();
-    let signal_reset_policy = opts.reset_policy;
-    thread::Builder::new()
-        .name("yserver-signalfd".into())
-        .spawn(move || {
-            let signal_fd = signal_fd;
-            #[cfg(target_os = "linux")]
-            loop {
-                match signal_fd.read_signal() {
-                    Ok(Some(siginfo)) => {
-                        let signo = siginfo.ssi_signo as i32;
-                        if signo == drawable_dump_signal() {
-                            log::info!("drawable dump requested by signal");
-                            if signal_sender.send(Message::DumpDrawables).is_err() {
-                                return;
-                            }
-                            continue;
-                        }
-                        if signo == nix::libc::SIGUSR1 {
-                            log::info!("yserver: received SIGUSR1, forwarding VT release");
-                            if signal_sender.send(Message::VtRelease).is_err() {
-                                return;
-                            }
-                            continue;
-                        }
-                        if signo == nix::libc::SIGUSR2 {
-                            log::info!("yserver: received SIGUSR2, forwarding VT acquire");
-                            if signal_sender.send(Message::VtAcquire).is_err() {
-                                return;
-                            }
-                            continue;
-                        }
-                        let (message, what) = signal_action(signo, signal_reset_policy);
-                        log::info!("yserver: received signal {signo}, requesting {what}");
-                        let stop = matches!(message, Message::Shutdown);
-                        if signal_sender.send(message).is_err() || stop {
-                            return;
-                        }
-                        continue;
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        log::warn!("yserver: signalfd read error: {err}");
-                        let _ = signal_sender.send(Message::Shutdown);
-                        return;
-                    }
-                }
-            }
-            #[cfg(target_os = "freebsd")]
-            {
-                use nix::sys::event::KEvent;
-                let mut events = [KEvent::new(
-                    0,
-                    nix::sys::event::EventFilter::EVFILT_SIGNAL,
-                    nix::sys::event::EvFlags::empty(),
-                    nix::sys::event::FilterFlag::empty(),
-                    0,
-                    0isize,
-                ); 4];
-                loop {
-                    let n = match signal_fd.kevent(&[], &mut events, None) {
-                        Ok(n) => n,
-                        Err(nix::errno::Errno::EINTR) => continue,
-                        Err(err) => {
-                            log::warn!("yserver: kevent signal read error: {err}");
-                            let _ = signal_sender.send(Message::Shutdown);
-                            return;
-                        }
-                    };
-                    for ev in &events[..n] {
-                        let signo = ev.ident() as i32;
-                        if signo == nix::libc::SIGUSR1 {
-                            log::info!("yserver: received SIGUSR1, forwarding VT release");
-                            if signal_sender.send(Message::VtRelease).is_err() {
-                                return;
-                            }
-                            continue;
-                        }
-                        if signo == nix::libc::SIGUSR2 {
-                            log::info!("yserver: received SIGUSR2, forwarding VT acquire");
-                            if signal_sender.send(Message::VtAcquire).is_err() {
-                                return;
-                            }
-                            continue;
-                        }
-                        let (message, what) = signal_action(signo, signal_reset_policy);
-                        log::info!("yserver: received signal {signo}, requesting {what}");
-                        let stop = matches!(message, Message::Shutdown);
-                        if signal_sender.send(message).is_err() || stop {
-                            return;
-                        }
-                    }
-                }
-            }
-        })?;
+    spawn_signal_thread(signal_fd, sender.clone_handle(), opts.reset_policy)?;
 
     // Readiness handshake: ServerState is fully constructed, the socket is
     // bound + chmod'd, and the lock is held — we can complete an initial X
@@ -1031,10 +952,126 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     result
 }
 
+/// signalfd → Message bridge. yserver-core deliberately doesn't
+/// depend on nix; a tiny thread wraps the SignalFd read so run_core
+/// only sees channel-side messages. SIGINT/SIGTERM map to
+/// `Shutdown`; SIGUSR1/SIGUSR2 map to VT release/acquire messages
+/// (a no-op when VT switching is not armed).
+///
+/// SIGUSR1 carries three distinct, non-conflicting meanings here:
+/// (1) the *inherited disposition* read once at startup
+/// (`sigusr1_was_ignored` in `run`) drives the readiness handshake
+/// *to the parent* DM (`launch::signal_ready`); (2) masked-and-
+/// signalfd-consumed *delivery to self* drives the VT release/
+/// acquire handshake; (3) we *send* SIGUSR1 outward to the parent
+/// at readiness. Disposition-in, delivery-to-self, and signal-out
+/// are separate.
+fn spawn_signal_thread(
+    signal_fd: SignalSource,
+    signal_sender: core_loop::CoreSender,
+    signal_reset_policy: ResetPolicy,
+) -> io::Result<()> {
+    thread::Builder::new()
+        .name("yserver-signalfd".into())
+        .spawn(move || {
+            let signal_fd = signal_fd;
+            #[cfg(target_os = "linux")]
+            loop {
+                match signal_fd.read_signal() {
+                    Ok(Some(siginfo)) => {
+                        let signo = siginfo.ssi_signo as i32;
+                        if signo == drawable_dump_signal() {
+                            log::info!("drawable dump requested by signal");
+                            if signal_sender.send(Message::DumpDrawables).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        if signo == nix::libc::SIGUSR1 {
+                            log::info!("yserver: received SIGUSR1, forwarding VT release");
+                            if signal_sender.send(Message::VtRelease).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        if signo == nix::libc::SIGUSR2 {
+                            log::info!("yserver: received SIGUSR2, forwarding VT acquire");
+                            if signal_sender.send(Message::VtAcquire).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        let (message, what) = signal_action(signo, signal_reset_policy);
+                        log::info!("yserver: received signal {signo}, requesting {what}");
+                        let stop = matches!(message, Message::Shutdown);
+                        if signal_sender.send(message).is_err() || stop {
+                            return;
+                        }
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        log::warn!("yserver: signalfd read error: {err}");
+                        let _ = signal_sender.send(Message::Shutdown);
+                        return;
+                    }
+                }
+            }
+            #[cfg(any(target_os = "freebsd", target_os = "macos"))]
+            {
+                use nix::sys::event::KEvent;
+                let mut events = [KEvent::new(
+                    0,
+                    nix::sys::event::EventFilter::EVFILT_SIGNAL,
+                    nix::sys::event::EvFlags::empty(),
+                    nix::sys::event::FilterFlag::empty(),
+                    0,
+                    0isize,
+                ); 4];
+                loop {
+                    let n = match signal_fd.kevent(&[], &mut events, None) {
+                        Ok(n) => n,
+                        Err(nix::errno::Errno::EINTR) => continue,
+                        Err(err) => {
+                            log::warn!("yserver: kevent signal read error: {err}");
+                            let _ = signal_sender.send(Message::Shutdown);
+                            return;
+                        }
+                    };
+                    for ev in &events[..n] {
+                        let signo = ev.ident() as i32;
+                        if signo == nix::libc::SIGUSR1 {
+                            log::info!("yserver: received SIGUSR1, forwarding VT release");
+                            if signal_sender.send(Message::VtRelease).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        if signo == nix::libc::SIGUSR2 {
+                            log::info!("yserver: received SIGUSR2, forwarding VT acquire");
+                            if signal_sender.send(Message::VtAcquire).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        let (message, what) = signal_action(signo, signal_reset_policy);
+                        log::info!("yserver: received signal {signo}, requesting {what}");
+                        let stop = matches!(message, Message::Shutdown);
+                        if signal_sender.send(message).is_err() || stop {
+                            return;
+                        }
+                    }
+                }
+            }
+        })?;
+    Ok(())
+}
+
 /// Build a `KmsBackend`. yserver is always Direct — self-managed DRM master
 /// with VT_PROCESS — so this opens DRM + libinput directly, arming VT_PROCESS
 /// when a real controlling console is present. (libseat/logind session
 /// management was removed; the Direct model is the sole seat model.)
+#[cfg(kms)]
 fn build_kms_backend(
     device_paths: &[std::path::PathBuf],
     console_guard: crate::kms::ConsoleGuardOpt,
@@ -1058,7 +1095,7 @@ fn build_kms_backend(
 /// SIGINT/SIGTERM and anything else still map to `Shutdown` under every
 /// policy. SIGUSR1/SIGUSR2 never reach here — the signalfd loops handle
 /// the VT handshake before calling this.
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 fn signal_action(signo: i32, policy: ResetPolicy) -> (Message, &'static str) {
     if signo == nix::libc::SIGHUP && policy != ResetPolicy::NoReset {
         return (Message::ResetRequested, "a server reset");
@@ -1069,6 +1106,12 @@ fn signal_action(signo: i32, policy: ResetPolicy) -> (Message, &'static str) {
 /// `SIGRTMIN+3` requests the drawable dump the Ctrl+Alt+F12 hotkey does
 /// (`kill -RTMIN+3 $(pidof yserver)`), for sessions where a client reacts to
 /// the modifiers.
+/// What the signal thread reads signals from.
+#[cfg(target_os = "linux")]
+type SignalSource = SignalFd;
+#[cfg(any(target_os = "freebsd", target_os = "macos"))]
+type SignalSource = nix::sys::event::Kqueue;
+
 #[cfg(target_os = "linux")]
 fn drawable_dump_signal() -> i32 {
     nix::libc::SIGRTMIN() + 3
@@ -1111,9 +1154,9 @@ fn signalfd_mask() -> SigSet {
     }
 }
 
-/// FreeBSD: ignore the same signals and return a kqueue fd with
+/// FreeBSD and macOS: ignore the same signals and return a kqueue fd with
 /// EVFILT_SIGNAL filters registered.
-#[cfg(target_os = "freebsd")]
+#[cfg(any(target_os = "freebsd", target_os = "macos"))]
 fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
     use nix::sys::{
         event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue},
@@ -1192,11 +1235,16 @@ mod tcp_tests;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(kms)]
     use super::{
-        InputStartup, Message, ResetPolicy, build_auth_state, build_xdmcp_service,
-        ensure_input_devices_opened, input_startup_action, install_backend_root_bindings, launch,
-        signal_action, validate_tcp_startup,
+        InputStartup, ensure_input_devices_opened, input_startup_action,
+        install_backend_root_bindings,
     };
+    use super::{
+        Message, ResetPolicy, build_auth_state, build_xdmcp_service, launch, signal_action,
+        validate_tcp_startup,
+    };
+    #[cfg(kms)]
     use yserver_core::{
         backend::Backend,
         resources::{ARGB_COLORMAP, ARGB_VISUAL, ROOT_VISUAL, ROOT_WINDOW},
@@ -1376,6 +1424,7 @@ mod tests {
         }
     }
 
+    #[cfg(kms)]
     #[test]
     fn install_backend_root_bindings_sets_root_host_xid_and_visuals() {
         let mut state = ServerState::new();
@@ -1405,6 +1454,7 @@ mod tests {
         );
     }
 
+    #[cfg(kms)]
     #[test]
     fn ensure_input_devices_opened_rejects_zero_with_actionable_message() {
         let err = ensure_input_devices_opened(0).expect_err("zero devices must abort startup");
@@ -1421,12 +1471,14 @@ mod tests {
         );
     }
 
+    #[cfg(kms)]
     #[test]
     fn ensure_input_devices_opened_accepts_one_or_more() {
         assert!(ensure_input_devices_opened(1).is_ok());
         assert!(ensure_input_devices_opened(8).is_ok());
     }
 
+    #[cfg(kms)]
     #[test]
     fn direct_mode_without_input_ctx_aborts_startup() {
         // Regression: always-Direct with a failed libinput setup
@@ -1436,6 +1488,7 @@ mod tests {
         assert_eq!(input_startup_action(false), InputStartup::AbortNoInput);
     }
 
+    #[cfg(kms)]
     #[test]
     fn with_input_ctx_spawns_input_thread() {
         assert_eq!(input_startup_action(true), InputStartup::DirectSpawn);

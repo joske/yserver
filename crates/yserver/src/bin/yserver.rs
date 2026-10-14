@@ -3,6 +3,7 @@ use std::{env, process::ExitCode};
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    #[cfg(kms)]
     if let Some(result) = yserver::internal_probe::run_reexec_helper_if_requested() {
         return match result {
             Ok(()) => ExitCode::SUCCESS,

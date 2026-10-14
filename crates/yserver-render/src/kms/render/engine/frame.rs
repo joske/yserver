@@ -891,17 +891,14 @@ impl RenderEngine {
                         std::mem::take(&mut open_frame.pending_present_completions);
                     if !drained_completions.is_empty() {
                         let (wait, signal) = match completion_signal {
-                            Some(signal) => match signal.export_sync_file_fd() {
-                                Ok(Some(fd)) => (PresentBatchWait::Fd(fd), Some(signal)),
-                                Ok(None) => (PresentBatchWait::Ready, Some(signal)),
-                                Err(e) => {
-                                    log::warn!(
-                                        "B.3 close_open_frame: vkGetSemaphoreFdKHR(SYNC_FD) \
-                                         failed: {e:?}; falling back to FenceTicket polling"
-                                    );
-                                    (PresentBatchWait::Poll, Some(signal))
-                                }
-                            },
+                            Some(signal) => (
+                                PresentBatchWait::from_signal_export(
+                                    "B.3 close_open_frame",
+                                    signal.sync_file_exportable(),
+                                    || signal.export_sync_file_fd(),
+                                ),
+                                Some(signal),
+                            ),
                             // No signal: its allocation failed. Poll the
                             // frame's fence (the batch ticket below).
                             None => (PresentBatchWait::Poll, None),

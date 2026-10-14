@@ -4,15 +4,13 @@ use crate::{
         core::KmsCore,
         render::{
             backend::{
-                CrtcConfigProbeExecutor, KmsBackend, RandrIdAllocator, ScanoutM0Telemetry,
-                ScanoutM1ProbeCache, ScanoutM2State, TrackedWindows, WarnThrottle,
+                CrtcConfigProbeExecutor, KmsBackend, KmsBackendState, RandrIdAllocator,
+                ScanoutM0Telemetry, ScanoutM1ProbeCache, ScanoutM2State,
                 kms::export::probe_dmabuf_export_support,
             },
             engine::RenderEngine,
             platform::PlatformBackend,
             scene::SceneCompositor,
-            store::DrawableStore,
-            telemetry::Telemetry,
         },
     },
 };
@@ -102,66 +100,20 @@ impl KmsBackend {
             crate::kms::render::probe_executor::ProcessProbeExecutor::new()?,
         ));
         let kms_outputs_active = !platform.outputs.is_empty();
-        let mut b = Self {
-            core,
-            platform,
-            logged_gaps: RefCell::new(HashSet::new()),
-            store: DrawableStore::new(),
-            engine,
-            scene,
-            windows: TrackedWindows::default(),
-            subwindow_clip_cache: std::cell::RefCell::new(None),
-            shape_generation: 0,
-            next_window_stack_rank: 1,
-            telemetry: Telemetry::new(),
-            last_observed_pool_creates: 0,
-            last_observed_pool_resets: 0,
-            cow_id: None,
-            deferred_cow_release: false,
+        let pstate = KmsBackendState {
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             crtc_queue_sequence_unsupported_devices: HashSet::new(),
-            clip_mask_cache: None,
-            depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
-            uniform_glyph_source_cache: crate::kms::backend::UniformGlyphSourceCache::new(64),
-            clip_mask_snapshot: None,
-            fill_pattern_cache: None,
-            kms_outputs_active,
-            clear_window_area_calls: 0,
-            engine_copy_area_calls: 0,
-            recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
-            picture_drawable_ids: HashMap::new(),
-            pending_picture_drawable_refs: HashMap::new(),
-            root_readback_warn: WarnThrottle::default(),
-            dst_fanout_active: false,
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
             syncobj_eventfd_supported: None,
             dmabuf_sync_file_warned: Cell::new(false),
-            pending_present_batches: std::collections::VecDeque::new(),
-            retained_present_wakes: std::collections::HashMap::new(),
             pending_present_source_waits: HashMap::new(),
             next_present_source_wait_id: 1,
-            present_source_pins: HashMap::new(),
-            next_present_source_pin_id: 1,
-            pending_completed_events_on_shutdown: Vec::new(),
-            cursor_records: HashMap::new(),
-            cursor_pixmaps: HashMap::new(),
-            next_cursor_version: 1,
-            default_cursor_xid: None,
-            input_only_pointer_hosts: HashMap::new(),
-            effective_cursor_xid: None,
-            grab_cursor_override: None,
-            cursor_hidden: false,
-            displayed_cursor_pending: None,
-            anim_cursor_records: HashMap::new(),
-            released_cursors: HashSet::new(),
-            active_cursor_anim: None,
-            last_drained_fb_opens: 0,
             // Direct mode: no on-core libinput; the core sender is installed
             // after the channel is created in `lib.rs`.
             vt_state: crate::vt::state::VtState::Active,
@@ -170,8 +122,6 @@ impl KmsBackend {
             vt_switching_armed: false,
             led_relay: None,
             leds_sent: 0,
-            floating_keyboard_states: HashMap::new(),
-            lock_filter_priv_by_device: HashMap::new(),
             input_sender: None,
             crtc_config_probe_executor,
             pending_crtc_config_probes: HashMap::new(),
@@ -197,6 +147,7 @@ impl KmsBackend {
             dmabuf_export_supported,
             export_holders: Default::default(),
         };
+        let mut b = Self::assemble(core, platform, engine, scene, pstate, kms_outputs_active);
         // Validate every route already committed during platform bring-up,
         // then apply Xorg's one-shot AutoBindGPU-shaped startup policy: every
         // opened KMS endpoint distinct from the selected renderer becomes an
@@ -223,15 +174,15 @@ impl KmsBackend {
     fn arm_direct_vt_switching(&mut self) {
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         {
-            let Some(console_guard) = self.console_guard.as_ref() else {
+            let Some(console_guard) = self.pstate.console_guard.as_ref() else {
                 return;
             };
-            if self.vt_switching_armed {
+            if self.pstate.vt_switching_armed {
                 return;
             }
             match console_guard.arm_vt_process(nix::libc::SIGUSR1, nix::libc::SIGUSR2) {
                 Ok(()) => {
-                    self.vt_switching_armed = true;
+                    self.pstate.vt_switching_armed = true;
                     log::info!("kms: direct-mode VT_PROCESS armed (SIGUSR1/SIGUSR2)");
                 }
                 Err(err) => {
@@ -252,7 +203,7 @@ impl KmsBackend {
     /// controlling console.
     #[must_use]
     pub fn vt_switching_armed(&self) -> bool {
-        self.vt_switching_armed
+        self.pstate.vt_switching_armed
     }
 
     /// Direct-mode input-thread control handle, set when the separate
@@ -261,11 +212,11 @@ impl KmsBackend {
         &mut self,
         control: std::sync::Arc<crate::input_thread::InputThreadControl>,
     ) {
-        self.input_thread_control = Some(control);
+        self.pstate.input_thread_control = Some(control);
     }
 
     fn pause_input_thread(&self) -> bool {
-        if let Some(control) = self.input_thread_control.as_ref() {
+        if let Some(control) = self.pstate.input_thread_control.as_ref() {
             control.pause();
             true
         } else {
@@ -274,7 +225,7 @@ impl KmsBackend {
     }
 
     fn resume_input_thread(&self) {
-        if let Some(control) = self.input_thread_control.as_ref() {
+        if let Some(control) = self.pstate.input_thread_control.as_ref() {
             control.resume();
         }
     }
@@ -287,7 +238,7 @@ impl KmsBackend {
     pub(super) fn update_input_extent(&mut self, fb_w: u16, fb_h: u16) {
         let w = u32::from(fb_w);
         let h = u32::from(fb_h);
-        if let Some(ctrl) = self.input_thread_control.as_ref() {
+        if let Some(ctrl) = self.pstate.input_thread_control.as_ref() {
             ctrl.push_resize(w, h);
         }
     }
@@ -417,8 +368,8 @@ impl KmsBackend {
         if result.is_ok() {
             self.stop_direct_after_scanout_replaced("shutdown");
             self.pending_completed_events_on_shutdown
-                .append(&mut self.scanout_m2.completed);
-            self.scanout_m1.clear("shutdown");
+                .append(&mut self.pstate.scanout_m2.completed);
+            self.pstate.scanout_m1.clear("shutdown");
         }
         result
     }
@@ -459,7 +410,7 @@ impl KmsBackend {
         state.dpms.power_level = 0;
         state.dpms.last_activity = std::time::Instant::now();
 
-        let direct_shadow_error = if self.scanout_m2.active() {
+        let direct_shadow_error = if self.pstate.scanout_m2.active() {
             self.materialize_direct_shadow_for_unflip().err()
         } else {
             None
@@ -507,7 +458,7 @@ impl KmsBackend {
         }
         self.platform
             .clear_atomic_cursor_state_after_old_events_discard();
-        if self.scanout_m2.active() {
+        if self.pstate.scanout_m2.active() {
             self.stop_direct_after_scanout_replaced("VT suspend");
         }
 
@@ -537,8 +488,8 @@ impl KmsBackend {
 
         // M1 framebuffers are diagnostic-only and never active, but their GEM
         // registrations belong to this DRM-master/topology epoch.
-        if !self.scanout_m2.active() {
-            self.scanout_m1.clear("VT suspend");
+        if !self.pstate.scanout_m2.active() {
+            self.pstate.scanout_m1.clear("VT suspend");
         }
 
         if let Some(error) = direct_shadow_error {
@@ -596,7 +547,7 @@ impl KmsBackend {
         // A retained direct framebuffer must be released against the old
         // routes even when the connector set is unchanged. Any active removal
         // likewise requires all old CRTCs to be disabled before pools drop.
-        let topology_quiesced = self.scanout_m2.active() || active_removed;
+        let topology_quiesced = self.pstate.scanout_m2.active() || active_removed;
         if topology_quiesced
             && let Err(error) = self.quiesce_before_topology_mutation("VT resume topology apply")
         {
@@ -604,8 +555,8 @@ impl KmsBackend {
             return false;
         }
 
-        let configured = self.randr_id_alloc.client_configured_keys();
-        let known_connected = self.randr_id_alloc.connected_keys();
+        let configured = self.pstate.randr_id_alloc.client_configured_keys();
+        let known_connected = self.pstate.randr_id_alloc.connected_keys();
         let rescan = self
             .platform
             .apply_connector_snapshot(snapshot, &known_connected);
@@ -701,7 +652,7 @@ impl KmsBackend {
     /// (same mechanism the input thread uses for Zap). Called on
     /// unrecoverable errors during resume or renderer/device loss.
     pub(super) fn request_exit(&self) {
-        if let Some(s) = &self.input_sender {
+        if let Some(s) = &self.pstate.input_sender {
             let _ = s.send(yserver_core::core_loop::Message::Shutdown);
         } else {
             log::error!("kms: request_exit: no input_sender — cannot signal shutdown");
@@ -727,25 +678,31 @@ impl KmsBackend {
         // flip can't strand us: after a suspend, a coalesced `pending_enable`
         // resumes; after a resume, a coalesced `pending_disable` re-suspends
         // (the no-blink boundary, via `resume_complete`).
-        let entry_state = self.vt_state;
-        let mut action = self.vt_state.on_event(&mut self.vt_pending, ev);
+        let entry_state = self.pstate.vt_state;
+        let mut action = self
+            .pstate
+            .vt_state
+            .on_event(&mut self.pstate.vt_pending, ev);
         log::info!(
             "kms: drive_vt_event ev={ev:?} {entry_state:?}→{:?} action={action:?}",
-            self.vt_state,
+            self.pstate.vt_state,
         );
         loop {
             match action {
                 VtAction::BeginSuspend => {
                     self.run_suspend(state);
-                    self.vt_state.suspend_complete(&self.vt_pending);
-                    if self.vt_pending.pending_enable {
-                        self.vt_pending.pending_enable = false;
+                    self.pstate
+                        .vt_state
+                        .suspend_complete(&self.pstate.vt_pending);
+                    if self.pstate.vt_pending.pending_enable {
+                        self.pstate.vt_pending.pending_enable = false;
                         // Re-drive through the state machine so it
                         // transitions Suspended → Resuming (and returns
                         // BeginResume) — resume_complete asserts Resuming.
                         action = self
+                            .pstate
                             .vt_state
-                            .on_event(&mut self.vt_pending, VtEventKind::Enable);
+                            .on_event(&mut self.pstate.vt_pending, VtEventKind::Enable);
                         continue;
                     }
                     break;
@@ -761,7 +718,10 @@ impl KmsBackend {
                     // `resume_complete` returns `BeginSuspend` (consuming
                     // `pending_disable`) for the no-blink boundary, else
                     // commits `Active`.
-                    action = self.vt_state.resume_complete(&mut self.vt_pending);
+                    action = self
+                        .pstate
+                        .vt_state
+                        .resume_complete(&mut self.pstate.vt_pending);
                     if matches!(action, VtAction::BeginSuspend) {
                         continue;
                     }
@@ -774,7 +734,7 @@ impl KmsBackend {
                     log::debug!(
                         "kms: VT event {:?} ignored in state {:?}",
                         ev,
-                        self.vt_state
+                        self.pstate.vt_state
                     );
                     break;
                 }
@@ -788,11 +748,11 @@ impl KmsBackend {
         &mut self,
         sender: yserver_core::core_loop::CoreSender,
     ) {
-        if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
+        if let Some(executor) = self.pstate.crtc_config_probe_executor.as_mut() {
             executor.set_core_sender(sender.clone_handle());
         }
-        self.input_sender = Some(sender);
-        if !self.ready_crtc_config_announcements.is_empty() {
+        self.pstate.input_sender = Some(sender);
+        if !self.pstate.ready_crtc_config_announcements.is_empty() {
             self.wake_crtc_config_ready();
         }
     }
@@ -800,7 +760,7 @@ impl KmsBackend {
     pub(in crate::kms::render::backend) fn backend_session_request_vt_switch(&mut self, vt: u32) {
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         {
-            let Some(console_guard) = self.console_guard.as_ref() else {
+            let Some(console_guard) = self.pstate.console_guard.as_ref() else {
                 log::warn!("kms: request_vt_switch({vt}) — no console guard; ignoring");
                 return;
             };
@@ -844,7 +804,7 @@ impl KmsBackend {
         }
         log::info!("kms: VT release — master dropped; VT_RELDISP(1)");
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        if let Some(console_guard) = self.console_guard.as_ref()
+        if let Some(console_guard) = self.pstate.console_guard.as_ref()
             && let Err(err) = console_guard.vt_reldisp(1)
         {
             log::warn!("kms: VT_RELDISP(1) failed: {err}");
@@ -856,10 +816,10 @@ impl KmsBackend {
         &mut self,
         state: &mut ServerState,
     ) {
-        if let Some(deadline) = self.hotplug_rescan_deadline
+        if let Some(deadline) = self.pstate.hotplug_rescan_deadline
             && std::time::Instant::now() >= deadline
         {
-            self.hotplug_rescan_deadline = None;
+            self.pstate.hotplug_rescan_deadline = None;
             self.run_display_rescan(state);
         }
     }
@@ -881,13 +841,13 @@ impl KmsBackend {
         // rejection. Without this the write would be silently dropped and
         // every client device-config knob (natural scroll, tap, accel…)
         // would be a no-op under lightdm.
-        let Some(control) = self.input_thread_control.as_ref() else {
+        let Some(control) = self.pstate.input_thread_control.as_ref() else {
             return Err(yserver_core::xinput::libinput_props::DeviceConfigError::SourceGone);
         };
         let token = yserver_core::xinput::libinput_props::DeviceConfigToken(
-            self.next_device_config_token.max(1),
+            self.pstate.next_device_config_token.max(1),
         );
-        self.next_device_config_token = token.0.wrapping_add(1).max(1);
+        self.pstate.next_device_config_token = token.0.wrapping_add(1).max(1);
         control.push_config(token, source, change, cancel);
         Ok(yserver_core::xinput::libinput_props::DeviceConfigStart::Pending(token))
     }
@@ -919,7 +879,7 @@ impl KmsBackend {
             log::info!(
                 "kms: set_dpms_power(level={level}) — session not active \
                  (vt_state={:?}); skipping, outputs are already dark",
-                self.vt_state,
+                self.pstate.vt_state,
             );
             return Ok(());
         }
@@ -982,7 +942,7 @@ impl KmsBackend {
             //    its queued flip events consumed before scene acknowledgements
             //    or BO phases are reset. Otherwise a live front buffer can be
             //    reused, or a stale event can retire a fresh post-wake flip.
-            let direct_shadow_error = if self.scanout_m2.active() {
+            let direct_shadow_error = if self.pstate.scanout_m2.active() {
                 self.materialize_direct_shadow_for_unflip().err()
             } else {
                 None
@@ -1012,7 +972,7 @@ impl KmsBackend {
             self.platform
                 .clear_atomic_cursor_state_after_old_events_discard();
             self.stop_direct_after_scanout_replaced("DPMS off");
-            self.scanout_m1.clear("DPMS off");
+            self.pstate.scanout_m1.clear("DPMS off");
             log::info!("kms: dpms sleep — scene.drain_all");
             self.scene.drain_all(&mut self.platform);
             log::info!("kms: dpms sleep — reset_scanout_bos_for_suspend");
@@ -1044,7 +1004,7 @@ impl KmsBackend {
 
         log::info!("kms: VT acquire — begin; VT_RELDISP(VT_ACKACQ)");
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        if let Some(console_guard) = self.console_guard.as_ref()
+        if let Some(console_guard) = self.pstate.console_guard.as_ref()
             && let Err(err) = console_guard.vt_reldisp(crate::kms::console::VT_ACKACQ)
         {
             log::warn!("kms: VT_ACKACQ failed: {err}");
@@ -1083,10 +1043,10 @@ impl KmsBackend {
 
         log::info!("kms: VT acquire — master held={acquired}; run_resume");
         self.drive_vt_event(state, VtEventKind::Enable);
-        if self.vt_state != crate::vt::state::VtState::Active {
+        if self.pstate.vt_state != crate::vt::state::VtState::Active {
             log::error!(
                 "kms: VT acquire did not reach Active ({:?}); keeping input paused",
-                self.vt_state
+                self.pstate.vt_state
             );
             return;
         }

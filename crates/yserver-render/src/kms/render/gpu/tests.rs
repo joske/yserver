@@ -119,3 +119,33 @@ fn fence_ticket_retains_imported_wait_semaphores_across_clones() {
     ticket.retain_imported_wait_semaphores(vec![vk::Semaphore::null()]);
     assert_eq!(clone.inner.imported_wait_semaphores.borrow().len(), 1);
 }
+
+/// Without SYNC_FD the completion signal is a plain semaphore whose batch
+/// polls; no export is attempted.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn present_completion_signal_without_sync_fd_is_not_exportable() {
+    let options = crate::kms::vk::device::VkContextOptions {
+        wants_kms_interop: false,
+        ..crate::kms::vk::device::VkContextOptions::KMS
+    };
+    let vk = match VkContext::new_with_options(options) {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e:?}");
+            return;
+        }
+    };
+    let signal =
+        super::fence::create_present_completion_signal(Arc::clone(&vk)).expect("plain semaphore");
+    assert!(!signal.sync_file_exportable());
+    let wait = crate::kms::render::present_batch::PresentBatchWait::from_signal_export(
+        "test",
+        signal.sync_file_exportable(),
+        || panic!("export attempted without SYNC_FD"),
+    );
+    assert!(matches!(
+        wait,
+        crate::kms::render::present_batch::PresentBatchWait::Poll
+    ));
+}

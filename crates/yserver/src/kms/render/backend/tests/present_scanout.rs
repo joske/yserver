@@ -6,7 +6,7 @@ fn output_crtc_key(backend: &KmsBackend, output_idx: usize) -> CrtcKey {
 
 fn bind_test_randr_crtc(backend: &mut KmsBackend, output_idx: usize, crtc_id: u32) {
     let output_key = backend.platform.outputs[output_idx].key.clone();
-    backend.crtc_key_by_id.insert(crtc_id, output_key);
+    backend.pstate.crtc_key_by_id.insert(crtc_id, output_key);
     backend.refresh_present_crtc_clock_epochs();
 }
 
@@ -31,17 +31,17 @@ fn dispatch_test_sequence(backend: &mut KmsBackend, user_data: u64, time_ns: i64
 #[test]
 fn armed_vblank_targets_starts_empty() {
     let b = crate::kms::render::backend::KmsBackend::for_tests();
-    assert!(b.armed_vblank_targets.is_empty());
-    assert!(b.crtc_queue_sequence_unsupported_devices.is_empty());
+    assert!(b.pstate.armed_vblank_targets.is_empty());
+    assert!(b.pstate.crtc_queue_sequence_unsupported_devices.is_empty());
 }
 
 #[test]
 fn clear_all_armed_vblank_targets_empties_map() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let h = test_crtc_key(test_device_key(7), 7);
-    b.armed_vblank_targets.insert(h, 0);
+    b.pstate.armed_vblank_targets.insert(h, 0);
     b.clear_all_armed_vblank_targets();
-    assert!(b.armed_vblank_targets.is_empty());
+    assert!(b.pstate.armed_vblank_targets.is_empty());
 }
 
 #[test]
@@ -49,11 +49,11 @@ fn prune_armed_targets_drops_stale_keeps_live() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let live = output_crtc_key(&b, 0);
     let stale = test_crtc_key(live.device_key, 999);
-    b.armed_vblank_targets.insert(live, 0);
-    b.armed_vblank_targets.insert(stale, 0);
+    b.pstate.armed_vblank_targets.insert(live, 0);
+    b.pstate.armed_vblank_targets.insert(stale, 0);
     b.prune_armed_targets_to_live_outputs();
-    assert!(b.armed_vblank_targets.contains_key(&live));
-    assert!(!b.armed_vblank_targets.contains_key(&stale));
+    assert!(b.pstate.armed_vblank_targets.contains_key(&live));
+    assert!(!b.pstate.armed_vblank_targets.contains_key(&stale));
 }
 
 #[test]
@@ -61,17 +61,19 @@ fn prune_armed_targets_drops_stale_absolute_entries_keeps_live() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let live = output_crtc_key(&b, 0);
     let stale = test_crtc_key(live.device_key, 999);
-    b.absolute_vblank_targets
+    b.pstate
+        .absolute_vblank_targets
         .entry(live)
         .or_default()
         .insert(50);
-    b.absolute_vblank_targets
+    b.pstate
+        .absolute_vblank_targets
         .entry(stale)
         .or_default()
         .insert(50);
     b.prune_armed_targets_to_live_outputs();
-    assert!(b.absolute_vblank_targets.contains_key(&live));
-    assert!(!b.absolute_vblank_targets.contains_key(&stale));
+    assert!(b.pstate.absolute_vblank_targets.contains_key(&live));
+    assert!(!b.pstate.absolute_vblank_targets.contains_key(&stale));
 }
 
 #[test]
@@ -79,7 +81,7 @@ fn on_crtc_sequence_event_happy_path_records_msc_and_clears_arm() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_key = output_crtc_key(&b, 0);
-    b.armed_vblank_targets.insert(crtc_key, 0);
+    b.pstate.armed_vblank_targets.insert(crtc_key, 0);
 
     dispatch_test_sequence(
         &mut b,
@@ -88,7 +90,10 @@ fn on_crtc_sequence_event_happy_path_records_msc_and_clears_arm() {
         7,
     );
 
-    assert!(b.armed_vblank_targets.is_empty(), "arm must be cleared");
+    assert!(
+        b.pstate.armed_vblank_targets.is_empty(),
+        "arm must be cleared"
+    );
     // ust_msc stores microseconds; primary output is index 0.
     assert_eq!(b.platform.present_get_ust_msc(crtc_key), (7, 1_500));
     assert_eq!(
@@ -107,7 +112,7 @@ fn active_crtc_sequence_advances_general_clock_only() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_key = output_crtc_key(&b, 0);
-    b.armed_vblank_targets.insert(crtc_key, 0);
+    b.pstate.armed_vblank_targets.insert(crtc_key, 0);
     b.scene.scene_structure_dirty = true;
 
     dispatch_test_sequence(&mut b, u64::from(u32::from(crtc)), 2_000_000, 9);
@@ -126,7 +131,8 @@ fn active_absolute_sequence_advances_completion_clock() {
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_id = u32::from(crtc);
     let crtc_key = output_crtc_key(&b, 0);
-    b.absolute_vblank_targets
+    b.pstate
+        .absolute_vblank_targets
         .entry(crtc_key)
         .or_default()
         .insert(9);
@@ -193,12 +199,12 @@ fn on_crtc_sequence_event_negative_time_clears_arm_and_drops() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_key = output_crtc_key(&b, 0);
-    b.armed_vblank_targets.insert(crtc_key, 0);
+    b.pstate.armed_vblank_targets.insert(crtc_key, 0);
 
     dispatch_test_sequence(&mut b, u64::from(u32::from(crtc)), -1, 7);
 
     assert!(
-        b.armed_vblank_targets.is_empty(),
+        b.pstate.armed_vblank_targets.is_empty(),
         "arm cleared even on drop"
     );
     assert_eq!(
@@ -213,12 +219,12 @@ fn on_crtc_sequence_event_stale_crtc_clears_arm_and_drops() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let device_key = b.platform.outputs[0].key.device_key;
     let stale = test_crtc_key(device_key, 999);
-    b.armed_vblank_targets.insert(stale, 0);
+    b.pstate.armed_vblank_targets.insert(stale, 0);
 
     dispatch_test_sequence(&mut b, 999, 1_000_000, 5);
 
     assert!(
-        b.armed_vblank_targets.is_empty(),
+        b.pstate.armed_vblank_targets.is_empty(),
         "stale arm cleared so the CRTC can't strand"
     );
     assert_eq!(b.platform.present_get_ust_msc(stale), (0, 0));
@@ -229,13 +235,13 @@ fn on_crtc_sequence_event_from_wrong_device_does_not_advance_clock() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_key = output_crtc_key(&b, 0);
-    b.armed_vblank_targets.insert(crtc_key, 0);
+    b.pstate.armed_vblank_targets.insert(crtc_key, 0);
     let wrong_device = test_device_key(99);
 
     b.on_crtc_sequence_event(wrong_device, u64::from(u32::from(crtc)), 1_000_000, 5);
 
     assert!(
-        b.armed_vblank_targets.contains_key(&crtc_key),
+        b.pstate.armed_vblank_targets.contains_key(&crtc_key),
         "an equal raw CRTC on another DRM device must not spend this device's arm"
     );
     assert_eq!(
@@ -256,16 +262,16 @@ fn same_raw_crtc_on_two_devices_keeps_present_state_independent() {
     assert_eq!(primary.crtc, secondary.crtc);
     assert_ne!(primary.device_key, secondary.device_key);
 
-    b.armed_vblank_targets.insert(primary, 0);
-    b.armed_vblank_targets.insert(secondary, 0);
+    b.pstate.armed_vblank_targets.insert(primary, 0);
+    b.pstate.armed_vblank_targets.insert(secondary, 0);
     b.on_crtc_sequence_event(secondary.device_key, u64::from(raw_crtc), 3_000_000, 17);
 
     assert!(
-        b.armed_vblank_targets.contains_key(&primary),
+        b.pstate.armed_vblank_targets.contains_key(&primary),
         "the event must not retire the equal raw CRTC on the primary card"
     );
     assert!(
-        !b.armed_vblank_targets.contains_key(&secondary),
+        !b.pstate.armed_vblank_targets.contains_key(&secondary),
         "the event retires only the device-qualified secondary arm"
     );
     assert_eq!(b.platform.ust_msc.get(&secondary), Some(&(17, 3_000)));
@@ -325,10 +331,11 @@ fn present_randr_crtc_routes_equal_raw_handles_to_the_owning_device() {
     })
     .expect("arm selected secondary domain");
     assert_eq!(armed_on, vec![secondary]);
-    assert!(!b.armed_vblank_targets.contains_key(&primary));
-    assert!(b.armed_vblank_targets.contains_key(&secondary));
+    assert!(!b.pstate.armed_vblank_targets.contains_key(&primary));
+    assert!(b.pstate.armed_vblank_targets.contains_key(&secondary));
 
-    b.crtc_queue_sequence_unsupported_devices
+    b.pstate
+        .crtc_queue_sequence_unsupported_devices
         .insert(primary.device_key);
     assert!(!b.present_absolute_vblank_arm_supported(primary_xid));
     assert!(b.present_absolute_vblank_arm_supported(secondary_xid));
@@ -369,7 +376,8 @@ fn present_clock_epoch_changes_on_route_removal_and_readd() {
 fn off_randr_crtc_has_no_present_domain_or_direct_path() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc_id = 0x5300;
-    b.crtc_key_by_id
+    b.pstate
+        .crtc_key_by_id
         .insert(crtc_id, test_output_key(0, "not-live"));
     b.refresh_present_crtc_clock_epochs();
 
@@ -434,7 +442,7 @@ fn arm_idle_vblanks_with_empty_targets_is_noop() {
         .unwrap();
     assert_eq!(armed, 0);
     assert_eq!(calls, 0);
-    assert!(b.armed_vblank_targets.is_empty());
+    assert!(b.pstate.armed_vblank_targets.is_empty());
 }
 
 #[test]
@@ -451,7 +459,7 @@ fn arm_idle_vblanks_with_arms_primary_once_then_dedups() {
         .unwrap();
     assert_eq!(armed, 1);
     assert_eq!(calls, 1);
-    assert!(b.armed_vblank_targets.contains_key(&primary));
+    assert!(b.pstate.armed_vblank_targets.contains_key(&primary));
 
     // Already armed → no second ioctl while the sequence is in flight.
     let armed2 = b
@@ -471,7 +479,8 @@ fn arm_idle_vblanks_skips_an_unsupported_selected_device() {
     push_test_output(&mut b, 2);
     b.platform.outputs[1].key.device_key = test_device_key(1);
     let secondary = output_crtc_key(&b, 1);
-    b.crtc_queue_sequence_unsupported_devices
+    b.pstate
+        .crtc_queue_sequence_unsupported_devices
         .insert(primary.device_key);
 
     let mut attempted = Vec::new();
@@ -484,7 +493,7 @@ fn arm_idle_vblanks_skips_an_unsupported_selected_device() {
 
     assert_eq!(armed, 0);
     assert!(attempted.is_empty());
-    assert!(!b.armed_vblank_targets.contains_key(&primary));
+    assert!(!b.pstate.armed_vblank_targets.contains_key(&primary));
 
     let secondary_armed = b
         .arm_idle_vblanks_with(secondary, &[100], |crtc_key| {
@@ -494,7 +503,7 @@ fn arm_idle_vblanks_skips_an_unsupported_selected_device() {
         .unwrap();
     assert_eq!(secondary_armed, 1);
     assert_eq!(attempted, vec![secondary]);
-    assert!(b.armed_vblank_targets.contains_key(&secondary));
+    assert!(b.pstate.armed_vblank_targets.contains_key(&secondary));
 }
 
 #[test]
@@ -515,16 +524,16 @@ fn arm_idle_vblanks_transient_error_does_not_cross_domains() {
 
     assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
     assert_eq!(attempted, vec![primary]);
-    assert!(!b.armed_vblank_targets.contains_key(&primary));
-    assert!(!b.armed_vblank_targets.contains_key(&secondary));
+    assert!(!b.pstate.armed_vblank_targets.contains_key(&primary));
+    assert!(!b.pstate.armed_vblank_targets.contains_key(&secondary));
 }
 
 #[test]
 fn arm_idle_vblanks_with_scanout_disallowed_clears_and_returns_zero() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let primary = output_crtc_key(&b, 0);
-    b.armed_vblank_targets.insert(primary, 0);
-    b.vt_state = crate::vt::state::VtState::Suspended;
+    b.pstate.armed_vblank_targets.insert(primary, 0);
+    b.pstate.vt_state = crate::vt::state::VtState::Suspended;
 
     let mut calls = 0u32;
     let armed = b
@@ -536,7 +545,7 @@ fn arm_idle_vblanks_with_scanout_disallowed_clears_and_returns_zero() {
     assert_eq!(armed, 0);
     assert_eq!(calls, 0, "no arming without DRM master");
     assert!(
-        b.armed_vblank_targets.is_empty(),
+        b.pstate.armed_vblank_targets.is_empty(),
         "master loss drops queued sequences → clear bookkeeping"
     );
 }
@@ -546,7 +555,7 @@ fn arm_idle_vblanks_with_scanout_disallowed_clears_and_returns_zero() {
 #[test]
 fn absolute_vblank_targets_starts_empty() {
     let b = crate::kms::render::backend::KmsBackend::for_tests();
-    assert!(b.absolute_vblank_targets.is_empty());
+    assert!(b.pstate.absolute_vblank_targets.is_empty());
 }
 
 #[test]
@@ -555,8 +564,9 @@ fn tagged_sequence_event_does_not_clear_relative_slot() {
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_id = u32::from(crtc);
     let crtc_key = output_crtc_key(&b, 0);
-    b.armed_vblank_targets.insert(crtc_key, 0);
-    b.absolute_vblank_targets
+    b.pstate.armed_vblank_targets.insert(crtc_key, 0);
+    b.pstate
+        .absolute_vblank_targets
         .entry(crtc_key)
         .or_default()
         .insert(50);
@@ -570,7 +580,7 @@ fn tagged_sequence_event_does_not_clear_relative_slot() {
     );
 
     assert!(
-        b.armed_vblank_targets.contains_key(&crtc_key),
+        b.pstate.armed_vblank_targets.contains_key(&crtc_key),
         "a tagged event must not spend the untagged relative-1 slot"
     );
 }
@@ -581,8 +591,9 @@ fn untagged_sequence_event_does_not_retire_absolute_targets() {
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_id = u32::from(crtc);
     let crtc_key = output_crtc_key(&b, 0);
-    b.armed_vblank_targets.insert(crtc_key, 0);
-    b.absolute_vblank_targets
+    b.pstate.armed_vblank_targets.insert(crtc_key, 0);
+    b.pstate
+        .absolute_vblank_targets
         .entry(crtc_key)
         .or_default()
         .insert(50);
@@ -591,7 +602,7 @@ fn untagged_sequence_event_does_not_retire_absolute_targets() {
     dispatch_test_sequence(&mut b, u64::from(crtc_id), 1_000_000, 50);
 
     assert_eq!(
-        b.absolute_vblank_targets.get(&crtc_key).unwrap(),
+        b.pstate.absolute_vblank_targets.get(&crtc_key).unwrap(),
         &std::collections::BTreeSet::from([50u64]),
         "an untagged event must not retire the absolute per-target set"
     );
@@ -603,7 +614,8 @@ fn tagged_sequence_event_retires_targets_at_or_before_sequence_keeps_later() {
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_id = u32::from(crtc);
     let crtc_key = output_crtc_key(&b, 0);
-    b.absolute_vblank_targets
+    b.pstate
+        .absolute_vblank_targets
         .entry(crtc_key)
         .or_default()
         .extend([40u64, 50, 60]);
@@ -616,7 +628,7 @@ fn tagged_sequence_event_retires_targets_at_or_before_sequence_keeps_later() {
     );
 
     assert_eq!(
-        b.absolute_vblank_targets.get(&crtc_key).unwrap(),
+        b.pstate.absolute_vblank_targets.get(&crtc_key).unwrap(),
         &std::collections::BTreeSet::from([60u64]),
         "targets <= sequence retire; later targets stay armed"
     );
@@ -634,8 +646,9 @@ fn absolute_seq_user_data_round_trips_through_on_crtc_sequence_event() {
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_id = u32::from(crtc);
     let crtc_key = output_crtc_key(&b, 0);
-    b.armed_vblank_targets.insert(crtc_key, 0);
-    b.absolute_vblank_targets
+    b.pstate.armed_vblank_targets.insert(crtc_key, 0);
+    b.pstate
+        .absolute_vblank_targets
         .entry(crtc_key)
         .or_default()
         .insert(50);
@@ -650,11 +663,11 @@ fn absolute_seq_user_data_round_trips_through_on_crtc_sequence_event() {
     );
 
     assert!(
-        !b.absolute_vblank_targets.contains_key(&crtc_key),
+        !b.pstate.absolute_vblank_targets.contains_key(&crtc_key),
         "the target must retire through the real producer encoding"
     );
     assert!(
-        b.armed_vblank_targets.contains_key(&crtc_key),
+        b.pstate.armed_vblank_targets.contains_key(&crtc_key),
         "and must not touch the relative slot"
     );
 }
@@ -663,16 +676,17 @@ fn absolute_seq_user_data_round_trips_through_on_crtc_sequence_event() {
 fn clear_all_armed_vblank_targets_clears_absolute_targets_too() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc_key = output_crtc_key(&b, 0);
-    b.armed_vblank_targets.insert(crtc_key, 0);
-    b.absolute_vblank_targets
+    b.pstate.armed_vblank_targets.insert(crtc_key, 0);
+    b.pstate
+        .absolute_vblank_targets
         .entry(crtc_key)
         .or_default()
         .insert(50);
 
     b.clear_all_armed_vblank_targets();
 
-    assert!(b.armed_vblank_targets.is_empty());
-    assert!(b.absolute_vblank_targets.is_empty());
+    assert!(b.pstate.armed_vblank_targets.is_empty());
+    assert!(b.pstate.absolute_vblank_targets.is_empty());
 }
 
 #[test]
@@ -732,7 +746,7 @@ fn arm_present_absolute_vblank_false_result_is_not_tracked_as_covered() {
 
     assert_eq!(calls, 1);
     assert_eq!(covered, 0);
-    assert!(b.absolute_vblank_targets.is_empty());
+    assert!(b.pstate.absolute_vblank_targets.is_empty());
 }
 
 #[test]
@@ -744,9 +758,9 @@ fn destroy_subwindow_without_direct_frame_does_not_request_unflip() {
     b.destroy_subwindow(None, target_xid)
         .expect("destroy inactive target");
 
-    assert!(!b.scanout_m2.active());
-    assert!(!b.scanout_m2.unflip_requested);
-    assert!(!b.scanout_m2.hold_direct);
+    assert!(!b.pstate.scanout_m2.active());
+    assert!(!b.pstate.scanout_m2.unflip_requested);
+    assert!(!b.pstate.scanout_m2.hold_direct);
     assert!(!b.windows.contains_key(&target_xid));
     assert!(b.store.get(target_id).is_none());
 }
@@ -768,8 +782,8 @@ fn destroy_unrelated_subwindow_keeps_direct_scanout_active() {
 
     assert!(!b.windows.contains_key(&unrelated_xid));
     assert!(b.store.get(unrelated_id).is_none());
-    assert!(!b.scanout_m2.unflip_requested);
-    assert!(b.scanout_m2.hold_direct);
+    assert!(!b.pstate.scanout_m2.unflip_requested);
+    assert!(b.pstate.scanout_m2.hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
 }
@@ -787,12 +801,12 @@ fn destroy_subwindow_requests_pending_direct_unflip_without_releasing_pins() {
     b.destroy_subwindow(None, target_xid)
         .expect("destroy pending direct target");
 
-    assert!(b.scanout_m2.unflip_requested);
-    assert!(!b.scanout_m2.hold_direct);
-    assert!(b.scanout_m2.pending.is_some());
-    assert!(b.scanout_m2.current.is_none());
-    assert!(b.scanout_m2.completed.is_empty());
-    assert!(b.scanout_m2.idled.is_empty());
+    assert!(b.pstate.scanout_m2.unflip_requested);
+    assert!(!b.pstate.scanout_m2.hold_direct);
+    assert!(b.pstate.scanout_m2.pending.is_some());
+    assert!(b.pstate.scanout_m2.current.is_none());
+    assert!(b.pstate.scanout_m2.completed.is_empty());
+    assert!(b.pstate.scanout_m2.idled.is_empty());
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
     assert_eq!(b.store.get(source_id).map(|d| d.refcount), Some(2));
@@ -820,10 +834,10 @@ fn destroy_subwindow_retires_current_direct_idle_once_after_replacement() {
     b.destroy_subwindow(None, target_xid)
         .expect("destroy current direct target");
 
-    assert!(b.scanout_m2.unflip_requested);
-    assert!(!b.scanout_m2.hold_direct);
-    assert!(b.scanout_m2.current.is_some());
-    assert!(b.scanout_m2.idled.is_empty());
+    assert!(b.pstate.scanout_m2.unflip_requested);
+    assert!(!b.pstate.scanout_m2.hold_direct);
+    assert!(b.pstate.scanout_m2.current.is_some());
+    assert!(b.pstate.scanout_m2.idled.is_empty());
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
     assert_eq!(b.store.get(source_id).map(|d| d.refcount), Some(2));
@@ -856,7 +870,7 @@ fn final_cow_release_defers_storage_until_direct_replacement() {
     // The production path may already have prepared the lazy COW shadow
     // before the protocol release reaches us. Keep this unit test free of
     // Vulkan while exercising the ownership/deferral transition itself.
-    b.scanout_m2.unflip_shadow_ready = true;
+    b.pstate.scanout_m2.unflip_shadow_ready = true;
 
     let final_release = b.release_overlay_window(None).expect("final COW release");
 
@@ -864,9 +878,9 @@ fn final_cow_release_defers_storage_until_direct_replacement() {
     assert!(b.deferred_cow_release);
     assert_eq!(b.cow_id, Some(cow_id));
     assert!(b.windows.contains_key(&cow_xid));
-    assert!(b.scanout_m2.current.is_some());
-    assert!(b.scanout_m2.unflip_requested);
-    assert!(!b.scanout_m2.hold_direct);
+    assert!(b.pstate.scanout_m2.current.is_some());
+    assert!(b.pstate.scanout_m2.unflip_requested);
+    assert!(!b.pstate.scanout_m2.hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
     assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(2));
@@ -903,9 +917,9 @@ fn final_cow_release_materialization_failure_keeps_cow_and_pins() {
     assert!(!b.deferred_cow_release);
     assert_eq!(b.cow_id, Some(cow_id));
     assert!(b.store.get(cow_id).is_some());
-    assert!(b.scanout_m2.current.is_some());
-    assert!(!b.scanout_m2.unflip_requested);
-    assert!(b.scanout_m2.hold_direct);
+    assert!(b.pstate.scanout_m2.current.is_some());
+    assert!(!b.pstate.scanout_m2.unflip_requested);
+    assert!(b.pstate.scanout_m2.hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(
         b.present_source_pins.get(&fallback_pin),
@@ -921,7 +935,7 @@ fn get_cow_during_deferred_release_reuses_backend_identity() {
     b.get_overlay_window(None).expect("materialize COW");
     let cow_id = b.cow_id.expect("COW id");
     let _ = install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
-    b.scanout_m2.unflip_shadow_ready = true;
+    b.pstate.scanout_m2.unflip_shadow_ready = true;
     assert!(b.release_overlay_window(None).expect("final release"));
 
     let rematerialized = b.get_overlay_window(None).expect("reclaim deferred COW");
@@ -948,8 +962,8 @@ fn unmap_subwindow_requests_direct_unflip_without_releasing_pins() {
         .expect("unmap direct destination");
 
     assert!(!b.windows[&target_xid].mapped);
-    assert!(b.scanout_m2.unflip_requested);
-    assert!(!b.scanout_m2.hold_direct);
+    assert!(b.pstate.scanout_m2.unflip_requested);
+    assert!(!b.pstate.scanout_m2.hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
 }
@@ -970,8 +984,8 @@ fn unmap_unrelated_subwindow_keeps_direct_scanout_active() {
         .expect("unmap unrelated window");
 
     assert!(!b.windows[&unrelated_xid].mapped);
-    assert!(!b.scanout_m2.unflip_requested);
-    assert!(b.scanout_m2.hold_direct);
+    assert!(!b.pstate.scanout_m2.unflip_requested);
+    assert!(b.pstate.scanout_m2.hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
 }
@@ -994,8 +1008,8 @@ fn map_subwindow_requests_direct_unflip_without_releasing_pins() {
         .expect("map direct destination");
 
     assert!(b.windows[&target_xid].mapped);
-    assert!(b.scanout_m2.unflip_requested);
-    assert!(!b.scanout_m2.hold_direct);
+    assert!(b.pstate.scanout_m2.unflip_requested);
+    assert!(!b.pstate.scanout_m2.hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
 }
@@ -1020,8 +1034,8 @@ fn map_unrelated_subwindow_keeps_direct_scanout_active() {
         .expect("map unrelated window");
 
     assert!(b.windows[&unrelated_xid].mapped);
-    assert!(!b.scanout_m2.unflip_requested);
-    assert!(b.scanout_m2.hold_direct);
+    assert!(!b.pstate.scanout_m2.unflip_requested);
+    assert!(b.pstate.scanout_m2.hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
 }
@@ -1054,8 +1068,8 @@ fn configure_subwindow_requests_direct_unflip_without_releasing_pins() {
     .expect("configure direct destination");
 
     assert_eq!(b.windows[&target_xid].x, 12);
-    assert!(b.scanout_m2.unflip_requested);
-    assert!(!b.scanout_m2.hold_direct);
+    assert!(b.pstate.scanout_m2.unflip_requested);
+    assert!(!b.pstate.scanout_m2.hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
 }
@@ -1090,8 +1104,8 @@ fn configure_unrelated_subwindow_keeps_direct_scanout_active() {
     .expect("configure unrelated window");
 
     assert_eq!(b.windows[&unrelated_xid].x, 12);
-    assert!(!b.scanout_m2.unflip_requested);
-    assert!(b.scanout_m2.hold_direct);
+    assert!(!b.pstate.scanout_m2.unflip_requested);
+    assert!(b.pstate.scanout_m2.hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
 }
@@ -1105,7 +1119,7 @@ fn logical_resize_keeps_old_cow_pinned_until_direct_replacement() {
     let old_cow_id = b.cow_id.expect("old COW id");
     let (source_id, _, source_pin, cow_pin) =
         install_direct_frame_for_target_test(&mut b, target_xid, old_cow_id, true);
-    b.scanout_m2.unflip_shadow_ready = true;
+    b.pstate.scanout_m2.unflip_shadow_ready = true;
     let new_w = b.platform.fb_w.saturating_add(1);
     let new_h = b.platform.fb_h.saturating_add(1);
 
@@ -1114,8 +1128,8 @@ fn logical_resize_keeps_old_cow_pinned_until_direct_replacement() {
 
     let new_cow_id = b.cow_id.expect("replacement COW id");
     assert_ne!(new_cow_id, old_cow_id);
-    assert!(b.scanout_m2.unflip_requested);
-    assert!(!b.scanout_m2.hold_direct);
+    assert!(b.pstate.scanout_m2.unflip_requested);
+    assert!(!b.pstate.scanout_m2.hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&old_cow_id));
     assert_eq!(
@@ -1162,8 +1176,8 @@ fn logical_resize_materialization_failure_preserves_old_dimensions_and_cow() {
         Some(old_cow_id)
     );
     assert!(b.store.get(old_cow_id).is_some());
-    assert!(!b.scanout_m2.unflip_requested);
-    assert!(b.scanout_m2.hold_direct);
+    assert!(!b.pstate.scanout_m2.unflip_requested);
+    assert!(b.pstate.scanout_m2.hold_direct);
     assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
     assert_eq!(
         b.present_source_pins.get(&fallback_pin),
@@ -1196,7 +1210,7 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
 
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     push_test_output(&mut b, 2);
-    b.scanout_m2.cursor_bound_all = true;
+    b.pstate.scanout_m2.cursor_bound_all = true;
 
     let crtc_id = 0x5400;
     bind_test_randr_crtc(&mut b, 0, crtc_id);
@@ -1239,7 +1253,7 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
         completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
         emit_idle: true,
     };
-    b.scanout_m2.pending = Some(crate::kms::render::backend::DirectPresentFrame {
+    b.pstate.scanout_m2.pending = Some(crate::kms::render::backend::DirectPresentFrame {
         source_pin: 1,
         fallback_target_pin: 2,
         source_id,
@@ -1262,10 +1276,11 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
         source: PresentClockSource::PageFlip,
     };
     assert!(b.retire_direct_output(0, reference));
-    assert!(b.scanout_m2.completed.is_empty());
-    assert!(b.scanout_m2.current.is_none());
+    assert!(b.pstate.scanout_m2.completed.is_empty());
+    assert!(b.pstate.scanout_m2.current.is_none());
     assert_eq!(
-        b.scanout_m2
+        b.pstate
+            .scanout_m2
             .pending
             .as_ref()
             .and_then(|frame| frame.completion_clock),
@@ -1274,20 +1289,20 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
     );
 
     assert!(b.retire_direct_output(1, other));
-    assert_eq!(b.scanout_m2.completed.len(), 1);
+    assert_eq!(b.pstate.scanout_m2.completed.len(), 1);
     assert_eq!(
-        b.scanout_m2.completed[0].completion_clock,
+        b.pstate.scanout_m2.completed[0].completion_clock,
         Some(reference),
         "the last retiring output must not replace the selected CRTC timestamp"
     );
-    assert!(b.scanout_m2.pending.is_none());
-    assert!(b.scanout_m2.current.is_some());
-    assert!(b.scanout_m2.idled.is_empty());
+    assert!(b.pstate.scanout_m2.pending.is_none());
+    assert!(b.pstate.scanout_m2.current.is_some());
+    assert!(b.pstate.scanout_m2.idled.is_empty());
     assert!(
         !b.retire_direct_output(1, other),
         "a duplicate retirement cannot emit a second completion"
     );
-    assert_eq!(b.scanout_m2.completed.len(), 1);
+    assert_eq!(b.pstate.scanout_m2.completed.len(), 1);
 }
 
 #[test]
@@ -1295,31 +1310,37 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     use yserver_core::backend::{PresentClockSample, PresentClockSource};
 
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
-    b.scanout_m2.test_submit_direct_without_drm = true;
-    b.scanout_m2.cursor_bound_all = true;
+    b.pstate.scanout_m2.test_submit_direct_without_drm = true;
+    b.pstate.scanout_m2.cursor_bound_all = true;
     let fallback_id = seed_window(&mut b, 0x6a00, None, 0, 0);
 
     install_direct_frame_for_target_test(&mut b, 0x6b00, fallback_id, false);
-    let predecessor = b.scanout_m2.pending.take().expect("predecessor");
+    let predecessor = b.pstate.scanout_m2.pending.take().expect("predecessor");
 
     install_direct_frame_for_target_test(&mut b, 0x6c00, fallback_id, false);
-    let mut first_successor = b.scanout_m2.pending.take().expect("first successor");
+    let mut first_successor = b.pstate.scanout_m2.pending.take().expect("first successor");
     first_successor.candidate.present_id = 78;
     first_successor.event.present_id = 78;
     first_successor.event.serial = 10;
 
     install_direct_frame_for_target_test(&mut b, 0x6d00, fallback_id, false);
-    let mut latest_successor = b.scanout_m2.pending.take().expect("latest successor");
+    let mut latest_successor = b
+        .pstate
+        .scanout_m2
+        .pending
+        .take()
+        .expect("latest successor");
     latest_successor.candidate.present_id = 79;
     latest_successor.event.present_id = 79;
     latest_successor.event.serial = 11;
 
-    b.scanout_m2.pending = Some(predecessor);
+    b.pstate.scanout_m2.pending = Some(predecessor);
     b.queue_direct_successor(first_successor);
     b.queue_direct_successor(latest_successor);
 
     assert_eq!(
-        b.scanout_m2
+        b.pstate
+            .scanout_m2
             .queued_successor
             .as_ref()
             .map(|frame| frame.candidate.present_id),
@@ -1327,7 +1348,8 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
         "the hardware-successor state is one-slot latest-wins"
     );
     assert_eq!(
-        b.scanout_m2
+        b.pstate
+            .scanout_m2
             .deferred_successor_skips
             .iter()
             .map(|event| event.present_id)
@@ -1336,7 +1358,8 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
         "the coalesced successor is retained only as an ordered Skip"
     );
     assert_eq!(
-        b.scanout_m2
+        b.pstate
+            .scanout_m2
             .idled
             .iter()
             .map(|event| event.present_id)
@@ -1344,10 +1367,10 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
         vec![78],
         "the coalesced buffer idles immediately and exactly once"
     );
-    assert!(!b.scanout_m2.deferred_successor_skips[0].emit_idle);
-    assert!(!b.scanout_m2.unflip_requested);
-    assert!(b.scanout_m2.hold_direct);
-    assert!(b.scanout_m2.completed.is_empty());
+    assert!(!b.pstate.scanout_m2.deferred_successor_skips[0].emit_idle);
+    assert!(!b.pstate.scanout_m2.unflip_requested);
+    assert!(b.pstate.scanout_m2.hold_direct);
+    assert!(b.pstate.scanout_m2.completed.is_empty());
 
     let first_clock = PresentClockSample {
         msc: 100,
@@ -1357,7 +1380,8 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     assert!(b.retire_direct_output(0, first_clock));
 
     assert_eq!(
-        b.scanout_m2
+        b.pstate
+            .scanout_m2
             .completed
             .iter()
             .map(|event| (event.present_id, event.completion_mode))
@@ -1369,16 +1393,17 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
         "the predecessor completes before the coalesced successor Skip"
     );
     assert_eq!(
-        b.scanout_m2
+        b.pstate
+            .scanout_m2
             .pending
             .as_ref()
             .map(|frame| frame.candidate.present_id),
         Some(79),
         "retirement immediately submits the retained direct successor"
     );
-    assert!(b.scanout_m2.queued_successor.is_none());
-    assert!(!b.scanout_m2.unflip_requested);
-    assert!(b.scanout_m2.hold_direct);
+    assert!(b.pstate.scanout_m2.queued_successor.is_none());
+    assert!(!b.pstate.scanout_m2.unflip_requested);
+    assert!(b.pstate.scanout_m2.hold_direct);
 
     let second_clock = PresentClockSample {
         msc: 101,
@@ -1387,7 +1412,8 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     };
     assert!(b.retire_direct_output(0, second_clock));
     assert_eq!(
-        b.scanout_m2
+        b.pstate
+            .scanout_m2
             .completed
             .iter()
             .map(|event| (event.present_id, event.completion_mode))
@@ -1496,7 +1522,7 @@ fn arm_present_absolute_vblank_with_arms_only_selected_crtc() {
         "must arm the selected CRTC even when another domain has a larger counter"
     );
     assert!(
-        !b.absolute_vblank_targets.contains_key(&crtc1),
+        !b.pstate.absolute_vblank_targets.contains_key(&crtc1),
         "the unrelated CRTC must not gain an armed entry"
     );
 }
@@ -1828,10 +1854,10 @@ fn scanout_m1_redirected_game_and_region_present_never_reach_probe_cache() {
             ..candidate
         },
     );
-    assert!(b.scanout_m1.entries.is_empty());
-    assert_eq!(b.scanout_m0.m1_probe_pass, 0);
-    assert_eq!(b.scanout_m0.m1_probe_reject, 0);
-    assert_eq!(b.scanout_m0.m1_probe_error, 0);
+    assert!(b.pstate.scanout_m1.entries.is_empty());
+    assert_eq!(b.pstate.scanout_m0.m1_probe_pass, 0);
+    assert_eq!(b.pstate.scanout_m0.m1_probe_reject, 0);
+    assert_eq!(b.pstate.scanout_m0.m1_probe_error, 0);
 }
 
 #[test]
@@ -2014,7 +2040,7 @@ fn an_empty_cow_bounding_shape_unflips_the_direct_stage_frame() {
     seed_window(&mut b, source, None, 0, 0);
     let (w, h) = (u16::try_from(w).unwrap(), u16::try_from(h).unwrap());
     retain_direct_frame_from_source_test(&mut b, source, stage, w, h);
-    assert!(b.scanout_m2.active());
+    assert!(b.pstate.scanout_m2.active());
 
     b.set_shape_rectangles(None, cow, 2, Some(&[])).unwrap();
     b.set_shape_rectangles(
@@ -2030,13 +2056,16 @@ fn an_empty_cow_bounding_shape_unflips_the_direct_stage_frame() {
     )
     .unwrap();
     assert!(
-        !b.scanout_m2.unflip_requested,
+        !b.pstate.scanout_m2.unflip_requested,
         "an input shape or a root-covering bounding shape keeps the flip"
     );
 
     b.set_shape_rectangles(None, cow, 0, Some(&[])).unwrap();
-    assert!(b.scanout_m2.unflip_requested);
-    assert_eq!(b.scanout_m2.unflip_reason, Some("shape_clips_direct_frame"));
+    assert!(b.pstate.scanout_m2.unflip_requested);
+    assert_eq!(
+        b.pstate.scanout_m2.unflip_reason,
+        Some("shape_clips_direct_frame")
+    );
 }
 
 /// #133 step 3 (3.5) — a bordered paint chain is rejected outright,
@@ -2094,29 +2123,29 @@ fn scanout_m2_ineligible_root_resets_short_eligible_bursts() {
 #[test]
 fn active_direct_scanout_unflips_on_cursor_output_fallback() {
     let mut backend = crate::kms::render::backend::KmsBackend::for_tests();
-    backend.scanout_m2.test_force_active = true;
+    backend.pstate.scanout_m2.test_force_active = true;
     backend.handle_cursor_move_outcome(crate::kms::render::platform::CursorMoveOutcome {
         ebusy_count: 0,
         fallback_changed: true,
         retry_required: false,
     });
-    assert!(backend.scanout_m2.unflip_requested);
-    assert!(!backend.scanout_m2.hold_direct);
+    assert!(backend.pstate.scanout_m2.unflip_requested);
+    assert!(!backend.pstate.scanout_m2.hold_direct);
 }
 
 #[test]
 fn active_direct_scanout_unflips_and_wakes_for_cursor_rollback_retry() {
     let mut backend = crate::kms::render::backend::KmsBackend::for_tests();
     backend.scene.scene_structure_dirty = false;
-    backend.scanout_m2.test_force_active = true;
+    backend.pstate.scanout_m2.test_force_active = true;
     backend.handle_cursor_move_outcome(crate::kms::render::platform::CursorMoveOutcome {
         ebusy_count: 0,
         fallback_changed: false,
         retry_required: true,
     });
     assert!(backend.scene.scene_structure_dirty);
-    assert!(backend.scanout_m2.unflip_requested);
-    assert!(!backend.scanout_m2.hold_direct);
+    assert!(backend.pstate.scanout_m2.unflip_requested);
+    assert!(!backend.pstate.scanout_m2.hold_direct);
 }
 
 #[test]
@@ -2198,9 +2227,9 @@ fn scanout_m0_steady_candidate_keeps_one_shape_and_source_record() {
         ..candidate
     });
 
-    assert_eq!(b.scanout_m0.last_shape_by_dst.len(), 1);
-    assert_eq!(b.scanout_m0.recent_sources_by_dst[&0xD57].len(), 1);
-    assert_eq!(b.scanout_m0.presents, 2);
+    assert_eq!(b.pstate.scanout_m0.last_shape_by_dst.len(), 1);
+    assert_eq!(b.pstate.scanout_m0.recent_sources_by_dst[&0xD57].len(), 1);
+    assert_eq!(b.pstate.scanout_m0.presents, 2);
     assert_eq!(b.store.lookup(0xD57), Some(dst_id));
     assert_eq!(b.store.lookup(0x5AC), Some(source_id));
 }
@@ -2268,7 +2297,7 @@ fn scanout_m0_shape_ignores_region_xid_identity_but_not_presence() {
     };
 
     b.observe_scanout_m0(base);
-    let after_first = b.scanout_m0.last_shape_by_dst[&0xD57].clone();
+    let after_first = b.pstate.scanout_m0.last_shape_by_dst[&0xD57].clone();
 
     for (present_id, update) in [(2u64, 0x0041_44ebu32), (3, 0x0041_44f9)] {
         b.observe_scanout_m0(PresentScanoutCandidate {
@@ -2277,7 +2306,7 @@ fn scanout_m0_shape_ignores_region_xid_identity_but_not_presence() {
             ..base
         });
         assert_eq!(
-            b.scanout_m0.last_shape_by_dst[&0xD57], after_first,
+            b.pstate.scanout_m0.last_shape_by_dst[&0xD57], after_first,
             "a fresh update-region XID must not count as a shape change \
                  (present {present_id}, update {update:#x}) — that is the \
                  per-frame log flood in #146",
@@ -2293,7 +2322,7 @@ fn scanout_m0_shape_ignores_region_xid_identity_but_not_presence() {
         ..base
     });
     assert_ne!(
-        b.scanout_m0.last_shape_by_dst[&0xD57], after_first,
+        b.pstate.scanout_m0.last_shape_by_dst[&0xD57], after_first,
         "a Present that carries no update region at all is a different \
              shape and must still be logged",
     );
@@ -2377,8 +2406,8 @@ fn atomic_cursor_scanout_backend_with_hidden_cursor(hidden: bool) -> Option<KmsB
             backend.store.ack_presentation_damage(snapshot);
         }
     }
-    backend.scanout_m2.cursor_bound_all = true;
-    backend.scanout_m2.eligible_root_streak =
+    backend.pstate.scanout_m2.cursor_bound_all = true;
+    backend.pstate.scanout_m2.eligible_root_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     Some(backend)
 }
@@ -2621,7 +2650,7 @@ fn cursor_einval_rolls_back_and_hide_recovery_is_motion_driven_and_bounded() {
     let mut recovered_state = yserver_core::server::ServerState::new();
     retire_atomic_cursor_test_output(&mut recovered_backend, &mut recovered_state, 0, 1);
     retire_atomic_cursor_test_output(&mut recovered_backend, &mut recovered_state, 1, 1);
-    assert!(recovered_backend.scanout_m2.current.is_some());
+    assert!(recovered_backend.pstate.scanout_m2.current.is_some());
 
     recorder.script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
     Backend::warp_pointer_root(&mut recovered_backend, &mut recovered_state, 90, 70);
@@ -2638,7 +2667,7 @@ fn cursor_einval_rolls_back_and_hide_recovery_is_motion_driven_and_bounded() {
             raw_os_error: Some(libc::EINVAL),
         },
     );
-    assert!(recovered_backend.scanout_m2.unflip_requested);
+    assert!(recovered_backend.pstate.scanout_m2.unflip_requested);
     assert!(
         recovered_backend
             .platform
@@ -2748,18 +2777,18 @@ fn cursor_einval_rolls_back_and_hide_recovery_is_motion_driven_and_bounded() {
         recovered_backend.platform.scanout_pools[output_idx] =
             Some(crate::kms::vk::scanout::OutputScanout::Shared(pool));
     }
-    recovered_backend.scanout_m2.unflip_shadow_ready = true;
+    recovered_backend.pstate.scanout_m2.unflip_shadow_ready = true;
     Backend::maybe_composite(&mut recovered_backend).expect("submit cursorless composed unflip");
     assert_eq!(recorder.records().len(), 3);
     assert_atomic_cursorless_scene_record(&recorder.records()[2], position);
     assert_eq!(
-        recovered_backend.scanout_m2.unflip_awaiting_outputs,
+        recovered_backend.pstate.scanout_m2.unflip_awaiting_outputs,
         std::collections::HashSet::from([0, 1]),
     );
     assert_atomic_cursor_quiescent(&recovered_backend);
     retire_atomic_cursor_test_output(&mut recovered_backend, &mut recovered_state, 0, 2);
     retire_atomic_cursor_test_output(&mut recovered_backend, &mut recovered_state, 1, 2);
-    assert!(!recovered_backend.scanout_m2.active());
+    assert!(!recovered_backend.pstate.scanout_m2.active());
     assert_atomic_cursor_quiescent(&recovered_backend);
 
     // Three failed motion-led retries permanently disable the cursor. Later
@@ -2950,9 +2979,10 @@ fn randr_change_discards_an_inflight_cursor_flip_before_the_next_scene_flip() {
     let drm_fd = backend.platform.devices[0].device.as_fd().as_raw_fd();
     let mut state = yserver_core::server::ServerState::new();
     Backend::on_page_flip_ready(&mut backend, &mut state, drm_fd);
-    assert!(backend.scanout_m2.pending.is_none());
+    assert!(backend.pstate.scanout_m2.pending.is_none());
     assert_eq!(
         backend
+            .pstate
             .scanout_m2
             .current
             .as_ref()
@@ -3020,7 +3050,7 @@ fn prepare_atomic_cursor_direct_present_with_extent(
             ),
         )
         .expect("allocate fullscreen Present source");
-    backend.scanout_m1.entries.insert(
+    backend.pstate.scanout_m1.entries.insert(
         source_id,
         crate::kms::render::backend::ScanoutM1ProbeEntry::accepted(
             crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(atomic_cursor_raw(
@@ -3098,17 +3128,17 @@ fn hidden_cursor_allows_fullscreen_direct_scanout_without_unflip() {
     Backend::maybe_composite(&mut backend).expect("schedule hidden-cursor scene");
 
     let direct = prepare_atomic_cursor_direct_present(&mut backend, 91);
-    backend.scanout_m1.entries.remove(&direct.source_id);
+    backend.pstate.scanout_m1.entries.remove(&direct.source_id);
     Backend::note_present_scanout_candidate(&mut backend, direct.candidate);
     assert_eq!(
-        backend.scanout_m0.m1_probe_reject, 1,
+        backend.pstate.scanout_m0.m1_probe_reject, 1,
         "the M1 probe must reach its later geometry rejection after Hidden passes cursor eligibility"
     );
     assert_eq!(
-        backend.scanout_m0.m1_gate_open, 1,
+        backend.pstate.scanout_m0.m1_gate_open, 1,
         "the M1 diagnostic must report Hidden as direct-compatible"
     );
-    backend.scanout_m1.entries.insert(
+    backend.pstate.scanout_m1.entries.insert(
         direct.source_id,
         crate::kms::render::backend::ScanoutM1ProbeEntry::accepted(
             crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(atomic_cursor_raw(
@@ -3121,11 +3151,11 @@ fn hidden_cursor_allows_fullscreen_direct_scanout_without_unflip() {
             .expect("eligible fullscreen Present"),
         "a fully hidden cursor must not reject direct scanout"
     );
-    assert!(backend.scanout_m2.pending.is_some());
+    assert!(backend.pstate.scanout_m2.pending.is_some());
 
     Backend::maybe_composite(&mut backend).expect("composite tick during direct scanout");
     assert!(
-        !backend.scanout_m2.unflip_requested,
+        !backend.pstate.scanout_m2.unflip_requested,
         "Hidden must not request a direct unflip"
     );
     assert_eq!(recorder.records().len(), 1);
@@ -3186,7 +3216,7 @@ fn showing_cursor_during_direct_scanout_rebinds_or_requests_unflip() {
     // The test cursor plane intentionally has no dumb buffer, so its legacy
     // show operation fails and the backend must schedule a composed fallback.
     // A real plane may instead bind successfully and keep direct scanout.
-    backend.scanout_m2.cursor_bound_all = false;
+    backend.pstate.scanout_m2.cursor_bound_all = false;
     Backend::set_cursor_hidden(&mut backend, false);
     assert!(!backend.cursor_hidden);
     assert!(backend.scene.scene_structure_dirty);
@@ -3197,7 +3227,7 @@ fn showing_cursor_during_direct_scanout_rebinds_or_requests_unflip() {
         .as_ref()
         .is_some_and(|plane| plane.is_visible_on(first_crtc));
     assert!(
-        plane_visible || backend.scanout_m2.unflip_requested,
+        plane_visible || backend.pstate.scanout_m2.unflip_requested,
         "ShowCursor must bind the plane or schedule a composed unflip"
     );
 }
@@ -3320,6 +3350,7 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     let successor = prepare_atomic_cursor_direct_present(&mut backend, 52);
     assert_eq!(
         backend
+            .pstate
             .scanout_m2
             .pending
             .as_ref()
@@ -3334,6 +3365,7 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     );
     assert_eq!(
         backend
+            .pstate
             .scanout_m2
             .queued_successor
             .as_ref()
@@ -3371,6 +3403,7 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     assert_atomic_cursor_properties(&records[1], &latest_positions);
     assert_eq!(
         backend
+            .pstate
             .scanout_m2
             .pending
             .as_ref()
@@ -3439,7 +3472,7 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
 
     draw_atomic_cursor_test_root_overlay(&mut backend, 2);
     assert!(!backend.scene.root_overlay.is_empty());
-    backend.scanout_m2.unflip_shadow_ready = true;
+    backend.pstate.scanout_m2.unflip_shadow_ready = true;
     Backend::warp_pointer_root(&mut backend, &mut state, 1320, 330);
     let unflip_positions = backend
         .platform
@@ -3460,14 +3493,14 @@ fn direct_successor_waits_for_retirement_and_carries_motion() {
     );
     assert_atomic_cursor_properties(&records[4], &unflip_positions);
     assert_eq!(
-        backend.scanout_m2.unflip_awaiting_outputs,
+        backend.pstate.scanout_m2.unflip_awaiting_outputs,
         std::collections::HashSet::from([0, 1]),
     );
     assert_atomic_cursor_quiescent(&backend);
 
     retire_atomic_cursor_test_output(&mut backend, &mut state, 0, 4);
     retire_atomic_cursor_test_output(&mut backend, &mut state, 1, 4);
-    assert!(!backend.scanout_m2.active());
+    assert!(!backend.pstate.scanout_m2.active());
     Backend::client_disconnected(&mut backend, yserver_protocol::x11::ClientId(2));
     assert_atomic_cursor_quiescent(&backend);
 }
@@ -3493,7 +3526,7 @@ fn cursor_retirement_resumes_a_direct_successor_on_the_last_crtc() {
     assert_atomic_cursor_properties(&recorder.records()[0], &first_positions);
     retire_atomic_cursor_test_output(&mut backend, &mut state, 0, 1);
     retire_atomic_cursor_test_output(&mut backend, &mut state, 1, 1);
-    assert!(backend.scanout_m2.current.is_some());
+    assert!(backend.pstate.scanout_m2.current.is_some());
 
     Backend::warp_pointer_root(&mut backend, &mut state, 980, 230);
     Backend::maybe_composite(&mut backend).expect("submit two cursor-only commits");
@@ -3511,6 +3544,7 @@ fn cursor_retirement_resumes_a_direct_successor_on_the_last_crtc() {
     );
     assert_eq!(
         backend
+            .pstate
             .scanout_m2
             .queued_successor
             .as_ref()
@@ -3531,7 +3565,7 @@ fn cursor_retirement_resumes_a_direct_successor_on_the_last_crtc() {
     retire_atomic_cursor_test_output(&mut backend, &mut state, 0, 2);
     Backend::maybe_composite(&mut backend).expect("one CRTC remains blocked");
     assert_eq!(recorder.records().len(), 3);
-    assert!(backend.scanout_m2.queued_successor.is_some());
+    assert!(backend.pstate.scanout_m2.queued_successor.is_some());
 
     retire_atomic_cursor_test_output(&mut backend, &mut state, 1, 2);
     Backend::maybe_composite(&mut backend).expect("last cursor retirement arbitration");
@@ -3550,9 +3584,10 @@ fn cursor_retirement_resumes_a_direct_successor_on_the_last_crtc() {
         crate::drm::atomic::AtomicCommitKind::SceneWithCursor
     );
     assert_atomic_cursor_properties(&records[3], &latest_positions);
-    assert!(backend.scanout_m2.queued_successor.is_none());
+    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
     assert_eq!(
         backend
+            .pstate
             .scanout_m2
             .pending
             .as_ref()
@@ -3614,9 +3649,9 @@ fn first_direct_entry_declines_behind_cursor_commit_without_retaining_state() {
         !Backend::try_present_direct(&mut backend, declined.candidate, declined.event.clone(),)
             .expect("first direct entry declines")
     );
-    assert!(backend.scanout_m2.current.is_none());
-    assert!(backend.scanout_m2.pending.is_none());
-    assert!(backend.scanout_m2.queued_successor.is_none());
+    assert!(backend.pstate.scanout_m2.current.is_none());
+    assert!(backend.pstate.scanout_m2.pending.is_none());
+    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
     assert_eq!(
         backend.store.get(declined.source_id).unwrap().refcount,
         declined_source_refcount
@@ -3648,14 +3683,14 @@ fn first_direct_entry_declines_behind_cursor_commit_without_retaining_state() {
         )
         .expect("root overlay keeps direct scanout off")
     );
-    assert!(backend.scanout_m2.queued_successor.is_none());
-    assert!(backend.scanout_m2.pending.is_none());
+    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
+    assert!(backend.pstate.scanout_m2.pending.is_none());
 
     Backend::client_disconnected(&mut backend, yserver_protocol::x11::ClientId(1));
     assert!(backend.scene.root_overlay.is_empty());
     // The root overlay correctly reset direct-scanout probation. Restore the
     // admitted fixture state so this last Present isolates cursor retirement.
-    backend.scanout_m2.eligible_root_streak =
+    backend.pstate.scanout_m2.eligible_root_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     // A Copy completion is ready only once its GPU signal has executed; wait for the
     // device (bounded by the driver) instead of racing a slow software ICD.
@@ -3680,8 +3715,8 @@ fn first_direct_entry_declines_behind_cursor_commit_without_retaining_state() {
         crate::drm::atomic::AtomicCommitKind::SceneWithCursor
     );
     assert_atomic_cursor_properties(&recorder.records()[1], &[blocked_position]);
-    assert!(backend.scanout_m2.pending.is_some());
-    assert!(backend.scanout_m2.queued_successor.is_none());
+    assert!(backend.pstate.scanout_m2.pending.is_some());
+    assert!(backend.pstate.scanout_m2.queued_successor.is_none());
     assert_atomic_cursor_quiescent(&backend);
 }
 
@@ -3762,13 +3797,13 @@ fn eligible_fullscreen_present_records_cursor_positions_for_both_outputs() {
             ),
         )
         .expect("fullscreen Present source");
-    backend.scanout_m1.entries.insert(
+    backend.pstate.scanout_m1.entries.insert(
         source_id,
         crate::kms::render::backend::ScanoutM1ProbeEntry::accepted(
             crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(atomic_cursor_raw(71)),
         ),
     );
-    backend.scanout_m2.eligible_root_streak =
+    backend.pstate.scanout_m2.eligible_root_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
 
     let crtc_id = u32::from(backend.platform.outputs[0].output.crtc);
@@ -3822,7 +3857,7 @@ fn eligible_fullscreen_present_records_cursor_positions_for_both_outputs() {
         crate::drm::atomic::AtomicCommitKind::SceneWithCursor
     );
     assert_atomic_cursor_properties(&records[0], &positions);
-    assert!(backend.scanout_m2.pending.is_some());
+    assert!(backend.pstate.scanout_m2.pending.is_some());
     assert!(positions.iter().all(|position| {
         !backend
             .platform
@@ -3916,13 +3951,13 @@ fn shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs() {
         u16::try_from(width).expect("test root width"),
         u16::try_from(height).expect("test root height"),
     );
-    backend.scanout_m2.unflip_shadow_ready = true;
+    backend.pstate.scanout_m2.unflip_shadow_ready = true;
 
     Backend::set_shape_rectangles(&mut backend, None, cow, 0, Some(&[]))
         .expect("empty COW bounding shape");
-    assert!(backend.scanout_m2.unflip_requested);
+    assert!(backend.pstate.scanout_m2.unflip_requested);
     assert_eq!(
-        backend.scanout_m2.unflip_reason,
+        backend.pstate.scanout_m2.unflip_reason,
         Some("shape_clips_direct_frame")
     );
 
@@ -3936,7 +3971,7 @@ fn shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs() {
     );
     assert_atomic_cursor_properties(&records[0], &positions);
     assert_eq!(
-        backend.scanout_m2.unflip_awaiting_outputs,
+        backend.pstate.scanout_m2.unflip_awaiting_outputs,
         std::collections::HashSet::from([0, 1])
     );
     assert!(positions.iter().all(|position| {

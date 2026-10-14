@@ -1,5 +1,6 @@
-//! Stamp the build with the git commit for `--version`. The GLSL shaders
-//! are compiled by `yserver-render`'s build script.
+//! Emit the `kms` cfg alias and stamp the build with the git commit for
+//! `--version`. The GLSL shaders are compiled by `yserver-render`'s build
+//! script.
 
 use std::{
     env,
@@ -11,10 +12,41 @@ fn main() {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
 
+    // `cfg(kms)`: the DRM/KMS platform (and its libinput/VT stack) builds.
+    println!("cargo::rustc-check-cfg=cfg(kms)");
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if matches!(target_os.as_str(), "linux" | "freebsd") {
+        println!("cargo::rustc-cfg=kms");
+    }
+    // The `xkbcommon` crate links `-lxkbcommon` without a search path, and
+    // Homebrew's lib dir is not on the macOS linker's default path.
+    if target_os == "macos" {
+        emit_pkg_config_link_search("xkbcommon");
+    }
+
     // Stamp the build with the git commit for `--version`. Best-effort:
     // a tarball / crates.io build (no `.git`, or no `git` on PATH) falls
     // back to "unknown".
     emit_git_commit(&manifest_dir);
+}
+
+/// Add `lib`'s pkg-config `libdir` as a native link search path. `libdir`
+/// rather than `--libs-only-L`: pkgconf drops `-L` for its system dirs.
+fn emit_pkg_config_link_search(lib: &str) {
+    println!("cargo::rerun-if-env-changed=PKG_CONFIG_PATH");
+    let Ok(output) = Command::new("pkg-config")
+        .args(["--variable=libdir", lib])
+        .output()
+    else {
+        println!("cargo::warning=pkg-config not found; cannot locate {lib}");
+        return;
+    };
+    let libdir = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if libdir.is_empty() {
+        println!("cargo::warning=pkg-config has no libdir for {lib}");
+    } else {
+        println!("cargo::rustc-link-search=native={libdir}");
+    }
 }
 
 /// Emit `YSERVER_GIT_COMMIT` (consumed by `src/version.rs` via `env!`).

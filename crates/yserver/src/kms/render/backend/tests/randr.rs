@@ -126,8 +126,9 @@ fn async_crtc_config_test_backend() -> (KmsBackend, u32, ModeSpec) {
         .expect("initialize split provider policy");
 
     let output_key = backend.platform.outputs[0].key.clone();
-    let output_id = backend.randr_id_alloc.ids_for(&output_key).output_id;
+    let output_id = backend.pstate.randr_id_alloc.ids_for(&output_key).output_id;
     backend
+        .pstate
         .output_key_by_id
         .insert(output_id, output_key.clone());
     let requested = ModeSpec {
@@ -136,6 +137,7 @@ fn async_crtc_config_test_backend() -> (KmsBackend, u32, ModeSpec) {
         vrefresh: 60,
     };
     backend
+        .pstate
         .randr_id_alloc
         .entry_mut(&output_key)
         .modes
@@ -152,7 +154,7 @@ fn async_crtc_config_test_backend() -> (KmsBackend, u32, ModeSpec) {
         requested.vrefresh,
         false,
     ));
-    backend.crtc_config_discovery_override = Some(discovered);
+    backend.pstate.crtc_config_discovery_override = Some(discovered);
     (backend, output_id, requested)
 }
 
@@ -176,6 +178,7 @@ fn async_crtc_config_begin_keeps_old_topology_lit() {
         "fixture must exercise copied sink wire data"
     );
     let discovered = backend
+        .pstate
         .crtc_config_discovery_override
         .as_ref()
         .expect("fixture has prepared output");
@@ -195,7 +198,7 @@ fn async_crtc_config_begin_keeps_old_topology_lit() {
         backend.platform.outputs[0].height,
         backend.platform.outputs[0].scanout_route,
         backend.kms_outputs_active,
-        backend.crtc_config_topology_epoch,
+        backend.pstate.crtc_config_topology_epoch,
     );
     let apply =
         Backend::begin_crtc_config(&mut backend, output_id, "test", Some(requested), 100, 50)
@@ -228,7 +231,7 @@ fn async_crtc_config_begin_keeps_old_topology_lit() {
             backend.platform.outputs[0].height,
             backend.platform.outputs[0].scanout_route,
             backend.kms_outputs_active,
-            backend.crtc_config_topology_epoch,
+            backend.pstate.crtc_config_topology_epoch,
         ),
         before,
         "begin must not quiesce, modeset, or mutate the old live topology",
@@ -268,9 +271,15 @@ fn pending_probe_invalidation_wakes_once_and_suppresses_late_success() {
 
     backend.bump_crtc_config_topology_epoch("test topology invalidation");
     assert_eq!(state.borrow().cancelled, vec![token]);
-    assert!(backend.pending_crtc_config_probes.contains_key(&token));
+    assert!(
+        backend
+            .pstate
+            .pending_crtc_config_probes
+            .contains_key(&token)
+    );
     assert_eq!(
         backend
+            .pstate
             .ready_crtc_config_results
             .get(&token)
             .expect("synthetic invalidation result")
@@ -280,7 +289,7 @@ fn pending_probe_invalidation_wakes_once_and_suppresses_late_success() {
         io::ErrorKind::Interrupted,
     );
     assert_eq!(
-        backend.ready_crtc_config_announcements,
+        backend.pstate.ready_crtc_config_announcements,
         VecDeque::from([token])
     );
     assert_eq!(
@@ -315,9 +324,9 @@ fn pending_probe_invalidation_wakes_once_and_suppresses_late_success() {
     let error = Backend::finish_crtc_config(&mut backend, token)
         .expect_err("invalidated request must finish promptly with Interrupted");
     assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-    assert!(backend.pending_crtc_config_probes.is_empty());
-    assert!(backend.ready_crtc_config_results.is_empty());
-    assert!(backend.ready_crtc_config_announcements.is_empty());
+    assert!(backend.pstate.pending_crtc_config_probes.is_empty());
+    assert!(backend.pstate.ready_crtc_config_results.is_empty());
+    assert!(backend.pstate.ready_crtc_config_announcements.is_empty());
     assert_eq!(
         (
             backend.platform.outputs.len(),
@@ -365,7 +374,7 @@ fn vt_transition_promptly_interrupts_and_cancels_pending_probe() {
     let error = Backend::finish_crtc_config(&mut backend, token)
         .expect_err("VT transition must interrupt the parked request");
     assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-    assert!(backend.pending_crtc_config_probes.is_empty());
+    assert!(backend.pstate.pending_crtc_config_probes.is_empty());
 }
 
 #[test]
@@ -384,14 +393,14 @@ fn cancelling_invalidated_probe_removes_undrained_announcement() {
     };
     backend.bump_crtc_config_topology_epoch("test cancellation boundary");
     assert_eq!(
-        backend.ready_crtc_config_announcements,
+        backend.pstate.ready_crtc_config_announcements,
         VecDeque::from([token])
     );
 
     Backend::cancel_crtc_config(&mut backend, token);
-    assert!(backend.pending_crtc_config_probes.is_empty());
-    assert!(backend.ready_crtc_config_results.is_empty());
-    assert!(backend.ready_crtc_config_announcements.is_empty());
+    assert!(backend.pstate.pending_crtc_config_probes.is_empty());
+    assert!(backend.pstate.ready_crtc_config_results.is_empty());
+    assert!(backend.pstate.ready_crtc_config_announcements.is_empty());
     assert!(Backend::drain_ready_crtc_configs(&mut backend).is_empty());
     assert_eq!(probe_state.borrow().cancelled, vec![token, token]);
 }
@@ -412,10 +421,10 @@ fn dpms_transition_promptly_invalidates_pending_probe_after_no_op_guard() {
     else {
         panic!("cross-device reallocation must be asynchronous");
     };
-    let epoch_before = backend.crtc_config_topology_epoch;
+    let epoch_before = backend.pstate.crtc_config_topology_epoch;
 
     Backend::set_dpms_power(&mut backend, 0).expect("already-on DPMS request is a no-op");
-    assert_eq!(backend.crtc_config_topology_epoch, epoch_before);
+    assert_eq!(backend.pstate.crtc_config_topology_epoch, epoch_before);
     assert!(probe_state.borrow().cancelled.is_empty());
     assert!(receiver.try_recv_all().next().is_none());
 
@@ -423,7 +432,7 @@ fn dpms_transition_promptly_invalidates_pending_probe_after_no_op_guard() {
     // but invalidation must happen before that fallible transition.
     let _ = Backend::set_dpms_power(&mut backend, 3);
     assert_eq!(
-        backend.crtc_config_topology_epoch,
+        backend.pstate.crtc_config_topology_epoch,
         epoch_before.wrapping_add(1)
     );
     assert_eq!(probe_state.borrow().cancelled, vec![token]);
@@ -504,9 +513,10 @@ fn topology_invalidation_overwrites_announced_result_without_duplicate_wake() {
     backend.bump_crtc_config_topology_epoch("test after ready announcement");
     assert_eq!(state.borrow().cancelled, vec![token]);
     assert!(receiver.try_recv_all().next().is_none());
-    assert!(backend.ready_crtc_config_announcements.is_empty());
+    assert!(backend.pstate.ready_crtc_config_announcements.is_empty());
     assert_eq!(
         backend
+            .pstate
             .ready_crtc_config_results
             .get(&token)
             .expect("announced result remains consumable")
@@ -540,7 +550,7 @@ fn async_crtc_config_finish_rejects_vt_stale_result_without_quiesce() {
         backend.platform.outputs[0].width,
         backend.platform.outputs[0].height,
         backend.kms_outputs_active,
-        backend.crtc_config_topology_epoch,
+        backend.pstate.crtc_config_topology_epoch,
     );
 
     let CrtcConfigApply::Pending(token) =
@@ -555,7 +565,7 @@ fn async_crtc_config_finish_rejects_vt_stale_result_without_quiesce() {
     // parked request is finalized. Direct assignment keeps this focused
     // on finish's pre-replay guard: a real drive_vt_event also bumps the
     // topology epoch and would be rejected for both reasons.
-    backend.vt_state = crate::vt::state::VtState::Suspended;
+    backend.pstate.vt_state = crate::vt::state::VtState::Suspended;
     let error = Backend::finish_crtc_config(&mut backend, token)
         .expect_err("VT-stale qualification must not be installed");
     assert_eq!(error.kind(), io::ErrorKind::Interrupted);
@@ -567,13 +577,13 @@ fn async_crtc_config_finish_rejects_vt_stale_result_without_quiesce() {
             backend.platform.outputs[0].width,
             backend.platform.outputs[0].height,
             backend.kms_outputs_active,
-            backend.crtc_config_topology_epoch,
+            backend.pstate.crtc_config_topology_epoch,
         ),
         before,
         "stale finish must not quiesce or mutate the old topology",
     );
-    assert!(backend.pending_crtc_config_probes.is_empty());
-    assert!(backend.ready_crtc_config_results.is_empty());
+    assert!(backend.pstate.pending_crtc_config_probes.is_empty());
+    assert!(backend.pstate.ready_crtc_config_results.is_empty());
     assert_eq!(state.borrow().cancelled, vec![token]);
 }
 
@@ -667,7 +677,9 @@ fn mode_timing_passes_kernel_timing_and_masks_drm_only_flags() {
 fn kms_gamma_off_connector_seeds_identity_ramp_at_256() {
     let mut b = KmsBackend::for_tests();
     let crtc = 0x4000;
-    b.crtc_key_by_id.insert(crtc, test_output_key(0, "DP-1"));
+    b.pstate
+        .crtc_key_by_id
+        .insert(crtc, test_output_key(0, "DP-1"));
 
     assert_eq!(b.crtc_gamma_size(crtc), 256);
     let (red, green, blue) = b.get_crtc_gamma(crtc);
@@ -681,7 +693,9 @@ fn kms_gamma_off_connector_seeds_identity_ramp_at_256() {
 fn kms_gamma_off_connector_set_roundtrips_cached_values() {
     let mut b = KmsBackend::for_tests();
     let crtc = 0x4000;
-    b.crtc_key_by_id.insert(crtc, test_output_key(0, "DP-1"));
+    b.pstate
+        .crtc_key_by_id
+        .insert(crtc, test_output_key(0, "DP-1"));
     let red = vec![1u16; 256];
     let green = vec![2u16; 256];
     let blue = vec![3u16; 256];
@@ -695,8 +709,12 @@ fn kms_gamma_same_connector_name_on_two_devices_stays_independent() {
     let mut b = KmsBackend::for_tests();
     let crtc_a = 0x4000;
     let crtc_b = 0x4001;
-    b.crtc_key_by_id.insert(crtc_a, test_output_key(0, "DP-1"));
-    b.crtc_key_by_id.insert(crtc_b, test_output_key(1, "DP-1"));
+    b.pstate
+        .crtc_key_by_id
+        .insert(crtc_a, test_output_key(0, "DP-1"));
+    b.pstate
+        .crtc_key_by_id
+        .insert(crtc_b, test_output_key(1, "DP-1"));
 
     let a = (vec![1u16; 256], vec![2u16; 256], vec![3u16; 256]);
     let b_lut = (vec![4u16; 256], vec![5u16; 256], vec![6u16; 256]);
@@ -793,16 +811,18 @@ fn randr_provider_projection_is_per_kms_device_and_includes_disconnected_connect
     let first_live = backend.platform.outputs[0].key.clone();
     let first_disconnected = OutputKey::new(first_device, "DP-9");
     let second_disconnected = OutputKey::new(second_device, "HDMI-A-1");
-    let first_live_ids = backend.randr_id_alloc.ids_for(&first_live);
-    let first_disconnected_ids = backend.randr_id_alloc.ids_for(&first_disconnected);
-    let second_disconnected_ids = backend.randr_id_alloc.ids_for(&second_disconnected);
+    let first_live_ids = backend.pstate.randr_id_alloc.ids_for(&first_live);
+    let first_disconnected_ids = backend.pstate.randr_id_alloc.ids_for(&first_disconnected);
+    let second_disconnected_ids = backend.pstate.randr_id_alloc.ids_for(&second_disconnected);
 
     let providers = backend.randr_providers();
     assert_eq!(providers.len(), 2);
     let first_id = backend
+        .pstate
         .randr_id_alloc
         .provider_id_for(RandrProviderEndpoint::Kms(first_device));
     let second_id = backend
+        .pstate
         .randr_id_alloc
         .provider_id_for(RandrProviderEndpoint::Kms(second_device));
     let first = providers
@@ -842,19 +862,20 @@ fn provider_output_source_projection_is_endpoint_qualified_and_symmetric() {
     let sink_key = test_device_key(1);
     push_test_device(&mut backend, sink_key);
     let sink_output = OutputKey::new(sink_key, "DP-9");
-    let _ = backend.randr_id_alloc.ids_for(&sink_output);
+    let _ = backend.pstate.randr_id_alloc.ids_for(&sink_output);
     let render_id = RenderDeviceId::DrmRender(test_device_key(128));
     backend.platform.render_devices = vec![test_render_device(render_id, Some(source_key))];
     backend.platform.selected_render_device = Some(render_id);
     let source_endpoint = RandrProviderEndpoint::Kms(source_key);
     backend
+        .pstate
         .provider_output_sources
         .insert(sink_key, source_endpoint);
 
     let providers = backend.randr_providers();
-    let source_id = backend.randr_id_alloc.providers[&source_endpoint];
+    let source_id = backend.pstate.randr_id_alloc.providers[&source_endpoint];
     let sink_endpoint = RandrProviderEndpoint::Kms(sink_key);
-    let sink_id = backend.randr_id_alloc.providers[&sink_endpoint];
+    let sink_id = backend.pstate.randr_id_alloc.providers[&sink_endpoint];
     let source = providers
         .iter()
         .find(|provider| provider.provider_id == source_id)
@@ -904,9 +925,10 @@ fn automatic_inventoryless_sink_waits_for_connector_projection() {
         .expect("initialize automatic provider policy");
 
     let providers = backend.randr_providers();
-    let source_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(source_key)];
+    let source_id =
+        backend.pstate.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(source_key)];
     let inventoryless_id =
-        backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(inventoryless_key)];
+        backend.pstate.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(inventoryless_key)];
     assert_eq!(
         providers
             .iter()
@@ -933,7 +955,10 @@ fn automatic_inventoryless_sink_waits_for_connector_projection() {
     );
     assert!(backend.provider_output_source_allows(inventoryless_key));
     assert_eq!(
-        backend.provider_output_sources.get(&inventoryless_key),
+        backend
+            .pstate
+            .provider_output_sources
+            .get(&inventoryless_key),
         Some(&RandrProviderEndpoint::Kms(source_key)),
         "automatic policy is retained before the sink can be projected"
     );
@@ -948,6 +973,7 @@ fn automatic_inventoryless_sink_waits_for_connector_projection() {
     );
 
     let _ = backend
+        .pstate
         .randr_id_alloc
         .ids_for(&OutputKey::new(inventoryless_key, "DP-9"));
     let providers = backend.randr_providers();
@@ -981,7 +1007,7 @@ fn startup_automatically_binds_asahi_first_and_only_kms_sink() {
         .expect("initialize Asahi-shaped automatic policy");
     let source_endpoint = RandrProviderEndpoint::Render(render_id);
     assert_eq!(
-        backend.provider_output_sources.get(&display_key),
+        backend.pstate.provider_output_sources.get(&display_key),
         Some(&source_endpoint)
     );
     assert!(backend.provider_output_source_allows(display_key));
@@ -990,13 +1016,15 @@ fn startup_automatically_binds_asahi_first_and_only_kms_sink() {
     assert_eq!(providers.len(), 2);
     let source = providers
         .iter()
-        .find(|provider| provider.provider_id == backend.randr_id_alloc.providers[&source_endpoint])
+        .find(|provider| {
+            provider.provider_id == backend.pstate.randr_id_alloc.providers[&source_endpoint]
+        })
         .expect("distinct render source");
     let display = providers
         .iter()
         .find(|provider| {
             provider.provider_id
-                == backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(display_key)]
+                == backend.pstate.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(display_key)]
         })
         .expect("display sink");
     assert_eq!(source.capabilities, PROVIDER_CAPABILITY_SOURCE_OUTPUT);
@@ -1014,6 +1042,7 @@ fn coalesced_renderer_automatically_binds_inactive_secondary_sink() {
     let inactive_sink_key = test_device_key(1);
     push_test_device(&mut backend, inactive_sink_key);
     let _ = backend
+        .pstate
         .randr_id_alloc
         .ids_for(&OutputKey::new(inactive_sink_key, "DP-9"));
     let render_id = RenderDeviceId::DrmRender(test_device_key(128));
@@ -1025,18 +1054,27 @@ fn coalesced_renderer_automatically_binds_inactive_secondary_sink() {
     backend
         .initialize_provider_output_sources()
         .expect("initialize coalesced automatic policy");
-    assert_eq!(backend.provider_output_sources.len(), 1);
+    assert_eq!(backend.pstate.provider_output_sources.len(), 1);
     assert_eq!(
-        backend.provider_output_sources.get(&inactive_sink_key),
+        backend
+            .pstate
+            .provider_output_sources
+            .get(&inactive_sink_key),
         Some(&RandrProviderEndpoint::Kms(kms_key))
     );
-    assert!(!backend.provider_output_sources.contains_key(&kms_key));
+    assert!(
+        !backend
+            .pstate
+            .provider_output_sources
+            .contains_key(&kms_key)
+    );
     assert!(backend.provider_output_source_allows(kms_key));
     assert!(backend.provider_output_source_allows(inactive_sink_key));
 
     let providers = backend.randr_providers();
-    let source_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(kms_key)];
-    let sink_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(inactive_sink_key)];
+    let source_id = backend.pstate.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(kms_key)];
+    let sink_id =
+        backend.pstate.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(inactive_sink_key)];
     let source = providers
         .iter()
         .find(|provider| provider.provider_id == source_id)
@@ -1066,7 +1104,7 @@ fn automatic_provider_policy_validates_live_route_endpoints_before_binding() {
         .initialize_provider_output_sources()
         .expect_err("stale renderer endpoint must reject startup policy");
     assert!(error.to_string().contains("records renderer"));
-    assert!(backend.provider_output_sources.is_empty());
+    assert!(backend.pstate.provider_output_sources.is_empty());
 
     backend.platform.outputs[0].scanout_route =
         ScanoutRoute::new(selected_id, secondary_key, RenderKmsRelationship::Different);
@@ -1074,16 +1112,19 @@ fn automatic_provider_policy_validates_live_route_endpoints_before_binding() {
         .initialize_provider_output_sources()
         .expect_err("wrong KMS endpoint must reject startup policy");
     assert!(error.to_string().contains("records KMS endpoint"));
-    assert!(backend.provider_output_sources.is_empty());
+    assert!(backend.pstate.provider_output_sources.is_empty());
 }
 
 #[test]
 fn stale_allocated_provider_id_is_not_a_current_endpoint() {
     let mut backend = KmsBackend::for_tests();
     let stale = RandrProviderEndpoint::Render(RenderDeviceId::DrmRender(test_device_key(199)));
-    let stale_id = backend.randr_id_alloc.provider_id_for(stale);
+    let stale_id = backend.pstate.randr_id_alloc.provider_id_for(stale);
     assert_eq!(
-        backend.randr_id_alloc.provider_endpoint_for_id(stale_id),
+        backend
+            .pstate
+            .randr_id_alloc
+            .provider_endpoint_for_id(stale_id),
         Some(stale)
     );
     assert_eq!(backend.current_provider_endpoint_for_id(stale_id), None);
@@ -1095,7 +1136,7 @@ fn randr_rebuild_restores_the_stable_provider_projection() {
     let second_device = test_device_key(1);
     push_test_device(&mut backend, second_device);
     let disconnected = OutputKey::new(second_device, "DP-2");
-    let disconnected_ids = backend.randr_id_alloc.ids_for(&disconnected);
+    let disconnected_ids = backend.pstate.randr_id_alloc.ids_for(&disconnected);
     let render_id = RenderDeviceId::DrmRender(test_device_key(128));
     backend.platform.render_devices = vec![test_render_device(render_id, None)];
     backend.platform.selected_render_device = Some(render_id);
@@ -1133,6 +1174,7 @@ fn randr_rebuild_restores_the_stable_provider_projection() {
             .is_empty()
     );
     let added_ids = backend
+        .pstate
         .randr_id_alloc
         .entry(&added_key)
         .expect("reconciled connector entry")
@@ -1166,14 +1208,16 @@ fn provider_output_source_attach_detach_persists_without_timestamp_changes() {
     let sink_key = test_device_key(1);
     push_test_device(&mut backend, sink_key);
     let _ = backend
+        .pstate
         .randr_id_alloc
         .ids_for(&OutputKey::new(sink_key, "DP-9"));
     let render_id = RenderDeviceId::DrmRender(test_device_key(128));
     backend.platform.render_devices = vec![test_render_device(render_id, Some(source_key))];
     backend.platform.selected_render_device = Some(render_id);
     let providers = backend.randr_providers();
-    let source_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(source_key)];
-    let sink_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(sink_key)];
+    let source_id =
+        backend.pstate.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(source_key)];
+    let sink_id = backend.pstate.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(sink_key)];
     let (outputs, modes) = backend.randr_outputs_and_modes();
     let mut state = ServerState::with_randr_outputs_and_modes(
         backend.platform.fb_w,
@@ -1234,7 +1278,7 @@ fn explicit_detach_survives_rebuild_disconnect_and_reconnect() {
     let sink_key = test_device_key(1);
     push_test_device(&mut backend, sink_key);
     let sink_output = OutputKey::new(sink_key, "DP-9");
-    let _ = backend.randr_id_alloc.ids_for(&sink_output);
+    let _ = backend.pstate.randr_id_alloc.ids_for(&sink_output);
     assert!(
         !backend
             .reconcile_connector_registry(
@@ -1260,8 +1304,9 @@ fn explicit_detach_survives_rebuild_disconnect_and_reconnect() {
         .initialize_provider_output_sources()
         .expect("initialize automatic provider policy");
     let providers = backend.randr_providers();
-    let source_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(source_key)];
-    let sink_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(sink_key)];
+    let source_id =
+        backend.pstate.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(source_key)];
+    let sink_id = backend.pstate.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(sink_key)];
     let (outputs, modes) = backend.randr_outputs_and_modes();
     let mut state = ServerState::with_randr_outputs_and_modes(
         backend.platform.fb_w,
@@ -1351,7 +1396,12 @@ fn explicit_detach_survives_rebuild_disconnect_and_reconnect() {
             .is_empty(),
         "reconnect must preserve explicit detach"
     );
-    assert!(!backend.provider_output_sources.contains_key(&sink_key));
+    assert!(
+        !backend
+            .pstate
+            .provider_output_sources
+            .contains_key(&sink_key)
+    );
 }
 
 #[test]
@@ -1367,7 +1417,7 @@ fn active_split_sink_cannot_be_detached_while_dpms_dark() {
         .initialize_provider_output_sources()
         .expect("initialize active unknown split route");
     let providers = backend.randr_providers();
-    let sink_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(display_key)];
+    let sink_id = backend.pstate.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(display_key)];
     let mut state = ServerState::new();
     state.randr.set_providers(providers);
     backend.kms_outputs_active = false;
@@ -1465,8 +1515,11 @@ fn disabling_an_off_split_sink_does_not_require_attachment() {
     backend.platform.render_devices = vec![test_render_device(render_id, Some(source_key))];
     backend.platform.selected_render_device = Some(render_id);
     let output_key = OutputKey::new(sink_key, "DP-9");
-    let ids = backend.randr_id_alloc.ids_for(&output_key);
-    backend.output_key_by_id.insert(ids.output_id, output_key);
+    let ids = backend.pstate.randr_id_alloc.ids_for(&output_key);
+    backend
+        .pstate
+        .output_key_by_id
+        .insert(ids.output_id, output_key);
 
     assert!(!backend.provider_output_source_allows(sink_key));
     assert!(
@@ -1501,11 +1554,13 @@ fn conventional_renderer_coalesces_with_its_matching_kms_provider() {
     assert_eq!(
         providers[0].provider_id,
         backend
+            .pstate
             .randr_id_alloc
             .provider_id_for(RandrProviderEndpoint::Kms(kms_key))
     );
     assert!(
         !backend
+            .pstate
             .randr_id_alloc
             .providers
             .contains_key(&RandrProviderEndpoint::Render(selected_id)),
@@ -1513,6 +1568,7 @@ fn conventional_renderer_coalesces_with_its_matching_kms_provider() {
     );
     assert!(
         !backend
+            .pstate
             .randr_id_alloc
             .providers
             .contains_key(&RandrProviderEndpoint::Render(unselected_id)),
@@ -1538,11 +1594,13 @@ fn unverified_renderer_coalesces_when_its_primary_matches_kms() {
     assert_eq!(
         providers[0].provider_id,
         backend
+            .pstate
             .randr_id_alloc
             .provider_id_for(RandrProviderEndpoint::Kms(kms_key))
     );
     assert!(
         !backend
+            .pstate
             .randr_id_alloc
             .providers
             .contains_key(&RandrProviderEndpoint::Render(render_id)),
@@ -1555,7 +1613,7 @@ fn headless_selected_renderer_is_the_only_provider() {
     let mut backend = KmsBackend::for_tests();
     backend.platform.devices.clear();
     backend.platform.outputs.clear();
-    backend.randr_id_alloc = RandrIdAllocator::default();
+    backend.pstate.randr_id_alloc = RandrIdAllocator::default();
     let render_id = RenderDeviceId::DrmRender(test_device_key(128));
     backend.platform.render_devices = vec![test_render_device(render_id, None)];
     backend.platform.selected_render_device = Some(render_id);
@@ -1573,6 +1631,7 @@ fn headless_selected_renderer_is_the_only_provider() {
     assert_eq!(
         providers[0].provider_id,
         backend
+            .pstate
             .randr_id_alloc
             .provider_id_for(RandrProviderEndpoint::Render(render_id))
     );
@@ -1586,7 +1645,7 @@ fn split_asahi_shape_exposes_distinct_display_and_render_providers() {
     let render_id = RenderDeviceId::DrmRender(test_device_key(128));
     backend.platform.devices[0].key = display_key;
     backend.platform.outputs[0].key.device_key = display_key;
-    backend.randr_id_alloc = RandrIdAllocator::default();
+    backend.pstate.randr_id_alloc = RandrIdAllocator::default();
     backend.platform.render_devices =
         vec![test_render_device(render_id, Some(renderer_primary_key))];
     backend.platform.selected_render_device = Some(render_id);
@@ -1597,9 +1656,11 @@ fn split_asahi_shape_exposes_distinct_display_and_render_providers() {
     assert_eq!(backend.platform.render_devices.len(), 1);
     assert_eq!(providers.len(), 2);
     let display_id = backend
+        .pstate
         .randr_id_alloc
         .provider_id_for(RandrProviderEndpoint::Kms(display_key));
     let renderer_id = backend
+        .pstate
         .randr_id_alloc
         .provider_id_for(RandrProviderEndpoint::Render(render_id));
     let display = providers
@@ -1634,7 +1695,7 @@ fn provider_order_is_deterministic_and_reserves_selected_renderer_first() {
     let render_id = RenderDeviceId::DrmRender(test_device_key(128));
     backend.platform.devices[0].key = display_key;
     backend.platform.outputs[0].key.device_key = display_key;
-    backend.randr_id_alloc = RandrIdAllocator::default();
+    backend.pstate.randr_id_alloc = RandrIdAllocator::default();
     backend.platform.render_devices = vec![test_render_device(render_id, Some(test_device_key(0)))];
     backend.platform.selected_render_device = Some(render_id);
 
@@ -1642,9 +1703,11 @@ fn provider_order_is_deterministic_and_reserves_selected_renderer_first() {
     let providers = backend.randr_providers();
     let providers_again = backend.randr_providers();
     let renderer_xid = backend
+        .pstate
         .randr_id_alloc
         .provider_id_for(RandrProviderEndpoint::Render(render_id));
     let display_xid = backend
+        .pstate
         .randr_id_alloc
         .provider_id_for(RandrProviderEndpoint::Kms(display_key));
 
@@ -1666,7 +1729,7 @@ fn unverified_selected_renderer_has_a_tagged_stable_provider() {
     let mut backend = KmsBackend::for_tests();
     backend.platform.devices.clear();
     backend.platform.outputs.clear();
-    backend.randr_id_alloc = RandrIdAllocator::default();
+    backend.pstate.randr_id_alloc = RandrIdAllocator::default();
     let render_id = RenderDeviceId::UnverifiedFallback;
     backend.platform.render_devices = vec![test_render_device(render_id, None)];
     backend.platform.selected_render_device = Some(render_id);
@@ -1686,6 +1749,7 @@ fn unverified_selected_renderer_has_a_tagged_stable_provider() {
     assert_eq!(
         first[0].provider_id,
         backend
+            .pstate
             .randr_id_alloc
             .provider_id_for(RandrProviderEndpoint::Render(render_id))
     );
@@ -1698,7 +1762,7 @@ fn no_kms_and_no_selected_renderer_has_no_providers() {
     backend.platform.outputs.clear();
     backend.platform.render_devices.clear();
     backend.platform.selected_render_device = None;
-    backend.randr_id_alloc = RandrIdAllocator::default();
+    backend.pstate.randr_id_alloc = RandrIdAllocator::default();
 
     assert!(backend.randr_providers().is_empty());
 }
@@ -1708,8 +1772,8 @@ fn randr_projection_retains_device_identity_for_equal_connector_names() {
     let mut b = KmsBackend::for_tests();
     let first = test_output_key(1, "HDMI-A-1");
     let second = test_output_key(2, "HDMI-A-1");
-    let first_ids = b.randr_id_alloc.ids_for(&first);
-    let second_ids = b.randr_id_alloc.ids_for(&second);
+    let first_ids = b.pstate.randr_id_alloc.ids_for(&first);
+    let second_ids = b.pstate.randr_id_alloc.ids_for(&second);
 
     let (outputs, _) = b.randr_outputs_and_modes();
     let matching: Vec<_> = outputs
@@ -1719,8 +1783,14 @@ fn randr_projection_retains_device_identity_for_equal_connector_names() {
 
     assert_eq!(matching.len(), 2);
     assert_ne!(first_ids.output_id, second_ids.output_id);
-    assert_eq!(b.output_key_by_id.get(&first_ids.output_id), Some(&first));
-    assert_eq!(b.output_key_by_id.get(&second_ids.output_id), Some(&second));
+    assert_eq!(
+        b.pstate.output_key_by_id.get(&first_ids.output_id),
+        Some(&first)
+    );
+    assert_eq!(
+        b.pstate.output_key_by_id.get(&second_ids.output_id),
+        Some(&second)
+    );
 }
 
 #[test]
@@ -1764,7 +1834,7 @@ fn connector_only_probe_reconciles_state_and_retains_disconnected_modes() {
     let hdmi_key = OutputKey::new(device_key, "HDMI-A-1");
     let other_device_key = test_output_key(1, "DP-9");
     {
-        let dp = b.randr_id_alloc.entry_mut(&dp1_key);
+        let dp = b.pstate.randr_id_alloc.entry_mut(&dp1_key);
         dp.connected = true;
         dp.modes = vec![mode(2560, 1440, true)];
         dp.edid = vec![0x01, 0x02];
@@ -1774,9 +1844,12 @@ fn connector_only_probe_reconciles_state_and_retains_disconnected_modes() {
     }
     // A connector absent from the kernel resource list must also be
     // marked disconnected.
-    b.randr_id_alloc.entry_mut(&dp2_key).connected = true;
+    b.pstate.randr_id_alloc.entry_mut(&dp2_key).connected = true;
     // A connector on another device is outside this probe's scope.
-    b.randr_id_alloc.entry_mut(&other_device_key).connected = true;
+    b.pstate
+        .randr_id_alloc
+        .entry_mut(&other_device_key)
+        .connected = true;
 
     let probes = vec![
         ConnectorProbe {
@@ -1795,11 +1868,11 @@ fn connector_only_probe_reconciles_state_and_retains_disconnected_modes() {
             modes: Vec::new(),
         },
     ];
-    let delta = reconcile_connector_probe(&mut b.randr_id_alloc, device_key, &probes);
+    let delta = reconcile_connector_probe(&mut b.pstate.randr_id_alloc, device_key, &probes);
     assert!(!delta.is_empty());
     assert!(delta.config_changed);
 
-    let dp1 = b.randr_id_alloc.connectors.get(&dp1_key).unwrap();
+    let dp1 = b.pstate.randr_id_alloc.connectors.get(&dp1_key).unwrap();
     assert!(!dp1.connected);
     assert_eq!(
         dp1.modes,
@@ -1809,25 +1882,38 @@ fn connector_only_probe_reconciles_state_and_retains_disconnected_modes() {
     assert!(dp1.edid.is_empty(), "disconnect invalidates monitor EDID");
     assert_eq!((dp1.mm_width, dp1.mm_height), (0, 0));
     assert_eq!(dp1.connector_type, "DisplayPort");
-    assert!(!b.randr_id_alloc.connectors.get(&dp2_key).unwrap().connected);
     assert!(
-        !b.randr_id_alloc.connectors.get(&dp3_key).unwrap().connected,
+        !b.pstate
+            .randr_id_alloc
+            .connectors
+            .get(&dp2_key)
+            .unwrap()
+            .connected
+    );
+    assert!(
+        !b.pstate
+            .randr_id_alloc
+            .connectors
+            .get(&dp3_key)
+            .unwrap()
+            .connected,
         "a newly-known disconnected connector still receives a stable output XID",
     );
     assert!(
-        b.randr_id_alloc
+        b.pstate
+            .randr_id_alloc
             .connectors
             .get(&other_device_key)
             .unwrap()
             .connected,
         "probing one DRM device must not disconnect another device's outputs"
     );
-    let hdmi = b.randr_id_alloc.connectors.get(&hdmi_key).unwrap();
+    let hdmi = b.pstate.randr_id_alloc.connectors.get(&hdmi_key).unwrap();
     assert!(hdmi.connected);
     assert_eq!(hdmi.modes, vec![mode(1920, 1080, true)]);
 
     assert!(
-        reconcile_connector_probe(&mut b.randr_id_alloc, device_key, &probes).is_empty(),
+        reconcile_connector_probe(&mut b.pstate.randr_id_alloc, device_key, &probes).is_empty(),
         "an identical forced probe must not bump RANDR config time"
     );
 }
@@ -1881,7 +1967,7 @@ fn a_physical_disconnect_remembers_the_route_and_the_reconnect_relights_it() {
         &rescan.dropped_layouts,
     );
 
-    let entry = backend.randr_id_alloc.entry(&key).unwrap();
+    let entry = backend.pstate.randr_id_alloc.entry(&key).unwrap();
     assert!(!entry.connected);
     assert_eq!(
         entry.config,
@@ -1905,6 +1991,7 @@ fn a_physical_disconnect_remembers_the_route_and_the_reconnect_relights_it() {
     );
     assert!(
         backend
+            .pstate
             .randr_id_alloc
             .entry(&key)
             .unwrap()
@@ -1929,7 +2016,7 @@ fn a_physical_disconnect_remembers_the_route_and_the_reconnect_relights_it() {
     assert_eq!((requests[0].x, requests[0].y), (0, 0));
 
     backend.commit_relit_route(&requests[0]);
-    let entry = backend.randr_id_alloc.entry(&key).unwrap();
+    let entry = backend.pstate.randr_id_alloc.entry(&key).unwrap();
     assert_eq!(
         entry.config,
         crate::kms::render::backend::ConnectorConfig::Enabled {
@@ -1956,9 +2043,13 @@ fn a_route_that_was_already_off_when_it_departed_is_never_relit() {
     let mut backend = KmsBackend::for_tests();
     clear_test_outputs(&mut backend);
     let key = push_enabled_test_output(&mut backend, "HDMI-3", 7, 0, 0, 1920, 1080);
-    backend.randr_id_alloc.entry_mut(&key).config =
+    backend.pstate.randr_id_alloc.entry_mut(&key).config =
         crate::kms::render::backend::ConnectorConfig::Off;
-    backend.randr_id_alloc.entry_mut(&key).client_configured = true;
+    backend
+        .pstate
+        .randr_id_alloc
+        .entry_mut(&key)
+        .client_configured = true;
     let snapshot = relight_test_snapshot(&key, vec![test_advertised_mode(1920, 1080, 60, true)]);
 
     let rescan = backend
@@ -1977,6 +2068,7 @@ fn a_route_that_was_already_off_when_it_departed_is_never_relit() {
 
     assert!(
         backend
+            .pstate
             .randr_id_alloc
             .entry(&key)
             .unwrap()
@@ -1997,7 +2089,7 @@ fn a_client_config_on_a_departed_output_releases_its_reservation() {
     let mut backend = KmsBackend::for_tests();
     clear_test_outputs(&mut backend);
     let key = push_enabled_test_output(&mut backend, "HDMI-3", 7, 0, 0, 1920, 1080);
-    let output_id = backend.randr_id_alloc.ids_for(&key).output_id;
+    let output_id = backend.pstate.randr_id_alloc.ids_for(&key).output_id;
     let snapshot = relight_test_snapshot(&key, vec![test_advertised_mode(1920, 1080, 60, true)]);
 
     let rescan = backend
@@ -2031,6 +2123,7 @@ fn a_client_config_on_a_departed_output_releases_its_reservation() {
 
     assert!(
         backend
+            .pstate
             .randr_id_alloc
             .entry(&key)
             .unwrap()
@@ -2063,7 +2156,7 @@ fn an_incompatible_mode_reconnect_leaves_the_output_off_and_does_not_re_reserve(
     // First rescan after the replacement panel appears.
     let _ = backend.reconcile_connector_registry(std::slice::from_ref(&replacement), &[], &[]);
     assert!(backend.take_relight_requests().is_empty());
-    let entry = backend.randr_id_alloc.entry(&key).unwrap();
+    let entry = backend.pstate.randr_id_alloc.entry(&key).unwrap();
     assert_eq!(
         entry.config,
         crate::kms::render::backend::ConnectorConfig::Off
@@ -2080,7 +2173,7 @@ fn an_incompatible_mode_reconnect_leaves_the_output_off_and_does_not_re_reserve(
     assert!(backend.take_relight_requests().is_empty());
     assert!(backend.reserved_layout_slots().is_empty());
     assert_eq!(
-        backend.randr_id_alloc.entry(&key).unwrap().config,
+        backend.pstate.randr_id_alloc.entry(&key).unwrap().config,
         crate::kms::render::backend::ConnectorConfig::Off,
     );
 }
@@ -2111,7 +2204,7 @@ fn a_reserved_slot_keeps_the_survivor_in_place_and_the_relight_cannot_overlap_it
     );
     let reserved = backend.reserved_layout_slots();
     assert_eq!(reserved, vec![(0, 0, 1920, 1080)]);
-    let configured = backend.randr_id_alloc.client_configured_keys();
+    let configured = backend.pstate.randr_id_alloc.client_configured_keys();
     assert!(configured.is_empty(), "a bare session pins nothing");
     backend
         .platform
@@ -2217,7 +2310,8 @@ fn dropping_a_never_enabled_output_reserves_nothing_and_survivors_compact() {
     let b = push_enabled_test_output(&mut backend, "B", 8, 1920, 0, 3200, 1440);
     // A was never enabled — it is connected-but-Off, as a runtime-added
     // connector enters the registry.
-    backend.randr_id_alloc.entry_mut(&a).config = crate::kms::render::backend::ConnectorConfig::Off;
+    backend.pstate.randr_id_alloc.entry_mut(&a).config =
+        crate::kms::render::backend::ConnectorConfig::Off;
     let snapshot_b = relight_test_snapshot(&b, vec![test_advertised_mode(3200, 1440, 60, true)]);
 
     let rescan = backend.platform.apply_connector_snapshot(
@@ -2232,7 +2326,7 @@ fn dropping_a_never_enabled_output_reserves_nothing_and_survivors_compact() {
 
     let reserved = backend.reserved_layout_slots();
     assert!(reserved.is_empty(), "nothing enabled, nothing to reserve");
-    let configured = backend.randr_id_alloc.client_configured_keys();
+    let configured = backend.pstate.randr_id_alloc.client_configured_keys();
     backend
         .platform
         .recompact_horizontal_layout(&configured, &reserved);
@@ -2271,9 +2365,9 @@ fn startup_inventory_reserves_xids_but_heavy_snapshot_owns_identity_and_state() 
         connector_type: "HDMI".into(),
     };
 
-    backend.randr_id_alloc = RandrIdAllocator::default();
+    backend.pstate.randr_id_alloc = RandrIdAllocator::default();
     backend.seed_connector_topology_from_probes(&probes, std::slice::from_ref(&snapshot));
-    let entry = backend.randr_id_alloc.entry(&key).unwrap();
+    let entry = backend.pstate.randr_id_alloc.entry(&key).unwrap();
     let ids = entry.ids;
     assert!(entry.connected);
     assert_eq!(entry.modes, vec![heavy_mode]);
@@ -2285,9 +2379,9 @@ fn startup_inventory_reserves_xids_but_heavy_snapshot_owns_identity_and_state() 
         crate::kms::render::backend::ConnectorConfig::Enabled { .. }
     ));
 
-    backend.randr_id_alloc = RandrIdAllocator::default();
+    backend.pstate.randr_id_alloc = RandrIdAllocator::default();
     backend.seed_connector_topology_from_probes(&probes, &[]);
-    let entry = backend.randr_id_alloc.entry(&key).unwrap();
+    let entry = backend.pstate.randr_id_alloc.entry(&key).unwrap();
     assert_eq!(
         entry.ids, ids,
         "deterministic startup order keeps connector XIDs"
@@ -2319,7 +2413,7 @@ fn lightweight_mode_change_invalidates_identity_until_heavy_refresh() {
     let key = backend.platform.outputs[0].key.clone();
     let replacement_mode = test_advertised_mode(1200, 1600, 60, true);
     {
-        let entry = backend.randr_id_alloc.entry_mut(&key);
+        let entry = backend.pstate.randr_id_alloc.entry_mut(&key);
         entry.edid = vec![0x01, 0x02];
         entry.mm_width = 600;
         entry.mm_height = 340;
@@ -2333,19 +2427,19 @@ fn lightweight_mode_change_invalidates_identity_until_heavy_refresh() {
 
     assert!(
         !reconcile_connector_probe(
-            &mut backend.randr_id_alloc,
+            &mut backend.pstate.randr_id_alloc,
             key.device_key,
             std::slice::from_ref(&probe),
         )
         .is_empty()
     );
-    let entry = backend.randr_id_alloc.entry(&key).unwrap();
+    let entry = backend.pstate.randr_id_alloc.entry(&key).unwrap();
     assert_eq!(entry.modes, vec![replacement_mode]);
     assert!(entry.edid.is_empty());
     assert_eq!((entry.mm_width, entry.mm_height), (0, 0));
     assert_eq!(entry.connector_type, "DisplayPort");
     assert!(
-        reconcile_connector_probe(&mut backend.randr_id_alloc, key.device_key, &[probe],)
+        reconcile_connector_probe(&mut backend.pstate.randr_id_alloc, key.device_key, &[probe],)
             .is_empty(),
         "the same lightweight evidence is idempotent"
     );
@@ -2357,7 +2451,7 @@ fn lightweight_same_modes_cannot_detect_edid_only_replacement() {
 
     let mut backend = KmsBackend::for_tests();
     let key = backend.platform.outputs[0].key.clone();
-    let entry = backend.randr_id_alloc.entry_mut(&key);
+    let entry = backend.pstate.randr_id_alloc.entry_mut(&key);
     entry.edid = vec![0xaa, 0xbb];
     entry.mm_width = 500;
     entry.mm_height = 300;
@@ -2368,10 +2462,10 @@ fn lightweight_same_modes_cannot_detect_edid_only_replacement() {
     };
 
     assert!(
-        reconcile_connector_probe(&mut backend.randr_id_alloc, key.device_key, &[probe],)
+        reconcile_connector_probe(&mut backend.pstate.randr_id_alloc, key.device_key, &[probe],)
             .is_empty()
     );
-    let entry = backend.randr_id_alloc.entry(&key).unwrap();
+    let entry = backend.pstate.randr_id_alloc.entry(&key).unwrap();
     assert_eq!(entry.edid, vec![0xaa, 0xbb]);
     assert_eq!((entry.mm_width, entry.mm_height), (500, 300));
 }
@@ -2398,7 +2492,7 @@ fn connector_registry_detects_edid_only_replacement_and_keeps_xids() {
             .reconcile_connector_registry(std::slice::from_ref(&first), &[], &[])
             .is_empty()
     );
-    let ids = backend.randr_id_alloc.entry(&key).unwrap().ids;
+    let ids = backend.pstate.randr_id_alloc.entry(&key).unwrap().ids;
     let replacement_delta =
         backend.reconcile_connector_registry(std::slice::from_ref(&replacement), &[], &[]);
     assert!(
@@ -2409,7 +2503,7 @@ fn connector_registry_detects_edid_only_replacement_and_keeps_xids() {
         !replacement_delta.config_changed,
         "identity-only metadata does not advance lastConfigTime",
     );
-    let entry = backend.randr_id_alloc.entry(&key).unwrap();
+    let entry = backend.pstate.randr_id_alloc.entry(&key).unwrap();
     assert_eq!(entry.ids, ids, "monitor replacement reuses connector XIDs");
     assert_eq!(entry.edid, replacement.edid);
     assert!(
@@ -2476,7 +2570,7 @@ fn connected_off_output_exposes_identity_and_disconnect_clears_it() {
             .reconcile_connector_registry(std::slice::from_ref(&snapshot), &[], &[])
             .is_empty()
     );
-    let ids = backend.randr_id_alloc.entry(&key).unwrap().ids;
+    let ids = backend.pstate.randr_id_alloc.entry(&key).unwrap().ids;
 
     let (outputs, _) = backend.randr_outputs_and_modes();
     let connected = outputs
@@ -2686,7 +2780,7 @@ fn light_mode_change_then_heavy_connected_route_retirement_is_not_a_second_confi
     let key = backend.platform.outputs[0].key.clone();
     let replacement_mode = test_advertised_mode(1024, 768, 60, true);
     let light_delta = reconcile_connector_probe(
-        &mut backend.randr_id_alloc,
+        &mut backend.pstate.randr_id_alloc,
         key.device_key,
         &[ConnectorProbe {
             connector_name: key.connector_name.clone(),
@@ -2696,7 +2790,7 @@ fn light_mode_change_then_heavy_connected_route_retirement_is_not_a_second_confi
     );
     assert!(light_delta.config_changed);
     assert!(matches!(
-        backend.randr_id_alloc.entry(&key).unwrap().config,
+        backend.pstate.randr_id_alloc.entry(&key).unwrap().config,
         crate::kms::render::backend::ConnectorConfig::Enabled { .. }
     ));
 
@@ -2711,7 +2805,7 @@ fn light_mode_change_then_heavy_connected_route_retirement_is_not_a_second_confi
     state.randr.timestamp = 41;
     state.randr.config_timestamp = 37;
 
-    let entry = backend.randr_id_alloc.entry(&key).unwrap();
+    let entry = backend.pstate.randr_id_alloc.entry(&key).unwrap();
     let snapshot = ConnectorSnapshot {
         key: key.clone(),
         modes: vec![replacement_mode],
@@ -2728,7 +2822,7 @@ fn light_mode_change_then_heavy_connected_route_retirement_is_not_a_second_confi
     assert!(heavy_delta.is_empty());
     assert!(!heavy_delta.config_changed);
     assert_eq!(
-        backend.randr_id_alloc.entry(&key).unwrap().config,
+        backend.pstate.randr_id_alloc.entry(&key).unwrap().config,
         crate::kms::render::backend::ConnectorConfig::Off,
         "the unusable live route is still retired internally",
     );
@@ -2786,7 +2880,7 @@ fn heavy_disconnect_projection_does_not_revive_stale_active_output() {
         "physical loss retains the former CRTC association until a client disables it",
     );
     assert!(
-        !backend.randr_id_alloc.entry(&key).unwrap().connected,
+        !backend.pstate.randr_id_alloc.entry(&key).unwrap().connected,
         "stale platform output state must not overwrite a heavy disconnect"
     );
 }
@@ -2892,7 +2986,7 @@ fn randr_output_mode_ids_have_no_duplicate_xids() {
         "HDMI-A-1",
     );
     {
-        let e = b.randr_id_alloc.entry_mut(&hdmi_key);
+        let e = b.pstate.randr_id_alloc.entry_mut(&hdmi_key);
         e.connected = true;
         e.config = crate::kms::render::backend::ConnectorConfig::Off;
         e.modes = vec![
@@ -2936,13 +3030,13 @@ fn not_live_output_reports_connected_off_vs_disconnected() {
 
     // Hotplugged, registered OFF (the Task 5.2 add-path outcome).
     {
-        let e = b.randr_id_alloc.entry_mut(&hdmi_key);
+        let e = b.pstate.randr_id_alloc.entry_mut(&hdmi_key);
         e.connected = true;
         e.config = crate::kms::render::backend::ConnectorConfig::Off;
         e.modes = vec![test_advertised_mode(1920, 1080, 60, true)];
     }
     // Physically disconnected (default connected=false).
-    let _ = b.randr_id_alloc.entry_mut(&dp_key);
+    let _ = b.pstate.randr_id_alloc.entry_mut(&dp_key);
 
     let (outs, _modes) = b.randr_outputs_and_modes();
 

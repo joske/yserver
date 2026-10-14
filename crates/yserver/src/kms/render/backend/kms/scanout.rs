@@ -1,15 +1,11 @@
 use crate::kms::render::{
     backend::{
-        DirectFrameSlot, DirectPresentFrame, KmsBackend, PENDING_RETIRE_POLL_INTERVAL,
-        ScanoutM0Coverage, ScanoutM0Shape, ScanoutM0Target, ScanoutM1OutputGeometry,
-        ScanoutM1ProbeEntry, WindowGeometry, WindowsMap, kms::randr::effective_refresh_matches,
-        portable::default_window_init_color,
+        DirectFrameSlot, DirectPresentFrame, KmsBackend, ScanoutM0Coverage, ScanoutM0Shape,
+        ScanoutM0Target, ScanoutM1OutputGeometry, ScanoutM1ProbeEntry, WindowsMap,
+        kms::randr::effective_refresh_matches,
     },
-    store::{DrawableId, DrawableKind},
-    submit_trace::{
-        Flags as SubmitFlags, Op as SubmitOp, SrcClass, SubmitEvent, SubmitKind, TargetKind,
-    },
-    target::{Dst, Src},
+    store::DrawableId,
+    target::Src,
 };
 use ash::vk;
 use std::{
@@ -19,7 +15,7 @@ use std::{
     rc::Rc,
 };
 use yserver_core::{
-    backend::{Backend, OriginContext, PresentScanoutCandidate},
+    backend::{Backend, PresentScanoutCandidate},
     server::ServerState,
 };
 use yserver_protocol::x11::xfixes;
@@ -272,7 +268,7 @@ impl KmsBackend {
             .record_cursor_move_ebusy(u64::from(outcome.ebusy_count));
         if outcome.fallback_changed || outcome.retry_required {
             self.scene.wake_for_damage();
-            if self.scanout_m2.active() {
+            if self.pstate.scanout_m2.active() {
                 self.request_direct_unflip("cursor_move_fallback_or_retry");
             }
         }
@@ -283,9 +279,9 @@ impl KmsBackend {
     /// `false` when there are none, or when any is an ordinary window.
     pub(in crate::kms::render::backend) fn direct_frames_are_under_cow(&self) -> bool {
         let frames = [
-            self.scanout_m2.current.as_ref(),
-            self.scanout_m2.pending.as_ref(),
-            self.scanout_m2.queued_successor.as_ref(),
+            self.pstate.scanout_m2.current.as_ref(),
+            self.pstate.scanout_m2.pending.as_ref(),
+            self.pstate.scanout_m2.queued_successor.as_ref(),
         ];
         let mut any = false;
         for frame in frames.into_iter().flatten() {
@@ -301,15 +297,15 @@ impl KmsBackend {
     }
 
     pub(in crate::kms::render::backend) fn request_direct_unflip(&mut self, reason: &'static str) {
-        if !self.scanout_m2.active() {
+        if !self.pstate.scanout_m2.active() {
             return;
         }
-        if !self.scanout_m2.unflip_requested {
-            self.scanout_m2.unflip_reason = Some(reason);
+        if !self.pstate.scanout_m2.unflip_requested {
+            self.pstate.scanout_m2.unflip_reason = Some(reason);
         }
-        self.scanout_m2.unflip_requested = true;
-        self.scanout_m2.unflip_last_reason = Some(reason);
-        self.scanout_m2.hold_direct = false;
+        self.pstate.scanout_m2.unflip_requested = true;
+        self.pstate.scanout_m2.unflip_last_reason = Some(reason);
+        self.pstate.scanout_m2.hold_direct = false;
     }
 
     pub(in crate::kms::render::backend) fn direct_frame_references_host_drawable(
@@ -323,47 +319,27 @@ impl KmsBackend {
                     frame.source_id == id || frame.fallback_target.backing_id() == id
                 })
         };
-        self.scanout_m2.pending.as_ref().is_some_and(references)
+        self.pstate
+            .scanout_m2
+            .pending
+            .as_ref()
+            .is_some_and(references)
             || self
+                .pstate
                 .scanout_m2
                 .queued_successor
                 .as_ref()
                 .is_some_and(references)
-            || self.scanout_m2.current.as_ref().is_some_and(references)
-    }
-
-    fn finish_cow_release(&mut self) {
-        self.deferred_cow_release = false;
-
-        // Keep the backend COW projection and storage together until the
-        // last owner is safe to drop. For a direct frame, this helper runs
-        // only after the composed replacement retired and its pins released.
-        let cow_host_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
-        self.windows.remove(&cow_host_xid);
-        self.scene.mark_scene_structure_dirty();
-
-        self.drain_engine_present_batches();
-        if let Err(e) = self.engine.flush_render_batch(
-            &mut self.store,
-            &mut self.platform.gpu,
-            crate::kms::render::engine::RenderFlushReason::Other,
-        ) {
-            log::warn!("render release_overlay_window: flush_render_batch failed: {e:?}");
-        }
-        self.drain_render_telemetry();
-        if let Some(id) = self.cow_id.take() {
-            self.store_decref_with_invalidate(id);
-        }
-    }
-
-    fn finish_deferred_cow_release(&mut self) {
-        if self.deferred_cow_release {
-            self.finish_cow_release();
-        }
+            || self
+                .pstate
+                .scanout_m2
+                .current
+                .as_ref()
+                .is_some_and(references)
     }
 
     fn bind_direct_cursor_on_all_outputs(&mut self) {
-        if self.scanout_m2.cursor_bound_all {
+        if self.pstate.scanout_m2.cursor_bound_all {
             return;
         }
         if self.cursor_hidden {
@@ -381,7 +357,7 @@ impl KmsBackend {
             if failed {
                 self.request_direct_unflip("cursor_hide_failed");
             } else {
-                self.scanout_m2.cursor_bound_all = true;
+                self.pstate.scanout_m2.cursor_bound_all = true;
             }
             return;
         }
@@ -408,7 +384,7 @@ impl KmsBackend {
         if failed {
             self.request_direct_unflip("cursor_bind_failed");
         } else {
-            self.scanout_m2.cursor_bound_all = true;
+            self.pstate.scanout_m2.cursor_bound_all = true;
         }
     }
 
@@ -418,11 +394,11 @@ impl KmsBackend {
     /// participating CRTC. A sprite-only update can use the same ownership
     /// model: upload once per output route (deduplicated by version inside the
     /// cursor plane), then rebind at the current position.
-    pub(super) fn refresh_direct_cursor_on_all_outputs(
+    pub(in crate::kms::render::backend) fn refresh_direct_cursor_on_all_outputs(
         &mut self,
         record: &crate::kms::render::cursor::CursorRecord,
     ) -> bool {
-        if !self.scanout_m2.active() || self.platform.outputs.is_empty() {
+        if !self.pstate.scanout_m2.active() || self.platform.outputs.is_empty() {
             return false;
         }
         #[allow(clippy::cast_possible_truncation)]
@@ -455,7 +431,7 @@ impl KmsBackend {
                 return false;
             }
         }
-        self.scanout_m2.cursor_bound_all = true;
+        self.pstate.scanout_m2.cursor_bound_all = true;
         true
     }
 
@@ -505,11 +481,12 @@ impl KmsBackend {
 
     pub(super) fn submit_direct_frame(&mut self, frame: &mut DirectPresentFrame) -> io::Result<()> {
         #[cfg(test)]
-        if self.scanout_m2.test_submit_direct_without_drm {
+        if self.pstate.scanout_m2.test_submit_direct_without_drm {
             frame.awaiting_outputs = (0..self.platform.outputs.len()).collect();
             return Ok(());
         }
         let fb = self
+            .pstate
             .scanout_m1
             .entries
             .get(&frame.source_id)
@@ -570,7 +547,7 @@ impl KmsBackend {
         // A cursor/overlay/topology invalidation which arrived while the
         // predecessor was in flight wins over the queued Present. Leave the
         // successor retained for the composed-unflip teardown to Skip.
-        if self.scanout_m2.unflip_requested || self.scanout_m2.pending.is_some() {
+        if self.pstate.scanout_m2.unflip_requested || self.pstate.scanout_m2.pending.is_some() {
             return;
         }
         let direct_outputs: Vec<_> = (0..self.platform.outputs.len()).collect();
@@ -580,7 +557,7 @@ impl KmsBackend {
         {
             return;
         }
-        let Some(mut successor) = self.scanout_m2.queued_successor.take() else {
+        let Some(mut successor) = self.pstate.scanout_m2.queued_successor.take() else {
             return;
         };
         match self.submit_direct_frame(&mut successor) {
@@ -591,24 +568,25 @@ impl KmsBackend {
                     successor.candidate.present_id,
                     self.platform.outputs.len()
                 );
-                self.scanout_m2.pending = Some(successor);
-                self.scanout_m2.hold_direct = true;
+                self.pstate.scanout_m2.pending = Some(successor);
+                self.pstate.scanout_m2.hold_direct = true;
             }
             Err(error) => {
                 log::warn!(
                     "scanout_m2: queued direct successor submit failed after predecessor retirement: {error}"
                 );
                 self.defer_direct_successor_skip(successor);
-                self.scanout_m2
+                self.pstate
+                    .scanout_m2
                     .completed
-                    .append(&mut self.scanout_m2.deferred_successor_skips);
+                    .append(&mut self.pstate.scanout_m2.deferred_successor_skips);
                 self.request_direct_unflip("queued_direct_successor_submit_failed");
             }
         }
     }
 
     fn release_direct_frame(&mut self, frame: DirectPresentFrame) {
-        self.scanout_m2.idled.push(frame.event);
+        self.pstate.scanout_m2.idled.push(frame.event);
         <Self as Backend>::release_present_source(self, frame.source_pin);
         <Self as Backend>::release_present_source(self, frame.fallback_target_pin);
     }
@@ -621,8 +599,11 @@ impl KmsBackend {
         // `emit_idle = false` prevents the later completion from idling it a
         // second time.
         frame.event.emit_idle = false;
-        self.scanout_m2.idled.push(frame.event.clone());
-        self.scanout_m2.deferred_successor_skips.push(frame.event);
+        self.pstate.scanout_m2.idled.push(frame.event.clone());
+        self.pstate
+            .scanout_m2
+            .deferred_successor_skips
+            .push(frame.event);
         <Self as Backend>::release_present_source(self, frame.source_pin);
         <Self as Backend>::release_present_source(self, frame.fallback_target_pin);
         self.note_present_skip();
@@ -632,13 +613,14 @@ impl KmsBackend {
         &mut self,
         frame: DirectPresentFrame,
     ) {
-        if let Some(superseded) = self.scanout_m2.queued_successor.replace(frame) {
+        if let Some(superseded) = self.pstate.scanout_m2.queued_successor.replace(frame) {
             self.defer_direct_successor_skip(superseded);
         }
-        self.scanout_m2.hold_direct = true;
+        self.pstate.scanout_m2.hold_direct = true;
         log::debug!(
             "scanout_m2: queued latest direct successor present_id={}",
-            self.scanout_m2
+            self.pstate
+                .scanout_m2
                 .queued_successor
                 .as_ref()
                 .map_or(0, |frame| frame.candidate.present_id)
@@ -651,33 +633,34 @@ impl KmsBackend {
         &mut self,
         reason: &'static str,
     ) {
-        if let Some(mut pending) = self.scanout_m2.pending.take() {
+        if let Some(mut pending) = self.pstate.scanout_m2.pending.take() {
             pending.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_COPY;
             pending.event.emit_idle = true;
-            self.scanout_m2.completed.push(pending.event);
+            self.pstate.scanout_m2.completed.push(pending.event);
             <Self as Backend>::release_present_source(self, pending.source_pin);
             <Self as Backend>::release_present_source(self, pending.fallback_target_pin);
         }
-        if let Some(queued) = self.scanout_m2.queued_successor.take() {
+        if let Some(queued) = self.pstate.scanout_m2.queued_successor.take() {
             self.defer_direct_successor_skip(queued);
         }
-        self.scanout_m2
+        self.pstate
+            .scanout_m2
             .completed
-            .append(&mut self.scanout_m2.deferred_successor_skips);
-        if let Some(current) = self.scanout_m2.current.take() {
+            .append(&mut self.pstate.scanout_m2.deferred_successor_skips);
+        if let Some(current) = self.pstate.scanout_m2.current.take() {
             self.release_direct_frame(current);
         }
-        self.scanout_m2.hold_direct = false;
-        self.scanout_m2.cursor_bound_all = false;
-        self.scanout_m2.unflip_requested = false;
-        self.scanout_m2.unflip_reason = None;
-        self.scanout_m2.unflip_last_reason = None;
-        self.scanout_m2.unflip_awaiting_outputs.clear();
-        self.scanout_m2.reentry_blocked_until_composed = false;
-        self.scanout_m2.reset_eligible_root_probation();
-        self.scanout_m2.unflip_fallback_source = None;
-        self.scanout_m2.unflip_shadow_ready = false;
-        self.scanout_m2.degraded_composed_unflip = false;
+        self.pstate.scanout_m2.hold_direct = false;
+        self.pstate.scanout_m2.cursor_bound_all = false;
+        self.pstate.scanout_m2.unflip_requested = false;
+        self.pstate.scanout_m2.unflip_reason = None;
+        self.pstate.scanout_m2.unflip_last_reason = None;
+        self.pstate.scanout_m2.unflip_awaiting_outputs.clear();
+        self.pstate.scanout_m2.reentry_blocked_until_composed = false;
+        self.pstate.scanout_m2.reset_eligible_root_probation();
+        self.pstate.scanout_m2.unflip_fallback_source = None;
+        self.pstate.scanout_m2.unflip_shadow_ready = false;
+        self.pstate.scanout_m2.degraded_composed_unflip = false;
         self.finish_deferred_cow_release();
         log::debug!("scanout_m2: stopped after scanout replacement: {reason}");
     }
@@ -717,7 +700,7 @@ impl KmsBackend {
         &mut self,
         context: &'static str,
     ) -> io::Result<bool> {
-        if !self.scanout_m2.active() {
+        if !self.pstate.scanout_m2.active() {
             return Ok(false);
         }
         let relight = self.kms_outputs_active;
@@ -732,7 +715,7 @@ impl KmsBackend {
             return Err(error);
         }
         self.stop_direct_after_scanout_replaced(context);
-        self.scanout_m1.clear(context);
+        self.pstate.scanout_m1.clear(context);
         // Disabling every CRTC cancels queued sequence events. Retaining an
         // arm entry would make the next composed frame believe the cancelled
         // request was still pending forever.
@@ -753,16 +736,17 @@ impl KmsBackend {
     ) -> Option<&DirectPresentFrame> {
         let slot = direct_frame_slot_on_output(
             output_idx,
-            self.scanout_m2
+            self.pstate
+                .scanout_m2
                 .pending
                 .as_ref()
                 .map(|frame| &frame.awaiting_outputs),
-            self.scanout_m2.current.is_some(),
-            &self.scanout_m2.unflip_awaiting_outputs,
+            self.pstate.scanout_m2.current.is_some(),
+            &self.pstate.scanout_m2.unflip_awaiting_outputs,
         )?;
         match slot {
-            DirectFrameSlot::Pending => self.scanout_m2.pending.as_ref(),
-            DirectFrameSlot::Current => self.scanout_m2.current.as_ref(),
+            DirectFrameSlot::Pending => self.pstate.scanout_m2.pending.as_ref(),
+            DirectFrameSlot::Current => self.pstate.scanout_m2.current.as_ref(),
         }
     }
 
@@ -772,15 +756,18 @@ impl KmsBackend {
     /// pinned when that direct frame was submitted. This is the COW or nearest
     /// redirected backing for compositor frames, and the window's own backing
     /// for an Unredirected fullscreen frame.
-    pub(super) fn materialize_direct_shadow_for_unflip(&mut self) -> io::Result<()> {
-        if self.scanout_m2.unflip_shadow_ready {
+    pub(in crate::kms::render::backend) fn materialize_direct_shadow_for_unflip(
+        &mut self,
+    ) -> io::Result<()> {
+        if self.pstate.scanout_m2.unflip_shadow_ready {
             return Ok(());
         }
         let current = self
+            .pstate
             .scanout_m2
             .pending
             .as_ref()
-            .or(self.scanout_m2.current.as_ref())
+            .or(self.pstate.scanout_m2.current.as_ref())
             .ok_or_else(|| io::Error::other("scanout M2: no direct frame for fallback"))?;
         let source_id = current.source_id;
         let candidate = current.candidate;
@@ -844,7 +831,7 @@ impl KmsBackend {
                 crate::kms::render::submit_group::FlushReason::PresentCompletionSignal,
             )
             .map_err(|error| io::Error::other(format!("scanout M2 lazy COW submit: {error:?}")))?;
-        self.scanout_m2.unflip_shadow_ready = true;
+        self.pstate.scanout_m2.unflip_shadow_ready = true;
         log::debug!(
             "scanout_m2: lazily materialized direct source_id={} into fallback_target={} for unflip",
             source_id.as_u64(),
@@ -926,7 +913,7 @@ impl KmsBackend {
         result?;
         self.platform
             .cursor_plane_scene_commit_submitted(&cursor_positions);
-        self.scanout_m2.unflip_awaiting_outputs = (0..output_count).collect();
+        self.pstate.scanout_m2.unflip_awaiting_outputs = (0..output_count).collect();
         let describe_frame = |frame: &DirectPresentFrame| {
             (
                 frame.source_id.as_u64(),
@@ -937,10 +924,13 @@ impl KmsBackend {
         log::debug!(
             "scanout_m2: submitted atomic composed unflip outputs={} reason={} last_reason={} pending={:?} current={:?}",
             output_count,
-            self.scanout_m2.unflip_reason.unwrap_or("unknown"),
-            self.scanout_m2.unflip_last_reason.unwrap_or("unknown"),
-            self.scanout_m2.pending.as_ref().map(describe_frame),
-            self.scanout_m2.current.as_ref().map(describe_frame)
+            self.pstate.scanout_m2.unflip_reason.unwrap_or("unknown"),
+            self.pstate
+                .scanout_m2
+                .unflip_last_reason
+                .unwrap_or("unknown"),
+            self.pstate.scanout_m2.pending.as_ref().map(describe_frame),
+            self.pstate.scanout_m2.current.as_ref().map(describe_frame)
         );
         Ok(true)
     }
@@ -950,15 +940,20 @@ impl KmsBackend {
         output_idx: usize,
         clock: yserver_core::backend::PresentClockSample,
     ) -> bool {
-        if self.scanout_m2.unflip_awaiting_outputs.remove(&output_idx) {
-            let degraded = self.scanout_m2.degraded_composed_unflip;
-            if self.scanout_m2.unflip_awaiting_outputs.is_empty() {
+        if self
+            .pstate
+            .scanout_m2
+            .unflip_awaiting_outputs
+            .remove(&output_idx)
+        {
+            let degraded = self.pstate.scanout_m2.degraded_composed_unflip;
+            if self.pstate.scanout_m2.unflip_awaiting_outputs.is_empty() {
                 self.stop_direct_after_scanout_replaced(if degraded {
                     "degraded composed unflip"
                 } else {
                     "atomic composed unflip"
                 });
-                self.scanout_m2.reentry_blocked_until_composed = true;
+                self.pstate.scanout_m2.reentry_blocked_until_composed = true;
                 // Step 3 — while a CRTC scanned out a client buffer directly,
                 // the composed BOs were not painted and the scene was not
                 // tracking them; a direct retirement also bypasses
@@ -966,7 +961,7 @@ impl KmsBackend {
                 // as wholly stale on the way back.
                 self.scene.invalidate_all_scanout_damage();
                 self.scene.mark_scene_structure_dirty();
-                self.scanout_m2.degraded_composed_unflip = false;
+                self.pstate.scanout_m2.degraded_composed_unflip = false;
                 log::debug!("scanout_m2: composed unflip retired on all outputs");
             }
             if degraded {
@@ -977,7 +972,7 @@ impl KmsBackend {
             }
             return true;
         }
-        let Some(pending) = self.scanout_m2.pending.as_mut() else {
+        let Some(pending) = self.pstate.scanout_m2.pending.as_mut() else {
             return false;
         };
         if !pending.awaiting_outputs.remove(&output_idx) {
@@ -993,6 +988,7 @@ impl KmsBackend {
         // while the direct transaction is authoritative.
         if pending.awaiting_outputs.is_empty() {
             let mut presented = self
+                .pstate
                 .scanout_m2
                 .pending
                 .take()
@@ -1003,19 +999,24 @@ impl KmsBackend {
             presented.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_FLIP;
             presented.event.emit_idle = false;
             presented.event.completion_clock = Some(completion_clock);
-            self.scanout_m2.completed.push(presented.event.clone());
+            self.pstate
+                .scanout_m2
+                .completed
+                .push(presented.event.clone());
             // Xorg publishes the retiring flip before re-executing any
             // flip-ready successor. Coalesced successors therefore become
             // ordered Skip completions only at this retirement boundary.
-            self.scanout_m2
+            self.pstate
+                .scanout_m2
                 .completed
-                .append(&mut self.scanout_m2.deferred_successor_skips);
-            if let Some(previous) = self.scanout_m2.current.replace(presented) {
+                .append(&mut self.pstate.scanout_m2.deferred_successor_skips);
+            if let Some(previous) = self.pstate.scanout_m2.current.replace(presented) {
                 self.release_direct_frame(previous);
             }
             log::debug!(
                 "scanout_m2: direct frame retired on all outputs source_id={}",
-                self.scanout_m2
+                self.pstate
+                    .scanout_m2
                     .current
                     .as_ref()
                     .map_or(0, |frame| frame.source_id.as_u64())
@@ -1107,11 +1108,11 @@ impl KmsBackend {
         };
 
         let topology_signature = self.scanout_m1_topology_signature();
-        if self.scanout_m1.topology_signature != topology_signature {
-            self.scanout_m1.clear("output topology changed");
-            self.scanout_m1.topology_signature = topology_signature;
+        if self.pstate.scanout_m1.topology_signature != topology_signature {
+            self.pstate.scanout_m1.clear("output topology changed");
+            self.pstate.scanout_m1.topology_signature = topology_signature;
         }
-        if self.scanout_m1.entries.contains_key(&source_id) {
+        if self.pstate.scanout_m1.entries.contains_key(&source_id) {
             return;
         }
 
@@ -1139,10 +1140,12 @@ impl KmsBackend {
                 root,
                 output_geometry,
             );
-            self.scanout_m1
+            self.pstate
+                .scanout_m1
                 .entries
                 .insert(source_id, ScanoutM1ProbeEntry::rejected());
-            self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
+            self.pstate.scanout_m0.m1_probe_reject =
+                self.pstate.scanout_m0.m1_probe_reject.saturating_add(1);
             return;
         }
 
@@ -1191,8 +1194,11 @@ impl KmsBackend {
             fd_result,
         )) = import
         else {
-            self.scanout_m0.m1_gate_reject_import =
-                self.scanout_m0.m1_gate_reject_import.saturating_add(1);
+            self.pstate.scanout_m0.m1_gate_reject_import = self
+                .pstate
+                .scanout_m0
+                .m1_gate_reject_import
+                .saturating_add(1);
             return;
         };
         const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
@@ -1217,10 +1223,12 @@ impl KmsBackend {
                 width,
                 height,
             );
-            self.scanout_m1
+            self.pstate
+                .scanout_m1
                 .entries
                 .insert(source_id, ScanoutM1ProbeEntry::rejected());
-            self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
+            self.pstate.scanout_m0.m1_probe_reject =
+                self.pstate.scanout_m0.m1_probe_reject.saturating_add(1);
             return;
         }
         let fd = match fd_result {
@@ -1230,10 +1238,12 @@ impl KmsBackend {
                     "scanout_m1: source_id={} dma-buf dup failed: {error}",
                     source_id.as_u64()
                 );
-                self.scanout_m1
+                self.pstate
+                    .scanout_m1
                     .entries
                     .insert(source_id, ScanoutM1ProbeEntry::rejected());
-                self.scanout_m0.m1_probe_error = self.scanout_m0.m1_probe_error.saturating_add(1);
+                self.pstate.scanout_m0.m1_probe_error =
+                    self.pstate.scanout_m0.m1_probe_error.saturating_add(1);
                 return;
             }
         };
@@ -1250,10 +1260,12 @@ impl KmsBackend {
             })
             .collect();
         let Some(primary) = self.platform.primary_device() else {
-            self.scanout_m1
+            self.pstate
+                .scanout_m1
                 .entries
                 .insert(source_id, ScanoutM1ProbeEntry::rejected());
-            self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
+            self.pstate.scanout_m0.m1_probe_reject =
+                self.pstate.scanout_m0.m1_probe_reject.saturating_add(1);
             return;
         };
         let output_indices: Vec<_> = (0..self.platform.outputs.len()).collect();
@@ -1285,10 +1297,12 @@ impl KmsBackend {
                     height,
                     output_geometry,
                 );
-                self.scanout_m1
+                self.pstate
+                    .scanout_m1
                     .entries
                     .insert(source_id, ScanoutM1ProbeEntry::accepted(framebuffer));
-                self.scanout_m0.m1_probe_pass = self.scanout_m0.m1_probe_pass.saturating_add(1);
+                self.pstate.scanout_m0.m1_probe_pass =
+                    self.pstate.scanout_m0.m1_probe_pass.saturating_add(1);
             }
             Ok(crate::drm::modeset::DirectScanoutTestResult::Rejected(error)) => {
                 log::debug!(
@@ -1296,10 +1310,12 @@ impl KmsBackend {
                     source_id.as_u64(),
                     candidate.src_host_xid,
                 );
-                self.scanout_m1
+                self.pstate
+                    .scanout_m1
                     .entries
                     .insert(source_id, ScanoutM1ProbeEntry::rejected());
-                self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
+                self.pstate.scanout_m0.m1_probe_reject =
+                    self.pstate.scanout_m0.m1_probe_reject.saturating_add(1);
             }
             Err(error) => {
                 log::warn!(
@@ -1307,10 +1323,12 @@ impl KmsBackend {
                     source_id.as_u64(),
                     candidate.src_host_xid,
                 );
-                self.scanout_m1
+                self.pstate
+                    .scanout_m1
                     .entries
                     .insert(source_id, ScanoutM1ProbeEntry::rejected());
-                self.scanout_m0.m1_probe_error = self.scanout_m0.m1_probe_error.saturating_add(1);
+                self.pstate.scanout_m0.m1_probe_error =
+                    self.pstate.scanout_m0.m1_probe_error.saturating_add(1);
             }
         }
     }
@@ -1367,13 +1385,23 @@ impl KmsBackend {
         let shaped_off = |frame: &DirectPresentFrame| {
             !self.direct_shape_chain_covers_root(frame.candidate.paint_dst_host_xid, root)
         };
-        self.scanout_m2.pending.as_ref().is_some_and(shaped_off)
+        self.pstate
+            .scanout_m2
+            .pending
+            .as_ref()
+            .is_some_and(shaped_off)
             || self
+                .pstate
                 .scanout_m2
                 .queued_successor
                 .as_ref()
                 .is_some_and(shaped_off)
-            || self.scanout_m2.current.as_ref().is_some_and(shaped_off)
+            || self
+                .pstate
+                .scanout_m2
+                .current
+                .as_ref()
+                .is_some_and(shaped_off)
     }
 
     /// Whether an unredirected Present target is still the window which the
@@ -1577,7 +1605,7 @@ impl KmsBackend {
             && untransformed
             && source_id.is_some();
         self.maybe_probe_scanout_m1(source_id, target, coverage, candidate);
-        let diag = &mut self.scanout_m0;
+        let diag = &mut self.pstate.scanout_m0;
         diag.presents = diag.presents.saturating_add(1);
         if authoritative {
             diag.authoritative = diag.authoritative.saturating_add(1);
@@ -1766,40 +1794,23 @@ impl KmsBackend {
     /// Gate every master-requiring operation on this. In Direct mode
     /// `vt_state` is always `Active`, so this is always `true` there.
     pub(in crate::kms::render::backend) fn scanout_allowed(&self) -> bool {
-        self.vt_state.allows_scanout()
-    }
-
-    /// The scene needs a (re)compose when its structure changed
-    /// (map/unmap/restack/redirect — `scene_structure_dirty`) OR a
-    /// client painted a scene-participating window since the last
-    /// compose (undrained presentation damage). `next_wakeup` and
-    /// `maybe_composite` MUST use the same predicate: if `next_wakeup`
-    /// armed a wake that `maybe_composite` then declined, the loop
-    /// would busy-spin; if `maybe_composite` composed state that
-    /// `next_wakeup` never wakes for, the paint would be stranded (the
-    /// xfce submenu bug — a menu painted after its map-compose sat
-    /// off-screen until an unrelated event poked the loop).
-    pub(super) fn scene_wants_scene(&self) -> bool {
-        self.scene.scene_structure_dirty
-            || self.store.has_pending_presentation_damage()
-            // An invalidated or never-presented frame owes a repaint no producer
-            // reports; without this the tick is never driven to paint it.
-            || self.scene.owes_repaint()
+        self.pstate.vt_state.allows_scanout()
     }
 
     pub(super) fn scene_wants_compose(&self) -> bool {
-        if self.scanout_m2.pending.is_some() || !self.scanout_m2.unflip_awaiting_outputs.is_empty()
+        if self.pstate.scanout_m2.pending.is_some()
+            || !self.pstate.scanout_m2.unflip_awaiting_outputs.is_empty()
         {
             // The grouped direct or composed transaction's flip events are
             // the next progress source; its state will be re-arbitrated there.
             return false;
         }
         let outputs: Vec<_> = (0..self.platform.outputs.len()).collect();
-        let direct_transaction_waiting = self.scanout_m2.pending.is_some()
-            || self.scanout_m2.queued_successor.is_some()
-            || self.scanout_m2.unflip_requested;
-        let unflip_waiting_for_cursor = self.scanout_m2.current.is_some()
-            && self.scanout_m2.unflip_requested
+        let direct_transaction_waiting = self.pstate.scanout_m2.pending.is_some()
+            || self.pstate.scanout_m2.queued_successor.is_some()
+            || self.pstate.scanout_m2.unflip_requested;
+        let unflip_waiting_for_cursor = self.pstate.scanout_m2.current.is_some()
+            && self.pstate.scanout_m2.unflip_requested
             && self.platform.cursor_commit_in_flight_for_outputs(&outputs);
         if unflip_waiting_for_cursor {
             // The cursor flip event is the next progress source. Re-arming an
@@ -1962,71 +1973,6 @@ impl KmsBackend {
         }
     }
 
-    pub(in crate::kms::render::backend) fn backend_scanout_before_block(&mut self) {
-        // BlockHandler analog (cf. Xorg glamor_block_handler → glamor_flush):
-        // every dispatch-loop iteration, just before the core loop blocks,
-        // reap render-op resources whose fences have signaled. This is the
-        // reclaim half of `on_page_flip_ready` (the scanout / compose / flush
-        // half stays page-flip-driven), lifted onto the dispatch loop so it
-        // runs even when no page-flip occurs.
-        //
-        // Without this, the engine `submitted` queue (one per-op command
-        // buffer + any displaced images each) is drained ONLY on page-flip.
-        // While the display is dark (DPMS-off / monitor standby / VT-away)
-        // page-flips stop, but clients keep submitting render ops, so the
-        // queue grows without bound until amdgpu can't allocate command-
-        // submission memory and the device is lost
-        // (project_reclamation_starvation_leak). poll_retired only frees
-        // ops whose fence has signaled and is a cheap no-op on an empty
-        // queue, so running it every iteration costs nothing at idle.
-        self.engine.poll_retired(&self.platform.gpu);
-        self.poll_pending_retire_with_invalidate();
-        // #196: destroy pixmap-pool entries idle past the eviction age, so
-        // a burst drains back down; `next_wakeup` wakes us for it.
-        if let Some(pool) = self.platform.gpu.pixmap_pool.as_ref() {
-            pool.trim_idle(std::time::Instant::now());
-        }
-        // Diagnostic: drive the 1Hz telemetry emit from here too,
-        // publishing the live `submitted`-queue depth. maybe_emit()
-        // self-gates to 1Hz and is a no-op below threshold, but running
-        // it every dispatch iteration means the `render_telemetry:` line (and
-        // the submit-trace flush) keep ticking even while the display is
-        // dark — exactly when `submitted_queue_depth` is the number worth
-        // watching (project_reclamation_starvation_leak). Without this,
-        // the only other maybe_emit caller is on the compose path, which
-        // is gated off when dark, so telemetry went silent in the window.
-        self.telemetry.maybe_emit(self.engine.pending_count());
-    }
-
-    pub(in crate::kms::render::backend) fn backend_scanout_flush_before_damage_notify(&mut self) {
-        // A compositor may sample a redirected backing after DamageNotify
-        // or after retrieving coalesced damage via Subtract/FetchRegion.
-        // Close all recording paths before publishing their producer fences.
-        if let Err(error) = self.engine.flush_render_batch(
-            &mut self.store,
-            &mut self.platform.gpu,
-            crate::kms::render::engine::RenderFlushReason::Other,
-        ) {
-            log::warn!("render damage boundary batch flush failed: {error:?}");
-        }
-        if let Err(error) = self.engine.close_open_frame(
-            &mut self.store,
-            &mut self.platform.gpu,
-            crate::kms::render::frame_builder::CloseReason::DamageBoundary,
-        ) {
-            log::warn!("render DamageNotify submission boundary failed: {error:?}");
-        }
-        // Closing an already-closed frame does not drain command buffers
-        // parked in the submit group (including the render batch above).
-        if let Err(error) = self.engine.flush_submit_group(
-            &mut self.store,
-            &mut self.platform.gpu,
-            crate::kms::render::submit_group::FlushReason::SyncBoundary,
-        ) {
-            log::warn!("render damage boundary submit flush failed: {error:?}");
-        }
-    }
-
     pub(in crate::kms::render::backend) fn backend_scanout_next_wakeup(
         &self,
     ) -> Option<std::time::Instant> {
@@ -2045,44 +1991,28 @@ impl KmsBackend {
         } else {
             None
         };
-        let needs_present_poll = self.pending_present_batches.iter().any(|batch| {
-            matches!(
-                batch.wait,
-                crate::kms::render::present_batch::PresentBatchWait::Poll
-            )
-        });
-        let needs_source_wait_poll = self.pending_present_source_waits.values().any(|wait| {
-            !wait.ready_reported
-                && (wait.poll_timeline || wait.fds.iter().any(|fd| !fd.registered && !fd.ready))
-        });
-        let present_deadline = if needs_present_poll || needs_source_wait_poll {
-            Some(now + std::time::Duration::from_millis(1))
-        } else {
-            None
-        };
+        let needs_source_wait_poll =
+            self.pstate
+                .pending_present_source_waits
+                .values()
+                .any(|wait| {
+                    !wait.ready_reported
+                        && (wait.poll_timeline
+                            || wait.fds.iter().any(|fd| !fd.registered && !fd.ready))
+                });
+        let source_wait_deadline =
+            needs_source_wait_poll.then(|| now + std::time::Duration::from_millis(1));
         let rescan_deadline = self
+            .pstate
             .hotplug_rescan_deadline
             .map(|until| if now >= until { now } else { until });
-        // A drawable freed while its GPU work was in flight waits in
-        // `pending_retire` for `before_block` to see its fence signal; with
-        // no other activity nothing would wake us to release it.
-        let retire_deadline =
-            (self.store.pending_retire_count() > 0).then(|| now + PENDING_RETIRE_POLL_INTERVAL);
         scene_deadline
             .into_iter()
-            .chain(present_deadline)
+            .chain(source_wait_deadline)
             .chain(rescan_deadline)
-            .chain(retire_deadline)
             // Not gated on `allow_kms_timers`: `maybe_composite` closes the
             // paint frame on its timeout while dark too (#177).
-            .chain(self.engine.open_frame_timeout_deadline())
-            .chain(
-                self.platform
-                    .gpu
-                    .pixmap_pool
-                    .as_ref()
-                    .and_then(|pool| pool.next_trim_deadline()),
-            )
+            .chain(self.gpu_work_deadline(now))
             .chain(
                 allow_kms_timers
                     .then(|| self.cursor_anim_deadline())
@@ -2162,7 +2092,7 @@ impl KmsBackend {
         // commit gets the first opportunity once all of its CRTCs are clear.
         // The helper leaves it in the slot while any CRTC is still blocked.
         self.submit_queued_direct_successor();
-        if self.scanout_m2.active() {
+        if self.pstate.scanout_m2.active() {
             use crate::kms::render::scene::CursorPlaneMode;
             let cursor_mode = self.scene.cursor_mode();
             if self.platform.any_output_transformed() {
@@ -2180,21 +2110,23 @@ impl KmsBackend {
             // Never race a composed commit against the all-output direct
             // transaction. A requested unflip starts on the first tick after
             // the direct transaction itself has fully retired.
-            if self.scanout_m2.pending.is_some()
-                || !self.scanout_m2.unflip_awaiting_outputs.is_empty()
+            if self.pstate.scanout_m2.pending.is_some()
+                || !self.pstate.scanout_m2.unflip_awaiting_outputs.is_empty()
             {
                 self.drain_render_telemetry();
                 self.telemetry.maybe_emit(self.engine.pending_count());
                 return Ok(());
             }
-            if self.scanout_m2.hold_direct && !self.scanout_m2.unflip_requested {
+            if self.pstate.scanout_m2.hold_direct && !self.pstate.scanout_m2.unflip_requested {
                 // A fully-retired direct frame may continue receiving cursor
                 // motion. Let the scheduling pass send cursor-only commits
                 // while there is no direct successor waiting; once a
                 // successor is retained, its grouped direct transaction gets
                 // every later position and no CRTC is extended by another
                 // cursor-only commit.
-                if self.scanout_m2.current.is_some() && self.scanout_m2.queued_successor.is_none() {
+                if self.pstate.scanout_m2.current.is_some()
+                    && self.pstate.scanout_m2.queued_successor.is_none()
+                {
                     for output_idx in 0..self.platform.outputs.len() {
                         match self
                             .platform
@@ -2211,7 +2143,7 @@ impl KmsBackend {
                 self.telemetry.maybe_emit(self.engine.pending_count());
                 return Ok(());
             }
-            if self.scanout_m2.current.is_some() && self.scanout_m2.unflip_requested {
+            if self.pstate.scanout_m2.current.is_some() && self.pstate.scanout_m2.unflip_requested {
                 match self.submit_composed_unflip() {
                     Ok(true) => {
                         // The atomic replacement itself is now pending on every
@@ -2240,132 +2172,24 @@ impl KmsBackend {
                         // planes this tick, and `retire_direct_output` releases the
                         // direct frame only after every output has retired on the
                         // composed framebuffer.
-                        self.scanout_m2.unflip_awaiting_outputs =
+                        self.pstate.scanout_m2.unflip_awaiting_outputs =
                             (0..self.platform.outputs.len()).collect();
-                        self.scanout_m2.degraded_composed_unflip = true;
+                        self.pstate.scanout_m2.degraded_composed_unflip = true;
                         self.scene.mark_scene_structure_dirty();
                     }
                 }
             }
         }
-        // One main-loop tick = one frame_id. Submit events
-        // recorded between calls share the surrounding tick's
-        // id; the scene_compose event of this tick (if it
-        // submits) also carries this id.
-        self.telemetry.advance_frame();
-        let can_submit_scene =
-            self.scene_wants_scene() && self.scene.has_output_ready_for_submit(&self.platform);
-        // #214 telemetry: did this tick's compose close submit paint, and
-        // did the tick then compose anything?
-        let mut legacy_close_submitted = false;
-        if can_submit_scene {
-            // Stage 5 Task 3 (render-composite generalization): flush
-            // the render batch — scene.tick samples dst.
-            self.drain_engine_present_batches();
-            if let Err(e) = self.engine.flush_render_batch(
-                &mut self.store,
-                &mut self.platform.gpu,
-                crate::kms::render::engine::RenderFlushReason::Present,
-            ) {
-                log::warn!("render maybe_composite: flush_render_batch failed: {e:?}");
-            }
-            // Phase B Invariant M3: close any open frame BEFORE legacy compose
-            // records. compose samples drawable storage at record time
-            // (scene.rs:1307), so the open frame's layout + ticket-touch overlays
-            // must be committed before the compose CB lands. Retires at sub-phase
-            // B.4 when compose itself ports into the frame builder.
-            // NOTE: integration test for M3 lives in Task 23's mixed-sequence
-            // smoke (frame_builder_mixed_sequence_smoke); Task 13 only adds
-            // the wiring. Until Task 15 ports composite_glyphs into the frame
-            // builder, no frame can be open, so this call is a no-op.
-            match self.engine.close_open_frame(
-                &mut self.store,
-                &mut self.platform.gpu,
-                crate::kms::render::frame_builder::CloseReason::LegacyScCompose,
-            ) {
-                Ok(crate::kms::render::frame_builder::CloseOutcome::Submitted { .. }) => {
-                    legacy_close_submitted = true;
-                }
-                Ok(crate::kms::render::frame_builder::CloseOutcome::AlreadyClosed) => {}
-                Err(e) => log::warn!("render maybe_composite: close_open_frame failed: {e:?}"),
-            }
-            // Phase A Task 4: flush the SubmitGroup so scene.tick
-            // observes all paint CBs already submitted to the queue.
-            // Compose stays on its own dedicated `vkQueueSubmit2`
-            // (record_compose) — only the buffered paint group is
-            // flushed here. Drive through the engine wrapper so
-            // parked `pending_group_ops` commit too.
-            if let Err(e) = self.engine.flush_submit_group(
-                &mut self.store,
-                &mut self.platform.gpu,
-                crate::kms::render::submit_group::FlushReason::SceneCompose,
-            ) {
-                log::warn!("render maybe_composite: flush_submit_group failed: {e:?}");
-            }
+        let composed_outputs = self.compose_tick();
+        if let Some(composed) = &composed_outputs
+            && self.pstate.scanout_m2.reentry_blocked_until_composed
+            && composed.len() == self.platform.outputs.len()
+        {
+            self.pstate.scanout_m2.reentry_blocked_until_composed = false;
+            log::debug!("scanout_m2: composed fallback submitted; re-entry barrier cleared");
         }
-        // Task 4 inserts ready direct-candidate arbitration here. Direct
-        // Present callbacks keep their existing admission/submission paths.
-        let mut scene_submitted_outputs = HashSet::new();
-        let result = if !can_submit_scene {
-            Ok(())
-        } else {
-            let cow_host_xid = self.cow_host_xid();
-            let outputs = self.platform.scene_output_layouts();
-            let input = crate::kms::render::backend::scene_input(
-                &self.core,
-                &self.windows,
-                &outputs,
-                self.platform.fb_dimensions(),
-            );
-            match self.scene.tick(
-                &input,
-                &mut self.store,
-                &mut self.platform,
-                &mut self.telemetry,
-                cow_host_xid,
-            ) {
-                Ok(composed_outputs) => {
-                    scene_submitted_outputs.extend(composed_outputs.iter().copied());
-                    if legacy_close_submitted {
-                        crate::kms::vk::submit_stats::SUBMITS
-                            .record_legacy_sc_tick(!composed_outputs.is_empty());
-                    }
-                    if self.scanout_m2.reentry_blocked_until_composed
-                        && composed_outputs.len() == self.platform.outputs.len()
-                    {
-                        self.scanout_m2.reentry_blocked_until_composed = false;
-                        log::debug!(
-                            "scanout_m2: composed fallback submitted; re-entry barrier cleared"
-                        );
-                    }
-                    for output_idx in composed_outputs {
-                        self.telemetry.record_composite_submit();
-                        // One scene_compose event per output that presented
-                        // this tick, keyed by the exact output index.
-                        self.telemetry.record_submit_event(SubmitEvent {
-                            frame_id: 0,
-                            kind: SubmitKind::SceneCompose,
-                            target_kind: TargetKind::Output,
-                            target_id: u64::try_from(output_idx).unwrap_or(0),
-                            batch_size: 1,
-                            op: SubmitOp::None,
-                            src_class: SrcClass::None,
-                            mask_class: SrcClass::None,
-                            pipeline_id: None,
-                            flags: SubmitFlags::NONE,
-                        });
-                    }
-                    Ok(())
-                }
-                Err(e) => {
-                    if legacy_close_submitted {
-                        crate::kms::vk::submit_stats::SUBMITS.record_legacy_sc_tick(false);
-                    }
-                    log::warn!("render maybe_composite: scene.tick failed: {e:?}");
-                    Ok(())
-                }
-            }
-        };
+        let scene_submitted_outputs: HashSet<usize> =
+            composed_outputs.into_iter().flatten().collect();
         let cursor_outcome = self.platform.take_deferred_cursor_move_outcome();
         self.handle_cursor_move_outcome(cursor_outcome);
         for output_idx in 0..self.platform.outputs.len() {
@@ -2390,196 +2214,6 @@ impl KmsBackend {
             }
         }
         self.drain_paint_submit_telemetry();
-        result
-    }
-
-    /// Stage 4d — Composite Overlay Window allocation.
-    ///
-    /// The **0 → 1 claim edge only**: core owns the claim list and this
-    /// backend counts nothing, so every call here is a first claim.
-    /// Allocates screen-extent depth-24 storage at xid
-    /// `COMPOSITE_OVERLAY_WINDOW` (0x103) and stores the resulting
-    /// `DrawableId` on `self.cow_id`. The drawable stays off the normal
-    /// scene path; xfwm4 paints its composited desktop into its own child
-    /// window, so adding the COW as a topmost scene layer would cover the
-    /// real output with a stale black surface.
-    ///
-    /// Initial fill: storage from `allocate_drawable_storage`
-    /// is uninitialised Vk-DEVICE_LOCAL memory (same problem
-    /// Stage 3f.14 fixed for `create_pixmap`). We do an explicit
-    /// OPAQUE-black fill via `engine.fill_rect` so the
-    /// compositor's first paint composites over a known value
-    /// rather than recycled GPU garbage. Opaque, not transparent:
-    /// the COW is depth-24, and a depth-24 drawable has no alpha
-    /// channel on X11 — see `default_window_init_color`. The fill is
-    /// best-effort — on the stub fixture (no Vk) `engine.fill_rect`
-    /// errors; log + continue (storage already exists at xid level).
-    pub(in crate::kms::render::backend) fn backend_scanout_get_overlay_window(
-        &mut self,
-        _origin: Option<OriginContext>,
-    ) -> io::Result<bool> {
-        if self.cow_id.is_some() {
-            // Core only calls this on the 0 → 1 claim edge, so a live
-            // `cow_id` here can only be a physical teardown the previous
-            // final release deferred behind direct scanout: the protocol
-            // resource was logically destroyed but the backend identity
-            // and storage stayed alive for their safe replacement. Reuse
-            // that identity and ask core to materialize the protocol
-            // resource again.
-            debug_assert!(
-                self.deferred_cow_release,
-                "get_overlay_window is the 0 → 1 edge; a live cow_id here \
-                 without a deferred release means core and the backend have \
-                 drifted",
-            );
-            self.deferred_cow_release = false;
-            return Ok(true);
-        }
-        let fb_w = self.platform.fb_w.max(1);
-        let fb_h = self.platform.fb_h.max(1);
-        let storage = match self.platform.gpu.allocate_drawable_storage_as(
-            fb_w,
-            fb_h,
-            24,
-            crate::kms::vk::mem_accounting::MemCategory::WindowStorage,
-        ) {
-            Ok(storage) => {
-                self.telemetry.record_storage_allocation();
-                self.telemetry.record_image_view_create();
-                storage
-            }
-            Err(e) => {
-                // Test-fixture / no-Vk path: same shape as
-                // `init_root_storage` — fall back to a null-view
-                // stub so unit tests can exercise refcount /
-                // scene-registration without a live Vk ICD.
-                log::debug!("render get_overlay_window: no Vk, using stub COW storage: {e:?}");
-                crate::kms::render::store::Storage::for_tests_null(
-                    ash::vk::Extent2D {
-                        width: u32::from(fb_w),
-                        height: u32::from(fb_h),
-                    },
-                    crate::kms::render::gpu::GpuCore::format_for_depth(24),
-                )
-            }
-        };
-        let xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
-        // Defensive: if a stale mapping somehow survives a prior
-        // teardown (decref's PendingFence path detaches xid for us,
-        // but a synchronous-destroy path could race), detach first
-        // so the allocate doesn't trip XidInUse.
-        self.store.detach_xid(xid);
-        let id = self
-            .store_alloc(xid, DrawableKind::Window, 24, true, storage)
-            .map_err(|e| {
-                io::Error::other(format!("render get_overlay_window: store alloc: {e:?}"))
-            })?;
-        // Stage 3f.14 follow-on — zero-fill the fresh storage so
-        // the compositor doesn't composite over recycled GPU
-        // garbage on its first paint. Best-effort on stub paths.
-        let rect = ash::vk::Rect2D {
-            offset: ash::vk::Offset2D::default(),
-            extent: ash::vk::Extent2D {
-                width: u32::from(fb_w),
-                height: u32::from(fb_h),
-            },
-        };
-        if let Err(e) = self.engine.fill_rect(
-            &mut self.store,
-            &mut self.platform.gpu,
-            Dst::server_internal(id),
-            rect,
-            default_window_init_color(24),
-        ) && self.platform.gpu.vk.is_some()
-        {
-            log::warn!("render get_overlay_window: initial fill failed: {e:?}");
-        }
-        self.cow_id = Some(id);
-
-        // Phase 2 Task 2.2 — also materialize the backend's window-
-        // tree projection so the COW participates in build_scene /
-        // hit-testing / paint resolution the same way any top-level
-        // window does. The xid is the well-known protocol xid; v2
-        // keys windows on host xid directly.
-        let cow_host_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
-        let rank = self.alloc_window_stack_rank();
-        let geom = WindowGeometry {
-            border_width: 0,
-            border_pixel: None,
-            border_pixmap: None,
-            x: 0,
-            y: 0,
-            width: fb_w,
-            height: fb_h,
-            depth: 24,
-            mapped: true,
-            viewable: true,
-            // `parent: None` matches windows's convention for a
-            // direct child of the root (root is not itself tracked
-            // in windows — see register_top_level).
-            parent: None,
-            stack_rank: rank,
-            bg_pixel: None,
-            bg_pixmap: None,
-            cursor: None,
-        };
-        self.windows.insert(cow_host_xid, geom);
-        // The COW takes the pointer until its input region is emptied, so
-        // crossings resolve it like any window (Nonlinear to a sibling).
-        self.core.xid_map.insert(
-            cow_host_xid,
-            yserver_core::resources::COMPOSITE_OVERLAY_WINDOW,
-        );
-        self.deferred_cow_release = false;
-        // Step 2 (DRIFT 2): the COW's place in top_level_order is no longer
-        // set here — the GetOverlayWindow core handler reprojects from core
-        // children via `sync_top_level_order` AFTER materialize_cow_resource
-        // (which inserts the COW as a root child capped on top).
-        self.scene.mark_scene_structure_dirty();
-        Ok(true)
-    }
-
-    /// Stage 4d — Composite Overlay Window release.
-    ///
-    /// The **1 → 0 claim edge only**: core owns the claim list, so every
-    /// call here is the final release. Decrefs the store storage and
-    /// clears `self.cow_id`. If direct scanout is active, the logical
-    /// release succeeds immediately but physical teardown is deferred
-    /// until the composed replacement retires.
-    /// `DrawableStore::decref` removes the xid mapping (immediately on
-    /// synchronous-destroy, deferred on `PendingFence`) so the next
-    /// `GetOverlayWindow` reallocates fresh storage at the same xid.
-    ///
-    /// Returns `Ok(false)` when nothing was materialized — defensive
-    /// only; core does not call this without a claim.
-    pub(in crate::kms::render::backend) fn backend_scanout_release_overlay_window(
-        &mut self,
-        _origin: Option<OriginContext>,
-    ) -> io::Result<bool> {
-        if self.cow_id.is_none() {
-            return Ok(false);
-        }
-        if self.scanout_m2.active() {
-            // Do this while cow_id and its storage owner are authoritative.
-            // Failure leaves the COW and the direct pins untouched, so core
-            // can keep the caller's claim and let the compositor retry, or
-            // fail safely without freeing a scanned buffer.
-            self.materialize_direct_shadow_for_unflip()?;
-            self.request_direct_unflip("release_last_overlay_window");
-            self.deferred_cow_release = true;
-            return Ok(true);
-        }
-        self.finish_cow_release();
-        Ok(true)
-    }
-
-    pub(in crate::kms::render::backend) fn backend_scanout_cow_host_xid(&self) -> Option<u32> {
-        // The COW's host xid is the well-known protocol xid once
-        // get_overlay_window has materialized; None otherwise.
-        if self.cow_id.is_some() {
-            Some(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0)
-        } else {
-            None
-        }
+        Ok(())
     }
 }

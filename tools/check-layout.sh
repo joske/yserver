@@ -32,12 +32,38 @@ if grep -rnE 'crate::drm|\bgbm\b|OwnedFd|RawFd|libc::|nix::|platform::|backend::
     fail=1
 fi
 
+# 2b. ...and reaches the platform only through the seam (`P::` hooks).
+if grep -rnE 'PlatformBackend|pstate\.|CrtcKey|DrmDeviceKey|crate::input|crate::vt\b|vk::scanout|\binput::' "$portable"; then
+    echo "portable: $portable names the KMS platform or its state (matches above)"
+    fail=1
+fi
+
 # 3. yserver-render does not depend on the KMS stack or on yserver-core.
 tree=$(cargo tree -p yserver-render -e normal --prefix none --format '{p}')
 forbidden=$(echo "$tree" | awk '{ print $1 }' | sort -u |
     grep -xE 'drm|drm-sys|drm-ffi|gbm|gbm-sys|input|input-sys|udev|libudev-sys|yserver-core' || true)
 if [ -n "$forbidden" ]; then
     echo "render deps: yserver-render depends on: $(echo "$forbidden" | tr '\n' ' ')"
+    fail=1
+fi
+
+# 4. The surface platform is OS-neutral; window-system code lives in src/macos/.
+if grep -rnE 'objc2|AppKit|\bMetal|target_os' crates/yserver/src/surface; then
+    echo "surface: crates/yserver/src/surface names a window system or target_os (matches above)"
+    fail=1
+fi
+
+# 5. The Linux build pulls in no Objective-C runtime crates.
+linux_tree=$(cargo tree -p yserver -e normal --target x86_64-unknown-linux-gnu --prefix none --format '{p}')
+objc=$(echo "$linux_tree" | awk '{ print $1 }' | sort -u | grep -E '^(objc2.*|block2|dispatch2)$' || true)
+if [ -n "$objc" ]; then
+    echo "linux deps: yserver depends on: $(echo "$objc" | tr '\n' ' ')"
+    fail=1
+fi
+
+# 6. Behaviour differences come from hooks and capabilities, not target_os.
+if grep -rn 'target_os' "$portable"; then
+    echo "portable: $portable names target_os (matches above)"
     fail=1
 fi
 

@@ -1,5 +1,5 @@
 use crate::kms::render::{
-    backend::{KmsBackend, WindowGeometry, kms::do_dump_scanout},
+    backend::{WindowGeometry, XBackend, seam::Platform},
     target::Src,
 };
 use std::io;
@@ -87,8 +87,8 @@ pub(super) fn picture_pict_format(core: &crate::kms::core::KmsCore, host_pic: u3
 /// production-tested path. Each dump is one queue submit + one
 /// fence wait, so the total stop-the-world time is `O(n)` Vk waits
 /// — at ~5 ms per drawable on bee this is fine for diagnostic use.
-pub(in crate::kms::render::backend) fn do_dump_drawables(
-    backend: &mut KmsBackend,
+pub(in crate::kms::render::backend) fn do_dump_drawables<P: Platform>(
+    backend: &mut XBackend<P>,
 ) -> io::Result<()> {
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -317,7 +317,7 @@ leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::ImageText);
         let bytes = match backend.engine.get_image(
             &mut backend.store,
-            &mut backend.platform.gpu,
+            backend.platform.gpu_mut(),
             Src::server_internal(t.id),
             rect,
             t.depth,
@@ -469,7 +469,7 @@ fn write_drawable_ppm(
     Ok(())
 }
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     pub(in crate::kms::render::backend) fn backend_dump_dump_drawables(&mut self) {
         if let Err(e) = do_dump_drawables(self) {
             log::warn!("render dump_drawables: {e}");
@@ -480,7 +480,7 @@ impl KmsBackend {
         // Present after caja paints, which moves on every frame).
         // Pair the scanout dump with the drawable dump so a single
         // Ctrl+Alt+F12 captures all three artifacts atomically.
-        if let Err(e) = do_dump_scanout(self) {
+        if let Err(e) = P::dump_scanout_files(self) {
             log::warn!("render dump_drawables: scanout side: {e}");
         }
         // Surface the COW + present-src ring state so the user can

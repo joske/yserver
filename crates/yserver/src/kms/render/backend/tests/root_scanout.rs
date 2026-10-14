@@ -495,8 +495,8 @@ fn root_read_during_direct_scanout_returns_the_flipped_source() {
     );
 
     // Dropping the direct frame puts the read back on the composed route.
-    backend.scanout_m2.current = None;
-    backend.scanout_m2.hold_direct = false;
+    backend.pstate.scanout_m2.current = None;
+    backend.pstate.scanout_m2.hold_direct = false;
     assert!(
         bgr(&read(&mut backend)).iter().all(|px| *px == [0, 0, 0]),
         "the composed route must come back once the CRTC is unflipped"
@@ -1217,7 +1217,7 @@ fn scanout_read_route_is_composed_once_the_direct_frame_is_gone() {
     let target_xid = 0x5704;
     let fallback_id = seed_window(&mut b, target_xid, None, 0, 0);
     install_direct_frame_for_target_test(&mut b, target_xid, fallback_id, true);
-    b.scanout_m2.current = None;
+    b.pstate.scanout_m2.current = None;
 
     // The stub fixture has no scanout pools, so the composed branch can
     // only report "not covered by any pool" — which is still proof the
@@ -1260,7 +1260,8 @@ fn scanout_read_route_rejects_a_vanished_direct_source() {
     let target_xid = 0x570c;
     let fallback_id = seed_window(&mut b, target_xid, None, 0, 0);
     install_direct_frame_for_target_test(&mut b, target_xid, fallback_id, true);
-    b.scanout_m2
+    b.pstate
+        .scanout_m2
         .current
         .as_mut()
         .expect("direct frame installed")
@@ -1295,7 +1296,7 @@ fn scanout_read_route_is_per_output_during_a_composed_unflip() {
     let fallback_id = seed_window(&mut b, target_xid, None, 0, 0);
     install_direct_frame_for_target_test(&mut b, target_xid, fallback_id, true);
     // Composed unflip retired on output 0, still awaited on output 1.
-    b.scanout_m2.unflip_awaiting_outputs = outputs_set(&[1]);
+    b.pstate.scanout_m2.unflip_awaiting_outputs = outputs_set(&[1]);
 
     assert!(
         b.direct_scanout_frame_for_output(0).is_none(),
@@ -1428,7 +1429,7 @@ fn a_hotplug_that_shrank_the_extent_leaves_root_storage_alone() {
     );
 
     // B departs for good: no reservation, so the extent shrinks.
-    b.randr_id_alloc.entry_mut(&departing).last_enabled = None;
+    b.pstate.randr_id_alloc.entry_mut(&departing).last_enabled = None;
     b.platform.outputs.pop();
     b.platform.scanout_pools.pop();
     b.platform.bo_generations.pop();
@@ -1600,7 +1601,7 @@ fn set_logical_screen_size_updates_fb_and_root_storage() {
     let mut b = KmsBackend::for_tests();
     let initial_w = b.platform.fb_w;
     let initial_h = b.platform.fb_h;
-    let initial_epoch = b.crtc_config_topology_epoch;
+    let initial_epoch = b.pstate.crtc_config_topology_epoch;
 
     // Sanity: root storage allocated at boot dimensions.
     let root_xid = b.core.window_id;
@@ -1622,7 +1623,7 @@ fn set_logical_screen_size_updates_fb_and_root_storage() {
     assert_eq!(b.platform.fb_w, new_w, "fb_w must reflect new width");
     assert_eq!(b.platform.fb_h, new_h, "fb_h must reflect new height");
     assert_eq!(
-        b.crtc_config_topology_epoch,
+        b.pstate.crtc_config_topology_epoch,
         initial_epoch.wrapping_add(1),
         "a changed logical extent invalidates pending topology snapshots",
     );
@@ -1662,7 +1663,7 @@ fn set_logical_screen_size_updates_fb_and_root_storage() {
     assert_eq!(b.platform.fb_w, new_w);
     assert_eq!(b.platform.fb_h, new_h);
     assert_eq!(
-        b.crtc_config_topology_epoch,
+        b.pstate.crtc_config_topology_epoch,
         initial_epoch.wrapping_add(1),
         "an idempotent logical-size request must not invalidate probes",
     );

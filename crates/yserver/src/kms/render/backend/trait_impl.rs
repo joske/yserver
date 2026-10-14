@@ -1,4 +1,4 @@
-use crate::kms::render::backend::KmsBackend;
+use crate::kms::render::backend::{XBackend, seam::Platform};
 use std::{any::Any, io};
 use yserver_core::{
     backend::{
@@ -14,7 +14,7 @@ use yserver_core::{
 };
 use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, xfixes};
 
-impl Backend for KmsBackend {
+impl<P: Platform> Backend for XBackend<P> {
     // ── A. Accessors (mirror KmsBackend exactly) ────────────────
 
     fn window_id(&self) -> u32 {
@@ -34,7 +34,7 @@ impl Backend for KmsBackend {
     }
 
     fn fb_dimensions(&self) -> (u16, u16) {
-        KmsBackend::fb_dimensions(self)
+        self.platform.fb_size()
     }
 
     fn randr_outputs_and_modes(
@@ -43,11 +43,11 @@ impl Backend for KmsBackend {
         Vec<yserver_core::randr::RandrOutput>,
         Vec<yserver_core::randr::RandrMode>,
     ) {
-        KmsBackend::randr_outputs_and_modes(self)
+        P::randr_outputs_and_modes(self)
     }
 
     fn randr_providers(&mut self) -> Vec<yserver_core::randr::RandrProvider> {
-        KmsBackend::randr_providers(self)
+        P::randr_providers(self)
     }
 
     fn render_opcode(&self) -> Option<u8> {
@@ -79,7 +79,7 @@ impl Backend for KmsBackend {
     }
 
     fn crtc_gamma_size(&self, crtc: u32) -> u16 {
-        Self::backend_randr_crtc_gamma_size(self, crtc)
+        P::crtc_gamma_size(self, crtc)
     }
 
     fn set_crtc_gamma(
@@ -89,11 +89,11 @@ impl Backend for KmsBackend {
         green: &[u16],
         blue: &[u16],
     ) -> io::Result<()> {
-        Self::backend_randr_set_crtc_gamma(self, crtc, red, green, blue)
+        P::set_crtc_gamma(self, crtc, red, green, blue)
     }
 
     fn get_crtc_gamma(&self, crtc: u32) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
-        Self::backend_randr_get_crtc_gamma(self, crtc)
+        P::get_crtc_gamma(self, crtc)
     }
 
     fn render_format_for_ynest_id(&self, ynest_fmt: u32) -> Option<u32> {
@@ -136,16 +136,16 @@ impl Backend for KmsBackend {
         Self::backend_devices_on_host_input(self, state, ev)
     }
 
-    fn on_scanout_render_completion(&mut self, _state: &mut ServerState) {
-        Self::backend_scanout_on_scanout_render_completion(self, _state)
+    fn on_scanout_render_completion(&mut self, state: &mut ServerState) {
+        P::on_scanout_render_completion(self, state)
     }
 
-    fn on_page_flip_ready(&mut self, _state: &mut ServerState, drm_fd: std::os::fd::RawFd) {
-        Self::backend_scanout_on_page_flip_ready(self, _state, drm_fd)
+    fn on_page_flip_ready(&mut self, state: &mut ServerState, drm_fd: std::os::fd::RawFd) {
+        P::on_page_flip_ready(self, state, drm_fd)
     }
 
     fn before_block(&mut self) {
-        Self::backend_scanout_before_block(self)
+        P::before_block(self)
     }
 
     fn mark_dirty(&mut self) {
@@ -156,26 +156,30 @@ impl Backend for KmsBackend {
     }
 
     fn flush_before_damage_notify(&mut self) {
-        Self::backend_scanout_flush_before_damage_notify(self)
+        P::flush_before_damage_notify(self)
     }
 
     fn next_wakeup(&self) -> Option<std::time::Instant> {
-        Self::backend_scanout_next_wakeup(self)
+        P::next_wakeup(self)
     }
 
     fn maybe_composite(&mut self) -> io::Result<()> {
-        Self::backend_scanout_maybe_composite(self)
+        P::maybe_composite(self)
+    }
+
+    fn on_platform_event(&mut self, state: &mut ServerState) {
+        P::on_platform_event(self, state);
     }
 
     fn dump_scanout(&mut self) {
-        Self::backend_readback_dump_scanout(self)
+        P::dump_scanout(self)
     }
 
     fn report_export_holders(
         &mut self,
         core: &dyn Fn() -> yserver_core::backend::export_holders::CoreHolders,
     ) -> bool {
-        Self::backend_export_report_export_holders(self, core)
+        P::report_export_holders(self, core)
     }
 
     fn dump_drawables(&mut self) {
@@ -183,11 +187,11 @@ impl Backend for KmsBackend {
     }
 
     fn note_present_pixmap(&mut self, src_pixmap_xid: u32, dst_window_xid: u32) {
-        Self::backend_present_note_present_pixmap(self, src_pixmap_xid, dst_window_xid)
+        P::note_present_pixmap(self, src_pixmap_xid, dst_window_xid)
     }
 
     fn note_present_scanout_candidate(&mut self, candidate: PresentScanoutCandidate) {
-        self.observe_scanout_m0(candidate);
+        P::note_present_scanout_candidate(self, candidate)
     }
 
     fn try_present_direct(
@@ -195,7 +199,7 @@ impl Backend for KmsBackend {
         candidate: PresentScanoutCandidate,
         event: yserver_core::backend::CompletedPresentEvent,
     ) -> io::Result<bool> {
-        Self::backend_present_try_present_direct(self, candidate, event)
+        P::try_present_direct(self, candidate, event)
     }
 
     fn note_present_skip(&mut self) {
@@ -207,11 +211,7 @@ impl Backend for KmsBackend {
         src_pixmap_host_xid: u32,
         dst_window_host_xid: u32,
     ) -> io::Result<PresentSourceWait> {
-        Self::backend_present_arm_present_source_wait(
-            self,
-            src_pixmap_host_xid,
-            dst_window_host_xid,
-        )
+        P::arm_present_source_wait(self, src_pixmap_host_xid, dst_window_host_xid)
     }
 
     fn arm_present_syncobj_wait(
@@ -221,7 +221,7 @@ impl Backend for KmsBackend {
         acquire_syncobj: u32,
         acquire_value: u64,
     ) -> io::Result<PresentSourceWait> {
-        Self::backend_present_arm_present_syncobj_wait(
+        P::arm_present_syncobj_wait(
             self,
             src_pixmap_host_xid,
             dst_window_host_xid,
@@ -231,29 +231,27 @@ impl Backend for KmsBackend {
     }
 
     fn drain_ready_present_source_waits(&mut self) -> Vec<u64> {
-        Self::backend_present_drain_ready_present_source_waits(self)
+        P::drain_ready_present_source_waits(self)
     }
 
     fn begin_ready_present_destination_write(&mut self, wait_id: u64) {
-        Self::backend_present_begin_ready_present_destination_write(self, wait_id)
+        P::begin_ready_present_destination_write(self, wait_id)
     }
 
     fn finish_present_source_wait(&mut self, wait_id: u64) {
-        Self::backend_present_finish_present_source_wait(self, wait_id)
+        P::finish_present_source_wait(self, wait_id)
     }
 
     fn present_flip_in_flight(&self, crtc_id: u32) -> bool {
-        self.present_crtc_output(crtc_id)
-            .is_some_and(|(output_idx, _)| self.present_flip_in_flight_for_output(output_idx))
+        P::present_flip_in_flight(self, crtc_id)
     }
 
     fn present_display_idle(&self, crtc_id: u32) -> bool {
-        self.present_crtc_key(crtc_id)
-            .is_some_and(|crtc_key| self.present_completion_is_idle_for(crtc_key))
+        P::present_display_idle(self, crtc_id)
     }
 
     fn present_absolute_vblank_arm_supported(&self, crtc_id: u32) -> bool {
-        Self::backend_present_present_absolute_vblank_arm_supported(self, crtc_id)
+        P::present_absolute_vblank_arm_supported(self, crtc_id)
     }
 
     fn arm_present_absolute_vblank(
@@ -261,11 +259,11 @@ impl Backend for KmsBackend {
         randr_crtc_id: u32,
         targets: &[u64],
     ) -> io::Result<usize> {
-        Self::backend_present_arm_present_absolute_vblank(self, randr_crtc_id, targets)
+        P::arm_present_absolute_vblank(self, randr_crtc_id, targets)
     }
 
     fn present_scanout_blackout(&self) -> bool {
-        !(self.scanout_allowed() && self.kms_outputs_active)
+        P::present_scanout_blackout(self)
     }
 
     fn pin_present_source(&mut self, host_xid: u32) -> Option<u64> {
@@ -277,45 +275,43 @@ impl Backend for KmsBackend {
     }
 
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)> {
-        // Direct mode only: DRM fd + present-completion epfd. libinput runs
-        // on its own thread, not the core poll.
-        self.platform.poll_fds()
+        P::poll_fds(self)
     }
 
     fn vt_switching_armed(&self) -> bool {
-        self.vt_switching_armed
+        P::vt_switching_armed(self)
     }
 
     fn set_input_sender(&mut self, sender: yserver_core::core_loop::CoreSender) {
-        Self::backend_session_set_input_sender(self, sender)
+        P::set_input_sender(self, sender)
     }
 
     fn request_vt_switch(&mut self, vt: u32) {
-        Self::backend_session_request_vt_switch(self, vt)
+        P::request_vt_switch(self, vt)
     }
 
     fn begin_vt_release(&mut self) -> bool {
-        Self::backend_session_begin_vt_release(self)
+        P::begin_vt_release(self)
     }
 
     fn finish_vt_release(
         &mut self,
         state: &mut ServerState,
-        _input_inventory: &yserver_core::core_loop::input_inventory::InputInventory,
+        input_inventory: &yserver_core::core_loop::input_inventory::InputInventory,
     ) {
-        Self::backend_session_finish_vt_release(self, state, _input_inventory)
+        P::finish_vt_release(self, state, input_inventory)
     }
 
     fn on_vt_acquire(&mut self, state: &mut ServerState) {
-        Self::backend_session_on_vt_acquire(self, state)
+        P::on_vt_acquire(self, state)
     }
 
-    fn on_display_hotplug(&mut self, _state: &mut ServerState) {
-        Self::backend_randr_on_display_hotplug(self, _state)
+    fn on_display_hotplug(&mut self, state: &mut ServerState) {
+        P::on_display_hotplug(self, state)
     }
 
     fn reprobe_connectors(&mut self, state: &mut ServerState) -> io::Result<()> {
-        Self::backend_randr_reprobe_connectors(self, state)
+        P::reprobe_connectors(self, state)
     }
 
     fn set_provider_output_source(
@@ -324,7 +320,7 @@ impl Backend for KmsBackend {
         provider: u32,
         source_provider: Option<u32>,
     ) -> io::Result<bool> {
-        Self::backend_randr_set_provider_output_source(self, state, provider, source_provider)
+        P::set_provider_output_source(self, state, provider, source_provider)
     }
 
     fn begin_crtc_config(
@@ -335,19 +331,19 @@ impl Backend for KmsBackend {
         x: i32,
         y: i32,
     ) -> io::Result<CrtcConfigApply> {
-        Self::backend_randr_begin_crtc_config(self, output_id, connector, mode, x, y)
+        P::begin_crtc_config(self, output_id, connector, mode, x, y)
     }
 
     fn drain_ready_crtc_configs(&mut self) -> Vec<CrtcConfigToken> {
-        Self::backend_randr_drain_ready_crtc_configs(self)
+        P::drain_ready_crtc_configs(self)
     }
 
     fn finish_crtc_config(&mut self, token: CrtcConfigToken) -> io::Result<bool> {
-        Self::backend_randr_finish_crtc_config(self, token)
+        P::finish_crtc_config(self, token)
     }
 
     fn cancel_crtc_config(&mut self, token: CrtcConfigToken) {
-        Self::backend_randr_cancel_crtc_config(self, token)
+        P::cancel_crtc_config(self, token)
     }
 
     fn apply_crtc_config(
@@ -358,7 +354,7 @@ impl Backend for KmsBackend {
         x: i32,
         y: i32,
     ) -> io::Result<bool> {
-        Self::backend_randr_apply_crtc_config(self, output_id, connector, mode, x, y)
+        P::apply_crtc_config(self, output_id, connector, mode, x, y)
     }
 
     fn refresh_randr_state_set_time(
@@ -366,21 +362,19 @@ impl Backend for KmsBackend {
         state: &mut yserver_core::server::ServerState,
         set_time: u32,
     ) {
-        // A CRTC set bumps lastSetTime (to the client timestamp) but NOT
-        // lastConfigTime (the available configuration didn't change).
-        self.rebuild_randr_state(state, Some(set_time), false);
+        P::refresh_randr_state_set_time(self, state, set_time)
     }
 
     fn randr_layout_changed(&mut self, state: &mut ServerState) {
-        Self::backend_randr_randr_layout_changed(self, state)
+        P::randr_layout_changed(self, state)
     }
 
     fn output_identity(&self, output_id: u32) -> Option<(Vec<u8>, String)> {
-        self.output_identity_by_id.get(&output_id).cloned()
+        P::output_identity(self, output_id)
     }
 
     fn set_logical_screen_size(&mut self, w: u16, h: u16) -> io::Result<()> {
-        Self::backend_randr_set_logical_screen_size(self, w, h)
+        P::set_logical_screen_size(self, w, h)
     }
 
     fn on_libinput_ready(&mut self, _state: &mut ServerState) {
@@ -390,7 +384,7 @@ impl Backend for KmsBackend {
     }
 
     fn poll_deferred_input(&mut self, state: &mut ServerState) {
-        Self::backend_session_poll_deferred_input(self, state)
+        P::poll_deferred_input(self, state)
     }
 
     fn start_device_config(
@@ -402,7 +396,7 @@ impl Backend for KmsBackend {
         yserver_core::xinput::libinput_props::DeviceConfigStart,
         yserver_core::xinput::libinput_props::DeviceConfigError,
     > {
-        Self::backend_session_start_device_config(self, source, change, cancel)
+        P::start_device_config(self, source, change, cancel)
     }
 
     fn probe_input_devices(&mut self, _state: &mut ServerState) -> usize {
@@ -552,19 +546,19 @@ impl Backend for KmsBackend {
     }
 
     fn supports_dmabuf_export(&self) -> bool {
-        self.dmabuf_export_supported
+        P::supports_dmabuf_export(self)
     }
 
     fn glx_vendor_names(&self) -> &'static str {
-        Self::backend_export_glx_vendor_names(self)
+        P::glx_vendor_names(self)
     }
 
     fn acquire_glx_pixmap_export(&mut self, host_xid: u32) {
-        KmsBackend::acquire_glx_pixmap_export(self, host_xid);
+        P::acquire_glx_pixmap_export(self, host_xid)
     }
 
     fn release_glx_pixmap_export(&mut self, host_xid: u32) {
-        KmsBackend::release_glx_pixmap_export(self, host_xid);
+        P::release_glx_pixmap_export(self, host_xid)
     }
 
     fn client_disconnected(&mut self, client_id: yserver_protocol::x11::ClientId) {
@@ -576,7 +570,7 @@ impl Backend for KmsBackend {
     }
 
     fn promote_pixmap_exportable(&mut self, host_xid: u32) -> bool {
-        KmsBackend::promote_pixmap_exportable(self, host_xid)
+        P::promote_pixmap_exportable(self, host_xid)
     }
 
     /// Stage 4c.4 — flip a window's scene-participation under
@@ -780,7 +774,7 @@ impl Backend for KmsBackend {
     /// best-effort — on the stub fixture (no Vk) `engine.fill_rect`
     /// errors; log + continue (storage already exists at xid level).
     fn get_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
-        Self::backend_scanout_get_overlay_window(self, _origin)
+        Self::backend_overlay_get_overlay_window(self, _origin)
     }
 
     /// Stage 4d — Composite Overlay Window release.
@@ -797,11 +791,11 @@ impl Backend for KmsBackend {
     /// Returns `Ok(false)` when nothing was materialized — defensive
     /// only; core does not call this without a claim.
     fn release_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
-        Self::backend_scanout_release_overlay_window(self, _origin)
+        Self::backend_overlay_release_overlay_window(self, _origin)
     }
 
     fn cow_host_xid(&self) -> Option<u32> {
-        Self::backend_scanout_cow_host_xid(self)
+        Self::backend_overlay_cow_host_xid(self)
     }
 
     fn create_pixmap(
@@ -1589,12 +1583,16 @@ impl Backend for KmsBackend {
         Ok((0, 11))
     }
 
-    fn dri3_open(&mut self, _drawable: u32) -> io::Result<std::os::fd::OwnedFd> {
-        Self::backend_export_dri3_open(self, _drawable)
+    fn dri3_open(&mut self, drawable: u32) -> io::Result<std::os::fd::OwnedFd> {
+        P::dri3_open(self, drawable)
+    }
+
+    fn glx_available(&self) -> bool {
+        P::glx_available(self)
     }
 
     fn dri3_capabilities(&self) -> Dri3Caps {
-        Self::backend_export_dri3_capabilities(self)
+        P::dri3_capabilities(self)
     }
 
     fn dri3_import_pixmap(
@@ -1608,58 +1606,58 @@ impl Backend for KmsBackend {
         depth: u8,
         bpp: u8,
     ) -> io::Result<PixmapHandle> {
-        Self::backend_export_dri3_import_pixmap(
+        P::dri3_import_pixmap(
             self, fd, width, height, stride, offset, modifier, depth, bpp,
         )
     }
 
-    fn dri3_supported_modifiers(&self, _window: u32, depth: u8, bpp: u8) -> (Vec<u64>, Vec<u64>) {
-        Self::backend_export_dri3_supported_modifiers(self, _window, depth, bpp)
+    fn dri3_supported_modifiers(&self, window: u32, depth: u8, bpp: u8) -> (Vec<u64>, Vec<u64>) {
+        P::dri3_supported_modifiers(self, window, depth, bpp)
     }
 
     fn dri3_export_pixmap(
         &mut self,
         host_xid: u32,
     ) -> io::Result<(u32, u16, u16, u16, u8, u8, std::os::fd::OwnedFd)> {
-        Self::backend_export_dri3_export_pixmap(self, host_xid)
+        P::dri3_export_pixmap(self, host_xid)
     }
 
     fn dri3_export_pixmap_buffers(&mut self, host_xid: u32) -> io::Result<Dri3PixmapExport> {
-        Self::backend_export_dri3_export_pixmap_buffers(self, host_xid)
+        P::dri3_export_pixmap_buffers(self, host_xid)
     }
 
     fn dri3_fence_from_fd(&mut self, fence_xid: u32, fd: std::os::fd::OwnedFd) -> io::Result<()> {
-        Self::backend_export_dri3_fence_from_fd(self, fence_xid, fd)
+        P::dri3_fence_from_fd(self, fence_xid, fd)
     }
 
     fn dri3_trigger_fence(&mut self, fence_xid: u32) -> io::Result<()> {
-        Self::backend_export_dri3_trigger_fence(self, fence_xid)
+        P::dri3_trigger_fence(self, fence_xid)
     }
 
     fn dri3_fence_triggered(&self, fence_xid: u32) -> Option<bool> {
-        Self::backend_export_dri3_fence_triggered(self, fence_xid)
+        P::dri3_fence_triggered(self, fence_xid)
     }
 
     fn dri3_reset_fence(&mut self, fence_xid: u32) {
-        Self::backend_export_dri3_reset_fence(self, fence_xid)
+        P::dri3_reset_fence(self, fence_xid)
     }
 
     fn dri3_destroy_fence(&mut self, fence_xid: u32) {
-        Self::backend_export_dri3_destroy_fence(self, fence_xid)
+        P::dri3_destroy_fence(self, fence_xid)
     }
 
     fn dri3_xshmfence_handle(
         &self,
         fence_xid: u32,
     ) -> Option<std::sync::Arc<dyn yserver_core::backend::XshmfenceHandle>> {
-        Self::backend_export_dri3_xshmfence_handle(self, fence_xid)
+        P::dri3_xshmfence_handle(self, fence_xid)
     }
 
     fn dri3_syncobj_handle(
         &self,
         syncobj_xid: u32,
     ) -> Option<std::sync::Arc<dyn yserver_core::backend::SyncobjHandle>> {
-        Self::backend_export_dri3_syncobj_handle(self, syncobj_xid)
+        P::dri3_syncobj_handle(self, syncobj_xid)
     }
 
     fn dri3_syncobj_owned(
@@ -1667,11 +1665,11 @@ impl Backend for KmsBackend {
         client_id: yserver_protocol::x11::ClientId,
         syncobj_xid: u32,
     ) -> bool {
-        Self::backend_export_dri3_syncobj_owned(self, client_id, syncobj_xid)
+        P::dri3_syncobj_owned(self, client_id, syncobj_xid)
     }
 
     fn dri3_fd_from_fence(&mut self, fence_xid: u32) -> io::Result<std::os::fd::OwnedFd> {
-        Self::backend_export_dri3_fd_from_fence(self, fence_xid)
+        P::dri3_fd_from_fence(self, fence_xid)
     }
 
     fn dri3_import_syncobj(
@@ -1680,7 +1678,7 @@ impl Backend for KmsBackend {
         syncobj_xid: u32,
         fd: std::os::fd::OwnedFd,
     ) -> io::Result<()> {
-        Self::backend_export_dri3_import_syncobj(self, client_id, syncobj_xid, fd)
+        P::dri3_import_syncobj(self, client_id, syncobj_xid, fd)
     }
 
     fn dri3_free_syncobj(
@@ -1688,11 +1686,11 @@ impl Backend for KmsBackend {
         client_id: yserver_protocol::x11::ClientId,
         syncobj_xid: u32,
     ) -> io::Result<()> {
-        Self::backend_export_dri3_free_syncobj(self, client_id, syncobj_xid)
+        P::dri3_free_syncobj(self, client_id, syncobj_xid)
     }
 
     fn dri3_signal_syncobj(&mut self, syncobj_xid: u32, value: u64) -> io::Result<()> {
-        Self::backend_export_dri3_signal_syncobj(self, syncobj_xid, value)
+        P::dri3_signal_syncobj(self, syncobj_xid, value)
     }
 
     /// Stage 5 Task 6.1 — queue a deferred PRESENT completion.
@@ -1721,13 +1719,13 @@ impl Backend for KmsBackend {
     fn drain_completed_present_events(
         &mut self,
     ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
-        Self::backend_present_drain_completed_present_events(self)
+        P::drain_completed_present_events(self)
     }
 
     fn drain_retired_present_idle_events(
         &mut self,
     ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
-        std::mem::take(&mut self.scanout_m2.idled)
+        P::drain_retired_present_idle_events(self)
     }
 
     fn signal_present_wake(&mut self, present_id: u64) {
@@ -1735,22 +1733,22 @@ impl Backend for KmsBackend {
     }
 
     fn present_crtc_clock_epoch(&self, crtc_id: u32) -> u64 {
-        Self::backend_present_present_crtc_clock_epoch(self, crtc_id)
+        P::present_crtc_clock_epoch(self, crtc_id)
     }
 
     fn present_get_ust_msc(&self, crtc_id: u32) -> (u64, u64) {
-        Self::backend_present_present_get_ust_msc(self, crtc_id)
+        P::present_get_ust_msc(self, crtc_id)
     }
 
     fn present_get_completion_clock(
         &self,
         crtc_id: u32,
     ) -> yserver_core::backend::PresentClockSample {
-        Self::backend_present_present_get_completion_clock(self, crtc_id)
+        P::present_get_completion_clock(self, crtc_id)
     }
 
     fn arm_idle_vblanks(&mut self, crtc_id: u32, target_mscs: &[u64]) -> std::io::Result<usize> {
-        self.arm_idle_vblanks_ioctl(crtc_id, target_mscs)
+        P::arm_idle_vblanks(self, crtc_id, target_mscs)
     }
 
     fn arm_present_completion_idle_vblanks(
@@ -1758,11 +1756,11 @@ impl Backend for KmsBackend {
         crtc_id: u32,
         target_mscs: &[u64],
     ) -> std::io::Result<usize> {
-        Self::backend_present_arm_present_completion_idle_vblanks(self, crtc_id, target_mscs)
+        P::arm_present_completion_idle_vblanks(self, crtc_id, target_mscs)
     }
 
-    fn present_capabilities(&self, _window: u32) -> PresentCaps {
-        Self::backend_present_present_capabilities(self, _window)
+    fn present_capabilities(&self, window: u32) -> PresentCaps {
+        P::present_capabilities(self, window)
     }
 
     fn xkb_proxy(
@@ -1950,10 +1948,10 @@ impl Backend for KmsBackend {
     }
 
     fn dpms_capable(&self) -> bool {
-        true
+        P::dpms_capable(self)
     }
 
     fn set_dpms_power(&mut self, level: u8) -> std::io::Result<()> {
-        Self::backend_session_set_dpms_power(self, level)
+        P::set_dpms_power(self, level)
     }
 }

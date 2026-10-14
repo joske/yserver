@@ -3019,8 +3019,9 @@ fn xid_occupied_covers_every_namespace() {
 
     // 15. mit_shm_segments — requires a real fd; use memfd_create
     let id_shm = base + 16;
-    let fd = unsafe { libc::memfd_create(c"xcmisc-test-shm".as_ptr(), libc::MFD_CLOEXEC) };
-    assert!(fd >= 0, "memfd_create failed");
+    let fd = std::os::fd::IntoRawFd::into_raw_fd(
+        crate::anon_shm::create_anon_shm(c"xcmisc-test-shm").expect("create_anon_shm failed"),
+    );
     let rc = unsafe { libc::ftruncate(fd, 4096) };
     assert_eq!(rc, 0, "ftruncate failed");
     let shm_seg = MitShmSegment::from_fd(owner, fd, false).expect("MitShmSegment::from_fd");

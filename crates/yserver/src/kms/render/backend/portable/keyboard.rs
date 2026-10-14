@@ -1,4 +1,4 @@
-use crate::kms::render::backend::{FloatingKeyboardState, KmsBackend};
+use crate::kms::render::backend::{FloatingKeyboardState, XBackend, seam::Platform};
 use std::{
     collections::{HashMap, HashSet},
     io,
@@ -9,7 +9,7 @@ use yserver_core::{
     server::ServerState,
 };
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     // ── Input dispatch (Stage 3f.7) ─────────────────────────────
     //
     // Ports the v1 input cluster onto v2's state surface.
@@ -310,34 +310,13 @@ impl KmsBackend {
         self.clamp_group_to_keymap(self.core.locked_group)
     }
 
-    /// Direct-mode wiring: hand over the relay the input thread ends
-    /// of which `input_thread::run` polls. Called from `lib.rs` when
-    /// spawning the libinput thread.
-    pub fn set_led_relay(&mut self, relay: std::sync::Arc<crate::input::LedRelay>) {
-        self.led_relay = Some(relay);
-    }
-
-    /// Current lock-LED state derived from `xkb_state`, as
-    /// `input::Led` bits. Split from [`Self::sync_keyboard_leds`] so
-    /// the no-Vk test fixture can pin the XKB→LED mapping without a
-    /// libinput device. As on Xorg the keyboard LEDs follow the lit
-    /// indicators by index (`XkbDDXUpdateIndicators` hands the driver the
-    /// effective state; xf86-input-libinput/evdev light Caps Lock for bit
-    /// 0, Num Lock for bit 1, Scroll Lock for bit 2), not by name, so an
-    /// indicator renamed by SetNames keeps its LED.
-    pub(in crate::kms::render::backend) fn current_led_bits(&self) -> u32 {
-        let lit = self.core.xkb_desc.indicators_lit(&self.core.xkb_state.0);
-        let mut leds = input::Led::empty();
-        for (bit, led) in [
-            (0, input::Led::CAPSLOCK),
-            (1, input::Led::NUMLOCK),
-            (2, input::Led::SCROLLLOCK),
-        ] {
-            if lit & (1 << bit) != 0 {
-                leds |= led;
-            }
-        }
-        leds.bits()
+    /// The lit XKB indicators. As on Xorg the keyboard LEDs follow them by
+    /// index (`XkbDDXUpdateIndicators` hands the driver the effective state;
+    /// xf86-input-libinput/evdev light Caps Lock for bit 0, Num Lock for bit
+    /// 1, Scroll Lock for bit 2), not by name, so an indicator renamed by
+    /// SetNames keeps its LED.
+    pub(in crate::kms::render::backend) fn lit_indicators(&self) -> u32 {
+        self.core.xkb_desc.indicators_lit(&self.core.xkb_state.0)
     }
 
     /// Push the XKB lock-LED state (Caps/Num/Scroll) to the keyboards
@@ -346,14 +325,8 @@ impl KmsBackend {
     /// we do it via `libinput_device_led_update`. The update crosses to the
     /// input thread via the `LedRelay` eventfd.
     pub(in crate::kms::render::backend) fn sync_keyboard_leds(&mut self) {
-        let bits = self.current_led_bits();
-        if bits == self.leds_sent {
-            return;
-        }
-        self.leds_sent = bits;
-        if let Some(relay) = self.led_relay.as_ref() {
-            relay.set(bits);
-        }
+        let lit = self.lit_indicators();
+        P::set_keyboard_leds(&mut self.pstate, lit);
     }
 
     /// `ChangeKeyboardMapping` on the keyboard description, as Xorg's
@@ -809,7 +782,7 @@ impl KmsBackend {
     }
 }
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     pub(in crate::kms::render::backend) fn backend_keyboard_current_xkb_mods(
         &self,
     ) -> (u8, u8, u8, u8) {

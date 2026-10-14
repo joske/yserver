@@ -125,7 +125,7 @@ fn next_wakeup_suppresses_scene_deadline_when_scanout_disallowed() {
         "dirty scene should wake immediately while scanout is allowed",
     );
 
-    b.vt_state = VtState::Suspended;
+    b.pstate.vt_state = VtState::Suspended;
     assert!(
         b.next_wakeup().is_none(),
         "dirty scene must not busy-wake while scanout is disallowed",
@@ -264,8 +264,8 @@ fn frame_timeout_closes_and_is_scheduled_with_dpms_off() {
 fn frame_timeout_closes_and_is_scheduled_with_vt_away() {
     use crate::vt::state::VtState;
     assert_frame_timeout_serviced_while_dark(
-        |b| b.vt_state = VtState::Suspended,
-        |b| b.vt_state = VtState::Active,
+        |b| b.pstate.vt_state = VtState::Suspended,
+        |b| b.pstate.vt_state = VtState::Active,
         "VT away",
     );
 }
@@ -309,7 +309,7 @@ fn present_poll_deadline_survives_outputs_off() {
 fn display_hotplug_arms_rescan_deadline_and_next_wakeup() {
     let mut b = KmsBackend::for_tests();
     let now = std::time::Instant::now();
-    b.hotplug_rescan_deadline = Some(now + std::time::Duration::from_millis(150));
+    b.pstate.hotplug_rescan_deadline = Some(now + std::time::Duration::from_millis(150));
     let wake = b
         .next_wakeup()
         .expect("an armed hotplug rescan deadline must wake polling");
@@ -323,11 +323,11 @@ fn display_hotplug_arms_rescan_deadline_and_next_wakeup() {
 fn poll_deferred_input_clears_expired_rescan_deadline() {
     let mut b = KmsBackend::for_tests();
     let mut state = ServerState::new();
-    b.hotplug_rescan_deadline =
+    b.pstate.hotplug_rescan_deadline =
         Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
     b.poll_deferred_input(&mut state);
     assert!(
-        b.hotplug_rescan_deadline.is_none(),
+        b.pstate.hotplug_rescan_deadline.is_none(),
         "an elapsed hotplug rescan deadline must be cleared so the loop can idle",
     );
 }

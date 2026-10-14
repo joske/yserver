@@ -21,13 +21,10 @@ path = "src/bin/yserver.rs"
 [dependencies]
 ash.workspace = true
 crossbeam-channel.workspace = true
-drm.workspace = true
 env_logger.workspace = true
 flate2 = "1.1"
 fontconfig = "0.11"
 freetype-rs.workspace = true
-gbm.workspace = true
-input.workspace = true
 libc.workspace = true
 log.workspace = true
 nix.workspace = true
@@ -40,6 +37,12 @@ yserver-render.workspace = true
 
 [dev-dependencies]
 yserver-render = { workspace = true, features = ["test-support"] }
+
+# The DRM/KMS platform; build.rs emits `cfg(kms)` for the same targets.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+drm.workspace = true
+gbm.workspace = true
+input.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 udev.workspace = true

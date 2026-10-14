@@ -22,6 +22,8 @@ pub mod mask_scratch;
 pub(crate) mod masked_blit_pipeline;
 pub mod mem_accounting;
 pub mod ops;
+#[cfg(test)]
+mod options_tests;
 pub mod pipeline;
 pub mod pixmap_pool;
 pub mod probe_digest;

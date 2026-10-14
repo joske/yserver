@@ -9,9 +9,11 @@ pub use yserver_render::kms::vk::{
     logic_fill_pipeline, mask_scratch, mem_accounting, ops, pipeline, pixmap_pool, render_pipeline,
     submit_stats, sync, target, text_pipeline, trap_pipeline, vram,
 };
+#[cfg(kms)]
 pub(crate) use yserver_render::kms::vk::{
     image_format_properties2, optional_sync_fd_from_vk, owned_fd_from_vk, probe_digest,
     probe_pattern,
 };
 
+#[cfg(kms)]
 pub mod scanout;

@@ -123,6 +123,8 @@ pub struct LaunchOptions {
     /// XDMCP configuration: `None` unless one of `-query`, `-broadcast`
     /// or `-indirect` was given. See [`XdmcpOptions`].
     pub xdmcp: Option<XdmcpOptions>,
+    /// `--headless`: on a platform without KMS, run without a window.
+    pub headless: bool,
 }
 
 fn next_value(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -204,6 +206,8 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOption
             };
         } else if arg == "-novtswitch" {
             // Known no-arg no-op (lightdm passes it).
+        } else if arg == "--headless" {
+            o.headless = true;
         } else if matches!(arg.as_str(), "--version" | "-version") {
             // Print-and-exit; the binary acts on this before `run()`.
             // Keep scanning so it works regardless of position.
@@ -548,7 +552,10 @@ enum Occupancy {
 /// never-accepting listener in the world-writable socket dir, must not
 /// hang the launch). EAGAIN ⇒ backlog full ⇒ the display IS occupied.
 fn probe(path: &Path) -> Occupancy {
-    use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+    use nix::{
+        fcntl::{FcntlArg, FdFlag, OFlag, fcntl},
+        sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket},
+    };
 
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
@@ -558,15 +565,21 @@ fn probe(path: &Path) -> Occupancy {
     if !meta.file_type().is_socket() {
         return Occupancy::NonSocket;
     }
+    // Flags via fcntl: Apple has no SOCK_NONBLOCK/SOCK_CLOEXEC.
     let fd = match socket(
         AddressFamily::Unix,
         SockType::Stream,
-        SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+        SockFlag::empty(),
         None,
     ) {
         Ok(fd) => fd,
         Err(_) => return Occupancy::Opaque,
     };
+    if fcntl(&fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).is_err()
+        || fcntl(&fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).is_err()
+    {
+        return Occupancy::Opaque;
+    }
     let addr = match UnixAddr::new(path) {
         Ok(a) => a,
         Err(_) => return Occupancy::Opaque,
@@ -1127,6 +1140,14 @@ mod tests {
     #[test]
     fn explicit_colon_display() {
         assert_eq!(parse(&[":42"]).unwrap().display, Some(42));
+    }
+
+    #[test]
+    fn headless_flag_parses() {
+        assert!(!parse(&[":1"]).unwrap().headless);
+        let o = parse(&[":1", "--headless"]).unwrap();
+        assert!(o.headless);
+        assert_eq!(o.display, Some(1));
     }
 
     #[test]

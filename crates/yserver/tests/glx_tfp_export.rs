@@ -2,7 +2,7 @@
 //!
 //! Vulkan-gated — run with:
 //!   cargo test --test glx_tfp_export -- --ignored
-
+#![cfg(kms)]
 #![cfg(target_os = "linux")]
 // Test-side client buffers, outside the server's memory ledger.
 #![allow(clippy::disallowed_methods)]

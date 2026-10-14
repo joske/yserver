@@ -12,7 +12,10 @@ use crate::{
     server::ServerState,
 };
 use log::debug;
-use std::{io, os::fd::OwnedFd};
+use std::{
+    io,
+    os::fd::{IntoRawFd, OwnedFd},
+};
 use yserver_protocol::{
     x11,
     x11::{ClientId, RequestHeader, ResourceId, SequenceNumber},
@@ -662,8 +665,8 @@ fn handle_mit_shm_create_segment(
             MIT_SHM_MAJOR_OPCODE,
         );
     }
-    let fd = unsafe { libc::memfd_create(c"yserver-shm".as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
+    let Ok(fd) = crate::anon_shm::create_anon_shm(c"yserver-shm").map(IntoRawFd::into_raw_fd)
+    else {
         return emit_x11_error_with_minor(
             state,
             client_id,
@@ -673,7 +676,7 @@ fn handle_mit_shm_create_segment(
             u16::from(shm::CREATE_SEGMENT),
             MIT_SHM_MAJOR_OPCODE,
         );
-    }
+    };
     if unsafe { libc::ftruncate(fd, libc::off_t::from(req.size as i32)) } < 0 {
         unsafe { libc::close(fd) };
         return emit_x11_error_with_minor(

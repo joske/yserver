@@ -76,6 +76,9 @@ pub fn spawn(
     fd_passing: bool,
 ) -> io::Result<()> {
     let stream = stream.into();
+    // BSD `accept` (macOS has no `accept4`) inherits the listener's O_NONBLOCK;
+    // the setup thread's timed blocking reads need a blocking socket.
+    stream.set_nonblocking(false)?;
     let cloned = stream.try_clone()?;
     registry
         .lock()
@@ -291,6 +294,42 @@ mod tests {
     use yserver_protocol::x11::ClientByteOrder;
 
     #[test]
+    fn setup_on_a_nonblocking_accepted_socket_waits_for_the_late_request() {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let (_poll, sender, rx) = channel().unwrap();
+        let registry = make_registry();
+        spawn(
+            ClientId(1),
+            Transport::Unix(server),
+            sender.bind(),
+            registry.clone(),
+            AuthState::new(None),
+            true,
+            true,
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let mut setup = [0; 12];
+        setup[0] = b'l';
+        setup[2] = 11;
+        peer.write_all(&setup).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut allocated = false;
+        while !allocated && Instant::now() < deadline {
+            allocated = rx
+                .try_recv_all()
+                .any(|m| matches!(m, Message::SetupAllocate { .. }));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        shutdown_all(&registry);
+        assert!(
+            allocated,
+            "a setup request sent after accept must still be read"
+        );
+    }
+
+    #[test]
     fn tcp_setup_without_loaded_auth_never_allocates_a_client() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let mut peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -354,7 +393,12 @@ mod tests {
 
     /// Drain `n` bytes from `s` with a deadline; returns the bytes.
     fn read_n_with_timeout(s: &mut UnixStream, n: usize, timeout: Duration) -> io::Result<Vec<u8>> {
-        s.set_read_timeout(Some(timeout))?;
+        // macOS fails SO_RCVTIMEO with EINVAL once the peer has closed; the
+        // read below then reports the buffered bytes or EOF itself.
+        match s.set_read_timeout(Some(timeout)) {
+            Err(e) if e.kind() != io::ErrorKind::InvalidInput => return Err(e),
+            _ => {}
+        }
         let mut buf = vec![0u8; n];
         s.read_exact(&mut buf)?;
         Ok(buf)
@@ -742,9 +786,10 @@ mod tests {
 
         // Connection is closed by the server after reject (read → 0 bytes / EOF).
         let mut tail = [0u8; 1];
-        client_side
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
+        // macOS fails SO_RCVTIMEO with EINVAL once the peer has closed.
+        if let Err(e) = client_side.set_read_timeout(Some(Duration::from_secs(2))) {
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "read timeout: {e}");
+        }
         let n = client_side.read(&mut tail).unwrap_or(0);
         assert_eq!(n, 0, "server closed the connection after reject");
         let _ = std::fs::remove_file(&path);

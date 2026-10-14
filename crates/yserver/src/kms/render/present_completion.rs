@@ -98,7 +98,6 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use nix::sys::eventfd::{EfdFlags, EventFd};
     use yserver_core::backend::PresentWake;
     use yserver_protocol::x11::ClientId;
 
@@ -124,6 +123,14 @@ mod tests {
             self.imports.lock().unwrap().push(value);
             Ok(())
         }
+    }
+
+    /// The test syncobj ignores the fence, so any fd will do (eventfd is
+    /// Linux/FreeBSD-only).
+    fn any_fd() -> OwnedFd {
+        std::fs::File::open("/dev/null")
+            .expect("open /dev/null")
+            .into()
     }
 
     fn synced_entry(handle: Arc<dyn SyncobjHandle>) -> PendingPresentEntry {
@@ -239,9 +246,7 @@ mod tests {
             fail_import: false,
         });
         let mut entry = synced_entry(handle.clone());
-        let fence: OwnedFd = EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC)
-            .expect("eventfd")
-            .into();
+        let fence = any_fd();
 
         assert!(entry.publish_release_fence(&fence).expect("publish"));
         assert_eq!(*handle.imports.lock().unwrap(), vec![17]);
@@ -258,9 +263,7 @@ mod tests {
             fail_import: true,
         });
         let mut entry = synced_entry(handle);
-        let fence: OwnedFd = EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC)
-            .expect("eventfd")
-            .into();
+        let fence = any_fd();
 
         assert!(entry.publish_release_fence(&fence).is_err());
         assert!(matches!(

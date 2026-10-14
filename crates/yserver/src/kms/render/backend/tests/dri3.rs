@@ -333,19 +333,20 @@ fn dri3_fence_from_fd_xshmfence_path_triggers() {
     b.dri3_fence_from_fd(fence_xid, fd)
         .expect("xshmfence import");
     assert!(
-        b.dri3_xshmfences.contains_key(&fence_xid),
+        b.pstate.dri3_xshmfences.contains_key(&fence_xid),
         "xshmfence path stores under dri3_xshmfences",
     );
     assert!(
-        !b.dri3_sync_resources.contains_key(&fence_xid),
+        !b.pstate.dri3_sync_resources.contains_key(&fence_xid),
         "xshmfence path must NOT also populate dri3_sync_resources",
     );
     // Inspect the mapping's pre-trigger state.
-    let mapping = b.dri3_xshmfences.get(&fence_xid).expect("present");
+    let mapping = b.pstate.dri3_xshmfences.get(&fence_xid).expect("present");
     let pre = mapping.query();
     // Trigger via the public trait surface.
     b.dri3_trigger_fence(fence_xid).expect("trigger ok");
     let post = b
+        .pstate
         .dri3_xshmfences
         .get(&fence_xid)
         .expect("still present")
@@ -395,7 +396,7 @@ fn dri3_shm_fence_state_is_the_shared_memory() {
     b.dri3_destroy_fence(fence);
     assert_eq!(client.query(), 1, "DestroyFence triggers before unmapping");
     assert_eq!(b.dri3_fence_triggered(fence), None, "unmapped");
-    assert!(!b.dri3_xshmfences.contains_key(&fence));
+    assert!(!b.pstate.dri3_xshmfences.contains_key(&fence));
 }
 
 /// Fences and syncobjs are different X resource types with different
@@ -417,7 +418,7 @@ fn each_resolver_sees_only_its_own_registry() {
 
     let mut b = KmsBackend::for_tests();
     let xid = 0xAAAA_BBBB_u32;
-    b.dri3_syncobjs.insert(
+    b.pstate.dri3_syncobjs.insert(
         xid,
         (
             yserver_protocol::x11::ClientId(1),

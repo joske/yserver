@@ -18,6 +18,21 @@ use std::{
 
 use crate::transport::Transport;
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+const RECV_FLAGS: libc::c_int = libc::MSG_CMSG_CLOEXEC;
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+const RECV_FLAGS: libc::c_int = 0;
+/// Without `MSG_CMSG_CLOEXEC` each received fd gets `FD_CLOEXEC` after the
+/// fact; the window is harmless because the server never execs while reading.
+const RECV_SETS_CLOEXEC: bool = RECV_FLAGS != 0;
+
+fn set_cloexec(fd: libc::c_int) {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags >= 0 {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    }
+}
+
 /// Read up to `buf.len()` bytes from `stream` and collect any file
 /// descriptors that arrived via `SCM_RIGHTS` in the same message. Returns
 /// `(bytes_read, fds)`. The caller owns the returned FDs and must close
@@ -37,7 +52,7 @@ pub fn recv_with_fds(stream: &mut UnixStream, buf: &mut [u8]) -> io::Result<(usi
     msg.msg_control = cmsg_buf.as_mut_ptr().cast();
     msg.msg_controllen = cmsg_buf.len() as _;
 
-    let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+    let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, RECV_FLAGS) };
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -66,6 +81,9 @@ pub fn recv_with_fds(stream: &mut UnixStream, buf: &mut [u8]) -> io::Result<(usi
                         std::mem::size_of::<libc::c_int>(),
                     );
                 }
+                if !RECV_SETS_CLOEXEC {
+                    set_cloexec(fd);
+                }
                 fds.push(fd as RawFd);
             }
         }
@@ -84,13 +102,15 @@ pub fn send_with_fd(stream: &mut UnixStream, bytes: &[u8], fd: RawFd) -> io::Res
         iov_base: bytes.as_ptr() as *mut _,
         iov_len: bytes.len(),
     };
-    // CMSG_SPACE(sizeof(int)) on Linux x86_64 is 24 bytes; allocate that.
-    let mut cmsg_buf = [0u8; 24];
+    // msg_controllen must be exactly CMSG_SPACE(sizeof(int)): 24 on Linux
+    // x86_64, 16 on macOS, which rejects a longer control buffer (EINVAL).
+    let mut cmsg_buf = [0u64; 4];
+    let control_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) };
     let mut msg: libc::msghdr = unsafe { MaybeUninit::zeroed().assume_init() };
     msg.msg_iov = &raw mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg_buf.as_mut_ptr().cast();
-    msg.msg_controllen = cmsg_buf.len() as _;
+    msg.msg_controllen = control_len as _;
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
@@ -235,7 +255,7 @@ impl io::Read for FdReader {
 
 #[cfg(test)]
 mod tests {
-    use super::{FdReader, recv_with_fds, send_with_fd};
+    use super::{FdReader, recv_with_fds, send_with_fd, set_cloexec};
     use crate::transport::Transport;
     use std::{
         io::Write,
@@ -283,6 +303,34 @@ mod tests {
         assert_eq!(got, "hello-from-fd");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn is_cloexec(fd: i32) -> bool {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        flags & libc::FD_CLOEXEC != 0
+    }
+
+    #[test]
+    fn received_fds_are_close_on_exec() {
+        let (mut tx, mut rx) = UnixStream::pair().expect("socketpair");
+        let (probe, _keep) = UnixStream::pair().expect("probe socketpair");
+        send_with_fd(&mut tx, b"x", probe.as_raw_fd()).expect("sendmsg");
+        let mut buf = [0u8; 4];
+        let (_, fds) = recv_with_fds(&mut rx, &mut buf).expect("recvmsg");
+        assert_eq!(fds.len(), 1);
+        assert!(is_cloexec(fds[0]), "received fd must be FD_CLOEXEC");
+        unsafe { libc::close(fds[0]) };
+    }
+
+    #[test]
+    fn set_cloexec_marks_an_inherited_fd() {
+        let (sock, _peer) = UnixStream::pair().expect("socketpair");
+        // dup() never copies FD_CLOEXEC.
+        let fd = unsafe { libc::dup(sock.as_raw_fd()) };
+        assert!(fd >= 0 && !is_cloexec(fd));
+        set_cloexec(fd);
+        assert!(is_cloexec(fd));
+        unsafe { libc::close(fd) };
     }
 
     #[test]

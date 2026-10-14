@@ -1,11 +1,12 @@
 mod crtc_config;
-mod cursor;
 mod export;
+mod platform_hooks;
 mod present;
 mod randr;
 mod readback;
 mod scanout;
 mod session;
+pub(in crate::kms::render::backend) mod state;
 
 #[cfg(test)]
 pub(super) use crtc_config::*;

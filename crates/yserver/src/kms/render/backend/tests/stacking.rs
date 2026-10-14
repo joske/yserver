@@ -250,8 +250,8 @@ fn sync_top_level_order_restack_requests_direct_unflip() {
     });
     b.sync_top_level_order(&state);
 
-    assert!(b.scanout_m2.unflip_requested);
-    assert!(!b.scanout_m2.hold_direct);
+    assert!(b.pstate.scanout_m2.unflip_requested);
+    assert!(!b.pstate.scanout_m2.hold_direct);
 }
 
 #[test]
@@ -272,8 +272,8 @@ fn sync_top_level_order_without_restack_keeps_direct_scanout_active() {
 
     b.sync_top_level_order(&state);
 
-    assert!(!b.scanout_m2.unflip_requested);
-    assert!(b.scanout_m2.hold_direct);
+    assert!(!b.pstate.scanout_m2.unflip_requested);
+    assert!(b.pstate.scanout_m2.hold_direct);
 }
 
 /// A compositor's frame (the COW, or a window inside it — Muffin's output
@@ -314,10 +314,10 @@ fn restack_under_direct_target_is_ignored(direct_target_under_cow: fn(&mut KmsBa
     b.sync_top_level_order(&state);
 
     assert!(
-        !b.scanout_m2.unflip_requested,
+        !b.pstate.scanout_m2.unflip_requested,
         "a restack under the COW must not leave direct scanout"
     );
-    assert!(b.scanout_m2.hold_direct);
+    assert!(b.pstate.scanout_m2.hold_direct);
 }
 
 #[test]

@@ -2,16 +2,14 @@ use crate::kms::{
     core::KmsCore,
     render::{
         backend::{
-            ConnectorConfig, KmsBackend, PaintTargetShape, RandrIdAllocator, ScanoutM0Telemetry,
-            ScanoutM1ProbeCache, ScanoutM2State, ScenePlacement, TrackedWindows, WarnThrottle,
+            ConnectorConfig, KmsBackend, KmsBackendState, PaintTargetShape, RandrIdAllocator,
+            ScanoutM0Telemetry, ScanoutM1ProbeCache, ScanoutM2State, ScenePlacement,
         },
         engine::{RenderEngine, decode_x11_pixel_for_storage},
         gpu::GpuCore,
         platform::PlatformBackend,
         scene::SceneCompositor,
-        store::DrawableStore,
         target::{Dst, Src},
-        telemetry::Telemetry,
     },
 };
 use ash::vk;
@@ -542,66 +540,20 @@ impl KmsBackend {
     /// storage. Used by `for_tests_with_vk` so root allocation
     /// happens after the Vk context is attached.
     fn for_tests_seed() -> Self {
-        let mut backend = Self {
-            core: KmsCore::for_tests(),
-            platform: PlatformBackend::for_tests(),
-            logged_gaps: RefCell::new(HashSet::new()),
-            store: DrawableStore::new(),
-            engine: RenderEngine::stub(),
-            scene: SceneCompositor::stub(),
-            windows: TrackedWindows::default(),
-            subwindow_clip_cache: std::cell::RefCell::new(None),
-            shape_generation: 0,
-            next_window_stack_rank: 1,
-            telemetry: Telemetry::new(),
-            last_observed_pool_creates: 0,
-            last_observed_pool_resets: 0,
-            cow_id: None,
-            deferred_cow_release: false,
+        let pstate = KmsBackendState {
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             crtc_queue_sequence_unsupported_devices: HashSet::new(),
-            clip_mask_cache: None,
-            depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
-            uniform_glyph_source_cache: crate::kms::backend::UniformGlyphSourceCache::new(64),
-            clip_mask_snapshot: None,
-            fill_pattern_cache: None,
-            kms_outputs_active: true,
-            clear_window_area_calls: 0,
-            engine_copy_area_calls: 0,
-            recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
-            picture_drawable_ids: HashMap::new(),
-            pending_picture_drawable_refs: HashMap::new(),
-            root_readback_warn: WarnThrottle::default(),
-            dst_fanout_active: false,
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
             syncobj_eventfd_supported: None,
             dmabuf_sync_file_warned: Cell::new(false),
-            pending_present_batches: std::collections::VecDeque::new(),
-            retained_present_wakes: std::collections::HashMap::new(),
             pending_present_source_waits: HashMap::new(),
             next_present_source_wait_id: 1,
-            present_source_pins: HashMap::new(),
-            next_present_source_pin_id: 1,
-            pending_completed_events_on_shutdown: Vec::new(),
-            cursor_records: HashMap::new(),
-            cursor_pixmaps: HashMap::new(),
-            next_cursor_version: 1,
-            default_cursor_xid: None,
-            input_only_pointer_hosts: HashMap::new(),
-            effective_cursor_xid: None,
-            grab_cursor_override: None,
-            cursor_hidden: false,
-            displayed_cursor_pending: None,
-            anim_cursor_records: HashMap::new(),
-            released_cursors: HashSet::new(),
-            active_cursor_anim: None,
-            last_drained_fb_opens: 0,
             // Test fixtures always run in Direct mode.
             vt_state: crate::vt::state::VtState::Active,
             vt_pending: crate::vt::state::VtPending::default(),
@@ -609,8 +561,6 @@ impl KmsBackend {
             vt_switching_armed: false,
             led_relay: None,
             leds_sent: 0,
-            floating_keyboard_states: HashMap::new(),
-            lock_filter_priv_by_device: HashMap::new(),
             input_sender: None,
             crtc_config_probe_executor: None,
             pending_crtc_config_probes: HashMap::new(),
@@ -636,6 +586,14 @@ impl KmsBackend {
             dmabuf_export_supported: false,
             export_holders: Default::default(),
         };
+        let mut backend = Self::assemble(
+            KmsCore::for_tests(),
+            PlatformBackend::for_tests(),
+            RenderEngine::stub(),
+            SceneCompositor::stub(),
+            pstate,
+            true,
+        );
         let live: Vec<_> = backend
             .platform
             .outputs
@@ -659,7 +617,7 @@ impl KmsBackend {
             })
             .collect();
         for (key, config, modes, edid, mm_width, mm_height, connector_type) in live {
-            let entry = backend.randr_id_alloc.entry_mut(&key);
+            let entry = backend.pstate.randr_id_alloc.entry_mut(&key);
             entry.connected = true;
             entry.config = config;
             entry.modes = modes;

@@ -992,6 +992,10 @@ pub trait Backend {
         Ok(())
     }
 
+    /// The platform posted `Message::PlatformEvent`: drain its queue.
+    /// Default no-op for backends whose platform never posts one.
+    fn on_platform_event(&mut self, _state: &mut ServerState) {}
+
     /// Dump the current scanout buffer to a file in the process's
     /// cwd. Diagnostic-only — fired from `Message::DumpScanout`
     /// (Ctrl-Alt-Enter on KMS). Default no-op for backends that don't
@@ -2373,6 +2377,12 @@ pub trait Backend {
     /// — see the §4 fallback matrix.
     fn dri3_capabilities(&self) -> Dri3Caps {
         Dri3Caps::unsupported()
+    }
+
+    /// Whether GLX (indirect, server-synthesised) is advertised. A platform
+    /// without a GL client stack to talk to turns it off.
+    fn glx_available(&self) -> bool {
+        true
     }
 
     /// Import a client-supplied dma-buf as a server-owned pixmap and

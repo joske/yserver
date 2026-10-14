@@ -1525,7 +1525,7 @@ fn xkbcomp_compat_upload_reaches_leds_and_cooking() {
     let _ = replay.backend.cook_host_key(key(66, false));
     let caps = input::Led::CAPSLOCK.bits();
     assert_eq!(
-        replay.backend.leds_sent, caps,
+        replay.backend.pstate.leds_sent, caps,
         "precondition: Caps Lock LED on"
     );
     for (name, _) in steps.iter().take(2) {
@@ -1534,7 +1534,7 @@ fn xkbcomp_compat_upload_reaches_leds_and_cooking() {
     }
     // Lock is still locked, but the LED now shows locked Shift.
     assert_eq!(
-        replay.backend.leds_sent, 0,
+        replay.backend.pstate.leds_sent, 0,
         "Caps Lock LED off: it follows Shift now"
     );
     let st = &mut replay.backend.core.xkb_state.0;
@@ -1568,7 +1568,7 @@ fn xkbcomp_compat_upload_reaches_leds_and_cooking() {
         .0
         .serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED);
     assert_eq!(locked, 0, "compat: no Caps Lock");
-    assert_eq!(replay.backend.leds_sent, 0, "no LED");
+    assert_eq!(replay.backend.pstate.leds_sent, 0, "no LED");
 }
 
 /// Golden (`xorg-xkb-setcompat.txt`, Xvfb 21.1.24): SetCompatMap's
@@ -1653,10 +1653,10 @@ fn set_names_and_geometry_match_xorg() {
                 // The keyboard LEDs follow the indicators by index, as
                 // Xorg's input drivers do: bit 0 lights Caps Lock.
                 let caps = u32::from(xorg & 1 != 0) * input::Led::CAPSLOCK.bits();
-                if replay.backend.leds_sent & input::Led::CAPSLOCK.bits() != caps {
+                if replay.backend.pstate.leds_sent & input::Led::CAPSLOCK.bits() != caps {
                     failures.push(format!(
                         "{what}: keyboard LEDs {:#x}, Caps Lock LED expected {caps:#x}",
-                        replay.backend.leds_sent
+                        replay.backend.pstate.leds_sent
                     ));
                 }
             }

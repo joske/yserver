@@ -1,4 +1,6 @@
 //! Hardware-free tests of the actual startup listener and core setup paths.
+// The core-loop round trips below need the KMS test backend.
+#![cfg_attr(not(kms), allow(unused_imports, dead_code))]
 
 use std::{
     fs,
@@ -224,6 +226,7 @@ fn request_barrier(stream: &mut (impl Read + Write)) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(kms)]
 #[test]
 fn tcp_loopback_cookie_setup_and_listener_capabilities() {
     let mut fixture = Fixture::new();
@@ -389,6 +392,7 @@ fn request_reply(stream: &mut (impl Read + Write), request: &[u8]) -> io::Result
 /// non-descriptor minors must STILL work over the same connection, and the
 /// segment table must be untouched — that last one is what fails if the
 /// refusal is added without the cleanup.
+#[cfg(kms)]
 #[test]
 fn loopback_tcp_is_refused_the_fd_bearing_mit_shm_minors() {
     const MIT_SHM: u8 = 130;

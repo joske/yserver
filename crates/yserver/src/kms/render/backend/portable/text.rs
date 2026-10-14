@@ -2,7 +2,7 @@ use crate::kms::{
     cpu_types::Rectangle16,
     render::{
         backend::{
-            KmsBackend, ParsedGlyph, ParsedGlyphItems,
+            ParsedGlyph, ParsedGlyphItems, XBackend,
             portable::{
                 clip::local_rects_to_region,
                 dump::picture_pict_format,
@@ -11,6 +11,7 @@ use crate::kms::{
                     resolve_dst_picture_for_render,
                 },
             },
+            seam::Platform,
         },
         engine::decode_x11_pixel_for_storage,
         glyph_pixels::GlyphSourceFormat,
@@ -23,7 +24,7 @@ use std::{collections::HashMap, io};
 use yserver_core::backend::{FontHandle, OriginContext};
 use yserver_protocol::x11::{FontMetrics, xfixes};
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     // ── Stage 3a: Core-text helpers ─────────────────────────────
 
     /// FreeType rasterise + atlas dispatch for one text run.
@@ -207,7 +208,7 @@ impl KmsBackend {
         ];
         match self.engine.image_text(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             target.dst(),
             font_xid,
             foreground_rgba,
@@ -317,7 +318,7 @@ impl KmsBackend {
         };
         if let Err(e) = self.engine.fill_rect(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             target.dst(),
             rect,
             color,
@@ -641,7 +642,7 @@ pub(in crate::kms::render) fn parse_composite_glyph_items(
     out
 }
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     pub(in crate::kms::render::backend) fn backend_text_render_composite_glyphs(
         &mut self,
         _origin: Option<OriginContext>,
@@ -882,7 +883,7 @@ impl KmsBackend {
         let dst_pict_format = picture_pict_format(&self.core, host_dst);
         let stats = self.engine.composite_glyphs(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             dst_target.dst(),
             op,
             dst_pict_format,
@@ -961,7 +962,7 @@ impl KmsBackend {
     }
 }
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     pub(in crate::kms::render::backend) fn backend_text_open_font(
         &mut self,
         _origin: Option<OriginContext>,
@@ -1174,7 +1175,7 @@ impl KmsBackend {
     }
 }
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     pub(in crate::kms::render::backend) fn backend_draw_poly_text8(
         &mut self,
         origin: Option<OriginContext>,

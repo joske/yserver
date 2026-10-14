@@ -358,7 +358,9 @@ fn xshmfence_handle_accessor_returns_arc_clone() {
     // xshmfence FD in a unit test is fragile.
     let xid = 0x1234_5678_u32;
     let mapping = crate::kms::xshmfence::FenceMapping::for_tests_dummy();
-    b.dri3_xshmfences.insert(xid, std::sync::Arc::new(mapping));
+    b.pstate
+        .dri3_xshmfences
+        .insert(xid, std::sync::Arc::new(mapping));
     let h1 = b.dri3_xshmfence_handle(xid).expect("handle present");
     assert_eq!(
         std::sync::Arc::strong_count(&h1),
@@ -374,7 +376,7 @@ fn xshmfence_handle_accessor_returns_arc_clone() {
     let _ = h1;
     let _ = h2;
     // Drop the registry entry (mimics XFixesDestroyFence).
-    b.dri3_xshmfences.remove(&xid);
+    b.pstate.dri3_xshmfences.remove(&xid);
     // Accessor returns None now; but the caller's Arc clones
     // still pin the FenceMapping alive (no destructor panic).
     assert!(b.dri3_xshmfence_handle(xid).is_none());
@@ -462,7 +464,7 @@ fn syncobj_handle_accessor_returns_arc_clone() {
 
     let mut b = KmsBackend::for_tests();
     let xid = 0xAAAA_BBBB_u32;
-    b.dri3_syncobjs.insert(
+    b.pstate.dri3_syncobjs.insert(
         xid,
         (
             yserver_protocol::x11::ClientId(1),
@@ -478,7 +480,7 @@ fn syncobj_handle_accessor_returns_arc_clone() {
 
     let h = b.dri3_syncobj_handle(xid).expect("handle present");
     assert_eq!(std::sync::Arc::strong_count(&h), 2);
-    b.dri3_syncobjs.remove(&xid);
+    b.pstate.dri3_syncobjs.remove(&xid);
     // Accessor returns None now; the held Arc still pins the resource
     // alive, which is what the deferred completion path relies on.
     assert!(b.dri3_syncobj_handle(xid).is_none());

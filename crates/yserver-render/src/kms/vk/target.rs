@@ -1360,6 +1360,7 @@ pub enum TilingStrategy {
 }
 
 /// Allocate an external-memory, dma-buf-exportable `VkImage` + `VkDeviceMemory`.
+/// `ERROR_FORMAT_NOT_SUPPORTED` without [`VkContext::dmabuf_export`].
 ///
 /// **Linear layout preferred, chosen by asking the driver.** The strategy
 /// is selected once per `VkContext` and cached on its
@@ -1395,6 +1396,9 @@ pub fn allocate_exportable(
     height: u32,
     format: vk::Format,
 ) -> Result<ExportableImage, vk::Result> {
+    if !vk.dmabuf_export {
+        return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
+    }
     if let Some(strategy) = vk.tfp_tiling_strategy.get() {
         return allocate_with_strategy(vk, width, height, format, *strategy);
     }

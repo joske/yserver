@@ -8,7 +8,7 @@
 //! Marked `#[ignore]` because it needs a working Vulkan ICD (lavapipe
 //! suffices). Run with `cargo test -p yserver --test dri3_fd_leak --
 //! --ignored` under vng or on bare metal.
-
+#![cfg(kms)]
 #![cfg(target_os = "linux")]
 // Test-side client buffers, outside the server's memory ledger.
 #![allow(clippy::disallowed_methods)]

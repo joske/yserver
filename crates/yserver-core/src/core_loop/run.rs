@@ -2767,6 +2767,7 @@ fn run_core_with_inventory(
                             }
                             Message::DumpScanout => backend.dump_scanout(),
                             Message::DumpDrawables => backend.dump_drawables(),
+                            Message::PlatformEvent => backend.on_platform_event(state),
                         }
                         if state.server_grab_owner.is_none() {
                             release_server_grab_waiters(

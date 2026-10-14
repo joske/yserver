@@ -447,7 +447,14 @@ fn stays_quiet(peer: &mut UnixStream) -> bool {
                 | std::io::ErrorKind::UnexpectedEof
         ),
     };
-    peer.set_read_timeout(Some(TIMEOUT)).expect("read timeout");
+    // macOS fails SO_RCVTIMEO with EINVAL once the peer has closed.
+    if let Err(err) = peer.set_read_timeout(Some(TIMEOUT)) {
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "read timeout: {err}"
+        );
+    }
     quiet
 }
 

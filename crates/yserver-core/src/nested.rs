@@ -122,6 +122,8 @@ pub(crate) enum ExtensionAvailability {
     /// backend has no real caps yet). Task 11 will narrow this to the
     /// real capability check.
     Dri3,
+    /// GLX — gated on `Backend::glx_available()`.
+    Glx,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -312,7 +314,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         first_event: GLX_FIRST_EVENT,
         event_count: 2, // PbufferClobber=0, BufferSwapComplete=1
         first_error: GLX_FIRST_ERROR,
-        availability: ExtensionAvailability::Always,
+        availability: ExtensionAvailability::Glx,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
     },
     ExtensionMetadata {

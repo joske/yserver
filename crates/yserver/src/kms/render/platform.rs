@@ -409,7 +409,7 @@ where
 
 /// v2's real DRM/Vk/libinput owner. Replaces the flat field set
 /// that Stage 1b's `KmsBackend` carried.
-pub(crate) struct PlatformBackend {
+pub struct PlatformBackend {
     /// Armed only while the outer `KmsBackend` constructor is still
     /// fallible. `Drop` disables the initial modesets before the dumb
     /// swapchains are destroyed; full construction explicitly disarms it.

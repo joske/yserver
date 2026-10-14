@@ -278,6 +278,7 @@ pub(super) fn extension_query_reply(name: &str, backend: &mut dyn Backend) -> Op
         ExtensionAvailability::HostRender => backend.render_opcode().is_some(),
         ExtensionAvailability::HostXkb => backend.xkb_opcode().is_some(),
         ExtensionAvailability::Dri3 => backend.dri3_capabilities().version != (0, 0),
+        ExtensionAvailability::Glx => backend.glx_available(),
     };
     if !available {
         return None;
@@ -294,6 +295,7 @@ pub(super) fn advertised_extension_names(backend: &mut dyn Backend) -> Vec<&'sta
     let render_available = backend.render_opcode().is_some();
     let xkb_available = backend.xkb_opcode().is_some();
     let dri3_available = backend.dri3_capabilities().version != (0, 0);
+    let glx_available = backend.glx_available();
     EXTENSIONS
         .iter()
         .filter(|ext| match ext.availability {
@@ -301,6 +303,7 @@ pub(super) fn advertised_extension_names(backend: &mut dyn Backend) -> Vec<&'sta
             ExtensionAvailability::HostRender => render_available,
             ExtensionAvailability::HostXkb => xkb_available,
             ExtensionAvailability::Dri3 => dri3_available,
+            ExtensionAvailability::Glx => glx_available,
         })
         .map(|ext| ext.name)
         .collect()

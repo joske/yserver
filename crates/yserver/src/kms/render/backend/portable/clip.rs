@@ -3,9 +3,10 @@ use crate::kms::{
     cpu_types::Rectangle16,
     render::{
         backend::{
-            ClipMaskSnapshot, FillPatternCache, KmsBackend, SubwindowClipCacheEntry,
-            SubwindowModeClip,
+            ClipMaskSnapshot, FillPatternCache, SubwindowClipCacheEntry, SubwindowModeClip,
+            XBackend,
             portable::draw::{compute_copy_area_dst_rects, rects16_bbox},
+            seam::Platform,
         },
         target::{PaintTarget, Src},
     },
@@ -14,7 +15,7 @@ use std::io;
 use yserver_core::backend::{ClipState, OriginContext, PixmapHandle};
 use yserver_protocol::x11::{ClipRectangles, xfixes};
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     /// Decode the wire-packed clip rectangle list (`Vec<u8>` of
     /// i16 x, i16 y, u16 w, u16 h tuples) into `Rectangle16`s in
     /// dst-coords (with the GC clip-origin already added). Returns
@@ -197,7 +198,7 @@ impl KmsBackend {
             .engine
             .get_image(
                 &mut self.store,
-                &mut self.platform.gpu,
+                self.platform.gpu_mut(),
                 Src::server_internal(id),
                 rect,
                 depth,
@@ -242,7 +243,7 @@ impl KmsBackend {
             .engine
             .get_image(
                 &mut self.store,
-                &mut self.platform.gpu,
+                self.platform.gpu_mut(),
                 Src::server_internal(cache.drawable_id),
                 rect,
                 cache.depth,
@@ -384,7 +385,7 @@ impl KmsBackend {
         // before first use). No-ops when the version already matches.
         if let Err(e) = self.engine.refresh_clip_snapshot(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             sid,
             did,
             live_version,
@@ -910,7 +911,7 @@ pub(super) fn subtract_one_rect_clip(
     result
 }
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     // ── GC state ────────────────────────────────────────────────
     pub(in crate::kms::render::backend) fn backend_clip_clear_clip_rectangles(
         &mut self,
@@ -1003,7 +1004,7 @@ impl KmsBackend {
     }
 }
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     /// Audit #8 (2026-05-19) — return the picture's `clientClip` for
     /// `CreateRegionFromPicture` (XFixes). Outer `Option` distinguishes
     /// "picture doesn't carry a clientClip at all" (Solidfill /

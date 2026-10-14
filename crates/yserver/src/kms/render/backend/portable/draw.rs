@@ -2,8 +2,9 @@ use crate::kms::{
     cpu_types::{Rectangle16, Repeat},
     render::{
         backend::{
-            GET_IMAGE_FORMAT_XY_PIXMAP, KmsBackend,
+            GET_IMAGE_FORMAT_XY_PIXMAP, XBackend,
             portable::clip::{clip_rects16, intersect_rect_with_clip, subtract_one_rect_clip},
+            seam::Platform,
         },
         engine::decode_x11_pixel_for_storage,
         submit_trace::{Flags as SubmitFlags, Op as SubmitOp, SrcClass, SubmitEvent, SubmitKind},
@@ -17,7 +18,7 @@ use yserver_core::{
     host_x11::HostSubwindowVisual,
 };
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     /// Compute the surviving destination scissor rects for a CopyArea, in
     /// drawable-LOCAL space (before `dst_target.offset()` is added). This is the
     /// EXACT non-mask clip machinery the run-based path uses, in order: GC
@@ -220,7 +221,7 @@ impl KmsBackend {
             let opaque_alpha = logical_depth != 32; // true for depth-1
             match self.engine.logic_fill(
                 &mut self.store,
-                &mut self.platform.gpu,
+                self.platform.gpu_mut(),
                 target.dst(),
                 GcFunction::Copy,
                 opaque_alpha,
@@ -268,7 +269,7 @@ impl KmsBackend {
             let opaque_alpha = logical_depth != 32;
             match self.engine.logic_fill(
                 &mut self.store,
-                &mut self.platform.gpu,
+                self.platform.gpu_mut(),
                 target.dst(),
                 function,
                 opaque_alpha,
@@ -337,7 +338,7 @@ impl KmsBackend {
         let n_rects = u32::try_from(vk_rects.len()).unwrap_or(u32::MAX);
         match self.engine.fill_rect_batch(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             target.dst(),
             color,
             &vk_rects,
@@ -377,7 +378,7 @@ impl KmsBackend {
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CpuFallbackFill);
         let mut bytes = match self.engine.get_image(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             Src::server_internal(id),
             rect,
             depth,
@@ -419,7 +420,7 @@ impl KmsBackend {
         // unchanged rather than painting it.
         if let Err(e) = self.engine.put_image(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             Dst::server_internal(id),
             ash::vk::Offset2D::default(),
             extent,
@@ -513,7 +514,7 @@ impl KmsBackend {
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CopyAreaRop);
         let src_bytes = match self.engine.get_image(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             src_handle,
             rect(sx, sy),
             depth,
@@ -528,7 +529,7 @@ impl KmsBackend {
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CopyAreaRop);
         let mut dst_bytes = match self.engine.get_image(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             dst_handle.read_back(),
             rect(dx, dy),
             depth,
@@ -550,7 +551,7 @@ impl KmsBackend {
         }
         if let Err(e) = self.engine.put_image(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             dst_handle,
             ash::vk::Offset2D { x: dx, y: dy },
             ash::vk::Extent2D {
@@ -636,7 +637,7 @@ impl KmsBackend {
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::PutImageRop);
         let mut dst_bytes = match self.engine.get_image(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             dst_handle.read_back(),
             dst_rect,
             depth,
@@ -664,7 +665,7 @@ impl KmsBackend {
         }
         if let Err(e) = self.engine.put_image(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             dst_handle,
             dst_rect.offset,
             dst_rect.extent,
@@ -801,7 +802,7 @@ impl KmsBackend {
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CpuFallbackPattern);
         let mut dst_bytes = match self.engine.get_image(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             Src::server_internal(id),
             dst_rect,
             depth,
@@ -945,7 +946,7 @@ impl KmsBackend {
         }
         if let Err(e) = self.engine.put_image(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             Dst::server_internal(id),
             ash::vk::Offset2D::default(),
             extent,
@@ -1037,7 +1038,7 @@ impl KmsBackend {
         const OP_SRC: u8 = 1;
         let composite_result = self.engine.render_composite(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             OP_SRC,
             // GC tiles are pixmaps by protocol — whole storage.
             ResolvedSource::Drawable(SourceDrawable::whole(tile_id)),
@@ -1498,7 +1499,7 @@ pub(in crate::kms::render::backend) fn compute_copy_area_dst_rects(
     current
 }
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     pub(in crate::kms::render::backend) fn backend_draw_set_gc_fill_solid(
         &mut self,
         _origin: Option<OriginContext>,
@@ -1819,7 +1820,7 @@ impl KmsBackend {
                         self.engine
                             .refresh_clip_snapshot(
                                 &mut self.store,
-                                &mut self.platform.gpu,
+                                self.platform.gpu_mut(),
                                 sid,
                                 did,
                                 v,
@@ -1854,7 +1855,7 @@ impl KmsBackend {
                 self.engine
                     .masked_copy_area(
                         &mut self.store,
-                        &mut self.platform.gpu,
+                        self.platform.gpu_mut(),
                         src_h,
                         dst,
                         ash::vk::Offset2D {
@@ -1939,7 +1940,7 @@ impl KmsBackend {
                     let res = if routes_to_cow {
                         self.engine.cow_copy_area(
                             &mut self.store,
-                            &mut self.platform.gpu,
+                            self.platform.gpu_mut(),
                             dst_target.dst(),
                             src_h,
                             sub_src,
@@ -1948,7 +1949,7 @@ impl KmsBackend {
                     } else {
                         self.engine.copy_area(
                             &mut self.store,
-                            &mut self.platform.gpu,
+                            self.platform.gpu_mut(),
                             src_h,
                             dst_target.dst(),
                             sub_src,
@@ -2079,7 +2080,7 @@ impl KmsBackend {
             let res = if routes_to_cow {
                 self.engine.cow_copy_area(
                     &mut self.store,
-                    &mut self.platform.gpu,
+                    self.platform.gpu_mut(),
                     dst_target.dst(),
                     src_h,
                     src_sub_rect,
@@ -2088,7 +2089,7 @@ impl KmsBackend {
             } else {
                 self.engine.copy_area(
                     &mut self.store,
-                    &mut self.platform.gpu,
+                    self.platform.gpu_mut(),
                     src_h,
                     dst_target.dst(),
                     src_sub_rect,
@@ -2209,7 +2210,7 @@ impl KmsBackend {
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CopyPlane);
         let src_bytes = match self.engine.get_image(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             src_target.server_backing_src(),
             ash::vk::Rect2D {
                 offset: ash::vk::Offset2D::default(),
@@ -2440,7 +2441,7 @@ impl KmsBackend {
         }
         if let Err(e) = self.engine.put_image(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             target.dst(),
             ash::vk::Offset2D {
                 x: i32::from(dst_x) + target.offset().0,
@@ -2633,7 +2634,7 @@ impl KmsBackend {
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::ClientGetImage);
         let readback = self.engine.get_image(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             target.src_including_border(),
             rect,
             depth,
@@ -2782,7 +2783,7 @@ impl KmsBackend {
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::ReadDepth1);
         let result = match self.engine.get_image(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             target.src_including_border(),
             rect,
             1,

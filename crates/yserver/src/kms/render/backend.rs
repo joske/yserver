@@ -17,67 +17,63 @@
 //! - `for_tests`: `*_for_tests` entry points for the acceptance tests.
 //! - `tests`, `crtc_transform_tests`: unit tests.
 
+#[cfg(kms)]
 mod for_tests;
+#[cfg(kms)]
 mod kms;
+#[cfg(kms)]
+pub use kms::state::KmsBackend;
+#[cfg(kms)]
+pub(crate) use kms::state::*;
 mod portable;
+pub(crate) mod seam;
 mod trait_impl;
 
-#[cfg(test)]
+#[cfg(all(test, kms))]
 use crate::kms::render::backend::portable::{
-    apply_gc_function, apply_z_plane_mask, border_ring_rects, bordered_storage_extent,
-    clip_trap_bbox_to_extents, composite_needs_source_snapshot, compute_render_composite_clip,
-    copy_area_clip_gpu_eligible, default_window_init_color, depth_plane_mask,
-    dst_picture_clip_by_children, migrated_content_copy, picture_source_domain_clip,
-    read_z_pixmap_pixel, take_first_occurrence, write_z_pixmap_pixel, z_to_xy_planes,
+    apply_gc_function, apply_z_plane_mask, assemble_root_scanout, border_ring_rects,
+    bordered_storage_extent, clip_trap_bbox_to_extents, composite_needs_source_snapshot,
+    compute_render_composite_clip, copy_area_clip_gpu_eligible, default_window_init_color,
+    depth_plane_mask, dst_picture_clip_by_children, migrated_content_copy,
+    picture_source_domain_clip, read_z_pixmap_pixel, split_root_scanout_reads,
+    take_first_occurrence, write_z_pixmap_pixel, z_to_xy_planes,
 };
 use crate::kms::render::backend::portable::{
     compute_copy_area_dst_rects, intersect_rect_with_clip,
 };
-#[cfg(test)]
+#[cfg(all(test, kms))]
 use kms::*;
-#[cfg(test)]
+#[cfg(all(test, kms))]
 pub(super) use portable::parse_composite_glyph_items;
 
-#[cfg(test)]
+#[cfg(all(test, kms))]
 mod tests;
 
 use std::{
-    cell::{Cell, RefCell},
-    collections::{HashMap, HashSet, VecDeque},
-    io,
-    os::fd::OwnedFd,
+    cell::RefCell,
+    collections::{HashMap, HashSet},
 };
 
-#[cfg(test)]
+#[cfg(all(test, kms))]
 use crate::kms::core::PictureRecord;
-#[cfg(test)]
+#[cfg(all(test, kms))]
 use crate::kms::cpu_types::Rectangle16;
 use ash::vk;
-use yserver_core::backend::{
-    CrtcConfigToken, PixmapHandle, PresentScanoutCandidate, identity_ramp, resample_channel,
-};
 use yserver_protocol::x11::ResourceId;
 
 pub(crate) use super::window_geometry::WindowGeometry;
 pub(super) use super::window_geometry::WindowsMap;
 
-use crate::{
-    internal_probe::RouteProbeRequest,
-    kms::{
-        backend::OutputKey,
-        core::KmsCore,
-        render::{
-            engine::RenderEngine,
-            glyph_pixels::GlyphSourceFormat,
-            platform::{CrtcKey, PlatformBackend, QualifiedScanoutPlan},
-            scene::SceneCompositor,
-            store::{DrawableId, DrawableStore},
-            target::PaintTarget,
-            telemetry::Telemetry,
-        },
-        scanout_route::ScanoutRoute,
+use crate::kms::{
+    core::KmsCore,
+    render::{
+        engine::RenderEngine,
+        glyph_pixels::GlyphSourceFormat,
+        scene::SceneCompositor,
+        store::{DrawableId, DrawableStore},
+        target::PaintTarget,
+        telemetry::Telemetry,
     },
-    platform::drm::ModeIdentity,
 };
 
 /// Per-window geometry tracked by v2's scene assembler. Stage 2 plan
@@ -169,6 +165,7 @@ pub(super) fn scene_input<'a>(
 /// Test-only (#133): one scene participant's placement — its host xid and
 /// its output-local rects as `(x, y, w, h)`. Named so
 /// `KmsBackend::scene_participant_places_for_tests` has a simple signature.
+#[cfg(kms)]
 pub type ScenePlacement = (u32, Vec<(i32, i32, u32, u32)>, Vec<(i32, i32, u32, u32)>);
 
 /// #133 step 3 (P4) — the observable shape of a resolved paint target,
@@ -177,6 +174,7 @@ pub type ScenePlacement = (u32, Vec<(i32, i32, u32, u32)>, Vec<(i32, i32, u32, u
 /// `(x, y, w, h)` in storage coordinates (`None` = the whole storage),
 /// and whether the resolved chain carries a border clip at all (the
 /// direct-scanout gate's input, 3.5).
+#[cfg(kms)]
 pub type PaintTargetShape = ((i32, i32), Option<(i32, i32, u32, u32)>, bool);
 
 /// A moving window's place in an ancestor's shared redirect backing,
@@ -251,295 +249,6 @@ enum LeafContent {
     Migrate,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScanoutM0Target {
-    Cow,
-    CowDescendant,
-    Unredirected,
-    Other,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScanoutM0Coverage {
-    Root,
-    Output(usize),
-    None,
-}
-
-/// Which retained direct frame a single CRTC is scanning out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DirectFrameSlot {
-    Pending,
-    Current,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ScanoutM0Shape {
-    target: ScanoutM0Target,
-    coverage: ScanoutM0Coverage,
-    rect: Option<(i32, i32, u32, u32)>,
-    source_extent: (u32, u32),
-    depth: u8,
-    bpp: u8,
-    imported: bool,
-    fourcc: u32,
-    vk_format: vk::Format,
-    modifier: u64,
-    plane_offset: u64,
-    plane_pitch: u32,
-    offsets: (i16, i16),
-    /// Whether the Present carried a valid / update region, NOT which one.
-    ///
-    /// Issue #146: these were the region XIDs. A compositor creates a fresh
-    /// update region every frame (`update=0x4144dd` → `0x4144eb` →
-    /// `0x4144f9` in the reporter's log), so putting the XID in the dedup key
-    /// made the key change on every Present by construction — and
-    /// `scanout_m0 shape`, which is supposed to log only when the shape
-    /// CHANGES, logged once per composited frame instead.
-    ///
-    /// Only the zero-ness is ever consumed: `regions_ok` tests
-    /// `valid_region_xid == 0 && update_region_xid == 0 && update_is_full`.
-    /// The identities are printed in the log line straight from the
-    /// candidate, so nothing is lost by keeping them out of the key.
-    valid_region_present: bool,
-    update_region_present: bool,
-    update_is_full: bool,
-}
-
-struct ScanoutM0Telemetry {
-    interval_start: std::time::Instant,
-    last_shape_by_dst: HashMap<u32, ScanoutM0Shape>,
-    recent_sources_by_dst: HashMap<u32, std::collections::VecDeque<DrawableId>>,
-    interval_sources: HashSet<DrawableId>,
-    presents: u64,
-    authoritative: u64,
-    root_coverage: u64,
-    output_coverage: u64,
-    reject_server_owned: u64,
-    reject_target: u64,
-    reject_geometry: u64,
-    reject_offsets: u64,
-    reject_regions: u64,
-    m1_gate_candidates: u64,
-    m1_gate_open: u64,
-    m1_gate_reject_crtc: u64,
-    m1_gate_reject_vt: u64,
-    m1_gate_reject_outputs: u64,
-    m1_gate_reject_cursor: u64,
-    m1_gate_reject_overlay: u64,
-    m1_gate_reject_source: u64,
-    m1_gate_reject_import: u64,
-    m1_probe_pass: u64,
-    m1_probe_reject: u64,
-    m1_probe_error: u64,
-}
-
-impl Default for ScanoutM0Telemetry {
-    fn default() -> Self {
-        Self {
-            interval_start: std::time::Instant::now(),
-            last_shape_by_dst: HashMap::new(),
-            recent_sources_by_dst: HashMap::new(),
-            interval_sources: HashSet::new(),
-            presents: 0,
-            authoritative: 0,
-            root_coverage: 0,
-            output_coverage: 0,
-            reject_server_owned: 0,
-            reject_target: 0,
-            reject_geometry: 0,
-            reject_offsets: 0,
-            reject_regions: 0,
-            m1_gate_candidates: 0,
-            m1_gate_open: 0,
-            m1_gate_reject_crtc: 0,
-            m1_gate_reject_vt: 0,
-            m1_gate_reject_outputs: 0,
-            m1_gate_reject_cursor: 0,
-            m1_gate_reject_overlay: 0,
-            m1_gate_reject_source: 0,
-            m1_gate_reject_import: 0,
-            m1_probe_pass: 0,
-            m1_probe_reject: 0,
-            m1_probe_error: 0,
-        }
-    }
-}
-
-struct ScanoutM1ProbeEntry {
-    /// Retained solely for its FB/GEM lifetime; `Drop` performs teardown.
-    _framebuffer: Option<crate::drm::modeset::DirectScanoutProbeFramebuffer>,
-}
-
-impl ScanoutM1ProbeEntry {
-    fn rejected() -> Self {
-        Self { _framebuffer: None }
-    }
-
-    fn accepted(framebuffer: crate::drm::modeset::DirectScanoutProbeFramebuffer) -> Self {
-        Self {
-            _framebuffer: Some(framebuffer),
-        }
-    }
-
-    fn framebuffer(&self) -> Option<&crate::drm::modeset::DirectScanoutProbeFramebuffer> {
-        self._framebuffer.as_ref()
-    }
-}
-
-struct ScanoutM1ProbeCache {
-    topology_signature: u64,
-    entries: HashMap<DrawableId, ScanoutM1ProbeEntry>,
-}
-
-impl ScanoutM1ProbeCache {
-    fn new() -> Self {
-        Self {
-            topology_signature: 0,
-            entries: HashMap::new(),
-        }
-    }
-
-    fn remove(&mut self, id: DrawableId) {
-        self.entries.remove(&id);
-    }
-
-    fn clear(&mut self, reason: &'static str) {
-        if !self.entries.is_empty() {
-            log::debug!(
-                "scanout_m1: dropping {} cached probe framebuffer(s): {reason}",
-                self.entries.len()
-            );
-            self.entries.clear();
-        }
-    }
-}
-
-struct DirectPresentFrame {
-    source_pin: u64,
-    fallback_target_pin: u64,
-    source_id: DrawableId,
-    candidate: PresentScanoutCandidate,
-    fallback_target: PaintTarget,
-    event: yserver_core::backend::CompletedPresentEvent,
-    /// Output whose CRTC domain owns CompleteNotify/MSC for this Present.
-    completion_output_idx: usize,
-    /// Exact pageflip sample from the selected/reference CRTC. Xorg waits for
-    /// every grouped CRTC to retire before completing, but stamps the event
-    /// from this reference sample rather than the last/max output.
-    completion_clock: Option<yserver_core::backend::PresentClockSample>,
-    awaiting_outputs: HashSet<usize>,
-}
-
-/// Require a short stable run before entering direct ownership. Compositors
-/// such as E27 alternate full-root Presents with authoritative region-limited
-/// Presents; entering on every eligible member of that stream otherwise
-/// causes direct/composed atomic thrash.
-const SCANOUT_M2_ELIGIBLE_ROOT_PROBATION: u8 = 8;
-
-struct ScanoutM2State {
-    pending: Option<DirectPresentFrame>,
-    /// One eligible direct successor, retained while `pending` owns the
-    /// hardware transaction. Newer successors replace this slot (latest
-    /// wins); there is never more than one not-yet-submitted direct frame.
-    queued_successor: Option<DirectPresentFrame>,
-    current: Option<DirectPresentFrame>,
-    completed: Vec<yserver_core::backend::CompletedPresentEvent>,
-    /// Coalesced successors cannot overtake the in-flight predecessor's
-    /// CompleteNotify. Release their storage immediately, but publish their
-    /// Skip completions only when that predecessor retires.
-    deferred_successor_skips: Vec<yserver_core::backend::CompletedPresentEvent>,
-    idled: Vec<yserver_core::backend::CompletedPresentEvent>,
-    hold_direct: bool,
-    cursor_bound_all: bool,
-    unflip_requested: bool,
-    /// First request in the current direct-to-composed transition. This is
-    /// the causal trigger; later composite ticks must not overwrite it.
-    unflip_reason: Option<&'static str>,
-    /// Most recent request before submission, useful for distinguishing the
-    /// initiating event from the gate that finally drove the atomic unflip.
-    unflip_last_reason: Option<&'static str>,
-    unflip_awaiting_outputs: HashSet<usize>,
-    reentry_blocked_until_composed: bool,
-    eligible_root_streak: u8,
-    unflip_fallback_source: Option<DrawableId>,
-    unflip_shadow_ready: bool,
-    /// The synchronized composed unflip failed and was degraded to the
-    /// per-output scene compose path. Keep direct-frame pins held until those
-    /// composed flips replace every direct plane.
-    degraded_composed_unflip: bool,
-    #[cfg(test)]
-    test_force_active: bool,
-    #[cfg(test)]
-    test_submit_direct_without_drm: bool,
-}
-
-impl ScanoutM2State {
-    fn new() -> Self {
-        Self {
-            pending: None,
-            queued_successor: None,
-            current: None,
-            completed: Vec::new(),
-            deferred_successor_skips: Vec::new(),
-            idled: Vec::new(),
-            hold_direct: false,
-            cursor_bound_all: false,
-            unflip_requested: false,
-            unflip_reason: None,
-            unflip_last_reason: None,
-            unflip_awaiting_outputs: HashSet::new(),
-            reentry_blocked_until_composed: false,
-            eligible_root_streak: 0,
-            unflip_fallback_source: None,
-            unflip_shadow_ready: false,
-            degraded_composed_unflip: false,
-            #[cfg(test)]
-            test_force_active: false,
-            #[cfg(test)]
-            test_submit_direct_without_drm: false,
-        }
-    }
-
-    fn active(&self) -> bool {
-        self.pending.is_some() || self.queued_successor.is_some() || self.current.is_some() || {
-            #[cfg(test)]
-            {
-                self.test_force_active
-            }
-            #[cfg(not(test))]
-            {
-                false
-            }
-        }
-    }
-
-    fn admit_eligible_root(&mut self) -> bool {
-        if self.active() {
-            return true;
-        }
-        self.eligible_root_streak = self
-            .eligible_root_streak
-            .saturating_add(1)
-            .min(SCANOUT_M2_ELIGIBLE_ROOT_PROBATION);
-        self.eligible_root_streak >= SCANOUT_M2_ELIGIBLE_ROOT_PROBATION
-    }
-
-    fn reset_eligible_root_probation(&mut self) {
-        self.eligible_root_streak = 0;
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ScanoutM1OutputGeometry {
-    x: i32,
-    y: i32,
-    width: u32,
-    height: u32,
-    mode_width: u32,
-    mode_height: u32,
-}
-
 /// One leaf→backing composite emitted by
 /// `KmsBackend::plan_backing_inferiors`. Coordinates are
 /// backing-local (B's `(0, 0)` == the redirected window's origin);
@@ -555,399 +264,21 @@ struct SeedInferiorDraw {
     height: u32,
 }
 
-/// Monotonic device-qualified RANDR connector registry.
-///
-/// Authoritative store for every connector yserver has ever seen:
-/// stable ids, connection state, current config, the persistent
-/// `client_configured` bit, and the last-known advertised mode list.
-/// The rescan/resume layout-preservation rule and `apply_crtc_config`
-/// key off this; the core only sees the resulting `Vec<RandrOutput>`.
-#[derive(Debug, Default)]
-pub(crate) struct RandrIdAllocator {
-    next: u32,
-    providers: HashMap<RandrProviderEndpoint, u32>,
-    connectors: HashMap<OutputKey, ConnectorEntry>,
-    modes: HashMap<ModeIdentity, u32>,
-}
-
-/// One endpoint that can own a RANDR provider XID.
-///
-/// Keep the variants tagged even though both verified renderer identities and
-/// KMS identities ultimately contain DRM major/minor pairs. A render node and
-/// a primary node with the same raw numbers are different endpoint kinds and
-/// must never alias by accident. Same-device provider coalescing is an
-/// explicit projection decision based on Vulkan's advertised primary node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum RandrProviderEndpoint {
-    Kms(crate::platform::drm::DrmDeviceKey),
-    Render(crate::kms::render::platform::RenderDeviceId),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ConnectorIds {
-    pub output_id: u32,
-    pub crtc_id: u32,
-}
-
-/// Owned connector snapshot used while allocating mode XIDs mutably.
-struct NotLiveConnector {
-    key: OutputKey,
-    ids: ConnectorIds,
-    connected: bool,
-    modes: Vec<crate::platform::drm::Mode>,
-    edid: Vec<u8>,
-    mm_width: u32,
-    mm_height: u32,
-    connector_type: String,
-}
-
-type ProjectedRandrOutputState = (bool, u32, u32, i16, i16, u16, u16);
-
-/// Per-connector current configuration in the registry.
-// Consumed by the SetCrtcConfig apply path + rescan/resume layout
-// preservation (later RANDR output-management tasks); storage only here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConnectorConfig {
-    /// Connected but not scanning out (mode=None, no CRTC).
-    Off,
-    /// Scanning out at `(mode_w, mode_h, vrefresh)` placed at `(x, y)`.
-    Enabled {
-        mode_w: u16,
-        mode_h: u16,
-        vrefresh: u32,
-        x: i32,
-        y: i32,
-    },
-}
-
-/// Everything a relight needs to put a remembered route back exactly where it
-/// was, read out of a [`ConnectorConfig::Enabled`].
-///
-/// P3b adds the assigned CRTC XID to `ConnectorConfig::Enabled` and to this
-/// struct; every relight reader goes through
-/// [`ConnectorConfig::restorable_route`], so that addition stays local
-/// instead of touching each consumer (design, "P3 extends `last_enabled`").
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RememberedRoute {
-    pub mode: yserver_core::backend::ModeSpec,
-    pub x: i32,
-    pub y: i32,
-}
-
-impl ConnectorConfig {
-    /// The route policy this config remembers, or `None` when it is `Off`.
-    fn restorable_route(self) -> Option<RememberedRoute> {
-        match self {
-            Self::Off => None,
-            Self::Enabled {
-                mode_w,
-                mode_h,
-                vrefresh,
-                x,
-                y,
-            } => Some(RememberedRoute {
-                mode: yserver_core::backend::ModeSpec {
-                    width: mode_w,
-                    height: mode_h,
-                    vrefresh,
-                },
-                x,
-                y,
-            }),
-        }
-    }
-
-    /// The layout rectangle this config occupies, or `None` when it is `Off`.
-    fn placed_rect(self) -> Option<crate::kms::render::platform::LayoutRect> {
-        match self {
-            Self::Off => None,
-            Self::Enabled {
-                mode_w,
-                mode_h,
-                x,
-                y,
-                ..
-            } => Some((x, y, mode_w, mode_h)),
-        }
-    }
-}
-
-/// One route [`KmsBackend::take_relight_requests`] decided to restore.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RelightRequest {
-    key: OutputKey,
-    mode: yserver_core::backend::ModeSpec,
-    x: i32,
-    y: i32,
-}
-
-/// Owned request handed to the asynchronous PRIME route qualifier.
-///
-/// The duplicate KMS fd keeps the exact DRM open-file description alive until
-/// the worker/helper finishes, even if hotplug or backend teardown retires the
-/// platform entry before this job starts. The request itself contains only
-/// scalar handles and route identities; live output ownership remains in the
-/// pending backend entry.
-pub(crate) struct CrtcConfigProbeJob {
-    pub(crate) kms_fd: OwnedFd,
-    pub(crate) request: RouteProbeRequest,
-}
-
-/// One completed asynchronous qualification. A successful plan contains no
-/// live Vulkan/DRM object and can therefore be rejected safely if its topology
-/// or VT snapshot has gone stale.
-pub(crate) struct CrtcConfigProbeCompletion {
-    pub(crate) token: CrtcConfigToken,
-    pub(crate) result: io::Result<QualifiedScanoutPlan>,
-}
-
-/// Injectable owner of the worker/helper transport. Production sends the owned
-/// job through the process-isolated qualifier; tests use an in-memory
-/// implementation without changing the core-facing token lifecycle.
-pub(crate) trait CrtcConfigProbeExecutor {
-    fn set_core_sender(&mut self, _sender: yserver_core::core_loop::CoreSender) {}
-    /// Queue one process-helper request and return without performing the
-    /// qualification or waiting for the child on the core thread.
-    fn enqueue(&mut self, job: CrtcConfigProbeJob) -> io::Result<()>;
-    /// Non-blockingly drain results already delivered by the helper owner.
-    fn drain_ready(&mut self) -> Vec<CrtcConfigProbeCompletion>;
-    /// Best-effort, non-blocking cancellation/retirement. Implementations must
-    /// tolerate this racing a completed child and repeated calls.
-    fn cancel(&mut self, _token: CrtcConfigToken) {}
-}
-
-struct PendingCrtcConfigProbe {
-    output_id: u32,
-    output_key: OutputKey,
-    connector: String,
-    mode: yserver_core::backend::ModeSpec,
-    x: i32,
-    y: i32,
-    route: ScanoutRoute,
-    prepared_output: Option<crate::platform::drm::Output>,
-    topology_signature: u64,
-    topology_epoch: u64,
-    vt_state: crate::vt::state::VtState,
-    was_active: bool,
-}
-
-/// One connector the backend has ever seen.
-// Fields consumed by later RANDR output-management tasks (reprobe,
-// SetCrtcConfig apply, layout preservation); storage only here.
-#[derive(Debug, Clone)]
-pub(crate) struct ConnectorEntry {
-    pub ids: ConnectorIds,
-    pub connected: bool,
-    pub config: ConnectorConfig,
-    /// Whether `GetOutputInfo.crtc` retains this connector's former CRTC.
-    /// Physical loss retains the association; an explicit client disable
-    /// clears it. It cannot be inferred from `connected` or `config`: both
-    /// physical loss and a deliberate disable leave the route Off.
-    pub crtc_associated: bool,
-    /// `true` once a client SetCrtcConfig/SetScreenSize touched this
-    /// output. The auto-layout (recompact / boot extend-right) only
-    /// ever touches `!client_configured` outputs. A lightweight connection
-    /// query retains it because that query does not detach the CRTC; the
-    /// later heavy physical-topology apply clears it when the route goes.
-    pub client_configured: bool,
-    /// Route policy of a connector retired by a **physical** disconnect,
-    /// kept so the reconnect edge relights it with no client request
-    /// (design P1b, invariant 1). `None` whenever nothing is remembered: a
-    /// client's explicit `SetCrtcConfig`, an incompatible-mode reconnect and
-    /// a successful relight all clear it.
-    ///
-    /// This is also the reservation record. While it is `Some` and the route
-    /// is not live, the remembered rectangle is excluded from auto-layout
-    /// packing and unioned into the virtual-screen extent, so a survivor
-    /// never moves into the hole a restorable route left (invariant 7).
-    /// Releasing a reservation is exactly clearing this field — there is no
-    /// second record to drop.
-    pub last_enabled: Option<ConnectorConfig>,
-    /// Last-known advertised mode list, preferred-first. Retained across
-    /// disconnect so a momentarily-gone monitor keeps reporting stable mode
-    /// resources until reconnect refreshes them.
-    pub modes: Vec<crate::platform::drm::Mode>,
-    /// Connector identity from the latest heavy startup/hotplug/resume
-    /// snapshot. Lightweight RANDR force queries never refresh these fields;
-    /// they invalidate monitor-owned EDID/dimensions when connection or mode
-    /// evidence says the previous identity may have departed.
-    pub edid: Vec<u8>,
-    pub mm_width: u32,
-    pub mm_height: u32,
-    pub connector_type: String,
-}
-
-#[derive(Debug, Default)]
-struct ConnectorRegistryDelta {
-    /// Outputs whose advertised connection, modes, or monitor identity
-    /// changed and therefore need OutputChangeNotify.
-    changed_keys: Vec<OutputKey>,
-    /// Xorg's config timestamp covers available output/mode configuration,
-    /// not EDID, millimeter dimensions, or connector-type metadata alone.
-    config_changed: bool,
-}
-
-impl ConnectorRegistryDelta {
-    fn is_empty(&self) -> bool {
-        self.changed_keys.is_empty()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct GammaLut {
-    red: Vec<u16>,
-    green: Vec<u16>,
-    blue: Vec<u16>,
-}
-
-impl GammaLut {
-    fn identity(size: u16) -> Self {
-        let ramp = identity_ramp(size);
-        Self {
-            red: ramp.clone(),
-            green: ramp.clone(),
-            blue: ramp,
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.red.len()
-    }
-
-    fn resampled(&self, size: u16) -> Self {
-        let dst_len = usize::from(size);
-        Self {
-            red: resample_channel(&self.red, dst_len),
-            green: resample_channel(&self.green, dst_len),
-            blue: resample_channel(&self.blue, dst_len),
-        }
-    }
-}
-
-impl RandrIdAllocator {
-    fn fresh(&mut self) -> u32 {
-        self.next = self.next.saturating_add(1);
-        self.next
-    }
-
-    fn provider_id_for(&mut self, endpoint: RandrProviderEndpoint) -> u32 {
-        if let Some(id) = self.providers.get(&endpoint) {
-            return *id;
-        }
-        let id = self.fresh();
-        self.providers.insert(endpoint, id);
-        id
-    }
-
-    /// Resolve a provider XID back to its tagged endpoint identity.
-    ///
-    /// The allocator is monotonic, so this may return an endpoint that was
-    /// projected earlier in the process lifetime but is not part of the
-    /// current provider set. Request paths must additionally validate the
-    /// result against [`KmsBackend::randr_provider_endpoints`].
-    fn provider_endpoint_for_id(&self, provider_id: u32) -> Option<RandrProviderEndpoint> {
-        self.providers
-            .iter()
-            .find_map(|(endpoint, id)| (*id == provider_id).then_some(*endpoint))
-    }
-
-    fn ids_for(&mut self, output_key: &OutputKey) -> ConnectorIds {
-        if let Some(entry) = self.connectors.get(output_key) {
-            return entry.ids;
-        }
-        let ids = ConnectorIds {
-            output_id: self.fresh(),
-            crtc_id: self.fresh(),
-        };
-        self.connectors.insert(
-            output_key.clone(),
-            ConnectorEntry {
-                ids,
-                connected: false,
-                config: ConnectorConfig::Off,
-                crtc_associated: false,
-                client_configured: false,
-                last_enabled: None,
-                modes: Vec::new(),
-                edid: Vec::new(),
-                mm_width: 0,
-                mm_height: 0,
-                connector_type: String::new(),
-            },
-        );
-        ids
-    }
-
-    pub(super) fn mode_id(&mut self, mode: &crate::platform::drm::Mode) -> u32 {
-        let identity = ModeIdentity::from(mode);
-        if let Some(id) = self.modes.get(&identity) {
-            return *id;
-        }
-        let id = self.fresh();
-        self.modes.insert(identity, id);
-        id
-    }
-
-    /// Output keys whose layout a client has explicitly configured
-    /// (SetCrtcConfig/SetScreenSize). The auto-layout recompact must
-    /// leave these where the client placed them — see Task 5.1.
-    fn client_configured_keys(&self) -> HashSet<OutputKey> {
-        self.connectors
-            .iter()
-            .filter(|(_, e)| e.client_configured)
-            .map(|(key, _)| key.clone())
-            .collect()
-    }
-
-    pub(super) fn connected_keys(&self) -> HashSet<OutputKey> {
-        self.connectors
-            .iter()
-            .filter(|(_, entry)| entry.connected)
-            .map(|(key, _)| key.clone())
-            .collect()
-    }
-
-    fn known_connectors(&self) -> Vec<(OutputKey, ConnectorIds)> {
-        self.connectors
-            .iter()
-            .map(|(key, entry)| (key.clone(), entry.ids))
-            .collect()
-    }
-
-    /// Get or create the registry entry for a connector, allocating
-    /// stable ids on first sight. New entries default to disconnected,
-    /// Off, not-client-configured, empty mode list.
-    fn entry_mut(&mut self, key: &OutputKey) -> &mut ConnectorEntry {
-        if !self.connectors.contains_key(key) {
-            // Allocate ids (also inserts the default entry).
-            let _ = self.ids_for(key);
-        }
-        self.connectors.get_mut(key).expect("just inserted")
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn entry(&self, key: &OutputKey) -> Option<&ConnectorEntry> {
-        self.connectors.get(key)
-    }
-
-    pub(crate) fn entries(&self) -> impl Iterator<Item = (&OutputKey, &ConnectorEntry)> {
-        self.connectors.iter()
-    }
-}
-
 /// v2 sibling backend. Shares `KmsCore` with `KmsBackend`;
 /// owns `PlatformBackend` (real DRM/Vk/libinput per Stage 2a)
 /// plus stub `DrawableStore` / `RenderEngine` / `SceneCompositor`
 /// that fill in across Stages 2b–2e. Paint / RENDER / scene ops
 /// log gaps until those substages land.
-pub struct KmsBackend {
+///
+/// Generic over the platform `P` under it; on DRM/KMS that is [`KmsBackend`].
+pub struct XBackend<P: seam::Platform> {
     /// Shared protocol-bookkeeping state. Identical to v1's
     /// `KmsBackend.core` — same struct, same construction path.
     pub(crate) core: KmsCore,
 
     /// Real DRM/KMS/libinput/Vulkan owner per Stage 2a. Replaced
     /// the flat field set Stage 1b carried.
-    pub(crate) platform: PlatformBackend,
+    pub(crate) platform: P,
 
     /// Once-per-method dedup set for `v2: <method> not yet
     /// implemented` warnings. `RefCell` to keep the helper callable
@@ -1000,52 +331,6 @@ pub struct KmsBackend {
     /// The protocol resource is logically gone, but the backend identity and
     /// storage stay alive until the composed replacement retires.
     deferred_cow_release: bool,
-
-    /// M0 direct-scanout telemetry. Purely observational: it never owns a
-    /// drawable pin, submits DRM work, or affects Present capabilities.
-    scanout_m0: ScanoutM0Telemetry,
-    scanout_m1: ScanoutM1ProbeCache,
-    scanout_m2: ScanoutM2State,
-
-    /// Per-CRTC armed absolute MSC for idle vblank pacing. Keyed by the
-    /// stable `crtc::Handle`; presence means "a `DRM_CRTC_SEQUENCE` is
-    /// queued on this CRTC and we are waiting for it" (value `0` is the
-    /// relative-next-vblank sentinel this spike uses). A per-CRTC map
-    /// rather than a single bool so arming CRTC A can't suppress arming
-    /// CRTC B (the dual-monitor permanent-stall class).
-    ///
-    /// **Invariant (load-bearing):** every code path that drops or
-    /// completes an armed sequence MUST clear the matching entry —
-    /// `on_crtc_sequence_event` (unconditional clear-arm before
-    /// validating), `!scanout_allowed()` in `arm_idle_vblanks_with`,
-    /// `run_suspend` / DPMS-off (master loss drops queued sequences), and
-    /// output removal (`prune_armed_targets_to_live_outputs`). A stuck
-    /// entry = a permanent ~0 fps stall on that CRTC.
-    pub(crate) armed_vblank_targets: std::collections::HashMap<CrtcKey, u64>,
-
-    /// Per-CRTC absolute (per-target) armed MSCs for deferred Present
-    /// execution (spec §msc-due future-target rule). Keyed by raw
-    /// `crtc_id` (not `Handle` — `arm_present_absolute_vblank` deals in
-    /// the same `u32` ids `queue_crtc_sequence` takes). Own set,
-    /// entirely independent of `armed_vblank_targets`: multiple
-    /// in-flight `CRTC_QUEUE_SEQUENCE`s per CRTC are legal, and the
-    /// absolute arm must neither consume nor suppress the relative-1
-    /// idle arm (which a compositor parks every iteration — sharing the
-    /// slot would starve one arm kind or the other). Entries retire in
-    /// `on_crtc_sequence_event` when a tagged event's `sequence` reaches
-    /// the target; `clear_all_armed_vblank_targets` clears this
-    /// alongside `armed_vblank_targets` at the same lifecycle edges.
-    pub(crate) absolute_vblank_targets:
-        std::collections::HashMap<CrtcKey, std::collections::BTreeSet<u64>>,
-
-    /// Latches true the first time `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` returns
-    /// EOPNOTSUPP/ENOTTY (pre-4.14 kernels lack the ioctl). Once set we stop
-    /// attempting idle arming and degrade to flip-driven MSC only. Shared
-    /// between the relative idle arm (`arm_idle_vblanks_ioctl`) and the
-    /// absolute per-target arm (`arm_present_absolute_vblank`) — the ioctl
-    /// is either supported or not, independent of which caller issues it.
-    /// Logged once on transition; never resets within a process lifetime.
-    pub(crate) crtc_queue_sequence_unsupported_devices: HashSet<crate::platform::drm::DrmDeviceKey>,
 
     /// CPU-side clip-mask cache for the current GC clip pixmap
     /// (depth-1 or depth-8). Install keeps identity/origin metadata
@@ -1151,55 +436,6 @@ pub struct KmsBackend {
     /// not fan out again.
     dst_fanout_active: bool,
 
-    /// DRI3 `FenceFromFD` xshmfence-backed fences keyed by the
-    /// client's xid. Mesa's loader_dri3 uses xshmfence (memfd +
-    /// futex) for idle/sync fences; the mmap'd mapping lets us
-    /// `xshmfence_trigger` directly when the X side wants to
-    /// signal idle. Mirrors v1's `dri3_xshmfences` field shape.
-    pub(crate) dri3_xshmfences: HashMap<u32, std::sync::Arc<crate::kms::xshmfence::FenceMapping>>,
-    /// DRI3 sync-fence resources keyed by the client's xid, from
-    /// `FenceFromFD` falling through the xshmfence path (sync_file fd →
-    /// `VkSemaphore`). Syncobjs live in `dri3_syncobjs`.
-    pub(crate) dri3_sync_resources:
-        HashMap<u32, std::sync::Arc<crate::kms::render::owned_semaphore::OwnedSemaphore>>,
-    /// DRI3 1.4 syncobj resources keyed by the client's xid, imported by
-    /// `ImportSyncobj`. The tuple's first element is the importing client —
-    /// Xorg models a DRI3 syncobj as a first-class X resource owned by a
-    /// client (`dri3_syncobj_type = CreateNewResourceType(...)`), and every
-    /// conformance property in the spec's table falls out of that one
-    /// decision: `FreeSyncobj` ownership, the disconnect purge, and the
-    /// `PresentPixmapSynced` xid checks.
-    pub(crate) dri3_syncobjs: HashMap<
-        u32,
-        (
-            yserver_protocol::x11::ClientId,
-            std::sync::Arc<crate::kms::render::imported_syncobj::ImportedSyncobj>,
-        ),
-    >,
-
-    /// Result of the one-shot `DRM_IOCTL_SYNCOBJ_EVENTFD` probe: `None` until
-    /// probed, then the answer for the rest of the session.
-    ///
-    /// FreeBSD's drm-kmod reports `DRM_CAP_SYNCOBJ_TIMELINE` (which is what
-    /// `Dri3Caps::syncobj` derives from) but does not implement the eventfd
-    /// ioctl, which is a much later Linux addition. Without this latch every
-    /// synced Present logged a warning and retried a call that cannot
-    /// succeed — a warning per frame, on a path where per-frame logging is
-    /// known to perturb the timing it reports.
-    syncobj_eventfd_supported: Option<bool>,
-
-    /// Latches the first "dma-buf sync-file export unsupported" warning.
-    ///
-    /// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` is absent on FreeBSD's drm-kmod and
-    /// these three sites run per Present: one GhostBSD/MATE session logged 412
-    /// of them. Unlike the syncobj eventfd probe this latches only the LOG,
-    /// not the behaviour — `ExportedSyncFile::Unsupported` conflates "no such
-    /// ioctl" with "this buffer failed", and copying immediately is correct
-    /// either way, so suppressing the attempt could disable a working path.
-    /// `Cell` permits the source site to record it while still holding a
-    /// `&self` borrow of `self.store`; the backend remains on the core thread.
-    dmabuf_sync_file_warned: Cell<bool>,
-
     /// Stage 5 Task 6.1: queue of in-flight deferred PRESENT
     /// completion batches. Drained by `drain_completed_present_events`
     /// when the inner `present_completion_epfd` reports a submitted
@@ -1216,12 +452,6 @@ pub struct KmsBackend {
     /// `CompletedPresentEvent::present_id`.
     retained_present_wakes:
         std::collections::HashMap<u64, crate::kms::render::present_completion::PinnedWake>,
-
-    /// Imported Present sources parked on their producer sync-file. The exact
-    /// source `DrawableId` is incref'd while an entry lives here.
-    pub(crate) pending_present_source_waits:
-        HashMap<u64, crate::kms::render::present_source_wait::PendingPresentSourceWait>,
-    pub(crate) next_present_source_wait_id: u64,
 
     /// `pin_present_source` tokens: the xid is resolved to a `DrawableId`
     /// ONCE at pin time and held here, incref'd, so a later `FreePixmap` /
@@ -1308,136 +538,80 @@ pub struct KmsBackend {
     /// drain helper emit one `record_frame_builder_open` per new open
     /// without requiring a separate event queue.
     last_drained_fb_opens: u64,
-
-    // ── VT switching (Direct/VT_PROCESS). Suspend/resume state machine,
-    //    driven by VtRelease/VtAcquire (SIGUSR1/2) → `drive_vt_event`.
-    /// State machine for the suspend/resume cycle.
-    /// Used by `scanout_allowed()` / `run_suspend`.
-    vt_state: crate::vt::state::VtState,
-    /// Coalesced counter-events for the state machine.
-    /// Consumed by `drive_vt_event`.
-    vt_pending: crate::vt::state::VtPending,
-    /// Controlling console TTY guard. Present in direct mode when the
-    /// process is launched on a real VT; `None` when no controlling
-    /// console exists (pty / graphical terminal / test harness).
-    /// On non-console platforms this is a unit placeholder (unused).
-    #[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
-    console_guard: crate::kms::ConsoleGuardOpt,
-    /// Whether VT switching has been armed in direct mode.
-    vt_switching_armed: bool,
-    /// Direct-mode lock-LED sink: the input thread owns the libinput
-    /// devices, so LED changes cross via this relay (mask + eventfd in
-    /// the thread's epoll). `None` in test fixtures.
-    led_relay: Option<std::sync::Arc<crate::input::LedRelay>>,
-    /// Last `input::Led` bits pushed — dedup so only lock-state
-    /// TRANSITIONS reach the hardware, not every key event.
-    leds_sent: u32,
     /// Independent XKB cooking states for keyboard slaves detached by an
     /// explicit XI2 grab. The XI device ID is stable for the grab lifetime.
     floating_keyboard_states: HashMap<u16, FloatingKeyboardState>,
     /// Xorg's XkbFilterLockState `filter->priv` and `filter->upAction` for
     /// each held LockMods key.
     lock_filter_priv_by_device: HashMap<u16, HashMap<u8, LockFilterPriv>>,
-    /// Core-channel sender for backend-originated shutdowns. Handed in via
-    /// `set_input_sender` after the channel is created in `lib.rs`.
-    input_sender: Option<yserver_core::core_loop::CoreSender>,
-    /// Optional asynchronous cross-device scanout qualifier. Absence keeps the
-    /// existing synchronous `apply_crtc_config` path unchanged.
-    crtc_config_probe_executor: Option<Box<dyn CrtcConfigProbeExecutor>>,
-    pending_crtc_config_probes: HashMap<CrtcConfigToken, PendingCrtcConfigProbe>,
-    ready_crtc_config_results: HashMap<CrtcConfigToken, io::Result<QualifiedScanoutPlan>>,
-    invalidated_crtc_config_probes: HashSet<CrtcConfigToken>,
-    ready_crtc_config_announcements: VecDeque<CrtcConfigToken>,
-    next_crtc_config_token: u64,
-    next_device_config_token: u64,
-    /// Invalidates results across any topology quiesce or VT event, including
-    /// an ABA transition which happens to restore the same final layout.
-    crtc_config_topology_epoch: u64,
-    /// Test-only discovery result used to exercise the real `begin` hook with
-    /// the fd-less DRM fixture. Production always performs live discovery.
-    #[cfg(test)]
-    crtc_config_discovery_override: Option<crate::platform::drm::Output>,
-    /// Direct-mode input-thread control channel. Used by VT release /
-    /// acquire to pause and resume the dedicated input thread.
-    input_thread_control: Option<std::sync::Arc<crate::input_thread::InputThreadControl>>,
-    randr_id_alloc: RandrIdAllocator,
-    /// Session-persistent PRIME Output Source policy, keyed by the KMS sink.
-    ///
-    /// Values use the provider's tagged endpoint identity rather than a DRM
-    /// primary-node key: the selected renderer may be a distinct render node
-    /// or the unverified Vulkan fallback, neither of which can be represented
-    /// truthfully as a KMS device. Startup seeds every distinct opened KMS
-    /// endpoint once; a later explicit detach removes that entry. Provider
-    /// XIDs are only a projection of this policy and may be rebuilt without
-    /// changing it.
-    provider_output_sources: HashMap<crate::platform::drm::DrmDeviceKey, RandrProviderEndpoint>,
-    /// Per-output-id identity for RANDR output properties: `(EDID blob,
-    /// ConnectorType name)`. Rebuilt by `randr_outputs_and_modes` each
-    /// time RANDR state is (re)projected; read by the `EDID`/`EDID_DATA`
-    /// /`ConnectorType` output-property handlers via `output_identity`.
-    output_identity_by_id: std::collections::HashMap<u32, (Vec<u8>, String)>,
-    /// Resolve a RANDR output XID back to its owning DRM device and connector.
-    /// Connector names are only unique within one DRM device.
-    output_key_by_id: std::collections::HashMap<u32, OutputKey>,
-    /// RANDR CRTC XID to the owning device-qualified connector. Gamma
-    /// requests address the CRTC XID, so connector names alone are ambiguous
-    /// once multiple cards can both expose (for example) `DP-1`.
-    crtc_key_by_id: std::collections::HashMap<u32, OutputKey>,
-    /// Live Present clock-domain generation per RANDR CRTC XID. The epoch is
-    /// retained only while that XID resolves to the same active
-    /// device-qualified CRTC. Off/removal or a KMS CRTC reassignment allocates
-    /// a fresh epoch on the next live projection, letting core discard raw MSC
-    /// targets captured in the old counter domain.
-    present_crtc_clock_epochs: HashMap<u32, (CrtcKey, u64)>,
-    next_present_crtc_clock_epoch: u64,
-    hotplug_rescan_deadline: Option<std::time::Instant>,
-    gamma_luts: RefCell<HashMap<OutputKey, GammaLut>>,
 
-    /// GLX-TFP (Tasks 2.3 + 2.4): per-`DrawableId` export tracking for
-    /// pixmaps shared with a GL consumer via `GLX_EXT_texture_from_pixmap`.
-    /// AT MOST ONE entry per drawable regardless of how many times
-    /// `BufferFromPixmap` is issued for it (muffin re-exports per damage).
-    /// Canonical owner of the export lifetime ref + the dup'd dma-buf fd;
-    /// a parallel sync-only fd dup lives on `store.exported_sync` so the
-    /// engine's flush chokepoint can reach it.
-    exported_dmabufs: HashMap<crate::kms::render::store::DrawableId, ExportedBacking>,
-
-    /// Cached result of `probe_dmabuf_export_support` run once at
-    /// construction.  When `true`, `ServerState::glx_tfp_supported` is
-    /// set and the GLX extension string advertises
-    /// `GLX_EXT_texture_from_pixmap`.
-    dmabuf_export_supported: bool,
-
-    /// Last `export holders` report, for change detection.
-    export_holders: crate::kms::render::export_holders::ExportHoldersReporter,
+    /// KMS/DRM/VT/DRI3 state that the portable half never touches.
+    pub(crate) pstate: P::BackendState,
 }
 
-/// GLX-TFP export state for one drawable. See `exported_dmabufs`.
-struct ExportedBacking {
-    /// A dup of the exported dma-buf fd, kept for implicit-sync fence
-    /// I/O. `None` until the first `BufferFromPixmap` export (an entry
-    /// can exist earlier, created by an `acquire_glx_pixmap_export` from
-    /// `glXCreatePixmap`).
-    fd: Option<std::os::fd::OwnedFd>,
-    /// How many live GLXPixmaps reference this backing. Teardown fires
-    /// when this reaches 0.
-    glx_refs: u32,
-    /// True once the single lifetime ref has been taken (so teardown
-    /// releases it exactly once).
-    lifetime_ref_held: bool,
-    /// The backing's `DrawableId`, captured at ref-take time so teardown
-    /// can decref the store entry directly even if the `by_xid` mapping
-    /// was detached by an intervening `FreePixmap` (PendingFence).
-    backing_id: crate::kms::render::store::DrawableId,
-    /// The backing's host-xid handle, captured at ref-take time so
-    /// teardown can release the alias_registry counter (keyed by xid)
-    /// even after the store entry is gone.
-    backing: PixmapHandle,
-    /// Which counter holds the lifetime ref: `true` = `alias_registry`
-    /// (NameWindowPixmap'd redirect backing); `false` = `DrawableStore`
-    /// refcount (plain pixmap). Captured at take time so an alias
-    /// torn-down between take and release can't misroute the decref.
-    lifetime_via_alias: bool,
+impl<P: seam::Platform> XBackend<P> {
+    /// A backend over `platform` with every portable field at its initial
+    /// state. Platform bring-up (root storage, cursor sprite, …) follows.
+    pub(crate) fn assemble(
+        core: KmsCore,
+        platform: P,
+        engine: RenderEngine,
+        scene: SceneCompositor,
+        pstate: P::BackendState,
+        kms_outputs_active: bool,
+    ) -> Self {
+        Self {
+            core,
+            platform,
+            logged_gaps: RefCell::new(HashSet::new()),
+            store: DrawableStore::new(),
+            engine,
+            scene,
+            windows: TrackedWindows::default(),
+            subwindow_clip_cache: std::cell::RefCell::new(None),
+            shape_generation: 0,
+            next_window_stack_rank: 1,
+            telemetry: Telemetry::new(),
+            last_observed_pool_creates: 0,
+            last_observed_pool_resets: 0,
+            cow_id: None,
+            deferred_cow_release: false,
+            clip_mask_cache: None,
+            depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
+            uniform_glyph_source_cache: crate::kms::backend::UniformGlyphSourceCache::new(64),
+            clip_mask_snapshot: None,
+            fill_pattern_cache: None,
+            kms_outputs_active,
+            clear_window_area_calls: 0,
+            engine_copy_area_calls: 0,
+            recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
+            picture_drawable_ids: HashMap::new(),
+            pending_picture_drawable_refs: HashMap::new(),
+            root_readback_warn: WarnThrottle::default(),
+            dst_fanout_active: false,
+            pending_present_batches: std::collections::VecDeque::new(),
+            retained_present_wakes: std::collections::HashMap::new(),
+            present_source_pins: HashMap::new(),
+            next_present_source_pin_id: 1,
+            pending_completed_events_on_shutdown: Vec::new(),
+            cursor_records: HashMap::new(),
+            cursor_pixmaps: HashMap::new(),
+            next_cursor_version: 1,
+            default_cursor_xid: None,
+            input_only_pointer_hosts: HashMap::new(),
+            effective_cursor_xid: None,
+            grab_cursor_override: None,
+            cursor_hidden: false,
+            displayed_cursor_pending: None,
+            anim_cursor_records: HashMap::new(),
+            released_cursors: HashSet::new(),
+            active_cursor_anim: None,
+            last_drained_fb_opens: 0,
+            floating_keyboard_states: HashMap::new(),
+            lock_filter_priv_by_device: HashMap::new(),
+            pstate,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1463,14 +637,6 @@ struct ClipMaskSnapshot {
     width: u32,
     height: u32,
 }
-
-/// user_data tag for absolute (per-target) sequence arms. The kernel
-/// event carries no CRTC; the low 32 bits stay the crtc_id (matching the
-/// relative arm's `user_data = u64::from(crtc_id)`), the high bit
-/// discriminates the arm kind so `on_crtc_sequence_event` can tell an
-/// absolute-arm retirement apart from the single-slot relative idle arm
-/// (spec round-4 F2).
-const ABSOLUTE_SEQ_TAG: u64 = 1 << 63;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KmsButtonDiagnostic {
@@ -1512,77 +678,6 @@ struct InferiorPiece {
 static COMPOSITE_GLYPHS_DROP_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum ScanoutReadSelection {
-    OnScreenOnly,
-    PermissiveDump,
-}
-
-/// Where an on-screen read of one rect actually has to come from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScanoutReadRoute {
-    /// The compositor's own scanout BO. `local` is the rect rebased into that
-    /// BO's coordinate space.
-    Pool {
-        pool_idx: usize,
-        bo_idx: usize,
-        local: vk::Rect2D,
-    },
-    /// A transformed output's intermediate, which holds root pixels. `local`
-    /// is `requested_root ∩ footprint_root − crtc_origin` (spec D6).
-    Intermediate {
-        output_idx: usize,
-        local: vk::Rect2D,
-    },
-    /// A client drawable flipped directly onto this output's CRTC. `source` is
-    /// the rect rebased into that drawable's own coordinate space.
-    Direct {
-        source_id: DrawableId,
-        source_xid: u32,
-        depth: u8,
-        source: vk::Rect2D,
-    },
-}
-
-/// Which buffer a completed read came out of. Reported so a diagnostic dump
-/// can name it and a stale artifact can never be mistaken for the screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScanoutReadOrigin {
-    /// Degenerate read of an empty rect; no buffer was touched.
-    Empty,
-    ComposedPool {
-        pool_idx: usize,
-        bo_idx: usize,
-    },
-    TransformIntermediate {
-        output_idx: usize,
-    },
-    /// The scene composed afresh for a root read (`fresh_root_readback`).
-    RootReadback {
-        output_idx: usize,
-    },
-    DirectSource {
-        source_xid: u32,
-    },
-}
-
-impl ScanoutReadOrigin {
-    /// Short filename-safe tag naming the buffer that was read.
-    fn label(self) -> String {
-        match self {
-            Self::Empty => "empty".to_string(),
-            Self::ComposedPool { pool_idx, bo_idx } => {
-                format!("composed-pool{pool_idx}-bo{bo_idx}")
-            }
-            Self::TransformIntermediate { output_idx } => {
-                format!("transform-intermediate-out{output_idx}")
-            }
-            Self::RootReadback { output_idx } => format!("root-readback-out{output_idx}"),
-            Self::DirectSource { source_xid } => format!("direct-src-0x{source_xid:x}"),
-        }
-    }
-}
-
 /// One scanout read for a root-source `CopyArea(IncludeInferiors)` screenshot:
 /// which root-absolute region to read from the composited scanout, and where
 /// (destination-local) to write it.
@@ -1603,10 +698,6 @@ enum RootReadSource {
     /// Covered by no output: the root window's own storage.
     Background,
 }
-
-/// Granularity of [`ensure_scanout_readback`] growth: a full-screen read
-/// allocates once, and the per-row reads that follow fit.
-const SCANOUT_READBACK_GRANULE: u64 = 1024 * 1024;
 
 /// How often an otherwise idle server re-polls the fences of freed
 /// drawables parked in `pending_retire`.
@@ -1774,6 +865,6 @@ impl WarnThrottle {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, kms))]
 #[path = "crtc_transform_tests.rs"]
 mod crtc_transform_tests;

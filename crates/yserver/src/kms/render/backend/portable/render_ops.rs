@@ -3,7 +3,7 @@ use crate::kms::{
     cpu_types::{PictTransform, Rectangle16, Repeat},
     render::{
         backend::{
-            COMPOSITE_GLYPHS_DROP_WARNED, KmsBackend,
+            COMPOSITE_GLYPHS_DROP_WARNED, XBackend,
             portable::{
                 clip::{
                     intersect_clip_lists, intersect_rect_with_clip, local_rects_to_region,
@@ -12,6 +12,7 @@ use crate::kms::{
                 draw::depth_plane_mask,
                 dump::picture_pict_format,
             },
+            seam::Platform,
         },
         submit_trace::{Flags as SubmitFlags, SrcClass, SubmitKind},
         target::{PaintTarget, Src},
@@ -24,7 +25,7 @@ use yserver_core::backend::{
 };
 use yserver_protocol::x11::{RENDER_FMT_A1, RENDER_FMT_A8, RENDER_FMT_ARGB32, xfixes};
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     /// Resolve a RENDER source / mask picture into what the engine samples.
     ///
     /// Takes `&self` because a picture on a WINDOW must go through
@@ -254,7 +255,7 @@ impl KmsBackend {
             .engine
             .get_image(
                 &mut self.store,
-                &mut self.platform.gpu,
+                self.platform.gpu_mut(),
                 Src::server_internal(src.id()),
                 rect,
                 depth,
@@ -455,7 +456,7 @@ impl KmsBackend {
         let dst_pict_format = picture_pict_format(&self.core, host_dst);
         let stats = self.engine.render_composite(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             op,
             src_resolved,
             mask_resolved,
@@ -648,7 +649,7 @@ impl KmsBackend {
             };
             if let Err(e) = b.engine.copy_area(
                 &mut b.store,
-                &mut b.platform.gpu,
+                b.platform.gpu_mut(),
                 src.src_including_border(),
                 dst.server_backing_dst(),
                 src_rect,
@@ -1108,7 +1109,7 @@ pub(in crate::kms::render::backend) fn compute_render_composite_clip(
     acc
 }
 
-impl KmsBackend {
+impl<P: Platform> XBackend<P> {
     pub(in crate::kms::render::backend) fn backend_render_ops_render_format_for_ynest_id(
         &self,
         ynest_fmt: u32,
@@ -1503,7 +1504,7 @@ impl KmsBackend {
 
         let stats = self.engine.render_fill_rectangles(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             op,
             color_premul,
             dst_target.dst(),
@@ -1705,7 +1706,7 @@ impl KmsBackend {
             i32::from(src_y) - (i32::from(y_off) + dst_target.offset().1) - first_trap_left_p1_y;
         let stats = self.engine.render_traps_or_tris(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             op,
             src_resolved,
             dst_target.dst(),
@@ -1925,7 +1926,7 @@ impl KmsBackend {
             i32::from(src_y) - (i32::from(y_off) + dst_target.offset().1) - first_tri_p1_y;
         let stats = self.engine.render_traps_or_tris(
             &mut self.store,
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             op,
             src_resolved,
             dst_target.dst(),
@@ -2046,7 +2047,7 @@ impl KmsBackend {
             })
             .collect();
         if let Err(e) = self.engine.build_and_insert_linear_gradient(
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             picture_xid,
             (p1x, p1y),
             (p2x, p2y),
@@ -2105,7 +2106,7 @@ impl KmsBackend {
             })
             .collect();
         if let Err(e) = self.engine.build_and_insert_radial_gradient(
-            &mut self.platform.gpu,
+            self.platform.gpu_mut(),
             picture_xid,
             (icx, icy, ir),
             (ocx, ocy, or_),
