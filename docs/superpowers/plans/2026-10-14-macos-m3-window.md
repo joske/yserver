@@ -10,7 +10,7 @@ the window), it is sharp or comfortably sized on a Retina screen by choice, copy
 close button asks before killing connected clients, and there is an app bundle that starts without `just`.
 
 **Non-goals:** rootless (M4), GLX (M4), several X screens or several windows, IME, launchd socket activation of
-`DISPLAY` (the XQuartz `org.xquartz:0` model; see open question 5), notarisation/signing for distribution,
+`DISPLAY` (the XQuartz `org.xquartz:0` model; M4, opt-in), notarisation/signing for distribution,
 Windows.
 
 Tags: **[C]** = checked in code at `30213b61` (file:line). **[A]** = assumption about macOS/AppKit, verified on
@@ -61,43 +61,59 @@ eiger before the task that depends on it merges.
 
 ## Decisions
 
-### 1. One size of truth: the window's content in X pixels
+### 1. Two sizes: the root (X screen) and the output (the window)
 
-The X screen size is always the window's content size in X pixels (`content_points × backing_scale / x_scale`,
-decision 3). Both directions converge on one platform function, `resize_screen(w, h)`, which reallocates surface
-state and then the core publishes the change:
+The surface keeps two sizes apart, as KMS does with a virtual screen larger than its CRTCs:
 
-- **Host → X.** The window becomes `Resizable`. The view reports its new size; the shell posts
-  `ShellEvent::Resized { px_w, px_h, backing_scale }`. During a live resize the shell posts at most one event per
-  display-link tick and always one at `viewDidEndLiveResize`, so clients see a bounded stream, not one per mouse
-  event. `on_platform_event` calls `resize_screen`, then a new `pub` core entry
-  `yserver_core::core_loop::host_screen_resized(state, backend, w, h)` — the body of
-  `handle_host_container_resize`, which the nested backend then also calls.
-- **X → host.** The surface overrides `set_logical_screen_size(w, h)`: `resize_screen(w, h)`, then asks the shell to
-  resize the window (`ShellUi::set_content_size(points)`). The window's own resize event that follows is recognised
-  (same pixel size) and dropped, so there is no loop. If the window cannot grow that far (larger than the screen's
-  visible frame), the window is clamped and the X screen keeps the requested size: the view shows the top-left
-  part, as Xephyr does with a too-large `-screen`. **[open question 2]**
-- **Modes.** The output lists the current size as its preferred mode plus a fixed list of common sizes
-  (1024x768, 1280x800, 1440x900, 1680x1050, 1920x1080, 1920x1200, 2560x1440, 2560x1600, capped at the visible frame
-  in X pixels), so `xrandr -s 1280x800` and desktop display settings work. A host resize to a size not in the list
-  adds it as the current mode (like Xwayland's resizable mode). `RRSetCrtcConfig` with one of the listed modes =
-  `resize_screen` + window resize; anything else (rotation, a second output) gets `BadMatch`, matching the
-  M0/M1 plan's "refused".
-- **Size range.** `RRGetScreenSizeRange` reports min 320x200 and max = the Vulkan max image extent clamped to
-  8192 per side.
+- **Root size** = the RandR screen size = root window and COW storage. Changed by `RRSetScreenSize` and by host
+  resizes. Always contains the output.
+- **Output size** = the `WINDOW-0` CRTC's mode = the window's content in X pixels
+  (`content_points × backing_scale / x_scale`, decision 3). The slots and the swapchain follow the output, not the
+  root. The CRTC sits at (0,0), so a root larger than the output is shown cropped to its top-left part (Xephyr's
+  answer to a too-large `-screen`).
 
-### 2. `resize_screen` is the KMS storage code, lifted
+The three ways a size changes:
 
-`apply_virtual_screen_extent`'s platform-neutral body (unflip, epoch, input extent, root/COW reallocation and
-refill, damage invalidation) moves to `kms/render/backend/portable/` as `resize_root_storage(w, h)`; KMS keeps its
-`fb_w/fb_h` lines and calls it. The surface version adds: `fb_size`, the output's slot images (reallocated at the
-new extent, previous content dropped — the next composite repaints everything), the `CAMetalLayer` `drawableSize`
-(via `ShellUi`, main thread), and marks the swapchain for recreation. `record_copy` then copies at the slot extent;
-the slot and the swapchain extent can disagree for one frame during a live resize — the copy uses the smaller of the
-two per axis and the uncovered part stays the layer's previous content.
+- **The user resizes the window (host → X).** The window becomes `Resizable`. The view reports its size; the shell
+  posts `ShellEvent::Resized { px_w, px_h, backing_scale, request: None }`, at most once per display-link tick during
+  a live resize and always at `viewDidEndLiveResize`. `on_platform_event` resizes output and root to the window
+  (slots, root/COW), then calls the `pub` core entry `host_screen_resized(state, backend, w, h)` (`randr.resize`:
+  screen + output + CRTC, notifies, root ConfigureNotify). A root enlarged with `--fb` is therefore reset to the
+  window on the next user resize. An event whose size equals the current output is dropped.
+- **A client sets the screen size (`RRSetScreenSize`).** Root only; the output and the window do not change. A size
+  smaller than the output is BadMatch (the core's existing crop check). No window event follows, so there is no
+  loop.
+- **A client switches mode (`RRSetCrtcConfig`, `xrandr -s`).** The mode must fit in the root (BadMatch otherwise —
+  `xrandr -s` sets the screen size first). The output takes the mode (slots resized), then the surface asks the
+  shell to resize the window with a request token (`ShellUi::set_content_size(points, token)`). The window's resize
+  event carries the token back (`request: Some(token)`); a tokened event only completes the request: if AppKit
+  clamped the window, the output (CRTC mode) follows the actual size and a CrtcChangeNotify goes out, but the root
+  never changes. So a clamp cannot shrink X behind the client's back, and nothing loops.
+- **Modes.** The output lists the current size as its preferred mode plus 1024x768, 1280x800, 1440x900, 1680x1050,
+  1920x1080, 1920x1200, 2560x1440, 2560x1600, each only if it fits the screen's visible frame in X pixels, so a
+  listed mode is not normally clamped. A user resize to an unlisted size adds it as the current mode (Xwayland's
+  resizable mode). Rotation, reflection, a second output or a CRTC position other than (0,0) is BadMatch.
+- **Size range.** `RRGetScreenSizeRange` reports min 320x200, max = the Vulkan max image extent clamped to 8192 per
+  side.
 
-### 3. HiDPI: `--scale` is X pixels per point; default 2 on Retina **[open question 1]**
+### 2. Resizes are atomic: allocate everything, then commit
+
+A resize allocates all new storage first — root, COW, and the slots when the output changes — and only then swaps
+it in and updates `fb_size`, the output layout and `state.randr`. The commit step cannot fail. If any allocation
+fails, the new storage is freed and nothing changes:
+
+- client-driven (`RRSetScreenSize`, `RRSetCrtcConfig`): the request fails with BadMatch and the server keeps its old
+  size, as Xorg (`randr/rrscreen.c:289–293`: a failed `RRScreenSizeSet` is BadMatch);
+- host-driven (window resize): the window cannot be refused, so the output and the root keep their old size and the
+  window shows them cropped or with the uncovered part cleared (`record_copy` copies the smaller extent per axis
+  already); one warning is logged, and the next resize event retries.
+
+The shared `resize_root_storage` (portable) is split into `prepare` (allocate, may fail, returns the new storage) and
+`commit` (swap + refill + damage, infallible); KMS's `apply_virtual_screen_extent` uses the same split, which also
+fixes its detach-before-allocate order. Tests inject an allocation failure (through the memory budget or a test
+hook) for both directions and assert the old state and, for client requests, BadMatch.
+
+### 3. HiDPI: `--scale` is X pixels per point; default `auto` (= 2 on Retina)
 
 Today one X pixel = one backing pixel: sharp, but every X app is half size on Retina, and almost no X client reads
 DPI. `--scale N` (N ∈ {1, 2}, default **auto** = the window's `backingScaleFactor`, i.e. 1 X pixel = 1 point) sets
@@ -120,14 +136,20 @@ that honour DPI (Xft.dpi via xrdb is the user's business, not ours) see the trut
 
 ### 4. Clipboard: an in-process X client, the xpbproxy model
 
-XQuartz bridges with `xpbproxy`, an ordinary X client. We do the same: a `clipboard` thread connects to our own
-`DISPLAY` over the Unix socket as a normal client. That keeps the selection code in the core untouched and makes
-the bridge an X client we can test on Linux against the headless server.
+XQuartz bridges with `xpbproxy`, an ordinary X client. We do the same: a `clipboard` thread speaks the X protocol
+as a normal client. That keeps the selection code in the core untouched and makes the bridge an X client we can test
+on Linux against the headless server.
+
+- **Connection, and why it is not counted:** the thread does not connect through the listener. The server creates a
+  socketpair, hands one end to the core as an internal connection (the same setup path as an accepted socket, plus
+  an `internal` flag on `ClientState`), and gives the other end to the thread. The client-count hook (decision 5)
+  counts only clients without the flag, so the bridge never triggers the quit alert; it is otherwise an ordinary
+  client (it shows in `xlsclients`, gets SelectionClear, is killed by KillClient and reconnected by the bridge).
 
 - **X side (OS-neutral, `surface/clipboard/`):** a minimal hand-written X client on `yserver-protocol` encoders
   (no new dependency; it needs InternAtom, CreateWindow, SetSelectionOwner, ConvertSelection, GetProperty,
-  ChangeProperty, SendEvent, XFixes SelectSelectionInput). It watches CLIPBOARD (and PRIMARY, open question 3)
-  with XFixes; on an owner change it converts to `UTF8_STRING` (fallback `STRING`), handles `INCR`, and hands the
+  ChangeProperty, SendEvent, XFixes SelectSelectionInput). It watches CLIPBOARD only (PRIMARY is M4+) with
+  XFixes; on an owner change it converts to `UTF8_STRING` (fallback `STRING`), handles `INCR`, and hands the
   text to the host. When the host clipboard changes it takes ownership of CLIPBOARD and answers `TARGETS`,
   `UTF8_STRING`, `STRING`, `TEXT`, `TIMESTAMP`, using `INCR` above the max request size.
 - **Host side:** a `Pasteboard` trait (`read_text`, `write_text`, `change_count`); macOS implements it with
@@ -139,7 +161,8 @@ the bridge an X client we can test on Linux against the headless server.
 ### 5. Close button and Quit ask while clients are connected (maintainer, binding)
 
 The core publishes the connected-client count to the shell (an `Arc<AtomicUsize>` in `SurfaceBackendState`,
-updated where `state.clients` gains or loses a client; the internal clipboard client is not counted).
+updated where `state.clients` gains or loses a client; clients with the `internal` flag — the clipboard bridge,
+decision 4 — are not counted).
 `windowShouldClose:` and `applicationShouldTerminate:` show an `NSAlert` ("N X clients are connected. Quit
 yserver?" Quit / Cancel) when the count is > 0; Cancel keeps everything running. SIGTERM never asks.
 `applicationShouldTerminateAfterLastWindowClosed` stays `true`, so close = quit after the alert.
@@ -170,16 +193,19 @@ As M2: nightly fmt; `cargo clippy --all-targets -- -D warnings` (+ `--features x
 ## Tasks
 
 1. **Resize core plumbing (Linux-testable).** `pub host_screen_resized` in core (nested backend switched to it);
-   `resize_root_storage` lifted out of `apply_virtual_screen_extent` (KMS behaviour unchanged — existing KMS
-   resize/hotplug tests are the oracle); surface `resize_screen` + `set_logical_screen_size` override; mode list and
-   size range; `RRSetCrtcConfig` BadMatch for unsupported configs. Tests (headless surface on lavapipe):
-   RRSetScreenSize grow and shrink reallocate root (GetImage of the new area returns the root background, not an
-   error/zero), root ConfigureNotify and RRScreenChangeNotify carry the new size, `xrandr -s` mode switch, BadMatch
-   cases (expected errors taken from Xorg `randr/rrcrtc.c`, not guessed). **G.**
+   `resize_root_storage` lifted out of `apply_virtual_screen_extent` and split into prepare/commit (KMS behaviour
+   unchanged except the allocate-before-detach order — existing KMS resize/hotplug tests are the oracle); surface
+   root size vs output size (decision 1): `set_logical_screen_size` resizes the root only, slots follow the output;
+   mode list, size range, `RRSetCrtcConfig` mode switch (output + slots + tokened window request) and BadMatch for
+   unsupported configs. Tests (headless surface on lavapipe): RRSetScreenSize grow and shrink reallocate root
+   (GetImage of the new area returns the root background), root ConfigureNotify and RRScreenChangeNotify carry the
+   new size, the CRTC mode and the slots keep the output size after `--fb`, `xrandr -s` mode switch, allocation
+   failure for both directions (old state kept; BadMatch for client requests), BadMatch cases (expected errors
+   taken from Xorg `randr/rrcrtc.c`, not guessed). **G.**
 2. **Host resize on macOS.** `Resizable` style, view size → `ShellEvent::Resized` (tick-coalesced),
    `drawableSize` update, `ShellInput` size update, `ShellUi::set_content_size`, loop guard. Eiger: drag the corner,
    twm's root menu and an `xterm -geometry 80x24-0-0` follow; `xrandr -s 1024x768` shrinks the window;
-   `xrandr --fb 3000x2000` larger than the screen (behaviour per open question 2).
+   `xrandr --fb 3000x2000` larger than the screen: the window keeps its size and shows the top-left part of the root.
 3. **`--scale`.** Option parsing (`auto|1|2`), blit path with `NEAREST`, input/cursor/warp factor, backing-scale
    change, real mm. Linux unit tests for the coordinate math (both factors, both edges). Eiger: `--scale 1` and
    `--scale 2` side by side; xeyes and twm drag land under the macOS pointer at both; drag the window to a
@@ -209,18 +235,23 @@ As M2: nightly fmt; `cargo clippy --all-targets -- -D warnings` (+ `--features x
 - **Blit support** on KosmicKrisp for the swapchain format **[A]**; fallback = a fullscreen draw (the existing
   `ScalePassPipeline`).
 
-## Open questions (maintainer / codex)
+## Open questions — resolved (codex round 1; maintainer may override)
 
-1. **Default `--scale` on Retina:** `auto` (= 2, X px = points, readable, softer) or 1 (sharp, tiny)? XQuartz
-   defaults to points (it has a "full resolution" toggle).
-2. **X screen larger than the host can show** (`xrandr --fb 4000x3000`): clamp the window and show the top-left part
-   (Xephyr), refuse with BadValue, or scale down to fit?
-3. **PRIMARY:** sync PRIMARY → macOS (XQuartz option "Update Pasteboard when CLIPBOARD/PRIMARY changes"), or
-   CLIPBOARD only? Proposal: CLIPBOARD both ways; PRIMARY → pasteboard behind a flag, off by default.
-4. **Bundle scope:** Homebrew dependency (this plan) vs. bundled dylibs + ICD (`dylibbundler`) for a drag-and-drop
-   app. Bundling is bigger and touches signing; proposal: M4.
-5. **launchd `DISPLAY` activation** (start yserver on first X client, like XQuartz's `org.xquartz:0`): conflicts with
-   XQuartz if both are installed. Proposal: M4, opt-in.
+1. **Default `--scale`:** `auto` (X px = points on Retina, readable, visibly pixelated at 2× nearest); `--scale 1`
+   for full resolution. The eiger side-by-side of both is an acceptance check of task 3.
+2. **X screen larger than the window:** a larger root shown cropped to the top-left (decision 1).
+3. **PRIMARY:** CLIPBOARD only in M3.
+4. **Bundle:** Homebrew-dependent, documented (decision 7); bundled dylibs later.
+5. **launchd `DISPLAY` activation:** M4, opt-in.
+
+## Review round 1 (codex) — resolved
+
+- RandR vs rendered output disagreed after `--fb` (slots followed the root) → decision 1: root and output sizes
+  are separate; slots follow the output.
+- A failed resize could split the server between sizes; root storage was detached before allocation → decision 2:
+  allocate-then-commit, BadMatch on client failure, keep-old on host failure, allocation-failure tests.
+- Same-size guard looped on a clamped window → tokened window requests; a tokened event never changes the root.
+- The clipboard bridge would be counted by the quit alert → internal socketpair connection with an `internal` flag.
 
 ## Implementation notes
 
@@ -230,3 +261,6 @@ As M2: nightly fmt; `cargo clippy --all-targets -- -D warnings` (+ `--features x
   `set_logical_screen_size`. `RRSetScreenSize` stays screen-only, as Xorg: the `WINDOW-0` CRTC keeps its mode, so a
   later shrink below the mode is BadMatch until the mode list lands. `record_copy` already copied the smaller extent
   per axis (decision 2 described it as new). Mode list, BadMatch, size range and all AppKit parts wait for review.
+- **After review round 1:** `4e4009a8` resizes the slots and the output layout on `RRSetScreenSize`; decision 1
+  makes that root-only, and decision 2 makes the storage swap atomic. Both are reworked in task 1 before anything
+  builds on them.
