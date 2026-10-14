@@ -302,3 +302,19 @@ As M2: nightly fmt; `cargo clippy --all-targets -- -D warnings` (+ `--features x
   `drawableSize` and `ShellInput`'s pointer clamp first; the layer frame follows the view on every change (actions
   disabled) with `contentsGravity` top-left. The core rebuilds every swapchain on every `Resized`, even when the
   output keeps its size, so the swapchain always ends at the last drawable size. Content min size 320x200 X pixels.
+- **Task 3** (macOS shell not compiled here; eiger pending): `--scale auto|1|2` (`LaunchOptions.scale`, warned
+  as ignored on KMS). `surface/resize.rs` holds the arithmetic: copy factor `N` = `round(backing)` for auto, else
+  the given factor; X pixels per point = `backing / N`; the output's millimetres = X size / xpp points × the
+  screen's mm per point. `ShellEvent::Resized` carries `scale` (N) and `mm`; every surface takes N
+  (`set_copy_scale`) and rebuilds its swapchain. Slots stay X-sized; for N > 1 `record_slot_copy` blits with
+  `NEAREST` (src = what fits whole, dst = src × N, the rest cleared), checked by a lavapipe test that reads the
+  blit back pixel by pixel. Without `BLIT_SRC` on the slot format or `BLIT_DST` on the swapchain format the copy
+  stays 1:1 with one warning — a known gap; the `ScalePassPipeline` fallback is not built. Millimetres go on the
+  `WINDOW-0` output only (0 = unknown → 96 DPI); the screen keeps 96 DPI, as Xorg without a DisplaySize
+  (`xf86RandR12.c:788-815`), and an mm-only change sends the RandR notifies. The shell (`macos/scale.rs`)
+  converts with xpp everywhere (window and min size, `max_content_size`, `setContentSize:`, pointer, warp, cursor
+  image and hot spot), sizes the drawable at size × N, and on `viewDidChangeBackingProperties` or
+  `windowDidChangeScreen:` updates the layer's `contentsScale`, the min size and the cursors and posts at once if
+  size, N or mm changed (`ResizeCoalescer::post_now`, was `answered`). Display id for `CGDisplayScreenSize`:
+  `deviceDescription()["NSScreenNumber"]`. Default geometry 1280x800 (`just macos-run` too). Not done: scroll
+  deltas stay point-based; the mode list (`max_output`) is not recomputed when xpp or the screen changes.
