@@ -2,6 +2,7 @@
 //! through its own Vulkan swapchain. A shell (macOS: `crate::macos`) creates
 //! the surfaces; without one the server is headless.
 
+pub(crate) mod clipboard;
 pub(crate) mod clock;
 pub(crate) mod input;
 pub(crate) mod link;
