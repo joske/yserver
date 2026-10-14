@@ -79,7 +79,11 @@ The three ways a size changes:
   a live resize and always at `viewDidEndLiveResize`. `on_platform_event` resizes output and root to the window
   (slots, root/COW), then calls the `pub` core entry `host_screen_resized(state, backend, w, h)` (`randr.resize`:
   screen + output + CRTC, notifies, root ConfigureNotify). A root enlarged with `--fb` is therefore reset to the
-  window on the next user resize. An event whose size equals the current output is dropped.
+  window on the next user resize. An event whose size equals the current output is dropped. `host_screen_resized`
+  today returns early when the *screen* already has the size (`run.rs:3548`); it must compare against both the
+  screen and the output mode, and notify only what changed (root ConfigureNotify/ScreenChange when the screen
+  changed, CrtcChange/OutputChange when the output did). Test: `--fb 1600x900` with a 1024x768 output, then a user
+  resize to 1600x900 → the output becomes 1600x900, the screen is untouched and gets no ConfigureNotify.
 - **A client sets the screen size (`RRSetScreenSize`).** Root only; the output and the window do not change. A size
   smaller than the output is BadMatch (the core's existing crop check). No window event follows, so there is no
   loop.
@@ -98,9 +102,13 @@ The three ways a size changes:
 
 ### 2. Resizes are atomic: allocate everything, then commit
 
-A resize allocates all new storage first — root, COW, and the slots when the output changes — and only then swaps
-it in and updates `fb_size`, the output layout and `state.randr`. The commit step cannot fail. If any allocation
-fails, the new storage is freed and nothing changes:
+A resize runs in two phases. **Prepare** does every fallible step on objects nothing published refers to yet:
+allocate the new root, COW and (when the output changes) slot images; fill and refill the new root and COW (root
+background or tile, old content copied in) by GPU work targeting the unattached images; build the new scene output
+state for the new layouts (`rebuild_outputs`, `scene/lifecycle.rs:235`, split into a fallible
+`prepare_outputs(sink, layouts) -> PreparedOutputs` and an infallible `install_outputs`). **Commit** only swaps
+handles and updates `fb_size`, the output layout and `state.randr`; it allocates nothing and submits nothing, so it
+cannot fail. If any prepare step fails, everything it made is freed and nothing changes:
 
 - client-driven (`RRSetScreenSize`, `RRSetCrtcConfig`): the request fails with BadMatch and the server keeps its old
   size, as Xorg (`randr/rrscreen.c:289–293`: a failed `RRScreenSizeSet` is BadMatch);
@@ -110,8 +118,9 @@ fails, the new storage is freed and nothing changes:
 
 The shared `resize_root_storage` (portable) is split into `prepare` (allocate, may fail, returns the new storage) and
 `commit` (swap + refill + damage, infallible); KMS's `apply_virtual_screen_extent` uses the same split, which also
-fixes its detach-before-allocate order. Tests inject an allocation failure (through the memory budget or a test
-hook) for both directions and assert the old state and, for client requests, BadMatch.
+fixes its detach-before-allocate order. Tests inject a failure at each prepare stage — allocation, the
+fill/refill submission (`engine/fill_copy.rs:31` and the copy), and `prepare_outputs` — for both directions, and
+assert the old state and, for client requests, BadMatch.
 
 ### 3. HiDPI: `--scale` is X pixels per point; default `auto` (= 2 on Retina)
 
@@ -252,6 +261,14 @@ As M2: nightly fmt; `cargo clippy --all-targets -- -D warnings` (+ `--features x
   allocate-then-commit, BadMatch on client failure, keep-old on host failure, allocation-failure tests.
 - Same-size guard looped on a clamped window → tokened window requests; a tokened event never changes the root.
 - The clipboard bridge would be counted by the quit alert → internal socketpair connection with an `internal` flag.
+
+## Review round 2 (codex) — resolved
+
+- `host_screen_resized` returned early when only the output differed (root already at the size after `--fb`) →
+  compare screen and output, notify per change, test that sequence (decision 1).
+- Prepare covered allocation only; the scene rebuild and the background fill can fail after publication → both
+  move into prepare (fill on unattached images, `prepare_outputs`/`install_outputs`), with failure injection per
+  stage (decision 2).
 
 ## Implementation notes
 
