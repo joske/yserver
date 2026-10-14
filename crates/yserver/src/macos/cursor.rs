@@ -127,6 +127,11 @@ fn build(image: &CursorImage, xpp: f64) -> Retained<NSCursor> {
     let (width, height) = (image.width.max(1), image.height.max(1));
     let rep = bitmap(width, height, &rgba);
     let size = NSSize::new(f64::from(width) / xpp, f64::from(height) / xpp);
+    log::debug!(
+        "macos: cursor {width}x{height} px at {xpp} px/pt = {}x{} pt",
+        size.width,
+        size.height
+    );
     let ns_image = NSImage::initWithSize(NSImage::alloc(), size);
     if let Some(rep) = rep {
         // Else the rep claims its pixel count in points.
