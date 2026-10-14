@@ -2026,15 +2026,6 @@ pub(crate) fn drain_ready_crtc_configs(
     }
 }
 
-/// X11 default auto-repeat initial delay before the first synthetic
-/// KeyPress fires. Matches xset's `-r` defaults; not yet pulled from
-/// the XKB Controls block.
-const REPEAT_INITIAL_DELAY: Duration = Duration::from_millis(660);
-
-/// X11 default auto-repeat period (25 Hz = 40 ms between synthetic
-/// KeyPress events while a key is held).
-const REPEAT_PERIOD: Duration = Duration::from_millis(40);
-
 /// Run the core loop until `Message::Shutdown` is observed.
 ///
 /// `poll` must already have its waker registered against `NOTIFY_TOKEN`
@@ -4251,6 +4242,13 @@ pub fn handle_host_input(state: &mut ServerState, backend: &mut dyn Backend, ev:
 /// Xorg's per-device XKB repeat state: a key press from another keyboard
 /// cannot replace it. A matching release clears that origin's timer.
 fn update_repeat_state(state: &mut ServerState, ev: &HostInputEvent) {
+    update_repeat_state_at(state, ev, Instant::now());
+}
+
+/// [`update_repeat_state`] at `now`; a press arms its first repeat the XKB
+/// RepeatKeys delay later (Xorg `AccessXFilterPressEvent`'s `TimerSet` of
+/// `ctrls->repeat_delay`).
+fn update_repeat_state_at(state: &mut ServerState, ev: &HostInputEvent, now: Instant) {
     use crate::core_loop::{
         InputOrigin,
         message::HostInputEvent::{DeviceRemoved, DeviceSuspended, Key},
@@ -4284,7 +4282,8 @@ fn update_repeat_state(state: &mut ServerState, ev: &HostInputEvent) {
             key.origin,
             KeyRepeatState {
                 event: *key,
-                next_fire: Instant::now() + REPEAT_INITIAL_DELAY,
+                next_fire: now
+                    + Duration::from_millis(u64::from(state.keyboard_control.repeat_delay)),
             },
         );
     } else if state
@@ -4312,6 +4311,16 @@ fn update_repeat_state(state: &mut ServerState, ev: &HostInputEvent) {
 /// compositor at the iteration rate instead of the repeat rate
 /// (idle free-run, [[project_idle_compositor_redraw_loop]] cut 2a).
 pub fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) -> bool {
+    fire_pending_repeats_at(state, backend, Instant::now())
+}
+
+/// [`fire_pending_repeats`] at `now`. Each fire re-arms the XKB RepeatKeys
+/// interval later, read at fire time like Xorg's `AccessXRepeatKeyExpire`.
+pub(crate) fn fire_pending_repeats_at(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    now: Instant,
+) -> bool {
     let mut origins: Vec<_> = state.key_repeats.keys().copied().collect();
     origins.sort_by_key(|origin| match origin {
         crate::core_loop::InputOrigin::Physical(source) => (0, source.0),
@@ -4342,7 +4351,6 @@ pub fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) 
         state.key_repeats.remove(&origin);
     }
 
-    let now = Instant::now();
     let due: Vec<_> = origins
         .into_iter()
         .filter_map(|origin| {
@@ -4358,10 +4366,12 @@ pub fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) 
         return false;
     }
 
+    // SetControls refuses 0; never spin on it.
+    let interval = Duration::from_millis(u64::from(state.keyboard_control.repeat_interval.max(1)));
     for (origin, armed) in due {
         let mut next_fire = armed.next_fire;
         while now >= next_fire {
-            next_fire += REPEAT_PERIOD;
+            next_fire += interval;
         }
         // Update the timer first so any reentrant arming during fan-out
         // doesn't double-fire.

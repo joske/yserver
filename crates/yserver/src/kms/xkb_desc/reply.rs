@@ -716,8 +716,9 @@ pub(crate) fn reply_get_names(
 }
 
 /// XKB GetControls (minor 6), fixed 92 bytes (`xkbGetControlsReply`). The
-/// group count is the model's; the per-key repeat is filled in by the core
-/// loop, which owns it. Offsets per XKBproto.h (see the test).
+/// group count is the model's; the per-key repeat and the repeat delay and
+/// interval are filled in by the core loop, which owns them. Offsets per
+/// XKBproto.h (see the test).
 pub(crate) fn reply_get_controls(desc: &XkbDesc) -> Vec<u8> {
     let mut r = vec![0u8; 92];
     r[0] = 1;
@@ -727,8 +728,10 @@ pub(crate) fn reply_get_controls(desc: &XkbDesc) -> Vec<u8> {
     r[9] = desc.num_groups.clamp(1, 4);
     // groupsWrap: XkbInitControls' XkbSetGroupInfo(1, XkbWrapIntoRange, 0).
     r[10] = 0x01;
-    r[20..22].copy_from_slice(&500_u16.to_le_bytes());
-    r[22..24].copy_from_slice(&33_u16.to_le_bytes());
+    // repeatDelay / repeatInterval: Xorg's defaults; the core loop
+    // overwrites them with the RepeatKeys controls it owns.
+    r[20..22].copy_from_slice(&yserver_core::server::XKB_DEFAULT_REPEAT_DELAY.to_le_bytes());
+    r[22..24].copy_from_slice(&yserver_core::server::XKB_DEFAULT_REPEAT_INTERVAL.to_le_bytes());
     r[56..60].copy_from_slice(&crate::kms::xkb::XKB_ENABLED_CONTROLS.to_le_bytes());
     r
 }

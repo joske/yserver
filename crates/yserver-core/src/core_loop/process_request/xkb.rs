@@ -3,9 +3,10 @@ use crate::{
     core_loop::{
         fanout::fanout_event_to_clients,
         process_request::{
-            RequestOutcome, X_KB_SELECT_EVENTS, X_KB_SET_COMPAT_MAP, X_KB_SET_GEOMETRY,
-            X_KB_SET_INDICATOR_MAP, X_KB_SET_MAP, X_KB_SET_NAMES, X_KB_USE_EXTENSION,
-            XKB_LAST_REQUEST, emit_x11_error_with_minor, write_to_client,
+            RequestOutcome, X_KB_GET_CONTROLS, X_KB_SELECT_EVENTS, X_KB_SET_COMPAT_MAP,
+            X_KB_SET_CONTROLS, X_KB_SET_GEOMETRY, X_KB_SET_INDICATOR_MAP, X_KB_SET_MAP,
+            X_KB_SET_NAMES, X_KB_USE_EXTENSION, XKB_LAST_REQUEST, emit_x11_error_with_minor,
+            write_to_client,
         },
     },
     server::ServerState,
@@ -48,6 +49,7 @@ pub(super) fn handle_xkb_request(
     // hasn't called XkbUseExtension (every XKB request but UseExtension).
     let min_body = match minor {
         X_KB_SELECT_EVENTS => 12,
+        X_KB_SET_CONTROLS => 96,
         X_KB_SET_MAP => 32,
         X_KB_SET_COMPAT_MAP => 12,
         X_KB_SET_INDICATOR_MAP => 8,
@@ -105,6 +107,23 @@ pub(super) fn handle_xkb_request(
     if minor == X_KB_SELECT_EVENTS
         && let Err((code, value)) =
             crate::core_loop::xkb_select::select_events(state, client_id, body)
+    {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            code,
+            value,
+            u16::from(minor),
+            header.opcode,
+        );
+    }
+    // SetControls: the repeat controls are core state for every backend. On
+    // success the request still reaches the backend (a nested backend
+    // forwards it to its host).
+    if minor == X_KB_SET_CONTROLS
+        && let Err((code, value)) =
+            crate::core_loop::xkb_controls::set_controls(state, &*backend, header.opcode, body)
     {
         return emit_x11_error_with_minor(
             state,
@@ -281,11 +300,11 @@ pub(super) fn handle_xkb_request(
     };
     if let Some(mut bytes) = reply {
         stamp_reply_sequence(&mut bytes, byte_order, sequence);
-        // GetControls: the per-key repeat is the core keyboard feedback's
-        // (Xorg keeps XKB `per_key_repeat` and `autoRepeats` in sync), which
-        // lives here, not in the backend.
-        if minor == 6 && bytes.len() >= 92 {
-            bytes[60..92].copy_from_slice(&state.keyboard_control.auto_repeats);
+        // GetControls: the repeat controls are the core loop's (Xorg keeps
+        // XKB `per_key_repeat` and the feedback's `autoRepeats` in sync, and
+        // RepeatKeys with its global auto-repeat), not the backend's.
+        if minor == X_KB_GET_CONTROLS {
+            crate::core_loop::xkb_controls::patch_get_controls_reply(state, &mut bytes);
         }
         let Some(client) = state.clients.get_mut(&client_id.0) else {
             return Ok(RequestOutcome::Handled);

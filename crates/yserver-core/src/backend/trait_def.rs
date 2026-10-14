@@ -2972,6 +2972,13 @@ pub trait Backend {
         None
     }
 
+    /// `(numGroups, enabledControls)` of the backend's XKB keyboard, as its
+    /// GetControls reply carries them, for the `XkbControlsNotify` the core
+    /// loop sends. `None` = no XKB keymap here.
+    fn xkb_controls_base(&self) -> Option<(u8, u32)> {
+        None
+    }
+
     /// RANDR per-output identity for the read-only output properties
     /// `EDID` / `EDID_DATA` / `ConnectorType`: returns `(raw EDID blob,
     /// ConnectorType name)` for the given RANDR output id, or `None`

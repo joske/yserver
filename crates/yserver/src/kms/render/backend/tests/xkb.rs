@@ -697,7 +697,7 @@ fn cooking_gate(backend: &KmsBackend, what: &str, failures: &mut Vec<String>) {
 }
 
 /// XKB GetControls through the core loop (which owns the per-key repeat).
-fn xkb_get_controls(
+pub(super) fn xkb_get_controls(
     state: &mut yserver_core::server::ServerState,
     backend: &mut KmsBackend,
     peer: &mut std::os::unix::net::UnixStream,

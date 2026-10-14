@@ -188,7 +188,7 @@ pub(crate) fn send_xkb_map_notify(
 }
 
 /// yserver's one XKB keyboard, as every XKB reply and event names it.
-const XKB_DEVICE_ID: u8 = 1;
+pub(crate) const XKB_DEVICE_ID: u8 = 1;
 /// `XkbPerKeyRepeatMask` in `XkbControlsNotify.changedControls`.
 const XKB_PER_KEY_REPEAT_MASK: u32 = 1 << 30;
 /// Core `X_ChangeKeyboardMapping`: the cause Xorg's `XkbApplyMappingChange`
@@ -377,7 +377,10 @@ pub(crate) fn apply_keyboard_mapping_repeats(
         device_id: XKB_DEVICE_ID,
         num_groups: change.num_groups,
         changed_controls: XKB_PER_KEY_REPEAT_MASK,
-        enabled_controls: change.enabled_controls,
+        enabled_controls: crate::core_loop::xkb_controls::enabled_controls(
+            state,
+            change.enabled_controls,
+        ),
         enabled_control_changes: 0,
         keycode: 0,
         event_type: 0,

@@ -39,7 +39,7 @@ const CLIENT_MIN_KEYCODE: u8 = 8;
 const CLIENT_MAX_KEYCODE: u8 = 255;
 
 /// `_XkbErrCode2`.
-fn err_code2(a: u32, b: u32) -> u32 {
+pub(crate) fn err_code2(a: u32, b: u32) -> u32 {
     (a << 24) | (b & 0x00ff_ffff)
 }
 

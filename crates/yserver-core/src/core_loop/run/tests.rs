@@ -3934,3 +3934,68 @@ fn run_iteration_tail_flushes_damage_before_compositing() {
     assert!(flush < compose);
     assert!(!state.damage_notify_flush_pending);
 }
+
+/// XKB SetControls(RepeatKeys, delay 200, interval 20) drives the repeat
+/// timer: a held key's first repeat fires 200 ms after the press, then one
+/// every 20 ms (Xorg's `TimerSet(repeat_delay)` and
+/// `AccessXRepeatKeyExpire` returning `repeat_interval`).
+#[test]
+fn held_key_repeats_at_the_set_controls_delay_and_interval() {
+    use std::time::{Duration, Instant};
+
+    use crate::{
+        backend::recording::{RecordedCall, RecordingBackend},
+        core_loop::InputOrigin,
+        host_x11::HostKeyEvent,
+    };
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    let mut body = [0u8; 96];
+    body[28..32].copy_from_slice(&1u32.to_le_bytes()); // changeCtrls = RepeatKeys
+    body[32..34].copy_from_slice(&200u16.to_le_bytes());
+    body[34..36].copy_from_slice(&20u16.to_le_bytes());
+    crate::core_loop::xkb_controls::set_controls(&mut state, &backend, 136, &body)
+        .expect("SetControls");
+
+    let t0 = Instant::now();
+    let press = HostInputEvent::Key(HostKeyEvent {
+        origin: InputOrigin::NestedHost,
+        pressed: true,
+        keycode: 38,
+        time: 0,
+        root_x: 0,
+        root_y: 0,
+        event_x: 0,
+        event_y: 0,
+        state: 0,
+    });
+    update_repeat_state_at(&mut state, &press, t0);
+    let transition = crate::core_loop::key_fanout::key_transition_status(
+        &state,
+        InputOrigin::NestedHost,
+        38,
+        true,
+    )
+    .expect("NestedHost has a master keyboard");
+    crate::core_loop::key_fanout::commit_key_transition(
+        &mut state,
+        InputOrigin::NestedHost,
+        38,
+        true,
+        transition,
+    );
+
+    let ms = |n: u64| t0 + Duration::from_millis(n);
+    let fired: Vec<u64> = [199, 200, 219, 220, 239, 240]
+        .into_iter()
+        .filter(|&n| fire_pending_repeats_at(&mut state, &mut backend, ms(n)))
+        .collect();
+    assert_eq!(fired, [200, 220, 240]);
+    let repeats = backend
+        .calls()
+        .into_iter()
+        .filter(|c| matches!(c, RecordedCall::HostKey { repeat: true, .. }))
+        .count();
+    assert_eq!(repeats, 6, "a release + press pair per fire");
+}

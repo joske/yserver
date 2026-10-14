@@ -175,6 +175,8 @@ const XKB_LAST_REQUEST: u8 = 25;
 /// XKB request minors (`X_kb*`).
 const X_KB_USE_EXTENSION: u8 = 0;
 const X_KB_SELECT_EVENTS: u8 = 1;
+const X_KB_GET_CONTROLS: u8 = 6;
+const X_KB_SET_CONTROLS: u8 = 7;
 const X_KB_SET_MAP: u8 = 9;
 const X_KB_SET_COMPAT_MAP: u8 = 11;
 const X_KB_SET_INDICATOR_MAP: u8 = 14;
@@ -332,7 +334,14 @@ pub fn process_request(
         37 => handle_ungrab_server(state, client_id, sequence),
         // ── void requests with local state/backend handling ──
         96 => handle_recolor_cursor(state, backend, origin, client_id, sequence, body),
-        102 => handle_change_keyboard_control(state, client_id, sequence, header, body),
+        102 => {
+            // Xorg's XkbSetRepeatKeys: the RepeatKeys control follows the
+            // global auto-repeat, with a ControlsNotify for what changed.
+            let old = crate::core_loop::xkb_controls::RepeatControls::of(state);
+            let outcome = handle_change_keyboard_control(state, client_id, sequence, header, body);
+            crate::core_loop::xkb_controls::send_controls_notify(state, &*backend, old, (0, 0));
+            outcome
+        }
         104 => handle_bell(state, client_id, sequence, header),
         105 => handle_change_pointer_control(state, client_id, sequence, header, body),
         107 => handle_set_screen_saver(state, client_id, sequence, header, body),

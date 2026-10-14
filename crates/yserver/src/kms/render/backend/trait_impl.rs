@@ -1934,6 +1934,13 @@ impl Backend for KmsBackend {
         Some(self.core.xkb_desc.per_key_repeat)
     }
 
+    fn xkb_controls_base(&self) -> Option<(u8, u32)> {
+        Some((
+            self.core.xkb_desc.num_groups.clamp(1, 4),
+            crate::kms::xkb::XKB_ENABLED_CONTROLS,
+        ))
+    }
+
     fn get_modifier_mapping(
         &mut self,
         _origin: Option<OriginContext>,

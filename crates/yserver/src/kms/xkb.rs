@@ -977,8 +977,10 @@ mod tests {
         assert_eq!(u32::from_le_bytes([r[4], r[5], r[6], r[7]]), 15);
         assert_eq!(r[9], 1, "numGroups");
         assert_eq!(r[10], 0x01, "groupsWrap (golden: groupsWrap=0x01)");
-        assert_eq!(u16::from_le_bytes([r[20], r[21]]), 500);
-        assert_eq!(u16::from_le_bytes([r[22], r[23]]), 33);
+        // repeatDelay / repeatInterval: Xorg's defaults
+        // (testdata/xorg-repeat-controls.txt).
+        assert_eq!(u16::from_le_bytes([r[20], r[21]]), 660);
+        assert_eq!(u16::from_le_bytes([r[22], r[23]]), 40);
         let enabled = u32::from_le_bytes([r[56], r[57], r[58], r[59]]);
         assert_eq!(enabled & 0x01, 0x01, "RepeatKeys bit set");
     }
