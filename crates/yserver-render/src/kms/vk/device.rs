@@ -1706,6 +1706,10 @@ fn load_entry() -> Result<ash::Entry, ash::LoadingError> {
                 return Ok(entry);
             }
         }
+        log::error!(
+            "vulkan: no loader in the default search path, /opt/homebrew/lib or /usr/local/lib; \
+             `brew install vulkan-loader`"
+        );
     }
     default
 }
