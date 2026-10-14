@@ -102,6 +102,17 @@ mod tests {
     const TEST_SOURCE_ID: InputSourceId = InputSourceId(1);
 
     #[test]
+    fn reset_discards_the_sub_click_remainder() {
+        let mut scroll = ScrollV120::default();
+        let mut out = Vec::new();
+        scroll.drain(TEST_SOURCE_ID, 0, 60, 0, &mut out);
+        scroll.reset(TEST_SOURCE_ID);
+        assert!(scroll.is_empty());
+        scroll.drain(TEST_SOURCE_ID, 0, 60, 0, &mut out);
+        assert!(out.is_empty(), "60 + 60 across a reset is no click");
+    }
+
+    #[test]
     fn scroll_accumulates_subclick_v120() {
         let mut scroll = ScrollV120::default();
         let mut out = Vec::new();
