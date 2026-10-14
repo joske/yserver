@@ -56,8 +56,8 @@ pub(super) fn create(
     view.setWantsLayer(true);
     let content: &NSView = &view;
     window.setContentView(Some(content));
-    // Without it no `mouseMoved:` arrives, tracking area or not.
-    window.setAcceptsMouseMovedEvents(true);
+    // No `setAcceptsMouseMovedEvents`: the view's `MouseMoved` tracking
+    // area already delivers `mouseMoved:`, and both together doubled it.
     let responder: &NSResponder = &view;
     let _ = window.makeFirstResponder(Some(responder));
     window.center();
