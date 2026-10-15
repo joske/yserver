@@ -92,6 +92,8 @@ struct LayerPtr(*const c_void);
 // SAFETY: only handed to `vkCreateMetalSurfaceEXT`; the main thread keeps the
 // layer retained until the process exits.
 unsafe impl Send for LayerPtr {}
+// SAFETY: as for `Send`; the commit hook only reads layer properties.
+unsafe impl Sync for LayerPtr {}
 
 impl LayerPtr {
     fn get(&self) -> *const c_void {
@@ -101,6 +103,7 @@ impl LayerPtr {
 
 /// A `VK_EXT_metal_surface` surface on `layer`.
 pub(super) fn metal_surface(layer: &CAMetalLayer) -> NativeSurface {
+    let probe = LayerPtr(std::ptr::from_ref(layer).cast());
     let layer = LayerPtr(std::ptr::from_ref(layer).cast());
     NativeSurface::new(ash::ext::metal_surface::NAME, move |entry, instance| {
         let loader = ash::ext::metal_surface::Instance::new(entry, instance);
@@ -110,5 +113,19 @@ pub(super) fn metal_surface(layer: &CAMetalLayer) -> NativeSurface {
     })
     // The driver sets layer properties on the core thread, which has no run
     // loop to commit them: they would show only once the main thread commits.
-    .with_commit(CATransaction::flush)
+    .with_commit(move || {
+        static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+            // SAFETY: the main thread keeps the layer retained.
+            let layer: &CAMetalLayer = unsafe { &*probe.get().cast::<CAMetalLayer>() };
+            log::debug!(
+                "macos: layer presentsWithTransaction={} displaySync={} drawables={} drawable {:?}",
+                layer.presentsWithTransaction(),
+                layer.displaySyncEnabled(),
+                layer.maximumDrawableCount(),
+                layer.drawableSize()
+            );
+        }
+        CATransaction::flush();
+    })
 }
