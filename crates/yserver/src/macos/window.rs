@@ -6,7 +6,8 @@ use std::{ffi::c_void, rc::Rc};
 use ash::vk;
 use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained};
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSResponder, NSScreen, NSView, NSWindow, NSWindowStyleMask,
+    NSBackingStoreType, NSColor, NSResponder, NSScreen, NSView, NSWindow,
+    NSWindowAnimationBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSString};
 use objc2_quartz_core::{CALayer, CAMetalLayer, CATransaction, kCAGravityTopLeft};
@@ -40,6 +41,8 @@ pub(super) fn create(
     };
     // SAFETY: the shell owns the window outside a window controller.
     unsafe { window.setReleasedWhenClosed(false) };
+    // Metal presents during the open animation never show: no animation.
+    window.setAnimationBehavior(NSWindowAnimationBehavior::None);
     window.setTitle(&NSString::from_str("yserver"));
     window.setBackgroundColor(Some(&*NSColor::blackColor()));
     window.setContentMinSize(metrics.points(MIN_SCREEN));
