@@ -233,6 +233,19 @@ impl Party {
         self.conn.get_selection_owner(self.clipboard).unwrap()
     }
 
+    /// Wait for `window` to be destroyed. A disconnect is processed in one
+    /// core step, so the window's client is gone too.
+    fn wait_destroyed(&mut self, window: u32) {
+        const BAD_WINDOW: u8 = 3;
+        let property = self.time;
+        wait_until("the window to be destroyed", || {
+            self.conn
+                .get_property(window, property, false)
+                .unwrap()
+                .is_err_and(|e| e.code == BAD_WINDOW)
+        });
+    }
+
     fn event(&mut self, code: u8) -> Event {
         self.conn.wait_event(|e| e[0] & 0x7f == code).unwrap()
     }
@@ -322,6 +335,7 @@ fn x_owner_text_reaches_the_host_once_without_echo() {
     assert_eq!(u32_at(&request, 16), x.clipboard);
     assert_eq!(u32_at(&request, 4), owned_at, "the owner's selection time");
     assert_ne!(u32_at(&request, 24), 0, "a property to write to");
+    let bridge_window = u32_at(&request, 12);
     wait_until("the host text", || {
         pasteboard.text().as_deref() == Some("héllo ✓")
     });
@@ -331,7 +345,10 @@ fn x_owner_text_reaches_the_host_once_without_echo() {
     assert_eq!(x.owner(), x.window);
     assert_eq!(pasteboard.writes(), 1);
 
+    // The core learns of the bridge's close from the client's reader thread,
+    // asynchronously; shutting down before it does would still count it.
     bridge.stop();
+    x.wait_destroyed(bridge_window);
     drop(x);
     let internal = server.shutdown();
     assert!(internal.iter().all(|i| !i), "the bridge disconnected");
