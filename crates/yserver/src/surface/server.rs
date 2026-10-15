@@ -44,6 +44,8 @@ pub(crate) struct WindowSpec {
     pub(crate) max_output: Option<(u16, u16)>,
     /// The window's physical size in millimetres; 0: unknown.
     pub(crate) output_mm: (u32, u32),
+    /// Swapchain pixels per X pixel; later changes come as `Resized`.
+    pub(crate) copy_scale: u32,
     /// Bridged with CLIPBOARD.
     pub(crate) pasteboard: Box<dyn Pasteboard>,
 }
@@ -93,6 +95,7 @@ pub(crate) fn run_windowed(opts: launch::LaunchOptions, spec: WindowSpec) -> io:
         clients,
         max_output,
         output_mm,
+        copy_scale,
         pasteboard,
     } = spec;
     let result = serve(
@@ -103,8 +106,9 @@ pub(crate) fn run_windowed(opts: launch::LaunchOptions, spec: WindowSpec) -> io:
                 width: u32::from(size.0),
                 height: u32::from(size.1),
             };
-            let output = SurfaceOutput::new(Arc::clone(&vk), &surface, extent, clock)
+            let mut output = SurfaceOutput::new(Arc::clone(&vk), &surface, extent, clock)
                 .map_err(|e| io::Error::other(format!("surface: {e:?}")))?;
+            output.set_copy_scale(copy_scale);
             let mut backend = super::surface_backend(vk, size, opts.layout.clone(), vec![output])?;
             backend.pstate.link = Some(Arc::clone(&link));
             backend.pstate.ui = Some(Arc::clone(&ui));

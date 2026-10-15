@@ -274,6 +274,7 @@ impl YserverAppDelegate {
             clients: Arc::clone(&ivars.clients),
             max_output: super::window::max_content_size(mtm),
             output_mm: metrics.mm(size),
+            copy_scale: metrics.factor,
             pasteboard: Box::new(super::pasteboard::GeneralPasteboard),
         };
         let spawned = thread::Builder::new()
