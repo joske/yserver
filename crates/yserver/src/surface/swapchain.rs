@@ -66,7 +66,7 @@ impl NativeSurface {
         }
     }
 
-    /// Run `commit` on the core thread after each swapchain change and present.
+    /// Run `commit` on the core thread after each swapchain change.
     #[cfg_attr(all(kms, not(test)), allow(dead_code))] // A window shell's.
     #[must_use]
     pub(crate) fn with_commit(mut self, commit: impl Fn() + Send + Sync + 'static) -> Self {
@@ -451,9 +451,6 @@ impl SurfaceOutput {
             // The present's semaphore wait still executes.
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.note_out_of_date(),
             Err(e) => return Err(e),
-        }
-        if let Some(commit) = &self.commit {
-            commit();
         }
         #[cfg(test)]
         {
