@@ -33,6 +33,26 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-15 macOS M3: window, scale, clipboard, bundle (branch `feat/macos-m0`, plan
+  `plans/2026-10-14-macos-m3-window.md`):** the X screen follows the window. Resizes are coalesced per frame-clock
+  tick (`surface/resize.rs` `ResizeCoalescer`); the root and the output size are separate, so RRSetScreenSize and a
+  RandR mode switch resize the window (`ShellUi` window request with a token), and a host resize goes through the
+  core's `host_screen_resized`. Root storage is resized as prepare/commit (`render` backend), shared with the KMS
+  `xrandr --fb` path. `--scale auto|1|2`: X pixels per point (`auto` = one per point) and a NEAREST slot→swapchain
+  blit at the copy factor; the factor and the WINDOW-0 millimetres (CGDisplayScreenSize) are posted with every
+  `Resized` and passed in `WindowSpec` at startup; the screen keeps 96 DPI. CLIPBOARD is bridged to NSPasteboard by
+  an internal X client on a socketpair (`surface/clipboard/`, flagged `internal`: not counted, no auth, no XDMCP);
+  UTF8_STRING/STRING/TEXT/TARGETS/TIMESTAMP/MULTIPLE, INCR both ways, keeps the text when the X owner exits.
+  Quitting with X clients connected asks first (internal clients excluded). `just macos-bundle` builds
+  `target/yserver.app` (Homebrew Mesa via `VK_DRIVER_FILES`, lowest free display from `:1` in the title, log in
+  `~/Library/Logs/yserver.log`). The core thread flushes Core Animation after each swapchain build (KosmicKrisp sets
+  layer properties there). Verified on eiger: scale, resize at scale 2, mm (ruler), clipboard (589 KB / 969 KB
+  byte-identical, owner gone), bundle, quit dialog. Black startup frames and full-screen black/stale frames are a Mesa
+  26.2.x KosmicKrisp bug, fixed on Mesa main (51ffe555 suspected); HEAD fixes both. Homebrew xterm in Latin-1
+  ("locale not supported by Xlib") is the `libx11` bottle's misnamed locale modules (Homebrew/homebrew-core#318717),
+  not the server. Open: moving the window to a screen with another backing scale (no second screen yet); PRIMARY,
+  clipboard images/files (M4).
+
 - **2026-10-14 macOS M2: input and cursor (branch `feat/macos-m0`, plan `plans/2026-10-14-macos-m2-input.md`):**
   keyboard, mouse, scroll and the X cursor in the rooted window. A local key monitor sends every key to X (Cmd =
   Super_L/R on Mod4, Option = Alt on Mod1, Cmd-Q = Super+Q; quit is the close button, the menu's Quit without a
