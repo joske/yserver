@@ -324,17 +324,14 @@ impl SurfaceOutput {
     /// Vulkan failed on acquire, submit or present.
     pub(crate) fn present_pending(&mut self) -> Result<bool, vk::Result> {
         let Some((bo_idx, SlotPhase::Composed)) = self.slots.pending() else {
-            log::trace!("present: nothing composed");
             return Ok(false);
         };
         if self.hidden {
-            log::trace!("present: slot {bo_idx} hidden");
             return Ok(false);
         }
         if self.needs_recreate || self.swapchain.is_none() {
             self.recreate_swapchain()?;
             if self.swapchain.is_none() {
-                log::trace!("present: slot {bo_idx} no swapchain");
                 return Ok(false);
             }
         }
@@ -342,7 +339,6 @@ impl SurfaceOutput {
         let sync = &self.syncs[sync_idx];
         // SAFETY: a fence of this device.
         if !unsafe { self.vk.device.get_fence_status(sync.copied) }? {
-            log::trace!("present: slot {bo_idx} sync {sync_idx} busy");
             return Ok(false);
         }
         let Some(swapchain) = self.swapchain.as_ref() else {
@@ -363,12 +359,8 @@ impl SurfaceOutput {
                 self.needs_recreate |= suboptimal;
                 image_idx
             }
-            Err(e @ (vk::Result::NOT_READY | vk::Result::TIMEOUT)) => {
-                log::trace!("present: slot {bo_idx} acquire {e:?}");
-                return Ok(false);
-            }
+            Err(vk::Result::NOT_READY | vk::Result::TIMEOUT) => return Ok(false),
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                log::trace!("present: slot {bo_idx} acquire out of date");
                 self.note_out_of_date();
                 return Ok(false);
             }
@@ -439,15 +431,7 @@ impl SurfaceOutput {
             self.swapchain_fns
                 .queue_present(self.vk.graphics_queue, &present)
         } {
-            Ok(suboptimal) => {
-                log::trace!(
-                    "present: slot {bo_idx} → image {image_idx} {}x{} scale {} suboptimal={suboptimal}",
-                    image_extent.width,
-                    image_extent.height,
-                    region.scale
-                );
-                self.needs_recreate |= suboptimal;
-            }
+            Ok(suboptimal) => self.needs_recreate |= suboptimal,
             // The present's semaphore wait still executes.
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.note_out_of_date(),
             Err(e) => return Err(e),
