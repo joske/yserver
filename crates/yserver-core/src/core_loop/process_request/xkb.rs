@@ -159,44 +159,84 @@ pub(super) fn handle_xkb_request(
         return Ok(RequestOutcome::Handled);
     }
     // XkbLatchLockState (minor 5): a group lock switches the authoritative
-    // keyboard group and broadcasts XkbStateNotify to subscribed clients.
+    // keyboard group, a modifier lock sets/clears real modifier locks (this
+    // is the path `numlockx` takes via XkbLockModifiers), and either one
+    // broadcasts XkbStateNotify to subscribed clients. One request may carry
+    // both, so both are applied before the SINGLE notify Xorg sends — two
+    // notifies for one request would be a visible protocol deviation.
     // LatchLockState is a void request (no reply), so this runs in the
     // pre-proxy region; the backend's xkb_proxy minor-5 returns None.
-    if minor == 5
-        && let Some(requested_group) = crate::core_loop::xkb_layout::parse_latch_lock_group(body)
-    {
-        let old_group = backend.current_group();
-        backend.set_locked_group(requested_group);
-        let group = backend.current_group();
-        if group == old_group {
-            return Ok(RequestOutcome::Handled);
+    if minor == 5 {
+        // Xorg validates the whole request before applying any part of it.
+        if let Err((code, value)) = crate::core_loop::xkb_layout::check_latch_lock_state(body) {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                code,
+                value,
+                u16::from(minor),
+                header.opcode,
+            );
         }
-        let base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
-        let (eff_mods, base_mods, latched_mods, locked_mods) = backend.current_xkb_mods();
-        let subs = crate::core_loop::xkb_layout::subscribers(state, 0x0004);
-        let notify = x11::XkbStateNotify {
-            device_id: 1,
-            mods: eff_mods,
-            base_mods,
-            latched_mods,
-            locked_mods,
-            group,
-            locked_group: group,
-            changed: 0x0090, // XkbGroupStateMask | XkbGroupLockMask
-            keycode: 0,
-            event_type: 0, // caused by an XKB request, not a key
-            request_major: 136,
-            request_minor: 5,
-        };
-        let _dropped = fanout_event_to_clients(state, &subs, |buf, seq, order| {
-            let _ = x11::write_xkb_state_notify(buf, order, seq, base, notify);
-        });
-        state.last_xkb_mods = eff_mods;
-        // Dedup anchor: record the group we just announced so the
-        // compiled-`grp:`-key-action path in `key_event_fanout_to_state`
-        // (Driver 2) doesn't re-emit a redundant StateNotify on the
-        // next key. (Driver 2 sets the same field after its own emit.)
-        state.last_xkb_group = group;
+        let requested_group = crate::core_loop::xkb_layout::parse_latch_lock_group(body);
+        let requested_mods = crate::core_loop::xkb_layout::parse_latch_lock_mods(body);
+        // Neither component present (e.g. a latch-only request): fall
+        // through untouched, exactly as before this branch grew the
+        // modifier side.
+        if requested_group.is_some() || requested_mods.is_some() {
+            let old = (backend.current_group(), backend.current_xkb_mods());
+
+            if let Some(group) = requested_group {
+                backend.set_locked_group(group);
+            }
+            if let Some((affect, values)) = requested_mods {
+                backend.set_locked_mods(affect, values);
+            }
+
+            let group = backend.current_group();
+            let (eff_mods, base_mods, latched_mods, locked_mods) = backend.current_xkb_mods();
+
+            let changed = crate::core_loop::xkb_layout::latch_lock_changed(
+                old,
+                (group, (eff_mods, base_mods, latched_mods, locked_mods)),
+            );
+            // Nothing actually moved (already in the requested state) —
+            // stay silent rather than announce a no-change transition.
+            if changed == 0 {
+                return Ok(RequestOutcome::Handled);
+            }
+
+            let base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
+            // XkbSendStateNotify: only clients whose selected StateNotify
+            // details intersect what changed.
+            let subs = crate::core_loop::xkb_select::interest_recipients(state, |i| {
+                i.state & changed != 0
+            });
+            let notify = x11::XkbStateNotify {
+                device_id: 1,
+                mods: eff_mods,
+                base_mods,
+                latched_mods,
+                locked_mods,
+                group,
+                locked_group: group,
+                changed,
+                keycode: 0,
+                event_type: 0, // caused by an XKB request, not a key
+                request_major: 136,
+                request_minor: 5,
+            };
+            let _dropped = fanout_event_to_clients(state, &subs, |buf, seq, order| {
+                let _ = x11::write_xkb_state_notify(buf, order, seq, base, notify);
+            });
+            state.last_xkb_mods = eff_mods;
+            // Dedup anchor: record the group we just announced so the
+            // compiled-`grp:`-key-action path in `key_event_fanout_to_state`
+            // (Driver 2) doesn't re-emit a redundant StateNotify on the
+            // next key. (Driver 2 sets the same field after its own emit.)
+            state.last_xkb_group = group;
+        }
     }
     // XkbGetKbdByName (minor 23): a real keymap load + reply, NOT the
     // minimal stub. The backend owns the keymap/rmlvo/atom-resolution, so it

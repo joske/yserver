@@ -278,3 +278,87 @@ fn legacy_map_notify_filters_xkb_clients() {
     assert_eq!(count(read_all_available(&mut xkb_keysyms)), 0);
     assert_eq!(count(read_all_available(&mut xkb_none)), 0);
 }
+
+/// XkbUseExtension, then SelectEvents for StateNotify with `details` only
+/// (affectState = state = `details`, nothing else selected).
+fn select_state_details(
+    state: &mut ServerState,
+    backend: &mut RecordingBackend,
+    client: u32,
+    details: u16,
+) {
+    xkb_request(state, backend, client, 0, &[1, 0, 0, 0]);
+    let [lo, hi] = details.to_le_bytes();
+    let body = [
+        0x00, 0x01, 0x04, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, lo, hi, lo, hi,
+    ];
+    xkb_request(state, backend, client, 1, &body);
+}
+
+/// LatchLockState body locking (affect, values) and nothing else.
+fn lock_mods_body(affect: u8, values: u8) -> [u8; 12] {
+    [0x00, 0x01, affect, values, 0, 0, 0, 0, 0, 0, 0, 0]
+}
+
+/// `XkbSendStateNotify`: a client gets the event only when its selected
+/// StateNotify details intersect `changed`. Locking Mod2 changes ModifierLock
+/// and ModifierState, so a GroupState-only selector stays silent; repeating
+/// the request changes nothing and nobody hears about it.
+#[test]
+fn latch_lock_mods_state_notify_respects_selected_details() {
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    let mut group_only = install_client(&mut state, 1);
+    let mut lock_only = install_client(&mut state, 2);
+    let mut all = install_client(&mut state, 3);
+    select_state_details(&mut state, &mut backend, 1, 0x0010);
+    select_state_details(&mut state, &mut backend, 2, 0x0008);
+    select_state_details(&mut state, &mut backend, 3, 0x3fff);
+    for peer in [&mut group_only, &mut lock_only, &mut all] {
+        let _ = read_all_available(peer);
+    }
+    // RecordingBackend has no XKB event base: StateNotify is code 0, xkbType 2.
+    let notifies = |b: Vec<u8>| b.chunks(32).filter(|e| e[0] == 0 && e[1] == 2).count();
+
+    xkb_request(&mut state, &mut backend, 3, 5, &lock_mods_body(0x10, 0x10));
+    assert_eq!(backend.xkb_mods, (0x10, 0, 0, 0x10));
+    assert_eq!(notifies(read_all_available(&mut group_only)), 0);
+    assert_eq!(notifies(read_all_available(&mut lock_only)), 1);
+    assert_eq!(notifies(read_all_available(&mut all)), 1);
+
+    xkb_request(&mut state, &mut backend, 3, 5, &lock_mods_body(0x10, 0x10));
+    assert_eq!(notifies(read_all_available(&mut group_only)), 0);
+    assert_eq!(notifies(read_all_available(&mut lock_only)), 0);
+    assert_eq!(notifies(read_all_available(&mut all)), 0);
+}
+
+/// `ProcXkbLatchLockState` validates before applying: values outside the
+/// affect mask are BadMatch (`_XkbErrCode2(0x01, bad bits)`), a wrong-size
+/// request BadLength, and neither touches the modifier state.
+#[test]
+fn latch_lock_mods_rejects_invalid_requests_without_change() {
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    let mut peer = install_client(&mut state, 1);
+    xkb_request(&mut state, &mut backend, 1, 0, &[1, 0, 0, 0]);
+    let _ = read_all_available(&mut peer);
+
+    xkb_request(&mut state, &mut backend, 1, 5, &lock_mods_body(0x10, 0x11));
+    let err = read_all_available(&mut peer);
+    assert_eq!(
+        (err[0], err[1], &err[4..8]),
+        (0, x11::error::BAD_MATCH, &[1u8, 0, 0, 1][..])
+    );
+    assert_eq!(backend.xkb_mods, (0, 0, 0, 0));
+
+    xkb_request(
+        &mut state,
+        &mut backend,
+        1,
+        5,
+        &lock_mods_body(0x10, 0x10)[..4],
+    );
+    let err = read_all_available(&mut peer);
+    assert_eq!((err[0], err[1]), (0, x11::error::BAD_LENGTH));
+    assert_eq!(backend.xkb_mods, (0, 0, 0, 0));
+}

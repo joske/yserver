@@ -795,6 +795,44 @@ impl<P: Platform> XBackend<P> {
         )
     }
 
+    pub(in crate::kms::render::backend) fn backend_keyboard_set_locked_mods(
+        &mut self,
+        affect: u8,
+        values: u8,
+    ) {
+        // Read the whole serialized state first: update_mask replaces all
+        // six components at once, so depressed/latched mods and every
+        // layout component have to be carried across untouched or a
+        // client locking NumLock would silently drop a held Shift or the
+        // locked layout.
+        let (depressed, latched, locked, dep_layout, lat_layout, lock_layout) = {
+            let s = &self.core.xkb_state.0;
+            (
+                s.serialize_mods(xkbcommon::xkb::STATE_MODS_DEPRESSED),
+                s.serialize_mods(xkbcommon::xkb::STATE_MODS_LATCHED),
+                s.serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED),
+                s.serialize_layout(xkbcommon::xkb::STATE_LAYOUT_DEPRESSED),
+                s.serialize_layout(xkbcommon::xkb::STATE_LAYOUT_LATCHED),
+                s.serialize_layout(xkbcommon::xkb::STATE_LAYOUT_LOCKED),
+            )
+        };
+        let new_locked = (locked & !u32::from(affect)) | u32::from(values);
+        if new_locked == locked {
+            return;
+        }
+        self.core.xkb_state.0.update_mask(
+            depressed,
+            latched,
+            new_locked,
+            dep_layout,
+            lat_layout,
+            lock_layout,
+        );
+        // Same LED side effect the physical key path gets — without this
+        // the lock would be live but the keyboard LED dark.
+        self.sync_keyboard_leds();
+    }
+
     // ── Other extensions ────────────────────────────────────────
     pub(in crate::kms::render::backend) fn backend_keyboard_xkb_proxy(
         &mut self,

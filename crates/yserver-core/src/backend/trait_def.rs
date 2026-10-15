@@ -649,6 +649,17 @@ pub trait Backend {
     fn current_group(&self) -> u8 {
         0
     }
+    /// Lock or unlock the real modifiers named by `affect` to the matching
+    /// bits of `values` — `XkbLatchLockState`'s affectModLocks/modLocks,
+    /// which is how `numlockx` (`XkbLockModifiers`) turns NumLock on.
+    ///
+    /// `values` has no bits outside `affect` (the request is BadMatch
+    /// otherwise), so implementations merge with `(old & !affect) | values`.
+    /// They own the lock-LED side effect too: locking Num_Lock/Caps_Lock
+    /// this way must light the keyboard LED exactly as pressing the key does.
+    ///
+    /// Default no-op for backends without an XKB state machine.
+    fn set_locked_mods(&mut self, _affect: u8, _values: u8) {}
     /// The current real-modifier state as `(effective, base, latched,
     /// locked)` masks, read from the live xkb state. Drives
     /// `XkbStateNotify` so libxkbcommon clients track modifier changes.

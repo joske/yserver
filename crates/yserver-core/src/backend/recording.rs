@@ -1186,6 +1186,12 @@ impl Backend for RecordingBackend {
         None
     }
 
+    fn set_locked_mods(&mut self, affect: u8, values: u8) {
+        let (_, base, latched, locked) = self.xkb_mods;
+        let locked = (locked & !affect) | values;
+        self.xkb_mods = (base | latched | locked, base, latched, locked);
+    }
+
     fn current_xkb_mods(&self) -> (u8, u8, u8, u8) {
         self.xkb_mods
     }

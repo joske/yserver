@@ -459,6 +459,84 @@ pub fn parse_latch_lock_group(body: &[u8]) -> Option<u8> {
     if body[4] != 0 { Some(body[5]) } else { None }
 }
 
+/// Decode the modifier-lock target from an `xkbLatchLockStateReq` body (the
+/// bytes after the 4-byte request header). Returns `Some((affect, values))`
+/// iff `affectModLocks` names at least one modifier, else `None`.
+///
+/// Sibling of [`parse_latch_lock_group`]: one LatchLockState may carry a
+/// group lock, a modifier lock, both or neither, so callers ask both
+/// decoders independently and apply whatever came back.
+///
+/// This is the path `numlockx` uses — `XkbLockModifiers` lands here with
+/// `lockGroup` clear and only `affectModLocks`/`modLocks` filled in, which
+/// is why reading the group alone made the request a silent no-op.
+///
+/// Run [`check_latch_lock_state`] first: it rejects `values` bits outside
+/// `affect`, so callers can merge with a plain `(old & !affect) | values`.
+#[must_use]
+pub fn parse_latch_lock_mods(body: &[u8]) -> Option<(u8, u8)> {
+    if body.len() < 4 {
+        return None;
+    }
+    let affect = body[2];
+    if affect == 0 {
+        return None;
+    }
+    Some((affect, body[3]))
+}
+
+/// `xkbLatchLockStateReq` body length (16-byte request minus the header).
+const LATCH_LOCK_STATE_BODY_LEN: usize = 12;
+
+/// Xorg `ProcXkbLatchLockState`'s checks before anything is applied:
+/// `REQUEST_SIZE_MATCH`, then `CHK_MASK_MATCH(0x01, …)` for the modifier
+/// lock pair and the modifier latch pair. `Err` is `(error code, value)`.
+pub fn check_latch_lock_state(body: &[u8]) -> Result<(), (u8, u32)> {
+    if body.len() != LATCH_LOCK_STATE_BODY_LEN {
+        return Err((x11::error::BAD_LENGTH, 0));
+    }
+    for (affect, values) in [(body[2], body[3]), (body[6], body[7])] {
+        if values & !affect != 0 {
+            return Err((
+                x11::error::BAD_MATCH,
+                crate::core_loop::xkb_select::err_code2(0x01, u32::from(values & !affect)),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `XkbStateNotify.changed` for a LatchLockState, compared component by
+/// component as Xorg's `XkbStateChangedFlags`. Arguments are
+/// `(group, (effective, base, latched, locked))` before and after; the
+/// group here is the locked group, which is also the effective one.
+///
+/// The serializer fills compat state, grab, compat grab, lookup and
+/// compat lookup mods from the effective mods, so those five bits move
+/// with them.
+#[must_use]
+pub fn latch_lock_changed(old: (u8, (u8, u8, u8, u8)), new: (u8, (u8, u8, u8, u8))) -> u16 {
+    let (old_group, (old_eff, old_base, old_latched, old_locked)) = old;
+    let (group, (eff, base, latched, locked)) = new;
+    let mut changed: u16 = 0;
+    if group != old_group {
+        changed |= 0x0090; // XkbGroupStateMask | XkbGroupLockMask
+    }
+    if eff != old_eff {
+        changed |= 0x0001 | 0x1F00; // XkbModifierStateMask + derived fields
+    }
+    if base != old_base {
+        changed |= 0x0002; // XkbModifierBaseMask
+    }
+    if latched != old_latched {
+        changed |= 0x0004; // XkbModifierLatchMask
+    }
+    if locked != old_locked {
+        changed |= 0x0008; // XkbModifierLockMask
+    }
+    changed
+}
+
 pub(crate) use crate::core_loop::xkb_select::subscribers;
 
 #[cfg(test)]
@@ -760,5 +838,119 @@ mod tests {
             0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         assert_eq!(parse_latch_lock_group(&body2), None);
+    }
+
+    /// `numlockx on` shape: affectModLocks=Mod2 (numlock), modLocks=Mod2,
+    /// lockGroup clear. The group decoder must stay quiet and the mod
+    /// decoder must report the lock — that pairing is the whole bug.
+    #[test]
+    fn parse_latch_lock_mods_decodes_numlockx_on() {
+        let body = [
+            0x00, 0x01, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(parse_latch_lock_mods(&body), Some((0x10, 0x10)));
+        assert_eq!(
+            parse_latch_lock_group(&body),
+            None,
+            "a mod-only LatchLockState must not read as a group lock"
+        );
+    }
+
+    /// `numlockx off`: the modifier is named in affectModLocks but its
+    /// value bit is clear, so this is an unlock — distinct from "not
+    /// mentioned at all", which must decode as None.
+    #[test]
+    fn parse_latch_lock_mods_distinguishes_unlock_from_absent() {
+        let unlock = [
+            0x00, 0x01, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(parse_latch_lock_mods(&unlock), Some((0x10, 0x00)));
+        let absent = [
+            0x00, 0x01, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(
+            parse_latch_lock_mods(&absent),
+            None,
+            "affectModLocks=0 means don't touch locks, whatever modLocks says"
+        );
+    }
+
+    /// Short bodies must not panic — the wire is client-controlled.
+    #[test]
+    fn parse_latch_lock_mods_rejects_short_body() {
+        assert_eq!(parse_latch_lock_mods(&[]), None);
+        assert_eq!(parse_latch_lock_mods(&[0x00, 0x01, 0x10]), None);
+    }
+
+    #[test]
+    fn check_latch_lock_state_accepts_numlockx_on() {
+        let body = [
+            0x00, 0x01, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(check_latch_lock_state(&body), Ok(()));
+    }
+
+    /// Xorg `REQUEST_SIZE_MATCH`: the body is exactly 12 bytes; a short one
+    /// must not lock anything (it used to: the parsers only need 4/6 bytes).
+    #[test]
+    fn check_latch_lock_state_rejects_wrong_length() {
+        for len in [0, 4, 8, 16] {
+            let body = vec![0u8; len];
+            assert_eq!(
+                check_latch_lock_state(&body),
+                Err((x11::error::BAD_LENGTH, 0)),
+                "len {len}"
+            );
+        }
+    }
+
+    /// Xorg `CHK_MASK_MATCH(0x01, …)`: value bits outside the affect mask
+    /// are BadMatch, for the lock pair and the latch pair alike — not
+    /// silently masked off.
+    #[test]
+    fn check_latch_lock_state_rejects_values_outside_affect() {
+        let locks = [
+            0x00, 0x01, 0x10, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(
+            check_latch_lock_state(&locks),
+            Err((x11::error::BAD_MATCH, 0x0100_0001))
+        );
+        let latches = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(
+            check_latch_lock_state(&latches),
+            Err((x11::error::BAD_MATCH, 0x0100_0004))
+        );
+    }
+
+    /// Locking a held Shift changes only the lock component: effective
+    /// mods stay 0x01, so neither ModifierState nor the mirrors are flagged.
+    #[test]
+    fn latch_lock_changed_flags_only_what_moved() {
+        assert_eq!(
+            latch_lock_changed((0, (1, 1, 0, 0)), (0, (1, 1, 0, 1))),
+            0x0008
+        );
+    }
+
+    /// NumLock on from idle: lock + effective, and the five fields the
+    /// StateNotify serializer derives from effective mods.
+    #[test]
+    fn latch_lock_changed_flags_effective_mirrors() {
+        assert_eq!(
+            latch_lock_changed((0, (0, 0, 0, 0)), (0, (0x10, 0, 0, 0x10))),
+            0x1F09
+        );
+    }
+
+    #[test]
+    fn latch_lock_changed_flags_group_lock() {
+        assert_eq!(
+            latch_lock_changed((0, (0, 0, 0, 0)), (1, (0, 0, 0, 0))),
+            0x0090
+        );
+        assert_eq!(latch_lock_changed((1, (0, 0, 0, 0)), (1, (0, 0, 0, 0))), 0);
     }
 }

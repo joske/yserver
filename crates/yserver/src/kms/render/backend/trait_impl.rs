@@ -70,6 +70,10 @@ impl<P: Platform> Backend for XBackend<P> {
         self.effective_locked_group()
     }
 
+    fn set_locked_mods(&mut self, affect: u8, values: u8) {
+        Self::backend_keyboard_set_locked_mods(self, affect, values);
+    }
+
     fn current_xkb_mods(&self) -> (u8, u8, u8, u8) {
         Self::backend_keyboard_current_xkb_mods(self)
     }
