@@ -442,10 +442,6 @@ impl XBackend<SurfacePlatform> {
                 self.telemetry.record_frame_present();
                 retired_any = true;
             }
-            if self.platform.outputs[idx].take_repaint_wanted() {
-                self.scene.invalidate_all_scanout_damage();
-                self.scene.wake_for_damage();
-            }
             let output = &self.platform.outputs[idx];
             if output.has_pending() {
                 output.clock().arm_tick();

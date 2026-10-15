@@ -151,10 +151,6 @@ pub(crate) struct SurfaceOutput {
     blit_warned: bool,
     clock: Arc<FrameClock>,
     commit: Option<Arc<SurfaceCommit>>,
-    /// Presents on the current swapchain.
-    swapchain_presents: u32,
-    /// The first present on a new swapchain went out: compose again.
-    repaint_wanted: bool,
     #[cfg(test)]
     frames_presented: u64,
     #[cfg(test)]
@@ -198,8 +194,6 @@ impl SurfaceOutput {
             blit_warned: false,
             clock,
             commit: native.commit.clone(),
-            swapchain_presents: 0,
-            repaint_wanted: false,
             #[cfg(test)]
             frames_presented: 0,
             #[cfg(test)]
@@ -453,11 +447,6 @@ impl SurfaceOutput {
                     region.scale
                 );
                 self.needs_recreate |= suboptimal;
-                self.swapchain_presents += 1;
-                if self.swapchain_presents == 1 {
-                    log::debug!("present: first on this swapchain; composing again");
-                    self.repaint_wanted = true;
-                }
             }
             // The present's semaphore wait still executes.
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.note_out_of_date(),
@@ -540,11 +529,6 @@ impl SurfaceOutput {
             Some((_, SlotPhase::Composed)) => self.hidden,
             _ => false,
         }
-    }
-
-    /// Whether the first present on a new swapchain went out since asked.
-    pub(crate) fn take_repaint_wanted(&mut self) -> bool {
-        std::mem::take(&mut self.repaint_wanted)
     }
 
     /// Whether a frame awaits presentation or retirement.
@@ -777,7 +761,6 @@ impl SurfaceOutput {
             images.len(),
             format.format
         );
-        self.swapchain_presents = 0;
         self.swapchain = Some(Swapchain {
             handle,
             images,
