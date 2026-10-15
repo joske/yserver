@@ -260,6 +260,31 @@ fn surface_frame_runs_record_acquire_copy_present_then_retires_on_a_tick() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD"]
+fn a_swapchain_build_commits_the_native_surface() {
+    let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&commits);
+    let native = NativeSurface::headless().with_commit(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+    let vk = match native.create_context() {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!("skipping: no presenting Vk: {e}");
+            return;
+        }
+    };
+    let link = Arc::new(ShellLink::default());
+    let clock = Arc::new(FrameClock::new(link));
+    let extent = vk::Extent2D {
+        width: 64,
+        height: 48,
+    };
+    let _output = SurfaceOutput::new(vk, &native, extent, clock).expect("headless surface output");
+    assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
 fn surface_slots_rotate_and_report_their_buffer_age() {
     let Some(mut f) = surface_or_skip() else {
         return;

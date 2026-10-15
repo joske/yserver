@@ -9,7 +9,7 @@ use objc2_app_kit::{
     NSBackingStoreType, NSColor, NSResponder, NSScreen, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSString};
-use objc2_quartz_core::{CALayer, CAMetalLayer, kCAGravityTopLeft};
+use objc2_quartz_core::{CALayer, CAMetalLayer, CATransaction, kCAGravityTopLeft};
 
 use super::{input::ShellInput, scale::Metrics, view::YserverView};
 use crate::surface::{
@@ -108,4 +108,7 @@ pub(super) fn metal_surface(layer: &CAMetalLayer) -> NativeSurface {
         // SAFETY: a live CAMetalLayer and an instance with the extension.
         unsafe { loader.create_metal_surface(&info, None) }
     })
+    // The driver sets layer properties on the core thread, which has no run
+    // loop to commit them: they would show only once the main thread commits.
+    .with_commit(CATransaction::flush)
 }

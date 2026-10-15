@@ -40,10 +40,16 @@ const SLOT_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 pub(crate) type SurfaceCreator =
     dyn Fn(&ash::Entry, &ash::Instance) -> Result<vk::SurfaceKHR, vk::Result> + Send;
 
-/// A shell's surface: its instance extension and how to create it.
+/// Commits what the driver changed on the shell's surface from the calling
+/// thread.
+pub(crate) type SurfaceCommit = dyn Fn() + Send + Sync;
+
+/// A shell's surface: its instance extension, how to create it and how to
+/// commit the driver's changes to it.
 pub(crate) struct NativeSurface {
     extension: &'static CStr,
     create: Box<SurfaceCreator>,
+    commit: Option<Arc<SurfaceCommit>>,
 }
 
 impl NativeSurface {
@@ -56,7 +62,16 @@ impl NativeSurface {
         Self {
             extension,
             create: Box::new(create),
+            commit: None,
         }
+    }
+
+    /// Run `commit` on the core thread after each swapchain change.
+    #[cfg_attr(all(kms, not(test)), allow(dead_code))] // A window shell's.
+    #[must_use]
+    pub(crate) fn with_commit(mut self, commit: impl Fn() + Send + Sync + 'static) -> Self {
+        self.commit = Some(Arc::new(commit));
+        self
     }
 
     /// `VK_EXT_headless_surface`: presents nowhere (tests).
@@ -135,6 +150,7 @@ pub(crate) struct SurfaceOutput {
     blit: bool,
     blit_warned: bool,
     clock: Arc<FrameClock>,
+    commit: Option<Arc<SurfaceCommit>>,
     #[cfg(test)]
     frames_presented: u64,
     #[cfg(test)]
@@ -177,6 +193,7 @@ impl SurfaceOutput {
             blit: false,
             blit_warned: false,
             clock,
+            commit: native.commit.clone(),
             #[cfg(test)]
             frames_presented: 0,
             #[cfg(test)]
@@ -595,8 +612,17 @@ impl SurfaceOutput {
     }
 
     /// (Re)create the swapchain for the surface's current size; none while
-    /// the surface has zero size (minimised).
+    /// the surface has zero size (minimised). The driver's changes to the
+    /// surface are committed after, whatever the outcome.
     fn recreate_swapchain(&mut self) -> Result<(), vk::Result> {
+        let result = self.rebuild_swapchain();
+        if let Some(commit) = &self.commit {
+            commit();
+        }
+        result
+    }
+
+    fn rebuild_swapchain(&mut self) -> Result<(), vk::Result> {
         let pd = self.vk.physical_device;
         // SAFETY: the surface belongs to this instance.
         let caps = unsafe {
