@@ -222,6 +222,9 @@ the lowest free display from `:1`, shows it in the window title
 default; one X pixel per point, 2 on a Retina screen), `1` (full
 resolution) or `2`.
 
+Text copied in X clients (CLIPBOARD) can be pasted in Mac apps, and the other
+way round. PRIMARY (select / middle-click) stays within X.
+
 Clients connect with the display number, e.g. with XQuartz's clients:
 
 ```sh
