@@ -447,7 +447,7 @@ impl XBackend<SurfacePlatform> {
                 self.scene.wake_for_damage();
             }
             let output = &self.platform.outputs[idx];
-            if output.has_pending() || output.diag_ticking() {
+            if output.has_pending() {
                 output.clock().arm_tick();
             }
         }
