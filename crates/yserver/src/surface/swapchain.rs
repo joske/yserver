@@ -155,6 +155,8 @@ pub(crate) struct SurfaceOutput {
     swapchain_presents: u32,
     /// The first present on a new swapchain went out: compose again.
     repaint_wanted: bool,
+    /// Service passes since the start (diagnostic).
+    diag_ticks: u32,
     #[cfg(test)]
     frames_presented: u64,
     #[cfg(test)]
@@ -200,6 +202,7 @@ impl SurfaceOutput {
             commit: native.commit.clone(),
             swapchain_presents: 0,
             repaint_wanted: false,
+            diag_ticks: 0,
             #[cfg(test)]
             frames_presented: 0,
             #[cfg(test)]
@@ -455,8 +458,7 @@ impl SurfaceOutput {
                 self.needs_recreate |= suboptimal;
                 self.swapchain_presents += 1;
                 if self.swapchain_presents == 1 {
-                    log::debug!("present: first on this swapchain; composing again");
-                    self.repaint_wanted = true;
+                    log::debug!("present: first on this swapchain");
                 }
             }
             // The present's semaphore wait still executes.
@@ -544,7 +546,17 @@ impl SurfaceOutput {
 
     /// Whether the first present on a new swapchain went out since asked.
     pub(crate) fn take_repaint_wanted(&mut self) -> bool {
+        self.diag_ticks += 1;
+        if matches!(self.diag_ticks, 30 | 60 | 120 | 180 | 300) {
+            log::debug!("present: diag repaint at tick {}", self.diag_ticks);
+            self.repaint_wanted = true;
+        }
         std::mem::take(&mut self.repaint_wanted)
+    }
+
+    /// Keep ticking until the diagnostic repaints are done.
+    pub(crate) fn diag_ticking(&self) -> bool {
+        self.diag_ticks < 300
     }
 
     /// Whether a frame awaits presentation or retirement.
