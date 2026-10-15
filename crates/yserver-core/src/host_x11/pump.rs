@@ -106,7 +106,10 @@ pub(super) fn connect_to_host() -> io::Result<HostStream> {
                     "DISPLAY number too large for TCP port",
                 )
             })?;
-            HostStream::Tcp(TcpStream::connect((host, port))?)
+            let stream = TcpStream::connect((host, port))?;
+            // Nagle off, as libxcb does for its TCP connections.
+            stream.set_nodelay(true)?;
+            HostStream::Tcp(stream)
         }
     };
     write_setup_request(&mut stream, auth.as_ref())?;

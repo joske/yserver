@@ -4812,6 +4812,13 @@ fn accept_pending(
                 // same-machine client keeps MIT-SHM — its `Attach` passes
                 // a SysV shmid, an integer on the wire, so shared memory
                 // works fine without a descriptor.
+                //
+                // Nagle off, as xtrans `SocketINETAccept` does: a small
+                // reply held back behind an unacked write costs the
+                // client a delayed-ACK round trip.
+                if let Err(err) = stream.set_nodelay(true) {
+                    warn!("TCP_NODELAY on {peer}: {err}");
+                }
                 (Transport::Tcp(stream), address_is_ours(peer.ip()), false)
             }),
         };
