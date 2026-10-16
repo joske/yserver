@@ -49,6 +49,7 @@ pub(super) fn handle_xkb_request(
     // hasn't called XkbUseExtension (every XKB request but UseExtension).
     let min_body = match minor {
         X_KB_SELECT_EVENTS => 12,
+        5 => 12, // LatchLockState
         X_KB_SET_CONTROLS => 96,
         X_KB_SET_MAP => 32,
         X_KB_SET_COMPAT_MAP => 12,
@@ -161,9 +162,8 @@ pub(super) fn handle_xkb_request(
     // XkbLatchLockState (minor 5): a group lock switches the authoritative
     // keyboard group, a modifier lock sets/clears real modifier locks (this
     // is the path `numlockx` takes via XkbLockModifiers), and either one
-    // broadcasts XkbStateNotify to subscribed clients. One request may carry
-    // both, so both are applied before the SINGLE notify Xorg sends — two
-    // notifies for one request would be a visible protocol deviation.
+    // broadcasts XkbStateNotify to subscribed clients. When a request carries
+    // both, both are applied before one XkbStateNotify, as in Xorg.
     // LatchLockState is a void request (no reply), so this runs in the
     // pre-proxy region; the backend's xkb_proxy minor-5 returns None.
     if minor == 5 {
@@ -181,9 +181,8 @@ pub(super) fn handle_xkb_request(
         }
         let requested_group = crate::core_loop::xkb_layout::parse_latch_lock_group(body);
         let requested_mods = crate::core_loop::xkb_layout::parse_latch_lock_mods(body);
-        // Neither component present (e.g. a latch-only request): fall
-        // through untouched, exactly as before this branch grew the
-        // modifier side.
+        // Neither component present (e.g. a latch-only request): the state
+        // is left untouched and nothing is sent.
         if requested_group.is_some() || requested_mods.is_some() {
             let old = (backend.current_group(), backend.current_xkb_mods());
 

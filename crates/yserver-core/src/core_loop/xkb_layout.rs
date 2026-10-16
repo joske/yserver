@@ -467,9 +467,8 @@ pub fn parse_latch_lock_group(body: &[u8]) -> Option<u8> {
 /// group lock, a modifier lock, both or neither, so callers ask both
 /// decoders independently and apply whatever came back.
 ///
-/// This is the path `numlockx` uses — `XkbLockModifiers` lands here with
-/// `lockGroup` clear and only `affectModLocks`/`modLocks` filled in, which
-/// is why reading the group alone made the request a silent no-op.
+/// This is the path `numlockx` uses: `XkbLockModifiers` sends
+/// `lockGroup` clear and only `affectModLocks`/`modLocks` filled in.
 ///
 /// Run [`check_latch_lock_state`] first: it rejects `values` bits outside
 /// `affect`, so callers can merge with a plain `(old & !affect) | values`.
@@ -842,7 +841,7 @@ mod tests {
 
     /// `numlockx on` shape: affectModLocks=Mod2 (numlock), modLocks=Mod2,
     /// lockGroup clear. The group decoder must stay quiet and the mod
-    /// decoder must report the lock — that pairing is the whole bug.
+    /// decoder must report the lock.
     #[test]
     fn parse_latch_lock_mods_decodes_numlockx_on() {
         let body = [
@@ -891,7 +890,7 @@ mod tests {
     }
 
     /// Xorg `REQUEST_SIZE_MATCH`: the body is exactly 12 bytes; a short one
-    /// must not lock anything (it used to: the parsers only need 4/6 bytes).
+    /// must not lock anything, although the parsers only need 4/6 bytes.
     #[test]
     fn check_latch_lock_state_rejects_wrong_length() {
         for len in [0, 4, 8, 16] {

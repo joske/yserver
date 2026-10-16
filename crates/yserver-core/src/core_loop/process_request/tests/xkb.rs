@@ -362,3 +362,23 @@ fn latch_lock_mods_rejects_invalid_requests_without_change() {
     assert_eq!((err[0], err[1]), (0, x11::error::BAD_LENGTH));
     assert_eq!(backend.xkb_mods, (0, 0, 0, 0));
 }
+
+/// Xorg checks `REQUEST_SIZE_MATCH` before the XkbUseExtension check: a
+/// short LatchLockState from an uninitialised client is BadLength, not
+/// BadAccess.
+#[test]
+fn latch_lock_short_request_is_bad_length_before_bad_access() {
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    let mut peer = install_client(&mut state, 1);
+    xkb_request(
+        &mut state,
+        &mut backend,
+        1,
+        5,
+        &lock_mods_body(0x10, 0x10)[..4],
+    );
+    let err = read_all_available(&mut peer);
+    assert_eq!((err[0], err[1], err[8]), (0, x11::error::BAD_LENGTH, 5));
+    assert_eq!(backend.xkb_mods, (0, 0, 0, 0));
+}
