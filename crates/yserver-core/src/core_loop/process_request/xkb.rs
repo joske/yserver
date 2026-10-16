@@ -179,6 +179,14 @@ pub(super) fn handle_xkb_request(
                 header.opcode,
             );
         }
+        // Modifier and group latches are validated but not applied yet.
+        if body[6] != 0 || body[9] != 0 {
+            debug!(
+                "client {} #{} XkbLatchLockState latches not applied: \
+                 affectModLatches={:#04x} latchGroup={}",
+                client_id.0, sequence.0, body[6], body[9]
+            );
+        }
         let requested_group = crate::core_loop::xkb_layout::parse_latch_lock_group(body);
         let requested_mods = crate::core_loop::xkb_layout::parse_latch_lock_mods(body);
         // Neither component present (e.g. a latch-only request): the state
