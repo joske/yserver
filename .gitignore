@@ -49,6 +49,7 @@ PXL_*
 *.jpg
 *.jpeg
 *.png
+!/assets/*.png
 *.heic
 
 # perf data captures (binary, can be large)
