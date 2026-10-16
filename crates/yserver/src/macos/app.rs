@@ -30,10 +30,10 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy,
-    NSApplicationDelegate, NSApplicationTerminateReply, NSMenu, NSMenuItem, NSWindow,
+    NSApplicationDelegate, NSApplicationTerminateReply, NSImage, NSMenu, NSMenuItem, NSWindow,
     NSWindowDelegate, NSWindowOcclusionState,
 };
-use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSString, ns_string};
+use objc2_foundation::{NSData, NSNotification, NSObject, NSObjectProtocol, NSString, ns_string};
 use objc2_quartz_core::CAMetalLayer;
 
 use super::{display_link::DisplayLink, input::ShellInput, scale::Metrics};
@@ -405,6 +405,17 @@ fn install_menu(app: &NSApplication, mtm: MainThreadMarker) {
     app.setMainMenu(Some(&*menu_bar));
 }
 
+/// The Dock icon, set at run time so a bare binary started from a terminal
+/// gets it too, not only the bundle.
+fn set_dock_icon(app: &NSApplication) {
+    const ICON_PNG: &[u8] = include_bytes!("../../../../assets/yserver-icon.png");
+    let data = NSData::with_bytes(ICON_PNG);
+    if let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) {
+        // SAFETY: a non-nil image is always a valid application icon.
+        unsafe { app.setApplicationIconImage(Some(&image)) };
+    }
+}
+
 /// Run the AppKit application on the main thread; does not return on a
 /// normal quit (AppKit exits the process).
 ///
@@ -416,6 +427,7 @@ pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
         .ok_or_else(|| io::Error::other("the window shell must run on the main thread"))?;
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    set_dock_icon(&app);
     install_menu(&app, mtm);
     let delegate = YserverAppDelegate::new(mtm, opts);
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));

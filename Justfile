@@ -178,8 +178,15 @@ macos-bundle:
     version=$(cargo pkgid -p yserver | sed 's/.*[#@]//')
     app=target/yserver.app
     rm -rf "$app"
-    mkdir -p "$app/Contents/MacOS"
+    mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
     cp "{{TARGETDIR}}/yserver" "$app/Contents/MacOS/yserver"
+    iconset=target/yserver.iconset
+    rm -rf "$iconset" && mkdir -p "$iconset"
+    for size in 16 32 128 256 512; do
+        sips -z $size $size assets/yserver-icon.png --out "$iconset/icon_${size}x${size}.png" >/dev/null
+        sips -z $((size * 2)) $((size * 2)) assets/yserver-icon.png --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+    done
+    iconutil -c icns "$iconset" -o "$app/Contents/Resources/yserver.icns"
     cat > "$app/Contents/Info.plist" <<EOF
     <?xml version="1.0" encoding="UTF-8"?>
     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -192,6 +199,8 @@ macos-bundle:
         <key>CFBundleName</key>
         <string>yserver</string>
         <key>CFBundleDisplayName</key>
+        <string>yserver</string>
+        <key>CFBundleIconFile</key>
         <string>yserver</string>
         <key>CFBundlePackageType</key>
         <string>APPL</string>
