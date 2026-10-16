@@ -2709,6 +2709,45 @@ fn caps_lock_toggle_drives_led_bits() {
     assert_eq!(b.current_led_bits(), 0, "second toggle clears the LED bit");
 }
 
+/// `set_locked_mods` (XkbLatchLockState) uses `update_mask` on the master
+/// `xkb_state` that physical keys drive with `update_key`. A held Shift
+/// stays depressed across the lock, the NumLock LED follows it, and the
+/// physical NumLock key and the Shift release still act on that state.
+#[test]
+fn latch_lock_numlock_keeps_held_shift_and_physical_key_unlocks() {
+    use yserver_core::backend::Backend;
+    // X keycodes (evdev + 8): Shift_L 50, Num_Lock 77.
+    let key = |keycode, pressed| yserver_core::host_x11::HostKeyEvent {
+        keycode,
+        ..caps_key(pressed)
+    };
+    const SHIFT: u8 = 0x01;
+    const MOD2: u8 = 0x10;
+    let mut b = KmsBackend::for_tests();
+
+    let _ = b.cook_host_key(key(50, true));
+    Backend::set_locked_mods(&mut b, MOD2, MOD2);
+    let (eff, base, _latched, locked) = Backend::current_xkb_mods(&b);
+    assert_eq!(base, SHIFT, "Shift still depressed after the lock");
+    assert_eq!(locked, MOD2, "NumLock locked");
+    assert_eq!(eff, SHIFT | MOD2);
+    assert_eq!(b.current_led_bits(), input::Led::NUMLOCK.bits());
+
+    let _ = b.cook_host_key(key(77, true));
+    let _ = b.cook_host_key(key(77, false));
+    let (_eff, base, _latched, locked) = Backend::current_xkb_mods(&b);
+    assert_eq!(locked, 0, "physical NumLock unlocks");
+    assert_eq!(base, SHIFT, "Shift still held");
+    assert_eq!(b.current_led_bits(), 0, "NumLock LED off");
+
+    let _ = b.cook_host_key(key(50, false));
+    assert_eq!(
+        Backend::current_xkb_mods(&b),
+        (0, 0, 0, 0),
+        "Shift released"
+    );
+}
+
 fn caps_key(pressed: bool) -> yserver_core::host_x11::HostKeyEvent {
     // 66 == X keycode for Caps Lock (evdev KEY_CAPSLOCK 58 + 8).
     yserver_core::host_x11::HostKeyEvent {

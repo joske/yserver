@@ -171,14 +171,12 @@ fn press_release_key(state: &mut xkbcommon::xkb::State, kc: u8) {
 /// and releasing the keymap's own lock keys; returns the bits no key could
 /// lock.
 ///
-/// Why replay and not `update_mask`: xkbcommon documents `update_mask` as the
-/// lossy client-side entry point that "must not be used to update the server
-/// state" and must not be mixed with `update_key`, which drives this state for
-/// every real key event afterwards. Its server-side counterpart for
-/// out-of-band lock changes, `xkb_state_update_latched_locked`, needs
-/// libxkbcommon 1.8 and isn't exposed by the `xkbcommon` crate. A replay only
-/// goes through `update_key`, so the state reaches the locks by the keymap's
-/// own `LockMods` actions and the real lock keys still unlock afterwards.
+/// A replay only goes through `update_key`, so the state reaches the locks by
+/// the keymap's own `LockMods` actions and the real lock keys still unlock
+/// afterwards. An out-of-band lock on the master state uses `update_mask`
+/// instead (`backend_keyboard_set_locked_mods`, XkbLatchLockState); the
+/// KMS test `latch_lock_numlock_keeps_held_shift_and_physical_key_unlocks`
+/// pins that held keys and the physical lock key keep working with it.
 ///
 /// Candidates come from probing every keycode on a scratch state: a key
 /// qualifies when a press+release locks only real modifiers we want and
@@ -2814,13 +2812,8 @@ impl KmsCore {
     ///
     /// LIMITATION (deliberate): *locked* state (Caps Lock, a locked group)
     /// is reset by the rebuild — only physically-held keys are re-asserted.
-    /// We do NOT restore locked mods/group via `update_mask`: xkbcommon
-    /// documents `update_mask` as the lossy slave/wire entry point that
-    /// "must not be used to update the master state" and "should not be used
-    /// together" with `update_key`. Mixing it in would risk an incoherent
-    /// master state for subsequent real key events. This matches the
-    /// VT-acquire path's fresh-state behavior. (An in-place edit,
-    /// [`Self::install_desc`], does carry the locks, by replay.)
+    /// This matches the VT-acquire path's fresh-state behavior. (An in-place
+    /// edit, [`Self::install_desc`], does carry the locks, by replay.)
     pub(crate) fn recompile_keymap(&mut self, rmlvo: &XkbRmlvo) -> Option<(u8, u8)> {
         if self.keymap_is_pristine(rmlvo) {
             return None;
