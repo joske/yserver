@@ -4,7 +4,7 @@ use crate::{
         damage_fanout::{accumulate_damage_full_to_state, accumulate_damage_to_state},
         fanout::emit_window_event_to_state,
         process_request::{
-            CopyAreaSubRect, RequestOutcome, emit_x11_error,
+            CopyAreaSubRect, RequestOutcome, background_paint_inhibited, emit_x11_error,
             redirect::{
                 current_bounding_in_parent, effective_redirect_mode_for_window,
                 redirected_ancestor_or_self,
@@ -1028,10 +1028,13 @@ pub(super) fn handle_clear_area(
             let width = clear_extent(request.width, request.x, w_width);
             let height = clear_extent(request.height, request.y, w_height);
             if width != 0 && height != 0 {
-                // Background None (X11 §ClearArea): the contents are
-                // left untouched — no paint, no damage. Expose events
+                // Background None (X11 §ClearArea), or inhibited
+                // (`miPaintWindow`, `mi/miexpose.c:435`): the contents
+                // are left untouched — no paint, no damage. Expose events
                 // (below) still fire when requested.
-                if let Some(bg) = resolved_bg {
+                if let Some(bg) = resolved_bg
+                    && !background_paint_inhibited(state, request.window)
+                {
                     backend.clear_area(
                         origin,
                         target.host_xid(),
@@ -1313,6 +1316,7 @@ fn finish_copy_exposures(
     if let Some(window) = state.resources.window(dst)
         && !window.background_none
         && !rects.is_empty()
+        && !background_paint_inhibited(state, dst)
     {
         let paint = match &exposed {
             Some((r, true)) => crate::core_loop::clip_list::intersect(

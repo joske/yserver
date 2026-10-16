@@ -157,9 +157,18 @@ pub(crate) fn teardown_overlay(
                 );
             });
         }
+        let clips_before =
+            crate::core_loop::clip_list::clip_lists_under(state, COMPOSITE_OVERLAY_WINDOW);
         // DeleteWindow's UnmapWindow re-evaluates the pointer while the
         // overlay still exists (`dix/window.c:2871`).
         let _ = state.resources.unmap_window(COMPOSITE_OVERLAY_WINDOW);
+        // ... and exposes what the overlay covered (`dix/window.c:2856-2866`).
+        let after = crate::core_loop::clip_list::clip_lists_under(state, COMPOSITE_OVERLAY_WINDOW);
+        for (w, region) in crate::core_loop::clip_list::newly_exposed(&clips_before, after, None) {
+            crate::core_loop::process_request::send_window_exposures(
+                state, backend, origin, w, &region, true,
+            );
+        }
         backend.windows_restructured(state);
     }
     for (event_window, mask) in targets {

@@ -3207,3 +3207,267 @@ fn reparent_between_redirected_parents_with_different_modes_flips_mode() {
         *calls,
     );
 }
+
+// ---------------- inhibitBGPaint ----------------
+
+const INHIBIT_APP: u32 = 1;
+const INHIBIT_COMP: u32 = 2;
+const INHIBIT_W: u32 = 0x0010_0001;
+
+/// Root's subwindows Manual-redirected by `INHIBIT_COMP`, which holds a
+/// NonEmpty Damage on root; `INHIBIT_W` (100x100 at 0,0, client
+/// `INHIBIT_APP`) mapped under it; the app selects Expose on root.
+fn manual_root_fixture() -> (
+    ServerState,
+    RecordingBackend,
+    std::os::unix::net::UnixStream,
+    std::os::unix::net::UnixStream,
+) {
+    use crate::server::DamageObject;
+    use yserver_protocol::x11::damage as x11damage;
+    let mut state = ServerState::new();
+    let app = install_client(&mut state, INHIBIT_APP);
+    let comp = install_client(&mut state, INHIBIT_COMP);
+    let mut backend = RecordingBackend::new().with_redirect_activation();
+    state.resources.window_mut(ROOT_WINDOW).unwrap().host_xid =
+        crate::backend::WindowHandle::from_raw(backend.window_id());
+    create_root_child(&mut state, INHIBIT_W);
+    state
+        .resources
+        .window_mut(ResourceId(INHIBIT_W))
+        .unwrap()
+        .host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(
+        INHIBIT_W | 0x0040_0000,
+    ));
+    let _ = state.resources.map_window(ResourceId(INHIBIT_W));
+    state
+        .clients
+        .get_mut(&INHIBIT_APP)
+        .unwrap()
+        .event_masks
+        .insert(ROOT_WINDOW, 0x0000_8000);
+    dispatch_composite_window_update(
+        &mut state,
+        &mut backend,
+        ClientId(INHIBIT_COMP),
+        2,
+        ROOT_WINDOW.0,
+        1,
+    );
+    state.damage_objects.insert(
+        0x0020_0001,
+        DamageObject {
+            owner: ClientId(INHIBIT_COMP),
+            drawable: ROOT_WINDOW,
+            level: x11damage::report_level::NON_EMPTY,
+            rects: Vec::new(),
+            pending_notify_fired: false,
+            last_reported_geometry: None,
+        },
+    );
+    backend.calls.lock().unwrap().clear();
+    (state, backend, app, comp)
+}
+
+fn root_fills(state: &ServerState, backend: &RecordingBackend) -> Vec<(i16, i16, u16, u16)> {
+    let root = state
+        .resources
+        .host_drawable_target(ROOT_WINDOW)
+        .expect("root has a host target")
+        .host_xid();
+    backend
+        .calls()
+        .iter()
+        .filter_map(|call| match call {
+            RecordedCall::FillRectangle {
+                host_xid,
+                x,
+                y,
+                width,
+                height,
+                ..
+            } if *host_xid == root => Some((*x, *y, *width, *height)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn root_exposes(peer: &mut std::os::unix::net::UnixStream) -> Vec<(u16, u16, u16, u16, u16)> {
+    let u16_at = |e: &[u8], at: usize| u16::from_le_bytes([e[at], e[at + 1]]);
+    read_all_available(peer)
+        .chunks_exact(32)
+        .filter(|e| e[0] & 0x7f == 12 && e[4..8] == ROOT_WINDOW.0.to_le_bytes())
+        .map(|e| {
+            (
+                u16_at(e, 8),
+                u16_at(e, 10),
+                u16_at(e, 12),
+                u16_at(e, 14),
+                u16_at(e, 16),
+            )
+        })
+        .collect()
+}
+
+fn damage_event_count(peer: &mut std::os::unix::net::UnixStream) -> usize {
+    read_all_available(peer)
+        .chunks_exact(32)
+        .filter(|e| e[0] & 0x7f == crate::nested::DAMAGE_FIRST_EVENT)
+        .count()
+}
+
+fn root_size(state: &ServerState) -> (u16, u16) {
+    let root = state.resources.window(ROOT_WINDOW).unwrap();
+    (root.width, root.height)
+}
+
+/// A window the compositor unredirected (fullscreen) clips root again, so
+/// unmapping it exposes root. `miWindowExposures` still sends the Expose,
+/// but `miPaintWindow` returns on `inhibitBGPaint` before painting
+/// (`mi/miexpose.c:387-389`, `:435-436`): no paint, no damage.
+#[test]
+fn unmap_exposing_an_inhibited_root_paints_nothing_but_still_exposes() {
+    let (mut state, mut backend, mut app, mut comp) = manual_root_fixture();
+    dispatch_composite_window_update(
+        &mut state,
+        &mut backend,
+        ClientId(INHIBIT_COMP),
+        3,
+        INHIBIT_W,
+        1,
+    );
+    assert_eq!(
+        state.composite_redirects.window_mode(ResourceId(INHIBIT_W)),
+        None
+    );
+    let _ = read_all_available(&mut comp);
+    let _ = read_all_available(&mut app);
+    backend.calls.lock().unwrap().clear();
+
+    handle_unmap_window(
+        &mut state,
+        &mut backend,
+        None,
+        ClientId(INHIBIT_APP),
+        SequenceNumber(2),
+        &INHIBIT_W.to_le_bytes(),
+    )
+    .expect("handle_unmap_window");
+
+    assert_eq!(root_fills(&state, &backend), []);
+    assert_eq!(damage_event_count(&mut comp), 0);
+    assert_eq!(root_exposes(&mut app), [(0, 0, 100, 100, 0)]);
+}
+
+/// `compFreeClientSubwindows` clears `inhibitBGPaint` and calls
+/// `ClearToBackground(pWin, 0, 0, 0, 0, TRUE)` before unredirecting the
+/// children (`composite/compalloc.c:436-455`), so root's clip list still
+/// treats them as transparent (`mi/mivaltree.c:171`): the whole root is
+/// painted and exposed in one rect (`mi/miwindow.c:63-117`).
+fn assert_whole_root_cleared_and_exposed(
+    state: &ServerState,
+    backend: &RecordingBackend,
+    app: &mut std::os::unix::net::UnixStream,
+) {
+    let (width, height) = root_size(state);
+    assert_eq!(root_fills(state, backend), [(0, 0, width, height)]);
+    assert_eq!(root_exposes(app), [(0, 0, width, height, 0)]);
+}
+
+#[test]
+fn unredirect_subwindows_clears_and_exposes_the_whole_root() {
+    let (mut state, mut backend, mut app, _comp) = manual_root_fixture();
+    let _ = read_all_available(&mut app);
+    dispatch_composite_window_update(
+        &mut state,
+        &mut backend,
+        ClientId(INHIBIT_COMP),
+        4,
+        ROOT_WINDOW.0,
+        1,
+    );
+    assert!(state.composite_redirects.is_empty());
+    assert_whole_root_cleared_and_exposed(&state, &backend, &mut app);
+}
+
+#[test]
+fn compositor_disconnect_clears_and_exposes_the_whole_root() {
+    let (mut state, mut backend, mut app, _comp) = manual_root_fixture();
+    let _ = read_all_available(&mut app);
+    crate::core_loop::process_disconnect::process_disconnect(
+        &mut state,
+        &mut backend,
+        ClientId(INHIBIT_COMP),
+    );
+    assert!(state.composite_redirects.is_empty());
+    assert_whole_root_cleared_and_exposed(&state, &backend, &mut app);
+}
+
+/// With the overlay up, root's clip list is empty when the redirect goes;
+/// the overlay's teardown then exposes root through `DeleteWindow`'s
+/// `UnmapWindow` (`dix/window.c:2856-2866`), now uninhibited, so root is
+/// painted wherever the unredirected `W` does not cover it.
+#[test]
+fn compositor_disconnect_with_overlay_repaints_root_when_the_overlay_goes() {
+    let (mut state, mut backend, mut app, _comp) = manual_root_fixture();
+    dispatch_composite_minor(
+        &mut state,
+        &mut backend,
+        ClientId(INHIBIT_COMP),
+        2,
+        yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+        &ROOT_WINDOW.0.to_le_bytes(),
+    );
+    assert!(backend.cow_materialized);
+    let _ = read_all_available(&mut app);
+    backend.calls.lock().unwrap().clear();
+
+    crate::core_loop::process_disconnect::process_disconnect(
+        &mut state,
+        &mut backend,
+        ClientId(INHIBIT_COMP),
+    );
+
+    assert!(!backend.cow_materialized);
+    let (width, height) = root_size(&state);
+    let painted: u32 = root_fills(&state, &backend)
+        .iter()
+        .map(|(_, _, w, h)| u32::from(*w) * u32::from(*h))
+        .sum();
+    assert_eq!(painted, u32::from(width) * u32::from(height) - 100 * 100);
+    let exposed: u32 = root_exposes(&mut app)
+        .iter()
+        .map(|(_, _, w, h, _)| u32::from(*w) * u32::from(*h))
+        .sum();
+    assert_eq!(exposed, painted);
+}
+
+/// `ProcClearToBackground` → `miClearToBackground` → `miPaintWindow`,
+/// which returns on `inhibitBGPaint` (`dix/dispatch.c:1711`,
+/// `mi/miwindow.c:113-116`, `mi/miexpose.c:435-436`).
+#[test]
+fn clear_area_on_an_inhibited_root_paints_nothing() {
+    let (mut state, mut backend, _app, mut comp) = manual_root_fixture();
+    let _ = read_all_available(&mut comp);
+    let body = [
+        ROOT_WINDOW.0.to_le_bytes().as_slice(),
+        &[0, 0, 0, 0, 0, 0, 0, 0],
+    ]
+    .concat();
+    crate::core_loop::process_request::drawing::handle_clear_area(
+        &mut state,
+        &mut backend,
+        None,
+        ClientId(INHIBIT_APP),
+        SequenceNumber(2),
+        RequestHeader {
+            opcode: 61,
+            data: 0,
+            length_units: 4,
+        },
+        &body,
+    )
+    .expect("handle_clear_area");
+    assert_eq!(root_fills(&state, &backend), []);
+    assert_eq!(damage_event_count(&mut comp), 0);
+}

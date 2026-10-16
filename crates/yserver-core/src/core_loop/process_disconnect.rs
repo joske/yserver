@@ -435,7 +435,15 @@ pub fn process_disconnect_reporting(
     // leave every Manual window invisible).
     let dead: Vec<ResourceId> = dead_windows.iter().copied().collect();
     state.composite_redirects.forget_windows(&dead);
-    for (window, before) in state.composite_redirects.forget_client(client_id) {
+    let parents = state.composite_redirects.subwindows_parents_of(client_id);
+    let released = crate::core_loop::process_request::manual_subwindows_release_regions(
+        state, client_id, &parents,
+    );
+    let changed = state.composite_redirects.forget_client(client_id);
+    crate::core_loop::process_request::clear_after_manual_subwindows_release(
+        state, backend, None, &released,
+    );
+    for (window, before) in changed {
         crate::core_loop::process_request::sync_redirect_backing(
             state,
             backend,

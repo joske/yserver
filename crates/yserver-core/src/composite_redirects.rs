@@ -91,6 +91,19 @@ impl CompositeRedirects {
         self.subwindows.get(&parent).map_or(&[], Vec::as_slice)
     }
 
+    /// The parents whose subwindows list holds a record of `owner`.
+    #[must_use]
+    pub fn subwindows_parents_of(&self, owner: ClientId) -> Vec<ResourceId> {
+        let mut parents: Vec<ResourceId> = self
+            .subwindows
+            .iter()
+            .filter(|(_, list)| list.iter().any(|r| r.owner == owner))
+            .map(|(parent, _)| *parent)
+            .collect();
+        parents.sort_unstable_by_key(|p| p.0);
+        parents
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.windows.is_empty() && self.subwindows.is_empty()

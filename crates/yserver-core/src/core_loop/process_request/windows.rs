@@ -77,10 +77,10 @@ fn resolve_host_subwindow_visual_to_state(
 
 /// Xorg's `miWindowExposures` (`mi/miexpose.c:375-410`) for `region` of
 /// `window` (its content space): its background over the region when
-/// `paint` (unless None), and Expose events to the clients that selected
-/// them, one per rect with the count still to follow, or the extents
-/// alone past `RECTLIMIT` rects.
-pub(super) fn send_window_exposures(
+/// `paint` (unless None or inhibited, `miPaintWindow`), and Expose events
+/// to the clients that selected them, one per rect with the count still
+/// to follow, or the extents alone past `RECTLIMIT` rects.
+pub(crate) fn send_window_exposures(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     origin: Option<OriginContext>,
@@ -93,9 +93,9 @@ pub(super) fn send_window_exposures(
     }
     if paint
         && let Some(bg) = state.resources.window_resolved_background(window)
+        && !background_paint_inhibited(state, window)
         && let Some(target) = state.resources.host_drawable_target(window)
     {
-        let inhibited = background_paint_inhibited(state, window);
         for r in region {
             let _ = backend.clear_area(
                 origin,
@@ -108,10 +108,7 @@ pub(super) fn send_window_exposures(
                 r.height,
                 bg.tile_origin_offset,
             );
-            if !inhibited {
-                let _dropped =
-                    accumulate_damage_to_state(state, window, r.x, r.y, r.width, r.height);
-            }
+            let _dropped = accumulate_damage_to_state(state, window, r.x, r.y, r.width, r.height);
         }
     }
     if subscribers_by_id(state, window, 0x0000_8000).is_empty() {
@@ -178,7 +175,7 @@ fn send_map_exposures(
 /// (itself, or the ancestor its ParentRelative chain resolves to) has a
 /// Manual `RedirectSubwindows`, so `miPaintWindow` skips the background
 /// (`composite/compalloc.c:411`, `mi/miexpose.c:435`).
-fn background_paint_inhibited(state: &ServerState, window: ResourceId) -> bool {
+pub(crate) fn background_paint_inhibited(state: &ServerState, window: ResourceId) -> bool {
     let mut current = window;
     while let Some(w) = state.resources.window(current) {
         let parent_relative = matches!(w.background_pixmap, Some(bg) if bg.0 == 1);
@@ -189,6 +186,45 @@ fn background_paint_inhibited(state: &ServerState, window: ResourceId) -> bool {
     }
     state.composite_redirects.subwindows_mode(current)
         == Some(crate::server::CompositeRedirectMode::Manual)
+}
+
+/// Of `parents`, those on which `owner` holds the Manual
+/// `RedirectSubwindows`, each with its clip list taken while its children
+/// are still Manual and so transparent: Xorg's `compFreeClientSubwindows`
+/// clears the background before it unredirects them
+/// (`composite/compalloc.c:436-455`).
+pub(crate) fn manual_subwindows_release_regions(
+    state: &ServerState,
+    owner: ClientId,
+    parents: &[ResourceId],
+) -> Vec<(ResourceId, Vec<x11::xfixes::RegionRect>)> {
+    parents
+        .iter()
+        .filter(|p| {
+            state
+                .composite_redirects
+                .subwindows_records(**p)
+                .iter()
+                .any(|r| r.owner == owner && r.mode == crate::server::CompositeRedirectMode::Manual)
+        })
+        .map(|p| (*p, crate::core_loop::clip_list::clip_list(state, *p)))
+        .collect()
+}
+
+/// Once the Manual records of [`manual_subwindows_release_regions`] are
+/// gone: `ClearToBackground(pWin, 0, 0, 0, 0, TRUE)`, the background over
+/// the clip list and Expose events for it (`mi/miwindow.c:63-117`).
+pub(crate) fn clear_after_manual_subwindows_release(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    released: &[(ResourceId, Vec<x11::xfixes::RegionRect>)],
+) {
+    for (parent, region) in released {
+        if state.resources.window(*parent).is_some() {
+            send_window_exposures(state, backend, origin, *parent, region, true);
+        }
+    }
 }
 
 /// One window's worth of identity captured *before* destroy_window

@@ -128,6 +128,15 @@ pub(super) fn handle_composite_request(
                 mode,
                 owner: client_id,
             };
+            let released = if !redirect && subwindows {
+                crate::core_loop::process_request::manual_subwindows_release_regions(
+                    state,
+                    client_id,
+                    &[window],
+                )
+            } else {
+                Vec::new()
+            };
             let redirects = &mut state.composite_redirects;
             let ok = match (redirect, subwindows) {
                 // Only one Manual redirect per window or subwindows list,
@@ -160,6 +169,11 @@ pub(super) fn handle_composite_request(
                     } else {
                         x11::error::BAD_VALUE
                     },
+                );
+            }
+            if mode == crate::server::CompositeRedirectMode::Manual {
+                crate::core_loop::process_request::clear_after_manual_subwindows_release(
+                    state, backend, origin, &released,
                 );
             }
             for (target, before) in targets.into_iter().zip(before) {
