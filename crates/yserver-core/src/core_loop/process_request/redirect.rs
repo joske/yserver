@@ -8,6 +8,18 @@ use crate::{
 };
 use yserver_protocol::{x11, x11::ResourceId};
 
+/// Who reports DAMAGE for a freshly allocated redirect backing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackingDamage {
+    /// The allocation: the window was already viewable, so nothing else
+    /// tells the compositor that the new backing holds its pixels.
+    Allocation,
+    /// The window's map exposures, after its MapNotify: Xorg allocates on
+    /// realize (`compRealizeWindow`) without damage, and `MapWindow`
+    /// delivers MapNotify before `RealizeTree` (`dix/window.c:2677-2683`).
+    MapExposures,
+}
+
 /// Allocate the redirect's reason-1 backing for `window` and set
 /// `Window.redirected_backing`. Shared between B.6a (single-window
 /// REDIRECT_WINDOW), B.6b (REDIRECT_SUBWINDOWS walking children),
@@ -39,6 +51,7 @@ pub(super) fn activate_redirect_backing_for(
     origin: Option<OriginContext>,
     window: ResourceId,
     mode: crate::server::CompositeRedirectMode,
+    damage: BackingDamage,
 ) {
     // Xorg compCheckRedirect (composite/compwindow.c:156-170): the
     // overlay window is NEVER actually redirected — should=FALSE for
@@ -164,15 +177,13 @@ pub(super) fn activate_redirect_backing_for(
             // initial full-window damage wakeup here, compositors such as picom
             // can leave the freshly-redirected window absent from the COW until
             // some unrelated later event (click, move, resize) dirties it.
-            //
-            // This mirrors the "first viewable contents need one wakeup" rule
-            // on MapWindow: once the redirected backing exists and participation
-            // flips are installed, wake DAMAGE subscribers so they pull the
-            // seeded pixels into their own composite output immediately.
-            if state
-                .resources
-                .window(window)
-                .is_some_and(|w| w.map_state == MapState::Viewable)
+            // A window being mapped must not: its compositor tracks it from
+            // MapNotify, and the map exposures report the paints after that.
+            if damage == BackingDamage::Allocation
+                && state
+                    .resources
+                    .window(window)
+                    .is_some_and(|w| w.map_state == MapState::Viewable)
             {
                 let _dropped = accumulate_damage_full_to_state(state, window);
                 // #143 — and the RING, which `accumulate_damage_full_to_state`
@@ -242,7 +253,14 @@ fn flip_redirect_target_mode(
             "flip_redirect_target_mode(0x{:x}): no existing backing; falling back to allocate",
             target.0
         );
-        activate_redirect_backing_for(state, backend, origin, target, new_mode);
+        activate_redirect_backing_for(
+            state,
+            backend,
+            origin,
+            target,
+            new_mode,
+            BackingDamage::Allocation,
+        );
         return;
     };
     // See activate_redirect_backing_for for the rationale: B is
@@ -271,13 +289,15 @@ fn flip_redirect_target_mode(
 /// Xorg `compCheckRedirect` after `window`'s redirect records changed from
 /// effective mode `before`: allocate, flip or drop its backing to match.
 /// Allocation and the flip need `supports_redirect_activation()`; a
-/// teardown is a no-op for a window that never got a backing.
+/// teardown is a no-op for a window that never got a backing. `damage`
+/// applies to an allocation only.
 pub(crate) fn sync_redirect_backing(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     origin: Option<OriginContext>,
     window: ResourceId,
     before: Option<crate::server::CompositeRedirectMode>,
+    damage: BackingDamage,
 ) {
     let after = state.composite_redirects.window_mode(window);
     if before == after {
@@ -288,7 +308,9 @@ pub(crate) fn sync_redirect_backing(
             state, backend, origin, window,
         ),
         _ if !backend.supports_redirect_activation() => {}
-        (None, Some(mode)) => activate_redirect_backing_for(state, backend, origin, window, mode),
+        (None, Some(mode)) => {
+            activate_redirect_backing_for(state, backend, origin, window, mode, damage);
+        }
         (Some(_), Some(mode)) => flip_redirect_target_mode(state, backend, origin, window, mode),
     }
 }
@@ -342,7 +364,14 @@ fn realize_redirect_backing(
     let Some(mode) = effective_redirect_mode_for_window(state, window) else {
         return;
     };
-    activate_redirect_backing_for(state, backend, origin, window, mode);
+    activate_redirect_backing_for(
+        state,
+        backend,
+        origin,
+        window,
+        mode,
+        BackingDamage::MapExposures,
+    );
 }
 
 /// Apply a viewability delta to COMPOSITE backings: the windows that became

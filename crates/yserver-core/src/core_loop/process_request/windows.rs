@@ -16,10 +16,11 @@ use crate::{
             grabs::{confine_pointer_now, release_core_grabs_for_unviewable},
             present_ext::{discard_stale_present_event, fire_present_configure_notify_for_window},
             redirect::{
-                apply_viewability_delta_to_redirects, effective_redirect_mode_for_window,
-                has_redirected_ancestor, realize_storage_for_delta,
-                reapply_redirect_mode_after_map, release_storage_for_delta,
-                rotate_redirected_backing_on_resize, sync_redirect_backing,
+                BackingDamage, apply_viewability_delta_to_redirects,
+                effective_redirect_mode_for_window, has_redirected_ancestor,
+                realize_storage_for_delta, reapply_redirect_mode_after_map,
+                release_storage_for_delta, rotate_redirected_backing_on_resize,
+                sync_redirect_backing,
             },
             selection::drop_selections_owned_by_windows,
             write_to_client,
@@ -94,6 +95,7 @@ pub(super) fn send_window_exposures(
         && let Some(bg) = state.resources.window_resolved_background(window)
         && let Some(target) = state.resources.host_drawable_target(window)
     {
+        let inhibited = background_paint_inhibited(state, window);
         for r in region {
             let _ = backend.clear_area(
                 origin,
@@ -106,7 +108,10 @@ pub(super) fn send_window_exposures(
                 r.height,
                 bg.tile_origin_offset,
             );
-            let _dropped = accumulate_damage_to_state(state, window, r.x, r.y, r.width, r.height);
+            if !inhibited {
+                let _dropped =
+                    accumulate_damage_to_state(state, window, r.x, r.y, r.width, r.height);
+            }
         }
     }
     if subscribers_by_id(state, window, 0x0000_8000).is_empty() {
@@ -143,7 +148,10 @@ pub(super) fn send_window_exposures(
 /// its inferiors, a window before its children and children top-most
 /// first, each for its whole clip list (`miHandleValidateExposures`,
 /// `mi/miwindow.c`, after `miComputeClips` gives a newly viewable window
-/// its clip list as exposed). Their backgrounds are painted on realize.
+/// its clip list as exposed). Their borders and backgrounds are painted on
+/// realize; the DAMAGE for those paints goes out here, after the caller's
+/// MapNotify: each window's border ring, then its background over the clip
+/// list unless None or inhibited (`miPaintWindow`, `mi/miexpose.c`).
 fn send_map_exposures(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -152,9 +160,35 @@ fn send_map_exposures(
 ) {
     for top in tops {
         for (w, region) in crate::core_loop::clip_list::subtree_clip_lists(state, *top) {
+            let _dropped = accumulate_damage_border_to_state(state, w);
+            if state.resources.window_resolved_background(w).is_some()
+                && !background_paint_inhibited(state, w)
+            {
+                for r in &region {
+                    let _dropped =
+                        accumulate_damage_to_state(state, w, r.x, r.y, r.width, r.height);
+                }
+            }
             send_window_exposures(state, backend, origin, w, &region, false);
         }
     }
+}
+
+/// Xorg `inhibitBGPaint`: the window whose background `window` paints with
+/// (itself, or the ancestor its ParentRelative chain resolves to) has a
+/// Manual `RedirectSubwindows`, so `miPaintWindow` skips the background
+/// (`composite/compalloc.c:411`, `mi/miexpose.c:435`).
+fn background_paint_inhibited(state: &ServerState, window: ResourceId) -> bool {
+    let mut current = window;
+    while let Some(w) = state.resources.window(current) {
+        let parent_relative = matches!(w.background_pixmap, Some(bg) if bg.0 == 1);
+        if !parent_relative || w.parent == current {
+            break;
+        }
+        current = w.parent;
+    }
+    state.composite_redirects.subwindows_mode(current)
+        == Some(crate::server::CompositeRedirectMode::Manual)
 }
 
 /// One window's worth of identity captured *before* destroy_window
@@ -694,7 +728,14 @@ pub(super) fn handle_reparent_window(
         state.composite_redirects.window_mode(window),
     );
     if backend.supports_redirect_activation() {
-        sync_redirect_backing(state, backend, origin, window, before);
+        sync_redirect_backing(
+            state,
+            backend,
+            origin,
+            window,
+            before,
+            BackingDamage::MapExposures,
+        );
     }
     // After the reconcile, so a revoke still sees the backing it tears down.
     apply_viewability_delta_to_redirects(state, backend, origin, &result.delta);
@@ -756,6 +797,7 @@ pub(super) fn handle_reparent_window(
         // MapWindow exposes it in the new place, its background painted
         // there: the storage it kept is not what Xorg shows.
         for (w, region) in crate::core_loop::clip_list::subtree_clip_lists(state, window) {
+            let _dropped = accumulate_damage_border_to_state(state, w);
             send_window_exposures(state, backend, origin, w, &region, true);
         }
     }
@@ -1502,23 +1544,6 @@ fn border_source_cwa_values(border: BorderSource) -> (u32, Vec<u32>) {
         } => (0x04, vec![host.as_raw()]),
         BorderSource::Pixmap { host_xid: None, .. } => (0x08, vec![0]),
         BorderSource::Pixel(pixel) => (0x08, vec![pixel]),
-    }
-}
-
-fn reset_damage_notify_cycle_for_drawable(state: &mut ServerState, drawable: ResourceId) {
-    let mut drawables = vec![drawable];
-    if let Some(window) = state.resources.window(drawable) {
-        drawables.extend(
-            window
-                .composite_named_pixmaps
-                .iter()
-                .map(|p| p.client_pixmap),
-        );
-    }
-    for damage in state.damage_objects.values_mut() {
-        if drawables.contains(&damage.drawable) {
-            damage.pending_notify_fired = false;
-        }
     }
 }
 
@@ -2325,35 +2350,6 @@ pub(super) fn handle_map_window(
             send_map_exposures(state, backend, origin, &[window]);
         }
     }
-    // Audit #11: Xorg's `miPaintWindow` fires damage on the window's
-    // extent when the window becomes viewable (the server-background
-    // fill is itself a paint, and DAMAGE hooks every paint).
-    // Compositors that subscribe via `XDamageCreate(window)` rely on
-    // that first DamageNotify to read the freshly-mapped window's
-    // pixels into their own offscreen.
-    //
-    // Order matters: this MUST come AFTER the MapNotify emissions
-    // above. Marco subscribes to SubstructureNotify on root, registers
-    // the window in its compositor tree on receiving MapNotify, and
-    // only then accepts DAMAGE-Notify on it as a NameWindowPixmap
-    // trigger. Pre-fix (damage emitted before MapNotify) marco saw the
-    // damage on a window it didn't yet track and silently dropped it,
-    // causing mate-panel-top to render blank until a later resize
-    // damage finally landed. See mate.xtrace lines 4938→4940 vs
-    // mate-xorg.xtrace lines 5164→5173.
-    if host_xid.is_some() {
-        let _dropped = accumulate_damage_full_to_state(state, window);
-        // The mapped window itself keeps its just-fired notify cycle.
-        for promoted in transition
-            .delta
-            .became_viewable
-            .iter()
-            .filter(|w| **w != window)
-        {
-            reset_damage_notify_cycle_for_drawable(state, *promoted);
-        }
-        accumulate_damage_viewable_descendants_to_state(state, window);
-    }
     // Xorg MapWindow ends in WindowsRestructured (`dix/window.c:2695`): the
     // pointer's crossings follow MapNotify and Expose within the request.
     backend.windows_restructured(state);
@@ -2365,19 +2361,6 @@ pub(super) fn handle_map_window(
         transition.delta.became_viewable.len()
     );
     Ok(RequestOutcome::Handled)
-}
-
-fn accumulate_damage_viewable_descendants_to_state(state: &mut ServerState, root: ResourceId) {
-    let children: Vec<ResourceId> = state.resources.children(root).to_vec();
-    for child in children {
-        let child_window = state.resources.window(child);
-        let viewable = child_window.is_some_and(|w| w.map_state == MapState::Viewable);
-        if !viewable {
-            continue;
-        }
-        let _dropped = accumulate_damage_full_to_state(state, child);
-        accumulate_damage_viewable_descendants_to_state(state, child);
-    }
 }
 
 pub(super) fn handle_map_subwindows(
@@ -2438,11 +2421,6 @@ pub(super) fn map_subwindows_with_delta(
         delta.extend(transition.delta);
         if host_xid.is_some() {
             reapply_redirect_mode_after_map(state, backend, origin, child);
-            // Audit #11: see `handle_map_window` for the rationale.
-            // Mirror the damage bump so MapSubwindows-driven mass
-            // maps (mate-panel applet realize cascade, GTK
-            // children-on-show) also notify subscribed compositors.
-            let _dropped = accumulate_damage_full_to_state(state, child);
         }
         if was_unmapped {
             let _dropped =

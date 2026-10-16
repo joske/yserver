@@ -48,3 +48,4 @@ pixmap-refs          guest=pixmap-refs.sh            host=pixmap-refs-host.sh   
 bg-gc                guest=bg-gc.sh                  timeout=300
 slow-client          guest=slow-client.sh            timeout=400
 glyph-atlas          guest=glyph-atlas.sh            timeout=400
+damage-after-map     guest=damage-after-map.sh       timeout=300

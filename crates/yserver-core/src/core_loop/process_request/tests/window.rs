@@ -443,6 +443,7 @@ fn map_window_on_already_mapped_window_is_no_op() {
             border_width: 0,
             class: 1,
             visual: crate::resources::ROOT_VISUAL,
+            background_pixel: Some(0x0080_8080),
             ..Default::default()
         },
     );
@@ -1303,6 +1304,7 @@ fn map_window_emits_map_notify_before_damage_notify() {
             border_width: 0,
             class: 1,
             visual: crate::resources::ROOT_VISUAL,
+            background_pixel: Some(0x0080_8080),
             ..Default::default()
         },
     );
@@ -2899,4 +2901,174 @@ fn create_window_validates_class_constraints() {
             "{label}: BadMatch must carry CreateWindow opcode"
         );
     }
+}
+
+/// The issue-#248 probe (`tools/damage-after-map-probe.c`, `map1`): root's
+/// subwindows Manual-redirected by a compositor (client 2) that selects
+/// SubstructureNotify on root and holds a NonEmpty Damage on frame `W`;
+/// the app (client 1) maps `W` with its child `C` already mapped. Returns
+/// the compositor's and the app's events in the probe's notation.
+fn map_redirected_frame_events(background_pixel: bool) -> (Vec<String>, Vec<String>) {
+    use crate::{nested::DAMAGE_FIRST_EVENT, server::DamageObject};
+    use yserver_protocol::x11::damage as x11damage;
+
+    const APP: u32 = 1;
+    const COMP: u32 = 2;
+    const W: u32 = 0x0010_0001;
+    const C: u32 = 0x0010_0002;
+    const DAMAGE_ID: u32 = 0x0020_0001;
+
+    let mut state = ServerState::new();
+    let mut app = install_client(&mut state, APP);
+    let mut comp = install_client(&mut state, COMP);
+    let mut backend = RecordingBackend::new().with_redirect_activation();
+    let background = background_pixel.then_some(0x0080_8080);
+    for (window, parent, x, y, width, height) in [
+        (W, ROOT_WINDOW, 50, 50, 300, 200),
+        (C, ResourceId(W), 10, 10, 280, 180),
+    ] {
+        state.resources.create_window(
+            ClientId(APP),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(window),
+                parent,
+                x,
+                y,
+                width,
+                height,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                background_pixel: background,
+                ..Default::default()
+            },
+        );
+        state
+            .resources
+            .window_mut(ResourceId(window))
+            .unwrap()
+            .host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(
+            window | 0x0040_0000,
+        ));
+        state
+            .clients
+            .get_mut(&APP)
+            .unwrap()
+            .event_masks
+            .insert(ResourceId(window), 0x0000_8000);
+    }
+    let _ = state.resources.map_window(ResourceId(C));
+    // RedirectSubwindows(root, Manual).
+    let outcome = process_request(
+        &mut state,
+        &mut backend,
+        ClientId(COMP),
+        SequenceNumber(1),
+        RequestHeader {
+            opcode: 144,
+            data: 2,
+            length_units: 3,
+        },
+        &[ROOT_WINDOW.0.to_le_bytes().as_slice(), &[1, 0, 0, 0]].concat(),
+        None,
+    )
+    .expect("RedirectSubwindows");
+    assert!(matches!(outcome, RequestOutcome::Handled));
+    assert_eq!(
+        state.composite_redirects.window_mode(ResourceId(W)),
+        Some(crate::server::CompositeRedirectMode::Manual)
+    );
+    state
+        .clients
+        .get_mut(&COMP)
+        .unwrap()
+        .event_masks
+        .insert(ROOT_WINDOW, 0x0008_0000 | 0x0002_0000);
+    state.damage_objects.insert(
+        DAMAGE_ID,
+        DamageObject {
+            owner: ClientId(COMP),
+            drawable: ResourceId(W),
+            level: x11damage::report_level::NON_EMPTY,
+            rects: Vec::new(),
+            pending_notify_fired: false,
+            last_reported_geometry: None,
+        },
+    );
+    let _ = read_all_available(&mut comp);
+
+    handle_map_window(
+        &mut state,
+        &mut backend,
+        None,
+        ClientId(APP),
+        SequenceNumber(2),
+        &W.to_le_bytes(),
+    )
+    .expect("handle_map_window");
+
+    let u16_at = |e: &[u8], at: usize| u16::from_le_bytes([e[at], e[at + 1]]);
+    let i16_at = |e: &[u8], at: usize| i16::from_le_bytes([e[at], e[at + 1]]);
+    let u32_at = |e: &[u8], at: usize| u32::from_le_bytes(e[at..at + 4].try_into().unwrap());
+    let comp_events = read_all_available(&mut comp)
+        .chunks_exact(32)
+        .filter_map(|e| match e[0] & 0x7f {
+            19 if u32_at(e, 8) == W => Some("MapNotify".to_owned()),
+            t if t == DAMAGE_FIRST_EVENT && u32_at(e, 4) == W => Some(format!(
+                "Damage({},{} {}x{})",
+                i16_at(e, 16),
+                i16_at(e, 18),
+                u16_at(e, 20),
+                u16_at(e, 22)
+            )),
+            _ => None,
+        })
+        .collect();
+    let app_events = read_all_available(&mut app)
+        .chunks_exact(32)
+        .filter(|e| e[0] & 0x7f == 12)
+        .map(|e| {
+            let name = if u32_at(e, 4) == W { "W" } else { "C" };
+            format!(
+                "Expose({name} {},{} {}x{})",
+                u16_at(e, 8),
+                u16_at(e, 10),
+                u16_at(e, 12),
+                u16_at(e, 14)
+            )
+        })
+        .collect();
+    (comp_events, app_events)
+}
+
+/// The app's Expose events of the probe's `map1`, identical on Xorg and
+/// Xvfb for both backgrounds.
+const PROBE_MAP_EXPOSES: [&str; 5] = [
+    "Expose(W 0,0 300x10)",
+    "Expose(W 0,10 10x180)",
+    "Expose(W 290,10 10x180)",
+    "Expose(W 0,190 300x10)",
+    "Expose(C 0,0 280x180)",
+];
+
+/// Xorg delivers MapNotify before `RealizeTree` allocates the redirect
+/// backing, and the background paint of the exposures damages the frame
+/// after it (`dix/window.c:2677-2689`). Measured: `a/pixel map1` =
+/// `MapNotify Damage(0,0 300x200)`.
+#[test]
+fn map_redirected_window_with_background_pixel_damages_after_map_notify() {
+    let (comp, app) = map_redirected_frame_events(true);
+    assert_eq!(comp, ["MapNotify", "Damage(0,0 300x200)"]);
+    assert_eq!(app, PROBE_MAP_EXPOSES);
+}
+
+/// `miPaintWindow` paints nothing for background None, so the map reports
+/// no damage at all (`mi/miexpose.c:438-440`). Measured: `a/none map1` =
+/// `MapNotify` alone.
+#[test]
+fn map_redirected_window_with_background_none_reports_no_damage() {
+    let (comp, app) = map_redirected_frame_events(false);
+    assert_eq!(comp, ["MapNotify"]);
+    assert_eq!(app, PROBE_MAP_EXPOSES);
 }

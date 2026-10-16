@@ -437,7 +437,12 @@ pub fn process_disconnect_reporting(
     state.composite_redirects.forget_windows(&dead);
     for (window, before) in state.composite_redirects.forget_client(client_id) {
         crate::core_loop::process_request::sync_redirect_backing(
-            state, backend, None, window, before,
+            state,
+            backend,
+            None,
+            window,
+            before,
+            crate::core_loop::process_request::BackingDamage::Allocation,
         );
     }
     state.present_event_selections.retain(|_, selection| {

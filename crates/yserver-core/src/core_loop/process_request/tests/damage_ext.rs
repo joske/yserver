@@ -62,6 +62,7 @@ fn manual_redirect_keeps_window_out_of_scene() {
         None,
         ResourceId(WINDOW_XID),
         crate::server::CompositeRedirectMode::Manual,
+        BackingDamage::Allocation,
     );
 
     // Window participation: Manual → false (the external
@@ -128,6 +129,7 @@ fn activate_redirect_on_cow_is_never_applied() {
         None,
         COMPOSITE_OVERLAY_WINDOW,
         crate::server::CompositeRedirectMode::Manual,
+        BackingDamage::Allocation,
     );
 
     let cow = state
@@ -217,6 +219,7 @@ fn manual_redirect_marks_backing_scene_participating_so_paints_emit_damage() {
         None,
         ResourceId(WINDOW_XID),
         crate::server::CompositeRedirectMode::Manual,
+        BackingDamage::Allocation,
     );
 
     let calls = backend.calls();
@@ -304,6 +307,7 @@ fn activate_redirect_on_mapped_window_emits_initial_damage() {
         None,
         ResourceId(WINDOW_XID),
         crate::server::CompositeRedirectMode::Manual,
+        BackingDamage::Allocation,
     );
 
     let damage = state
@@ -368,6 +372,7 @@ fn damage_create_on_named_pixmap_alias_seeds_initial_damage() {
         None,
         ResourceId(WINDOW_XID),
         crate::server::CompositeRedirectMode::Manual,
+        BackingDamage::Allocation,
     );
     let host_pixmap = state
         .resources
@@ -490,6 +495,7 @@ fn map_window_reapplies_manual_redirect_scene_participation() {
         None,
         ResourceId(WINDOW_XID),
         crate::server::CompositeRedirectMode::Manual,
+        BackingDamage::Allocation,
     );
     let before = backend.calls().len();
 
@@ -539,8 +545,9 @@ fn map_window_reapplies_manual_redirect_scene_participation() {
 /// through `Present::Pixmap → COW`.
 ///
 /// Oracle: a `DamageObject` subscribed to a freshly-created
-/// window must accumulate damage rects covering the window's
-/// full extent after `handle_map_window` returns.
+/// window with a background pixel must accumulate damage rects
+/// after `handle_map_window` returns (`miWindowExposures` paints
+/// the background; a background-None window gets none).
 #[test]
 fn map_window_emits_damage_on_window_extent() {
     use crate::server::DamageObject;
@@ -567,6 +574,7 @@ fn map_window_emits_damage_on_window_extent() {
             border_width: 0,
             class: 1,
             visual: crate::resources::ROOT_VISUAL,
+            background_pixel: Some(0x0080_8080),
             ..Default::default()
         },
     );
@@ -661,6 +669,7 @@ fn map_window_seeds_damage_for_newly_viewable_descendant() {
             border_width: 0,
             class: 1,
             visual: crate::resources::ROOT_VISUAL,
+            background_pixel: Some(0x0080_8080),
             ..Default::default()
         },
     );
@@ -721,8 +730,13 @@ fn map_window_seeds_damage_for_newly_viewable_descendant() {
     );
 }
 
+/// A NonEmpty damage that already fired and was never subtracted stays
+/// non-empty across the map: Xorg reports NonEmpty only on the empty →
+/// non-empty transition (`DamageReportDamage`, `miext/damage/damage.c`),
+/// as the issue-#248 probe measures for the mapped window itself
+/// (`b/pixel`, `map2`: no DamageNotify).
 #[test]
-fn map_window_rereports_nonempty_damage_for_newly_viewable_descendant() {
+fn map_window_does_not_rereport_held_nonempty_damage_for_newly_viewable_descendant() {
     use crate::{nested::DAMAGE_FIRST_EVENT, server::DamageObject};
     use std::io::Read;
     use yserver_protocol::x11::{damage as x11damage, xfixes::RegionRect};
@@ -837,9 +851,8 @@ fn map_window_rereports_nonempty_damage_for_newly_viewable_descendant() {
     }
 
     assert!(
-        all.chunks_exact(32).any(|evt| evt[0] == DAMAGE_FIRST_EVENT),
-        "mapping a parent must re-report NON_EMPTY damage for descendants promoted \
-             from Unviewable to Viewable even when they already fired before becoming viewable"
+        !all.chunks_exact(32).any(|evt| evt[0] == DAMAGE_FIRST_EVENT),
+        "a held NON_EMPTY damage must not re-report when its drawable becomes viewable"
     );
 }
 

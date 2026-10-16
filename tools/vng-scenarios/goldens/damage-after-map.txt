@@ -1,0 +1,84 @@
+==> probe.log <==
+a/none
+  create         comp: ever=0 | app:
+  map1           comp: MapNotify ever=0 | app: Expose(W 0,0 300x10) Expose(W 0,10 10x180) Expose(W 290,10 10x180) Expose(W 0,190 300x10) Expose(C 0,0 280x180)
+  draw1          comp: Damage(0,0 300x200)+sub ever=1 | app:
+  unmap          comp: UnmapNotify ever=1 | app:
+  map2           comp: MapNotify ever=0 | app: Expose(W 0,0 300x10) Expose(W 0,10 10x180) Expose(W 290,10 10x180) Expose(W 0,190 300x10) Expose(C 0,0 280x180)
+  draw2          comp: Damage(0,0 300x200)+sub ever=1 | app:
+  destroy        comp: UnmapNotify ever=1 | app:
+a/pixel
+  create         comp: ever=0 | app:
+  map1           comp: MapNotify Damage(0,0 300x200)+sub ever=1 | app: Expose(W 0,0 300x10) Expose(W 0,10 10x180) Expose(W 290,10 10x180) Expose(W 0,190 300x10) Expose(C 0,0 280x180)
+  draw1          comp: Damage(0,0 300x200)+sub ever=1 | app:
+  unmap          comp: UnmapNotify ever=1 | app:
+  map2           comp: MapNotify Damage(0,0 300x200)+sub ever=1 | app: Expose(W 0,0 300x10) Expose(W 0,10 10x180) Expose(W 290,10 10x180) Expose(W 0,190 300x10) Expose(C 0,0 280x180)
+  draw2          comp: Damage(0,0 300x200)+sub ever=1 | app:
+  destroy        comp: UnmapNotify ever=1 | app:
+b/none
+  create         comp: ever=0 | app:
+  map1           comp: MapNotify ever=0 | app: Expose(W 0,0 300x10) Expose(W 0,10 10x180) Expose(W 290,10 10x180) Expose(W 0,190 300x10) Expose(C 0,0 280x180)
+  draw1          comp: Damage(0,0 300x200)(held) ever=0 | app:
+  unmap          comp: UnmapNotify ever=0 | app:
+  map2           comp: MapNotify ever=0 | app: Expose(W 0,0 300x10) Expose(W 0,10 10x180) Expose(W 290,10 10x180) Expose(W 0,190 300x10) Expose(C 0,0 280x180)
+  draw2          comp: ever=0 | app:
+  destroy        comp: UnmapNotify ever=0 | app:
+b/pixel
+  create         comp: ever=0 | app:
+  map1           comp: MapNotify Damage(0,0 300x200)+sub ever=1 | app: Expose(W 0,0 300x10) Expose(W 0,10 10x180) Expose(W 290,10 10x180) Expose(W 0,190 300x10) Expose(C 0,0 280x180)
+  draw1          comp: Damage(0,0 300x200)(held) ever=1 | app:
+  unmap          comp: UnmapNotify ever=1 | app:
+  map2           comp: MapNotify ever=0 | app: Expose(W 0,0 300x10) Expose(W 0,10 10x180) Expose(W 290,10 10x180) Expose(W 0,190 300x10) Expose(C 0,0 280x180)
+  draw2          comp: ever=0 | app:
+  destroy        comp: UnmapNotify ever=0 | app:
+c/none
+  create         comp: ever=0 | app:
+  map1           comp: MapNotify ever=0 | app: Expose(W 0,0 300x10) Expose(W 0,10 10x180) Expose(W 290,10 10x180) Expose(W 0,190 300x10) Expose(C 0,0 280x180)
+  draw1          comp: Damage(0,0 300x200)+sub ever=1 | app:
+  unmap          comp: UnmapNotify ever=1 | app:
+  draw-unmapped  comp: ever=1 | app:
+  map2           comp: MapNotify ever=0 | app: Expose(W 0,0 300x10) Expose(W 0,10 10x180) Expose(W 290,10 10x180) Expose(W 0,190 300x10) Expose(C 0,0 280x180)
+  draw2          comp: Damage(0,0 300x200)+sub ever=1 | app:
+  destroy        comp: UnmapNotify ever=1 | app:
+c/pixel
+  create         comp: ever=0 | app:
+  map1           comp: MapNotify Damage(0,0 300x200)+sub ever=1 | app: Expose(W 0,0 300x10) Expose(W 0,10 10x180) Expose(W 290,10 10x180) Expose(W 0,190 300x10) Expose(C 0,0 280x180)
+  draw1          comp: Damage(0,0 300x200)+sub ever=1 | app:
+  unmap          comp: UnmapNotify ever=1 | app:
+  draw-unmapped  comp: ever=1 | app:
+  map2           comp: MapNotify Damage(0,0 300x200)+sub ever=1 | app: Expose(W 0,0 300x10) Expose(W 0,10 10x180) Expose(W 290,10 10x180) Expose(W 0,190 300x10) Expose(C 0,0 280x180)
+  draw2          comp: Damage(0,0 300x200)+sub ever=1 | app:
+  destroy        comp: UnmapNotify ever=1 | app:
+d/none
+  create         comp: ever=0 | app:
+  map1           comp: MapNotify ever=0 | app: Expose(W 0,0 300x10) Expose(W 0,10 10x180) Expose(W 290,10 10x180) Expose(W 0,190 300x10) Expose(C 0,0 280x180)
+  draw1          comp: Damage(0,0 300x200)+sub ever=1 | app:
+  unmap          comp: UnmapNotify ever=1 | app:
+  move+raise     comp: ever=1 | app:
+  map2           comp: MapNotify ever=0 | app: Expose(W 0,0 300x10) Expose(W 0,10 10x180) Expose(W 290,10 10x180) Expose(W 0,190 300x10) Expose(C 0,0 280x180)
+  draw2          comp: Damage(0,0 300x200)+sub ever=1 | app:
+  destroy        comp: UnmapNotify ever=1 | app:
+d/pixel
+  create         comp: ever=0 | app:
+  map1           comp: MapNotify Damage(0,0 300x200)+sub ever=1 | app: Expose(W 0,0 300x10) Expose(W 0,10 10x180) Expose(W 290,10 10x180) Expose(W 0,190 300x10) Expose(C 0,0 280x180)
+  draw1          comp: Damage(0,0 300x200)+sub ever=1 | app:
+  unmap          comp: UnmapNotify ever=1 | app:
+  move+raise     comp: ever=1 | app:
+  map2           comp: MapNotify Damage(0,0 300x200)+sub ever=1 | app: Expose(W 0,0 300x10) Expose(W 0,10 10x180) Expose(W 290,10 10x180) Expose(W 0,190 300x10) Expose(C 0,0 280x180)
+  draw2          comp: Damage(0,0 300x200)+sub ever=1 | app:
+  destroy        comp: UnmapNotify ever=1 | app:
+e/none
+  create         comp: ever=0 | app:
+  map1           comp: MapNotify ever=0 | app: Expose(W 0,0 300x10) Expose(W 0,10 10x180) Expose(W 290,10 10x180) Expose(W 0,190 300x10) Expose(C 0,0 280x180)
+  draw1          comp: Damage(0,0 300x200)+sub ever=1 | app:
+  unmap          comp: UnmapNotify ever=1 | app:
+  map2+draw      comp: MapNotify Damage(0,0 300x200)+sub ever=1 | app: Expose(W 0,0 300x10) Expose(W 0,10 10x180) Expose(W 290,10 10x180) Expose(W 0,190 300x10) Expose(C 0,0 280x180)
+  destroy        comp: UnmapNotify ever=1 | app:
+e/pixel
+  create         comp: ever=0 | app:
+  map1           comp: MapNotify Damage(0,0 300x200)+sub ever=1 | app: Expose(W 0,0 300x10) Expose(W 0,10 10x180) Expose(W 290,10 10x180) Expose(W 0,190 300x10) Expose(C 0,0 280x180)
+  draw1          comp: Damage(0,0 300x200)+sub ever=1 | app:
+  unmap          comp: UnmapNotify ever=1 | app:
+  map2+draw      comp: MapNotify Damage(0,0 300x200)+sub ever=1 | app: Expose(W 0,0 300x10) Expose(W 0,10 10x180) Expose(W 290,10 10x180) Expose(W 0,190 300x10) Expose(C 0,0 280x180)
+  destroy        comp: UnmapNotify ever=1 | app:
+done
