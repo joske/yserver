@@ -1335,6 +1335,14 @@ pub struct ServerState {
     /// `SetClientVersion`. Missing means the legacy v0 reply layout, matching
     /// Xorg's `ClientMajorVersion`.
     pub vidmode_client_versions: HashMap<ClientId, (u16, u16)>,
+    /// The screen's VidMode gamma (red, green, blue) as the last `SetGamma`
+    /// stored it, which `GetGamma` reports: Xorg's `pScrn->gamma`, a float
+    /// each, 1.0 until set.
+    pub vidmode_gamma: [f32; 3],
+    /// The screen's VidMode gamma table under every CRTC's RANDR ramp, as
+    /// the last `SetGamma` or `SetGammaRamp` left it. `None` until the
+    /// first: the identity, and the CRTCs load their RANDR ramps alone.
+    pub vidmode_gamma_table: Option<crate::backend::gamma::VidModeGammaTable>,
     /// XI version each client announced with XIQueryVersion (Xorg
     /// `XIClientRec.major_version/minor_version`), kept by Xorg's rules:
     /// the first query sets it; a later one raises it only when both are
@@ -1840,6 +1848,8 @@ impl ServerState {
             glx_next_context_tag: 1,
             glx_drawables: HashMap::new(),
             vidmode_client_versions: HashMap::new(),
+            vidmode_gamma: [1.0; 3],
+            vidmode_gamma_table: None,
             xi2_client_versions: HashMap::new(),
             randr_client_versions: HashMap::new(),
             glx_tfp_supported: false,

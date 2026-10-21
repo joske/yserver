@@ -320,6 +320,13 @@ impl Platform for PlatformBackend {
         KmsBackend::backend_randr_get_crtc_gamma(b, crtc)
     }
 
+    fn set_vidmode_gamma(
+        b: &mut KmsBackend,
+        table: Option<&yserver_core::backend::gamma::VidModeGammaTable>,
+    ) -> io::Result<()> {
+        KmsBackend::backend_set_vidmode_gamma(b, table)
+    }
+
     fn on_scanout_render_completion(b: &mut KmsBackend, state: &mut ServerState) {
         KmsBackend::backend_scanout_on_scanout_render_completion(b, state)
     }

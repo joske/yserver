@@ -875,6 +875,21 @@ pub trait Backend {
         (Vec::new(), Vec::new(), Vec::new())
     }
 
+    /// The screen's VidMode gamma table, under every CRTC's RANDR ramp
+    /// (Xorg's CMap gamma on modesetting): each CRTC's hardware LUT becomes
+    /// [`VidModeGammaTable::crtc_lut`] of its RANDR ramp, now, whenever
+    /// that ramp changes and whenever the CRTC is lit. `None` loads the
+    /// RANDR ramps alone. `get_crtc_gamma` keeps reporting the RANDR ramp.
+    /// Default: Ok(()) no-op, for a backend without gamma.
+    ///
+    /// [`VidModeGammaTable::crtc_lut`]: crate::backend::gamma::VidModeGammaTable::crtc_lut
+    fn set_vidmode_gamma(
+        &mut self,
+        _table: Option<&crate::backend::gamma::VidModeGammaTable>,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Refresh RANDR state after a successful `RRSetCrtcConfig`, setting
     /// `lastSetTime` to the client's request timestamp (0/CurrentTime
     /// already resolved to `now` by the caller). A CRTC set bumps

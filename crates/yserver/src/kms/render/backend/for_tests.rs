@@ -662,6 +662,7 @@ impl KmsBackend {
             next_present_crtc_clock_epoch: 1,
             hotplug_rescan_deadline: None,
             gamma_luts: RefCell::new(HashMap::new()),
+            vidmode_gamma: None,
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported: false,
             export_holders: Default::default(),

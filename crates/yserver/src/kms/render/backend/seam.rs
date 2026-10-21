@@ -193,6 +193,13 @@ pub trait Platform: OutputSink + Sized + 'static {
         (Vec::new(), Vec::new(), Vec::new())
     }
 
+    fn set_vidmode_gamma(
+        _b: &mut XBackend<Self>,
+        _table: Option<&yserver_core::backend::gamma::VidModeGammaTable>,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
     fn on_scanout_render_completion(_b: &mut XBackend<Self>, _state: &mut ServerState) {}
 
     fn on_page_flip_ready(

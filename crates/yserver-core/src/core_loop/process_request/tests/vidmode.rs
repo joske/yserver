@@ -409,7 +409,7 @@ fn xf86vidmode_rejects_malformed_bodies_with_bad_length() {
 }
 
 #[test]
-fn xf86vidmode_gamma_matches_selected_randr_crtc() {
+fn xf86vidmode_gamma_ramp_is_the_vidmode_table_not_the_randr_crtc() {
     use yserver_protocol::x11::xf86vidmode as x11vm;
 
     let mut state = ServerState::new();
@@ -458,7 +458,11 @@ fn xf86vidmode_gamma_matches_selected_randr_crtc() {
     );
     assert_eq!(size.len(), 32);
     assert_eq!(size[0], 1);
-    assert_eq!(u16::from_le_bytes(size[8..10].try_into().unwrap()), 256);
+    assert_eq!(
+        u16::from_le_bytes(size[8..10].try_into().unwrap()),
+        1024,
+        "the table's size, not the CRTC's 256"
+    );
 
     let gamma = dispatch_vidmode_with_backend(
         &mut state,
@@ -483,22 +487,24 @@ fn xf86vidmode_gamma_matches_selected_randr_crtc() {
         &mut peer,
         4,
         x11vm::GET_GAMMA_RAMP,
-        &[0, 0, 0, 1], // screen=0, size=256
+        &[0, 0, 0, 4], // screen=0, size=1024
     );
-    assert_eq!(ramp.len(), 32 + 256 * 3 * 2);
+    assert_eq!(ramp.len(), 32 + 1024 * 3 * 2);
     assert_eq!(
         u32::from_le_bytes(ramp[4..8].try_into().unwrap()),
-        256 * 3 * 2 / 4
+        1024 * 3 * 2 / 4
     );
-    assert_eq!(u16::from_le_bytes(ramp[8..10].try_into().unwrap()), 256);
-    assert_eq!(u16::from_le_bytes(ramp[32..34].try_into().unwrap()), 0x1111);
+    assert_eq!(u16::from_le_bytes(ramp[8..10].try_into().unwrap()), 1024);
+    let entry = |at: usize| u16::from_le_bytes(ramp[at..at + 2].try_into().unwrap());
+    // The identity table widened (xf86GetGammaRamp), not the seeded
+    // 0x1111/0x2222/0x3333 of the CRTC's RANDR ramp.
+    assert_eq!((entry(32), entry(34), entry(32 + 1023 * 2)), (0, 64, 65535));
+    assert_eq!(entry(32 + 2048), 0, "green starts at 0");
+    assert_eq!(entry(32 + 4096 + 1023 * 2), 65535, "blue ends at 65535");
     assert_eq!(
-        u16::from_le_bytes(ramp[544..546].try_into().unwrap()),
-        0x2222
-    );
-    assert_eq!(
-        u16::from_le_bytes(ramp[1056..1058].try_into().unwrap()),
-        0x3333
+        backend.get_crtc_gamma(crtc).0[0],
+        0x1111,
+        "the RANDR ramp is untouched"
     );
 
     let wrong_size = dispatch_vidmode_with_backend(
@@ -507,7 +513,7 @@ fn xf86vidmode_gamma_matches_selected_randr_crtc() {
         &mut peer,
         5,
         x11vm::GET_GAMMA_RAMP,
-        &[0, 0, 128, 0],
+        &[0, 0, 0, 1],
     );
     assert_vidmode_error(&wrong_size, x11::error::BAD_VALUE, x11vm::GET_GAMMA_RAMP);
 }
@@ -854,4 +860,308 @@ fn xf86vidmode_mode_line_agrees_with_randr_mode_info() {
     assert_eq!(mode.vsync_end, info.vsync_end);
     assert_eq!(mode.flags, info.mode_flags);
     assert_eq!(mode.dot_clock, (info.dot_clock + 500) / 1000);
+}
+
+/// A `SetGamma` body: screen 0 and the three values times 10000.
+fn set_gamma_body(red: u32, green: u32, blue: u32) -> Vec<u8> {
+    let mut body = vec![0u8; 28];
+    for (at, value) in [(4, red), (8, green), (12, blue)] {
+        body[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    body
+}
+
+/// GetGamma's three values.
+fn get_gamma(
+    state: &mut ServerState,
+    backend: &mut RecordingBackend,
+    peer: &mut UnixStream,
+) -> [u32; 3] {
+    let reply = dispatch_vidmode_with_backend(
+        state,
+        backend,
+        peer,
+        90,
+        yserver_protocol::x11::xf86vidmode::GET_GAMMA,
+        &[0; 28],
+    );
+    assert_eq!(reply[0], 1, "GetGamma replies");
+    [8usize, 12, 16].map(|at| u32::from_le_bytes(reply[at..at + 4].try_into().unwrap()))
+}
+
+/// GetGammaRamp's three channels, for a 1024-entry ramp.
+fn get_gamma_ramp(
+    state: &mut ServerState,
+    backend: &mut RecordingBackend,
+    peer: &mut UnixStream,
+) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+    let reply = dispatch_vidmode_with_backend(
+        state,
+        backend,
+        peer,
+        91,
+        yserver_protocol::x11::xf86vidmode::GET_GAMMA_RAMP,
+        &[0, 0, 0, 4],
+    );
+    assert_eq!(reply[0], 1, "GetGammaRamp replies");
+    let channel = |index: usize| -> Vec<u16> {
+        let start = 32 + index * 2048;
+        reply[start..start + 2048]
+            .chunks_exact(2)
+            .map(|w| u16::from_le_bytes([w[0], w[1]]))
+            .collect()
+    };
+    (channel(0), channel(1), channel(2))
+}
+
+/// A local client's SetGamma stores the values GetGamma reads back and
+/// builds the screen's table with Xorg's `ComputeGamma` (values printed by
+/// Xorg's own function), which the backend gets to load under every
+/// CRTC's RANDR ramp; the RANDR ramp itself is untouched.
+#[test]
+fn xf86vidmode_local_set_gamma_builds_the_vidmode_table() {
+    use crate::backend::gamma::{VidModeGammaTable, identity_ramp};
+    use yserver_protocol::x11::xf86vidmode as x11vm;
+
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let crtc = current_vidmode_output(&state)
+        .expect("active output")
+        .crtc_id;
+    let mut backend = RecordingBackend::new();
+
+    let reply = dispatch_vidmode_with_backend(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        1,
+        x11vm::SET_GAMMA,
+        &set_gamma_body(20_000, 10_000, 5_000),
+    );
+    assert!(reply.is_empty(), "SetGamma has no reply: {reply:?}");
+    assert_eq!(
+        get_gamma(&mut state, &mut backend, &mut peer),
+        [20_000, 10_000, 5_000]
+    );
+    let table = backend
+        .vidmode_gamma
+        .clone()
+        .expect("the backend got the table");
+    assert_eq!(table, VidModeGammaTable::from_gamma([2.0, 1.0, 0.5]));
+    assert_eq!((table.red[1], table.green[1], table.blue[1]), (32, 1, 0));
+    assert_eq!(
+        (table.red[512], table.green[512], table.blue[512]),
+        (724, 512, 256)
+    );
+    let ramp = get_gamma_ramp(&mut state, &mut backend, &mut peer);
+    assert_eq!(
+        (ramp.0[1], ramp.1[1], ramp.2[1]),
+        (32 << 6 | 32 >> 4, 64, 0),
+        "GetGammaRamp reads the table back"
+    );
+    let identity = identity_ramp(256);
+    assert_eq!(
+        backend.get_crtc_gamma(crtc),
+        (identity.clone(), identity.clone(), identity),
+        "the CRTC's RANDR ramp is untouched"
+    );
+}
+
+/// Xorg's CMapChangeGamma takes each value in [0.1, 10] and answers
+/// anything else with BadValue, storing nothing.
+#[test]
+fn xf86vidmode_set_gamma_out_of_range_is_bad_value() {
+    use yserver_protocol::x11::xf86vidmode as x11vm;
+
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let mut backend = RecordingBackend::new();
+
+    for (seq, (red, green, blue)) in [
+        (5_000, 0, 0),
+        (999, 10_000, 10_000),
+        (10_000, 100_001, 10_000),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        #[allow(clippy::cast_possible_truncation)]
+        let seq = seq as u16 + 1;
+        let reply = dispatch_vidmode_with_backend(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            seq,
+            x11vm::SET_GAMMA,
+            &set_gamma_body(red, green, blue),
+        );
+        assert_vidmode_error(&reply, x11::error::BAD_VALUE, x11vm::SET_GAMMA);
+    }
+    assert_eq!(
+        get_gamma(&mut state, &mut backend, &mut peer),
+        [10_000; 3],
+        "a refused SetGamma stores nothing"
+    );
+
+    let edges = dispatch_vidmode_with_backend(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        10,
+        x11vm::SET_GAMMA,
+        &set_gamma_body(1_000, 100_000, 10_000),
+    );
+    assert!(edges.is_empty(), "0.1 and 10 are in range: {edges:?}");
+    assert_eq!(
+        get_gamma(&mut state, &mut backend, &mut peer),
+        [1_000, 100_000, 10_000]
+    );
+
+    let short = dispatch_vidmode_with_backend(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        11,
+        x11vm::SET_GAMMA,
+        &[0; 4],
+    );
+    assert_vidmode_error(&short, x11::error::BAD_LENGTH, x11vm::SET_GAMMA);
+}
+
+/// SetGammaRamp takes exactly the table's size, GetGammaRampSize's 1024,
+/// as a request of exactly that many entries, and makes the ramp the table
+/// (`ComputeGammaRamp`, values printed by Xorg's own function) without
+/// touching GetGamma's values or the CRTC's RANDR ramp.
+#[test]
+fn xf86vidmode_local_set_gamma_ramp_replaces_the_vidmode_table() {
+    use crate::backend::gamma::identity_ramp;
+    use yserver_protocol::x11::xf86vidmode as x11vm;
+
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let crtc = current_vidmode_output(&state)
+        .expect("active output")
+        .crtc_id;
+    let mut backend = RecordingBackend::new();
+
+    let wrong_size = dispatch_vidmode_with_backend(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        1,
+        x11vm::SET_GAMMA_RAMP,
+        &[0, 0, 0, 1], // the CRTC's 256, not the table's 1024
+    );
+    assert_vidmode_error(&wrong_size, x11::error::BAD_VALUE, x11vm::SET_GAMMA_RAMP);
+
+    let mut body = vec![0, 0, 0, 4]; // screen 0, size 1024
+    let truncated = dispatch_vidmode_with_backend(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        2,
+        x11vm::SET_GAMMA_RAMP,
+        &body,
+    );
+    assert_vidmode_error(&truncated, x11::error::BAD_LENGTH, x11vm::SET_GAMMA_RAMP);
+
+    let channels: [Vec<u16>; 3] = [
+        (0..1024).map(|i| 65535 - i * 64).collect(),
+        (0..1024).map(|i| i * 64 + 63).collect(),
+        (0..1024u32).map(|i| (i * 37) as u16).collect(),
+    ];
+    for channel in &channels {
+        for entry in channel {
+            body.extend_from_slice(&entry.to_le_bytes());
+        }
+    }
+    let reply = dispatch_vidmode_with_backend(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        3,
+        x11vm::SET_GAMMA_RAMP,
+        &body,
+    );
+    assert!(reply.is_empty(), "SetGammaRamp has no reply: {reply:?}");
+    let table = backend
+        .vidmode_gamma
+        .clone()
+        .expect("the backend got the table");
+    assert_eq!(
+        (table.red[0], table.red[1], table.blue[1023]),
+        (1023, 1022, 591)
+    );
+    let ramp = get_gamma_ramp(&mut state, &mut backend, &mut peer);
+    assert_eq!((ramp.0[0], ramp.1[0], ramp.2[0]), (65535, 0, 0));
+    assert_eq!((ramp.0[1], ramp.1[1], ramp.2[1]), (65471, 64, 0));
+    assert_eq!(
+        (ramp.0[1023], ramp.1[1023], ramp.2[1023]),
+        (0, 65535, 37860)
+    );
+    assert_eq!(
+        get_gamma(&mut state, &mut backend, &mut peer),
+        [10_000; 3],
+        "SetGammaRamp leaves GetGamma's values"
+    );
+    let identity = identity_ramp(256);
+    assert_eq!(
+        backend.get_crtc_gamma(crtc),
+        (identity.clone(), identity.clone(), identity),
+        "the CRTC's RANDR ramp is untouched"
+    );
+
+    let short = dispatch_vidmode_with_backend(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        4,
+        x11vm::SET_GAMMA_RAMP,
+        &[0, 0],
+    );
+    assert_vidmode_error(&short, x11::error::BAD_LENGTH, x11vm::SET_GAMMA_RAMP);
+}
+
+/// LockModeSwitch succeeds for a local client; mode setting stays RANDR's
+/// and keeps ClientNotLocal.
+#[test]
+fn xf86vidmode_local_lock_succeeds_and_mode_setting_stays_refused() {
+    use yserver_protocol::x11::xf86vidmode as x11vm;
+
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+
+    let lock = dispatch_vidmode(
+        &mut state,
+        &mut peer,
+        1,
+        x11vm::LOCK_MODE_SWITCH,
+        &[0, 0, 1, 0],
+    );
+    assert!(lock.is_empty(), "LockModeSwitch has no reply: {lock:?}");
+    let other_screen = dispatch_vidmode(
+        &mut state,
+        &mut peer,
+        2,
+        x11vm::LOCK_MODE_SWITCH,
+        &[1, 0, 1, 0],
+    );
+    assert_vidmode_error(
+        &other_screen,
+        x11::error::BAD_VALUE,
+        x11vm::LOCK_MODE_SWITCH,
+    );
+    let short = dispatch_vidmode(&mut state, &mut peer, 3, x11vm::LOCK_MODE_SWITCH, &[0, 0]);
+    assert_vidmode_error(&short, x11::error::BAD_LENGTH, x11vm::LOCK_MODE_SWITCH);
+
+    for (seq, minor) in [2u8, 3, 7, 8, 10, 12].into_iter().enumerate() {
+        #[allow(clippy::cast_possible_truncation)]
+        let seq = seq as u16 + 10;
+        let reply = dispatch_vidmode(&mut state, &mut peer, seq, minor, &[]);
+        assert_vidmode_error(
+            &reply,
+            crate::nested::XF86VIDMODE_FIRST_ERROR + x11vm::CLIENT_NOT_LOCAL,
+            minor,
+        );
+    }
 }

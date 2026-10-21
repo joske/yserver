@@ -704,6 +704,34 @@ fn kms_gamma_off_connector_set_roundtrips_cached_values() {
     assert_eq!(b.get_crtc_gamma(crtc), (red, green, blue));
 }
 
+/// GetCrtcGamma keeps reporting the RANDR ramp under a VidMode table.
+#[test]
+fn kms_gamma_vidmode_table_leaves_the_randr_ramp() {
+    use yserver_core::backend::gamma::VidModeGammaTable;
+
+    let mut b = KmsBackend::for_tests();
+    let crtc = 0x4000;
+    b.pstate
+        .crtc_key_by_id
+        .insert(crtc, test_output_key(0, "DP-1"));
+    let before = b.get_crtc_gamma(crtc);
+    let table = VidModeGammaTable::from_gamma([2.0, 1.0, 0.5]);
+    b.set_vidmode_gamma(Some(&table))
+        .expect("set VidMode table");
+    assert_eq!(b.pstate.vidmode_gamma.as_ref(), Some(&table));
+    assert_eq!(b.get_crtc_gamma(crtc), before);
+
+    let ramp = vec![7u16; 256];
+    b.set_crtc_gamma(crtc, &ramp, &ramp, &ramp)
+        .expect("set gamma cache");
+    assert_eq!(b.get_crtc_gamma(crtc), (ramp.clone(), ramp.clone(), ramp));
+    assert_eq!(
+        b.pstate.vidmode_gamma.as_ref(),
+        Some(&table),
+        "a RANDR set keeps the VidMode table"
+    );
+}
+
 #[test]
 fn kms_gamma_same_connector_name_on_two_devices_stays_independent() {
     let mut b = KmsBackend::for_tests();

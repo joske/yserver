@@ -949,6 +949,11 @@ pub struct KmsBackendState {
     pub(in crate::kms::render::backend) next_present_crtc_clock_epoch: u64,
     pub(in crate::kms::render::backend) hotplug_rescan_deadline: Option<std::time::Instant>,
     pub(in crate::kms::render::backend) gamma_luts: RefCell<HashMap<OutputKey, GammaLut>>,
+    /// The screen's VidMode gamma table, under every output's RANDR ramp
+    /// in `gamma_luts` when its hardware LUT is loaded; `None` loads the
+    /// RANDR ramp alone.
+    pub(in crate::kms::render::backend) vidmode_gamma:
+        Option<yserver_core::backend::gamma::VidModeGammaTable>,
 
     /// GLX-TFP (Tasks 2.3 + 2.4): per-`DrawableId` export tracking for
     /// pixmaps shared with a GL consumer via `GLX_EXT_texture_from_pixmap`.

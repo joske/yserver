@@ -1,4 +1,4 @@
-//! Read-only XFree86-VidModeExtension protocol surface.
+//! XFree86-VidModeExtension protocol surface.
 //!
 //! Mesa implements `glXGetMscRateOML` entirely client-side. It obtains the
 //! active mode timing through `XF86VidModeQueryVersion` followed by
@@ -10,9 +10,12 @@
 //! Xorg serves VidMode's read requests even to clients without mode-setting
 //! permission. Yserver mirrors that read surface from the selected RANDR
 //! output: one active mode, monitor/timing information, viewport `(0, 0)`,
-//! and the same gamma ramp exposed through RANDR. Mode-setting and gamma
-//! writes remain disabled; the core dispatcher rejects them with VidMode's
-//! `ClientNotLocal` error, matching the read-only permission model.
+//! and the screen's VidMode gamma table. A local client's gamma writes apply
+//! as Xorg's modesetting server applies them: `SetGamma` and `SetGammaRamp`
+//! replace that 1024-entry table, which every CRTC loads under its own
+//! RANDR ramp, and `LockModeSwitch` succeeds. Mode setting stays RANDR's;
+//! the core dispatcher rejects it with VidMode's `ClientNotLocal` error, as
+//! it does every write from a remote client.
 //!
 //! Request bodies reach the parsers here already in host byte order —
 //! `request_swap` has swapped them for a big-endian client — so the
@@ -79,6 +82,15 @@ pub struct GammaRampRequest {
     pub size: u16,
 }
 
+/// `SetGamma`'s values, each the gamma times 10000 as on the wire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SetGammaRequest {
+    pub screen: u16,
+    pub red: u32,
+    pub green: u32,
+    pub blue: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ValidateModeLineRequest {
     pub screen: u32,
@@ -120,12 +132,63 @@ pub fn parse_gamma_screen(body: &[u8]) -> Option<u16> {
     (body.len() == 28).then(|| u16::from_le_bytes([body[0], body[1]]))
 }
 
+/// Parse `SetGamma`: `screen(u16), pad(u16), red, green, blue (u32, the
+/// value times 10000)`, padded to 32 bytes like `GetGamma`.
+#[must_use]
+pub fn parse_set_gamma(body: &[u8]) -> Option<SetGammaRequest> {
+    let value =
+        |at: usize| u32::from_le_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
+    (body.len() == 28).then(|| SetGammaRequest {
+        screen: u16::from_le_bytes([body[0], body[1]]),
+        red: value(4),
+        green: value(8),
+        blue: value(12),
+    })
+}
+
+/// The screen of a `LockModeSwitch`: `screen(u16), lock(u16)`.
+#[must_use]
+pub fn parse_lock_mode_switch_screen(body: &[u8]) -> Option<u16> {
+    (body.len() == 4).then(|| u16::from_le_bytes([body[0], body[1]]))
+}
+
 #[must_use]
 pub fn parse_gamma_ramp_request(body: &[u8]) -> Option<GammaRampRequest> {
     (body.len() == 4).then(|| GammaRampRequest {
         screen: u16::from_le_bytes([body[0], body[1]]),
         size: u16::from_le_bytes([body[2], body[3]]),
     })
+}
+
+/// The fixed part of `SetGammaRamp`, `screen(u16), size(u16)`, ahead of
+/// its three channels. `None` when the request is shorter than that.
+#[must_use]
+pub fn parse_set_gamma_ramp_header(body: &[u8]) -> Option<GammaRampRequest> {
+    (body.len() >= 4).then(|| GammaRampRequest {
+        screen: u16::from_le_bytes([body[0], body[1]]),
+        size: u16::from_le_bytes([body[2], body[3]]),
+    })
+}
+
+/// The channels of a `SetGammaRamp` of `size` entries, each padded to an
+/// even count as Xorg reads them (`(size + 1) & ~1`). `None` unless the
+/// body is exactly that long, Xorg's `REQUEST_FIXED_SIZE`.
+#[must_use]
+pub fn parse_set_gamma_ramp_channels(
+    body: &[u8],
+    size: u16,
+) -> Option<(Vec<u16>, Vec<u16>, Vec<u16>)> {
+    let padded = (usize::from(size) + 1) & !1;
+    if body.len() != 4 + padded * 6 {
+        return None;
+    }
+    let channel = |index: usize| -> Vec<u16> {
+        let start = 4 + index * padded * 2;
+        (0..usize::from(size))
+            .map(|i| u16::from_le_bytes([body[start + i * 2], body[start + i * 2 + 1]]))
+            .collect()
+    };
+    Some((channel(0), channel(1), channel(2)))
 }
 
 /// Parse the version-dependent `ValidateModeLine` request.
@@ -263,13 +326,17 @@ pub fn encode_get_dot_clocks_reply(
     out
 }
 
-/// `GetGamma` reports per-screen scalar values, not the CRTC LUT. Because
-/// yserver rejects `SetGamma`, the state remains Xorg's identity default.
+/// `GetGamma` reports the per-screen scalars the last `SetGamma` stored
+/// (1.0 each until then), times 10000, not the CRTC LUT.
 #[must_use]
-pub fn encode_get_gamma_reply(byte_order: ClientByteOrder, sequence: SequenceNumber) -> Vec<u8> {
+pub fn encode_get_gamma_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    gamma: [u32; 3],
+) -> Vec<u8> {
     let mut out = reply_prefix(byte_order, sequence, 0);
-    for _ in 0..3 {
-        write_u32(byte_order, &mut out, 10_000); // 1.0 * 10000
+    for value in gamma {
+        write_u32(byte_order, &mut out, value);
     }
     out.resize(32, 0);
     out
@@ -636,9 +703,16 @@ mod tests {
             MAX_CLOCKS
         );
 
-        let gamma = encode_get_gamma_reply(ClientByteOrder::LittleEndian, SequenceNumber(6));
+        let gamma = encode_get_gamma_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(6),
+            [10_000, 15_000, 1_000],
+        );
         assert_eq!(gamma.len(), 32);
-        assert_eq!(&gamma[8..20], &[0x10, 0x27, 0, 0].repeat(3));
+        assert_eq!(
+            &gamma[8..20],
+            &[0x10, 0x27, 0, 0, 0x98, 0x3a, 0, 0, 0xe8, 0x03, 0, 0]
+        );
     }
 
     #[test]
@@ -687,6 +761,42 @@ mod tests {
                 size: 256
             })
         );
+
+        let mut set_gamma = [0u8; 28];
+        set_gamma[4..8].copy_from_slice(&15_000u32.to_le_bytes());
+        set_gamma[8..12].copy_from_slice(&10_000u32.to_le_bytes());
+        set_gamma[12..16].copy_from_slice(&5_000u32.to_le_bytes());
+        assert_eq!(
+            parse_set_gamma(&set_gamma),
+            Some(SetGammaRequest {
+                screen: 0,
+                red: 15_000,
+                green: 10_000,
+                blue: 5_000
+            })
+        );
+        assert_eq!(parse_set_gamma(&set_gamma[..24]), None);
+        assert_eq!(parse_lock_mode_switch_screen(&[1, 0, 1, 0]), Some(1));
+        assert_eq!(parse_lock_mode_switch_screen(&[1, 0]), None);
+        assert_eq!(parse_set_gamma_ramp_header(&[0, 0]), None);
+
+        // Three entries pad to four per channel: 4 + 4 * 2 * 3 bytes.
+        let mut ramp = vec![0, 0, 3, 0];
+        for channel in [[1u16, 2, 3, 0], [4, 5, 6, 0], [7, 8, 9, 0]] {
+            for entry in channel {
+                ramp.extend_from_slice(&entry.to_le_bytes());
+            }
+        }
+        assert_eq!(
+            parse_set_gamma_ramp_header(&ramp),
+            Some(GammaRampRequest { screen: 0, size: 3 })
+        );
+        assert_eq!(
+            parse_set_gamma_ramp_channels(&ramp, 3),
+            Some((vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9]))
+        );
+        assert_eq!(parse_set_gamma_ramp_channels(&ramp[..26], 3), None);
+        assert_eq!(parse_set_gamma_ramp_channels(&ramp, 5), None);
 
         let mut legacy_validate = [0u8; 36];
         legacy_validate[0..4].copy_from_slice(&1u32.to_be_bytes());

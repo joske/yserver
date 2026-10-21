@@ -104,6 +104,13 @@ impl<P: Platform> Backend for XBackend<P> {
         P::get_crtc_gamma(self, crtc)
     }
 
+    fn set_vidmode_gamma(
+        &mut self,
+        table: Option<&yserver_core::backend::gamma::VidModeGammaTable>,
+    ) -> io::Result<()> {
+        P::set_vidmode_gamma(self, table)
+    }
+
     fn render_format_for_ynest_id(&self, ynest_fmt: u32) -> Option<u32> {
         Self::backend_render_ops_render_format_for_ynest_id(self, ynest_fmt)
     }

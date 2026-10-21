@@ -1544,13 +1544,31 @@ impl KmsBackend {
             return Ok(());
         }
         let lut = self.cached_gamma_for_current_size(output_key, gamma_size);
+        // The VidMode table goes under the RANDR ramp, as modesetting's
+        // xf86RandR12CrtcComputeGamma loads every CRTC.
+        let (red, green, blue) = match &self.pstate.vidmode_gamma {
+            Some(table) => {
+                table.crtc_lut((&lut.red, &lut.green, &lut.blue), usize::from(gamma_size))
+            }
+            None => (lut.red, lut.green, lut.blue),
+        };
         let Some(device) = self.platform.device_for_key(device_key) else {
             return Ok(());
         };
         device
             .device
-            .set_gamma(crtc, &lut.red, &lut.green, &lut.blue)
+            .set_gamma(crtc, &red, &green, &blue)
             .map_err(|e| io::Error::other(format!("set_gamma for {output_key:?} failed: {e}")))
+    }
+
+    /// Keep the VidMode gamma table and reload every live output's LUT.
+    pub(in crate::kms::render::backend) fn backend_set_vidmode_gamma(
+        &mut self,
+        table: Option<&yserver_core::backend::gamma::VidModeGammaTable>,
+    ) -> io::Result<()> {
+        self.pstate.vidmode_gamma = table.cloned();
+        self.reapply_gamma_for_live_outputs();
+        Ok(())
     }
 
     fn reapply_gamma_for_output(&self, output_key: &OutputKey) {

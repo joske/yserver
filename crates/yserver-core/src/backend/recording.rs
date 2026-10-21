@@ -391,6 +391,8 @@ pub struct RecordingBackend {
     pub warped_to: Option<(i32, i32)>,
     /// In-memory per-RANDR-CRTC gamma LUT for unit tests (size 256).
     pub gamma: std::cell::RefCell<std::collections::HashMap<u32, GammaTriplet>>,
+    /// The VidMode gamma table last handed to `set_vidmode_gamma`.
+    pub vidmode_gamma: Option<crate::backend::gamma::VidModeGammaTable>,
     /// Active RMLVO `[rules, model, layout, variant, options]` returned by
     /// `current_xkb_rules_names`. `None` (the default) models a backend
     /// without a real keymap; tests that exercise `_XKB_RULES_NAMES`
@@ -653,6 +655,7 @@ impl RecordingBackend {
             probe_rounds_run: std::cell::Cell::new(0),
             warped_to: None,
             gamma: std::cell::RefCell::new(std::collections::HashMap::new()),
+            vidmode_gamma: None,
             xkb_rules_names: None,
             keymap_rmlvo_result: None,
             kbd_by_name_result: None,
@@ -1498,6 +1501,14 @@ impl Backend for RecordingBackend {
         }
         let ramp = crate::backend::gamma::identity_ramp(256);
         (ramp.clone(), ramp.clone(), ramp)
+    }
+
+    fn set_vidmode_gamma(
+        &mut self,
+        table: Option<&crate::backend::gamma::VidModeGammaTable>,
+    ) -> io::Result<()> {
+        self.vidmode_gamma = table.cloned();
+        Ok(())
     }
 
     fn probe_input_devices(&mut self, state: &mut crate::server::ServerState) -> usize {
