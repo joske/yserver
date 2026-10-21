@@ -1,5 +1,8 @@
 use crate::{
-    backend::Backend,
+    backend::{
+        Backend,
+        gamma::{VIDMODE_GAMMA_ENTRIES, VidModeGammaTable},
+    },
     core_loop::process_request::{
         CurrentVidModeOutput, RequestOutcome, emit_x11_error_with_minor, write_to_client,
     },
@@ -314,7 +317,8 @@ pub(super) fn handle_xf86vidmode_request(
                     XF86VIDMODE_MAJOR_OPCODE,
                 );
             }
-            let reply = x11vm::encode_get_gamma_reply(byte_order, sequence);
+            let gamma = state.vidmode_gamma.map(vidmode_gamma_to_wire);
+            let reply = x11vm::encode_get_gamma_reply(byte_order, sequence, gamma);
             return write_vidmode_reply(state, client_id, &reply);
         }
         x11vm::GET_GAMMA_RAMP => {
@@ -351,7 +355,7 @@ pub(super) fn handle_xf86vidmode_request(
                     XF86VIDMODE_MAJOR_OPCODE,
                 );
             };
-            let expected = backend.crtc_gamma_size(current.crtc_id);
+            let expected = vidmode_gamma_ramp_size(backend, current.crtc_id);
             if request.size != expected {
                 return emit_x11_error_with_minor(
                     state,
@@ -363,19 +367,16 @@ pub(super) fn handle_xf86vidmode_request(
                     XF86VIDMODE_MAJOR_OPCODE,
                 );
             }
-            let (red, green, blue) = backend.get_crtc_gamma(current.crtc_id);
-            let expected = usize::from(expected);
-            if red.len() != expected || green.len() != expected || blue.len() != expected {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_VALUE,
-                    0,
-                    u16::from(header.data),
-                    XF86VIDMODE_MAJOR_OPCODE,
-                );
-            }
+            // xf86GetGammaRamp: the VidMode table, not a CRTC's RANDR ramp.
+            let (red, green, blue) = if expected == 0 {
+                (Vec::new(), Vec::new(), Vec::new())
+            } else {
+                state
+                    .vidmode_gamma_table
+                    .clone()
+                    .unwrap_or_else(VidModeGammaTable::identity)
+                    .ramp()
+            };
             let reply =
                 x11vm::encode_get_gamma_ramp_reply(byte_order, sequence, &red, &green, &blue);
             return write_vidmode_reply(state, client_id, &reply);
@@ -425,7 +426,7 @@ pub(super) fn handle_xf86vidmode_request(
                         x11vm::GET_GAMMA_RAMP_SIZE => x11vm::encode_get_gamma_ramp_size_reply(
                             byte_order,
                             sequence,
-                            backend.crtc_gamma_size(current.crtc_id),
+                            vidmode_gamma_ramp_size(backend, current.crtc_id),
                         ),
                         x11vm::GET_MONITOR => {
                             let edid = backend
@@ -478,10 +479,21 @@ pub(super) fn handle_xf86vidmode_request(
             };
             return write_vidmode_reply(state, client_id, &reply);
         }
-        // Yserver is Unix-socket-only, so these clients are physically local.
-        // We nevertheless expose Xorg's coherent non-local/read-only VidMode
-        // policy: RANDR owns all writes, permissions omit WRITE, and known
-        // write minors fail with the matching extension error.
+        // A local client, told it may write (GetPermissions), has its gamma
+        // and lock writes applied as Xorg applies them.
+        x11vm::SET_GAMMA | x11vm::SET_GAMMA_RAMP | x11vm::LOCK_MODE_SWITCH if is_local => {
+            return handle_vidmode_local_write(
+                state,
+                backend,
+                client_id,
+                sequence,
+                header.data,
+                body,
+            );
+        }
+        // Mode setting stays RANDR's, so it fails with the extension's
+        // ClientNotLocal error even for a local client; so does every write
+        // from a remote one, as in Xorg's dispatch.
         x11vm::MOD_MODE_LINE
         | x11vm::SWITCH_MODE
         | x11vm::LOCK_MODE_SWITCH
@@ -512,6 +524,131 @@ pub(super) fn handle_xf86vidmode_request(
                 XF86VIDMODE_MAJOR_OPCODE,
             );
         }
+    }
+    Ok(RequestOutcome::Handled)
+}
+
+/// A `SetGamma` value as Xorg holds it: `((float) value) / 10000.`, a
+/// double narrowed to the float `SetGamma` takes.
+fn vidmode_gamma_from_wire(value: u32) -> f32 {
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    let gamma = (f64::from(value as f32) / 10_000.0) as f32;
+    gamma
+}
+
+/// `GetGamma`'s `(CARD32) (gamma * 10000.)`, truncated.
+fn vidmode_gamma_to_wire(gamma: f32) -> u32 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let value = (f64::from(gamma) * 10_000.0) as u32;
+    value
+}
+
+/// VidMode's gamma ramp size, as modesetting reports it: the CMap table's
+/// `gammaElements`, whatever the hardware LUT's size; 0 when the CRTC has
+/// no gamma, as Xwayland's.
+fn vidmode_gamma_ramp_size(backend: &dyn Backend, crtc: u32) -> u16 {
+    if backend.crtc_gamma_size(crtc) == 0 {
+        0
+    } else {
+        VIDMODE_GAMMA_ENTRIES
+    }
+}
+
+/// Make `table` the screen's VidMode gamma and hand it to the backend,
+/// which loads it under every CRTC's RANDR ramp.
+fn install_vidmode_gamma_table(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    table: VidModeGammaTable,
+) {
+    if let Err(e) = backend.set_vidmode_gamma(Some(&table)) {
+        log::warn!("XF86VidMode gamma apply failed: {e}");
+    }
+    state.vidmode_gamma_table = Some(table);
+}
+
+/// A local client's `SetGamma`, `SetGammaRamp` and `LockModeSwitch`, as
+/// Xorg's modesetting server answers them: Xext/vidmode.c's checks, then
+/// hw/xfree86's `CMapChangeGamma` (`ComputeGamma`) for the gamma,
+/// `xf86ChangeGammaRamp` (`ComputeGammaRamp`) for the ramp, both loaded
+/// through `xf86RandR12LoadPalette` under every CRTC's RANDR ramp, and
+/// `xf86VidModeLockZoom` for the lock.
+fn handle_vidmode_local_write(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    minor: u8,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use crate::nested::XF86VIDMODE_MAJOR_OPCODE;
+    use yserver_protocol::x11::xf86vidmode as x11vm;
+
+    let error = |state: &mut ServerState, code: u8, bad_value: u32| {
+        emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            code,
+            bad_value,
+            u16::from(minor),
+            XF86VIDMODE_MAJOR_OPCODE,
+        )
+    };
+    match minor {
+        x11vm::LOCK_MODE_SWITCH => {
+            let Some(screen) = x11vm::parse_lock_mode_switch_screen(body) else {
+                return error(state, x11::error::BAD_LENGTH, 0);
+            };
+            if let Err((code, bad_value)) = vidmode_screen_number(u32::from(screen)) {
+                return error(state, code, bad_value);
+            }
+            // xf86VidModeLockZoom fails only under the DontZoom option,
+            // which yserver has no counterpart of.
+        }
+        x11vm::SET_GAMMA => {
+            let Some(request) = x11vm::parse_set_gamma(body) else {
+                return error(state, x11::error::BAD_LENGTH, 0);
+            };
+            if let Err((code, bad_value)) = vidmode_screen_number(u32::from(request.screen)) {
+                return error(state, code, bad_value);
+            }
+            let gamma = [request.red, request.green, request.blue].map(vidmode_gamma_from_wire);
+            // CMapChangeGamma: each within [GAMMA_MIN, GAMMA_MAX], 1/10 to 10.
+            if gamma
+                .iter()
+                .any(|&g| f64::from(g) < 1.0 / 10.0 || f64::from(g) > 10.0)
+            {
+                return error(state, x11::error::BAD_VALUE, 0);
+            }
+            state.vidmode_gamma = gamma;
+            install_vidmode_gamma_table(state, backend, VidModeGammaTable::from_gamma(gamma));
+        }
+        x11vm::SET_GAMMA_RAMP => {
+            let Some(request) = x11vm::parse_set_gamma_ramp_header(body) else {
+                return error(state, x11::error::BAD_LENGTH, 0);
+            };
+            if let Err((code, bad_value)) = vidmode_screen_number(u32::from(request.screen)) {
+                return error(state, code, bad_value);
+            }
+            let Some(current) = current_vidmode_output(state) else {
+                return error(state, x11::error::BAD_VALUE, 0);
+            };
+            // The size GetGammaRampSize reports, then exactly that ramp.
+            // It replaces the table; GetGamma's values stay as they were.
+            let size = vidmode_gamma_ramp_size(backend, current.crtc_id);
+            if request.size != size {
+                return error(state, x11::error::BAD_VALUE, u32::from(request.size));
+            }
+            let Some((red, green, blue)) = x11vm::parse_set_gamma_ramp_channels(body, size) else {
+                return error(state, x11::error::BAD_LENGTH, 0);
+            };
+            if size > 0 {
+                let table = VidModeGammaTable::from_ramp(&red, &green, &blue);
+                install_vidmode_gamma_table(state, backend, table);
+            }
+        }
+        _ => unreachable!("not a VidMode gamma or lock write"),
     }
     Ok(RequestOutcome::Handled)
 }
