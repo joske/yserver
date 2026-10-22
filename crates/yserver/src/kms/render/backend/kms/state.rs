@@ -918,6 +918,13 @@ pub struct KmsBackendState {
     #[cfg(test)]
     pub(in crate::kms::render::backend) crtc_config_discovery_override:
         Option<crate::platform::drm::Output>,
+    /// Test-only scanout pool returned with the discovery override, for a
+    /// connector enable on the fd-less fixture that cannot allocate one.
+    #[cfg(test)]
+    pub(in crate::kms::render::backend) crtc_config_discovery_pool: Option<(
+        crate::kms::scanout_route::ScanoutRoute,
+        crate::kms::vk::scanout::OutputScanout,
+    )>,
     /// Direct-mode input-thread control channel. Used by VT release /
     /// acquire to pause and resume the dedicated input thread.
     pub(in crate::kms::render::backend) input_thread_control:

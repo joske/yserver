@@ -224,6 +224,24 @@ impl PlatformBackend {
         device.cursor.crtc_states.entry(crtc).or_default().valid = false;
     }
 
+    /// Drop the cursor positions cached and queued for one CRTC, and force
+    /// its next cursor commit, after that CRTC moved in the root window.
+    pub(crate) fn forget_cursor_position_for_crtc(
+        &mut self,
+        device_key: crate::platform::drm::DrmDeviceKey,
+        crtc: ::drm::control::crtc::Handle,
+    ) {
+        let Some(device) = self
+            .devices
+            .iter_mut()
+            .find(|device| device.key == device_key)
+        else {
+            return;
+        };
+        device.cursor.clear_atomic_position(crtc);
+        device.cursor.crtc_states.entry(crtc).or_default().valid = false;
+    }
+
     pub(crate) fn invalidate_live_cursor_applied(&mut self) {
         let live_crtcs: Vec<_> = self
             .outputs
@@ -1752,7 +1770,7 @@ impl PlatformBackend {
     /// skipped here: only the post-success explicit-enable hook may make its
     /// first attempt. A prior transient attempt is retried at this later
     /// topology/resume boundary.
-    pub(crate) fn refresh_cursor_topology_for_devices(
+    pub(super) fn refresh_cursor_topology_for_devices(
         &mut self,
         changed_devices: &HashSet<crate::platform::drm::DrmDeviceKey>,
     ) {

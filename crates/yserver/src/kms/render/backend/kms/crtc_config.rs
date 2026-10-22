@@ -10,10 +10,15 @@ use crate::{
             platform::{CrtcKey, is_terminal_disposable_probe_error},
         },
         scanout_route::{RenderKmsRelationship, ScanoutRoute},
+        vk::scanout::OutputScanout,
     },
 };
 use std::{collections::HashSet, io, os::fd::AsFd as _, rc::Rc};
 use yserver_core::backend::{Backend as _, CrtcConfigApply, CrtcConfigToken};
+
+/// A scanout pool and the route it was allocated for, installed by a
+/// connector enable instead of allocating one.
+type PreparedScanoutPool = (ScanoutRoute, OutputScanout);
 
 /// Reconcile the physical-output gate after a successful CRTC mutation.
 ///
@@ -408,15 +413,18 @@ impl KmsBackend {
         Ok(token)
     }
 
+    /// Discover `connector`'s route. The second value is a scanout pool to
+    /// install instead of allocating one; only the test discovery override
+    /// supplies it, since the fd-less test device cannot allocate.
     fn discover_crtc_config_output(
         &mut self,
         output_key: &OutputKey,
         output_device: &Rc<crate::drm::Device>,
         connector: &str,
-    ) -> io::Result<crate::platform::drm::Output> {
+    ) -> io::Result<(crate::platform::drm::Output, Option<PreparedScanoutPool>)> {
         #[cfg(test)]
         if let Some(output) = self.pstate.crtc_config_discovery_override.take() {
-            return Ok(output);
+            return Ok((output, self.pstate.crtc_config_discovery_pool.take()));
         }
 
         let reserved_routes: Vec<_> = self
@@ -439,6 +447,7 @@ impl KmsBackend {
             connector,
             &reserved_routes,
         )
+        .map(|output| (output, None))
         .map_err(|error| {
             log::error!("begin_crtc_config: target discovery for {connector} failed: {error}");
             error
@@ -656,7 +665,7 @@ impl KmsBackend {
         // while the old topology is still lit. The live DRM output stays in
         // the pending entry; the executor receives one owned KMS-fd duplicate
         // plus a scalar route request.
-        let prepared_output =
+        let (prepared_output, _) =
             self.discover_crtc_config_output(&output_key, &output_device, connector)?;
         if prepared_output.connector_name != connector {
             return Err(io::Error::new(
@@ -1029,17 +1038,19 @@ impl KmsBackend {
                 }
             });
         if let (Some(PerCrtcChange::Position), Some(idx)) = (per_crtc, existing_idx) {
-            return Ok(self.apply_crtc_position(idx, &output_key, requested, x, y));
+            return self.apply_crtc_position(idx, &output_key, requested, x, y);
         }
 
         // Resolve the requested connector before taking the old CRTC set
         // offline. A pure discovery failure must not blank a working desktop.
         // Pool allocation and the actual modeset remain in `enable_connector`
         // after quiescing, where failures can restore the old composed set.
-        let mut prepared_output = if mode.is_some() {
-            Some(self.discover_crtc_config_output(&output_key, &output_device, connector)?)
+        let (mut prepared_output, mut prepared_pool) = if mode.is_some() {
+            let (output, pool) =
+                self.discover_crtc_config_output(&output_key, &output_device, connector)?;
+            (Some(output), pool)
         } else {
-            None
+            (None, None)
         };
 
         // A mode change keeps its live encoder/CRTC/plane: discovery prefers
@@ -1078,6 +1089,7 @@ impl KmsBackend {
                         x,
                         y,
                         existing_idx,
+                        prepared_pool.take(),
                     ),
                     (None, Some(idx)) => self.finish_per_crtc_off(&output_key, idx),
                     (None, None) => unreachable!("classify gives no off change for an off output"),
@@ -1361,7 +1373,11 @@ impl KmsBackend {
                         .scanout_pools
                         .get(idx)
                         .and_then(Option::as_ref)
-                        .is_none_or(|pool| same_route(pool.route()))
+                        .is_none_or(|pool| {
+                            // A copied pool has a sink ledger even when its
+                            // sink is the display device itself.
+                            matches!(pool, OutputScanout::Shared(_)) && same_route(pool.route())
+                        })
             });
         if !all_same {
             return Some("copied or cross-device scanout route");
@@ -1396,22 +1412,38 @@ impl KmsBackend {
         requested: ConnectorConfig,
         x: i32,
         y: i32,
-    ) -> bool {
+    ) -> io::Result<bool> {
         self.bump_crtc_config_topology_epoch("RANDR CRTC position changed");
         let crtc = self.platform.outputs[idx].output.crtc;
-        self.platform.outputs[idx].x = x;
-        self.platform.outputs[idx].y = y;
+        let old = (self.platform.outputs[idx].x, self.platform.outputs[idx].y);
+        (self.platform.outputs[idx].x, self.platform.outputs[idx].y) = (x, y);
         self.platform.recompute_fb_extent();
         if let Err(error) = self
             .scene
             .sync_output_layouts(&self.platform.scene_output_layouts())
         {
+            // Like the other per-CRTC paths: keep the old configuration and
+            // report the failure to the client.
             log::error!("apply_crtc_config: scene could not follow the moved CRTC: {error}");
+            (self.platform.outputs[idx].x, self.platform.outputs[idx].y) = old;
+            self.platform.recompute_fb_extent();
+            if let Err(restore) = self
+                .scene
+                .sync_output_layouts(&self.platform.scene_output_layouts())
+            {
+                log::error!(
+                    "apply_crtc_config: scene could not return to the old layout: {restore}; exiting"
+                );
+                self.request_exit();
+            }
+            return Err(io::Error::other(format!(
+                "apply_crtc_config: scene could not follow the moved CRTC: {error}"
+            )));
         }
+        // Positions cached for this CRTC were computed from its old origin.
+        // Other CRTCs on the device keep their pending moves.
         self.platform
-            .refresh_cursor_topology_for_devices(&HashSet::from([output_key.device_key]));
-        self.platform
-            .invalidate_cursor_applied(output_key.device_key, crtc);
+            .forget_cursor_position_for_crtc(output_key.device_key, crtc);
         self.pstate.randr_id_alloc.entry_mut(output_key).config = requested;
         self.pstate
             .randr_id_alloc
@@ -1423,7 +1455,7 @@ impl KmsBackend {
         );
         self.update_input_extent(self.platform.fb_w, self.platform.fb_h);
         self.scene.wake_for_damage();
-        true
+        Ok(true)
     }
 
     /// Start a per-CRTC modeset: stop new cursor-only commits on the
@@ -1482,6 +1514,7 @@ impl KmsBackend {
         x: i32,
         y: i32,
         existing_idx: Option<usize>,
+        prepared_pool: Option<PreparedScanoutPool>,
     ) -> io::Result<bool> {
         let was_active = self.kms_outputs_active;
         if let Some(idx) = existing_idx {
@@ -1490,14 +1523,17 @@ impl KmsBackend {
             self.pstate.armed_vblank_targets.remove(&crtc);
             self.pstate.absolute_vblank_targets.remove(&crtc);
         }
-        // A reallocated pool drops the old BOs; no GPU work may still use them.
-        self.platform.wait_idle_bounded();
+        // `enable_connector` idles the GPU itself if it replaces the pool.
         self.pstate.scanout_m1.clear("per-CRTC RANDR change");
 
-        if let Err(error) = self
-            .platform
-            .enable_connector(output_key, output, mode_spec, x, y)
-        {
+        if let Err(error) = self.platform.enable_connector_with_pool(
+            output_key,
+            output,
+            mode_spec,
+            x,
+            y,
+            prepared_pool,
+        ) {
             log::error!(
                 "apply_crtc_config: enable_connector({}) failed: {error}",
                 output_key.connector_name
@@ -1546,7 +1582,7 @@ impl KmsBackend {
     fn finish_per_crtc_off(&mut self, output_key: &OutputKey, idx: usize) -> io::Result<bool> {
         let was_active = self.kms_outputs_active;
         self.scene.drain_output(&mut self.platform, idx);
-        self.platform.wait_idle_bounded();
+        // `disable_connector` drains the pool (a device idle) before dropping it.
         self.pstate.scanout_m1.clear("per-CRTC RANDR change");
         match self.platform.disable_connector(output_key) {
             Ok(true) => {}

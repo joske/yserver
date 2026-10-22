@@ -425,6 +425,28 @@ impl PlatformBackend {
         )
     }
 
+    /// [`Self::enable_connector`], installing `prepared_pool` instead of
+    /// allocating when the output needs a new pool.
+    pub(crate) fn enable_connector_with_pool(
+        &mut self,
+        output_key: &OutputKey,
+        output: crate::platform::drm::Output,
+        mode_spec: yserver_core::backend::ModeSpec,
+        x: i32,
+        y: i32,
+        prepared_pool: Option<(ScanoutRoute, OutputScanout)>,
+    ) -> io::Result<()> {
+        self.enable_connector_inner(
+            output_key,
+            output,
+            mode_spec,
+            x,
+            y,
+            prepared_pool,
+            initialize_cursor_plane_for_device,
+        )
+    }
+
     /// Replay one resource-free worker qualification on the live Vulkan
     /// context and install the resulting pool/output through the ordinary
     /// synchronous modeset ownership path. This never probes another
@@ -668,14 +690,8 @@ impl PlatformBackend {
 
         // (Re)allocate the scanout pool if needed.
         let mut new_pool_committed_framebuffer = None;
-        #[cfg(test)]
-        let test_pool = self.test_scanout_pool_override.take();
-        #[cfg(not(test))]
-        let test_pool: Option<OutputScanout> = None;
         let mut new_pool: Option<Option<OutputScanout>> = if needs_pool_realloc {
-            if let Some(pool) = test_pool {
-                Some(Some(pool))
-            } else if let Some((_prepared_route, pool)) = prepared_pool {
+            if let Some((_prepared_route, pool)) = prepared_pool {
                 // Exact replay and live TEST_ONLY already completed while the
                 // previous topology was still active. Keep this dark-window
                 // path to the KMS commit and ownership installation only.
@@ -888,6 +904,11 @@ impl PlatformBackend {
             self.outputs[idx].width = w;
             self.outputs[idx].height = h;
             if let Some(pool) = new_pool {
+                // Dropping the old BOs frees images that GPU work outside the
+                // scene's fences (scanout reads) may still use.
+                if self.scanout_pools[idx].is_some() {
+                    self.wait_idle_bounded();
+                }
                 self.scanout_pools[idx] = pool;
                 self.bo_generations[idx] = self.scanout_pools[idx]
                     .as_ref()
