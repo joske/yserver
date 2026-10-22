@@ -258,6 +258,36 @@ fn mode_change_whose_discovery_moves_the_crtc_takes_the_global_quiesce() {
 }
 
 #[test]
+// Mutation: proceed with the per-CRTC modeset after the wait times out.
+fn a_flip_that_never_retires_falls_back_to_the_global_quiesce() {
+    let (mut backend, log) = two_heads();
+    // Output 1 owes a flip whose event never arrives.
+    backend.scene.test_set_flip_in_flight(true);
+    let mut discovered = clone_test_drm_output(&backend.platform.outputs[1].output);
+    discovered.picked = advertised(640, 480);
+    discovered.modes.push(advertised(640, 480));
+    backend.pstate.crtc_config_discovery_override = Some(discovered);
+    let name = connector(&backend, 1);
+    let id = output_id(&mut backend, &name);
+    let untouched = crtc(&backend, 0);
+    let mode = ModeSpec {
+        width: 640,
+        height: 480,
+        vrefresh: 60,
+    };
+
+    // The fd-less fixture cannot relight; only which path ran matters.
+    let _ = Backend::apply_crtc_config(&mut backend, id, &name, Some(mode), 800, 0);
+
+    assert!(
+        log.entries().contains(&("off", untouched)),
+        "the global quiesce turns the untouched CRTC off too: {:?}",
+        log.entries()
+    );
+    assert_eq!(backend.pstate.crtc_config_gated_crtc, None);
+}
+
+#[test]
 // Mutation: drop the scanout_m2.active() check from per_crtc_fallback_reason.
 fn direct_scanout_takes_the_global_quiesce() {
     let (mut backend, _log) = two_heads();
@@ -361,6 +391,11 @@ fn retire_all(fixture: &mut RecordingSceneFixture, flips: &[(u32, u64)], frame: 
     }
 }
 
+/// Completions queued on the DRM fd and not yet delivered.
+fn undelivered(fixture: &RecordingSceneFixture) -> usize {
+    fixture.events.event_sources[&device_fd(fixture)].queued_flip_count()
+}
+
 fn bo_phases(backend: &KmsBackend, idx: usize) -> Vec<BoPhase> {
     backend.platform.scanout_pools[idx]
         .as_ref()
@@ -435,6 +470,12 @@ fn mode_change_modesets_only_its_crtc_while_the_other_keeps_presenting() {
 
     assert_eq!(log.entries(), vec![("on", crtc1)]);
     assert_ne!(backend.pstate.crtc_config_topology_epoch, epoch);
+    assert_eq!(
+        undelivered(&fixture),
+        0,
+        "CRTC 1's flip retired before its modeset"
+    );
+    let backend = &fixture.events.backend;
     assert_eq!(backend.platform.outputs[1].width, 640);
     assert_eq!(backend.pstate.crtc_config_gated_crtc, None);
     assert!(
@@ -487,6 +528,12 @@ fn turning_one_output_off_migrates_the_survivors_in_flight_frame() {
 
     assert_eq!(log.entries(), vec![("off", crtc0)]);
     assert_ne!(backend.pstate.crtc_config_topology_epoch, epoch);
+    assert_eq!(
+        undelivered(&fixture),
+        0,
+        "CRTC 0's flip retired before its disable"
+    );
+    let backend = &fixture.events.backend;
     assert_eq!(backend.platform.outputs.len(), 1);
     assert_eq!(crtc(backend, 0), crtc1);
     assert!(
