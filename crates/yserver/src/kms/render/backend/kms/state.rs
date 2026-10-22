@@ -294,6 +294,9 @@ pub(in crate::kms::render::backend) struct ScanoutM2State {
     /// per-output scene compose path. Keep direct-frame pins held until those
     /// composed flips replace every direct plane.
     pub(in crate::kms::render::backend) degraded_composed_unflip: bool,
+    /// The grouped unflip carried freshly composed scene frames; the scene
+    /// retires its own BOs on the accepted replacement events.
+    pub(in crate::kms::render::backend) fresh_composed_unflip: bool,
 }
 
 impl ScanoutM2State {
@@ -317,6 +320,7 @@ impl ScanoutM2State {
             unflip_fallback_source: None,
             unflip_shadow_ready: false,
             degraded_composed_unflip: false,
+            fresh_composed_unflip: false,
         }
     }
 

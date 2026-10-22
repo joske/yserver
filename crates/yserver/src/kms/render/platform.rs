@@ -522,6 +522,11 @@ pub struct PlatformBackend {
     /// A scene retirement attempted to hide a hardware cursor and failed.
     /// The backend consumes this to keep tearing's fallback diagnostic once.
     pub(crate) scene_cursor_hide_failed: bool,
+    /// While set, a shared scene frame is rendered and its fence exported but
+    /// not committed: `(output_idx, bo_idx)` is recorded in
+    /// `deferred_scene_flips` for one grouped commit by the caller.
+    pub(crate) defer_scene_flips: bool,
+    pub(crate) deferred_scene_flips: Vec<(usize, usize)>,
 
     // Input side
     input_ctx: Option<crate::input::SendContext>,

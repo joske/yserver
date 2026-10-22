@@ -135,6 +135,25 @@ impl OutputSink for PlatformBackend {
         let mut cursor_rejection_error = None;
         let mut async_outcome = None;
         let outcome = match pool {
+            OutputScanout::Shared(pool) if self.defer_scene_flips => {
+                let Some(bo) = pool.bos.get_mut(bo_idx) else {
+                    return FinishOutcome::Unavailable(FrameTargetError::NoSlot);
+                };
+                // The caller commits every deferred frame in one transaction
+                // and then installs the accepted event identity on the ack.
+                let result = render_shared_scanout_frame(bo, record).map(|(submit, _, _)| {
+                    self.deferred_scene_flips.push((output_idx, bo_idx));
+                    FrameHandoff::FlipPending {
+                        submit,
+                        event_id: None,
+                    }
+                });
+                FinishOutcome::Finished {
+                    result,
+                    previous_gpu_ns: bo.last_gpu_render_ns.take(),
+                    fail_stop: false,
+                }
+            }
             OutputScanout::Shared(pool) => {
                 let allocation_plan = pool.allocation_plan;
                 let Some(bo) = pool.bos.get_mut(bo_idx) else {
@@ -568,20 +587,13 @@ impl ComposeRenderTarget for CopiedRenderSource {
     }
 }
 
-/// Render directly into the KMS framebuffer and immediately queue its flip.
-fn submit_shared_scanout_frame(
-    drm: &crate::drm::Device,
-    atomic_commit_sink: &crate::drm::atomic::AtomicCommitSink,
-    output: &crate::platform::drm::Output,
-    allocation_plan: crate::kms::vk::scanout::ScanoutAllocationPlan,
+/// Render into a free KMS framebuffer and leave it `Submitted` with its
+/// exported render fence held as the `IN_FENCE_FD` of the flip to come.
+fn render_shared_scanout_frame(
     bo: &mut ScanoutBo,
     record: &mut RecordFrame<'_>,
-    cursor_positions: &[crate::drm::atomic::CursorPlanePosition],
-    async_ledger: &mut crate::drm::async_flip::AsyncFlipLedger,
-    timing: crate::drm::async_flip::FlipTiming,
-    tearing_context: crate::drm::atomic::TearingCommitContext,
-) -> Result<(ComposeSubmit, crate::drm::async_flip::AsyncOutcome, u64), PresentError> {
-    use std::os::fd::{FromRawFd, IntoRawFd};
+) -> Result<(ComposeSubmit, ::drm::control::framebuffer::Handle, i32), PresentError> {
+    use std::os::fd::IntoRawFd;
 
     if bo.state.phase != BoPhase::Free {
         return Err(PresentError::WrongPhase(bo.state.phase));
@@ -595,6 +607,25 @@ fn submit_shared_scanout_frame(
         .map_err(PresentError::Vk)?
         .map_or(-1, IntoRawFd::into_raw_fd);
     bo.state.transition_to_submitted(fd);
+    Ok((submitted, fb_handle, fd))
+}
+
+/// Render directly into the KMS framebuffer and immediately queue its flip.
+fn submit_shared_scanout_frame(
+    drm: &crate::drm::Device,
+    atomic_commit_sink: &crate::drm::atomic::AtomicCommitSink,
+    output: &crate::platform::drm::Output,
+    allocation_plan: crate::kms::vk::scanout::ScanoutAllocationPlan,
+    bo: &mut ScanoutBo,
+    record: &mut RecordFrame<'_>,
+    cursor_positions: &[crate::drm::atomic::CursorPlanePosition],
+    async_ledger: &mut crate::drm::async_flip::AsyncFlipLedger,
+    timing: crate::drm::async_flip::FlipTiming,
+    tearing_context: crate::drm::atomic::TearingCommitContext,
+) -> Result<(ComposeSubmit, crate::drm::async_flip::AsyncOutcome, u64), PresentError> {
+    use std::os::fd::FromRawFd;
+
+    let (submitted, fb_handle, fd) = render_shared_scanout_frame(bo, record)?;
 
     let shape = composed_async_shape(output, allocation_plan, bo.pitch, bo.width, bo.height);
     let stream = crate::drm::async_flip::AsyncStream::Composed(output.crtc);

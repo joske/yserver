@@ -1468,6 +1468,9 @@ pub(crate) struct DirectScanoutPlaneState<'a> {
 pub(crate) struct ComposedScanoutPlaneState<'a> {
     pub(crate) output: &'a Output,
     pub(crate) fb: framebuffer::Handle,
+    /// `IN_FENCE_FD` for a framebuffer whose compose may still be running;
+    /// `-1` is the already-signalled sentinel. `None` omits the property.
+    pub(crate) in_fence_fd: Option<i32>,
 }
 
 /// Successfully imported framebuffer retained after an accepted M1 probe.
@@ -1832,6 +1835,12 @@ pub(crate) fn submit_composed_scanout(
             output.plane_crtc_h_prop,
             u64::from(output.mode.size().1),
         );
+        if let Some(fd) = state.in_fence_fd {
+            let prop = output
+                .plane_in_fence_fd_prop
+                .ok_or_else(|| io::Error::other("scanout M2: plane has no IN_FENCE_FD"))?;
+            request.add_raw_property(output.plane.into(), prop, fd as i64 as u64);
+        }
     }
     for position in cursor_positions {
         request.add_cursor_position(*position);

@@ -843,6 +843,7 @@ impl KmsBackend {
         self.pstate.scanout_m2.unflip_fallback_source = None;
         self.pstate.scanout_m2.unflip_shadow_ready = false;
         self.pstate.scanout_m2.degraded_composed_unflip = false;
+        self.pstate.scanout_m2.fresh_composed_unflip = false;
         self.finish_deferred_cow_release();
         log::debug!("scanout_m2: stopped after scanout replacement: {reason}");
     }
@@ -1078,6 +1079,7 @@ impl KmsBackend {
                 Ok(crate::drm::modeset::ComposedScanoutPlaneState {
                     output: &layout.output,
                     fb,
+                    in_fence_fd: None,
                 })
             })
             .collect::<io::Result<_>>()?;
@@ -1140,6 +1142,160 @@ impl KmsBackend {
         Ok(true)
     }
 
+    /// Whether the unflip can replace every direct plane with a freshly
+    /// composed scene frame: shared scene outputs that can all accept a frame
+    /// now, explicit in-fences, and the grouped unflip's own topology.
+    fn fresh_composed_unflip_eligible(&self) -> bool {
+        use crate::kms::render::scene::{OutputRoute, OutputSink};
+
+        let outputs: Vec<_> = (0..self.platform.outputs.len()).collect();
+        !outputs.is_empty()
+            && !self.pstate.tearing.is_on()
+            && self.pstate.scanout_m2.unflip_reason != Some("tearing_cursor_handoff")
+            && self.direct_scanout_topology_eligible()
+            && !self.platform.cursor_commit_in_flight_for_outputs(&outputs)
+            && outputs.iter().all(|&output_idx| {
+                self.platform.route(output_idx) == OutputRoute::Shared
+                    && self.platform.outputs[output_idx]
+                        .output
+                        .plane_in_fence_fd_prop
+                        .is_some()
+                    && self
+                        .scene
+                        .output_ready_for_submit(output_idx, &self.platform)
+            })
+    }
+
+    /// #281: compose a fresh frame from the materialized direct source on
+    /// every output and flip all of them in one grouped atomic commit, each
+    /// plane waiting on its compose through `IN_FENCE_FD`. Returns false
+    /// when nothing was committed; the retained-framebuffer unflip then
+    /// runs as before, and any frame already rendered here is recycled only
+    /// after its compose fence signals.
+    fn submit_fresh_composed_unflip(&mut self) -> bool {
+        if !self.fresh_composed_unflip_eligible() {
+            return false;
+        }
+        if let Err(error) = self.materialize_direct_shadow_for_unflip() {
+            log::debug!("scanout_m2: fresh composed unflip skipped: {error}");
+            return false;
+        }
+        self.scene.invalidate_all_scanout_damage();
+        self.scene.mark_scene_structure_dirty();
+        self.platform.defer_scene_flips = true;
+        self.compose_tick();
+        self.platform.defer_scene_flips = false;
+        let deferred = std::mem::take(&mut self.platform.deferred_scene_flips);
+        let output_count = self.platform.outputs.len();
+        let targets: Option<Vec<_>> = (0..output_count)
+            .map(|output_idx| {
+                let mut frames = deferred.iter().filter(|&&(out, _)| out == output_idx);
+                match (frames.next(), frames.next()) {
+                    (Some(&(_, bo_idx)), None) => {
+                        self.platform.deferred_scene_flip_target(output_idx, bo_idx)
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        let result = match targets {
+            Some(targets) => self.commit_fresh_composed_unflip(&targets),
+            None => Err(io::Error::other(format!(
+                "composed {} of {output_count} outputs",
+                deferred.len()
+            ))),
+        };
+        let accepted_event_id = result.as_ref().ok().copied();
+        for &(output_idx, bo_idx) in &deferred {
+            self.platform.settle_deferred_scene_flip(
+                output_idx,
+                bo_idx,
+                accepted_event_id.is_some(),
+            );
+            match accepted_event_id {
+                Some(event_id) => {
+                    self.scene.accept_deferred_flip(output_idx, event_id);
+                }
+                None => {
+                    self.scene
+                        .abandon_deferred_flip(output_idx, &mut self.platform);
+                }
+            }
+        }
+        let Some(accepted_event_id) = accepted_event_id else {
+            log::warn!(
+                "scanout_m2: fresh composed unflip failed: {}; using retained framebuffers",
+                result
+                    .err()
+                    .map_or_else(String::new, |error| error.to_string())
+            );
+            return false;
+        };
+        self.pstate.scanout_m2.unflip_outputs_to_replace = (0..output_count).collect();
+        self.pstate.scanout_m2.unflip_awaiting_outputs = (0..output_count)
+            .map(|output_idx| (output_idx, accepted_event_id))
+            .collect();
+        self.pstate.scanout_m2.fresh_composed_unflip = true;
+        log::debug!(
+            "scanout_m2: submitted fresh atomic composed unflip outputs={output_count} reason={}",
+            self.pstate.scanout_m2.unflip_reason.unwrap_or("unknown")
+        );
+        true
+    }
+
+    /// The grouped commit of [`Self::submit_fresh_composed_unflip`]: one
+    /// `(framebuffer, IN_FENCE_FD)` per output, in output order.
+    fn commit_fresh_composed_unflip(
+        &mut self,
+        targets: &[(::drm::control::framebuffer::Handle, i32)],
+    ) -> io::Result<u64> {
+        let planes: Vec<_> = self
+            .platform
+            .outputs
+            .iter()
+            .zip(targets)
+            .map(
+                |(layout, &(fb, in_fence_fd))| crate::drm::modeset::ComposedScanoutPlaneState {
+                    output: &layout.output,
+                    fb,
+                    in_fence_fd: Some(in_fence_fd),
+                },
+            )
+            .collect();
+        let (device, atomic_commit_sink) = self
+            .platform
+            .primary_device()
+            .map(|primary| {
+                (
+                    Rc::clone(&primary.device),
+                    Rc::clone(&primary.atomic_commit_sink),
+                )
+            })
+            .ok_or_else(|| io::Error::other("scanout M2: fresh unflip without a KMS device"))?;
+        let output_indices: Vec<_> = (0..planes.len()).collect();
+        let cursor_positions = self
+            .platform
+            .cursor_plane_atomic_positions_for_outputs(&output_indices);
+        let result = crate::drm::modeset::submit_composed_scanout(
+            &device,
+            atomic_commit_sink.as_ref(),
+            &planes,
+            &cursor_positions,
+        );
+        if let Err(error) = &result
+            && atomic_commit_sink.take_last_cursor_rejection()
+        {
+            let outcome = self
+                .platform
+                .reject_atomic_cursor_commit(&cursor_positions, &error.to_string());
+            self.handle_cursor_move_outcome(outcome);
+        }
+        let accepted_event_id = result?;
+        self.platform
+            .cursor_plane_scene_commit_submitted(&cursor_positions);
+        Ok(accepted_event_id)
+    }
+
     /// Install only accepted per-output scene commits as degraded-unflip
     /// retirement obligations. Copied render readiness alone has no KMS ID.
     pub(in crate::kms::render::backend) fn record_accepted_degraded_unflip_replacements(&mut self) {
@@ -1187,8 +1343,9 @@ impl KmsBackend {
                 .unflip_outputs_to_replace
                 .remove(&output_idx);
             let degraded = self.pstate.scanout_m2.degraded_composed_unflip;
-            let cursor_handoff =
-                !degraded && self.pstate.scanout_m2.unflip_reason == Some("tearing_cursor_handoff");
+            let scene_owned = degraded || self.pstate.scanout_m2.fresh_composed_unflip;
+            let cursor_handoff = !scene_owned
+                && self.pstate.scanout_m2.unflip_reason == Some("tearing_cursor_handoff");
             if cursor_handoff {
                 self.scene
                     .retire_external_cursor_handoff(output_idx, &mut self.platform);
@@ -1210,10 +1367,10 @@ impl KmsBackend {
                 self.pstate.scanout_m2.degraded_composed_unflip = false;
                 log::debug!("scanout_m2: composed unflip retired on all outputs");
             }
-            if degraded {
-                // The planes were replaced by the scene's own per-output
-                // composed flips, which must still unwind their pending-acks
-                // and BO state through the scene; hand the retire back.
+            if scene_owned {
+                // The planes were replaced by the scene's own composed
+                // frames, which must still unwind their pending-acks and BO
+                // state through the scene; hand the retire back.
                 return false;
             }
             return true;
@@ -2548,7 +2705,12 @@ impl KmsBackend {
                 && self.pstate.scanout_m2.unflip_requested
                 && !self.pstate.scanout_m2.degraded_composed_unflip
             {
-                match self.submit_composed_unflip() {
+                let submitted = if self.submit_fresh_composed_unflip() {
+                    Ok(true)
+                } else {
+                    self.submit_composed_unflip()
+                };
+                match submitted {
                     Ok(true) => {
                         self.pstate
                             .tearing

@@ -16,7 +16,7 @@ use yserver_core::backend::Backend;
 const DIRECT_PROBATION: usize = 8;
 const WAIT_DEADLINE: Duration = Duration::from_secs(5);
 
-fn direct_fixture(
+pub(super) fn direct_fixture(
     output_count: usize,
     route: P1SceneRoute,
     present_id: u64,
@@ -28,15 +28,15 @@ fn direct_fixture(
     Some((fixture, direct))
 }
 
-fn fd(fixture: &RecordingSceneFixture) -> RawFd {
+pub(super) fn fd(fixture: &RecordingSceneFixture) -> RawFd {
     fixture.kms_fd(0)
 }
 
-fn record_count(fixture: &RecordingSceneFixture, device_fd: RawFd) -> usize {
+pub(super) fn record_count(fixture: &RecordingSceneFixture, device_fd: RawFd) -> usize {
     fixture.events.recorders[&device_fd].records().len()
 }
 
-fn records_since(
+pub(super) fn records_since(
     fixture: &RecordingSceneFixture,
     device_fd: RawFd,
     offset: usize,
@@ -49,7 +49,7 @@ fn records_since(
         .collect()
 }
 
-fn accepted_records(records: &[AtomicCommitRecord]) -> Vec<AtomicCommitRecord> {
+pub(super) fn accepted_records(records: &[AtomicCommitRecord]) -> Vec<AtomicCommitRecord> {
     records
         .iter()
         .filter(|record| accepted_event_id(record).is_some())
@@ -94,7 +94,7 @@ fn enter_async_tearing(fixture: &mut RecordingSceneFixture, direct: &DirectPrese
     Backend::set_cursor_hidden(&mut fixture.events.backend, true);
 }
 
-fn submit_direct(
+pub(super) fn submit_direct(
     fixture: &mut RecordingSceneFixture,
     direct: &DirectPresentSetup,
     device_fd: RawFd,
@@ -104,7 +104,7 @@ fn submit_direct(
     records_since(fixture, device_fd, start)
 }
 
-fn inject_output(
+pub(super) fn inject_output(
     fixture: &mut RecordingSceneFixture,
     device_fd: RawFd,
     record: &AtomicCommitRecord,
@@ -127,7 +127,7 @@ fn inject_output(
     );
 }
 
-fn request_unflip(fixture: &mut RecordingSceneFixture, direct: &DirectPresentSetup) {
+pub(super) fn request_unflip(fixture: &mut RecordingSceneFixture, direct: &DirectPresentSetup) {
     let mut successor = direct.candidate;
     successor.present_id += 1;
     successor.valid_region_xid = 0x55;
@@ -142,7 +142,7 @@ fn request_unflip(fixture: &mut RecordingSceneFixture, direct: &DirectPresentSet
     assert!(fixture.events.backend.pstate.scanout_m2.unflip_requested);
 }
 
-fn drain_present_notifications(
+pub(super) fn drain_present_notifications(
     fixture: &mut RecordingSceneFixture,
     expected_completed: &[u64],
     expected_idled: &[u64],
@@ -177,7 +177,7 @@ fn drain_present_notifications(
     );
 }
 
-fn complete_direct_initial(
+pub(super) fn complete_direct_initial(
     fixture: &mut RecordingSceneFixture,
     direct_record: &AtomicCommitRecord,
     direct_id: u64,
@@ -201,7 +201,7 @@ fn complete_direct_initial(
     assert!(fixture.events.backend.pstate.scanout_m2.current.is_some());
 }
 
-fn grouped_unflip_record(
+pub(super) fn grouped_unflip_record(
     fixture: &mut RecordingSceneFixture,
     device_fd: RawFd,
     offset: usize,
@@ -316,7 +316,7 @@ fn deliver_copied_job(fixture: &mut RecordingSceneFixture, job_id: u64) {
     }
 }
 
-fn direct_source_pins(
+pub(super) fn direct_source_pins(
     fixture: &RecordingSceneFixture,
     source_id: crate::kms::render::store::DrawableId,
 ) -> usize {
@@ -842,6 +842,8 @@ fn p1_degraded_shared_unflip_waits_for_accepted_replacements() {
 
     let recorder = fixture.events.recorders[&device_fd].clone();
     let offset = record_count(&fixture, device_fd);
+    // Fresh grouped unflip, then the retained-framebuffer grouped unflip.
+    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
     recorder.script_result(Ok(()));
     recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));

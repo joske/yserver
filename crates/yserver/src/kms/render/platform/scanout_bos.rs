@@ -212,6 +212,51 @@ impl PlatformBackend {
             .fb_handle
     }
 
+    /// Framebuffer and held `IN_FENCE_FD` (`-1` when already signalled) of a
+    /// shared frame rendered while scene flips were deferred.
+    pub(crate) fn deferred_scene_flip_target(
+        &self,
+        output_idx: usize,
+        bo_idx: usize,
+    ) -> Option<(::drm::control::framebuffer::Handle, i32)> {
+        let Some(Some(OutputScanout::Shared(pool))) = self.scanout_pools.get(output_idx) else {
+            return None;
+        };
+        let bo = pool.bos.get(bo_idx)?;
+        (bo.state.phase == BoPhase::Submitted)
+            .then_some((bo.fb_handle?, bo.state.in_fence_fd.unwrap_or(-1)))
+    }
+
+    /// Settle a deferred shared frame after its grouped commit: `Pending` when
+    /// accepted, otherwise back to `Recording` until the scene's failed-submit
+    /// recycler sees its compose fence signal. Either way the held in-fence
+    /// is closed; the kernel keeps its own reference on acceptance.
+    pub(crate) fn settle_deferred_scene_flip(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+        accepted: bool,
+    ) {
+        let Some(Some(OutputScanout::Shared(pool))) = self.scanout_pools.get_mut(output_idx) else {
+            return;
+        };
+        let Some(bo) = pool.bos.get_mut(bo_idx) else {
+            return;
+        };
+        if bo.state.phase != BoPhase::Submitted {
+            return;
+        }
+        let in_fence = if accepted {
+            bo.state.transition_to_pending(-1)
+        } else {
+            bo.state.transition_to_recording_after_atomic_reject()
+        };
+        if let Some(fd) = in_fence {
+            // SAFETY: the state transition returns unique fd ownership.
+            unsafe { libc::close(fd) };
+        }
+    }
+
     /// Mark a BO's content tracking as invalidated. Called by
     /// SceneCompositor on the 9b atomic-commit-failed path —
     /// the GPU rendered into the BO but KMS rejected the flip,

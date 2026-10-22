@@ -1,6 +1,6 @@
 use crate::kms::render::{
     scene::{
-        FailedSubmitBo, InFlightStage, OutputCursorMode, OutputSceneState, OutputSink,
+        FailedSubmitBo, InFlightStage, OutputCursorMode, OutputSceneState, OutputSink, PendingAck,
         RenderCompletion, SceneCompositor, SceneCompositorInner,
         cursor::{
             apply_cursor_transition_on_retire, force_cursor_retry_repaint,
@@ -355,52 +355,109 @@ pub(super) fn handle_scanout_render_completion_inner(
             // The scene may retire only A-local descriptor resources, and
             // only behind A's compose fence; damage/cursor metadata remain
             // live for a later repaint because no frame reached the screen.
-            sink.invalidate_slot(output_idx, bo_idx);
             let state = &mut inner.outputs[output_idx];
             let ack = state
                 .pending_acks
                 .pop_front()
                 .expect("completion identity was checked against the front ack");
-            state.current_generation = ack.generation.saturating_sub(1);
-            if let Some(rect) = ack.submitted_output_damage.bounding_rect() {
-                state.pending_repaint_after_failed_submit.add(rect);
-            }
-            if let Some(slot) = state.pool_slots.pop_front() {
-                match ack.ticket {
-                    None => match sink.recycle_failed_slot(output_idx, bo_idx) {
-                        Ok(()) => state.pool_ring.release(slot),
-                        Err(recovery_error) => {
-                            log::error!(
-                                "render copied scanout: renderer recovery failed for output \
-                                     {output_idx} bo {bo_idx}: {recovery_error}"
-                            );
-                            sink.gpu_mut().renderer_failed = true;
-                        }
-                    },
-                    Some(ticket) => {
-                        // Even if the fence is already signalled, route
-                        // all post-A-submit failures through the same
-                        // deferred recycler. That recycler rearms dirty
-                        // export semaphores, retires the consumed prior
-                        // B->A wait, and only then frees the paired slot.
-                        state.failed_submit_bos.push_back(FailedSubmitBo {
-                            bo_idx,
-                            pool_slot: slot,
-                            ticket,
-                        });
-                    }
-                }
-            } else {
-                log::error!(
-                    "render copied scanout: missing descriptor slot for failed output \
-                         {output_idx} bo {bo_idx}"
-                );
-                sink.gpu_mut().renderer_failed = true;
-            }
+            let slot = state.pool_slots.pop_front();
+            unwind_unpresented_ack(state, output_idx, ack, slot, sink);
             state.next_submit_retry_at =
                 Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
             false
         }
+    }
+}
+
+/// Unwind a frame whose GPU work was submitted but which never reached the
+/// screen: damage and generation fold back, and the slot plus its descriptor
+/// pool slot go to the deferred recycler behind the compose fence.
+fn unwind_unpresented_ack(
+    state: &mut OutputSceneState,
+    output_idx: usize,
+    ack: PendingAck,
+    slot: Option<usize>,
+    sink: &mut dyn OutputSink,
+) {
+    let bo_idx = ack.bo_idx;
+    sink.invalidate_slot(output_idx, bo_idx);
+    state.current_generation = ack.generation.saturating_sub(1);
+    state.damage.retire_failure();
+    if let Some(rect) = ack.submitted_output_damage.bounding_rect() {
+        state.pending_repaint_after_failed_submit.add(rect);
+    }
+    let Some(slot) = slot else {
+        log::error!(
+            "render scene: missing descriptor slot for unpresented output {output_idx} bo {bo_idx}"
+        );
+        sink.gpu_mut().renderer_failed = true;
+        return;
+    };
+    match ack.ticket {
+        None => match sink.recycle_failed_slot(output_idx, bo_idx) {
+            Ok(()) => state.pool_ring.release(slot),
+            Err(recovery_error) => {
+                log::error!(
+                    "render scene: renderer recovery failed for output \
+                     {output_idx} bo {bo_idx}: {recovery_error}"
+                );
+                sink.gpu_mut().renderer_failed = true;
+            }
+        },
+        Some(ticket) => {
+            // Even if the fence is already signalled, route all post-submit
+            // failures through the same deferred recycler. That recycler
+            // rearms dirty export semaphores, retires a copied route's
+            // consumed prior B->A wait, and only then frees the slot.
+            state.failed_submit_bos.push_back(FailedSubmitBo {
+                bo_idx,
+                pool_slot: slot,
+                ticket,
+            });
+        }
+    }
+}
+
+impl SceneCompositor {
+    /// Install the accepted commit identity on a frame the sink rendered
+    /// while its flip was deferred to a grouped commit.
+    pub fn accept_deferred_flip(&mut self, output_idx: usize, event_id: u64) -> bool {
+        let Some(ack) = self
+            .inner
+            .as_mut()
+            .and_then(|inner| inner.outputs.get_mut(output_idx))
+            .and_then(|state| state.pending_acks.back_mut())
+        else {
+            return false;
+        };
+        if ack.stage != (InFlightStage::KmsFlipPending { event_id: None }) {
+            return false;
+        }
+        ack.stage = InFlightStage::KmsFlipPending {
+            event_id: Some(event_id),
+        };
+        true
+    }
+
+    /// Drop a frame whose deferred flip was never committed. Its slot is
+    /// recycled only once the compose fence signals.
+    pub fn abandon_deferred_flip(&mut self, output_idx: usize, sink: &mut dyn OutputSink) -> bool {
+        let Some(state) = self
+            .inner
+            .as_mut()
+            .and_then(|inner| inner.outputs.get_mut(output_idx))
+        else {
+            return false;
+        };
+        if state.pending_acks.back().map(|ack| ack.stage)
+            != Some(InFlightStage::KmsFlipPending { event_id: None })
+        {
+            return false;
+        }
+        let ack = state.pending_acks.pop_back().expect("checked above");
+        let slot = state.pool_slots.pop_back();
+        unwind_unpresented_ack(state, output_idx, ack, slot, sink);
+        true
     }
 }
 

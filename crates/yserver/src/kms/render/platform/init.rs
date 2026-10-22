@@ -739,6 +739,8 @@ impl PlatformBackend {
             requested_flip_timing: crate::drm::async_flip::FlipTiming::Vsync,
             scene_flip_timings: Vec::new(),
             scene_cursor_hide_failed: false,
+            defer_scene_flips: false,
+            deferred_scene_flips: Vec::new(),
             input_ctx,
             #[cfg(target_os = "linux")]
             hotplug_monitor,
@@ -877,6 +879,8 @@ impl PlatformBackend {
             requested_flip_timing: crate::drm::async_flip::FlipTiming::Vsync,
             scene_flip_timings: Vec::new(),
             scene_cursor_hide_failed: false,
+            defer_scene_flips: false,
+            deferred_scene_flips: Vec::new(),
             input_ctx: None,
             #[cfg(target_os = "linux")]
             hotplug_monitor,
