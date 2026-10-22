@@ -1553,7 +1553,7 @@ impl KmsBackend {
             .map_err(|e| io::Error::other(format!("set_gamma for {output_key:?} failed: {e}")))
     }
 
-    fn reapply_gamma_for_output(&self, output_key: &OutputKey) {
+    pub(super) fn reapply_gamma_for_output(&self, output_key: &OutputKey) {
         if let Err(e) = self.apply_gamma_to_live_output(output_key) {
             log::warn!("kms gamma: reapply for {output_key:?} failed: {e}");
         }

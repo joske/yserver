@@ -1752,7 +1752,7 @@ impl PlatformBackend {
     /// skipped here: only the post-success explicit-enable hook may make its
     /// first attempt. A prior transient attempt is retried at this later
     /// topology/resume boundary.
-    pub(super) fn refresh_cursor_topology_for_devices(
+    pub(crate) fn refresh_cursor_topology_for_devices(
         &mut self,
         changed_devices: &HashSet<crate::platform::drm::DrmDeviceKey>,
     ) {

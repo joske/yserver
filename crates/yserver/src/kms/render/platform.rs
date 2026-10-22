@@ -594,6 +594,11 @@ pub struct PlatformBackend {
     pub(crate) first_pageflip_logged: Vec<bool>,
 
     pub(crate) shutting_down: bool,
+
+    /// Test-only scanout pool handed to the next connector enable that needs
+    /// a new pool: the fd-less test DRM device cannot allocate one.
+    #[cfg(test)]
+    pub(crate) test_scanout_pool_override: Option<OutputScanout>,
 }
 
 impl PlatformBackend {

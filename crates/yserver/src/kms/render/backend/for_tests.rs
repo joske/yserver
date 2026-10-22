@@ -650,6 +650,7 @@ impl KmsBackend {
             next_crtc_config_token: 1,
             next_device_config_token: 1,
             crtc_config_topology_epoch: 0,
+            crtc_config_gated_crtc: None,
             #[cfg(test)]
             crtc_config_discovery_override: None,
             input_thread_control: None,

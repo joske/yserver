@@ -1012,40 +1012,85 @@ impl KmsBackend {
             )));
         }
 
+        let existing_idx = self
+            .platform
+            .outputs
+            .iter()
+            .position(|layout| layout.key == output_key);
+        let per_crtc = PerCrtcChange::classify(current, requested, existing_idx)
+            .and_then(|change| match self.per_crtc_fallback_reason(&output_key, change) {
+                None => Some(change),
+                Some(reason) => {
+                    log::info!(
+                        "apply_crtc_config: {connector}: {} falls back to global quiesce ({reason})",
+                        change.label()
+                    );
+                    None
+                }
+            });
+        if let (Some(PerCrtcChange::Position), Some(idx)) = (per_crtc, existing_idx) {
+            return Ok(self.apply_crtc_position(idx, &output_key, requested, x, y));
+        }
+
         // Resolve the requested connector before taking the old CRTC set
         // offline. A pure discovery failure must not blank a working desktop.
         // Pool allocation and the actual modeset remain in `enable_connector`
         // after quiescing, where failures can restore the old composed set.
-        let prepared_output = if mode.is_some() {
-            let reserved_routes: Vec<_> = self
-                .platform
-                .outputs
-                .iter()
-                .filter(|layout| {
-                    layout.key.device_key == output_key.device_key && layout.key != output_key
-                })
-                .map(|layout| {
-                    (
-                        layout.output.encoder,
-                        layout.output.crtc,
-                        layout.output.plane,
-                    )
-                })
-                .collect();
-            Some(
-                crate::platform::drm::discover_output_for_connector(
-                    &output_device,
-                    connector,
-                    &reserved_routes,
-                )
-                .map_err(|e| {
-                    log::error!("apply_crtc_config: target discovery for {connector} failed: {e}");
-                    e
-                })?,
-            )
+        let mut prepared_output = if mode.is_some() {
+            Some(self.discover_crtc_config_output(&output_key, &output_device, connector)?)
         } else {
             None
         };
+
+        // A mode change keeps its live encoder/CRTC/plane: discovery prefers
+        // the encoder's bound CRTC. Moving it would leave the old CRTC lit
+        // without its connector, which only the global quiesce handles.
+        let per_crtc = per_crtc.filter(|change| {
+            let moved = *change == PerCrtcChange::Mode
+                && existing_idx
+                    .zip(prepared_output.as_ref())
+                    .is_some_and(|(idx, prepared)| {
+                        let live = &self.platform.outputs[idx].output;
+                        (live.encoder, live.crtc, live.plane)
+                            != (prepared.encoder, prepared.crtc, prepared.plane)
+                    });
+            if moved {
+                log::info!(
+                    "apply_crtc_config: {connector}: mode falls back to global quiesce \
+                     (discovery moved its CRTC/plane)"
+                );
+            }
+            !moved
+        });
+        if let Some(change) = per_crtc {
+            if self.begin_per_crtc_change(existing_idx, change) {
+                log::info!(
+                    "apply_crtc_config: per-CRTC {} on {connector}",
+                    change.label()
+                );
+                let result = match (mode, existing_idx) {
+                    (Some(mode_spec), _) => self.finish_per_crtc_enable(
+                        &output_key,
+                        prepared_output
+                            .take()
+                            .expect("enabled request prepared its connector"),
+                        mode_spec,
+                        x,
+                        y,
+                        existing_idx,
+                    ),
+                    (None, Some(idx)) => self.finish_per_crtc_off(&output_key, idx),
+                    (None, None) => unreachable!("classify gives no off change for an off output"),
+                };
+                self.pstate.crtc_config_gated_crtc = None;
+                return result;
+            }
+            log::info!(
+                "apply_crtc_config: {connector}: {} falls back to global quiesce (timed out \
+                 waiting for the CRTC's page-flip events)",
+                change.label()
+            );
+        }
 
         // ── Flip-safety: quiesce the complete old topology ────────────────
         //
@@ -1077,15 +1122,7 @@ impl KmsBackend {
                     // Already off — still update the registry.
                     log::debug!("apply_crtc_config: {connector} was already off");
                 }
-                // Update registry: connector stays known, config → Off.
-                {
-                    let entry = self.pstate.randr_id_alloc.entry_mut(&output_key);
-                    entry.config = ConnectorConfig::Off;
-                    entry.crtc_associated = false;
-                    // client_configured is set to record that a client
-                    // explicitly disabled this output (not an auto-layout op).
-                    entry.client_configured = true;
-                }
+                self.record_crtc_config_off(&output_key);
             }
             Some(mode_spec) => {
                 // ── Enable / mode-change path ────────────────────────────
@@ -1140,20 +1177,7 @@ impl KmsBackend {
                     return Err(self.recover_failed_crtc_config(restore_old_on_failure, e));
                 }
 
-                // Update registry.
-                {
-                    let entry = self.pstate.randr_id_alloc.entry_mut(&output_key);
-                    entry.config = ConnectorConfig::Enabled {
-                        mode_w: mode_spec.width,
-                        mode_h: mode_spec.height,
-                        vrefresh: mode_spec.vrefresh,
-                        x,
-                        y,
-                    };
-                    entry.crtc_associated = true;
-                    entry.client_configured = true;
-                    entry.connected = true;
-                }
+                self.record_crtc_config_enabled(&output_key, mode_spec, x, y);
 
                 log::info!(
                     "apply_crtc_config: enabled {connector} {}×{}@{} at ({x},{y})",
@@ -1205,5 +1229,360 @@ impl KmsBackend {
 
         self.scene.wake_for_damage();
         Ok(true)
+    }
+}
+
+/// How long a per-CRTC RANDR change waits for the affected CRTC's pending
+/// page-flip and cursor events before it falls back to the global quiesce.
+/// A flip retires within one refresh; a retirement may start one cursor
+/// transition, which retires on the next.
+const PER_CRTC_EVENT_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A `SetCrtcConfig` that only touches the named CRTC, as Xorg's
+/// `xf86RandR12CrtcSet` → `drmmode_set_mode_major` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::kms::render::backend) enum PerCrtcChange {
+    /// Same mode on a live output, new origin: no KMS commit.
+    Position,
+    /// New mode (and possibly origin) on a live output.
+    Mode,
+    /// A mode on an output that was off.
+    Enable,
+    /// Turn a live output off.
+    Off,
+}
+
+impl PerCrtcChange {
+    pub(in crate::kms::render::backend) fn classify(
+        current: ConnectorConfig,
+        requested: ConnectorConfig,
+        existing_idx: Option<usize>,
+    ) -> Option<Self> {
+        match (current, requested, existing_idx) {
+            (
+                ConnectorConfig::Enabled {
+                    mode_w,
+                    mode_h,
+                    vrefresh,
+                    ..
+                },
+                ConnectorConfig::Enabled {
+                    mode_w: new_w,
+                    mode_h: new_h,
+                    vrefresh: new_vrefresh,
+                    ..
+                },
+                Some(_),
+            ) if (mode_w, mode_h, vrefresh) == (new_w, new_h, new_vrefresh) => Some(Self::Position),
+            (ConnectorConfig::Enabled { .. }, ConnectorConfig::Enabled { .. }, Some(_)) => {
+                Some(Self::Mode)
+            }
+            (ConnectorConfig::Off, ConnectorConfig::Enabled { .. }, None) => Some(Self::Enable),
+            (ConnectorConfig::Enabled { .. }, ConnectorConfig::Off, Some(_)) => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn label(self) -> &'static str {
+        match self {
+            Self::Position => "position",
+            Self::Mode => "mode",
+            Self::Enable => "enable",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl KmsBackend {
+    fn record_crtc_config_enabled(
+        &mut self,
+        output_key: &OutputKey,
+        mode_spec: yserver_core::backend::ModeSpec,
+        x: i32,
+        y: i32,
+    ) {
+        let entry = self.pstate.randr_id_alloc.entry_mut(output_key);
+        entry.config = ConnectorConfig::Enabled {
+            mode_w: mode_spec.width,
+            mode_h: mode_spec.height,
+            vrefresh: mode_spec.vrefresh,
+            x,
+            y,
+        };
+        entry.crtc_associated = true;
+        entry.client_configured = true;
+        entry.connected = true;
+    }
+
+    fn record_crtc_config_off(&mut self, output_key: &OutputKey) {
+        // The connector stays known, config → Off.
+        let entry = self.pstate.randr_id_alloc.entry_mut(output_key);
+        entry.config = ConnectorConfig::Off;
+        entry.crtc_associated = false;
+        // client_configured records that a client explicitly disabled this
+        // output (not an auto-layout op).
+        entry.client_configured = true;
+    }
+
+    /// Why `change` must take the global quiesce instead of touching only
+    /// its own CRTC, or `None` when the per-CRTC path is safe.
+    ///
+    /// Direct scanout holds one grouped transaction across every CRTC.
+    /// Copied and cross-device routes carry a second device's ledger the
+    /// per-CRTC path does not migrate; requiring every live output to be a
+    /// same-device route also confines the path to one KMS device, since
+    /// only one renderer is selected.
+    pub(in crate::kms::render::backend) fn per_crtc_fallback_reason(
+        &self,
+        output_key: &OutputKey,
+        change: PerCrtcChange,
+    ) -> Option<&'static str> {
+        let direct = &self.pstate.scanout_m2;
+        if direct.active()
+            || !direct.unflip_outputs_to_replace.is_empty()
+            || !direct.unflip_awaiting_outputs.is_empty()
+            || direct.degraded_composed_unflip
+        {
+            return Some("direct scanout active");
+        }
+        if self.platform.gpu.renderer_failed {
+            return Some("renderer failed");
+        }
+        let same_route = |route: ScanoutRoute| route.relationship == RenderKmsRelationship::Same;
+        let all_same = self
+            .platform
+            .outputs
+            .iter()
+            .enumerate()
+            .all(|(idx, output)| {
+                same_route(output.scanout_route)
+                    && self
+                        .platform
+                        .scanout_pools
+                        .get(idx)
+                        .and_then(Option::as_ref)
+                        .is_none_or(|pool| same_route(pool.route()))
+            });
+        if !all_same {
+            return Some("copied or cross-device scanout route");
+        }
+        if change == PerCrtcChange::Position {
+            return None;
+        }
+        if !self.scanout_allowed() {
+            return Some("VT not active");
+        }
+        if !self.kms_outputs_active {
+            return Some("outputs dark");
+        }
+        if change == PerCrtcChange::Enable
+            && !self
+                .platform
+                .scanout_route_for_kms(output_key.device_key)
+                .is_ok_and(same_route)
+        {
+            return Some("copied or cross-device scanout route");
+        }
+        None
+    }
+
+    /// Move one live output without a modeset. Its pool is per output, so
+    /// only the layout, scene footprint, cursor topology and input extent
+    /// follow; no CRTC is committed.
+    fn apply_crtc_position(
+        &mut self,
+        idx: usize,
+        output_key: &OutputKey,
+        requested: ConnectorConfig,
+        x: i32,
+        y: i32,
+    ) -> bool {
+        self.bump_crtc_config_topology_epoch("RANDR CRTC position changed");
+        let crtc = self.platform.outputs[idx].output.crtc;
+        self.platform.outputs[idx].x = x;
+        self.platform.outputs[idx].y = y;
+        self.platform.recompute_fb_extent();
+        if let Err(error) = self
+            .scene
+            .sync_output_layouts(&self.platform.scene_output_layouts())
+        {
+            log::error!("apply_crtc_config: scene could not follow the moved CRTC: {error}");
+        }
+        self.platform
+            .refresh_cursor_topology_for_devices(&HashSet::from([output_key.device_key]));
+        self.platform
+            .invalidate_cursor_applied(output_key.device_key, crtc);
+        self.pstate.randr_id_alloc.entry_mut(output_key).config = requested;
+        self.pstate
+            .randr_id_alloc
+            .entry_mut(output_key)
+            .client_configured = true;
+        log::info!(
+            "apply_crtc_config: per-CRTC position on {} at ({x},{y})",
+            output_key.connector_name
+        );
+        self.update_input_extent(self.platform.fb_w, self.platform.fb_h);
+        self.scene.wake_for_damage();
+        true
+    }
+
+    /// Start a per-CRTC modeset: stop new cursor-only commits on the
+    /// affected CRTC and retire every event it still owes through the
+    /// normal page-flip handler, which retires the other CRTCs' events on
+    /// the same device as usual. Returns `false`, ungated, when the events
+    /// did not arrive within [`PER_CRTC_EVENT_WAIT`].
+    fn begin_per_crtc_change(
+        &mut self,
+        existing_idx: Option<usize>,
+        change: PerCrtcChange,
+    ) -> bool {
+        self.exit_tearing("per_crtc_config");
+        self.bump_crtc_config_topology_epoch("RANDR CRTC configuration changed");
+        let Some(idx) = existing_idx else {
+            return true;
+        };
+        let gated = CrtcKey::for_output(&self.platform.outputs[idx]);
+        self.pstate.crtc_config_gated_crtc = Some(gated);
+        let device_key = gated.device_key;
+        let deadline = std::time::Instant::now() + PER_CRTC_EVENT_WAIT;
+        loop {
+            if !self.platform.output_owes_kms_event(idx) && !self.scene.has_pending_page_flip(idx) {
+                return true;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match self
+                .platform
+                .wait_drm_events_ready(device_key, deadline - now)
+            {
+                Ok(Some(fd)) => self.dispatch_page_flip_events(fd),
+                Ok(None) => {}
+                Err(error) => {
+                    log::warn!(
+                        "apply_crtc_config: waiting for {} events failed: {error}",
+                        change.label()
+                    );
+                    break;
+                }
+            }
+        }
+        self.pstate.crtc_config_gated_crtc = None;
+        false
+    }
+
+    /// Modeset (or first enable of) one output after its own events retired.
+    /// Every other output keeps scanning out and presenting.
+    fn finish_per_crtc_enable(
+        &mut self,
+        output_key: &OutputKey,
+        output: crate::platform::drm::Output,
+        mode_spec: yserver_core::backend::ModeSpec,
+        x: i32,
+        y: i32,
+        existing_idx: Option<usize>,
+    ) -> io::Result<bool> {
+        let was_active = self.kms_outputs_active;
+        if let Some(idx) = existing_idx {
+            self.scene.drain_output(&mut self.platform, idx);
+            let crtc = CrtcKey::for_output(&self.platform.outputs[idx]);
+            self.pstate.armed_vblank_targets.remove(&crtc);
+            self.pstate.absolute_vblank_targets.remove(&crtc);
+        }
+        // A reallocated pool drops the old BOs; no GPU work may still use them.
+        self.platform.wait_idle_bounded();
+        self.pstate.scanout_m1.clear("per-CRTC RANDR change");
+
+        if let Err(error) = self
+            .platform
+            .enable_connector(output_key, output, mode_spec, x, y)
+        {
+            log::error!(
+                "apply_crtc_config: enable_connector({}) failed: {error}",
+                output_key.connector_name
+            );
+            // The atomic commit was refused, so the old output (if any) keeps
+            // its mode and pool; only its drained scene state needs rebuilding.
+            if let Some(idx) = existing_idx {
+                self.restore_scene_output(idx);
+            }
+            return Err(error);
+        }
+
+        let idx = existing_idx.unwrap_or(self.platform.outputs.len() - 1);
+        self.platform.invalidate_bo_generations_at(idx);
+        if let Err(error) =
+            self.scene
+                .rebuild_output(&self.platform, &self.platform.scene_output_layouts(), idx)
+        {
+            log::error!(
+                "apply_crtc_config: scene rebuild of {} failed: {error:?}; exiting",
+                output_key.connector_name
+            );
+            self.kms_outputs_active = false;
+            self.request_exit();
+            return Err(io::Error::other(format!(
+                "apply_crtc_config: scene rebuild failed: {error:?}"
+            )));
+        }
+        let crtc = self.platform.outputs[idx].output.crtc;
+        self.platform
+            .invalidate_cursor_applied(output_key.device_key, crtc);
+        self.prune_armed_targets_to_live_outputs();
+        // A modeset may reset the hardware LUT.
+        self.reapply_gamma_for_output(output_key);
+        self.record_crtc_config_enabled(output_key, mode_spec, x, y);
+        self.kms_outputs_active =
+            kms_outputs_active_after_crtc_config(was_active, true, self.platform.outputs.len());
+        self.update_input_extent(self.platform.fb_w, self.platform.fb_h);
+        self.scene.wake_for_damage();
+        Ok(true)
+    }
+
+    /// Turn one output off after its own events retired. The platform and
+    /// the scene drop the same slot, so every later output's pool and
+    /// pending acknowledgement move down one index together.
+    fn finish_per_crtc_off(&mut self, output_key: &OutputKey, idx: usize) -> io::Result<bool> {
+        let was_active = self.kms_outputs_active;
+        self.scene.drain_output(&mut self.platform, idx);
+        self.platform.wait_idle_bounded();
+        self.pstate.scanout_m1.clear("per-CRTC RANDR change");
+        match self.platform.disable_connector(output_key) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(io::Error::other(format!(
+                    "apply_crtc_config: {} vanished before its disable",
+                    output_key.connector_name
+                )));
+            }
+            Err(error) => {
+                self.restore_scene_output(idx);
+                return Err(error);
+            }
+        }
+        self.scene.remove_output(idx);
+        self.prune_armed_targets_to_live_outputs();
+        self.record_crtc_config_off(output_key);
+        self.kms_outputs_active =
+            kms_outputs_active_after_crtc_config(was_active, false, self.platform.outputs.len());
+        self.update_input_extent(self.platform.fb_w, self.platform.fb_h);
+        self.scene.wake_for_damage();
+        Ok(true)
+    }
+
+    /// Rebuild a drained scene output whose CRTC kept its old configuration.
+    fn restore_scene_output(&mut self, idx: usize) {
+        if let Err(error) =
+            self.scene
+                .rebuild_output(&self.platform, &self.platform.scene_output_layouts(), idx)
+        {
+            log::error!(
+                "apply_crtc_config: scene recovery after failure failed: {error:?}; exiting"
+            );
+            self.kms_outputs_active = false;
+            self.request_exit();
+        }
+        self.scene.wake_for_damage();
     }
 }

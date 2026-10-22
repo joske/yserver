@@ -910,6 +910,9 @@ pub struct KmsBackendState {
     /// Invalidates results across any topology quiesce or VT event, including
     /// an ABA transition which happens to restore the same final layout.
     pub(in crate::kms::render::backend) crtc_config_topology_epoch: u64,
+    /// The CRTC a per-CRTC RANDR change is waiting to modeset. Page-flip
+    /// retirement must not start a cursor-only commit on it meanwhile.
+    pub(in crate::kms::render::backend) crtc_config_gated_crtc: Option<CrtcKey>,
     /// Test-only discovery result used to exercise the real `begin` hook with
     /// the fd-less DRM fixture. Production always performs live discovery.
     #[cfg(test)]

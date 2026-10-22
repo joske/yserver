@@ -4,6 +4,7 @@ use crate::kms::render::{
         ScanoutM0Target, ScanoutM1OutputGeometry, ScanoutM1ProbeEntry, WindowsMap,
         kms::randr::effective_refresh_matches,
     },
+    platform::CrtcKey,
     scene::CursorUploadOutcome,
     store::DrawableId,
     target::Src,
@@ -2368,6 +2369,14 @@ impl KmsBackend {
         _state: &mut ServerState,
         drm_fd: std::os::fd::RawFd,
     ) {
+        self.dispatch_page_flip_events(drm_fd);
+    }
+
+    /// The normal page-flip/sequence event handler for one DRM fd. Also
+    /// driven by a per-CRTC RANDR change while it waits for that CRTC's
+    /// events, so every other CRTC's events retire exactly as they would
+    /// from the core loop.
+    pub(super) fn dispatch_page_flip_events(&mut self, drm_fd: std::os::fd::RawFd) {
         // Gate: when not Active we have no DRM master; page-flip events
         // are drained (so the fd doesn't stay readable) but no resubmit
         // or flush_submit_group runs. In Direct mode this is always false
@@ -2424,6 +2433,16 @@ impl KmsBackend {
                 );
             if direct_retired || scene_retired {
                 self.telemetry.record_frame_present();
+            }
+            // A CRTC waiting for a per-CRTC modeset takes no new cursor-only
+            // commit; the pending move is applied after the modeset.
+            if self.pstate.crtc_config_gated_crtc.is_some_and(|gated| {
+                self.platform
+                    .outputs
+                    .get(output_idx)
+                    .is_some_and(|output| CrtcKey::for_output(output) == gated)
+            }) {
+                continue;
             }
             // Retry only the cursor state owned by the card whose output just
             // retired. A page flip on card A must not consume card B's EBUSY

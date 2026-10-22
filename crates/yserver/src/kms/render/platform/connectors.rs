@@ -204,7 +204,8 @@ impl PlatformBackend {
         }
 
         // DRM disable (ALLOW_MODESET atomic commit zeroing the CRTC).
-        if let Err(e) = crate::drm::modeset::disable_output(&device, &self.outputs[idx].output) {
+        let executor = Rc::clone(&self.output_power_executor);
+        if let Err(e) = executor.disable(&device, &self.outputs[idx].output) {
             log::error!("render disable_connector: disable_output({connector}) failed: {e}");
             return Err(e);
         }
@@ -255,6 +256,9 @@ impl PlatformBackend {
         }
         if idx < self.first_pageflip_logged.len() {
             self.first_pageflip_logged.remove(idx);
+        }
+        if idx < self.scene_flip_timings.len() {
+            self.scene_flip_timings.remove(idx);
         }
         self.outputs.remove(idx);
 
@@ -664,8 +668,14 @@ impl PlatformBackend {
 
         // (Re)allocate the scanout pool if needed.
         let mut new_pool_committed_framebuffer = None;
+        #[cfg(test)]
+        let test_pool = self.test_scanout_pool_override.take();
+        #[cfg(not(test))]
+        let test_pool: Option<OutputScanout> = None;
         let mut new_pool: Option<Option<OutputScanout>> = if needs_pool_realloc {
-            if let Some((_prepared_route, pool)) = prepared_pool {
+            if let Some(pool) = test_pool {
+                Some(Some(pool))
+            } else if let Some((_prepared_route, pool)) = prepared_pool {
                 // Exact replay and live TEST_ONLY already completed while the
                 // previous topology was still active. Keep this dark-window
                 // path to the KMS commit and ownership installation only.
@@ -821,7 +831,8 @@ impl PlatformBackend {
 
         // Commit the modeset.  On failure, pool is freed (dropped below).
         if new_pool_committed_framebuffer.is_none()
-            && let Err(e) = crate::drm::modeset::commit_modeset(&device, &output, fb_for_commit)
+            && let Err(e) =
+                Rc::clone(&self.output_power_executor).enable(&device, &output, fb_for_commit)
         {
             log::error!(
                 "render enable_connector: commit_modeset for {connector} ({}×{}@{}) at ({x},{y}) failed: {e}",
@@ -983,6 +994,46 @@ impl PlatformBackend {
             layout.x = next_x;
             layout.y = 0;
             next_x = next_x.saturating_add(i32::from(layout.width));
+        }
+    }
+
+    /// Wait up to `timeout` for DRM events on `device_key`, without reading
+    /// them. Returns the fd to hand to the normal page-flip handler once
+    /// events are readable.
+    pub(crate) fn wait_drm_events_ready(
+        &self,
+        device_key: crate::platform::drm::DrmDeviceKey,
+        timeout: std::time::Duration,
+    ) -> io::Result<Option<std::os::fd::RawFd>> {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        let device = self.device_for_key(device_key).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no DRM device {device_key} to wait on"),
+            )
+        })?;
+        let ready = device
+            .page_flip_event_source
+            .wait_ready(&device.device, timeout)?;
+        Ok(ready.then(|| device.device.as_fd().as_raw_fd()))
+    }
+
+    /// Whether output `idx` still owes a page-flip event: a scene flip held
+    /// by its scanout pool or an accepted cursor-only commit on its CRTC.
+    pub(crate) fn output_owes_kms_event(&self, idx: usize) -> bool {
+        self.scanout_pools
+            .get(idx)
+            .and_then(Option::as_ref)
+            .is_some_and(|pool| pool.display_pool().has_pending_pageflip())
+            || self.cursor_atomic_event_pending_for_output(idx)
+    }
+
+    /// Distrust every buffer-age record of output `idx` after a modeset, as
+    /// [`Self::reset_scanout_bos_for_suspend`] does for all outputs.
+    pub(crate) fn invalidate_bo_generations_at(&mut self, idx: usize) {
+        for generation in self.bo_generations.get_mut(idx).into_iter().flatten() {
+            generation.last_present_generation = None;
+            generation.content_invalidated = true;
         }
     }
 

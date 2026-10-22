@@ -132,6 +132,39 @@ pub(crate) trait PageFlipEventSource {
         &self,
         device: &crate::drm::Device,
     ) -> io::Result<Option<(Vec<KernelPageFlip>, Vec<KernelCrtcSequence>)>>;
+
+    /// Wait up to `timeout` for events to become readable without reading
+    /// them, so the caller can deliver them through the normal handler.
+    fn wait_ready(
+        &self,
+        device: &crate::drm::Device,
+        timeout: std::time::Duration,
+    ) -> io::Result<bool> {
+        let mut poll_fd = libc::pollfd {
+            fd: device.as_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = i32::try_from(timeout.as_millis().max(1)).unwrap_or(i32::MAX);
+        // SAFETY: `poll_fd` is one initialized record for the duration of
+        // this bounded readiness wait.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        let error_events = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+        if poll_fd.revents & error_events != 0 {
+            return Err(io::Error::other(format!(
+                "DRM fd {} reported poll error flags 0x{:x} while waiting for events",
+                poll_fd.fd, poll_fd.revents
+            )));
+        }
+        Ok(ready > 0 && poll_fd.revents & libc::POLLIN != 0)
+    }
 }
 
 pub(crate) struct DrmPageFlipEventSource;
@@ -309,6 +342,19 @@ impl PageFlipEventSource for RecordingPageFlipEventSource {
             return Ok(None);
         }
         self.drain_events(device).map(Some)
+    }
+
+    fn wait_ready(
+        &self,
+        _device: &crate::drm::Device,
+        _timeout: std::time::Duration,
+    ) -> io::Result<bool> {
+        let delay = self.delayed_ready_checks.get();
+        if delay > 0 {
+            self.delayed_ready_checks.set(delay - 1);
+            return Ok(false);
+        }
+        Ok(!self.flips.borrow().is_empty() || !self.sequences.borrow().is_empty())
     }
 }
 

@@ -758,6 +758,8 @@ impl PlatformBackend {
             bo_generations,
             next_present_generation: 0,
             first_pageflip_logged,
+            #[cfg(test)]
+            test_scanout_pool_override: None,
             shutting_down: false,
         })
     }
@@ -899,6 +901,8 @@ impl PlatformBackend {
             next_present_generation: 0,
             first_pageflip_logged: vec![false],
             shutting_down: false,
+            #[cfg(test)]
+            test_scanout_pool_override: None,
         }
     }
 
