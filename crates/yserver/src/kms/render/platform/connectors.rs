@@ -210,7 +210,7 @@ impl PlatformBackend {
             return Err(e);
         }
 
-        self.remove_connector_at(idx);
+        self.remove_connector_at_scoped(idx, true);
 
         log::info!(
             "render disable_connector: {connector} disabled; fb now {}×{}",
@@ -237,6 +237,13 @@ impl PlatformBackend {
     }
 
     pub(super) fn remove_connector_at(&mut self, idx: usize) {
+        self.remove_connector_at_scoped(idx, false);
+    }
+
+    /// Remove output `idx`. With `per_crtc`, only the removed CRTC's cursor
+    /// state is dropped; the device's surviving CRTCs keep theirs (cursor
+    /// state is CRTC-keyed, so the index shift does not move it).
+    fn remove_connector_at_scoped(&mut self, idx: usize, per_crtc: bool) {
         let output_key = self.outputs[idx].key.clone();
         let changed_device = self.outputs[idx].key.device_key;
         let removed_crtc = self.outputs[idx].output.crtc;
@@ -275,7 +282,11 @@ impl PlatformBackend {
         self.fb_w = fb_w;
         self.fb_h = fb_h;
         self.prune_present_clocks_to_live_outputs();
-        self.refresh_cursor_topology_for_devices(&HashSet::from([changed_device]));
+        self.refresh_cursor_topology_scoped_with(
+            &HashSet::from([changed_device]),
+            per_crtc.then_some(removed_crtc),
+            initialize_cursor_plane_for_device,
+        );
     }
 
     fn resolve_connector_enable(
@@ -425,8 +436,9 @@ impl PlatformBackend {
         )
     }
 
-    /// [`Self::enable_connector`], installing `prepared_pool` instead of
-    /// allocating when the output needs a new pool.
+    /// [`Self::enable_connector`] for a per-CRTC RANDR change: installs
+    /// `prepared_pool` instead of allocating when the output needs a new
+    /// pool, and drops cursor state for this CRTC only.
     pub(crate) fn enable_connector_with_pool(
         &mut self,
         output_key: &OutputKey,
@@ -443,6 +455,7 @@ impl PlatformBackend {
             x,
             y,
             prepared_pool,
+            true,
             initialize_cursor_plane_for_device,
         )
     }
@@ -623,6 +636,7 @@ impl PlatformBackend {
             x,
             y,
             Some((scanout_route, pool)),
+            false,
             initialize_cursor_plane_for_device,
         )
     }
@@ -639,7 +653,16 @@ impl PlatformBackend {
     where
         F: FnMut(&mut KmsDevice, &[::drm::control::crtc::Handle], &str),
     {
-        self.enable_connector_inner(output_key, output, mode_spec, x, y, None, cursor_factory)
+        self.enable_connector_inner(
+            output_key,
+            output,
+            mode_spec,
+            x,
+            y,
+            None,
+            false,
+            cursor_factory,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -651,6 +674,7 @@ impl PlatformBackend {
         x: i32,
         y: i32,
         prepared_pool: Option<(ScanoutRoute, OutputScanout)>,
+        per_crtc: bool,
         mut cursor_factory: F,
     ) -> io::Result<()>
     where
@@ -959,7 +983,12 @@ impl PlatformBackend {
         // genuinely deferred device is intentionally skipped here so a
         // failure in the new lazy attempt cannot be retried twice at the same
         // boundary.
-        self.refresh_cursor_topology_for_devices_with(&changed_devices, &mut cursor_factory);
+        let installed_crtc = self.outputs[installed_idx].output.crtc;
+        self.refresh_cursor_topology_scoped_with(
+            &changed_devices,
+            per_crtc.then_some(installed_crtc),
+            &mut cursor_factory,
+        );
         self.initialize_headless_cursor_for_device_with(
             output_key.device_key,
             "first successful explicit RANDR enable",
