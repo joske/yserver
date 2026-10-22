@@ -316,10 +316,16 @@ fn define_cursor_rebind_routes_motion_to_bound_plane_during_vsync_direct_scanout
     }
 
     finish_held_direct_cursor_test(&mut backend, &mut state, &recorder, WINDOW, 90, Some(1));
+    // The unflip's fresh scene frames retire the scene's cursor state: the
+    // plane bound on output 0 during direct scanout is hidden there.
+    assert_eq!(
+        hide_executor.calls(),
+        [backend.platform.outputs[0].output.crtc]
+    );
     let mut expected = vec![AtomicCommitKind::Scene];
     expected.extend([AtomicCommitKind::CursorOnly; 10]);
     expected.push(AtomicCommitKind::SceneWithCursor);
-    expected.extend([AtomicCommitKind::SceneWithCursor; 2]);
+    expected.extend([AtomicCommitKind::Scene, AtomicCommitKind::SceneWithCursor]);
     assert_commit_sequence(&recorder, &expected);
     backend.platform.wait_idle_bounded();
 }
