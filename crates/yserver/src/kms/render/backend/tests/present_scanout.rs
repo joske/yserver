@@ -1462,9 +1462,13 @@ fn direct_scanout_topology_compares_precise_fractional_timings() {
     b.platform.outputs[1].output.picked = timing;
     assert!(b.direct_scanout_topology_eligible());
 
-    // Both modes round to the same advertised integer refresh, but their
-    // pixel-clock ratios differ. The grouped path must not conflate them.
+    // 60 vs 59.94 Hz: two "60 Hz" monitors, within the grouping tolerance.
     b.platform.outputs[1].output.picked.clock_khz = 148_352;
+    assert!(b.direct_scanout_topology_eligible());
+
+    // The advertised integer still says 60, but the kernel timing is 50 Hz.
+    // The grouped path must go by the timing, not the integer.
+    b.platform.outputs[1].output.picked.clock_khz = 123_750;
     assert!(
         !b.direct_scanout_topology_eligible(),
         "same integer vrefresh is insufficient when kernel timing is available"
@@ -1497,6 +1501,41 @@ fn direct_scanout_refresh_comparison_accounts_for_scan_multipliers() {
         !crate::kms::render::backend::effective_refresh_matches(&base, &adjusted),
         "vscan > 1 divides the effective refresh"
     );
+}
+
+#[test]
+fn direct_scanout_refresh_comparison_groups_near_equal_rates_only() {
+    // 1680x1050 CVT-RB, 119.0 MHz / (1840 * 1080) = 59.883 Hz.
+    let reduced = crate::platform::drm::Mode {
+        clock_khz: 119_000,
+        htotal: 1840,
+        vtotal: 1080,
+        vscan: 1,
+        ..Default::default()
+    };
+    // 1680x1050 CVT, 146.25 MHz / (2240 * 1089) = 59.954 Hz.
+    let cvt = crate::platform::drm::Mode {
+        clock_khz: 146_250,
+        htotal: 2240,
+        vtotal: 1089,
+        vscan: 1,
+        ..Default::default()
+    };
+    assert!(crate::kms::render::backend::effective_refresh_matches(
+        &reduced, &cvt
+    ));
+    // 1680x1050@75: 187.0 MHz / (2272 * 1099) = 74.892 Hz.
+    let seventy_five = crate::platform::drm::Mode {
+        clock_khz: 187_000,
+        htotal: 2272,
+        vtotal: 1099,
+        vscan: 1,
+        ..Default::default()
+    };
+    assert!(!crate::kms::render::backend::effective_refresh_matches(
+        &cvt,
+        &seventy_five
+    ));
 }
 
 #[test]

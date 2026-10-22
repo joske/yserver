@@ -1651,10 +1651,10 @@ impl KmsBackend {
     /// all-output direct transaction.
     ///
     /// One atomic request cannot cross DRM devices. Even on one card, grouping
-    /// heterogeneous-refresh CRTCs makes replacement retirement wait for the
-    /// slowest CRTC; keep those layouts on the normal per-output composed path
-    /// so each output retains its native cadence. A future direct path can
-    /// relax this only with per-output authoritative sources and lifetimes.
+    /// CRTCs of clearly different refresh makes replacement retirement wait for
+    /// the slowest CRTC; keep those layouts on the normal per-output composed
+    /// path so each output retains its native cadence. Rates within 0.5% (two
+    /// "60 Hz" monitors) are grouped, like Xorg's multi-CRTC flip.
     pub(in crate::kms::render::backend) fn direct_scanout_topology_eligible(&self) -> bool {
         let Some(primary) = self.platform.primary_device() else {
             return false;

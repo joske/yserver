@@ -141,10 +141,17 @@ pub(in crate::kms::render::backend) fn mode_timing(
     })
 }
 
-/// Compare the effective vertical rates without collapsing fractional timings
-/// to `Mode::vrefresh`'s integer. Kernel mode refresh is pixel clock divided by
-/// horizontal and vertical totals, doubled for interlace and halved for
-/// doublescan. Synthetic/test modes fall back to the advertised integer rate.
+/// Whether two effective vertical rates are within 0.5% of each other, without
+/// collapsing fractional timings to `Mode::vrefresh`'s integer. Kernel mode
+/// refresh is pixel clock divided by horizontal and vertical totals, doubled
+/// for interlace and halved for doublescan. Synthetic/test modes fall back to
+/// the advertised integer rate.
+///
+/// Two "60 Hz" monitors rarely share exact timings (59.883 vs 59.954 Hz for
+/// two 1680x1050 modes); their vblanks drift a frame apart every ~14 s, which
+/// a grouped commit absorbs as an occasional late flip, as Xorg's multi-CRTC
+/// flip does. A real mismatch (60 vs 75 or 144 Hz) would hold the faster
+/// output to the slower one's cadence, so it stays excluded.
 pub(in crate::kms::render::backend) fn effective_refresh_matches(
     a: &crate::platform::drm::Mode,
     b: &crate::platform::drm::Mode,
@@ -171,7 +178,10 @@ pub(in crate::kms::render::backend) fn effective_refresh_matches(
     }
 
     match (ratio(a), ratio(b)) {
-        (Some((a_num, a_den)), Some((b_num, b_den))) => a_num * b_den == b_num * a_den,
+        (Some((a_num, a_den)), Some((b_num, b_den))) => {
+            let (a, b) = (a_num * b_den, b_num * a_den);
+            a.abs_diff(b) * 200 <= a.max(b)
+        }
         _ => a.vrefresh == b.vrefresh,
     }
 }
