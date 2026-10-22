@@ -126,6 +126,23 @@ impl SceneCompositor {
             .unwrap_or_default()
     }
 
+    /// Test-only: make every compose of `output_idx` report at most `limit`
+    /// draws recorded, as an exhausted descriptor pool does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_compose_descriptor_limit_for_tests(
+        &mut self,
+        output_idx: usize,
+        limit: Option<usize>,
+    ) {
+        if let Some(output) = self
+            .inner
+            .as_mut()
+            .and_then(|inner| inner.outputs.get_mut(output_idx))
+        {
+            output.test_compose_descriptor_sets = limit;
+        }
+    }
+
     /// Test-only: force [`has_pending_page_flips`](Self::has_pending_page_flips)
     /// without a live output/`PendingAck` queue.
     #[cfg(any(test, feature = "test-support"))]

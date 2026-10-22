@@ -142,7 +142,8 @@ impl OutputSink for PlatformBackend {
                 // The caller commits every deferred frame in one transaction
                 // and then installs the accepted event identity on the ack.
                 let result = render_shared_scanout_frame(bo, record).map(|(submit, _, _)| {
-                    self.deferred_scene_flips.push((output_idx, bo_idx));
+                    self.deferred_scene_flips
+                        .push((output_idx, bo_idx, submit.is_complete()));
                     FrameHandoff::FlipPending {
                         submit,
                         event_id: None,

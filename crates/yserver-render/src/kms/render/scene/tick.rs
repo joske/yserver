@@ -9,8 +9,8 @@ use crate::kms::{
             TickSkipReason, Visibility,
             build::build_scene_with,
             compose::{
-                compose_submit_was_complete, present_error_is_device_lost,
-                record_and_submit_render, stage_submitted_frame, vk_result_is_device_lost,
+                present_error_is_device_lost, record_and_submit_render, stage_submitted_frame,
+                vk_result_is_device_lost,
             },
             cursor::{
                 cursor_damage_for_frame, cursorless_hide_frame_required, derive_cursor_transition,
@@ -1246,8 +1246,10 @@ fn tick_one_output(
             &[],
         )
     };
+    #[cfg(any(test, feature = "test-support"))]
+    let descriptor_limit = inner.outputs[output_idx].test_compose_descriptor_sets;
     let mut record = |target: &mut dyn ComposeRenderTarget| {
-        record_and_submit_render(
+        let submit = record_and_submit_render(
             &inner.vk,
             target,
             &inner.pipeline,
@@ -1262,7 +1264,10 @@ fn tick_one_output(
             xor_layout,
             scale_pass.as_ref(),
             cursor_save,
-        )
+        );
+        #[cfg(any(test, feature = "test-support"))]
+        let submit = submit.map(|submit| submit.capped(descriptor_limit));
+        submit
     };
     let (render_result, previous_gpu_ns, copied_prepare_failed) =
         match sink.finish_frame(output_idx, token.bo_idx, &mut record) {
@@ -1274,8 +1279,7 @@ fn tick_one_output(
             } => (
                 result.map(|handoff| match handoff {
                     FrameHandoff::FlipPending { submit, event_id } => {
-                        compose_complete =
-                            compose_submit_was_complete(submit, render_scene.draws.len());
+                        compose_complete = submit.is_complete();
                         Handoff::Flipped(event_id)
                     }
                     FrameHandoff::RenderCompletion(completion) => Handoff::Render(completion),

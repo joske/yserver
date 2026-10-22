@@ -523,10 +523,12 @@ pub struct PlatformBackend {
     /// The backend consumes this to keep tearing's fallback diagnostic once.
     pub(crate) scene_cursor_hide_failed: bool,
     /// While set, a shared scene frame is rendered and its fence exported but
-    /// not committed: `(output_idx, bo_idx)` is recorded in
+    /// not committed: `(output_idx, bo_idx, complete)` is recorded in
     /// `deferred_scene_flips` for one grouped commit by the caller.
+    /// `complete` is false when the compose recorded only a prefix of the
+    /// scene (descriptor pool exhausted); such a frame must not be flipped.
     pub(crate) defer_scene_flips: bool,
-    pub(crate) deferred_scene_flips: Vec<(usize, usize)>,
+    pub(crate) deferred_scene_flips: Vec<(usize, usize, bool)>,
 
     // Input side
     input_ctx: Option<crate::input::SendContext>,

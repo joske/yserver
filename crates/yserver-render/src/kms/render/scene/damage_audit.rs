@@ -4,9 +4,7 @@ use crate::kms::{
             ComposeRenderTarget, CursorEntry, DamageAuditEpisodeStart, DamageAuditLedgerEntry,
             DamageAuditTarget, OutputDamageAudit, OutputLayout, OutputRoute, OutputSink, Repaint,
             SceneBuild, SceneCompositor, SceneCompositorInner, SceneError, SceneInput, Visibility,
-            build::build_scene,
-            compose::{compose_submit_was_complete, record_and_submit_render},
-            output_transform,
+            build::build_scene, compose::record_and_submit_render, output_transform,
         },
         store::{DrawableStore, RegionSet},
     },
@@ -845,7 +843,7 @@ fn submit_audit_compose(
     }
     let submitted = result?;
     wait?;
-    Ok(compose_submit_was_complete(submitted, scene.draws.len()))
+    Ok(submitted.is_complete())
 }
 
 pub(super) fn create_audit_descriptor_pool(

@@ -43,18 +43,20 @@ fn damage_audit_attribution_filters_to_episode_event_range() {
 
 #[test]
 fn damage_audit_partial_compose_is_detectable() {
-    assert!(compose_submit_was_complete(
+    assert!(
         ComposeSubmit {
-            descriptor_count: 4
-        },
-        4
-    ));
-    assert!(!compose_submit_was_complete(
-        ComposeSubmit {
-            descriptor_count: 3
-        },
-        4
-    ));
+            descriptor_count: 4,
+            draw_count: 4,
+        }
+        .is_complete()
+    );
+    assert!(
+        !ComposeSubmit {
+            descriptor_count: 3,
+            draw_count: 4,
+        }
+        .is_complete()
+    );
 }
 
 #[test]

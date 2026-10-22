@@ -24,10 +24,6 @@ pub(super) fn vk_result_is_device_lost(result: vk::Result) -> bool {
     result == vk::Result::ERROR_DEVICE_LOST
 }
 
-pub(super) fn compose_submit_was_complete(submitted: ComposeSubmit, draw_count: usize) -> bool {
-    submitted.descriptor_count == draw_count
-}
-
 /// Step 3's staging, gated on the submit having recorded every draw.
 ///
 /// A truncated submit (descriptor pool exhausted, `record_command_buffer` drew
@@ -187,6 +183,7 @@ pub(super) fn record_and_submit_render<T: ComposeRenderTarget + ?Sized>(
     }
     Ok(ComposeSubmit {
         descriptor_count: descriptors.len(),
+        draw_count: scene.draws.len(),
     })
 }
 

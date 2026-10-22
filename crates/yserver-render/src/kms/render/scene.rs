@@ -333,6 +333,10 @@ pub struct PreparedOutputs(Option<Vec<OutputSceneState>>);
 
 struct OutputSceneState {
     output_idx: usize,
+    /// Test-only: the most draws a compose of this output reports recorded,
+    /// standing in for an exhausted descriptor pool (drivers over-allocate).
+    #[cfg(any(test, feature = "test-support"))]
+    test_compose_descriptor_sets: Option<usize>,
     damage_audit: Option<OutputDamageAudit>,
     pool_ring: CompositePoolRing,
     /// Slots map: pending_ack[i] is using descriptor-pool slot
@@ -1014,6 +1018,25 @@ enum Repaint {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ComposeSubmit {
     descriptor_count: usize,
+    draw_count: usize,
+}
+
+impl ComposeSubmit {
+    /// Whether every draw of the scene was recorded. Descriptor allocation
+    /// `break`s on pool exhaustion and the recorder draws only the allocated
+    /// prefix, so an incomplete frame painted less than its scene.
+    pub fn is_complete(self) -> bool {
+        self.descriptor_count == self.draw_count
+    }
+
+    /// Test-only: report at most `limit` draws recorded.
+    #[cfg(any(test, feature = "test-support"))]
+    fn capped(self, limit: Option<usize>) -> Self {
+        Self {
+            descriptor_count: limit.map_or(self.descriptor_count, |n| self.descriptor_count.min(n)),
+            ..self
+        }
+    }
 }
 
 /// The root as a node of the walk: its place is its storage rect at the

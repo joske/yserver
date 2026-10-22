@@ -413,3 +413,33 @@ fn fresh_unflip_copied_output_uses_retained_unflip() {
     drain_present_notifications(&mut fixture, &[], &[direct.candidate.present_id]);
     fixture.finish_after_normal_drain();
 }
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: commit the fresh frames although one output's compose was truncated.
+fn fresh_unflip_incomplete_compose_falls_back_to_retained_frames() {
+    let Some((mut fixture, direct)) = enter_direct_over_stale_frame(2, 305) else {
+        return;
+    };
+    let device_fd = fd(&fixture);
+    let retained = retained_framebuffers(&fixture);
+    request_unflip(&mut fixture, &direct);
+    // Output 1's fresh compose runs out of descriptor sets before its first
+    // draw, so it records only a prefix of the scene.
+    fixture
+        .events
+        .backend
+        .scene
+        .set_compose_descriptor_limit_for_tests(1, Some(0));
+    let offset = record_count(&fixture, device_fd);
+    Backend::maybe_composite(&mut fixture.events.backend).expect("unflip through Backend");
+    fixture
+        .events
+        .backend
+        .scene
+        .set_compose_descriptor_limit_for_tests(1, None);
+    let attempts = records_since(&fixture, device_fd, offset);
+    assert_eq!(attempts.len(), 1, "no fresh grouped commit: {attempts:?}");
+    assert_fell_back_to_retained_unflip(&mut fixture, &direct, &retained, &attempts, &[0, 1]);
+    fixture.finish_after_normal_drain();
+}

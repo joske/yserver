@@ -1187,11 +1187,16 @@ impl KmsBackend {
         self.platform.defer_scene_flips = false;
         let deferred = std::mem::take(&mut self.platform.deferred_scene_flips);
         let output_count = self.platform.outputs.len();
+        let incomplete: Vec<_> = deferred
+            .iter()
+            .filter(|&&(_, _, complete)| !complete)
+            .map(|&(output_idx, _, _)| output_idx)
+            .collect();
         let targets: Option<Vec<_>> = (0..output_count)
             .map(|output_idx| {
-                let mut frames = deferred.iter().filter(|&&(out, _)| out == output_idx);
+                let mut frames = deferred.iter().filter(|&&(out, _, _)| out == output_idx);
                 match (frames.next(), frames.next()) {
-                    (Some(&(_, bo_idx)), None) => {
+                    (Some(&(_, bo_idx, _)), None) => {
                         self.platform.deferred_scene_flip_target(output_idx, bo_idx)
                     }
                     _ => None,
@@ -1199,6 +1204,11 @@ impl KmsBackend {
             })
             .collect();
         let result = match targets {
+            // A truncated compose painted only a prefix of the scene: never
+            // flip it, the retained frames are whole.
+            Some(_) if !incomplete.is_empty() => Err(io::Error::other(format!(
+                "incomplete compose on outputs {incomplete:?}"
+            ))),
             Some(targets) => self.commit_fresh_composed_unflip(&targets),
             None => Err(io::Error::other(format!(
                 "composed {} of {output_count} outputs",
@@ -1206,7 +1216,7 @@ impl KmsBackend {
             ))),
         };
         let accepted_event_id = result.as_ref().ok().copied();
-        for &(output_idx, bo_idx) in &deferred {
+        for &(output_idx, bo_idx, _) in &deferred {
             self.platform.settle_deferred_scene_flip(
                 output_idx,
                 bo_idx,
@@ -1214,11 +1224,23 @@ impl KmsBackend {
             );
             match accepted_event_id {
                 Some(event_id) => {
-                    self.scene.accept_deferred_flip(output_idx, event_id);
+                    if !self.scene.accept_deferred_flip(output_idx, event_id) {
+                        log::error!(
+                            "scanout_m2: fresh composed unflip committed output {output_idx} \
+                             but the scene has no deferred frame to accept event {event_id}"
+                        );
+                    }
                 }
                 None => {
-                    self.scene
-                        .abandon_deferred_flip(output_idx, &mut self.platform);
+                    if !self
+                        .scene
+                        .abandon_deferred_flip(output_idx, &mut self.platform)
+                    {
+                        log::error!(
+                            "scanout_m2: fresh composed unflip found no deferred scene frame \
+                             to abandon on output {output_idx}"
+                        );
+                    }
                 }
             }
         }

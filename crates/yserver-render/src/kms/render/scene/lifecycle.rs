@@ -168,6 +168,8 @@ impl SceneCompositor {
         let bo_depth = sink.slot_count(i).unwrap_or(3);
         Ok(OutputSceneState {
             output_idx: i,
+            #[cfg(any(test, feature = "test-support"))]
+            test_compose_descriptor_sets: None,
             damage_audit: build_output_damage_audit(
                 vk,
                 vk::Extent2D {
