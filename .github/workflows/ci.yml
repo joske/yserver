@@ -9,7 +9,9 @@ env:
   CARGO_TERM_COLOR: always
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # 26.04 for its Mesa: older lavapipe lacks the extensions the scanout
+    # tests need, and those tests then skip silently (see the lavapipe step).
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -122,6 +124,18 @@ jobs:
           ./target/debug/yserver --version | grep -q feedfacefeed \
             || { echo "stale stamp — rerun-if-env-changed missing:"; \
                  ./target/debug/yserver --version; exit 1; }
+      - name: Check lavapipe has the scanout-test extensions
+        # The commit-identity, unflip, tearing and cursor-sprite tests need
+        # SYNC_FD export and DRM format modifiers; without them they report
+        # `ok` while skipping. Fail here instead of passing vacuously.
+        if: matrix.name == 'xdmcp'
+        run: |
+          set -eu
+          vulkaninfo 2>/dev/null > "$RUNNER_TEMP/vulkaninfo.txt" || true
+          grep -m1 -E "driverName|deviceName" "$RUNNER_TEMP/vulkaninfo.txt" || true
+          for ext in VK_KHR_external_semaphore_fd VK_EXT_image_drm_format_modifier; do
+            grep -q "$ext" "$RUNNER_TEMP/vulkaninfo.txt" || { echo "lavapipe lacks $ext"; exit 1; }
+          done
       - name: Run software-Vulkan render tests (lavapipe)
         # GPU-less runner: Mesa's lavapipe is the only Vulkan ICD, so
         # the `#[ignore = "needs live Vulkan ICD"]` render tests run on
