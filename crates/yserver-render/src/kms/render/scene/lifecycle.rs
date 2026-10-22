@@ -368,109 +368,197 @@ impl SceneCompositor {
         sink.clear_render_completions();
         let vk = inner.vk.clone();
         for (output_idx, o) in inner.outputs.iter_mut().enumerate() {
-            // B.2-context fix (codex audit followup): wait for any
-            // in-flight compose fences before resetting their
-            // descriptor-pool slots. `disable_output` runs
-            // device_wait_idle later, but we hit
-            // vkResetDescriptorPool BEFORE that wait. Wait on each
-            // ack's ticket here to keep VUID-vkResetDescriptorPool-
-            // descriptorPool-00313 satisfied during teardown too.
-            let mut retained_acks = VecDeque::with_capacity(o.pending_acks.len());
-            let mut retained_slots = VecDeque::with_capacity(o.pool_slots.len());
-            while let Some(ack) = o.pending_acks.pop_front() {
-                let slot = o.pool_slots.pop_front();
-                let wait_ok = ack
-                    .ticket
-                    .as_ref()
-                    .is_none_or(|ticket| match ticket.wait(&vk) {
-                        Ok(()) => true,
-                        Err(error) => {
-                            log::error!(
-                                "render scene drain: output {output_idx} compose fence wait \
-                                 failed: {error:?}; retaining resources for quarantine"
-                            );
-                            sink.gpu_mut().renderer_failed = true;
-                            false
-                        }
-                    });
-                if wait_ok {
-                    if let Some(slot) = slot {
-                        o.pool_ring.release(slot);
-                    }
-                } else {
-                    retained_acks.push_back(ack);
-                    if let Some(slot) = slot {
-                        retained_slots.push_back(slot);
-                    }
-                }
-            }
-            retained_slots.append(&mut o.pool_slots);
-            o.pending_acks = retained_acks;
-            o.pool_slots = retained_slots;
-            // Step 3 — this pops every ack, and retains any whose fence wait
-            // failed, so a staged frame can be discarded or left half-retired.
-            // Invalidating is consistent with both, and it is also how suspend,
-            // DPMS off/on and the topology quiesce get covered: all three run
-            // `drain_all` first.
-            o.damage.invalidate();
-            let pending_pool_releases = &mut o.pending_pool_releases;
-            let failed_submit_bos = &mut o.failed_submit_bos;
-            let pool_ring = &mut o.pool_ring;
-            let mut wait_failed = false;
-            let mut recovery_failed = false;
-            drain_deferred_scene_resources(
-                pending_pool_releases,
-                failed_submit_bos,
-                |ticket| match ticket.wait(&vk) {
-                    Ok(()) => true,
-                    Err(error) => {
-                        log::error!(
-                            "render scene drain: deferred compose fence wait failed: \
-                             {error:?}; retaining resources for quarantine"
-                        );
-                        wait_failed = true;
-                        false
-                    }
-                },
-                |release| match release {
-                    DeferredSceneRelease::PoolSlot(slot) => {
-                        pool_ring.release(slot);
-                        true
-                    }
-                    DeferredSceneRelease::FailedSubmit { bo_idx, pool_slot } => {
-                        match sink.recycle_failed_slot(output_idx, bo_idx) {
-                            Ok(()) => {
-                                pool_ring.release(pool_slot);
-                                true
-                            }
-                            Err(error) => {
-                                log::error!(
-                                    "render scene drain: failed to recover output {output_idx} \
-                                     bo {bo_idx}: {error}"
-                                );
-                                recovery_failed = true;
-                                false
-                            }
-                        }
-                    }
-                },
-            );
-            if wait_failed || recovery_failed {
-                sink.gpu_mut().renderer_failed = true;
-            }
-            // Stage 5 Phase D' — global recovery: reset every
-            // output's cursor mode to Hidden. The post-recovery
-            // first compose re-decides via build_scene's
-            // strategy. cursor_prev_pos is also cleared so the
-            // next frame doesn't damage a stale trail rect.
-            reset_cursor_mode_for_lifecycle(&mut o.last_frame_cursor_mode);
-            o.cursor_prev_pos = None;
-            o.last_present_cursor_rect = None;
-            o.last_present_cursor_version = None;
-            reset_cursor_retry_for_lifecycle(&mut o.force_show_retry_version);
+            drain_output_state(o, output_idx, &vk, sink);
         }
         // Hide the plane everywhere + invalidate uploaded_version.
         // Best-effort; the platform hook logs per-CRTC failures.
         let _ = sink.cursor_plane_mut().hide_all();
     }
+
+    /// [`Self::drain_all`] for one output: wait its compose fences, release
+    /// its descriptor slots and reset its cursor lifecycle state. The caller
+    /// has retired every page flip this output owed, so no acknowledgement
+    /// popped here still has a KMS event outstanding. Leaves the cursor plane
+    /// and every other output untouched.
+    pub fn drain_output(&mut self, sink: &mut dyn OutputSink, output_idx: usize) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let vk = inner.vk.clone();
+        if let Some(o) = inner.outputs.get_mut(output_idx) {
+            drain_output_state(o, output_idx, &vk, sink);
+        }
+    }
+
+    /// Replace output `output_idx`'s state with a fresh one built for
+    /// `layouts[output_idx]`, or append it when `output_idx` is one past the
+    /// last output. The caller drained that output first; every other output
+    /// keeps its state, pending acknowledgements included.
+    ///
+    /// # Errors
+    ///
+    /// The output's descriptor pools, damage audit or intermediate could not
+    /// be created; the old state is then left in place.
+    pub fn rebuild_output(
+        &mut self,
+        sink: &dyn OutputSink,
+        layouts: &[OutputLayout],
+        output_idx: usize,
+    ) -> Result<(), SceneError> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(());
+        };
+        if output_idx > inner.outputs.len() || output_idx >= layouts.len() {
+            return Err(SceneError::OutputIndex(output_idx));
+        }
+        let state = Self::build_output_state(&inner.vk, sink, layouts, output_idx)?;
+        let vk = inner.vk.clone();
+        if let Some(old) = inner.outputs.get_mut(output_idx) {
+            release_intermediate(old, &vk);
+            *old = state;
+        } else {
+            inner.outputs.push(state);
+        }
+        if let Some(readback) = inner.root_readbacks.get_mut(output_idx) {
+            *readback = None;
+        }
+        ensure_intermediates(inner, layouts)?;
+        self.note_structure_change();
+        self.root_overlay_clear();
+        Ok(())
+    }
+
+    /// Remove output `output_idx`, shifting every later output down one
+    /// slot together with its pending acknowledgements, exactly as the
+    /// platform removes the matching scanout pool. The caller drained that
+    /// output first.
+    pub fn remove_output(&mut self, output_idx: usize) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        if output_idx >= inner.outputs.len() {
+            return;
+        }
+        let vk = inner.vk.clone();
+        let mut removed = inner.outputs.remove(output_idx);
+        release_intermediate(&mut removed, &vk);
+        drop(removed);
+        for (idx, o) in inner.outputs.iter_mut().enumerate().skip(output_idx) {
+            o.output_idx = idx;
+        }
+        if output_idx < inner.root_readbacks.len() {
+            inner.root_readbacks.remove(output_idx);
+        }
+        self.note_structure_change();
+        self.root_overlay_clear();
+    }
+}
+
+/// One output's share of [`SceneCompositor::drain_all`].
+fn drain_output_state(
+    o: &mut OutputSceneState,
+    output_idx: usize,
+    vk: &crate::kms::vk::device::VkContext,
+    sink: &mut dyn OutputSink,
+) {
+    // B.2-context fix (codex audit followup): wait for any
+    // in-flight compose fences before resetting their
+    // descriptor-pool slots. `disable_output` runs
+    // device_wait_idle later, but we hit
+    // vkResetDescriptorPool BEFORE that wait. Wait on each
+    // ack's ticket here to keep VUID-vkResetDescriptorPool-
+    // descriptorPool-00313 satisfied during teardown too.
+    let mut retained_acks = VecDeque::with_capacity(o.pending_acks.len());
+    let mut retained_slots = VecDeque::with_capacity(o.pool_slots.len());
+    while let Some(ack) = o.pending_acks.pop_front() {
+        let slot = o.pool_slots.pop_front();
+        let wait_ok = ack
+            .ticket
+            .as_ref()
+            .is_none_or(|ticket| match ticket.wait(vk) {
+                Ok(()) => true,
+                Err(error) => {
+                    log::error!(
+                        "render scene drain: output {output_idx} compose fence wait \
+                         failed: {error:?}; retaining resources for quarantine"
+                    );
+                    sink.gpu_mut().renderer_failed = true;
+                    false
+                }
+            });
+        if wait_ok {
+            if let Some(slot) = slot {
+                o.pool_ring.release(slot);
+            }
+        } else {
+            retained_acks.push_back(ack);
+            if let Some(slot) = slot {
+                retained_slots.push_back(slot);
+            }
+        }
+    }
+    retained_slots.append(&mut o.pool_slots);
+    o.pending_acks = retained_acks;
+    o.pool_slots = retained_slots;
+    // Step 3 — this pops every ack, and retains any whose fence wait
+    // failed, so a staged frame can be discarded or left half-retired.
+    // Invalidating is consistent with both, and it is also how suspend,
+    // DPMS off/on and the topology quiesce get covered: all three run
+    // `drain_all` first.
+    o.damage.invalidate();
+    let pending_pool_releases = &mut o.pending_pool_releases;
+    let failed_submit_bos = &mut o.failed_submit_bos;
+    let pool_ring = &mut o.pool_ring;
+    let mut wait_failed = false;
+    let mut recovery_failed = false;
+    drain_deferred_scene_resources(
+        pending_pool_releases,
+        failed_submit_bos,
+        |ticket| match ticket.wait(vk) {
+            Ok(()) => true,
+            Err(error) => {
+                log::error!(
+                    "render scene drain: deferred compose fence wait failed: \
+                     {error:?}; retaining resources for quarantine"
+                );
+                wait_failed = true;
+                false
+            }
+        },
+        |release| match release {
+            DeferredSceneRelease::PoolSlot(slot) => {
+                pool_ring.release(slot);
+                true
+            }
+            DeferredSceneRelease::FailedSubmit { bo_idx, pool_slot } => {
+                match sink.recycle_failed_slot(output_idx, bo_idx) {
+                    Ok(()) => {
+                        pool_ring.release(pool_slot);
+                        true
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "render scene drain: failed to recover output {output_idx} \
+                             bo {bo_idx}: {error}"
+                        );
+                        recovery_failed = true;
+                        false
+                    }
+                }
+            }
+        },
+    );
+    if wait_failed || recovery_failed {
+        sink.gpu_mut().renderer_failed = true;
+    }
+    // Stage 5 Phase D' — global recovery: reset every
+    // output's cursor mode to Hidden. The post-recovery
+    // first compose re-decides via build_scene's
+    // strategy. cursor_prev_pos is also cleared so the
+    // next frame doesn't damage a stale trail rect.
+    reset_cursor_mode_for_lifecycle(&mut o.last_frame_cursor_mode);
+    o.cursor_prev_pos = None;
+    o.last_present_cursor_rect = None;
+    o.last_present_cursor_version = None;
+    reset_cursor_retry_for_lifecycle(&mut o.force_show_retry_version);
 }

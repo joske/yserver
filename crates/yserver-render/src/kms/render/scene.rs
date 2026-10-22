@@ -896,6 +896,8 @@ pub enum SceneError {
     Present(PresentError),
     #[error("output {0} is transformed but has no intermediate")]
     NoIntermediate(usize),
+    #[error("output {0} is not a live or next output slot")]
+    OutputIndex(usize),
 }
 
 impl From<PresentError> for SceneError {
