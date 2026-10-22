@@ -565,6 +565,12 @@ impl RecordingSceneFixture {
         }
     }
 
+    /// Free these pixmaps with the fixture's own at the end of
+    /// [`Self::finish_after_normal_drain`].
+    pub(crate) fn adopt_drawables(&mut self, xids: impl IntoIterator<Item = u32>) {
+        self.extra_drawables.extend(xids);
+    }
+
     pub(crate) fn finish(self) {
         let super::support::AtomicEventFixture { mut backend, .. } = self.events;
         // XBackend drops PlatformBackend before SceneCompositor. Hold the
@@ -752,75 +758,26 @@ pub(in crate::kms::render::backend::tests) fn build_recording_scene_backend(
         .bo_generations
         .resize_with(output_count, Vec::new);
 
-    let vk = Arc::clone(
-        backend
-            .platform
-            .gpu
-            .vk
-            .as_ref()
-            .expect("Vk-backed test fixture has a context"),
-    );
     for output_idx in 0..output_count {
         let width = u32::from(backend.platform.outputs[output_idx].width);
         let height = u32::from(backend.platform.outputs[output_idx].height);
         let route = backend.platform.outputs[output_idx].scanout_route;
         let key = backend.platform.outputs[output_idx].key.clone();
-        let drm = std::rc::Rc::clone(
-            &backend
-                .platform
-                .device_for_key(key.device_key)
-                .expect("test output has a KMS device")
-                .device,
-        );
         let output = &mut backend.platform.outputs[output_idx].output;
         set_scene_fence_properties(output);
         set_unique_direct_plane_properties(output);
-
-        let mut bos = Vec::with_capacity(3);
-        for bo_idx in 0..3 {
-            let xid = 0x6a00
-                + u32::try_from(output_idx).expect("output index fits") * 0x10
-                + u32::try_from(bo_idx).expect("BO index fits");
-            let storage = backend
-                .platform
-                .gpu
-                .allocate_drawable_storage(
-                    u16::try_from(width).expect("test width fits"),
-                    u16::try_from(height).expect("test height fits"),
-                    32,
-                )
-                .map_err(|error| format!("test target image allocation failed: {error:?}"))?;
-            let image = storage.image;
-            let image_view = storage.image_view;
-            backend
-                .store
-                .allocate(
-                    xid,
-                    crate::kms::render::store::DrawableKind::Pixmap,
-                    32,
-                    false,
-                    storage,
-                )
-                .map_err(|error| format!("test target storage registration failed: {error:?}"))?;
-            let mut bo = ScanoutBo::for_tests_compose_target(
-                Arc::clone(&vk),
-                std::rc::Rc::clone(&drm),
-                raw(0x5200 + u32::try_from(output_idx * 2 + bo_idx).expect("test BO handle fits")),
-                width,
-                height,
-                image,
-                image_view,
-            )
-            .map_err(|error| format!("test compose BO allocation failed: {error}"))?;
-            if bo_idx == 0 {
-                bo.state.phase = BoPhase::OnScreen;
-            }
-            bos.push(bo);
-        }
-        let pool = ScanoutBoPool::for_tests_recording_pool(route, width, height, bos);
+        let index = u32::try_from(output_idx).expect("output index fits");
+        let pool = recording_scanout_pool(
+            &mut backend,
+            &key,
+            route,
+            (width, height),
+            0x6a00 + index * 0x10,
+            0x5200 + index * 2,
+        )?;
         backend.platform.bo_generations[output_idx] =
             vec![crate::kms::render::platform::BoGenerationEntry::default(); 2];
-        backend.platform.scanout_pools[output_idx] = Some(OutputScanout::Shared(pool));
+        backend.platform.scanout_pools[output_idx] = Some(pool);
     }
     for output in &backend.platform.outputs {
         backend
@@ -830,6 +787,75 @@ pub(in crate::kms::render::backend::tests) fn build_recording_scene_backend(
     }
     backend.refresh_present_crtc_clock_epochs();
     Ok(Some(backend))
+}
+
+/// Three Vulkan-backed compose BOs with synthetic framebuffer handles
+/// `fb_base..fb_base + 3`, their images registered as pixmaps `xid_base..`.
+/// The first BO starts on screen.
+pub(in crate::kms::render::backend::tests) fn recording_scanout_pool(
+    backend: &mut KmsBackend,
+    key: &crate::kms::backend::OutputKey,
+    route: crate::kms::scanout_route::ScanoutRoute,
+    (width, height): (u32, u32),
+    xid_base: u32,
+    fb_base: u32,
+) -> Result<OutputScanout, String> {
+    let vk = Arc::clone(
+        backend
+            .platform
+            .gpu
+            .vk
+            .as_ref()
+            .expect("Vk-backed test fixture has a context"),
+    );
+    let drm = std::rc::Rc::clone(
+        &backend
+            .platform
+            .device_for_key(key.device_key)
+            .expect("test output has a KMS device")
+            .device,
+    );
+    let mut bos = Vec::with_capacity(3);
+    for bo_idx in 0..3 {
+        let storage = backend
+            .platform
+            .gpu
+            .allocate_drawable_storage(
+                u16::try_from(width).expect("test width fits"),
+                u16::try_from(height).expect("test height fits"),
+                32,
+            )
+            .map_err(|error| format!("test target image allocation failed: {error:?}"))?;
+        let image = storage.image;
+        let image_view = storage.image_view;
+        backend
+            .store
+            .allocate(
+                xid_base + bo_idx,
+                crate::kms::render::store::DrawableKind::Pixmap,
+                32,
+                false,
+                storage,
+            )
+            .map_err(|error| format!("test target storage registration failed: {error:?}"))?;
+        let mut bo = ScanoutBo::for_tests_compose_target(
+            Arc::clone(&vk),
+            std::rc::Rc::clone(&drm),
+            raw(fb_base + bo_idx),
+            width,
+            height,
+            image,
+            image_view,
+        )
+        .map_err(|error| format!("test compose BO allocation failed: {error}"))?;
+        if bo_idx == 0 {
+            bo.state.phase = BoPhase::OnScreen;
+        }
+        bos.push(bo);
+    }
+    Ok(OutputScanout::Shared(
+        ScanoutBoPool::for_tests_recording_pool(route, width, height, bos),
+    ))
 }
 
 /// Convert the shared recording pools to copied pools (A copies into the

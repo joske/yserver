@@ -1,6 +1,9 @@
 use super::*;
 
-fn test_render_device(id: RenderDeviceId, primary: Option<DrmDeviceKey>) -> RenderDevice {
+pub(super) fn test_render_device(
+    id: RenderDeviceId,
+    primary: Option<DrmDeviceKey>,
+) -> RenderDevice {
     let selector_seed = match id {
         RenderDeviceId::DrmRender(render) => u8::try_from(render.minor).unwrap_or(1),
         RenderDeviceId::UnverifiedFallback => u8::MAX,
@@ -79,7 +82,9 @@ impl CrtcConfigProbeExecutor for TestCrtcConfigProbeExecutor {
     }
 }
 
-fn clone_test_drm_output(output: &crate::platform::drm::Output) -> crate::platform::drm::Output {
+pub(super) fn clone_test_drm_output(
+    output: &crate::platform::drm::Output,
+) -> crate::platform::drm::Output {
     crate::platform::drm::Output {
         connector: output.connector,
         connector_name: output.connector_name.clone(),

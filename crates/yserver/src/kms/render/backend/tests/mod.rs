@@ -9,6 +9,7 @@ mod gc_draw;
 mod keyboard_source;
 mod misc;
 mod paint_target;
+mod per_crtc_config;
 mod pointer;
 mod present_scanout;
 mod randr;
