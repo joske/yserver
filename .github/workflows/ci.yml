@@ -9,9 +9,7 @@ env:
   CARGO_TERM_COLOR: always
 jobs:
   build:
-    # 26.04 for its Mesa: older lavapipe lacks the extensions the scanout
-    # tests need, and those tests then skip silently (see the lavapipe step).
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -124,11 +122,26 @@ jobs:
           ./target/debug/yserver --version | grep -q feedfacefeed \
             || { echo "stale stamp — rerun-if-env-changed missing:"; \
                  ./target/debug/yserver --version; exit 1; }
+  lavapipe:
+    # The `#[ignore = "needs live Vulkan ICD"]` render tests on Mesa's
+    # lavapipe. Arch rather than Ubuntu: the KMS scanout tests (commit
+    # identity, unflip, tearing, cursor sprites) need SYNC_FD export and DRM
+    # format modifiers, which Ubuntu's lavapipe lacks, and without them they
+    # report `ok` while skipping. With --features xdmcp: the full build.
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install packages needed for build
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rustup libxshmfence libxkbcommon libinput \
+            shaderc systemd-libs fontconfig pkgconf mesa vulkan-swrast vulkan-tools \
+            xorg-fonts-misc xorg-fonts-75dpi xorg-fonts-100dpi
+          rustup default stable
+      - uses: actions/checkout@v7
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
       - name: Check lavapipe has the scanout-test extensions
-        # The commit-identity, unflip, tearing and cursor-sprite tests need
-        # SYNC_FD export and DRM format modifiers; without them they report
-        # `ok` while skipping. Fail here instead of passing vacuously.
-        if: matrix.name == 'xdmcp'
+        # Fail here instead of letting those tests pass vacuously.
         run: |
           set -eu
           vulkaninfo 2>/dev/null > "$RUNNER_TEMP/vulkaninfo.txt" || true
@@ -137,18 +150,6 @@ jobs:
             grep -q "$ext" "$RUNNER_TEMP/vulkaninfo.txt" || { echo "lavapipe lacks $ext"; exit 1; }
           done
       - name: Run software-Vulkan render tests (lavapipe)
-        # GPU-less runner: Mesa's lavapipe is the only Vulkan ICD, so
-        # the `#[ignore = "needs live Vulkan ICD"]` render tests run on
-        # it. They self-skip if no Vulkan device is present. KMS/scanout
-        # tests aren't in this set (no /dev/dri on the runner). All targets,
-        # not only the lib: render_acceptance and the other integration tests.
-        #
-        # On the xdmcp leg, with --features xdmcp, for the same reason as the
-        # step above: rendering is orthogonal to TCP and XDMCP, but these are
-        # the heaviest code CI actually executes and they ran on the full
-        # build before the default set was emptied. The leg has already
-        # compiled that lib, so this costs nothing extra.
-        if: matrix.name == 'xdmcp'
         env:
           YSERVER_ALLOW_SOFTWARE_VULKAN: "1"
         run: cargo test --workspace --locked --features xdmcp --no-fail-fast -- --ignored
