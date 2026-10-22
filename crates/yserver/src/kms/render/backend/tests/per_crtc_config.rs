@@ -4,7 +4,7 @@
 
 use super::{
     commit_identity::{
-        recording_scene::{RecordingSceneFixture, recording_scanout_pool},
+        recording_scene::{P1SceneRoute, RecordingSceneFixture, recording_scanout_pool},
         support::accepted_event_id,
     },
     randr::{clone_test_drm_output, test_render_device},
@@ -17,7 +17,7 @@ use crate::{
             platform::{OutputPowerExecutor, RenderDeviceId},
         },
         scanout_route::{RenderKmsRelationship, ScanoutRoute},
-        vk::scanout::BoPhase,
+        vk::scanout::{BoPhase, OutputScanout},
     },
     platform::drm::Output,
 };
@@ -102,6 +102,10 @@ fn output_id(backend: &mut KmsBackend, connector: &str) -> u32 {
         .output_id
 }
 
+fn handle<H: ::drm::control::ResourceHandle>(raw: u32) -> H {
+    ::drm::control::from_u32(raw).expect("nonzero handle")
+}
+
 fn crtc(backend: &KmsBackend, idx: usize) -> u32 {
     u32::from(backend.platform.outputs[idx].output.crtc)
 }
@@ -156,6 +160,60 @@ fn position_change_moves_one_crtc_without_any_commit() {
         first
     );
     assert_eq!((backend.platform.fb_w, backend.platform.fb_h), (1800, 600));
+}
+
+#[test]
+// Mutation: refresh the whole device's cursor topology on a position change
+// (every CRTC's queued cursor move is dropped).
+fn position_change_keeps_the_other_crtcs_queued_cursor_move() {
+    let (mut backend, _log) = two_heads();
+    let device_key = backend.platform.devices[0].key;
+    let queued0 = backend.platform.for_tests_seed_atomic_cursor_position(
+        0,
+        handle(91),
+        handle(92),
+        handle(93),
+        100,
+        100,
+        0,
+        0,
+    );
+    backend.platform.for_tests_seed_atomic_cursor_position(
+        1,
+        handle(91),
+        handle(92),
+        handle(93),
+        900,
+        100,
+        0,
+        0,
+    );
+    let (crtc0, crtc1) = (
+        backend.platform.outputs[0].output.crtc,
+        backend.platform.outputs[1].output.crtc,
+    );
+    let name = connector(&backend, 1);
+    let id = output_id(&mut backend, &name);
+
+    assert!(
+        Backend::apply_crtc_config(&mut backend, id, &name, Some(MODE_800), 1000, 0)
+            .expect("move the second output")
+    );
+
+    assert_eq!(
+        backend
+            .platform
+            .for_tests_atomic_cursor_pending_position(device_key, crtc0),
+        Some(queued0),
+        "the untouched CRTC keeps its queued move"
+    );
+    assert_eq!(
+        backend
+            .platform
+            .for_tests_atomic_cursor_pending_position(device_key, crtc1),
+        None,
+        "the moved CRTC's move was computed from its old origin"
+    );
 }
 
 #[test]
@@ -453,7 +511,7 @@ fn mode_change_modesets_only_its_crtc_while_the_other_keeps_presenting() {
     backend.pstate.crtc_config_discovery_override = Some(discovered);
     let pool = recording_scanout_pool(backend, &key1, route, (640, 480), 0x6b00, 0x5300)
         .expect("replacement 640x480 pool");
-    backend.platform.test_scanout_pool_override = Some(pool);
+    backend.pstate.crtc_config_discovery_pool = Some((route, pool));
     let name = connector(backend, 1);
     let id = output_id(backend, &name);
     let epoch = backend.pstate.crtc_config_topology_epoch;
@@ -585,7 +643,7 @@ fn enabling_an_off_output_modesets_only_its_crtc() {
     backend.pstate.crtc_config_discovery_override = Some(saved);
     let pool = recording_scanout_pool(backend, &key1, route, (800, 600), 0x6b00, 0x5300)
         .expect("pool for the re-enabled output");
-    backend.platform.test_scanout_pool_override = Some(pool);
+    backend.pstate.crtc_config_discovery_pool = Some((route, pool));
     let epoch = backend.pstate.crtc_config_topology_epoch;
     assert!(
         Backend::apply_crtc_config(backend, id, &name, Some(MODE_800), 800, 0)
@@ -602,4 +660,38 @@ fn enabling_an_off_output_modesets_only_its_crtc() {
     retire_all(&mut fixture, &next, 2);
     fixture.adopt_drawables(0x6b00..0x6b03);
     fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: drop the `OutputScanout::Shared` check from
+// per_crtc_fallback_reason (a same-device copied pool is moved per CRTC).
+fn same_device_copied_route_takes_the_global_quiesce() {
+    let Some(mut fixture) = RecordingSceneFixture::with_route(1, P1SceneRoute::CopiedSameDevice)
+        .expect("copied recording scene fixture construction")
+    else {
+        return;
+    };
+    let backend = &mut fixture.events.backend;
+    let route = use_same_device_route(backend);
+    let Some(OutputScanout::Copied(pool)) = backend.platform.scanout_pools[0].as_mut() else {
+        panic!("the copied fixture installs a copied pool");
+    };
+    // The copy's sink is the display device itself.
+    pool.route = route;
+    let log = install_power_log(backend);
+    backend.pstate.crtc_config_discovery_override =
+        Some(clone_test_drm_output(&backend.platform.outputs[0].output));
+    let name = connector(backend, 0);
+    let id = output_id(backend, &name);
+    let lit = crtc(backend, 0);
+
+    let _ = Backend::apply_crtc_config(backend, id, &name, Some(MODE_800), 0, 100);
+
+    assert!(
+        log.entries().contains(&("off", lit)),
+        "a copied pool takes the global quiesce: {:?}",
+        log.entries()
+    );
+    fixture.finish();
 }
