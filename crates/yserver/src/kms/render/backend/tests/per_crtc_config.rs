@@ -695,3 +695,97 @@ fn same_device_copied_route_takes_the_global_quiesce() {
     );
     fixture.finish();
 }
+
+/// Queue an unsent atomic cursor move on both outputs; returns the one
+/// queued for `survivor`.
+fn queue_cursor_moves(
+    backend: &mut KmsBackend,
+    survivor: usize,
+) -> crate::drm::atomic::CursorPlanePosition {
+    let mut queued = Vec::new();
+    for idx in 0..2 {
+        let root_x = backend.platform.outputs[idx].x + 100;
+        queued.push(backend.platform.for_tests_seed_atomic_cursor_position(
+            idx,
+            handle(91),
+            handle(92),
+            handle(93),
+            root_x,
+            100,
+            0,
+            0,
+        ));
+    }
+    queued[survivor]
+}
+
+fn queued_cursor_move(
+    backend: &KmsBackend,
+    crtc: u32,
+) -> Option<crate::drm::atomic::CursorPlanePosition> {
+    backend
+        .platform
+        .for_tests_atomic_cursor_pending_position(backend.platform.devices[0].key, handle(crtc))
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: let enable_connector_with_pool refresh the whole device's cursor
+// topology (the untouched CRTC's queued move is dropped).
+fn mode_change_keeps_the_other_crtcs_queued_cursor_move() {
+    let Some((mut fixture, log, _route)) = live_two_heads() else {
+        return;
+    };
+    let backend = &mut fixture.events.backend;
+    let (crtc0, crtc1) = (crtc(backend, 0), crtc(backend, 1));
+    let queued0 = queue_cursor_moves(backend, 0);
+    let mut faster = advertised(800, 600);
+    faster.vrefresh = 75;
+    let mut discovered = clone_test_drm_output(&backend.platform.outputs[1].output);
+    discovered.picked = faster.clone();
+    discovered.modes.push(faster);
+    backend.pstate.crtc_config_discovery_override = Some(discovered);
+    let name = connector(backend, 1);
+    let id = output_id(backend, &name);
+    let mode = ModeSpec {
+        width: 800,
+        height: 600,
+        vrefresh: 75,
+    };
+
+    assert!(
+        Backend::apply_crtc_config(backend, id, &name, Some(mode), 800, 0)
+            .expect("refresh-rate change on the second output")
+    );
+
+    assert_eq!(log.entries(), vec![("on", crtc1)]);
+    assert_eq!(queued_cursor_move(backend, crtc0), Some(queued0));
+    assert_eq!(queued_cursor_move(backend, crtc1), None);
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: let disable_connector refresh the whole device's cursor topology
+// (the survivor's queued move is dropped as it shifts to index 0).
+fn turning_one_output_off_keeps_the_survivors_queued_cursor_move() {
+    let Some((mut fixture, log, _route)) = live_two_heads() else {
+        return;
+    };
+    let backend = &mut fixture.events.backend;
+    let (crtc0, crtc1) = (crtc(backend, 0), crtc(backend, 1));
+    let queued1 = queue_cursor_moves(backend, 1);
+    let name = connector(backend, 0);
+    let id = output_id(backend, &name);
+
+    assert!(
+        Backend::apply_crtc_config(backend, id, &name, None, 0, 0)
+            .expect("turn the first output off")
+    );
+
+    assert_eq!(log.entries(), vec![("off", crtc0)]);
+    assert_eq!(crtc(backend, 0), crtc1);
+    assert_eq!(queued_cursor_move(backend, crtc1), Some(queued1));
+    assert_eq!(queued_cursor_move(backend, crtc0), None);
+    fixture.finish();
+}
