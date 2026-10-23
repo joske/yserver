@@ -254,6 +254,18 @@ impl Translator {
     }
 }
 
+/// Route a key event: with `key_equivalents`, a Command key-down is
+/// offered once to `menu` (the app menu, which runs a matching item);
+/// whether the event then goes to X: not when the menu took it.
+pub(crate) fn key_goes_to_x(
+    raw: &RawKey,
+    key_equivalents: bool,
+    menu: impl FnOnce() -> bool,
+) -> bool {
+    let offered = key_equivalents && raw.kind == KeyKind::Down && raw.flags & FLAG_COMMAND != 0;
+    !(offered && menu())
+}
+
 /// Whether `modifierFlags` has Caps Lock on.
 pub(crate) fn caps_locked(flags: u64) -> bool {
     flags & FLAG_CAPS_LOCK != 0
@@ -299,7 +311,7 @@ mod tests {
 
     use super::{
         FLAG_CAPS_LOCK, FLAG_COMMAND, FLAG_OPTION, FLAG_SHIFT, KeyKind, RawKey, Translator,
-        caps_lock_sync, caps_locked, nx,
+        caps_lock_sync, caps_locked, key_goes_to_x, nx,
     };
     use crate::surface::input::keymap::kvk;
 
@@ -595,6 +607,49 @@ mod tests {
         t.release_all(0, &mut out);
         assert_eq!(summary(&out), [(MIDDLE, false)]);
         assert_eq!(click(&mut t, 0, false, 0), [], "the release was sent");
+    }
+
+    fn key(kvk: u16, kind: KeyKind, flags: u64) -> RawKey {
+        RawKey {
+            kvk,
+            kind,
+            flags,
+            is_repeat: false,
+        }
+    }
+
+    /// `(goes to X, times the menu was asked)`.
+    fn route(raw: &RawKey, key_equivalents: bool, handled: bool) -> (bool, u32) {
+        let mut asked = 0;
+        let to_x = key_goes_to_x(raw, key_equivalents, || {
+            asked += 1;
+            handled
+        });
+        (to_x, asked)
+    }
+
+    #[test]
+    fn a_handled_command_shortcut_is_dispatched_once_and_not_sent_to_x() {
+        let cmd_q = key(kvk::kVK_ANSI_Q, KeyKind::Down, CMD_L);
+        assert_eq!(route(&cmd_q, true, true), (false, 1));
+    }
+
+    #[test]
+    fn unhandled_command_keys_and_other_keys_go_to_x() {
+        let cmd_t = key(kvk::kVK_ANSI_T, KeyKind::Down, CMD_L);
+        assert_eq!(route(&cmd_t, true, false), (true, 1), "not a menu key");
+        let q = key(kvk::kVK_ANSI_Q, KeyKind::Down, 0);
+        assert_eq!(route(&q, true, true), (true, 0), "no Command");
+        let up = key(kvk::kVK_ANSI_Q, KeyKind::Up, CMD_L);
+        assert_eq!(route(&up, true, true), (true, 0), "a release");
+        let cmd = key(kvk::kVK_Command, KeyKind::FlagsChanged, CMD_L);
+        assert_eq!(route(&cmd, true, true), (true, 0), "the modifier itself");
+    }
+
+    #[test]
+    fn without_key_equivalents_everything_goes_to_x() {
+        let cmd_q = key(kvk::kVK_ANSI_Q, KeyKind::Down, CMD_L);
+        assert_eq!(route(&cmd_q, false, true), (true, 0));
     }
 
     #[test]

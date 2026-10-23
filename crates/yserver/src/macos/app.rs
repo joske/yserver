@@ -1,9 +1,9 @@
-//! The AppKit application: a Quit menu, one window (rooted) or one window
+//! The AppKit application: the app menu, one window (rooted) or one window
 //! per X top-level (rootless, `super::rootless`), and the core loop on its
 //! own thread. The main thread never touches Vulkan.
 //!
-//! Every key goes to X, Cmd-Q included (as Super+Q); the menu's Quit has no
-//! key equivalent.
+//! Every key goes to X; with key equivalents on, the menu's shortcuts
+//! (Cmd-Q, Cmd-H, Cmd-Alt-H, Cmd-,) go to the menu (`super::input`).
 //!
 //! Shutdown: Quit, the close button and SIGTERM all end in the core loop
 //! returning; the core thread then drops every Vulkan object and asks the
@@ -26,13 +26,13 @@ use dispatch2::DispatchQueue;
 use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::Retained,
-    runtime::{AnyObject, ProtocolObject},
+    runtime::{AnyObject, ProtocolObject, Sel},
     sel,
 };
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy,
-    NSApplicationDelegate, NSApplicationTerminateReply, NSImage, NSMenu, NSMenuItem, NSWindow,
-    NSWindowDelegate, NSWindowOcclusionState,
+    NSApplicationDelegate, NSApplicationTerminateReply, NSEventModifierFlags, NSImage, NSMenu,
+    NSMenuItem, NSWindow, NSWindowDelegate, NSWindowOcclusionState,
 };
 use objc2_foundation::{NSData, NSNotification, NSObject, NSObjectProtocol, NSString, ns_string};
 use objc2_quartz_core::CAMetalLayer;
@@ -80,6 +80,8 @@ struct Ivars {
     input: OnceCell<Rc<ShellInput>>,
     /// The local key monitor, kept for the app's lifetime.
     key_monitor: OnceCell<Retained<AnyObject>>,
+    /// Releases held keys when a non-X window becomes key.
+    focus_observer: OnceCell<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
 }
 
 /// What ticks the frame clock: the display link, or a timer without one.
@@ -217,6 +219,14 @@ define_class!(
             }
         }
     }
+
+    impl YserverAppDelegate {
+        // SAFETY: an action method: one object argument, no return value.
+        #[unsafe(method(showSettings:))]
+        fn show_settings(&self, _sender: Option<&AnyObject>) {
+            log::info!("macos: Settings is not available yet");
+        }
+    }
 );
 
 impl YserverAppDelegate {
@@ -234,6 +244,7 @@ impl YserverAppDelegate {
             ticker: OnceCell::new(),
             input: OnceCell::new(),
             key_monitor: OnceCell::new(),
+            focus_observer: OnceCell::new(),
         });
         // SAFETY: `NSObject`'s `init` has this signature.
         unsafe { msg_send![super(this), init] }
@@ -249,13 +260,7 @@ impl YserverAppDelegate {
         let size = opts.geometry.unwrap_or(server::DEFAULT_SIZE);
         super::scale::set_option(opts.scale);
         let input = ShellInput::new(Arc::clone(&ivars.link), size, opts.live);
-        match input.install_key_monitor(mtm) {
-            Some(monitor) => {
-                let _ = ivars.key_monitor.set(monitor);
-            }
-            None => log::error!("macos: no key monitor; keys reach AppKit, not X"),
-        }
-        let _ = ivars.input.set(Rc::clone(&input));
+        self.attach_input(Rc::clone(&input));
         let (window, layer) = super::window::create(mtm, size, Rc::clone(&input));
         let surface = super::window::metal_surface(&layer);
         let clock = Arc::new(FrameClock::new(Arc::clone(&ivars.link)));
@@ -327,19 +332,26 @@ impl YserverAppDelegate {
         ) {
             Ok((ticker, input)) => {
                 let _ = ivars.ticker.set(ticker);
-                match input.install_key_monitor(mtm) {
-                    Some(monitor) => {
-                        let _ = ivars.key_monitor.set(monitor);
-                    }
-                    None => log::error!("macos: no key monitor; keys reach AppKit, not X"),
-                }
-                let _ = ivars.input.set(input);
+                self.attach_input(input);
             }
             Err(e) => {
                 log::error!("yserver: cannot start rootless mode: {e}");
                 std::process::exit(1);
             }
         }
+    }
+
+    /// Take the app's keys and focus changes for `input`.
+    fn attach_input(&self, input: Rc<ShellInput>) {
+        let ivars = self.ivars();
+        match input.install_key_monitor(self.mtm()) {
+            Some(monitor) => {
+                let _ = ivars.key_monitor.set(monitor);
+            }
+            None => log::error!("macos: no key monitor; keys reach AppKit, not X"),
+        }
+        let _ = ivars.focus_observer.set(input.install_focus_observer());
+        let _ = ivars.input.set(input);
     }
 
     /// Whether to quit: asks while X clients are connected, once per quit.
@@ -445,21 +457,45 @@ pub(super) fn quit_app(quit: &Arc<QuitState>, failed: bool) {
     });
 }
 
-/// A main menu with Quit, without a key equivalent: Cmd-Q belongs to X.
+/// A nil-targeted menu item: the action goes up the responder chain, to
+/// `NSApplication` or the app delegate.
+fn menu_item(mtm: MainThreadMarker, title: &str, action: Sel, key: &str) -> Retained<NSMenuItem> {
+    // SAFETY: every action passed is an `NSApplication` or delegate action
+    // taking a sender.
+    unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(title),
+            Some(action),
+            &NSString::from_str(key),
+        )
+    }
+}
+
+/// The app menu. Its shortcuts reach it only with key equivalents on; else
+/// the key monitor gives them to X.
 fn install_menu(app: &NSApplication, mtm: MainThreadMarker) {
-    let quit = {
-        // SAFETY: `terminate:` is an `NSApplication` action taking a sender.
-        unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                ns_string!("Quit yserver"),
-                Some(sel!(terminate:)),
-                ns_string!(""),
-            )
-        }
-    };
+    let hide_others = menu_item(mtm, "Hide Others", sel!(hideOtherApplications:), "h");
+    hide_others
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     let app_menu = NSMenu::new(mtm);
-    app_menu.addItem(&quit);
+    for item in [
+        menu_item(
+            mtm,
+            "About yserver",
+            sel!(orderFrontStandardAboutPanel:),
+            "",
+        ),
+        menu_item(mtm, "Settings…", sel!(showSettings:), ","),
+        NSMenuItem::separatorItem(mtm),
+        menu_item(mtm, "Hide yserver", sel!(hide:), "h"),
+        hide_others,
+        menu_item(mtm, "Show All", sel!(unhideAllApplications:), ""),
+        NSMenuItem::separatorItem(mtm),
+        menu_item(mtm, "Quit yserver", sel!(terminate:), "q"),
+    ] {
+        app_menu.addItem(&item);
+    }
     let app_item = NSMenuItem::new(mtm);
     app_item.setSubmenu(Some(&*app_menu));
     let menu_bar = NSMenu::new(mtm);

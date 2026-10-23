@@ -17,9 +17,9 @@ use std::{
 
 use ash::vk;
 use dispatch2::DispatchQueue;
-use objc2::{MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSApplication, NSMenuItem, NSScreen};
-use objc2_foundation::{NSSize, NSString, ns_string};
+use objc2::{ClassType, MainThreadMarker, MainThreadOnly};
+use objc2_app_kit::{NSApplication, NSMenuItem, NSScreen, NSView};
+use objc2_foundation::{NSObjectProtocol, NSSize, NSString, ns_string};
 use objc2_quartz_core::{CAMetalLayer, CATransaction};
 use yserver_core::rootless::{RootlessEvent, ToplevelId};
 
@@ -214,6 +214,11 @@ impl ShellUi for RootlessUi {
     fn set_content_size(&self, width: u16, height: u16, _token: u64) {
         log::debug!("macos: rootless ignores a window size {width}x{height}");
     }
+}
+
+/// Whether `view` is a top-level's view.
+pub(super) fn is_toplevel_view(content: &NSView) -> bool {
+    content.isKindOfClass(view::RootlessView::class())
 }
 
 /// The app became active: X's stacking follows the native order.

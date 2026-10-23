@@ -1,6 +1,7 @@
 //! NSEvent → plain values for the OS-neutral translator, sent to the core
-//! through the shell link. Every key the app receives goes to X,
-//! outside a modal alert.
+//! through the shell link. Every key the app receives goes to X while an X
+//! window (or none) is key, except the app menu's shortcuts with key
+//! equivalents on.
 
 use std::{
     cell::{Cell, RefCell},
@@ -10,8 +11,16 @@ use std::{
 };
 
 use block2::RcBlock;
-use objc2::{MainThreadMarker, Message, rc::Retained, runtime::AnyObject};
-use objc2_app_kit::{NSApplication, NSEvent, NSEventMask, NSEventPhase, NSEventType, NSView};
+use objc2::{
+    ClassType, MainThreadMarker, Message,
+    rc::Retained,
+    runtime::{AnyObject, ProtocolObject},
+};
+use objc2_app_kit::{
+    NSApplication, NSEvent, NSEventMask, NSEventPhase, NSEventType, NSView, NSWindow,
+    NSWindowDidBecomeKeyNotification,
+};
+use objc2_foundation::{NSNotification, NSNotificationCenter, NSObjectProtocol};
 
 use yserver_core::{core_loop::HostInputEvent, rootless::ToplevelId};
 
@@ -21,7 +30,7 @@ use crate::{
     surface::{
         input::{
             pointer::{self, RawPointer, RawScroll, ScrollPhase, Scroller, local_position},
-            translate::{KeyKind, RawKey, Translator, caps_locked},
+            translate::{KeyKind, RawKey, Translator, caps_locked, key_goes_to_x},
         },
         link::{ShellEvent, ShellLink},
     },
@@ -84,22 +93,32 @@ impl ShellInput {
         self.fb.set(fb);
     }
 
-    /// Route every key event of the app to X; AppKit sees none of them,
-    /// except while a modal alert is up.
+    /// Route every key event of the app to X, AppKit sees none of them;
+    /// except while a modal alert or another non-X window is key, and the
+    /// app menu's shortcuts with key equivalents on.
     pub(super) fn install_key_monitor(
         self: &Rc<Self>,
         mtm: MainThreadMarker,
     ) -> Option<Retained<AnyObject>> {
         let input = Rc::clone(self);
         let block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
-            if NSApplication::sharedApplication(mtm)
-                .modalWindow()
-                .is_some()
-            {
+            let app = NSApplication::sharedApplication(mtm);
+            if app.modalWindow().is_some() || app.keyWindow().is_some_and(|w| !is_x_window(&w)) {
                 return event.as_ptr();
             }
             // SAFETY: AppKit hands the monitor a live event.
-            input.key(unsafe { event.as_ref() });
+            let event = unsafe { event.as_ref() };
+            let Some(raw) = raw_key(event) else {
+                return std::ptr::null_mut();
+            };
+            // The menu runs the item itself (Quit may ask in a modal alert).
+            let menu = || {
+                app.mainMenu()
+                    .is_some_and(|menu| menu.performKeyEquivalent(event))
+            };
+            if key_goes_to_x(&raw, input.live.get().key_equivalents, menu) {
+                input.key(raw);
+            }
             std::ptr::null_mut()
         });
         let mask = NSEventMask::KeyDown | NSEventMask::KeyUp | NSEventMask::FlagsChanged;
@@ -107,23 +126,39 @@ impl ShellInput {
         unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &block) }
     }
 
-    fn key(&self, event: &NSEvent) {
-        let kind = match event.r#type() {
-            NSEventType::KeyDown => KeyKind::Down,
-            NSEventType::KeyUp => KeyKind::Up,
-            NSEventType::FlagsChanged => KeyKind::FlagsChanged,
-            _ => return,
-        };
-        let raw = RawKey {
-            kvk: event.keyCode(),
-            kind,
-            flags: event.modifierFlags().0 as u64,
-            // `isARepeat` raises on a flagsChanged event.
-            is_repeat: kind != KeyKind::FlagsChanged && event.isARepeat(),
-        };
+    /// Release in X every key and button held when a window of ours that
+    /// is not an X window (an alert) becomes key, so none sticks.
+    pub(super) fn install_focus_observer(
+        self: &Rc<Self>,
+    ) -> Retained<ProtocolObject<dyn NSObjectProtocol>> {
+        let input = Rc::clone(self);
+        let block = RcBlock::new(move |notification: NonNull<NSNotification>| {
+            // SAFETY: the center hands the block a live notification.
+            let window = unsafe { notification.as_ref() }
+                .object()
+                .and_then(|object| object.downcast::<NSWindow>().ok());
+            if window.is_some_and(|window| !is_x_window(&window)) {
+                log::debug!("macos: a non-X window became key");
+                input.release_all();
+            }
+        });
+        // SAFETY: window notifications post on the main thread, which owns
+        // the block's `Rc`; without a queue it runs there, synchronously.
+        unsafe {
+            NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+                Some(NSWindowDidBecomeKeyNotification),
+                None,
+                None,
+                &block,
+            )
+        }
+    }
+
+    fn key(&self, raw: RawKey) {
         log::debug!(
-            "macos key: kvk={:#04x} {kind:?} flags={:#x} repeat={}",
+            "macos key: kvk={:#04x} {:?} flags={:#x} repeat={}",
             raw.kvk,
+            raw.kind,
             raw.flags,
             raw.is_repeat
         );
@@ -271,6 +306,10 @@ impl ShellInput {
     /// The window resigned key: release everything held.
     pub(super) fn focus_lost(&self) {
         log::debug!("macos: window resigned key");
+        self.release_all();
+    }
+
+    fn release_all(&self) {
         let mut translator = self.translator.borrow_mut();
         self.link
             .send_input(|time, out| translator.release_all(time, out));
@@ -284,6 +323,31 @@ impl ShellInput {
             caps: caps_locked(flags),
         });
     }
+}
+
+/// A key event's plain values.
+fn raw_key(event: &NSEvent) -> Option<RawKey> {
+    let kind = match event.r#type() {
+        NSEventType::KeyDown => KeyKind::Down,
+        NSEventType::KeyUp => KeyKind::Up,
+        NSEventType::FlagsChanged => KeyKind::FlagsChanged,
+        _ => return None,
+    };
+    Some(RawKey {
+        kvk: event.keyCode(),
+        kind,
+        flags: event.modifierFlags().0 as u64,
+        // `isARepeat` raises on a flagsChanged event.
+        is_repeat: kind != KeyKind::FlagsChanged && event.isARepeat(),
+    })
+}
+
+/// Whether `window` shows X: the root (rooted) or a top-level (rootless).
+fn is_x_window(window: &NSWindow) -> bool {
+    window.contentView().is_some_and(|view| {
+        view.isKindOfClass(super::view::YserverView::class())
+            || super::rootless::is_toplevel_view(&view)
+    })
 }
 
 fn raw_pointer(view: &NSView, event: &NSEvent) -> RawPointer {
