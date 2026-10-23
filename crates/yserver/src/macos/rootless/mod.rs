@@ -20,9 +20,9 @@ use std::{
 
 use ash::vk;
 use dispatch2::DispatchQueue;
-use objc2::{ClassType, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSApplication, NSMenuItem, NSScreen, NSView};
-use objc2_foundation::{NSObjectProtocol, NSSize, NSString, ns_string};
+use objc2::{ClassType, MainThreadMarker};
+use objc2_app_kit::{NSScreen, NSView};
+use objc2_foundation::{NSObjectProtocol, NSSize};
 use objc2_quartz_core::{CAMetalLayer, CATransaction};
 use yserver_core::rootless::{RootlessEvent, ToplevelId};
 

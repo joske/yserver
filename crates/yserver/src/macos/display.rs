@@ -3,7 +3,7 @@
 
 use std::cell::Cell;
 
-use objc2::{MainThreadMarker, sel};
+use objc2::{MainThreadMarker, MainThreadOnly, sel};
 use objc2_app_kit::{NSApplication, NSMenuItem, NSPasteboard, NSPasteboardTypeString};
 use objc2_foundation::NSString;
 
