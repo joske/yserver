@@ -41,6 +41,7 @@ use super::{display_link::DisplayLink, input::ShellInput, scale::Metrics};
 use crate::{
     launch::{LaunchOptions, ShellMode},
     surface::{
+        clipboard::HostClipboard,
         clock::{FrameClock, SoftwareTicker},
         link::{ShellEvent, ShellLink},
         server::{self, WindowSpec},
@@ -82,6 +83,8 @@ struct Ivars {
     key_monitor: OnceCell<Retained<AnyObject>>,
     /// Releases held keys when a non-X window becomes key.
     focus_observer: OnceCell<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
+    /// The clipboard bridge's switch, the live `sync_clipboard`.
+    sync_clipboard: Arc<AtomicBool>,
 }
 
 /// What ticks the frame clock: the display link, or a timer without one.
@@ -232,6 +235,7 @@ define_class!(
 impl YserverAppDelegate {
     fn new(mtm: MainThreadMarker, opts: LaunchOptions, mode: ShellMode) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(Ivars {
+            sync_clipboard: Arc::new(AtomicBool::new(opts.live.sync_clipboard)),
             opts: Cell::new(Some(opts)),
             mode,
             link: Arc::new(ShellLink::default()),
@@ -304,7 +308,10 @@ impl YserverAppDelegate {
             max_output: super::window::max_content_size(mtm),
             output_mm: metrics.mm(size),
             copy_scale: metrics.factor,
-            pasteboard: Box::new(super::pasteboard::GeneralPasteboard),
+            clipboard: HostClipboard {
+                pasteboard: Box::new(super::pasteboard::GeneralPasteboard),
+                sync: Arc::clone(&ivars.sync_clipboard),
+            },
         };
         let spawned = thread::Builder::new()
             .name("yserver-core".into())
@@ -329,6 +336,7 @@ impl YserverAppDelegate {
             Arc::clone(&ivars.link),
             Arc::clone(&ivars.quit),
             Arc::clone(&ivars.clients),
+            Arc::clone(&ivars.sync_clipboard),
         ) {
             Ok((ticker, input)) => {
                 let _ = ivars.ticker.set(ticker);

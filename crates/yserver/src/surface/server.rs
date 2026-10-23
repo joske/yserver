@@ -17,7 +17,7 @@ use yserver_core::{
 
 use super::{
     SurfacePlatform,
-    clipboard::{ClipboardBridge, Pasteboard},
+    clipboard::{ClipboardBridge, HostClipboard},
     clock::FrameClock,
     link::ShellLink,
     swapchain::{NativeSurface, SurfaceOutput},
@@ -52,7 +52,7 @@ pub(crate) struct WindowSpec {
     /// Swapchain pixels per X pixel; later changes come as `Resized`.
     pub(crate) copy_scale: u32,
     /// Bridged with CLIPBOARD.
-    pub(crate) pasteboard: Box<dyn Pasteboard>,
+    pub(crate) clipboard: HostClipboard,
 }
 
 /// A rootless window shell's half of the server: one native window per
@@ -110,7 +110,7 @@ pub(crate) fn run_rootless(
     opts: launch::LaunchOptions,
     spec: RootlessSpec,
     host: Box<dyn RootlessHost + Send>,
-    pasteboard: Box<dyn Pasteboard>,
+    clipboard: HostClipboard,
 ) -> io::Result<()> {
     let result = serve(
         &opts,
@@ -133,7 +133,7 @@ pub(crate) fn run_rootless(
             .map_err(|e| io::Error::other(format!("rootless: {e}")))
         },
         Some(&spec.link),
-        Some(pasteboard),
+        Some(clipboard),
         |display| spec.ui.set_title(&format!("yserver DISPLAY=:{display}")),
     );
     spec.link.disconnect();
@@ -209,7 +209,7 @@ pub(crate) fn run_windowed(opts: launch::LaunchOptions, spec: WindowSpec) -> io:
         max_output,
         output_mm,
         copy_scale,
-        pasteboard,
+        clipboard,
     } = spec;
     let result = serve(
         &opts,
@@ -234,7 +234,7 @@ pub(crate) fn run_windowed(opts: launch::LaunchOptions, spec: WindowSpec) -> io:
         },
         |_, _| Ok(()),
         Some(&link),
-        Some(pasteboard),
+        Some(clipboard),
         |display| ui.set_title(&format!("yserver DISPLAY=:{display}")),
     );
     link.disconnect();
@@ -251,7 +251,7 @@ fn serve(
     build: impl FnOnce(&launch::LaunchOptions) -> io::Result<XBackend<SurfacePlatform>>,
     setup: impl FnOnce(&mut ServerState, &mut XBackend<SurfacePlatform>) -> io::Result<()>,
     link: Option<&ShellLink>,
-    pasteboard: Option<Box<dyn Pasteboard>>,
+    clipboard: Option<HostClipboard>,
     on_display: impl FnOnce(u16),
 ) -> io::Result<()> {
     log::info!(target: "yserver::startup", "yserver: startup — {}", crate::version::line());
@@ -316,8 +316,8 @@ fn serve(
     }
     launch::signal_ready(opts, display, sigusr1_was_ignored, parent_pid);
     // After the listener, stopped first: an internal client, never counted.
-    let clipboard = pasteboard.and_then(|pasteboard| {
-        ClipboardBridge::start(sender.clone_handle(), pasteboard)
+    let clipboard = clipboard.and_then(|host| {
+        ClipboardBridge::start(sender.clone_handle(), host)
             .inspect_err(|e| log::warn!("yserver: no clipboard bridge: {e}"))
             .ok()
     });

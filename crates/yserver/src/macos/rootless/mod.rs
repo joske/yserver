@@ -11,7 +11,10 @@ use std::{
     collections::{HashMap, HashSet},
     io,
     rc::Rc,
-    sync::{Arc, Mutex, atomic::AtomicUsize},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize},
+    },
     thread,
 };
 
@@ -39,6 +42,7 @@ use crate::{
         },
     },
     surface::{
+        clipboard::HostClipboard,
         clock::FrameClock,
         link::ShellLink,
         server::{self, RootlessSpec},
@@ -244,6 +248,7 @@ pub(super) fn start(
     link: Arc<ShellLink>,
     quit: Arc<QuitState>,
     clients: Arc<AtomicUsize>,
+    sync_clipboard: Arc<AtomicBool>,
 ) -> io::Result<(TickSource, Rc<ShellInput>)> {
     super::scale::set_option(opts.scale);
     let scale = Metrics::of_main_screen(mtm).xpp;
@@ -302,7 +307,10 @@ pub(super) fn start(
                 opts,
                 spec,
                 Box::new(host),
-                Box::new(super::pasteboard::GeneralPasteboard),
+                HostClipboard {
+                    pasteboard: Box::new(super::pasteboard::GeneralPasteboard),
+                    sync: sync_clipboard,
+                },
             )
         })?;
     Ok((ticker, input))

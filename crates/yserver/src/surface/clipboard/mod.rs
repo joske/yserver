@@ -1,7 +1,7 @@
 //! The clipboard bridge, XQuartz's `xpbproxy` model: the server's own X
 //! client (an internal connection, `Message::InternalClient`) keeps
-//! CLIPBOARD and the host pasteboard in step, as text. PRIMARY is not
-//! bridged.
+//! CLIPBOARD and the host pasteboard in step, as text, while the sync
+//! setting is on. PRIMARY is not bridged.
 
 mod bridge;
 pub(crate) mod conn;
@@ -36,6 +36,13 @@ pub(crate) trait Pasteboard: Send {
     fn write_text(&mut self, text: &str) -> i64;
 }
 
+/// The host pasteboard and the sync setting, which the host flips at any
+/// time; the bridge follows within one poll.
+pub(crate) struct HostClipboard {
+    pub(crate) pasteboard: Box<dyn Pasteboard>,
+    pub(crate) sync: Arc<AtomicBool>,
+}
+
 /// The bridge's thread; reconnects until stopped.
 pub(crate) struct ClipboardBridge {
     stop: Arc<AtomicBool>,
@@ -50,10 +57,11 @@ impl ClipboardBridge {
     /// # Errors
     ///
     /// The thread could not be spawned.
-    pub(crate) fn start(
-        sender: CoreSender,
-        mut pasteboard: Box<dyn Pasteboard>,
-    ) -> io::Result<Self> {
+    pub(crate) fn start(sender: CoreSender, host: HostClipboard) -> io::Result<Self> {
+        let HostClipboard {
+            mut pasteboard,
+            sync,
+        } = host;
         let stop = Arc::new(AtomicBool::new(false));
         let socket = Arc::new(Mutex::new(None));
         let thread = {
@@ -62,7 +70,7 @@ impl ClipboardBridge {
                 .name("yserver-clipboard".into())
                 .spawn(move || {
                     while !stop.load(Ordering::Acquire) {
-                        if let Err(e) = serve(&sender, &mut *pasteboard, &stop, &socket) {
+                        if let Err(e) = serve(&sender, &mut *pasteboard, &sync, &stop, &socket) {
                             log::debug!("clipboard: connection ended: {e}");
                         }
                         let mut waited = Duration::ZERO;
@@ -106,6 +114,7 @@ impl Drop for ClipboardBridge {
 fn serve(
     sender: &CoreSender,
     pasteboard: &mut dyn Pasteboard,
+    sync: &AtomicBool,
     stop: &AtomicBool,
     socket: &Mutex<Option<UnixStream>>,
 ) -> io::Result<()> {
@@ -119,5 +128,5 @@ fn serve(
     }
     sender.send(Message::InternalClient(core_side))?;
     let conn = conn::Conn::setup(ours)?;
-    bridge::Bridge::new(conn, pasteboard)?.run()
+    bridge::Bridge::new(conn, pasteboard, sync)?.run()
 }

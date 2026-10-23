@@ -1,9 +1,11 @@
 //! The bridge's X side: watches CLIPBOARD with XFIXES, converts a new
 //! owner's text for the host, and owns CLIPBOARD for host text (ICCCM §2,
-//! INCR both ways).
+//! INCR both ways). With the sync setting off it stands aside: no polling,
+//! no conversions, no ownership.
 
 use std::{
     io,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -73,6 +75,9 @@ struct Incoming {
 
 /// An INCR send to a requestor, one chunk per property deletion.
 struct Outgoing {
+    /// The request's time and target, to refuse it with.
+    time: u32,
+    target: u32,
     requestor: u32,
     property: u32,
     type_: u32,
@@ -84,6 +89,10 @@ struct Outgoing {
 pub(super) struct Bridge<'a> {
     conn: Conn,
     pasteboard: &'a mut dyn Pasteboard,
+    /// The setting, flipped from another thread.
+    sync: &'a AtomicBool,
+    /// The setting as last acted on.
+    syncing: bool,
     atoms: Atoms,
     window: u32,
     xfixes_event: u8,
@@ -95,9 +104,13 @@ pub(super) struct Bridge<'a> {
 }
 
 impl<'a> Bridge<'a> {
-    /// Set up the bridge's window and selection input, then take CLIPBOARD
-    /// for the host's text when no X client owns it.
-    pub(super) fn new(mut conn: Conn, pasteboard: &'a mut dyn Pasteboard) -> io::Result<Self> {
+    /// Set up the bridge's window and selection input, then, syncing, take
+    /// CLIPBOARD for the host's text when no X client owns it.
+    pub(super) fn new(
+        mut conn: Conn,
+        pasteboard: &'a mut dyn Pasteboard,
+        sync: &'a AtomicBool,
+    ) -> io::Result<Self> {
         let atoms = Atoms::intern(&mut conn)?;
         let (xfixes, xfixes_event) = conn
             .query_extension("XFIXES")?
@@ -107,9 +120,12 @@ impl<'a> Bridge<'a> {
         conn.xfixes_select_selection_input(xfixes, window, atoms.clipboard, XFIXES_SELECTION_MASK)?;
         let x_owner = conn.get_selection_owner(atoms.clipboard)?;
         let seen_count = pasteboard.change_count();
+        let syncing = sync.load(Ordering::Acquire);
         let mut bridge = Self {
             conn,
             pasteboard,
+            sync,
+            syncing,
             atoms,
             window,
             xfixes_event,
@@ -118,7 +134,8 @@ impl<'a> Bridge<'a> {
             incoming: None,
             outgoing: Vec::new(),
         };
-        if x_owner == 0
+        if syncing
+            && x_owner == 0
             && let Some(text) = bridge.pasteboard.read_text()
         {
             bridge.claim(text)?;
@@ -130,12 +147,23 @@ impl<'a> Bridge<'a> {
     pub(super) fn run(&mut self) -> io::Result<()> {
         let mut next_poll = Instant::now() + POLL;
         loop {
+            let sync = self.sync.load(Ordering::Acquire);
+            if sync != self.syncing {
+                self.syncing = sync;
+                if sync {
+                    self.sync_on()?;
+                } else {
+                    self.sync_off()?;
+                }
+            }
             let wait = next_poll.saturating_duration_since(Instant::now());
             if let Some(event) = self.conn.event(wait)? {
                 self.handle(&event)?;
             }
             if Instant::now() >= next_poll {
-                self.poll_host()?;
+                if self.syncing {
+                    self.poll_host()?;
+                }
                 self.expire();
                 next_poll = Instant::now() + POLL;
             }
@@ -156,6 +184,46 @@ impl<'a> Bridge<'a> {
             PROPERTY_NOTIFY => self.property_notify(event),
             _ if code == self.xfixes_event => self.owner_changed(event),
             _ => Ok(()),
+        }
+    }
+
+    /// Sync turned off: drop our conversion, refuse every INCR send in
+    /// flight, then give CLIPBOARD up, so no requestor waits on us.
+    fn sync_off(&mut self) -> io::Result<()> {
+        log::info!("clipboard: sync off");
+        self.incoming = None;
+        let mut requestors = Vec::new();
+        for o in std::mem::take(&mut self.outgoing) {
+            self.conn.send_selection_notify(
+                o.time,
+                o.requestor,
+                self.atoms.clipboard,
+                o.target,
+                0,
+            )?;
+            if !requestors.contains(&o.requestor) {
+                requestors.push(o.requestor);
+            }
+        }
+        for requestor in requestors {
+            self.conn.select_input(requestor, 0)?;
+        }
+        if self.owned.take().is_some() {
+            let time = self.server_time()?;
+            self.conn
+                .set_selection_owner(0, self.atoms.clipboard, time)?;
+        }
+        Ok(())
+    }
+
+    /// Sync turned on: the host's text is the current content; what X
+    /// copied meanwhile waits for X's next copy.
+    fn sync_on(&mut self) -> io::Result<()> {
+        log::info!("clipboard: sync on");
+        self.seen_count = self.pasteboard.change_count();
+        match self.pasteboard.read_text() {
+            Some(text) => self.claim(text),
+            None => Ok(()),
         }
     }
 
@@ -205,7 +273,7 @@ impl<'a> Bridge<'a> {
     fn owner_changed(&mut self, event: &Event) -> io::Result<()> {
         let (owner, selection, selection_time) =
             (u32_at(event, 8), u32_at(event, 12), u32_at(event, 20));
-        if selection != self.atoms.clipboard || owner == self.window {
+        if !self.syncing || selection != self.atoms.clipboard || owner == self.window {
             return Ok(());
         }
         self.owned = None;
@@ -368,7 +436,7 @@ impl<'a> Bridge<'a> {
                 if target == self.atoms.multiple {
                     self.convert_multiple(requestor, property)?
                 } else {
-                    self.convert_target(requestor, target, property, true)?
+                    self.convert_target(requestor, target, property, Some(time))?
                 }
             }
             _ => false,
@@ -422,13 +490,13 @@ impl<'a> Bridge<'a> {
     }
 
     /// Write `target` to `requestor`'s `property`; INCR when it does not fit
-    /// one request and `incr` allows it. False: refused.
+    /// one request and `incr` (the request's time) allows it. False: refused.
     fn convert_target(
         &mut self,
         requestor: u32,
         target: u32,
         property: u32,
-        incr: bool,
+        incr: Option<u32>,
     ) -> io::Result<bool> {
         let Some((type_, format, data)) = self.target_data(target) else {
             return Ok(false);
@@ -439,9 +507,9 @@ impl<'a> Bridge<'a> {
                 .change_property(0, requestor, property, type_, format, &data)?;
             return Ok(true);
         }
-        if !incr {
+        let Some(time) = incr else {
             return Ok(false);
-        }
+        };
         // §2.7.2: select PropertyNotify, write INCR with a lower bound on the
         // size, then a chunk after each deletion of the property.
         self.conn.select_input(requestor, PROPERTY_CHANGE_MASK)?;
@@ -457,6 +525,8 @@ impl<'a> Bridge<'a> {
         self.outgoing
             .retain(|o| !(o.requestor == requestor && o.property == property));
         self.outgoing.push(Outgoing {
+            time,
+            target,
             requestor,
             property,
             type_,
@@ -478,7 +548,7 @@ impl<'a> Bridge<'a> {
         }
         let mut atoms: Vec<u32> = pairs.data.chunks_exact(4).map(|c| u32_at(c, 0)).collect();
         for pair in atoms.chunks_exact_mut(2) {
-            if pair[1] == 0 || !self.convert_target(requestor, pair[0], pair[1], false)? {
+            if pair[1] == 0 || !self.convert_target(requestor, pair[0], pair[1], None)? {
                 pair[0] = 0;
             }
         }
