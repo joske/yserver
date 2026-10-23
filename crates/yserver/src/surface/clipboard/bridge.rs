@@ -75,9 +75,6 @@ struct Incoming {
 
 /// An INCR send to a requestor, one chunk per property deletion.
 struct Outgoing {
-    /// The request's time and target, to refuse it with.
-    time: u32,
-    target: u32,
     requestor: u32,
     property: u32,
     type_: u32,
@@ -187,27 +184,15 @@ impl<'a> Bridge<'a> {
         }
     }
 
-    /// Sync turned off: drop our conversion, refuse every INCR send in
-    /// flight, then give CLIPBOARD up, so no requestor waits on us.
+    /// Sync turned off: drop our own conversion and give CLIPBOARD up.
+    /// INCR sends already started run to their end: their requestors hold
+    /// a SelectionNotify of type INCR, and §2.7.2 has no way to take that
+    /// back. The transfer lives on the requestor's property, not on the
+    /// selection, so ownership can go at once; requests still queued to us
+    /// are refused by `selection_request`, later ones by the server.
     fn sync_off(&mut self) -> io::Result<()> {
         log::info!("clipboard: sync off");
         self.incoming = None;
-        let mut requestors = Vec::new();
-        for o in std::mem::take(&mut self.outgoing) {
-            self.conn.send_selection_notify(
-                o.time,
-                o.requestor,
-                self.atoms.clipboard,
-                o.target,
-                0,
-            )?;
-            if !requestors.contains(&o.requestor) {
-                requestors.push(o.requestor);
-            }
-        }
-        for requestor in requestors {
-            self.conn.select_input(requestor, 0)?;
-        }
         if self.owned.take().is_some() {
             let time = self.server_time()?;
             self.conn
@@ -436,7 +421,7 @@ impl<'a> Bridge<'a> {
                 if target == self.atoms.multiple {
                     self.convert_multiple(requestor, property)?
                 } else {
-                    self.convert_target(requestor, target, property, Some(time))?
+                    self.convert_target(requestor, target, property, true)?
                 }
             }
             _ => false,
@@ -490,13 +475,13 @@ impl<'a> Bridge<'a> {
     }
 
     /// Write `target` to `requestor`'s `property`; INCR when it does not fit
-    /// one request and `incr` (the request's time) allows it. False: refused.
+    /// one request and `incr` allows it. False: refused.
     fn convert_target(
         &mut self,
         requestor: u32,
         target: u32,
         property: u32,
-        incr: Option<u32>,
+        incr: bool,
     ) -> io::Result<bool> {
         let Some((type_, format, data)) = self.target_data(target) else {
             return Ok(false);
@@ -507,9 +492,9 @@ impl<'a> Bridge<'a> {
                 .change_property(0, requestor, property, type_, format, &data)?;
             return Ok(true);
         }
-        let Some(time) = incr else {
+        if !incr {
             return Ok(false);
-        };
+        }
         // §2.7.2: select PropertyNotify, write INCR with a lower bound on the
         // size, then a chunk after each deletion of the property.
         self.conn.select_input(requestor, PROPERTY_CHANGE_MASK)?;
@@ -525,8 +510,6 @@ impl<'a> Bridge<'a> {
         self.outgoing
             .retain(|o| !(o.requestor == requestor && o.property == property));
         self.outgoing.push(Outgoing {
-            time,
-            target,
             requestor,
             property,
             type_,
@@ -548,7 +531,7 @@ impl<'a> Bridge<'a> {
         }
         let mut atoms: Vec<u32> = pairs.data.chunks_exact(4).map(|c| u32_at(c, 0)).collect();
         for pair in atoms.chunks_exact_mut(2) {
-            if pair[1] == 0 || !self.convert_target(requestor, pair[0], pair[1], None)? {
+            if pair[1] == 0 || !self.convert_target(requestor, pair[0], pair[1], false)? {
                 pair[0] = 0;
             }
         }

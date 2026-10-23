@@ -88,10 +88,13 @@ defaults above (key equivalents on), not the saved values.
   button 2 or 3 is released as that same button even if the setting changes
   while it is held.
 - **Clipboard off:** both directions stop. The bridge stops polling the
-  pasteboard, ignores X selection-owner changes, finishes or aborts (with a
-  refusal to the requestor) any conversion in flight, INCR included, and then
-  relinquishes CLIPBOARD ownership with `SetSelectionOwner(None)`, so no X
-  request is left unanswered. **Clipboard on:** the Mac pasteboard is taken as
+  pasteboard, ignores X selection-owner changes and relinquishes CLIPBOARD
+  ownership with `SetSelectionOwner(None)` at once. An INCR send already
+  started is finished: its requestor holds a SelectionNotify of type INCR,
+  which ICCCM §2.7.2 cannot take back, and the transfer runs on the
+  requestor's property, independent of who owns the selection. A request
+  not yet answered gets the normal refusal (SelectionNotify with property
+  None); every request gets exactly one SelectionNotify. **Clipboard on:** the Mac pasteboard is taken as
   the current content (the bridge claims CLIPBOARD for it, as at startup); a
   change made in X while it was off is not pushed to the Mac until X sets
   CLIPBOARD again.
@@ -121,8 +124,9 @@ defaults above (key equivalents on), not the saved values.
   - focus to Settings releases held keys and modifiers in X;
   - click emulation turned off while an emulated button 3 is held releases
     button 3; the next press is button 1;
-  - clipboard off during an INCR transfer: the requestor gets a refusal, and
-    CLIPBOARD ownership is released;
+  - clipboard off during an INCR send: the send completes with no second
+    SelectionNotify, and CLIPBOARD ownership is released; a request queued
+    but unanswered when it goes off is refused exactly once;
   - restart with CLI overrides relaunches without them.
 - eiger: each checkbox live, each next-launch setting after a restart, launch at
   login across a logout, quitting with Cmd-Q, Cmd-, opening Settings in both

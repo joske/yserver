@@ -649,10 +649,11 @@ fn a_killed_bridge_reconnects_and_stays_internal() {
 }
 
 #[test]
-fn sync_off_mid_incr_refuses_the_requestor_and_gives_clipboard_up() {
+fn sync_off_mid_incr_finishes_the_send_and_gives_clipboard_up() {
     let server = Server::start();
     let pasteboard = FakePasteboard::default();
-    pasteboard.set(Some(&"0123456789abcdef".repeat(300 * 1024 / 16)));
+    let big = "0123456789abcdef".repeat(300 * 1024 / 16);
+    pasteboard.set(Some(&big));
     let sync = Arc::new(AtomicBool::new(true));
     let bridge = server.bridge_with(&pasteboard, &sync);
     let mut x = Party::new(&server);
@@ -662,14 +663,72 @@ fn sync_off_mid_incr_refuses_the_requestor_and_gives_clipboard_up() {
     let (property, start) = x.convert(x.utf8);
     assert_eq!(start.unwrap().type_, incr);
     sync.store(false, Ordering::Release);
-    let refusal = x.event(SELECTION_NOTIFY);
-    assert_eq!(u32_at(&refusal, 8), x.window, "requestor");
-    assert_eq!(u32_at(&refusal, 12), x.clipboard, "selection");
-    assert_eq!(u32_at(&refusal, 16), x.utf8, "target");
-    assert_eq!(u32_at(&refusal, 20), 0, "refused");
-    assert_ne!(property, 0);
     wait_until("CLIPBOARD to have no owner", || x.owner() == 0);
+    // The requestor holds an INCR SelectionNotify: the send runs to its
+    // zero-length end, with no second SelectionNotify.
+    let window = x.window;
+    let mut got = Vec::new();
+    loop {
+        let event = x
+            .conn
+            .wait_event(|e| {
+                e[0] & 0x7f == SELECTION_NOTIFY || is_property_notify(e, window, property, true)
+            })
+            .unwrap();
+        assert_ne!(
+            event[0] & 0x7f,
+            SELECTION_NOTIFY,
+            "a second SelectionNotify"
+        );
+        let chunk = x
+            .conn
+            .get_property(window, property, true)
+            .unwrap()
+            .unwrap();
+        if chunk.type_ == 0 {
+            continue;
+        }
+        if chunk.data.is_empty() {
+            break;
+        }
+        got.extend_from_slice(&chunk.data);
+    }
+    assert_eq!(got, big.as_bytes());
+    assert!(!x.gets_event(SELECTION_NOTIFY), "a late SelectionNotify");
     assert_eq!(pasteboard.writes(), 0);
+    bridge.stop();
+    server.shutdown();
+}
+
+#[test]
+fn sync_off_refuses_a_queued_request_exactly_once() {
+    let server = Server::start();
+    let pasteboard = FakePasteboard::default();
+    pasteboard.set(Some("mac"));
+    let sync = Arc::new(AtomicBool::new(true));
+    let bridge = server.bridge_with(&pasteboard, &sync);
+    let mut x = Party::new(&server);
+    wait_until("the bridge to own CLIPBOARD", || x.owner() != 0);
+    let time = x.time();
+
+    // Under a grab the bridge's sync_off blocks on its first request, so
+    // the conversion reaches it as a SelectionRequest while it still owns
+    // CLIPBOARD, and is handled only after it has let go.
+    x.conn.grab_server().unwrap();
+    sync.store(false, Ordering::Release);
+    std::thread::sleep(POLL * 3);
+    let (window, clipboard, utf8, property) = (x.window, x.clipboard, x.utf8, x.property);
+    x.conn
+        .convert_selection(window, clipboard, utf8, property, time)
+        .unwrap();
+    x.conn.sync().unwrap();
+    x.conn.ungrab_server().unwrap();
+    let refusal = x.event(SELECTION_NOTIFY);
+    assert_eq!(u32_at(&refusal, 8), window, "requestor");
+    assert_eq!(u32_at(&refusal, 16), utf8, "target");
+    assert_eq!(u32_at(&refusal, 20), 0, "refused");
+    assert!(!x.gets_event(SELECTION_NOTIFY), "a second SelectionNotify");
+    assert_eq!(x.owner(), 0);
     bridge.stop();
     server.shutdown();
 }

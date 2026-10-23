@@ -484,6 +484,17 @@ impl Conn {
         self.send(&request).map(drop)
     }
 
+    /// `GrabServer`: other clients' requests wait until `ungrab_server`.
+    #[cfg(all(test, kms))]
+    pub(crate) fn grab_server(&mut self) -> io::Result<()> {
+        self.send(&Req::new(36, 0).finish()).map(drop)
+    }
+
+    #[cfg(all(test, kms))]
+    pub(crate) fn ungrab_server(&mut self) -> io::Result<()> {
+        self.send(&Req::new(37, 0).finish()).map(drop)
+    }
+
     /// `KillClient` of `resource`'s client.
     #[cfg(all(test, kms))]
     pub(crate) fn kill_client(&mut self, resource: u32) -> io::Result<()> {
