@@ -260,6 +260,12 @@ define_class!(
 
     impl YserverAppDelegate {
         // SAFETY: an action method: one object argument, no return value.
+        #[unsafe(method(copyDisplay:))]
+        fn copy_display(&self, _sender: Option<&AnyObject>) {
+            super::display::copy();
+        }
+
+        // SAFETY: an action method: one object argument, no return value.
         #[unsafe(method(showSettings:))]
         fn show_settings(&self, _sender: Option<&AnyObject>) {
             let (mtm, ivars) = (self.mtm(), self.ivars());
@@ -470,12 +476,12 @@ struct MainQueueUi {
 }
 
 impl ShellUi for MainQueueUi {
-    fn set_title(&self, title: &str) {
-        let title = title.to_owned();
+    fn set_display(&self, display: u16) {
         DispatchQueue::main().exec_async(move || {
             let mtm = MainThreadMarker::new().expect("the main queue runs on the main thread");
+            super::display::announce(mtm, display);
             if let Some(window) = super::window::root_window(mtm) {
-                window.setTitle(&NSString::from_str(&title));
+                window.setTitle(&NSString::from_str(&super::display::title(display)));
             }
         });
     }

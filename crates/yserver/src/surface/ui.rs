@@ -27,9 +27,9 @@ impl CursorImage {
 
 /// The shell's UI commands; each runs on the shell's UI thread.
 pub(crate) trait ShellUi: Send + Sync {
-    /// Show `title` on the window.
+    /// Say the X display this server listens on, `:{display}`.
     #[cfg_attr(kms, allow(dead_code))] // Called by `server`, built without KMS.
-    fn set_title(&self, title: &str);
+    fn set_display(&self, display: u16);
     /// The core loop has ended and released every Vulkan object; quit.
     #[cfg_attr(kms, allow(dead_code))] // Called by `server`, built without KMS.
     fn quit(&self, failed: bool);

@@ -162,6 +162,11 @@ define_class!(
             unsafe { SMAppService::openSystemSettingsLoginItems() };
         }
 
+        #[unsafe(method(copyDisplay:))]
+        fn copy_display(&self, _sender: &NSButton) {
+            super::display::copy();
+        }
+
         #[unsafe(method(restart:))]
         fn restart(&self, _sender: &NSButton) {
             log::info!("macos: settings: restart");
@@ -245,6 +250,7 @@ fn set_login_item(on: bool) -> Result<(), String> {
 /// retain their target).
 pub(super) struct SettingsWindow {
     window: Retained<NSWindow>,
+    display: Retained<NSTextField>,
     _target: Retained<SettingsTarget>,
 }
 
@@ -295,6 +301,13 @@ impl SettingsWindow {
             popup.setAction(Some(sel!(setScale:)));
         }
         popup.setEnabled(!set_by_argv.scale);
+
+        let display_label = label(mtm, &display_text());
+        let copy_display = button(mtm, "Copy", Some((sel!(copyDisplay:), target_obj)));
+        let display_line = row(
+            mtm,
+            &[&label(mtm, "X display:"), &display_label, &copy_display],
+        );
 
         let mode_line = row(mtm, &[&label(mtm, "Mode:"), &mode_row]);
         let scale_line = row(mtm, &[&label(mtm, "Scale:"), &popup]);
@@ -354,6 +367,7 @@ impl SettingsWindow {
         let content = column(
             mtm,
             &[
+                &display_line,
                 &mode_line,
                 &scale_line,
                 &restart_line,
@@ -371,6 +385,7 @@ impl SettingsWindow {
             right: 20.0,
         });
         content.setCustomSpacing_afterView(20.0, &restart_line);
+        content.setCustomSpacing_afterView(20.0, &display_line);
 
         // SAFETY: a fresh allocation; released-when-closed is turned off below.
         let window = unsafe {
@@ -392,15 +407,23 @@ impl SettingsWindow {
         window.center();
         Self {
             window,
+            display: display_label,
             _target: target,
         }
     }
 
     /// Bring the window to front and make it key.
     pub(super) fn show(&self, mtm: MainThreadMarker) {
+        self.display
+            .setStringValue(&NSString::from_str(&display_text()));
         NSApplication::sharedApplication(mtm).activate();
         self.window.makeKeyAndOrderFront(None);
     }
+}
+
+/// The display's name, or that it is not known yet.
+fn display_text() -> String {
+    super::display::name().unwrap_or_else(|| "starting".to_owned())
 }
 
 /// A radio button for `setMode:`; `tag` 1 is the window mode. Radios with

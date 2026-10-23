@@ -4,6 +4,7 @@
 mod app;
 mod cursor;
 mod defaults;
+mod display;
 mod display_link;
 mod input;
 mod pasteboard;

@@ -134,7 +134,7 @@ pub(crate) fn run_rootless(
         },
         Some(&spec.link),
         Some(clipboard),
-        |display| spec.ui.set_title(&format!("yserver DISPLAY=:{display}")),
+        |display| spec.ui.set_display(display),
     );
     spec.link.disconnect();
     if let Err(e) = &result {
@@ -235,7 +235,7 @@ pub(crate) fn run_windowed(opts: launch::LaunchOptions, spec: WindowSpec) -> io:
         |_, _| Ok(()),
         Some(&link),
         Some(clipboard),
-        |display| ui.set_title(&format!("yserver DISPLAY=:{display}")),
+        |display| ui.set_display(display),
     );
     link.disconnect();
     if let Err(e) = &result {

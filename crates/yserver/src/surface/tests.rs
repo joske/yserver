@@ -911,7 +911,7 @@ impl RecordingUi {
 }
 
 impl ShellUi for RecordingUi {
-    fn set_title(&self, _title: &str) {}
+    fn set_display(&self, _display: u16) {}
 
     fn quit(&self, _failed: bool) {}
 

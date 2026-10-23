@@ -23,7 +23,7 @@ use crate::{
 struct NoUi;
 
 impl ShellUi for NoUi {
-    fn set_title(&self, _title: &str) {}
+    fn set_display(&self, _display: u16) {}
     fn quit(&self, _failed: bool) {}
     fn set_cursor(&self, _cursor: Option<CursorImage>) {}
     fn warp_pointer(&self, _x: i32, _y: i32) {}

@@ -176,30 +176,10 @@ struct RootlessUi {
 }
 
 impl ShellUi for RootlessUi {
-    /// A disabled first item of the app menu says the display.
-    fn set_title(&self, title: &str) {
-        let title = title.to_owned();
+    fn set_display(&self, display: u16) {
         DispatchQueue::main().exec_async(move || {
             let mtm = MainThreadMarker::new().expect("the main queue runs on the main thread");
-            let Some(menu) = NSApplication::sharedApplication(mtm)
-                .mainMenu()
-                .and_then(|bar| bar.itemAtIndex(0))
-                .and_then(|item| item.submenu())
-            else {
-                return;
-            };
-            // SAFETY: an item without an action.
-            let item = unsafe {
-                NSMenuItem::initWithTitle_action_keyEquivalent(
-                    NSMenuItem::alloc(mtm),
-                    &NSString::from_str(&title),
-                    None,
-                    ns_string!(""),
-                )
-            };
-            item.setEnabled(false);
-            menu.insertItem_atIndex(&item, 0);
-            menu.insertItem_atIndex(&NSMenuItem::separatorItem(mtm), 1);
+            super::display::announce(mtm, display);
         });
     }
 
