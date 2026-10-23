@@ -4,11 +4,12 @@
 use std::{ffi::c_void, rc::Rc};
 
 use ash::vk;
-use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained};
+use objc2::{ClassType, MainThreadMarker, MainThreadOnly, rc::Retained};
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSResponder, NSScreen, NSView, NSWindow, NSWindowStyleMask,
+    NSApplication, NSBackingStoreType, NSColor, NSResponder, NSScreen, NSView, NSWindow,
+    NSWindowStyleMask,
 };
-use objc2_foundation::{NSPoint, NSRect, NSString};
+use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSString};
 use objc2_quartz_core::{CALayer, CAMetalLayer, CATransaction, kCAGravityTopLeft};
 
 use super::{input::ShellInput, scale::Metrics, view::YserverView};
@@ -64,6 +65,19 @@ pub(super) fn create(
     let _ = window.makeFirstResponder(Some(responder));
     window.center();
     (window, layer)
+}
+
+/// The window showing the X screen; others (Settings, the About panel)
+/// come and go beside it.
+pub(super) fn root_window(mtm: MainThreadMarker) -> Option<Retained<NSWindow>> {
+    NSApplication::sharedApplication(mtm)
+        .windows()
+        .iter()
+        .find(|window| {
+            window
+                .contentView()
+                .is_some_and(|view| view.isKindOfClass(YserverView::class()))
+        })
 }
 
 /// The window's style.

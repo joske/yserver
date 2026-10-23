@@ -35,7 +35,7 @@ impl Mode {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Rootless => "rootless",
             Self::Window => "window",
@@ -104,7 +104,7 @@ impl Settings {
     }
 }
 
-fn scale_str(scale: ScaleOption) -> String {
+pub(crate) fn scale_str(scale: ScaleOption) -> String {
     match scale {
         ScaleOption::Auto => "auto".to_owned(),
         ScaleOption::Factor(n) => n.to_string(),

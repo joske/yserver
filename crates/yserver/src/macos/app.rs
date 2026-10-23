@@ -37,9 +37,15 @@ use objc2_app_kit::{
 use objc2_foundation::{NSData, NSNotification, NSObject, NSObjectProtocol, NSString, ns_string};
 use objc2_quartz_core::CAMetalLayer;
 
-use super::{display_link::DisplayLink, input::ShellInput, scale::Metrics};
+use super::{
+    display_link::DisplayLink,
+    input::ShellInput,
+    scale::Metrics,
+    settings_window::{self, SettingsWindow},
+};
 use crate::{
-    launch::{LaunchOptions, ShellMode},
+    launch::{LaunchOptions, ScaleOption, ShellMode},
+    settings::{Mode, SetByArgv},
     surface::{
         clipboard::HostClipboard,
         clock::{FrameClock, SoftwareTicker},
@@ -85,6 +91,11 @@ struct Ivars {
     focus_observer: OnceCell<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
     /// The clipboard bridge's switch, the live `sync_clipboard`.
     sync_clipboard: Arc<AtomicBool>,
+    /// What argv fixed for this run, and the scale it runs at.
+    set_by_argv: SetByArgv,
+    scale: ScaleOption,
+    /// Made on first open.
+    settings: OnceCell<SettingsWindow>,
 }
 
 /// What ticks the frame clock: the display link, or a timer without one.
@@ -227,7 +238,26 @@ define_class!(
         // SAFETY: an action method: one object argument, no return value.
         #[unsafe(method(showSettings:))]
         fn show_settings(&self, _sender: Option<&AnyObject>) {
-            log::info!("macos: Settings is not available yet");
+            let (mtm, ivars) = (self.mtm(), self.ivars());
+            let Some(input) = ivars.input.get() else {
+                return;
+            };
+            let window = ivars.settings.get_or_init(|| {
+                SettingsWindow::new(
+                    mtm,
+                    settings_window::Context {
+                        input: Rc::clone(input),
+                        sync_clipboard: Arc::clone(&ivars.sync_clipboard),
+                        set_by_argv: ivars.set_by_argv,
+                        mode: match ivars.mode {
+                            ShellMode::Rooted => Mode::Window,
+                            ShellMode::Rootless => Mode::Rootless,
+                        },
+                        scale: ivars.scale,
+                    },
+                )
+            });
+            window.show(mtm);
         }
     }
 );
@@ -236,6 +266,9 @@ impl YserverAppDelegate {
     fn new(mtm: MainThreadMarker, opts: LaunchOptions, mode: ShellMode) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(Ivars {
             sync_clipboard: Arc::new(AtomicBool::new(opts.live.sync_clipboard)),
+            set_by_argv: opts.set_by_argv,
+            scale: opts.scale,
+            settings: OnceCell::new(),
             opts: Cell::new(Some(opts)),
             mode,
             link: Arc::new(ShellLink::default()),
@@ -401,10 +434,7 @@ impl ShellUi for MainQueueUi {
         let title = title.to_owned();
         DispatchQueue::main().exec_async(move || {
             let mtm = MainThreadMarker::new().expect("the main queue runs on the main thread");
-            if let Some(window) = NSApplication::sharedApplication(mtm)
-                .windows()
-                .firstObject()
-            {
+            if let Some(window) = super::window::root_window(mtm) {
                 window.setTitle(&NSString::from_str(&title));
             }
         });
@@ -432,10 +462,7 @@ impl ShellUi for MainQueueUi {
         let request = Arc::clone(&self.resize_request);
         DispatchQueue::main().exec_async(move || {
             let mtm = MainThreadMarker::new().expect("the main queue runs on the main thread");
-            let Some(window) = NSApplication::sharedApplication(mtm)
-                .windows()
-                .firstObject()
-            else {
+            let Some(window) = super::window::root_window(mtm) else {
                 return;
             };
             // Before the resize: the view holds back its own report.

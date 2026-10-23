@@ -51,7 +51,8 @@ to X as Super, as today. Off restores today's "everything to X".
 Restart button (see Restart below).
 
 Saved settings apply only when yserver runs from the bundle. `just macos-run`,
-`macos-rootless`, `--headless` and any non-bundle start keep today's defaults.
+`macos-rootless`, `--headless` and any non-bundle start use the built-in
+defaults above (key equivalents on), not the saved values.
 
 ## Not in v1
 

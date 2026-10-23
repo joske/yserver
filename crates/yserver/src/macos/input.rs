@@ -88,6 +88,16 @@ impl ShellInput {
         })
     }
 
+    /// The settings that apply immediately.
+    pub(super) fn live(&self) -> Live {
+        self.live.get()
+    }
+
+    /// The Settings window changed a live setting.
+    pub(super) fn set_live(&self, live: Live) {
+        self.live.set(live);
+    }
+
     /// The window now shows a `fb`-sized output.
     pub(super) fn set_fb(&self, fb: (u16, u16)) {
         self.fb.set(fb);

@@ -11,6 +11,7 @@ mod resize;
 mod rootless;
 mod run;
 mod scale;
+mod settings_window;
 mod view;
 mod window;
 

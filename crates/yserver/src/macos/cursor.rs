@@ -5,8 +5,7 @@ use std::{cell::RefCell, collections::HashMap};
 
 use objc2::{AnyThread, MainThreadMarker, rc::Retained};
 use objc2_app_kit::{
-    NSApplication, NSBitmapImageRep, NSCursor, NSDeviceRGBColorSpace, NSImage, NSScreen, NSView,
-    NSWindow,
+    NSBitmapImageRep, NSCursor, NSDeviceRGBColorSpace, NSImage, NSScreen, NSView, NSWindow,
 };
 use objc2_foundation::{NSPoint, NSSize};
 
@@ -54,11 +53,9 @@ thread_local! {
     static CURSORS: RefCell<Cursors> = RefCell::new(Cursors::default());
 }
 
-/// The window and its content view.
+/// The root window and its content view.
 fn window_and_view(mtm: MainThreadMarker) -> Option<(Retained<NSWindow>, Retained<NSView>)> {
-    let window = NSApplication::sharedApplication(mtm)
-        .windows()
-        .firstObject()?;
+    let window = super::window::root_window(mtm)?;
     let view = window.contentView()?;
     Some((window, view))
 }
