@@ -17,6 +17,7 @@ use yserver_core::{core_loop::HostInputEvent, rootless::ToplevelId};
 
 use crate::{
     rootless::native::seat::PointerTracker,
+    settings::Live,
     surface::{
         input::{
             pointer::{self, RawPointer, RawScroll, ScrollPhase, Scroller, local_position},
@@ -56,10 +57,12 @@ pub(super) struct ShellInput {
     pointer: RefCell<PointerTracker>,
     /// Rootless: the mouse-down still held, for `_NET_WM_MOVERESIZE` moves.
     held_down: RefCell<Option<(ToplevelId, Retained<NSEvent>)>>,
+    /// The settings that apply immediately.
+    live: Cell<Live>,
 }
 
 impl ShellInput {
-    pub(super) fn new(link: Arc<ShellLink>, fb: (u16, u16)) -> Rc<Self> {
+    pub(super) fn new(link: Arc<ShellLink>, fb: (u16, u16), live: Live) -> Rc<Self> {
         let iso = iso_keyboard();
         log::info!(
             "macos: keyboard layout {}",
@@ -72,6 +75,7 @@ impl ShellInput {
             scroller: RefCell::new(Scroller::default()),
             pointer: RefCell::new(PointerTracker::default()),
             held_down: RefCell::new(None),
+            live: Cell::new(live),
         })
     }
 
@@ -143,11 +147,12 @@ impl ShellInput {
         let fb = self.fb.get();
         let number = event.buttonNumber() as i64;
         let flags = event.modifierFlags().0 as u64;
+        let emulate = self.live.get().emulate_buttons;
         log::debug!("macos button {number} pressed={pressed}: {raw:?}");
         let mut translator = self.translator.borrow_mut();
         self.link.send_input(|time, out| {
             out.push(pointer::motion(&raw, fb, time));
-            translator.button(number, pressed, flags, time, out);
+            translator.button(number, pressed, flags, emulate, time, out);
         });
     }
 
@@ -189,6 +194,7 @@ impl ShellInput {
         *self.held_down.borrow_mut() = pressed.then(|| (id, event.retain()));
         let number = event.buttonNumber() as i64;
         let flags = event.modifierFlags().0 as u64;
+        let emulate = self.live.get().emulate_buttons;
         log::debug!("macos button {number} pressed={pressed} {id:?}: {local:?}");
         let mut pointer = self.pointer.borrow_mut();
         let mut translator = self.translator.borrow_mut();
@@ -198,7 +204,7 @@ impl ShellInput {
                 None => Some(pointer.moved(id, local, time)),
             };
             out.extend(at.map(HostInputEvent::Rootless));
-            translator.button(number, pressed, flags, time, out);
+            translator.button(number, pressed, flags, emulate, time, out);
             if let Some(leave) = pointer.button(pressed, time) {
                 out.push(HostInputEvent::Rootless(leave));
             }

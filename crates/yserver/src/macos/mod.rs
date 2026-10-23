@@ -3,6 +3,7 @@
 
 mod app;
 mod cursor;
+mod defaults;
 mod display_link;
 mod input;
 mod pasteboard;
@@ -13,4 +14,5 @@ mod scale;
 mod view;
 mod window;
 
+pub(crate) use defaults::stored_settings;
 pub(crate) use run::run;

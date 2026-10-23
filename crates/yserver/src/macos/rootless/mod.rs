@@ -270,7 +270,7 @@ pub(super) fn start(
         clock.set_tick_hook(move || pacer.tick());
     }
     let ticker = TickSource::start(&clock)?;
-    let input = ShellInput::new(Arc::clone(&link), space.root());
+    let input = ShellInput::new(Arc::clone(&link), space.root(), opts.live);
     shell::install(
         space,
         Arc::clone(&link),

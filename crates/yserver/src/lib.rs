@@ -20,6 +20,7 @@ pub(crate) mod platform;
 pub mod present;
 pub(crate) mod rootless;
 pub(crate) mod scroll_v120;
+pub mod settings;
 // Only the macOS shell opens windows; elsewhere the window half is unused.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 pub(crate) mod surface;
@@ -299,6 +300,13 @@ pub const RESOURCE_TELEMETRY_TARGET: &str = "yserver::resources";
 pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     let mode = launch::shell_mode(&opts, true).map_err(io::Error::other)?;
     macos::run(opts, mode)
+}
+
+/// The settings stored in the user defaults.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn stored_settings() -> settings::Settings {
+    macos::stored_settings()
 }
 
 /// Run the server on a platform with neither KMS nor a window shell.

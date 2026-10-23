@@ -248,7 +248,7 @@ impl YserverAppDelegate {
         };
         let size = opts.geometry.unwrap_or(server::DEFAULT_SIZE);
         super::scale::set_option(opts.scale);
-        let input = ShellInput::new(Arc::clone(&ivars.link), size);
+        let input = ShellInput::new(Arc::clone(&ivars.link), size, opts.live);
         match input.install_key_monitor(mtm) {
             Some(monitor) => {
                 let _ = ivars.key_monitor.set(monitor);

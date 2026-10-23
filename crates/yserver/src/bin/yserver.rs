@@ -25,19 +25,25 @@ fn main() -> ExitCode {
             eprintln!("yserver: {err}");
             eprintln!(
                 "usage: yserver [:N | N] [vtN] [-seat NAME] [-auth FILE] \
-                 [-displayfd N] [-nolisten PROTO] [-novtswitch] [--version]"
+                 [-displayfd N] [-nolisten PROTO] [-novtswitch] [--headless] [--version]"
             );
+            #[cfg(target_os = "macos")]
+            eprintln!("       macOS: [--rootless | --rooted] [--geometry WxH] [--scale auto|1|2]");
             return ExitCode::FAILURE;
         }
     };
 
-    // Started from Finder, nobody can pass `:N`.
+    // Started from Finder, nobody can pass `:N`; the saved settings apply
+    // under argv.
     #[cfg(target_os = "macos")]
-    let opts = yserver::launch::LaunchOptions {
-        pick_free_display: startup.bundle.is_some(),
-        from_bundle: startup.bundle.is_some(),
-        ..opts
-    };
+    let opts = yserver::launch::apply_settings(
+        yserver::launch::LaunchOptions {
+            pick_free_display: startup.bundle.is_some(),
+            from_bundle: startup.bundle.is_some(),
+            ..opts
+        },
+        &yserver::stored_settings(),
+    );
 
     if opts.show_version {
         println!("{}", yserver::version::line());

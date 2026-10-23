@@ -156,17 +156,19 @@ impl Translator {
 
     /// Translate a mouse button: `number` is the window system's 0-based
     /// button number (0 left, 1 right, 2 middle, 3 back, 4 forward);
-    /// `flags` the `modifierFlags` at the event.
+    /// `flags` the `modifierFlags` at the event; `emulate`: Option- and
+    /// Command-clicks are buttons 2 and 3 (the setting, read per press).
     pub(crate) fn button(
         &mut self,
         number: i64,
         pressed: bool,
         flags: u64,
+        emulate: bool,
         time: u32,
         out: &mut Vec<HostInputEvent>,
     ) {
         if number == 0
-            && let Some(button) = self.fake_button(pressed, flags, time, out)
+            && let Some(button) = self.fake_button(pressed, flags, emulate, time, out)
         {
             self.change_button(button, pressed, time, out);
             return;
@@ -203,11 +205,12 @@ impl Translator {
     /// XQuartz's fake buttons (`darwinEvents.c:503-541`, masks `darwin.c:137-138`):
     /// a primary click that starts with Option held is button 2, with
     /// Command button 3; the modifier is released in X first. The release
-    /// matches the press, whatever the modifiers are by then.
+    /// matches the press, whatever the modifiers or `emulate` are by then.
     fn fake_button(
         &mut self,
         pressed: bool,
         flags: u64,
+        emulate: bool,
         time: u32,
         out: &mut Vec<HostInputEvent>,
     ) -> Option<u16> {
@@ -216,6 +219,9 @@ impl Translator {
         }
         if let Some(stale) = self.fake.take() {
             self.change_button(stale, false, time, out);
+        }
+        if !emulate {
+            return None;
         }
         let (button, group) = if flags & FLAG_OPTION != 0 {
             (BTN_MIDDLE, FLAG_OPTION)
@@ -425,8 +431,8 @@ mod tests {
             ],
         );
         let mut out = Vec::new();
-        t.button(0, true, 0, 0, &mut out);
-        t.button(1, true, 0, 0, &mut out);
+        t.button(0, true, 0, true, 0, &mut out);
+        t.button(1, true, 0, true, 0, &mut out);
         out.clear();
         t.release_all(0, &mut out);
         assert_eq!(
@@ -469,7 +475,7 @@ mod tests {
         let mut t = Translator::new(false);
         let mut out = Vec::new();
         for number in 0..=5 {
-            t.button(number, true, 0, 0, &mut out);
+            t.button(number, true, 0, true, 0, &mut out);
         }
         assert_eq!(
             summary(&out),
@@ -482,8 +488,8 @@ mod tests {
             ]
         );
         out.clear();
-        t.button(0, true, 0, 0, &mut out);
-        t.button(5, false, 0, 0, &mut out);
+        t.button(0, true, 0, true, 0, &mut out);
+        t.button(5, false, 0, true, 0, &mut out);
         assert!(out.is_empty(), "a held button and button 5 send nothing");
     }
 
@@ -495,8 +501,18 @@ mod tests {
     const MIDDLE: u32 = 256 + 0x112;
 
     fn click(t: &mut Translator, number: i64, pressed: bool, flags: u64) -> Vec<(u32, bool)> {
+        click_with(t, number, pressed, flags, true)
+    }
+
+    fn click_with(
+        t: &mut Translator,
+        number: i64,
+        pressed: bool,
+        flags: u64,
+        emulate: bool,
+    ) -> Vec<(u32, bool)> {
         let mut out = Vec::new();
-        t.button(number, pressed, flags, 0, &mut out);
+        t.button(number, pressed, flags, emulate, 0, &mut out);
         summary(&out)
     }
 
@@ -542,6 +558,23 @@ mod tests {
             run(&mut t, &[(kvk::kVK_Command, F, 0, false)]).is_empty(),
             "Super was already released"
         );
+    }
+
+    #[test]
+    fn emulation_turned_off_while_held_releases_the_emulated_button() {
+        let mut t = Translator::new(false);
+        assert_eq!(click_with(&mut t, 0, true, CMD_L, true), [(RIGHT, true)]);
+        assert_eq!(
+            click_with(&mut t, 0, false, CMD_L, false),
+            [(RIGHT, false)],
+            "matches the press"
+        );
+        assert_eq!(
+            click_with(&mut t, 0, true, CMD_L, false),
+            [(LEFT, true)],
+            "the next press is not emulated"
+        );
+        assert_eq!(click_with(&mut t, 0, false, CMD_L, true), [(LEFT, false)]);
     }
 
     #[test]
