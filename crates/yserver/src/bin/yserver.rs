@@ -40,6 +40,7 @@ fn main() -> ExitCode {
         yserver::launch::LaunchOptions {
             pick_free_display: startup.bundle.is_some(),
             from_bundle: startup.bundle.is_some(),
+            argv_overrides: yserver::launch::has_argv_overrides(&opts),
             ..opts
         },
         &yserver::stored_settings(),

@@ -96,6 +96,30 @@ pub fn bundle_of(exe: &Path) -> Option<&Path> {
     .then_some(bundle)
 }
 
+/// How long the relaunch helper waits for the old process to exit.
+const RELAUNCH_WAIT_TENTHS: u32 = 100;
+
+/// A helper that waits for process `pid` to exit (at most 10 s), then
+/// opens `bundle` as a new instance with no arguments, so the saved
+/// settings apply and nothing of the old argv survives. A separate
+/// process: it outlives ours, and starts the new instance only once the
+/// old one, its socket and its lock are gone.
+#[must_use]
+pub fn relaunch_command(pid: u32, bundle: &Path) -> std::process::Command {
+    let script = format!(
+        "i=0; while kill -0 \"$1\" 2>/dev/null && [ $i -lt {RELAUNCH_WAIT_TENTHS} ]; \
+         do sleep 0.1; i=$((i + 1)); done; exec /usr/bin/open -n \"$2\""
+    );
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(script)
+        .arg("yserver-relaunch")
+        .arg(pid.to_string())
+        .arg(bundle);
+    command
+}
+
 /// The log file under the home directory `home`.
 #[must_use]
 pub fn log_path(home: &Path) -> PathBuf {
@@ -155,6 +179,23 @@ fn redirect_output(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relaunch_waits_for_the_pid_and_opens_the_bundle_without_arguments() {
+        let command = relaunch_command(4242, Path::new("/Applications/yserver.app"));
+        assert_eq!(command.get_program(), "/bin/sh");
+        let args: Vec<&OsStr> = command.get_args().collect();
+        assert_eq!(args.len(), 5);
+        assert_eq!(args[0], "-c");
+        let script = args[1].to_str().unwrap();
+        assert!(script.contains("kill -0 \"$1\""));
+        assert!(script.ends_with("exec /usr/bin/open -n \"$2\""), "{script}");
+        assert!(!script.contains("--args"));
+        assert_eq!(
+            args[2..],
+            ["yserver-relaunch", "4242", "/Applications/yserver.app"]
+        );
+    }
 
     #[test]
     fn bundle_of_needs_app_contents_macos() {

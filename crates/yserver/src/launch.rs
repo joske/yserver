@@ -157,6 +157,17 @@ pub struct LaunchOptions {
     pub live: Live,
     /// Which stored settings argv overrode for this run.
     pub set_by_argv: SetByArgv,
+    /// Not set by [`parse_args`]: argv changed something for this run
+    /// ([`has_argv_overrides`]), which a restart from the Settings window
+    /// does not keep.
+    pub argv_overrides: bool,
+}
+
+/// Whether `parsed` (straight from [`parse_args`]) differs from a launch
+/// without arguments; flags that change nothing do not count.
+#[must_use]
+pub fn has_argv_overrides(parsed: &LaunchOptions) -> bool {
+    *parsed != LaunchOptions::default()
 }
 
 /// Rooted (one window is the root) or rootless (one native window per
@@ -1454,6 +1465,17 @@ mod tests {
             &Settings::load(&st),
         );
         assert_eq!(st, before);
+    }
+
+    #[test]
+    fn argv_overrides_are_flags_that_change_something() {
+        let given = |args: &[&str]| has_argv_overrides(&parse(args).unwrap());
+        assert!(!given(&[]));
+        assert!(!given(&["-novtswitch", "-noreset", "--unknown-flag"]));
+        assert!(given(&["--scale", "2"]));
+        assert!(given(&["--rootless"]));
+        assert!(given(&[":3"]));
+        assert!(given(&["--geometry", "800x600"]));
     }
 
     #[test]

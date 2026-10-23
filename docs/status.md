@@ -33,6 +33,19 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-23 macOS Settings window (branch `feat/macos-settings`, spec
+  `specs/2026-10-23-macos-settings-design.md`):** app menu with About, Settings… (Cmd-,), Hide/Hide Others/Show All,
+  Quit (Cmd-Q). Settings live in `NSUserDefaults` (`io.github.joske.yserver`) and apply only from the bundle; argv
+  wins per run and is never written back (`launch::apply_settings`, `settings.rs`). Live: click emulation, key
+  equivalents (a Cmd KeyDown is offered once to `performKeyEquivalent:`), clipboard sync (off: the bridge drops
+  CLIPBOARD at once, finishes an INCR send already started, refuses queued requests once). Next launch: mode,
+  scale, with Restart: the normal quit path, then `applicationWillTerminate:` leaves a `/bin/sh` helper that waits
+  for our PID and runs `open -n` on the bundle without arguments (`app_bundle::relaunch_command`). Launch at login
+  = `SMAppService.mainApp` (`objc2-service-management` 0.3.2), re-read whenever the window becomes key. Non-bundle
+  runs disable Restart and launch at login. eiger smoke (bundle): Settings in both modes, register/unregister,
+  restart rootless→window on the same display, restart with `--scale 2` drops it, restart confirm/cancel with an
+  xterm connected. Not run: launch at login across a logout, the requires-approval state.
+
 - **2026-10-20 monitor disconnect = Xorg modesetting (branch `fix/273-monitor-disconnect`, issue #273):** a
   physical disconnect issues no KMS commit and runs no global quiesce. The output keeps its `platform.outputs` row,
   scanout pool and CRTC (still scanning out); RANDR reports it Disconnected with an empty mode list and no EDID, while

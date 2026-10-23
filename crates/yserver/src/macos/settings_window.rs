@@ -2,8 +2,11 @@
 //! instance, brought to front on reopen. Every change is written to the user
 //! defaults at once; the live settings also apply at once. A setting a
 //! command-line flag fixed for this run is shown disabled and never written.
+//! Launch at login is `SMAppService.mainApp`'s state, never stored; Restart
+//! quits as Quit does and relaunches the bundle (`super::app`).
 
 use std::{
+    cell::{Cell, OnceCell},
     rc::Rc,
     sync::{
         Arc,
@@ -14,24 +17,25 @@ use std::{
 use objc2::{
     DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::Retained,
-    runtime::{AnyObject, Sel},
+    runtime::{AnyObject, ProtocolObject, Sel},
     sel,
 };
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSButton, NSColor, NSControlStateValueOff,
+    NSAlert, NSApplication, NSBackingStoreType, NSButton, NSColor, NSControlStateValueOff,
     NSControlStateValueOn, NSFont, NSLayoutAttribute, NSPopUpButton, NSStackView, NSTextField,
-    NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowStyleMask,
+    NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    NSEdgeInsets, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    NSEdgeInsets, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
+use objc2_service_management::SMAppService;
 
 use super::{defaults::UserDefaults, input::ShellInput};
 use crate::{
     launch::ScaleOption,
     settings::{
         KEY_EMULATE_BUTTONS, KEY_KEY_EQUIVALENTS, KEY_MODE, KEY_SCALE, KEY_SYNC_CLIPBOARD, Live,
-        Mode, SetByArgv, Store, scale_str,
+        LoginItem, Mode, SetByArgv, Store, restart_view, scale_str,
     },
 };
 
@@ -51,6 +55,25 @@ pub(super) struct Context {
     /// This run's mode and scale, shown for what argv fixed.
     pub(super) mode: Mode,
     pub(super) scale: ScaleOption,
+    /// Running from the app bundle: launch at login and Restart need it.
+    pub(super) from_bundle: bool,
+    /// Argv changed this run; a restart drops it.
+    pub(super) argv_overrides: bool,
+    /// Set by Restart before it asks the app to quit; the app delegate
+    /// relaunches on termination, and clears it when the quit is cancelled.
+    pub(super) restart: Rc<Cell<bool>>,
+}
+
+/// What the target updates when the launch-at-login state is re-read.
+struct LoginRow {
+    checkbox: Retained<NSButton>,
+    note: Retained<NSTextField>,
+    open: Retained<NSButton>,
+}
+
+struct TargetIvars {
+    context: Context,
+    login: OnceCell<LoginRow>,
 }
 
 define_class!(
@@ -58,11 +81,21 @@ define_class!(
     // `Drop`.
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
-    #[ivars = Context]
+    #[ivars = TargetIvars]
     struct SettingsTarget;
 
     // SAFETY: `NSObjectProtocol` has no safety requirements.
     unsafe impl NSObjectProtocol for SettingsTarget {}
+
+    // SAFETY: `NSWindowDelegate` has no safety requirements.
+    unsafe impl NSWindowDelegate for SettingsTarget {
+        // SAFETY: the signature matches the protocol method.
+        #[unsafe(method(windowDidBecomeKey:))]
+        fn did_become_key(&self, _notification: &NSNotification) {
+            // System Settings may have changed it meanwhile.
+            self.refresh_login();
+        }
+    }
 
     impl SettingsTarget {
         // SAFETY (all actions): one object argument, the sending control;
@@ -104,12 +137,46 @@ define_class!(
                 live.sync_clipboard = on;
             });
         }
+
+        #[unsafe(method(setLaunchAtLogin:))]
+        fn set_launch_at_login(&self, sender: &NSButton) {
+            let on = sender.state() == NSControlStateValueOn;
+            let result = set_login_item(on);
+            log::info!("macos: settings: launch at login = {on}: {result:?}");
+            self.refresh_login();
+            if let Err(e) = result {
+                let alert = NSAlert::new(self.mtm());
+                alert.setMessageText(&NSString::from_str(if on {
+                    "yserver could not be added to the login items"
+                } else {
+                    "yserver could not be removed from the login items"
+                }));
+                alert.setInformativeText(&NSString::from_str(&e));
+                alert.runModal();
+            }
+        }
+
+        #[unsafe(method(openLoginItems:))]
+        fn open_login_items(&self, _sender: &NSButton) {
+            // SAFETY: a class method without arguments.
+            unsafe { SMAppService::openSystemSettingsLoginItems() };
+        }
+
+        #[unsafe(method(restart:))]
+        fn restart(&self, _sender: &NSButton) {
+            log::info!("macos: settings: restart");
+            self.ivars().context.restart.set(true);
+            NSApplication::sharedApplication(self.mtm()).terminate(None);
+        }
     }
 );
 
 impl SettingsTarget {
     fn new(mtm: MainThreadMarker, context: Context) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(context);
+        let this = Self::alloc(mtm).set_ivars(TargetIvars {
+            context,
+            login: OnceCell::new(),
+        });
         // SAFETY: `NSObject`'s `init` has this signature.
         unsafe { msg_send![super(this), init] }
     }
@@ -118,7 +185,7 @@ impl SettingsTarget {
     fn set_live(&self, key: &str, sender: &NSButton, change: impl FnOnce(&mut Live, bool)) {
         let on = sender.state() == NSControlStateValueOn;
         UserDefaults::standard().set_bool(key, on);
-        let context = self.ivars();
+        let context = &self.ivars().context;
         let mut live = context.input.live();
         change(&mut live, on);
         context.input.set_live(live);
@@ -127,6 +194,51 @@ impl SettingsTarget {
             .store(live.sync_clipboard, Ordering::Release);
         log::info!("macos: settings: {key} = {on}");
     }
+
+    /// Show the launch-at-login state as it is now.
+    fn refresh_login(&self) {
+        let ivars = self.ivars();
+        let Some(row) = ivars.login.get() else {
+            return;
+        };
+        let view = login_item(ivars.context.from_bundle).view();
+        row.checkbox.setState(if view.checked {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
+        row.checkbox.setEnabled(view.enabled);
+        row.note
+            .setStringValue(&NSString::from_str(view.note.unwrap_or("")));
+        row.note.setHidden(view.note.is_none());
+        row.open.setHidden(!view.open_login_items);
+    }
+}
+
+/// `SMAppService.mainApp`'s state; it needs the bundle.
+fn login_item(from_bundle: bool) -> LoginItem {
+    if !from_bundle {
+        return LoginItem::NoBundle;
+    }
+    // SAFETY: class method and getter without arguments.
+    let status = unsafe { SMAppService::mainAppService().status() };
+    LoginItem::from_status(status.0)
+}
+
+/// Register or unregister the app as a login item; the error's
+/// description on failure.
+fn set_login_item(on: bool) -> Result<(), String> {
+    // SAFETY: class method without arguments.
+    let service = unsafe { SMAppService::mainAppService() };
+    // SAFETY: methods without arguments besides the error out-parameter.
+    let result = unsafe {
+        if on {
+            service.registerAndReturnError()
+        } else {
+            service.unregisterAndReturnError()
+        }
+    };
+    result.map_err(|e| e.localizedDescription().to_string())
 }
 
 /// The window and the target its controls send to (controls do not
@@ -141,6 +253,7 @@ impl SettingsWindow {
         let stored = super::defaults::stored_settings();
         let live = context.input.live();
         let set_by_argv = context.set_by_argv;
+        let (from_bundle, argv_overrides) = (context.from_bundle, context.argv_overrides);
         let (mode, scale) = (
             if set_by_argv.mode {
                 context.mode
@@ -194,12 +307,10 @@ impl SettingsWindow {
             }
         }
 
-        let restart = button(mtm, "Restart yserver");
-        restart.setEnabled(false);
-        let restart_line = row(
-            mtm,
-            &[&note(mtm, "Takes effect when yserver restarts"), &restart],
-        );
+        let (can_restart, restart_note) = restart_view(from_bundle, argv_overrides);
+        let restart = button(mtm, "Restart yserver", Some((sel!(restart:), target_obj)));
+        restart.setEnabled(can_restart);
+        let restart_line = row(mtm, &[&note(mtm, restart_note), &restart]);
 
         let emulate = checkbox(
             mtm,
@@ -219,8 +330,26 @@ impl SettingsWindow {
             live.sync_clipboard,
             Some((sel!(setSyncClipboard:), target_obj)),
         );
-        let login = checkbox(mtm, "Open yserver at login", false, None);
-        login.setEnabled(false);
+        let login = checkbox(
+            mtm,
+            "Open yserver at login",
+            false,
+            Some((sel!(setLaunchAtLogin:), target_obj)),
+        );
+        let login_note = note(mtm, "");
+        let open_login_items = button(
+            mtm,
+            "Open Login Items…",
+            Some((sel!(openLoginItems:), target_obj)),
+        );
+        let login_hint = row(mtm, &[&login_note, &open_login_items]);
+        let login_line = column(mtm, &[&login, &login_hint], 4.0);
+        let _ = target.ivars().login.set(LoginRow {
+            checkbox: login,
+            note: login_note,
+            open: open_login_items,
+        });
+        target.refresh_login();
 
         let content = column(
             mtm,
@@ -231,7 +360,7 @@ impl SettingsWindow {
                 &emulate,
                 &key_equivalents,
                 &clipboard,
-                &login,
+                &login_line,
             ],
             12.0,
         );
@@ -256,6 +385,7 @@ impl SettingsWindow {
         // SAFETY: the app delegate keeps the window outside a controller.
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(&NSString::from_str("yserver Settings"));
+        window.setDelegate(Some(ProtocolObject::from_ref(&*target)));
         window.setContentView(Some(&content));
         content.layoutSubtreeIfNeeded();
         window.setContentSize(content.fittingSize());
@@ -313,10 +443,21 @@ fn checkbox(
     checkbox
 }
 
-/// A push button without an action.
-fn button(mtm: MainThreadMarker, title: &str) -> Retained<NSButton> {
-    // SAFETY: no target, no action.
-    unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str(title), None, None, mtm) }
+/// A push button sending `action` to its target.
+fn button(
+    mtm: MainThreadMarker,
+    title: &str,
+    action: Option<(Sel, &AnyObject)>,
+) -> Retained<NSButton> {
+    // SAFETY: every action passed is its target's, taking a sender.
+    unsafe {
+        NSButton::buttonWithTitle_target_action(
+            &NSString::from_str(title),
+            action.map(|(_, target)| target),
+            action.map(|(action, _)| action),
+            mtm,
+        )
+    }
 }
 
 fn label(mtm: MainThreadMarker, text: &str) -> Retained<NSTextField> {

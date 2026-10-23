@@ -9,11 +9,16 @@
 //! returning; the core thread then drops every Vulkan object and asks the
 //! main thread to quit (`ShellUi::quit`), which answers a pending
 //! `applicationShouldTerminate:` or terminates. Quit and the close button
-//! ask first while X clients are connected; SIGTERM never asks.
+//! ask first while X clients are connected; SIGTERM never asks. Restart
+//! (Settings) is a Quit that, once the server is torn down and AppKit
+//! terminates, leaves a helper behind to open the bundle again
+//! (`crate::app_bundle::relaunch_command`).
 
 use std::{
     cell::{Cell, OnceCell},
     io,
+    path::PathBuf,
+    process::Stdio,
     rc::Rc,
     sync::{
         Arc,
@@ -96,6 +101,12 @@ struct Ivars {
     scale: ScaleOption,
     /// Made on first open.
     settings: OnceCell<SettingsWindow>,
+    /// The bundle this run started from, which a restart opens again.
+    bundle: Option<PathBuf>,
+    /// Argv changed this run.
+    argv_overrides: bool,
+    /// Restart asked for: relaunch on termination.
+    restart: Rc<Cell<bool>>,
 }
 
 /// What ticks the frame clock: the display link, or a timer without one.
@@ -147,11 +158,24 @@ define_class!(
                 return NSApplicationTerminateReply::TerminateNow;
             }
             if !self.confirm_quit() {
+                ivars.restart.set(false);
                 return NSApplicationTerminateReply::TerminateCancel;
             }
             ivars.quit.terminate_later.store(true, Ordering::Release);
             ivars.link.request_shutdown();
             NSApplicationTerminateReply::TerminateLater
+        }
+
+        // SAFETY: the signature matches the protocol method.
+        #[unsafe(method(applicationWillTerminate:))]
+        fn will_terminate(&self, _notification: &NSNotification) {
+            // The core loop has ended: clients, socket and lock are gone.
+            let ivars = self.ivars();
+            if ivars.restart.get()
+                && let Some(bundle) = &ivars.bundle
+            {
+                relaunch(bundle);
+            }
         }
 
         // SAFETY: the signature matches the protocol method.
@@ -254,6 +278,9 @@ define_class!(
                             ShellMode::Rootless => Mode::Rootless,
                         },
                         scale: ivars.scale,
+                        from_bundle: ivars.bundle.is_some(),
+                        argv_overrides: ivars.argv_overrides,
+                        restart: Rc::clone(&ivars.restart),
                     },
                 )
             });
@@ -269,6 +296,13 @@ impl YserverAppDelegate {
             set_by_argv: opts.set_by_argv,
             scale: opts.scale,
             settings: OnceCell::new(),
+            bundle: opts
+                .from_bundle
+                .then(|| std::env::current_exe().ok())
+                .flatten()
+                .and_then(|exe| crate::app_bundle::bundle_of(&exe).map(PathBuf::from)),
+            argv_overrides: opts.argv_overrides,
+            restart: Rc::new(Cell::new(false)),
             opts: Cell::new(Some(opts)),
             mode,
             link: Arc::new(ShellLink::default()),
@@ -402,7 +436,7 @@ impl YserverAppDelegate {
             return true;
         }
         let clients = ivars.clients.load(Ordering::Acquire);
-        if clients > 0 && !ask_quit(self.mtm(), clients) {
+        if clients > 0 && !ask_quit(self.mtm(), clients, ivars.restart.get()) {
             return false;
         }
         ivars.quit_confirmed.set(true);
@@ -410,15 +444,21 @@ impl YserverAppDelegate {
     }
 }
 
-/// Ask whether to quit with `clients` X clients connected.
-fn ask_quit(mtm: MainThreadMarker, clients: usize) -> bool {
+/// Ask whether to quit, or to `restart`, with `clients` X clients
+/// connected.
+fn ask_quit(mtm: MainThreadMarker, clients: usize, restart: bool) -> bool {
     let alert = NSAlert::new(mtm);
     let noun = if clients == 1 { "client" } else { "clients" };
     alert.setMessageText(&NSString::from_str(&format!(
         "{clients} X {noun} connected"
     )));
-    alert.setInformativeText(ns_string!("Quitting yserver disconnects them."));
-    alert.addButtonWithTitle(ns_string!("Quit"));
+    if restart {
+        alert.setInformativeText(ns_string!("Restarting yserver disconnects them."));
+        alert.addButtonWithTitle(ns_string!("Restart"));
+    } else {
+        alert.setInformativeText(ns_string!("Quitting yserver disconnects them."));
+        alert.addButtonWithTitle(ns_string!("Quit"));
+    }
     alert.addButtonWithTitle(ns_string!("Cancel"));
     alert.runModal() == NSAlertFirstButtonReturn
 }
@@ -490,6 +530,25 @@ pub(super) fn quit_app(quit: &Arc<QuitState>, failed: bool) {
             app.terminate(None);
         }
     });
+}
+
+/// Leave a helper that opens `bundle` again once this process has exited.
+fn relaunch(bundle: &std::path::Path) {
+    use std::os::unix::process::CommandExt;
+    let spawned = crate::app_bundle::relaunch_command(std::process::id(), bundle)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn();
+    match spawned {
+        Ok(child) => log::info!(
+            "macos: restart: relaunching {} (helper {})",
+            bundle.display(),
+            child.id()
+        ),
+        Err(e) => log::error!("macos: restart: cannot relaunch: {e}"),
+    }
 }
 
 /// A nil-targeted menu item: the action goes up the responder chain, to

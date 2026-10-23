@@ -120,6 +120,82 @@ pub struct SetByArgv {
     pub scale: bool,
 }
 
+/// The launch-at-login state, from `SMAppService.mainApp.status` (raw
+/// values 0-3), or `NoBundle` when not running from the app bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginItem {
+    NotRegistered,
+    Enabled,
+    /// Registered, waiting for the user's approval in System Settings.
+    RequiresApproval,
+    /// The system does not know the app as a login item.
+    NotFound,
+    /// `SMAppService.mainApp` needs the bundle.
+    NoBundle,
+}
+
+impl LoginItem {
+    /// `SMAppServiceStatus`; an unknown value reads as `NotFound`.
+    #[must_use]
+    pub fn from_status(raw: isize) -> Self {
+        match raw {
+            0 => Self::NotRegistered,
+            1 => Self::Enabled,
+            2 => Self::RequiresApproval,
+            _ => Self::NotFound,
+        }
+    }
+
+    /// How the Settings window shows this state.
+    #[must_use]
+    pub fn view(self) -> LoginItemView {
+        let (checked, enabled, note, open_login_items) = match self {
+            Self::NotRegistered | Self::NotFound => (false, true, None, false),
+            Self::Enabled => (true, true, None, false),
+            Self::RequiresApproval => (
+                true,
+                true,
+                Some("Allow yserver in System Settings → General → Login Items"),
+                true,
+            ),
+            Self::NoBundle => (false, false, Some("Only for yserver.app"), false),
+        };
+        LoginItemView {
+            checked,
+            enabled,
+            note,
+            open_login_items,
+        }
+    }
+}
+
+/// The launch-at-login row: the checkbox, a note under it and whether the
+/// button opening Login Items is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoginItemView {
+    pub checked: bool,
+    pub enabled: bool,
+    pub note: Option<&'static str>,
+    pub open_login_items: bool,
+}
+
+/// The Restart button's state and the note next to it. A restart relaunches
+/// the bundle with no arguments, so what argv set for this run is lost.
+#[must_use]
+pub fn restart_view(from_bundle: bool, argv_overrides: bool) -> (bool, &'static str) {
+    match (from_bundle, argv_overrides) {
+        (false, _) => (
+            false,
+            "Saved settings apply only when yserver runs as yserver.app",
+        ),
+        (true, true) => (
+            true,
+            "Takes effect at restart, without the command-line options",
+        ),
+        (true, false) => (true, "Takes effect when yserver restarts"),
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::HashMap;
@@ -208,5 +284,39 @@ pub(crate) mod tests {
         let mut st = MapStore::default();
         s.save(&mut st);
         assert_eq!(Settings::load(&st), s);
+    }
+
+    #[test]
+    fn login_item_status_maps_to_the_row() {
+        assert_eq!(LoginItem::from_status(0), LoginItem::NotRegistered);
+        assert_eq!(LoginItem::from_status(1), LoginItem::Enabled);
+        assert_eq!(LoginItem::from_status(2), LoginItem::RequiresApproval);
+        assert_eq!(LoginItem::from_status(3), LoginItem::NotFound);
+        assert_eq!(LoginItem::from_status(7), LoginItem::NotFound);
+
+        let off = LoginItem::NotRegistered.view();
+        assert!(!off.checked && off.enabled && off.note.is_none() && !off.open_login_items);
+        let on = LoginItem::Enabled.view();
+        assert!(on.checked && on.enabled && on.note.is_none() && !on.open_login_items);
+        let pending = LoginItem::RequiresApproval.view();
+        assert!(pending.checked && pending.enabled && pending.open_login_items);
+        assert!(pending.note.is_some());
+        let unknown = LoginItem::NotFound.view();
+        assert!(!unknown.checked && unknown.enabled);
+        let bare = LoginItem::NoBundle.view();
+        assert!(!bare.checked && !bare.enabled && !bare.open_login_items);
+        assert!(bare.note.is_some());
+    }
+
+    #[test]
+    fn restart_needs_the_bundle_and_warns_about_argv() {
+        assert!(!restart_view(false, false).0);
+        assert!(!restart_view(false, true).0);
+        let (enabled, plain) = restart_view(true, false);
+        assert!(enabled);
+        assert!(!plain.contains("command-line"));
+        let (enabled, warned) = restart_view(true, true);
+        assert!(enabled);
+        assert!(warned.contains("command-line"));
     }
 }
