@@ -86,19 +86,13 @@ fn fd_is_ready(fd: &OwnedFd) -> bool {
 mod tests {
     use std::os::fd::OwnedFd;
 
-    use nix::{
-        sys::eventfd::{EfdFlags, EventFd},
-        unistd::write,
-    };
+    use nix::unistd::{pipe, write};
 
     use super::*;
 
     #[test]
     fn readiness_tracks_the_sync_file_signal() {
-        let event =
-            EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
-                .expect("eventfd");
-        let fd: OwnedFd = event.into();
+        let (fd, signal): (OwnedFd, OwnedFd) = pipe().expect("pipe");
         let wait = PendingPresentSourceWait {
             fds: vec![PendingWaitFd {
                 fd,
@@ -114,27 +108,23 @@ mod tests {
         };
 
         assert!(!wait.is_ready());
-        write(&wait.fds[0].fd, &1_u64.to_ne_bytes()).expect("signal eventfd");
+        write(&signal, &[1]).expect("signal pipe");
         assert!(wait.is_ready());
     }
 
     #[test]
     fn readiness_requires_every_sync_file() {
-        let first =
-            EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
-                .expect("first eventfd");
-        let second =
-            EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
-                .expect("second eventfd");
+        let (first, signal_first) = pipe().expect("first pipe");
+        let (second, signal_second) = pipe().expect("second pipe");
         let wait = PendingPresentSourceWait {
             fds: vec![
                 PendingWaitFd {
-                    fd: first.into(),
+                    fd: first,
                     registered: false,
                     ready: false,
                 },
                 PendingWaitFd {
-                    fd: second.into(),
+                    fd: second,
                     registered: false,
                     ready: false,
                 },
@@ -147,9 +137,9 @@ mod tests {
             ready_reported: false,
         };
 
-        write(&wait.fds[0].fd, &1_u64.to_ne_bytes()).expect("signal first");
+        write(&signal_first, &[1]).expect("signal first");
         assert!(!wait.is_ready());
-        write(&wait.fds[1].fd, &1_u64.to_ne_bytes()).expect("signal second");
+        write(&signal_second, &[1]).expect("signal second");
         assert!(wait.is_ready());
     }
 }

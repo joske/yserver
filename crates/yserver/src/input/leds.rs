@@ -14,19 +14,18 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use nix::sys::eventfd::{EfdFlags, EventFd};
+use crate::platform::wakeup::{WakeupFd, wakeup_fd};
 
 pub struct LedRelay {
     /// Desired LED state, `input::Led` bits.
     mask: AtomicU32,
     /// Wakes the input thread's epoll when the mask changes.
-    efd: EventFd,
+    efd: WakeupFd,
 }
 
 impl LedRelay {
     pub fn new() -> io::Result<Self> {
-        let efd = EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
-            .map_err(|e| io::Error::other(format!("LedRelay eventfd: {e}")))?;
+        let efd = wakeup_fd().map_err(|e| io::Error::other(format!("LedRelay eventfd: {e}")))?;
         Ok(Self {
             mask: AtomicU32::new(0),
             efd,

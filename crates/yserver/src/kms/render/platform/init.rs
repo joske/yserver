@@ -667,11 +667,8 @@ impl PlatformBackend {
         // eventfd for deferred PRESENT completion. The eventfd lives
         // inside the poll set under `WAKEUP_EVENTFD_TOKEN`; per-entry
         // sync_file FDs join later via the enqueue path.
-        let wakeup_eventfd = nix::sys::eventfd::EventFd::from_value_and_flags(
-            0,
-            nix::sys::eventfd::EfdFlags::EFD_CLOEXEC | nix::sys::eventfd::EfdFlags::EFD_NONBLOCK,
-        )
-        .map_err(|e| io::Error::other(format!("eventfd: {e}")))?;
+        let wakeup_eventfd = crate::platform::wakeup::wakeup_fd()
+            .map_err(|e| io::Error::other(format!("eventfd: {e}")))?;
 
         // Backend-internal readiness set (epoll/kqueue). The wakeup
         // eventfd joins it under WAKEUP_EVENTFD_TOKEN; per-batch
@@ -777,11 +774,7 @@ impl PlatformBackend {
     /// existing shape from Stage 1b.
     #[doc(hidden)]
     pub(crate) fn for_tests() -> Self {
-        let wakeup_eventfd = nix::sys::eventfd::EventFd::from_value_and_flags(
-            0,
-            nix::sys::eventfd::EfdFlags::EFD_CLOEXEC | nix::sys::eventfd::EfdFlags::EFD_NONBLOCK,
-        )
-        .expect("test eventfd");
+        let wakeup_eventfd = crate::platform::wakeup::wakeup_fd().expect("test eventfd");
 
         let present_completion_epfd =
             crate::kms::render::completion_poller::CompletionPoller::new().expect("test poller");

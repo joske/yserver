@@ -37,7 +37,8 @@ pub(crate) trait PresentSyncobj: yserver_core::backend::SyncobjHandle {
 type SyncobjIoctlReq = libc::c_int;
 #[cfg(any(
     all(target_os = "linux", not(target_env = "musl")),
-    target_os = "freebsd"
+    target_os = "freebsd",
+    target_os = "openbsd"
 ))]
 type SyncobjIoctlReq = libc::c_ulong;
 
@@ -125,6 +126,7 @@ impl ImportedSyncobj {
     /// Register a non-blocking kernel notification for a timeline point.
     /// Unchanged in behaviour from the previous `OwnedSemaphore` version —
     /// that method already went through DRM.
+    #[cfg(eventfd)]
     pub(crate) fn signaled_eventfd(&self, value: u64) -> std::io::Result<OwnedFd> {
         use nix::sys::eventfd::{EfdFlags, EventFd};
 
@@ -134,6 +136,13 @@ impl ImportedSyncobj {
         self.drm
             .syncobj_eventfd(self.handle, value, event.as_fd(), false)?;
         Ok(event.into())
+    }
+
+    /// No eventfd on this platform; [`eventfd_supported`] reports false, so
+    /// callers poll instead.
+    #[cfg(not(eventfd))]
+    pub(crate) fn signaled_eventfd(&self, _value: u64) -> std::io::Result<OwnedFd> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
 }
 
@@ -150,6 +159,7 @@ impl ImportedSyncobj {
 ///
 /// Mirrors the shape of `eventfd_fires_on_the_registered_point` below, which
 /// passes on Linux: a fresh syncobj, a future timeline point, no wait.
+#[cfg(eventfd)]
 pub(crate) fn eventfd_supported(drm: &Arc<crate::drm::Device>) -> bool {
     use nix::sys::eventfd::{EfdFlags, EventFd};
 
@@ -163,6 +173,11 @@ pub(crate) fn eventfd_supported(drm: &Arc<crate::drm::Device>) -> bool {
         log::warn!("destroy probe syncobj failed: {e}");
     }
     supported
+}
+
+#[cfg(not(eventfd))]
+pub(crate) fn eventfd_supported(_drm: &Arc<crate::drm::Device>) -> bool {
+    false
 }
 
 impl std::fmt::Debug for ImportedSyncobj {

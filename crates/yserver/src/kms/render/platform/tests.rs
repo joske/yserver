@@ -346,14 +346,9 @@ fn copied_scanout_rejects_sink_without_explicit_dmabuf_layout_import() {
 
 #[test]
 fn topology_reset_cancels_completion_for_a_surviving_output() {
-    use nix::sys::eventfd::{EfdFlags, EventFd};
-
     let mut platform = PlatformBackend::for_tests();
     let output_key = platform.outputs[0].key.clone();
-    let ready: OwnedFd =
-        EventFd::from_value_and_flags(1, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
-            .expect("ready eventfd")
-            .into();
+    let (ready, _ready_writer) = pollable_fd(true);
     platform
         .register_scanout_render_completion(output_key, 1, Some(ready))
         .expect("register pollable copied completion");
@@ -370,18 +365,10 @@ fn topology_reset_cancels_completion_for_a_surviving_output() {
 
 #[test]
 fn scanout_render_completion_drain_is_not_queue_front_blocked() {
-    use nix::sys::eventfd::{EfdFlags, EventFd};
-
     let mut platform = PlatformBackend::for_tests();
     let output_key = platform.outputs[0].key.clone();
-    let blocked: OwnedFd =
-        EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
-            .expect("blocked eventfd")
-            .into();
-    let ready: OwnedFd =
-        EventFd::from_value_and_flags(1, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
-            .expect("ready eventfd")
-            .into();
+    let (blocked, _blocked_writer) = pollable_fd(false);
+    let (ready, _ready_writer) = pollable_fd(true);
     let first_job = platform
         .register_scanout_render_completion(output_key.clone(), 0, Some(blocked))
         .expect("register first job");
@@ -1975,4 +1962,14 @@ fn present_completion_epfd_present_at_init_and_poll_fds() {
         raw1, raw2,
         "the inner epfd is stable across poll_fds() calls"
     );
+}
+
+/// A pipe's read end, readable when `ready`, and its write end, which must
+/// stay open (a closed writer makes the reader readable too).
+fn pollable_fd(ready: bool) -> (OwnedFd, OwnedFd) {
+    let (read, write) = nix::unistd::pipe().expect("pipe");
+    if ready {
+        nix::unistd::write(&write, &[1]).expect("signal pipe");
+    }
+    (read, write)
 }

@@ -560,7 +560,7 @@ pub struct PlatformBackend {
     /// Stage 5 Task 6.1: eventfd used to wake the main loop when a
     /// PRESENT completion is enqueued. Registered with
     /// `present_completion_epfd` at init under `WAKEUP_EVENTFD_TOKEN`.
-    pub(crate) wakeup_eventfd: nix::sys::eventfd::EventFd,
+    pub(crate) wakeup_eventfd: crate::platform::wakeup::WakeupFd,
 
     /// Stable native readiness aggregator for renderer-completion sync files
     /// used by copied reverse-PRIME.  This is intentionally distinct from the

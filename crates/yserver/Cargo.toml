@@ -39,7 +39,7 @@ yserver-render.workspace = true
 yserver-render = { workspace = true, features = ["test-support"] }
 
 # The DRM/KMS platform; build.rs emits `cfg(kms)` for the same targets.
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]
 drm.workspace = true
 gbm.workspace = true
 input.workspace = true

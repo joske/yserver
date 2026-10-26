@@ -245,7 +245,7 @@ impl KmsBackend {
     }
 
     fn arm_direct_vt_switching(&mut self) {
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        #[cfg(kms)]
         {
             let Some(console_guard) = self.pstate.console_guard.as_ref() else {
                 return;
@@ -857,7 +857,7 @@ impl KmsBackend {
     }
 
     pub(in crate::kms::render::backend) fn backend_session_request_vt_switch(&mut self, vt: u32) {
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        #[cfg(kms)]
         {
             let Some(console_guard) = self.pstate.console_guard.as_ref() else {
                 log::warn!("kms: request_vt_switch({vt}) — no console guard; ignoring");
@@ -868,7 +868,7 @@ impl KmsBackend {
                 log::warn!("kms: VT_ACTIVATE({vt}) failed: {err}");
             }
         }
-        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        #[cfg(not(kms))]
         {
             log::warn!("kms: request_vt_switch({vt}) — not supported on this platform");
         }
@@ -900,7 +900,7 @@ impl KmsBackend {
             }
         }
         log::info!("kms: VT release — master dropped; VT_RELDISP(1)");
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        #[cfg(kms)]
         if let Some(console_guard) = self.pstate.console_guard.as_ref()
             && let Err(err) = console_guard.vt_reldisp(1)
         {
@@ -1108,7 +1108,7 @@ impl KmsBackend {
     ) {
         use crate::vt::state::VtEventKind;
         log::info!("kms: VT acquire — begin; VT_RELDISP(VT_ACKACQ)");
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        #[cfg(kms)]
         if let Some(console_guard) = self.pstate.console_guard.as_ref()
             && let Err(err) = console_guard.vt_reldisp(crate::kms::console::VT_ACKACQ)
         {

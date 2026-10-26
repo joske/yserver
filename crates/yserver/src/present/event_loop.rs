@@ -20,9 +20,9 @@ use std::{
     time::Instant,
 };
 
-#[cfg(target_os = "freebsd")]
+#[cfg(kqueue)]
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
-#[cfg(target_os = "linux")]
+#[cfg(epoll)]
 use nix::sys::{
     epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout},
     signalfd::SignalFd,
@@ -38,7 +38,7 @@ const DRM_TOKEN: u64 = 1;
 const INPUT_TOKEN: u64 = 2;
 const SIGNAL_TOKEN: u64 = 3;
 
-#[cfg(target_os = "linux")]
+#[cfg(epoll)]
 #[allow(clippy::too_many_arguments)]
 pub fn run_loop(
     device: &Rc<Device>,
@@ -151,7 +151,7 @@ pub fn run_loop(
     Ok(())
 }
 
-#[cfg(target_os = "freebsd")]
+#[cfg(kqueue)]
 #[allow(clippy::too_many_arguments)]
 pub fn run_loop(
     device: &Rc<Device>,

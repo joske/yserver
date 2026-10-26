@@ -2814,6 +2814,12 @@ pub struct PresentEventSelection {
     pub event_mask: u32,
 }
 
+/// `<sys/shm.h>`'s `SHM_RDONLY`, which the libc crate omits for OpenBSD.
+#[cfg(target_os = "openbsd")]
+const SHM_RDONLY: libc::c_int = 0o10000;
+#[cfg(not(target_os = "openbsd"))]
+const SHM_RDONLY: libc::c_int = libc::SHM_RDONLY;
+
 /// A shared memory segment attached via MIT-SHM. Owns the lifetime of both
 /// the file descriptor and the kernel mapping; the `Drop` impl `munmap`s
 /// and closes the fd in the right order.
@@ -2894,7 +2900,7 @@ impl MitShmSegment {
     /// commonly because the client and server live in different IPC
     /// namespaces).
     pub fn from_shmid(owner: ClientId, shmid: u32, read_only: bool) -> std::io::Result<Self> {
-        let flags = if read_only { libc::SHM_RDONLY } else { 0 };
+        let flags = if read_only { SHM_RDONLY } else { 0 };
         // SAFETY: shmat is fine to call with arbitrary user-provided shmid;
         // it returns (void*)-1 on failure.
         let addr = unsafe { libc::shmat(shmid as libc::c_int, std::ptr::null(), flags) };
@@ -2909,7 +2915,9 @@ impl MitShmSegment {
             unsafe { libc::shmdt(addr) };
             return Err(err);
         }
-        let size = info.shm_segsz;
+        // `size_t`, except `int` on OpenBSD.
+        #[allow(clippy::useless_conversion)]
+        let size = usize::try_from(info.shm_segsz).unwrap_or(0);
         if size == 0 {
             unsafe { libc::shmdt(addr) };
             return Err(std::io::Error::new(

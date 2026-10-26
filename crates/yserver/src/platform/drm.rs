@@ -338,7 +338,7 @@ fn node_for_path(path: PathBuf, kind: DrmNodeKind) -> io::Result<DrmNode> {
     let metadata = fs::metadata(&path)?;
     Ok(DrmNode {
         path,
-        key: device_key_from_rdev(metadata.rdev()),
+        key: device_key_from_rdev(dev_t_from_std(metadata.rdev())),
         kind,
     })
 }
@@ -377,6 +377,13 @@ fn device_key_from_fd(fd: BorrowedFd<'_>) -> io::Result<DrmDeviceKey> {
         return Err(io::Error::last_os_error());
     }
     Ok(device_key_from_rdev(stat.st_rdev))
+}
+
+/// std widens `st_rdev` to `u64`; narrow it back to the `dev_t` it came
+/// from (`i32` on OpenBSD).
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn dev_t_from_std(rdev: u64) -> libc::dev_t {
+    rdev as libc::dev_t
 }
 
 fn device_key_from_rdev(rdev: libc::dev_t) -> DrmDeviceKey {
@@ -706,7 +713,7 @@ mod tests {
         let metadata = file.metadata().unwrap();
         assert_eq!(
             device_key_from_fd(file.as_fd()).unwrap(),
-            device_key_from_rdev(metadata.rdev())
+            device_key_from_rdev(dev_t_from_std(metadata.rdev()))
         );
     }
 

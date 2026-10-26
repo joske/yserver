@@ -24,11 +24,11 @@ use std::{
     time::Instant,
 };
 
-#[cfg(target_os = "linux")]
+use crate::platform::wakeup::{WakeupFd, wakeup_fd};
+#[cfg(epoll)]
 use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
-#[cfg(target_os = "freebsd")]
+#[cfg(kqueue)]
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
-use nix::sys::eventfd::{EfdFlags, EventFd};
 use yserver_core::{
     core_loop::{CoreSender, HostInputEvent, InputOrigin, Message},
     host_x11::HostKeyEvent,
@@ -223,7 +223,7 @@ pub(crate) struct InputThreadControl {
             DeviceConfigCancelToken,
         )>,
     >,
-    efd: EventFd,
+    efd: WakeupFd,
     /// Latched pending resize. Written by the core thread via
     /// `push_resize`; read+cleared by the input thread via `take_resize`.
     /// Latest pending virtual-framebuffer extent, or `None` when no
@@ -237,7 +237,7 @@ pub(crate) struct InputThreadControl {
 
 impl InputThreadControl {
     pub(crate) fn new() -> io::Result<Self> {
-        let efd = EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
+        let efd = wakeup_fd()
             .map_err(|e| io::Error::other(format!("InputThreadControl eventfd: {e}")))?;
         Ok(Self {
             commands: Mutex::new(VecDeque::new()),
@@ -624,7 +624,7 @@ pub(crate) fn run(
     const TOKEN_LEDS: u64 = 2;
 
     // --- epoll setup (Linux) ---
-    #[cfg(target_os = "linux")]
+    #[cfg(epoll)]
     let input_poller = {
         use std::os::fd::BorrowedFd;
         let epoll = Epoll::new(EpollCreateFlags::empty())
@@ -648,8 +648,8 @@ pub(crate) fn run(
         epoll
     };
 
-    // --- kqueue setup (FreeBSD) ---
-    #[cfg(target_os = "freebsd")]
+    // --- kqueue setup ---
+    #[cfg(kqueue)]
     let input_poller = {
         let kq =
             Kqueue::new().map_err(|err| io::Error::other(format!("input thread kqueue: {err}")))?;
@@ -721,9 +721,9 @@ pub(crate) fn run(
     let mut resume_retry_window: Option<(crate::input::context::ResumeWindowToken, Instant)> = None;
 
     // Platform-specific event buffer.
-    #[cfg(target_os = "linux")]
+    #[cfg(epoll)]
     let mut buf = [EpollEvent::empty(); 4];
-    #[cfg(target_os = "freebsd")]
+    #[cfg(kqueue)]
     let mut kq_buf: Vec<KEvent> = vec![
         KEvent::new(
             0,
@@ -757,7 +757,7 @@ pub(crate) fn run(
             (None, None) => None,
         };
 
-        #[cfg(target_os = "linux")]
+        #[cfg(epoll)]
         {
             let timeout = match poll_until {
                 Some(until) => {
@@ -782,7 +782,7 @@ pub(crate) fn run(
             }
         }
 
-        #[cfg(target_os = "freebsd")]
+        #[cfg(kqueue)]
         {
             let timeout = match poll_until {
                 Some(until) => {

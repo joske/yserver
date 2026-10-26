@@ -304,17 +304,12 @@ fn dri3_fence_from_fd_xshmfence_path_triggers() {
     // alloc, we synthesise a memfd that's at least page-sized
     // and let `FenceMapping::map` mmap it — libxshmfence's
     // map_shm only requires the fd be at least one page.
-    use std::os::fd::{FromRawFd, OwnedFd};
-    #[cfg(target_os = "linux")]
-    let raw_result =
-        unsafe { libc::syscall(libc::SYS_memfd_create, c"yserver_dri3_test".as_ptr(), 0u32) };
-    #[cfg(not(target_os = "linux"))]
-    let raw_result = i64::from(unsafe { libc::memfd_create(c"yserver_dri3_test".as_ptr(), 0) });
-    if raw_result < 0 {
-        eprintln!("skip: memfd_create unavailable");
+    use std::os::fd::AsRawFd as _;
+    let Ok(fd) = yserver_core::anon_shm::create_anon_shm(c"yserver_dri3_test") else {
+        eprintln!("skip: anonymous shm unavailable");
         return;
-    }
-    let raw = i32::try_from(raw_result).expect("fd fits i32");
+    };
+    let raw = fd.as_raw_fd();
     // Size the memfd to one page so map_shm succeeds.
     let page_raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     let page: libc::off_t = if page_raw > 0 {
@@ -323,11 +318,9 @@ fn dri3_fence_from_fd_xshmfence_path_triggers() {
         4096
     };
     if unsafe { libc::ftruncate(raw, page) } != 0 {
-        unsafe { libc::close(raw) };
         eprintln!("skip: ftruncate failed");
         return;
     }
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     let mut b = KmsBackend::for_tests();
     let fence_xid: u32 = 0x4040_1111;
     b.dri3_fence_from_fd(fence_xid, fd)
@@ -364,18 +357,15 @@ fn dri3_fence_from_fd_xshmfence_path_triggers() {
 /// same memfd plays the client.
 #[test]
 fn dri3_shm_fence_state_is_the_shared_memory() {
-    use std::os::fd::{AsFd as _, FromRawFd, OwnedFd};
+    use std::os::fd::{AsFd as _, AsRawFd as _};
     use yserver_core::backend::Backend as _;
-    #[cfg(target_os = "linux")]
-    let raw_result =
-        unsafe { libc::syscall(libc::SYS_memfd_create, c"yserver_shm_fence".as_ptr(), 0u32) };
-    #[cfg(not(target_os = "linux"))]
-    let raw_result = i64::from(unsafe { libc::memfd_create(c"yserver_shm_fence".as_ptr(), 0) });
-    assert!(raw_result >= 0, "memfd_create");
-    let raw = i32::try_from(raw_result).expect("fd fits i32");
+    let fd = yserver_core::anon_shm::create_anon_shm(c"yserver_shm_fence").expect("anonymous shm");
     let page = libc::off_t::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096);
-    assert_eq!(unsafe { libc::ftruncate(raw, page) }, 0, "ftruncate");
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    assert_eq!(
+        unsafe { libc::ftruncate(fd.as_raw_fd(), page) },
+        0,
+        "ftruncate"
+    );
     let client = crate::kms::xshmfence::FenceMapping::map(fd.as_fd()).expect("client map");
     let mut b = KmsBackend::for_tests();
     let fence: u32 = 0x4040_2222;

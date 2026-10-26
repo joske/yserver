@@ -12,12 +12,15 @@ fn main() {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
 
-    // `cfg(kms)`: the DRM/KMS platform (and its libinput/VT stack) builds.
-    println!("cargo::rustc-check-cfg=cfg(kms)");
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if matches!(target_os.as_str(), "linux" | "freebsd") {
-        println!("cargo::rustc-cfg=kms");
-    }
+    let os = target_os.as_str();
+    // `cfg(kms)`: the DRM/KMS platform (and its libinput/VT stack) builds.
+    emit_cfg("kms", matches!(os, "linux" | "freebsd" | "openbsd"));
+    // The readiness API the platform's loops wait on.
+    emit_cfg("epoll", os == "linux");
+    emit_cfg("kqueue", matches!(os, "freebsd" | "openbsd" | "macos"));
+    // `eventfd(2)`, which DRM syncobj notification needs.
+    emit_cfg("eventfd", matches!(os, "linux" | "freebsd"));
     // The `xkbcommon` crate links `-lxkbcommon` without a search path, and
     // Homebrew's lib dir is not on the macOS linker's default path.
     if target_os == "macos" {
@@ -29,6 +32,13 @@ fn main() {
     // a tarball / crates.io build (no `.git`, or no `git` on PATH) falls
     // back to "unknown".
     emit_git_commit(&manifest_dir);
+}
+
+fn emit_cfg(name: &str, enabled: bool) {
+    println!("cargo::rustc-check-cfg=cfg({name})");
+    if enabled {
+        println!("cargo::rustc-cfg={name}");
+    }
 }
 
 /// Add `lib`'s pkg-config `libdir` as a native link search path. `libdir`

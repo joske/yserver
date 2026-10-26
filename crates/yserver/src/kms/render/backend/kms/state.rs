@@ -917,7 +917,7 @@ pub struct KmsBackendState {
     /// process is launched on a real VT; `None` when no controlling
     /// console exists (pty / graphical terminal / test harness).
     /// On non-console platforms this is a unit placeholder (unused).
-    #[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
+    #[cfg_attr(not(kms), allow(dead_code))]
     pub(in crate::kms::render::backend) console_guard: crate::kms::ConsoleGuardOpt,
     /// Whether VT switching has been armed in direct mode.
     pub(in crate::kms::render::backend) vt_switching_armed: bool,

@@ -1046,7 +1046,7 @@ fn spawn_signal_thread(
                     }
                 }
             }
-            #[cfg(any(target_os = "freebsd", target_os = "macos"))]
+            #[cfg(kqueue)]
             {
                 use nix::sys::event::KEvent;
                 let mut events = [KEvent::new(
@@ -1125,7 +1125,7 @@ fn build_kms_backend(
 /// SIGINT/SIGTERM and anything else still map to `Shutdown` under every
 /// policy. SIGUSR1/SIGUSR2 never reach here — the signalfd loops handle
 /// the VT handshake before calling this.
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+#[cfg(any(target_os = "linux", kqueue))]
 fn signal_action(signo: i32, policy: ResetPolicy) -> (Message, &'static str) {
     if signo == nix::libc::SIGHUP && policy != ResetPolicy::NoReset {
         return (Message::ResetRequested, "a server reset");
@@ -1139,7 +1139,7 @@ fn signal_action(signo: i32, policy: ResetPolicy) -> (Message, &'static str) {
 /// What the signal thread reads signals from.
 #[cfg(target_os = "linux")]
 type SignalSource = SignalFd;
-#[cfg(any(target_os = "freebsd", target_os = "macos"))]
+#[cfg(kqueue)]
 type SignalSource = nix::sys::event::Kqueue;
 
 #[cfg(target_os = "linux")]
@@ -1184,9 +1184,9 @@ fn signalfd_mask() -> SigSet {
     }
 }
 
-/// FreeBSD and macOS: ignore the same signals and return a kqueue fd with
+/// kqueue platforms: ignore the same signals and return a kqueue fd with
 /// EVFILT_SIGNAL filters registered.
-#[cfg(any(target_os = "freebsd", target_os = "macos"))]
+#[cfg(kqueue)]
 fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
     use nix::sys::{
         event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue},

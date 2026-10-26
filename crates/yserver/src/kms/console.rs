@@ -30,56 +30,24 @@ use nix::sys::termios::{
     tcgetattr, tcsetattr,
 };
 
-#[cfg(all(target_os = "linux", target_env = "musl"))]
-type IoctlReq = libc::c_int;
-#[cfg(any(
-    all(target_os = "linux", not(target_env = "musl")),
-    target_os = "freebsd"
-))]
-type IoctlReq = libc::c_ulong;
-
-#[cfg(target_os = "linux")]
-const VT_ACTIVATE: IoctlReq = 0x5606;
 #[cfg(target_os = "freebsd")]
-const VT_ACTIVATE: IoctlReq = 537_163_269;
-
+#[path = "console/freebsd.rs"]
+mod os;
 #[cfg(target_os = "linux")]
-const VT_SETMODE: IoctlReq = 0x5602;
-#[cfg(target_os = "freebsd")]
-const VT_SETMODE: IoctlReq = 2_148_038_146;
+#[path = "console/linux.rs"]
+mod os;
+#[cfg(target_os = "openbsd")]
+#[path = "console/openbsd.rs"]
+mod os;
 
-#[cfg(target_os = "linux")]
-const VT_RELDISP: IoctlReq = 0x5605;
-#[cfg(target_os = "freebsd")]
-const VT_RELDISP: IoctlReq = 537_163_268;
+use os::{
+    KDGKBMODE, KDSETMODE, KDSKBMODE, VT_ACTIVATE, VT_RELDISP, VT_SETMODE, screen_mode,
+    set_keyboard_raw_mode, vt_device_path, vt_frsig,
+};
 
 const VT_AUTO: libc::c_char = 0;
 const VT_PROCESS: libc::c_char = 1;
 pub(crate) const VT_ACKACQ: libc::c_long = 2;
-
-#[cfg(target_os = "linux")]
-const KDGKBMODE: IoctlReq = 0x4B44;
-#[cfg(target_os = "freebsd")]
-const KDGKBMODE: IoctlReq = 1_074_023_174;
-
-#[cfg(target_os = "linux")]
-const KDSKBMODE: IoctlReq = 0x4B45;
-#[cfg(target_os = "freebsd")]
-const KDSKBMODE: IoctlReq = 537_152_263;
-
-#[cfg(target_os = "linux")]
-const KDGETMODE: IoctlReq = 0x4B3B;
-#[cfg(target_os = "freebsd")]
-const KDGETMODE: IoctlReq = 1_074_023_177;
-
-#[cfg(target_os = "linux")]
-const KDSETMODE: IoctlReq = 0x4B3A;
-#[cfg(target_os = "freebsd")]
-const KDSETMODE: IoctlReq = 537_152_266;
-
-const K_RAW: libc::c_int = 0x00;
-#[cfg(target_os = "linux")]
-const K_OFF: libc::c_int = 0x04;
 
 const KD_GRAPHICS: libc::c_int = 0x01;
 
@@ -121,7 +89,8 @@ impl ConsoleGuard {
     /// `Ok(None)` and a log line, not an error.
     pub fn acquire(vt: Option<u32>) -> io::Result<Option<Self>> {
         // Prefer the explicit VT device (`/dev/ttyN` on Linux,
-        // `/dev/ttyvN` on FreeBSD, from the `vtN` launch arg) over
+        // `/dev/ttyvN` on FreeBSD, `/dev/ttyC{N-1}` on OpenBSD, from the
+        // `vtN` launch arg) over
         // `/dev/tty`. A display-manager-launched server has NO
         // controlling terminal, so `/dev/tty` fails with ENXIO and we
         // never take over the console or arm VT switching. The explicit
@@ -156,18 +125,14 @@ impl ConsoleGuard {
             return Ok(None);
         }
 
-        let mut saved_screen_mode: libc::c_int = 0;
-        // SAFETY: ioctl with a valid fd writing into a stack-local int.
-        let rc = unsafe { libc::ioctl(raw_fd, KDGETMODE, &mut saved_screen_mode) };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let saved_screen_mode = screen_mode(raw_fd)?;
 
         let saved_termios = tcgetattr(&fd).map_err(io::Error::from)?;
 
         // Stop the kernel from feeding characters to the TTY. Linux prefers
         // K_OFF (no TTY-side keyboard processing at all) and falls back to
-        // K_RAW. FreeBSD exposes K_RAW but not K_OFF.
+        // K_RAW. FreeBSD exposes K_RAW but not K_OFF. OpenBSD leaves the
+        // mode alone (see its `set_keyboard_raw_mode`).
         let used_mode = set_keyboard_raw_mode(raw_fd)?;
 
         // KDSETMODE is best-effort: if the user lacks CAP_SYS_TTY_CONFIG
@@ -312,17 +277,6 @@ impl Drop for ConsoleGuard {
     }
 }
 
-fn vt_device_path(n: u32) -> String {
-    #[cfg(target_os = "linux")]
-    {
-        format!("/dev/tty{n}")
-    }
-    #[cfg(target_os = "freebsd")]
-    {
-        format!("/dev/ttyv{n:x}")
-    }
-}
-
 fn vt_ioctl_index_arg(n: u32) -> io::Result<libc::c_int> {
     libc::c_int::try_from(n).map_err(|_| {
         io::Error::new(
@@ -332,49 +286,9 @@ fn vt_ioctl_index_arg(n: u32) -> io::Result<libc::c_int> {
     })
 }
 
-#[cfg(target_os = "linux")]
-fn vt_frsig(_: libc::c_int) -> libc::c_short {
-    0
-}
-
-#[cfg(target_os = "freebsd")]
-fn vt_frsig(relsig: libc::c_int) -> libc::c_short {
-    // FreeBSD vt(4) accepts frsig=0, but legacy syscons validates frsig as a
-    // real signal even though the field is documented "not implemented yet".
-    // Reusing relsig satisfies both drivers; actual release/acquire handling
-    // still uses relsig/acqsig.
-    relsig as libc::c_short
-}
-
-#[cfg(target_os = "linux")]
-fn set_keyboard_raw_mode(raw_fd: libc::c_int) -> io::Result<&'static str> {
-    // SAFETY: ioctl with a valid fd, no userspace pointer.
-    let rc = unsafe { libc::ioctl(raw_fd, KDSKBMODE, K_OFF) };
-    if rc < 0 {
-        // SAFETY: ioctl with a valid fd, no userspace pointer.
-        let rc2 = unsafe { libc::ioctl(raw_fd, KDSKBMODE, K_RAW) };
-        if rc2 < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok("K_RAW")
-    } else {
-        Ok("K_OFF")
-    }
-}
-
-#[cfg(target_os = "freebsd")]
-fn set_keyboard_raw_mode(raw_fd: libc::c_int) -> io::Result<&'static str> {
-    // SAFETY: ioctl with a valid fd, no userspace pointer.
-    let rc = unsafe { libc::ioctl(raw_fd, KDSKBMODE, K_RAW) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok("K_RAW")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{VtMode, vt_device_path};
+    use super::VtMode;
     use std::mem::{offset_of, size_of};
 
     #[test]
@@ -385,18 +299,5 @@ mod tests {
         assert_eq!(offset_of!(VtMode, relsig), 2);
         assert_eq!(offset_of!(VtMode, acqsig), 4);
         assert_eq!(offset_of!(VtMode, frsig), 6);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn vt_device_path_uses_linux_tty_names() {
-        assert_eq!(vt_device_path(7), "/dev/tty7");
-    }
-
-    #[cfg(target_os = "freebsd")]
-    #[test]
-    fn vt_device_path_uses_freebsd_ttyv_names() {
-        assert_eq!(vt_device_path(7), "/dev/ttyv7");
-        assert_eq!(vt_device_path(10), "/dev/ttyva");
     }
 }
