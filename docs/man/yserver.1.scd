@@ -2,7 +2,7 @@ yserver(1)
 
 # NAME
 
-yserver - X11 server for Linux KMS/DRM
+yserver - X11 server for KMS/DRM on Linux, FreeBSD and OpenBSD
 
 # SYNOPSIS
 
@@ -13,9 +13,10 @@ yserver - X11 server for Linux KMS/DRM
 *yserver* is an X11 server written from scratch in Rust. It is not an Xorg
 derivative. It drives atomic KMS/DRM directly and renders with Vulkan.
 
-There is no seat manager. The server process opens _/dev/dri/\*_ and
-_/dev/input/event\*_ itself, so it needs read/write access to both, and it
-requires a working Vulkan driver. How that access is obtained depends on
+There is no seat manager. The server process opens _/dev/dri/\*_ and the
+input devices (_/dev/input/event\*_; _/dev/wskbd\*_ and _/dev/wsmouse\*_ on
+OpenBSD) itself, so it needs read/write access to both, and it requires a
+working Vulkan driver. How that access is obtained depends on
 how the server is started:
 
 *Launched by a display manager*
@@ -23,14 +24,15 @@ how the server is started:
 	_@DOCDIR@/examples/lightdm-99-yserver.conf_.
 
 *Launched by the user from a console*
-	Use *starty*(1). The invoking user needs the _video_ and _input_
-	groups, or equivalent seat ACLs:
+	Use *starty*(1). On Linux the invoking user needs the _video_ and
+	_input_ groups, or equivalent seat ACLs:
 
 	```
 	sudo usermod -aG video,input $USER
 	```
 
-	then log out and back in.
+	then log out and back in. For FreeBSD and OpenBSD see "Device access"
+	in _@DOCDIR@/setup.md_.
 
 Some options need a build feature that a given binary may not have; those
 entries say so. *--version* reports what this binary was built with.

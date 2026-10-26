@@ -75,7 +75,7 @@ libxshmfence come from there), then as root:
 
 ```sh
 pkg_add rust git just shaderc vulkan-loader libinput-openbsd libudev-openbsd \
-  libxkbcommon
+  libxkbcommon scdoc
 ```
 
 rustc needs more memory than the default data size limit allows. Raise
@@ -174,9 +174,13 @@ handling the same way it is on Linux VTs.
 
 ### OpenBSD
 
-The keyboard, mouse and DRM devices are owned by `root:wheel` and only root
-can open them. Make them group-accessible to `wheel` (your user must be a
-member):
+Log in on the first console, `ttyC0`: the default `/etc/fbtab` hands the
+keyboard, the mouse and the first GPU (`/dev/dri/card0`,
+`/dev/dri/renderD128`) to whoever logs in there. With more than one GPU,
+add the other cards' nodes to that line.
+
+Alternatively make the devices group-accessible to `wheel` (your user must
+be a member):
 
 ```sh
 chmod 660 /dev/wskbd* /dev/wsmouse* /dev/dri/*
@@ -224,6 +228,10 @@ sudo install -m644 /usr/local/share/doc/yserver/examples/lightdm-99-yserver.conf
     /etc/lightdm/lightdm.conf.d/99-yserver.conf
 sudo systemctl restart lightdm
 ```
+
+On FreeBSD the drop-in goes in `/usr/local/etc/lightdm/lightdm.conf.d/`
+and lightdm restarts with `service lightdm restart`. OpenBSD has no
+lightdm package; its display manager is xenodm.
 
 The greeter appears, you log in, and lightdm's PAM stack unlocks the login
 keyring as usual.
