@@ -188,6 +188,37 @@ jobs:
             cargo clippy --all-targets -- -D warnings
             cargo clippy --all-targets --features xdmcp -- -D warnings
             cargo test --all-targets --features xdmcp --locked
+  openbsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Clippy and tests on OpenBSD
+        uses: vmactions/openbsd-vm@v1
+        with:
+          release: "8.0"
+          mem: 12288
+          cache-after-prepare: true
+          # Package list from docs/setup.md. Mesa, libgbm, fontconfig and the
+          # fonts come from the X sets, fetched if the image lacks them. Rust
+          # is OpenBSD's package; rustup does not support OpenBSD.
+          prepare: |
+            pkg_add rust rust-clippy just shaderc vulkan-loader libinput-openbsd \
+              libudev-openbsd libxkbcommon scdoc
+            if [ ! -e /usr/X11R6/lib/pkgconfig/gbm.pc ]; then
+              v=$(uname -r | tr -d .)
+              for set in xbase xfont xshare; do
+                ftp -o - "$(cat /etc/installurl)/$(uname -r)/$(machine)/$set$v.tgz" | tar xzphf - -C /
+              done
+            fi
+          # The default data size limit is too small for rustc, and debug info
+          # would not fit the disk.
+          run: |
+            set -e
+            ulimit -d "$(ulimit -Hd)"
+            export CARGO_PROFILE_DEV_DEBUG=0
+            cargo clippy --all-targets -- -D warnings
+            cargo clippy --all-targets --features xdmcp -- -D warnings
+            cargo test --all-targets --features xdmcp --locked
   macos:
     # KosmicKrisp (Mesa Vulkan on Metal) needs macOS 26+; Apple Silicon only.
     runs-on: macos-26
