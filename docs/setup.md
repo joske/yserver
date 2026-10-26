@@ -22,7 +22,7 @@ the example configs referenced below.
   Alpine and AUR ones deliberately do not, since the right one is
   hardware-specific — install it yourself there (`mesa-vulkan-ati` or
   `mesa-vulkan-intel` on Alpine, `vulkan-radeon` or `vulkan-intel` on Arch).
-- Linux with atomic KMS/DRM, or FreeBSD.
+- Linux with atomic KMS/DRM, FreeBSD, or OpenBSD.
 - Access to `/dev/dri/*` and `/dev/input/event*` — see
   [Device access](#device-access).
 
@@ -67,6 +67,22 @@ module as described in the
 [FreeBSD graphics guide](https://docs.freebsd.org/en/books/handbook/x11/).
 `mesa-libs` alone does not provide the Vulkan GPU driver. Use the appropriate
 NVIDIA driver packages for NVIDIA hardware instead.
+
+### OpenBSD
+
+Install the X sets (Mesa's Vulkan drivers, libgbm, fontconfig and
+libxshmfence come from there), then as root:
+
+```sh
+pkg_add rust git just shaderc vulkan-loader libinput-openbsd libudev-openbsd \
+  libxkbcommon
+```
+
+rustc needs more memory than the default data size limit allows. Raise
+`datasize-cur` (and `datasize-max` if it is lower) for your login class in
+`/etc/login.conf`, e.g. `:datasize-cur=8G:` under `staff`, and log in
+again. Run `cap_mkdb /etc/login.conf` first if `/etc/login.conf.db`
+exists.
 
 Then build and install:
 
@@ -154,6 +170,16 @@ conventionally `video` and `operator`; check with `ls -l` as above. The
 Console takeover is implemented on FreeBSD `vt(4)` consoles too, so
 `Ctrl-C` in an X client is shielded from the kernel's console signal
 handling the same way it is on Linux VTs.
+
+### OpenBSD
+
+The keyboard, mouse and DRM devices are owned by `root:wheel` and only root
+can open them. Make them group-accessible to `wheel` (your user must be a
+member):
+
+```sh
+chmod 660 /dev/wskbd* /dev/wsmouse* /dev/dri/*
+```
 
 ## The X11 socket directory
 
