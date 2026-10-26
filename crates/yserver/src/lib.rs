@@ -336,6 +336,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // the whole crate at `info`. A log without the hash cannot say which commit
     // it measured — that bit the 2026-09-03 z400 runs.
     log::info!(target: "yserver::startup", "yserver: startup — {}", crate::version::line());
+    raise_open_files_limit();
 
     // Validate TCP's startup invariants before opening devices or sockets.
     let auth = build_auth_state(&opts);
@@ -1136,6 +1137,40 @@ fn signal_action(signo: i32, policy: ResetPolicy) -> (Message, &'static str) {
 /// `SIGRTMIN+3` requests the drawable dump the Ctrl+Alt+F12 hotkey does
 /// (`kill -RTMIN+3 $(pidof yserver)`), for sessions where a client reacts to
 /// the modifiers.
+/// Every client, DRM device and the probe helper's inherited slots (fds 198,
+/// 199 and copies from 256) need descriptors. OpenBSD's daemon login class,
+/// which a display manager runs as, starts at 128; raise the soft limit to
+/// Linux's usual 1024, capped by the hard limit.
+#[cfg(kms)]
+fn raise_open_files_limit() {
+    const WANTED: libc::rlim_t = 1024;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes one rlimit into the stack-local struct.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0
+        || limit.rlim_cur >= WANTED
+    {
+        return;
+    }
+    let from = limit.rlim_cur;
+    limit.rlim_cur = WANTED.min(limit.rlim_max);
+    // SAFETY: setrlimit reads the struct; raising the soft limit no higher
+    // than the hard one needs no privilege.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) } == 0 {
+        log::info!(
+            "yserver: open-files limit raised from {from} to {}",
+            limit.rlim_cur
+        );
+    } else {
+        log::warn!(
+            "yserver: cannot raise the open-files limit from {from}: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
+
 /// What the signal thread reads signals from.
 #[cfg(target_os = "linux")]
 type SignalSource = SignalFd;
