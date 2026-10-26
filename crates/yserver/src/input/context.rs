@@ -42,7 +42,14 @@ use yserver_core::{
 
 use crate::input::{event::InputEvent, libinput_config};
 
-struct Interface;
+/// The fds libinput holds. OpenBSD's libinput (libopeninput) closes each
+/// device fd twice on teardown, once when suspending and again in the
+/// backend's destroy, so a close of an fd it does not hold is dropped rather
+/// than closing whatever reused that number.
+#[derive(Default)]
+struct Interface {
+    open_fds: HashSet<RawFd>,
+}
 
 /// Tracks the runtime source identity associated with each live backend
 /// handle. Descriptive device metadata such as an evdev node is deliberately
@@ -219,6 +226,7 @@ impl LibinputInterface for Interface {
         match result {
             Ok(file) => {
                 log::debug!("libinput: open_restricted ok: {}", path.display());
+                self.open_fds.insert(file.as_raw_fd());
                 Ok(file.into())
             }
             Err(err) => {
@@ -232,7 +240,15 @@ impl LibinputInterface for Interface {
     }
 
     fn close_restricted(&mut self, fd: OwnedFd) {
-        drop(File::from(fd));
+        if self.open_fds.remove(&fd.as_raw_fd()) {
+            drop(File::from(fd));
+        } else {
+            log::debug!(
+                "libinput: close_restricted for fd {} it does not hold; not closing it",
+                fd.as_raw_fd()
+            );
+            std::mem::forget(fd);
+        }
     }
 }
 
@@ -374,7 +390,7 @@ impl Context {
                  seat ACL) and run from the console, not over SSH."
             )));
         }
-        let mut libinput = Libinput::new_with_udev(Interface);
+        let mut libinput = Libinput::new_with_udev(Interface::default());
         libinput.udev_assign_seat("seat0").map_err(|()| {
             io::Error::other(
                 "libinput: udev_assign_seat(\"seat0\") failed — is udev running and the \
