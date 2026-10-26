@@ -7,8 +7,8 @@
 # /tmp file, the SERVER's copy — used only to validate incoming clients),
 # add the same cookie to the user's ~/.Xauthority keyed to :$display, run
 # the session with XAUTHORITY pointed at ~/.Xauthority, and on exit remove
-# the :$display entry + delete the temp server file. Needs xauth + mcookie
-# on PATH.
+# the :$display entry + delete the temp server file. Needs xauth on PATH;
+# the cookie comes from mcookie, or /dev/urandom where there is none.
 #
 # Usage:
 #   starty                 # run ~/.xinitrc (/etc/X11/xinit/xinitrc fallback)
@@ -22,12 +22,13 @@
 # docs/setup.md): `sudo usermod -aG video,input $USER` then re-login.
 #
 # Portable across the shells and platforms yserver supports (dash, bash,
-# BusyBox ash; Linux and FreeBSD) rather than strictly POSIX — it relies
-# on mktemp, [ -S ] and trap EXIT, which are universal in practice.
+# BusyBox ash; Linux, FreeBSD and OpenBSD) rather than strictly POSIX —
+# it relies on mktemp, [ -S ] and trap EXIT, which are universal in
+# practice.
 #
 # Console takeover (which stops the kernel from turning Ctrl-C in an X
-# client into a signal that kills the session) is implemented on Linux
-# and FreeBSD virtual consoles.
+# client into a signal that kills the session) is implemented on Linux,
+# FreeBSD and OpenBSD virtual consoles.
 
 set -eu
 
@@ -60,6 +61,7 @@ esac
 case "$(tty 2>/dev/null || true)" in
     /dev/tty[0-9]*) ;;      # Linux virtual console
     /dev/ttyv[0-9a-f]*) ;;  # FreeBSD vt(4) console (ttyv0..ttyvf)
+    /dev/ttyC[0-9a-f]*) ;;  # OpenBSD wscons console (ttyC0..)
     *) got=$(tty 2>/dev/null || true)
        [ -n "$got" ] || got='no controlling tty'
        echo "starty: must be run from a TTY (got: $got)" >&2
@@ -81,9 +83,8 @@ else
     [ -f "$xinitrc" ] || { echo "starty: no ~/.xinitrc and no /etc/X11/xinit/xinitrc" >&2; exit 1; }
 fi
 
-# --- Depends: xauth + mcookie are part of the auth handshake. ------------
+# --- Depends: xauth is part of the auth handshake. ----------------------
 command -v xauth  >/dev/null 2>&1 || { echo "starty: xauth not found on PATH (try: pacman -S xorg-xauth)" >&2; exit 1; }
-command -v mcookie >/dev/null 2>&1 || { echo "starty: mcookie not found on PATH (try: pacman -S util-linux)" >&2; exit 1; }
 command -v yserver >/dev/null 2>&1 || { echo "starty: yserver not found on PATH (run: just install)" >&2; exit 1; }
 
 # --- State + logs. -------------------------------------------------------
@@ -113,7 +114,12 @@ userauth="${XAUTHORITY:-$HOME/.Xauthority}"
 # Armed here, not after the server launch: a failing `xauth add` below
 # would otherwise leak the temp file and a half-written authority entry.
 trap cleanup EXIT INT TERM
-cookie=$(mcookie)
+# 128 random bits as 32 hex digits. OpenBSD has no mcookie (util-linux).
+if command -v mcookie >/dev/null 2>&1; then
+    cookie=$(mcookie)
+else
+    cookie=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+fi
 xauth -f "$authfile"  add ":$display" . "$cookie"
 xauth -f "$userauth"  add ":$display" . "$cookie"
 echo "starty: DISPLAY=:$display (server auth $authfile; cookie added to $userauth)"

@@ -134,8 +134,9 @@ adjusting.
 them, run the `cargo build` above in place of the plain one, then
 `just man` and `just install` as shown earlier.
 
-To run a session you also need `xauth` and `mcookie` at runtime —
-`xorg-xauth` and `util-linux` respectively.
+To run a session you also need `xauth` at runtime (`xorg-xauth`).
+`starty` uses `mcookie` (`util-linux`) when present and reads
+`/dev/urandom` otherwise.
 
 Packagers: see [Packaging](#packaging).
 
@@ -465,7 +466,7 @@ in the ELF headers:
 | Vulkan loader | `libvulkan.so.1` is dlopened at runtime                       | `vulkan-icd-loader`, `vulkan-loader`                                         |
 | A Vulkan ICD  | runtime driver, not linked                                    | `mesa-vulkan-drivers` — _recommends_, since the NVIDIA driver also qualifies |
 | `xauth`       | `starty` execs it                                             | `xorg-xauth`, `xauth`                                                        |
-| `mcookie`     | `starty` execs it                                             | `util-linux`                                                                 |
+| `mcookie`     | `starty` execs it if present (else reads `/dev/urandom`)      | `util-linux` — _recommends_                                                  |
 | XKB data      | keymap rules read at runtime                                  | `xkeyboard-config`                                                           |
 | X core fonts  | _recommends_ only — a fontless system falls back to built-ins | `xorg-fonts-misc`, `xfonts-base`                                             |
 

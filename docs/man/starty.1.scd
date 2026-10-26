@@ -34,7 +34,8 @@ readiness handshake would never reach the display manager.
 # OPERATION
 
 . Scan _/tmp/.X11-unix/_ and pick the lowest free display number.
-. Mint an MIT-MAGIC-COOKIE-1 with *mcookie*(1).
+. Mint an MIT-MAGIC-COOKIE-1 with *mcookie*(1), or from _/dev/urandom_
+  where there is no *mcookie*.
 . Write the cookie to an unguessable temporary file and pass it to the
   server as *-auth*. This is the server's copy, used only to validate
   connecting clients.
@@ -81,14 +82,15 @@ _$XDG_STATE_HOME/yserver/session.log_
 
 # REQUIREMENTS
 
-*xauth*(1) and *mcookie*(1) must be on *PATH*, along with *yserver*(1).
+*xauth*(1) must be on *PATH*, along with *yserver*(1). *mcookie*(1) is
+used when present.
 
 # PLATFORM NOTES
 
-Works on Linux virtual consoles (_/dev/ttyN_) and FreeBSD *vt*(4)
-consoles (_/dev/ttyvN_). Console takeover — which stops the kernel from
-turning *Ctrl-C* in an X client into a signal that kills the whole
-session — is implemented on both.
+Works on Linux virtual consoles (_/dev/ttyN_), FreeBSD *vt*(4) consoles
+(_/dev/ttyvN_) and OpenBSD *wscons*(4) consoles (_/dev/ttyCN_). Console
+takeover — which stops the kernel from turning *Ctrl-C* in an X client
+into a signal that kills the whole session — is implemented on all three.
 
 # SEE ALSO
 
