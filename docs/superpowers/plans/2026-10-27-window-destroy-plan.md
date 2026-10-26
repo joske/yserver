@@ -426,3 +426,142 @@ duplicate `collect_destroy_order` and `PendingDestroy`. The one test caller of
 - **Size.** Phases 1 and 4 are mechanical; 2 and 3 carry the behaviour changes
   and should be reviewable on their own. One branch (one issue), one commit per
   phase, FF-merged.
+
+## Phase 0 findings
+
+Static reading only, nothing run. Xorg paths are relative to `../xserver`;
+yserver paths to `crates/yserver-core/src/core_loop/` unless stated.
+
+**Xorg's one sequence.** `ProcDestroyWindow` (`dix/dispatch.c:829-835`) and
+`FreeClientResources` (`dix/resource.c:1146-1154`) both unlink the resource and
+call the RT_WINDOW delete function, `DeleteWindow` (`resource.c:439`).
+`DeleteWindow` (`window.c:1070`):
+
+1. `UnmapWindow` (`:1075`): UnmapNotify (`:2854-2855`); `UnrealizeTree` calls
+   `DeleteWindowFromAnyEvents(w, FALSE)` on every realized window of the subtree
+   (`:2806`); exposures (`:2866`); `WindowsRestructured` (`:2871`).
+2. `CrushTree` (`:1077`): per inferior, DestroyNotify (`:1041`),
+   `FreeResource(id, RT_WINDOW)` (`:1043`), `FreeWindowResources` (`:1050`).
+3. DestroyNotify of the top window (`:1083`), `FreeWindowResources` (`:1086`).
+
+`FreeWindowResources` (`:994`) = `DeleteWindowFromAnySaveSet`,
+`DeleteWindowFromAnySelections` (`:999`), `DeleteWindowFromAnyEvents(w, TRUE)`
+(`:1000`).
+
+### 1. Unmap of the top window
+- **Xorg:** identical for DestroyWindow and disconnect. UnmapNotify before any
+  DestroyNotify, exposure of the covered area (`window.c:2864-2869`). The
+  departing client gets none of it (`clientGone`, `dispatch.c:3518`, set before
+  `FreeClientResources` at `:3551`).
+- **A, D:** match. **B/C:** no exposures; UnmapNotify sent after the resource is
+  gone, from `fanout_destroy_sequence` (`process_disconnect.rs:47-60`), after
+  all other cleanup.
+- **Executor:** A's sequence for every path. Fanout already skips the departing
+  client (`fanout.rs:283`; B removes it from `state.clients` at `:354`).
+
+### 2. Core focus
+- **Xorg:** `DeleteWindowFromAnyEvents` (`events.c:5933-5985`) reverts every
+  keyboard's focus on the window, from `UnrealizeTree` (realized windows) or
+  `FreeWindowResources` (the rest): after UnmapNotify, before Expose.
+- **A:** reverts core focus **before** UnmapNotify (`windows.rs:505-509`).
+- **B/C:** XI1 only. No core focus revert anywhere on the disconnect path
+  (`revert_core_focus_from` is called only at `windows.rs:508` and
+  `focus_pointer.rs:300`); `core_focus` can name a destroyed window.
+- **Executor:** revert XI1 and core focus after the top's UnmapNotify, before
+  exposures.
+
+### 3. Grabs
+- **Xorg:** `DeleteWindowFromAnyEvents` deactivates **any** device's active grab
+  (core, XI1, XI2) whose window or confine-to is dying, whoever owns it
+  (`events.c:5915-5931`), and with `freeResources` frees passive grabs on it
+  (`:5997-5998`). `CloseDownClient` runs `ReleaseActiveGrabs(client)`
+  (`dispatch.c:3496`) **before** `FreeClientResources`.
+- **A:** `release_core_grabs_for_unviewable` (`windows.rs:643`), core only, after
+  all DestroyNotify. No XI1/XI2 active-grab release; passive grabs
+  (`button_grabs`, `key_grabs`, `xi1_passive_grabs`) are never pruned by window.
+- **B:** releases only the departing client's grabs, **after** destroying its
+  windows (`process_disconnect.rs:535-630`). **C:** none.
+- **Executor:** per planned window, deactivate any active core/XI1/XI2 grab on it
+  (window or confine-to) and drop passive grabs on it. B/C release the departing
+  client's own grabs before executing any plan.
+
+### 4. XFIXES selections
+- **Xorg:** `DeleteClientFromAnySelections` (`dispatch.c:3495`) runs before
+  `FreeClientResources` and matches the client that **set** the owner
+  (`selection.c:131-139`, `:220`), firing `SelectionClientClose`. Then each
+  window's `FreeWindowResources` fires `SelectionWindowDestroy` for selections
+  still on it (`selection.c:113-125`; subtypes `xfixes/select.c:67-74`). No core
+  SelectionClear either way.
+- **A:** `SelectionWindowDestroy` for the whole order before any DestroyNotify
+  (`windows.rs:590`).
+- **B:** ClientClose keyed on the **window's owner**
+  (`process_request/selection.rs:236-254`), then drops selections on dead
+  windows with no notify (`process_disconnect.rs:~646-648`). `state.selections`
+  doesn't record the setting client (`server.rs:1091`).
+- **C:** leaves selections naming destroyed windows.
+- **Executor:** `SelectionWindowDestroy` per window, after its DestroyNotify.
+
+### 5. Host event masks
+- **KMS:** `update_host_event_mask` is a no-op
+  (`crates/yserver/src/kms/render/backend/trait_impl.rs:565-578`).
+- **host_x11:** `destroy_subwindow` (`host_x11/request.rs:932-943`) leaves the
+  `host_event_masks` entry (`host_x11/mod.rs:563-581`); B/C leave it stale.
+- **Executor:** have host_x11 `destroy_subwindow` drop its own mask entry; A's
+  explicit clearing then goes.
+
+### 6. Attribute pixmaps
+Same orphan decision in A and B/C for attribute pixmaps (never in
+`last_names`); B/C add dedup and the report. As planned: the executor returns
+them, every caller frees through `free_orphaned_host_pixmaps`. Side question
+(UNVERIFIED): a backing whose last name was deferred reaches `free_pixmap`
+rather than `release_window_pixmap_name`.
+
+### 7. COW children
+- **Xorg:** `compDestroyOverlayWindow` (`compoverlay.c:167-173`) →
+  `FreeResource` → `DeleteWindow` → `CrushTree`: children destroyed.
+- **yserver:** B's window loop (`process_disconnect.rs:279-331`) runs before
+  `release_client_overlay_claims` (`:715`), so only children owned by **other**
+  clients reach D, which leaves them in the table.
+- **Executor:** the COW plan includes its subtree.
+
+### 8. COW destroyed by an ordinary request
+Citations confirmed: `compwindow.c:624-626`; `compext.c:303-307` (on failure it
+frees only the new claim, `:305`); `FreeResource` of a freed id is a no-op
+(`resource.c:906-924`).
+
+### Per-root order on disconnect
+- **Xorg:** `HandleSaveSet` first (`resource.c:1129`); then buckets in order,
+  newest first within a bucket (`:829-833`). Each window resource runs
+  `DeleteWindow` to completion before the next. `CrushTree` frees inferiors with
+  `FreeResource(id, RT_WINDOW)`, which skips their delete function
+  (`:887,918`) and unlinks them, so they are not visited again. Root order is
+  hash order: no protocol guarantee.
+- **yserver:** `collect_owned_window_roots` iterates a `HashMap`, which is also
+  arbitrary, and always crushes a descendant with its ancestor (one of Xorg's
+  possible orders). But B/C emit every root's events together at the end.
+- **Executor:** each root runs to completion, events included, before the next.
+
+## Scope after phase 0
+
+**Into the executor.** Each one is part of what `DeleteWindow` does for every
+caller:
+
+- divergences 1-3 and 5;
+- per-window `SelectionWindowDestroy` (4);
+- XI1/XI2 active-grab release and passive-grab pruning on planned windows (new);
+- Xorg's per-window event interleaving: focus and grab release at unrealize,
+  selection notify after each window's DestroyNotify (new).
+
+**Into phase 2, on the disconnect side:** release the departing client's own
+grabs before any plan executes, as Xorg does.
+
+**Out of scope, with their own issues and branches:**
+
+- **Save sets are never processed on disconnect.** Xorg `HandleSaveSet` reparents
+  a crashed WM's clients back; we destroy them.
+- **Close-down modes don't retain windows.** RetainPermanent/RetainTemporary
+  still destroy the client's windows (`process_disconnect.rs:270-331`). Xorg
+  keeps them (RT_WINDOW is not `RC_NEVERRETAIN`).
+- **XFIXES ClientClose is keyed on the window's owner, not the setting client.**
+  The fix needs the setting client recorded in `state.selections`.
+- **The deferred-name `free_pixmap` question in item 6.**
