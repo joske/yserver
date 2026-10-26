@@ -29,9 +29,16 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let reservation = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
-        let port = reservation.local_addr().unwrap().port();
-        assert!(port >= 6000);
+        // The display is the port minus 6000. OpenBSD's ephemeral range starts
+        // below that, so ask again until the kernel picks a usable port.
+        let (reservation, port) = std::iter::repeat_with(|| {
+            let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            (listener, port)
+        })
+        .take(64)
+        .find(|(_, port)| *port >= 6000)
+        .expect("an ephemeral port at or above 6000");
         let directory =
             std::env::temp_dir().join(format!("yserver-tcp-{}-{port}", std::process::id()));
         fs::create_dir(&directory).unwrap();
