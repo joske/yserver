@@ -210,11 +210,13 @@ jobs:
                 ftp -o - "$(cat /etc/installurl)/$(uname -r)/$(machine)/$set$v.tgz" | tar xzphf - -C /
               done
             fi
-          # The default data size limit is too small for rustc, and debug info
-          # would not fit the disk.
+          # The default data size limit is too small for rustc, the default
+          # open-files limit for the accept-flood tests, and debug info would
+          # not fit the disk.
           run: |
             set -e
             ulimit -d "$(ulimit -Hd)"
+            ulimit -n "$(ulimit -Hn)"
             export CARGO_PROFILE_DEV_DEBUG=0
             cargo clippy --all-targets -- -D warnings
             cargo clippy --all-targets --features xdmcp -- -D warnings
