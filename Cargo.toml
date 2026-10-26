@@ -22,7 +22,7 @@ freetype-rs = "0.38"
 gbm = { version = "0.18", default-features = false }
 input = "0.10"
 # 0.2.190 removed FreeBSD's NOTE_PCTRLMASK, still required by nix 0.31.3.
-libc = "=0.2.189"
+libc = "=0.2.191"
 log = "0.4"
 mio = { version = "1", features = ["net", "os-ext", "os-poll"] }
 nix = { version = "0.31", features = [
