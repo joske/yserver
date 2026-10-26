@@ -165,11 +165,42 @@ pub(crate) fn execute_destroy(
 `PreparedDestroy` wraps the plan and is only made by `DestroyPlan::prepare`
 (see "The COW"); the executor never sees a bare plan.
 
-It is today's `destroy_window_subtree` body, with every `order` replaced by
-`plan.windows` and `destroy_window(root)` replaced by `apply_destroy(&plan)`.
-The order of steps is kept (old tree readable for focus revert, event capture,
-clip lists and Picture frees; subscriptions dropped after apply; backend
-teardown and DestroyNotify last).
+It replaces today's `destroy_window_subtree` body. It does **not** keep that
+body's order: phase 0 showed it differs from Xorg's `DeleteWindow`
+(`dix/window.c:1070`), which the executor follows step by step. With `T` = the
+plan's top window and the plan's windows in CrushTree order:
+
+1. **Capture.** Read every planned window's parent, map state, host xid and
+   event subscribers while the tree is intact.
+2. **UnmapNotify for `T`**, if mapped: to `T`'s StructureNotify and its
+   parent's SubstructureNotify subscribers (`window.c:2854-2855`).
+3. **Unrealize**, if `T` was realized. Visit the realized windows of the subtree
+   in `UnrealizeTree` order (`window.c:2789-2820`): `T` first, then depth-first,
+   topmost child first. For each one, as `DeleteWindowFromAnyEvents(w, FALSE)`
+   (`events.c:5912-5985`) does:
+   - deactivate any device's active grab (core, XI1, XI2) whose window or
+     confine-to is `w`, whoever owns it;
+   - then revert any core or XI1 focus on `w`.
+4. **Unmap `T` in the core**, send exposures for what it covered
+   (`window.c:2864-2869`), then `windows_restructured`.
+5. **Per window, in CrushTree order** (inferiors, then `T`), as `CrushTree` /
+   `DeleteWindow` + `FreeWindowResources` (`window.c:1041-1050`, `:1083-1086`,
+   `:994-1000`):
+   - DestroyNotify to the window's StructureNotify and its parent's
+     SubstructureNotify subscribers;
+   - then `SelectionWindowDestroy` for every selection on that window;
+   - then the `DeleteWindowFromAnyEvents(w, TRUE)` part: active grabs and focus
+     for a window step 3 did not visit, drop passive grabs on `w`, drop all
+     clients' event selections on `w`.
+6. **Resource-level cleanup** that has no Xorg event of its own: Pictures,
+   Present purge, redirect release, attribute-pixmap collection,
+   `apply_destroy(&plan)`, backend teardown (children before `T`; the COW's own
+   step as below), `sync_top_level_order`, `release_dropped_cursors`.
+
+Today Pictures, Present and redirects are released before any DestroyNotify.
+Phase 1 checks whether any of them can put an event on the wire; one that can
+moves to where Xorg's equivalent runs. Everything else in step 6 sends
+nothing.
 
 **Attribute pixmaps leave the executor.** It returns them instead of freeing
 them, and every caller frees through `free_orphaned_host_pixmaps`:
@@ -187,6 +218,30 @@ from each owned root into `all_destroyed` / `dead_windows`, which the rest of
 selection cleanup at `process_disconnect.rs:359-648`). Those sets include
 windows of *surviving* clients under the departing client's windows; they come
 from the plan, not from an ownership filter.
+
+### The departing client
+
+Today B/C send all destroy events after the client has been removed from
+`state.clients` (`process_disconnect.rs:354`), so fanout skips it
+(`fanout.rs:283`). The executor emits during the teardown, while the client is
+still in the map. That map entry is still needed for the cleanup: owner
+lookups, `close_down_modes`, the resource-id base and per-client tables.
+
+Xorg sets `clientGone` before `FreeClientResources` (`dispatch.c:3518`, `:3551`).
+The equivalent here:
+
+- `ClientState` gets `gone: bool`. `process_disconnect` sets it first, before
+  the RECORD callback and before anything else that can emit.
+- `client_io::write_or_buffer` (`client_io.rs:52`) drops bytes for a gone client
+  and returns `Done`. It does not mark `write_failed`: the socket is already shut
+  down, and a failure would queue the client for disconnect again while that
+  disconnect is still running.
+- `failed_writers` skips gone clients.
+- 13 non-test sites lock `client.writer` directly instead of going through
+  `write_or_buffer`. Phase 2 audits each one: it either routes through
+  `write_or_buffer`, or checks `gone`.
+- Nothing else reads `gone`. The entry stays, with all its metadata, until the
+  existing removal.
 
 ### Callers
 
@@ -330,7 +385,29 @@ until phase 3 fixes it. Unit tests in `resources/tests/window.rs`:
 - the plan of the COW contains its children.
 
 Switch A to the executor; its attribute pixmaps go through
-`free_orphaned_host_pixmaps`. Drop the handler guard; keep
+`free_orphaned_host_pixmaps`.
+
+**Event-order tests** (DestroyWindow), on a mapped `T` with a mapped child `C`:
+- a survivor's selection owned on `C`, with an XFIXES subscriber;
+- the survivor's active pointer grab on `C`;
+- keyboard focus on `C`;
+- subscribers on `T`, `C` and `T`'s parent.
+
+The expected client-visible stream is written from `window.c` / `events.c` /
+`selection.c` **before** the test. Its shape:
+
+1. UnmapNotify(`T`);
+2. the grab-deactivation events, then the focus events, at unrealize;
+3. Expose on the parent;
+4. DestroyNotify(`C`), then XFixesSelectionNotify(WindowDestroy, `C`);
+5. DestroyNotify(`T`).
+
+The exact event sequence for steps 2-3 (crossings, FocusOut/FocusIn details) is
+measured on Xorg (Xephyr) with a probe in `tools/` first. Per "red-first needs
+a verified oracle", no expected list comes from our own output.
+
+Also: an XI2 active grab and a passive button grab on a destroyed window are
+released, and a recycled window id does not match the old passive grab. Drop the handler guard; keep
 `destroy_window_on_root_is_a_no_op`, which must stay green with the guard gone.
 
 ### Phase 2 — B and C on the executor
@@ -346,6 +423,15 @@ answers for divergences 1-5. Tests:
   expected result from phase 0).
 - `HostPixmapFrees` for a disconnect that frees a border-only tile reports the
   same `freed`/`deferred` sets as before the change.
+- **Departing client gets nothing.** Client X owns mapped window W. Survivor Y
+  owns a child of W, selects StructureNotify on it, and selects
+  SubstructureNotify on root. X selects SubstructureNotify on W. When X
+  disconnects:
+  - Y receives W's UnmapNotify (through root) and its child's DestroyNotify;
+  - X's output buffer receives no bytes after `gone` is set;
+  - nothing queues X for a second disconnect.
+- **Event order, disconnect.** Same expected stream as the phase 1 order test,
+  driven by a disconnect instead of DestroyWindow.
 - One test for each other divergence whose behaviour changes, with the expected
   events from the phase-0 Xorg reading.
 
@@ -416,6 +502,10 @@ duplicate `collect_destroy_order` and `PendingDestroy`. The one test caller of
 
 ## Risks
 
+- **Event order changes on every destroy.** Focus and grab events move after
+  UnmapNotify, and selection notifies are interleaved per window. WMs and
+  compositors see it on every window close, so the compositor HW smoke is
+  required.
 - **Behaviour change on disconnect.** Divergences 1-3 may add events (Expose,
   FocusIn/Out, grab release) that disconnects never sent before. That is what
   Xorg does if phase 0 confirms it, but WMs see it at every client exit, so it
@@ -456,8 +546,10 @@ call the RT_WINDOW delete function, `DeleteWindow` (`resource.c:439`).
 - **A, D:** match. **B/C:** no exposures; UnmapNotify sent after the resource is
   gone, from `fanout_destroy_sequence` (`process_disconnect.rs:47-60`), after
   all other cleanup.
-- **Executor:** A's sequence for every path. Fanout already skips the departing
-  client (`fanout.rs:283`; B removes it from `state.clients` at `:354`).
+- **Executor:** A's sequence for every path. The departing client is excluded
+  by its `gone` flag (see "The departing client"), not by the
+  `state.clients` removal at `:354`. Fanout skips a missing client
+  (`fanout.rs:283`), but the executor emits before that removal.
 
 ### 2. Core focus
 - **Xorg:** `DeleteWindowFromAnyEvents` (`events.c:5933-5985`) reverts every
@@ -557,8 +649,9 @@ grabs before any plan executes, as Xorg does.
 
 **Out of scope, with their own issues and branches:**
 
-- **Save sets are never processed on disconnect.** Xorg `HandleSaveSet` reparents
-  a crashed WM's clients back; we destroy them.
+- **Save sets are never processed on disconnect** (first in line, as codex
+  says). Xorg `HandleSaveSet` reparents a crashed WM's clients back; we destroy
+  them.
 - **Close-down modes don't retain windows.** RetainPermanent/RetainTemporary
   still destroy the client's windows (`process_disconnect.rs:270-331`). Xorg
   keeps them (RT_WINDOW is not `RC_NEVERRETAIN`).
