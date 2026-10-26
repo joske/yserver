@@ -3341,3 +3341,63 @@ fn a_parent_resize_unmaps_an_unmap_gravity_child() {
         "an unviewable parent's resize leaves the child mapped"
     );
 }
+
+/// #297: Xorg's `ProcDestroyWindow` frees only a window with a parent
+/// (`dix/dispatch.c:829`), so `DestroyWindow(root)` succeeds and changes
+/// nothing. yserver walked root's whole subtree and destroyed every window in
+/// the backend while the core kept them; the next ReparentWindow into one of
+/// them panicked in the KMS backend.
+#[test]
+fn destroy_window_on_root_is_a_no_op() {
+    use crate::backend::{WindowHandle, recording::RecordedCall};
+
+    const CLIENT_ID: u32 = 1;
+    const WINDOW_XID: u32 = 0x0010_0020;
+
+    let mut state = ServerState::new();
+    let _peer = install_client(&mut state, CLIENT_ID);
+    let mut backend = RecordingBackend::new();
+    state
+        .resources
+        .window_mut(ROOT_WINDOW)
+        .expect("root installed")
+        .host_xid = Some(WindowHandle::from_raw_for_test(0x0040_0001));
+    state.resources.create_window(
+        ClientId(CLIENT_ID),
+        yserver_protocol::x11::CreateWindowRequest {
+            depth: 24,
+            window: ResourceId(WINDOW_XID),
+            parent: ROOT_WINDOW,
+            width: 200,
+            height: 80,
+            class: 1,
+            visual: crate::resources::ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    state
+        .resources
+        .window_mut(ResourceId(WINDOW_XID))
+        .expect("window installed")
+        .host_xid = Some(WindowHandle::from_raw_for_test(0x0040_0020));
+
+    handle_destroy_window(
+        &mut state,
+        &mut backend,
+        None,
+        ClientId(CLIENT_ID),
+        SequenceNumber(1),
+        &ROOT_WINDOW.0.to_le_bytes(),
+    )
+    .expect("handle_destroy_window");
+
+    assert!(
+        !backend
+            .calls()
+            .iter()
+            .any(|call| matches!(call, RecordedCall::DestroySubwindow(_))),
+        "DestroyWindow(root) must not destroy anything in the backend"
+    );
+    assert!(state.resources.window(ROOT_WINDOW).is_some());
+    assert!(state.resources.window(ResourceId(WINDOW_XID)).is_some());
+}

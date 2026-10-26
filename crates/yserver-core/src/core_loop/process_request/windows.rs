@@ -2253,7 +2253,11 @@ pub(super) fn handle_destroy_window(
                 4,
             );
         }
-        destroy_window_subtree(state, backend, origin, window);
+        // `ProcDestroyWindow` frees only a window with a parent: root is a
+        // successful no-op (#297).
+        if window != ROOT_WINDOW {
+            destroy_window_subtree(state, backend, origin, window);
+        }
     }
     debug!("client {} #{} DestroyWindow", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
