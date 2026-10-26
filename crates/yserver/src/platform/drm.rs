@@ -248,6 +248,10 @@ pub(crate) fn render_node_for_primary(primary: DrmDeviceKey) -> io::Result<Optio
     }
 
     let candidates = enumerate_nodes("renderD", DrmNodeKind::Render)?;
+    #[cfg(target_os = "openbsd")]
+    if let Some(node) = paired_render_node(&candidates, primary) {
+        return Ok(Some(node));
+    }
     let primary_parent = device_parent_for(primary);
     let resolved: Vec<(DrmNode, Option<PathBuf>)> = candidates
         .into_iter()
@@ -257,6 +261,18 @@ pub(crate) fn render_node_for_primary(primary: DrmDeviceKey) -> io::Result<Optio
         })
         .collect();
     select_render_node(&resolved, primary_parent.as_deref(), primary)
+}
+
+/// OpenBSD pairs card N (minor N) with renderD(128+N) (minor 128+N). Its
+/// static `/dev/dri` holds nodes for absent units too, so there is never a
+/// lone render node to fall back on.
+#[cfg_attr(not(target_os = "openbsd"), allow(dead_code))]
+fn paired_render_node(candidates: &[DrmNode], primary: DrmDeviceKey) -> Option<DrmNode> {
+    let render = DrmDeviceKey {
+        major: primary.major,
+        minor: primary.minor.checked_add(128)?,
+    };
+    candidates.iter().find(|node| node.key == render).cloned()
 }
 
 fn select_render_node(
@@ -610,6 +626,25 @@ mod tests {
                 PathBuf::from("/dev/dri/card2"),
             ]
         );
+    }
+
+    #[test]
+    fn paired_render_node_is_the_card_minor_plus_128() {
+        // OpenBSD's static /dev/dri: card0..3 = minors 0..3, renderD128..131
+        // = minors 128..131.
+        let candidates: Vec<DrmNode> = (128..132)
+            .map(|minor| node(&format!("/dev/dri/renderD{minor}"), minor))
+            .collect();
+        let card = |minor| DrmDeviceKey { major: 226, minor };
+        assert_eq!(
+            paired_render_node(&candidates, card(0)).map(|node| node.path),
+            Some(PathBuf::from("/dev/dri/renderD128"))
+        );
+        assert_eq!(
+            paired_render_node(&candidates, card(1)).map(|node| node.path),
+            Some(PathBuf::from("/dev/dri/renderD129"))
+        );
+        assert_eq!(paired_render_node(&candidates, card(4)), None);
     }
 
     #[test]
