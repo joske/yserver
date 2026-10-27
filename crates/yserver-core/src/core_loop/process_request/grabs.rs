@@ -1376,7 +1376,7 @@ pub(super) fn handle_ungrab_keyboard(
 /// Tear down the active core keyboard grab held by `client_id` —
 /// shared by UngrabKeyboard and the unmap/destroy deactivation path
 /// (see [`deactivate_core_pointer_grab`]).
-fn deactivate_core_keyboard_grab(state: &mut ServerState, client_id: ClientId) {
+pub(super) fn deactivate_core_keyboard_grab(state: &mut ServerState, client_id: ClientId) {
     let prev_grab_window = state
         .active_keyboard_grab
         .filter(|g| g.owner == client_id)

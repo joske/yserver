@@ -3614,3 +3614,73 @@ fn xi_passive_key_grab_on_all_master_devices_grabs_and_ungrabs() {
         "the press is not grabbed"
     );
 }
+
+/// `DeleteWindowFromAnyEvents` deactivates every device's active grab on a
+/// dying window, whoever owns it (`dix/events.c:5915-5931`): an XI2 grab on
+/// the master pointer and one on a slave, the slave going back to its master
+/// (`DeactivatePointerGrab` → `ReattachToOldMaster`).
+#[test]
+fn destroy_window_releases_xi2_active_grabs_on_it() {
+    const OWNER: u32 = 1;
+    const SURVIVOR: u32 = 2;
+    const XI_GRAB_DEVICE: u8 = 51;
+    const WIN: u32 = 0x0020_0010;
+
+    let mut state = ServerState::new();
+    let _owner = install_capture_client(&mut state, OWNER);
+    let _survivor = install_capture_client(&mut state, SURVIVOR);
+    let mut backend = RecordingBackend::new();
+    state.resources.create_window(
+        ClientId(OWNER),
+        CreateWindowRequest {
+            depth: 24,
+            window: ResourceId(WIN),
+            parent: ROOT_WINDOW,
+            width: 100,
+            height: 100,
+            class: 1,
+            visual: crate::resources::ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    let _ = state.resources.map_window(ResourceId(WIN));
+    let (_source, slave) = xi_dynamic_grab_source(&mut state, 93, false, true, "destroy-grab");
+    for (sequence, device) in [(1, slave), (2, crate::xinput::DEVICEID_MASTER_POINTER)] {
+        let grab = xi_dynamic_wire_grab_body(WIN, device, 1, 1, false, Some(1 << 4));
+        process_xi_dynamic_request(
+            &mut state,
+            &mut backend,
+            ClientId(SURVIVOR),
+            SequenceNumber(sequence),
+            XI_GRAB_DEVICE,
+            &grab,
+        );
+    }
+    assert!(state.xi2_pointer_grabs.contains_key(&slave));
+    assert!(
+        state
+            .active_pointer_grab
+            .is_some_and(|g| g.via_xi2 && g.grab_window == ResourceId(WIN))
+    );
+    assert_eq!(
+        state.xi_devices.device(slave).unwrap().attached_master,
+        None
+    );
+
+    process_dynamic_request(
+        &mut state,
+        &mut backend,
+        ClientId(OWNER),
+        SequenceNumber(1),
+        4, // DestroyWindow
+        0,
+        &WIN.to_le_bytes(),
+    );
+
+    assert!(!state.xi2_pointer_grabs.contains_key(&slave));
+    assert!(state.active_pointer_grab.is_none());
+    assert_eq!(
+        state.xi_devices.device(slave).unwrap().attached_master,
+        Some(crate::xinput::DEVICEID_MASTER_POINTER)
+    );
+}

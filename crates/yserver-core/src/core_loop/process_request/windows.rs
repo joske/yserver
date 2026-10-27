@@ -11,7 +11,7 @@ use crate::{
         },
         process_request::{
             RequestOutcome, emit_x11_error,
-            focus_pointer::{revert_core_focus_from, revert_core_focus_if_unviewable},
+            focus_pointer::revert_core_focus_if_unviewable,
             glx::glx_fbconfig_depth,
             grabs::{confine_pointer_now, release_core_grabs_for_unviewable},
             present_ext::{discard_stale_present_event, fire_present_configure_notify_for_window},
@@ -22,7 +22,7 @@ use crate::{
                 reapply_redirect_mode_after_map, release_storage_for_delta,
                 rotate_redirected_backing_on_resize, sync_redirect_backing,
             },
-            selection::drop_selections_owned_by_windows,
+            window_destroy::finish_destroy,
             write_to_client,
         },
     },
@@ -304,47 +304,6 @@ pub(crate) fn clear_after_manual_subwindows_release(
     }
 }
 
-/// One window's worth of identity captured *before* destroy_window
-/// runs, so the subsequent UnmapNotify+DestroyNotify fanout has stable
-/// targets even though the resource table has already let go of the
-/// Window struct.
-struct PendingDestroy {
-    window: ResourceId,
-    parent: ResourceId,
-    was_mapped: bool,
-    host_xid: Option<crate::backend::WindowHandle>,
-    on_window: Vec<ClientId>,
-    on_parent: Vec<ClientId>,
-}
-
-fn collect_destroy_order(
-    table: &crate::resources::ResourceTable,
-    root: ResourceId,
-    out: &mut Vec<ResourceId>,
-) {
-    let Some(w) = table.window(root) else {
-        return;
-    };
-    // Xorg CrushTree (`dix/window.c:1023`): inferiors first, topmost first.
-    for child in w.children.clone().into_iter().rev() {
-        collect_destroy_order(table, child, out);
-    }
-    out.push(root);
-}
-
-/// DestroyNotify only: the destroyed window's UnmapNotify went out before the
-/// teardown, and its inferiors get none (Xorg CrushTree).
-fn fanout_destroy_sequence_to_state(state: &mut ServerState, pending: &PendingDestroy) {
-    let window = pending.window;
-    let parent = pending.parent;
-    let _dropped = fanout_event_to_clients(state, &pending.on_window, |buf, seq, order| {
-        x11::encode_destroy_notify_event(buf, seq, order, window, window);
-    });
-    let _dropped = fanout_event_to_clients(state, &pending.on_parent, |buf, seq, order| {
-        x11::encode_destroy_notify_event(buf, seq, order, parent, window);
-    });
-}
-
 /// Purge every core-visible Present population targeting a destroyed window
 /// subtree. Backend-hidden GPU/direct events cannot be cancelled here; the
 /// removed window generation makes their later drain discard wire delivery and
@@ -451,9 +410,6 @@ pub(crate) fn purge_present_for_destroyed_windows(
     }
 }
 
-/// Common subtree-destroy used by both DestroyWindow (root = the
-/// requested window) and DestroySubwindows (each child of the
-/// requested parent).
 /// Free every Picture on the doomed `windows`, whichever client owns it, while the
 /// window records still exist (Xorg `PictureDestroyWindow`, `render/picture.c:67`).
 pub(crate) fn free_pictures_on_destroyed_windows(
@@ -485,163 +441,6 @@ pub(crate) fn release_redirects_on_destroyed_windows(
         );
     }
     state.composite_redirects.forget_windows(windows);
-}
-
-pub(super) fn destroy_window_subtree(
-    state: &mut ServerState,
-    backend: &mut dyn Backend,
-    origin: Option<OriginContext>,
-    root: ResourceId,
-) {
-    // XI1 device focus inside the dying subtree reverts before the
-    // tree is torn down (the RevertToParent walk needs the surviving
-    // ancestors) — Xorg DeleteWindowFromAnyEvents shape.
-    crate::core_loop::xi1_focus::revert_focus_for_dying_subtree(state, root);
-    let mut order: Vec<ResourceId> = Vec::new();
-    collect_destroy_order(&state.resources, root, &mut order);
-    // Core focus inside the dying subtree reverts before teardown —
-    // Xorg DeleteWindowFromAnyEvents, same shape as the XI1 revert
-    // above (the RevertToParent walk needs the surviving ancestors).
-    if state.core_focus.raw > 1 {
-        let focus_win = ResourceId(state.core_focus.raw);
-        if order.contains(&focus_win) {
-            revert_core_focus_from(state, focus_win, &order);
-        }
-    }
-    let mut pending: Vec<PendingDestroy> = Vec::new();
-    for w in &order {
-        let (parent, was_mapped, host_xid) =
-            state
-                .resources
-                .window(*w)
-                .map_or((ROOT_WINDOW, false, None), |win| {
-                    (
-                        win.parent,
-                        win.map_state != MapState::Unmapped,
-                        win.host_xid,
-                    )
-                });
-        let on_window = subscribers_by_id(state, *w, 0x0002_0000);
-        let on_parent = subscribers_by_id(state, parent, 0x0008_0000);
-        pending.push(PendingDestroy {
-            window: *w,
-            parent,
-            was_mapped,
-            host_xid,
-            on_window,
-            on_parent,
-        });
-    }
-    // Xorg DeleteWindow unmaps the window first (`dix/window.c:1075`):
-    // UnmapNotify, then WindowsRestructured while the subtree still exists,
-    // so the pointer's Leave reaches the dying windows before any
-    // DestroyNotify. `order` ends with `root`.
-    if let Some(top) = pending.last()
-        && top.was_mapped
-    {
-        let (window, parent) = (top.window, top.parent);
-        let _dropped = fanout_event_to_clients(state, &top.on_window, |buf, seq, order| {
-            x11::encode_unmap_notify_event(buf, seq, order, window, window, false);
-        });
-        let _dropped = fanout_event_to_clients(state, &top.on_parent, |buf, seq, order| {
-            x11::encode_unmap_notify_event(buf, seq, order, parent, window, false);
-        });
-        let viewable_before = state
-            .resources
-            .window(window)
-            .is_some_and(|w| w.map_state == MapState::Viewable);
-        let clips_before = if viewable_before {
-            crate::core_loop::clip_list::with_borders(
-                state,
-                crate::core_loop::clip_list::clip_lists_under(state, window),
-            )
-        } else {
-            Vec::new()
-        };
-        let _ = state.resources.unmap_window(window);
-        // UnmapWindow exposes what the window covered (`dix/window.c:2856-2866`).
-        if viewable_before {
-            let after = crate::core_loop::clip_list::with_borders(
-                state,
-                crate::core_loop::clip_list::clip_lists_under(state, window),
-            );
-            send_exposures(
-                state,
-                backend,
-                origin,
-                crate::core_loop::clip_list::newly_exposed(&clips_before, after, None),
-                None,
-            );
-        }
-        backend.windows_restructured(state);
-    }
-    let attr_pixmap_xids = state.resources.collect_attribute_pixmap_host_xids(root);
-    free_pictures_on_destroyed_windows(state, backend, origin, &order);
-    purge_present_for_destroyed_windows(state, backend, &order);
-    release_redirects_on_destroyed_windows(state, backend, origin, &order);
-    // Audit #9 — selections owned by any destroyed window in this
-    // subtree must fire `XFixesSelectionNotify(SelectionWindowDestroy)`
-    // and clear ownership (Xorg `xfixes/select.c` registers a
-    // `SelectionWindowDestroy` callback against the resource-delete
-    // path). MUST run before `destroy_window` drops the resource (so
-    // subscribers don't reference a half-destroyed window) and BEFORE
-    // `drop_window_subscriptions` (which clears xfixes_selection_masks
-    // entries owned by the destroyed window).
-    drop_selections_owned_by_windows(
-        state,
-        &order,
-        yserver_protocol::x11::xfixes::SELECTION_NOTIFY_WINDOW_DESTROY,
-    );
-    let _ = state.resources.destroy_window(root);
-    state.drop_window_subscriptions(&order);
-    // Step 2 (DRIFT 2): the destroyed subtree may have removed a root
-    // child; reproject the backend top-level order from core (the backend
-    // backing teardown already ran above).
-    backend.sync_top_level_order(state);
-
-    // Same orphan rule as every other release site: the destroyed subtree's
-    // retained background AND border pixmaps may still be client-owned
-    // (FreePixmap not yet issued) or referenced by windows OUTSIDE the subtree
-    // (`resources.destroy_window` already ran, so the check sees only
-    // survivors). Free only the fully orphaned ones.
-    //
-    // Borders used to be collected by neither half of this (#133): the
-    // subtree walk skipped them and so did the gate, so a tile whose only
-    // remaining reference was a border died with its window and leaked.
-    for xid in &attr_pixmap_xids {
-        let Some(handle) = crate::backend::PixmapHandle::from_raw(*xid) else {
-            continue;
-        };
-        if state.resources.host_xid_still_referenced(handle) {
-            continue;
-        }
-        let _ = backend.free_pixmap(origin, *xid);
-        state.resources.host_pixmap_freed(*xid);
-    }
-    for entry in pending {
-        if let Some(xid) = entry.host_xid {
-            backend.unregister_host_window(xid.as_raw());
-            let _ = backend.update_host_event_mask(
-                origin,
-                xid.as_raw(),
-                crate::host_x11::POINTER_EVENT_MASK,
-                false,
-            );
-            let _ = backend.update_host_event_mask(
-                origin,
-                xid.as_raw(),
-                crate::host_x11::SUBWINDOW_EVENT_MASK,
-                false,
-            );
-            let _ = backend.destroy_subwindow(origin, xid.as_raw());
-        }
-        fanout_destroy_sequence_to_state(state, &entry);
-    }
-    // Active core grabs whose grab window just died deactivate (Xorg
-    // DeleteWindowFromAnyEvents) — the destroyed windows are gone from
-    // the resource table now, so the viewability probe sees them off.
-    release_core_grabs_for_unviewable(state, backend);
-    release_dropped_cursors(state, backend, origin);
 }
 
 /// Free on the backend each host cursor a window let go of that nothing
@@ -2253,10 +2052,13 @@ pub(super) fn handle_destroy_window(
                 4,
             );
         }
-        // `ProcDestroyWindow` frees only a window with a parent: root is a
-        // successful no-op (#297).
-        if window != ROOT_WINDOW {
-            destroy_window_subtree(state, backend, origin, window);
+        // `ProcDestroyWindow` frees only a window with a parent: root plans
+        // nothing and is a successful no-op (#297).
+        if let Some(plan) = state.resources.plan_destroy(window) {
+            let Ok(prepared) = plan.prepare(backend) else {
+                return emit_x11_error(state, client_id, sequence, x11::error::BAD_ALLOC, 0, 4);
+            };
+            finish_destroy(state, backend, origin, prepared);
         }
     }
     debug!("client {} #{} DestroyWindow", client_id.0, sequence.0);
@@ -2285,12 +2087,23 @@ pub(super) fn handle_destroy_subwindows(
                 5,
             );
         }
+        // Every child is planned and prepared before anything changes, so a
+        // failed preparation leaves the request undone.
+        let mut prepared = Vec::new();
+        for child in state.resources.children(parent).to_vec() {
+            let Some(plan) = state.resources.plan_destroy(child) else {
+                continue;
+            };
+            let Ok(ready) = plan.prepare(backend) else {
+                return emit_x11_error(state, client_id, sequence, x11::error::BAD_ALLOC, 0, 5);
+            };
+            prepared.push(ready);
+        }
         // Xorg unmaps them all first, so all UnmapNotifies and one exposure
         // of the parent precede the DestroyNotifies (`dix/window.c:1104-1124`).
         unmap_subwindows_with_delta(state, backend, origin, client_id, sequence, body)?;
-        let kids: Vec<ResourceId> = state.resources.children(parent).to_vec();
-        for k in kids {
-            destroy_window_subtree(state, backend, origin, k);
+        for ready in prepared {
+            finish_destroy(state, backend, origin, ready);
         }
     }
     debug!("client {} #{} DestroySubwindows", client_id.0, sequence.0);
@@ -2765,9 +2578,7 @@ pub(super) fn unmap_window(
             .map(|(d, _)| *d)
             .collect();
         for dev in released {
-            state.xi1_active_grabs.remove(&dev);
-            let xid_map = backend.xid_map().clone();
-            crate::core_loop::pointer_fanout::xi1_thaw_device(state, backend, &xid_map, dev);
+            release_xi1_active_grab(state, backend, dev);
         }
     }
     if was_mapped {
@@ -2812,6 +2623,18 @@ pub(super) fn unmap_window(
             backend.windows_restructured(state);
         }
     }
+}
+
+/// Drop `dev`'s XI1 active grab and thaw the device: the unmap and destroy
+/// deactivation of a grab whose window stops being viewable.
+pub(super) fn release_xi1_active_grab(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    dev: u16,
+) {
+    state.xi1_active_grabs.remove(&dev);
+    let xid_map = backend.xid_map().clone();
+    crate::core_loop::pointer_fanout::xi1_thaw_device(state, backend, &xid_map, dev);
 }
 
 pub(super) fn handle_unmap_subwindows(

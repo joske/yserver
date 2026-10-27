@@ -2115,7 +2115,7 @@ fn destroyed_window_generation_suppresses_hidden_direct_events_after_xid_reuse()
         });
     let mut backend = RecordingBackend::new();
 
-    destroy_window_subtree(&mut state, &mut backend, None, ResourceId(WINDOW));
+    destroy_window_subtree(&mut state, &mut backend, None, ResourceId(WINDOW)).expect("destroy");
     assert!(!state.present_window_generations.contains_key(&WINDOW));
     assert!(state.present_complete_gate.is_empty());
     assert!(state.present_event_selections.is_empty());
@@ -2727,7 +2727,8 @@ fn destroyed_window_purges_parked_present_wait_before_producer_ready() {
         },
     );
 
-    destroy_window_subtree(&mut state, &mut backend, None, ResourceId(WINDOW_XID));
+    destroy_window_subtree(&mut state, &mut backend, None, ResourceId(WINDOW_XID))
+        .expect("destroy");
 
     // (a) the parked entry and its side-map row are removed,
     assert!(

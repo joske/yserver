@@ -1254,3 +1254,98 @@ fn reparent_cow_to_a_normal_toplevel_succeeds_xorg_faithful() {
         ResourceId(0x200)
     );
 }
+
+#[test]
+fn plan_destroy_of_root_is_none() {
+    let t = ResourceTable::new();
+    assert!(t.plan_destroy(ROOT_WINDOW).is_none());
+}
+
+#[test]
+fn plan_destroy_of_unknown_id_is_none() {
+    let t = ResourceTable::new();
+    assert!(t.plan_destroy(ResourceId(0x00c0_ffee)).is_none());
+}
+
+/// T's children are created A then B, B's B1 then B2: each newer sibling
+/// is `firstChild`, the topmost (`dix/window.c:908-913`). CrushTree
+/// (`dix/window.c:1023-1062`) descends `firstChild` to a leaf, frees it, then
+/// moves to `nextSib` (the next lower sibling) or back up to the parent:
+/// B2, B1, B, A1, A; DeleteWindow frees T last (`:1083`).
+#[test]
+fn plan_destroy_order_is_crush_tree_order() {
+    let (t_id, a, a1, b, b1, b2) = (0x10, 0x11, 0x12, 0x13, 0x14, 0x15);
+    let mut t = ResourceTable::new();
+    make_window(&mut t, t_id);
+    make_child(&mut t, a, t_id, 0, 0);
+    make_child(&mut t, a1, a, 0, 0);
+    make_child(&mut t, b, t_id, 0, 0);
+    make_child(&mut t, b1, b, 0, 0);
+    make_child(&mut t, b2, b, 0, 0);
+
+    let plan = t.plan_destroy(ResourceId(t_id)).expect("plan");
+    assert_eq!(
+        plan.windows().map(|w| w.0).collect::<Vec<_>>(),
+        vec![b2, b1, b, a1, a, t_id]
+    );
+    assert_eq!(plan.top(), ResourceId(t_id));
+    assert!(!plan.contains_cow());
+}
+
+#[test]
+fn apply_destroy_removes_exactly_the_plan_and_unlinks_the_top() {
+    let (sibling, top, child, grandchild, other_child) = (0x20, 0x21, 0x22, 0x23, 0x24);
+    let mut t = ResourceTable::new();
+    make_window(&mut t, sibling);
+    make_window(&mut t, top);
+    make_child(&mut t, child, top, 0, 0);
+    make_child(&mut t, grandchild, child, 0, 0);
+    make_child(&mut t, other_child, sibling, 0, 0);
+
+    let plan = t.plan_destroy(ResourceId(top)).expect("plan");
+    t.apply_destroy(&plan);
+
+    for gone in [top, child, grandchild] {
+        assert!(t.window(ResourceId(gone)).is_none(), "0x{gone:x} destroyed");
+    }
+    for kept in [sibling, other_child] {
+        assert!(t.window(ResourceId(kept)).is_some(), "0x{kept:x} kept");
+    }
+    assert_eq!(
+        t.window(ROOT_WINDOW).unwrap().children,
+        vec![ResourceId(sibling)],
+        "the top is unlinked from its parent, the sibling stays"
+    );
+    assert_eq!(
+        t.window(ResourceId(sibling)).unwrap().children,
+        vec![ResourceId(other_child)]
+    );
+}
+
+#[test]
+#[should_panic(expected = "stale plan")]
+fn apply_destroy_panics_on_a_stale_plan() {
+    let (top, child) = (0x30, 0x31);
+    let mut t = ResourceTable::new();
+    make_window(&mut t, top);
+    make_child(&mut t, child, top, 0, 0);
+    let plan = t.plan_destroy(ResourceId(top)).expect("plan");
+    let _ = t.destroy_window(ResourceId(child));
+    t.apply_destroy(&plan);
+}
+
+#[test]
+fn plan_destroy_of_the_cow_contains_its_children() {
+    let child = 0xC0;
+    let mut t = ResourceTable::new();
+    let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
+    t.materialize_cow_resource(host_xid);
+    make_child(&mut t, child, COMPOSITE_OVERLAY_WINDOW.0, 0, 0);
+
+    let plan = t.plan_destroy(COMPOSITE_OVERLAY_WINDOW).expect("plan");
+    assert_eq!(
+        plan.windows().collect::<Vec<_>>(),
+        vec![ResourceId(child), COMPOSITE_OVERLAY_WINDOW]
+    );
+    assert!(plan.contains_cow());
+}

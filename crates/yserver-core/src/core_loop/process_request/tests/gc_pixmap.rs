@@ -868,7 +868,7 @@ fn destroying_a_window_releases_the_border_tile_it_was_keeping_alive() {
     // Destroying the window removes that last reference, so the host
     // handle has to go with it.
     let mut backend = RecordingBackend::new();
-    destroy_window_subtree(&mut state, &mut backend, None, win);
+    destroy_window_subtree(&mut state, &mut backend, None, win).expect("destroy");
     assert!(
         !state.resources.host_xid_still_referenced(host),
         "nothing may reference the tile after the window is destroyed"

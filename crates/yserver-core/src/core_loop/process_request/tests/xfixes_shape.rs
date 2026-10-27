@@ -462,7 +462,7 @@ fn xfixes_cursor_notify_goes_to_each_selection() {
     );
 
     // Destroying the child drops its selection (Xorg CursorFreeWindow).
-    destroy_window_subtree(&mut state, &mut backend, None, ResourceId(CHILD));
+    destroy_window_subtree(&mut state, &mut backend, None, ResourceId(CHILD)).expect("destroy");
     backend.displayed_cursor_change = Some(crate::backend::DisplayedCursor {
         host_xid: 0x0001_0099,
         serial: 1,

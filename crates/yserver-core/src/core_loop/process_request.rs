@@ -48,6 +48,7 @@ mod selection;
 mod shape_xfixes;
 mod sync_ext;
 mod vidmode;
+mod window_destroy;
 mod windows;
 mod xi;
 mod xkb;

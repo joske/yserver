@@ -410,6 +410,34 @@ pub(super) fn handle_xi_ungrab_device(
         role,
         crate::xinput::XiDeviceRole::MasterKeyboard | crate::xinput::XiDeviceRole::MasterPointer
     );
+    deactivate_xi2_device_grab(
+        state,
+        backend,
+        origin,
+        client_id,
+        deviceid,
+        is_keyboard,
+        is_master,
+    );
+    debug!(
+        "client {} #{} XIUngrabDevice deviceid={}",
+        client_id.0, sequence.0, deviceid
+    );
+    return Ok(RequestOutcome::Handled);
+}
+
+/// Deactivate `owner`'s XI2 grab on `deviceid`, if it holds one, and send the
+/// owner the `NotifyUngrab` events (Xorg `DeactivatePointerGrab` /
+/// `DeactivateKeyboardGrab`). XIUngrabDevice and window destroy.
+pub(in crate::core_loop::process_request) fn deactivate_xi2_device_grab(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    owner: ClientId,
+    deviceid: u16,
+    is_keyboard: bool,
+    is_master: bool,
+) {
     // Capture grab_window BEFORE clearing — we synthesize the
     // matching XI2 crossing with `NotifyUngrab` on the way out
     // so the client's grab state machine pairs cleanly with
@@ -419,24 +447,24 @@ pub(super) fn handle_xi_ungrab_device(
     let grab_window_for_event: Option<ResourceId> = if is_keyboard && is_master {
         state
             .active_keyboard_grab
-            .filter(|g| g.owner == client_id)
+            .filter(|g| g.owner == owner)
             .map(|g| g.grab_window)
     } else if is_keyboard {
         state
             .xi2_keyboard_grabs
             .get(&deviceid)
-            .filter(|g| g.owner == client_id)
+            .filter(|g| g.owner == owner)
             .map(|g| g.grab_window)
     } else if is_master {
         state
             .active_pointer_grab
-            .filter(|grab| grab.owner == client_id)
+            .filter(|grab| grab.owner == owner)
             .map(|grab| grab.grab_window)
     } else {
         state
             .xi2_pointer_grabs
             .get(&deviceid)
-            .filter(|grab| grab.owner == client_id)
+            .filter(|grab| grab.owner == owner)
             .map(|grab| grab.grab_window)
     };
     if grab_window_for_event.is_some() {
@@ -450,7 +478,7 @@ pub(super) fn handle_xi_ungrab_device(
             state.xi2_pointer_grabs.remove(&deviceid);
         }
         state.xi1_frozen.entry(deviceid).or_default().stored = None;
-        crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(state, deviceid, client_id);
+        crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(state, deviceid, owner);
         if !is_master {
             state.reattach_xi2_slave(deviceid);
         }
@@ -478,7 +506,7 @@ pub(super) fn handle_xi_ungrab_device(
                 let event_y =
                     i16::try_from(i32::from(root_y).saturating_sub(origin_y)).unwrap_or(i16::MAX);
                 let focus = !matches!(evtype, 9 | 10) && state.crossing_has_focus(target_window);
-                let _dropped = fanout_event_to_clients(state, &[client_id], |out, seq, order| {
+                let _dropped = fanout_event_to_clients(state, &[owner], |out, seq, order| {
                     x11::encode_xi2_crossing_event(
                         out,
                         order,
@@ -523,11 +551,6 @@ pub(super) fn handle_xi_ungrab_device(
             }
         }
     }
-    debug!(
-        "client {} #{} XIUngrabDevice deviceid={}",
-        client_id.0, sequence.0, deviceid
-    );
-    return Ok(RequestOutcome::Handled);
 }
 
 #[allow(clippy::needless_return)]

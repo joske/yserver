@@ -3401,3 +3401,328 @@ fn destroy_window_on_root_is_a_no_op() {
     assert!(state.resources.window(ROOT_WINDOW).is_some());
     assert!(state.resources.window(ResourceId(WINDOW_XID)).is_some());
 }
+
+const ORDER_T: u32 = 0x0010_0001;
+const ORDER_C: u32 = 0x0010_0002;
+
+/// One event as `tools/destroy-order-probe.c` prints it.
+fn describe_order_event(ev: &[u8]) -> String {
+    let u32_at = |at: usize| u32::from_le_bytes([ev[at], ev[at + 1], ev[at + 2], ev[at + 3]]);
+    let i16_at = |at: usize| i16::from_le_bytes([ev[at], ev[at + 1]]);
+    let u16_at = |at: usize| u16::from_le_bytes([ev[at], ev[at + 1]]);
+    let nm = |id: u32| match id {
+        0 => "None".to_owned(),
+        _ if id == ROOT_WINDOW.0 => "root".to_owned(),
+        ORDER_T => "T".to_owned(),
+        ORDER_C => "C".to_owned(),
+        _ => format!("0x{id:x}"),
+    };
+    let detail = |d: u8| {
+        [
+            "Ancestor",
+            "Virtual",
+            "Inferior",
+            "Nonlinear",
+            "NonlinearVirtual",
+            "Pointer",
+            "PointerRoot",
+            "DetailNone",
+        ]
+        .get(usize::from(d))
+        .copied()
+        .unwrap_or("?")
+    };
+    let mode = |m: u8| {
+        ["Normal", "Grab", "Ungrab", "WhileGrabbed"]
+            .get(usize::from(m))
+            .copied()
+            .unwrap_or("?")
+    };
+    match ev[0] & 0x7f {
+        t @ (7 | 8) => format!(
+            "{}(event={} child={} detail={} mode={} root={},{} event={},{} sf=0x{:x})",
+            if t == 7 { "EnterNotify" } else { "LeaveNotify" },
+            nm(u32_at(12)),
+            nm(u32_at(16)),
+            detail(ev[1]),
+            mode(ev[30]),
+            i16_at(20),
+            i16_at(22),
+            i16_at(24),
+            i16_at(26),
+            ev[31],
+        ),
+        t @ (9 | 10) => format!(
+            "{}(event={} detail={} mode={})",
+            if t == 9 { "FocusIn" } else { "FocusOut" },
+            nm(u32_at(4)),
+            detail(ev[1]),
+            mode(ev[8]),
+        ),
+        12 => format!(
+            "Expose({} {},{} {}x{} count={})",
+            nm(u32_at(4)),
+            u16_at(8),
+            u16_at(10),
+            u16_at(12),
+            u16_at(14),
+            u16_at(16),
+        ),
+        17 => format!(
+            "DestroyNotify(event={} window={})",
+            nm(u32_at(4)),
+            nm(u32_at(8))
+        ),
+        18 => format!(
+            "UnmapNotify(event={} window={} fromConfigure={})",
+            nm(u32_at(4)),
+            nm(u32_at(8)),
+            ev[12],
+        ),
+        t if t == crate::nested::XFIXES_FIRST_EVENT => format!(
+            "XFixesSelectionNotify(subtype={} window={} owner={})",
+            ev[1],
+            nm(u32_at(4)),
+            nm(u32_at(8)),
+        ),
+        t => format!("event{t}"),
+    }
+}
+
+/// `tools/destroy-order-probe.c`'s scenario: mapped T (100,100 200x200,
+/// child of root) with mapped C (50,50 100x100); the pointer at `pointer`;
+/// a survivor owns a selection on C, holds an active pointer grab on C and
+/// has the focus on C (RevertToParent).
+fn destroy_order_fixture(pointer: (i16, i16)) -> (ServerState, UnixStream, UnixStream) {
+    const APP: u32 = 1;
+    const GRB: u32 = 2;
+    const OBS: u32 = 3;
+    let mut state = ServerState::new();
+    let _app = install_client(&mut state, APP);
+    let grb = install_client(&mut state, GRB);
+    let obs = install_client(&mut state, OBS);
+    for (window, parent, x, y, size) in [
+        (ORDER_T, ROOT_WINDOW.0, 100, 100, 200),
+        (ORDER_C, ORDER_T, 50, 50, 100),
+    ] {
+        state.resources.create_window(
+            ClientId(APP),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(window),
+                parent: ResourceId(parent),
+                x,
+                y,
+                width: size,
+                height: size,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+    }
+    let _ = state.resources.map_window(ResourceId(ORDER_C));
+    let _ = state.resources.map_window(ResourceId(ORDER_T));
+
+    // SubstructureNotify|Exposure|FocusChange|EnterWindow|LeaveWindow on root,
+    // StructureNotify|FocusChange|EnterWindow|LeaveWindow on T and C.
+    let masks = &mut state.clients.get_mut(&OBS).unwrap().event_masks;
+    masks.insert(
+        ROOT_WINDOW,
+        0x0008_0000 | 0x8000 | 0x0020_0000 | 0x10 | 0x20,
+    );
+    masks.insert(ResourceId(ORDER_T), 0x0002_0000 | 0x0020_0000 | 0x10 | 0x20);
+    masks.insert(ResourceId(ORDER_C), 0x0002_0000 | 0x0020_0000 | 0x10 | 0x20);
+    let selection = AtomId(0x200);
+    state.xfixes_selection_masks.insert(
+        (OBS, ROOT_WINDOW, selection),
+        yserver_protocol::x11::xfixes::SELECTION_ALL_EVENTS_MASK,
+    );
+
+    state.pointer_root = pointer;
+    state.selections.insert(selection, (ResourceId(ORDER_C), 0));
+    set_test_pointer_grab(&mut state, GRB, ORDER_C, false, false);
+    state.core_focus = crate::server::CoreFocus {
+        raw: ORDER_C,
+        revert_to: 2,
+        time: 0,
+    };
+    (state, grb, obs)
+}
+
+/// The event stream of `DestroyWindow(T)`, measured on Xephyr with
+/// `tools/destroy-order-probe t`, matches `DeleteWindow`: UnmapNotify
+/// (`dix/window.c:2854`); at unrealize the grab on C deactivates, then the
+/// focus on C reverts (`dix/events.c:5915-5985`); the exposure of what T
+/// covered (`window.c:2866`); then per window DestroyNotify and its
+/// SelectionWindowDestroy (`window.c:1041-1050`, `:999`).
+///
+/// Xephyr also sends `LeaveNotify(T, Ancestor, Normal)` and
+/// `EnterNotify(root, Inferior, Normal)` between the Expose and
+/// DestroyNotify(C): WindowsRestructured's crossings, which come from the
+/// backend's `windows_restructured` and RecordingBackend does not produce.
+#[test]
+fn destroy_window_event_order_matches_xorg() {
+    let (mut state, mut grb, mut obs) = destroy_order_fixture((110, 110));
+    assert_eq!(
+        destroy_t_and_read_order_stream(&mut state, &mut obs),
+        [
+            "UnmapNotify(event=T window=T fromConfigure=0)",
+            "UnmapNotify(event=root window=T fromConfigure=0)",
+            "LeaveNotify(event=C child=None detail=Ancestor mode=Ungrab root=110,110 event=-40,-40 sf=0x3)",
+            "EnterNotify(event=T child=None detail=Inferior mode=Ungrab root=110,110 event=10,10 sf=0x2)",
+            "FocusOut(event=C detail=Ancestor mode=Normal)",
+            "FocusOut(event=T detail=Virtual mode=Normal)",
+            "FocusIn(event=root detail=Inferior mode=Normal)",
+            "Expose(root 100,100 200x200 count=0)",
+            "DestroyNotify(event=C window=C)",
+            "XFixesSelectionNotify(subtype=1 window=root owner=None)",
+            "DestroyNotify(event=T window=T)",
+            "DestroyNotify(event=root window=T)",
+        ]
+    );
+    assert!(
+        read_all_or_buffered(&mut state, 2, &mut grb).is_empty(),
+        "the grab's owner gets nothing (Xephyr: no event)"
+    );
+    // Probe epilogue: focus root, RevertToNone; another client's grab succeeds.
+    assert_eq!(state.core_focus.raw, ROOT_WINDOW.0);
+    assert_eq!(state.core_focus.revert_to, 0);
+    assert!(state.active_pointer_grab.is_none());
+}
+
+/// `tools/destroy-order-probe c`: the pointer inside the grab window C, so the
+/// grab deactivation's `DoEnterLeaveEvents(C, C, NotifyUngrab)` sends nothing.
+/// The same two backend crossings are left out as above.
+#[test]
+fn destroy_window_event_order_with_the_pointer_in_the_grab_window_matches_xorg() {
+    let (mut state, mut grb, mut obs) = destroy_order_fixture((200, 200));
+    assert_eq!(
+        destroy_t_and_read_order_stream(&mut state, &mut obs),
+        [
+            "UnmapNotify(event=T window=T fromConfigure=0)",
+            "UnmapNotify(event=root window=T fromConfigure=0)",
+            "FocusOut(event=C detail=Ancestor mode=Normal)",
+            "FocusOut(event=T detail=Virtual mode=Normal)",
+            "FocusIn(event=root detail=Inferior mode=Normal)",
+            "Expose(root 100,100 200x200 count=0)",
+            "DestroyNotify(event=C window=C)",
+            "XFixesSelectionNotify(subtype=1 window=root owner=None)",
+            "DestroyNotify(event=T window=T)",
+            "DestroyNotify(event=root window=T)",
+        ]
+    );
+    assert!(read_all_or_buffered(&mut state, 2, &mut grb).is_empty());
+    assert!(state.active_pointer_grab.is_none());
+}
+
+/// DestroyWindow(T) by client 1; what client 3 (`obs`) received.
+fn destroy_t_and_read_order_stream(state: &mut ServerState, obs: &mut UnixStream) -> Vec<String> {
+    let mut backend = RecordingBackend::new();
+    handle_destroy_window(
+        state,
+        &mut backend,
+        None,
+        ClientId(1),
+        SequenceNumber(1),
+        &ORDER_T.to_le_bytes(),
+    )
+    .expect("handle_destroy_window");
+    read_all_or_buffered(state, 3, obs)
+        .chunks_exact(32)
+        .map(describe_order_event)
+        .collect()
+}
+
+/// `DeleteWindowFromAnyEvents(w, TRUE)` frees the passive grabs on the
+/// window (`dix/events.c:5997-5998`), so a window recreated with the same id
+/// does not inherit them.
+#[test]
+fn destroy_window_drops_passive_grabs_and_a_recycled_id_does_not_match_them() {
+    const WIN: u32 = 0x0010_0040;
+    let mut state = ServerState::new();
+    let _peer = install_client(&mut state, 1);
+    let create = |state: &mut ServerState| {
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WIN),
+                parent: ROOT_WINDOW,
+                width: 50,
+                height: 50,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(WIN));
+    };
+    create(&mut state);
+    state.button_grabs.push(crate::server::PassiveButtonGrab {
+        owner: ClientId(1),
+        device_id: 0,
+        grab_window: ResourceId(WIN),
+        button: 0,
+        modifiers: 0x8000,
+        owner_events: false,
+        event_mask: 0,
+        pointer_mode: 1,
+        keyboard_mode: 1,
+        confine_to: ResourceId(0),
+        via_xi2: false,
+    });
+    state.key_grabs.push(crate::server::KeyGrab {
+        owner: ClientId(1),
+        device_id: 0,
+        grab_window: ResourceId(WIN),
+        keycode: 0,
+        modifiers: 0x8000,
+        owner_events: false,
+        pointer_mode: 1,
+        keyboard_mode: 1,
+        via_xi2: false,
+        xi2_mask: 0,
+    });
+    state.xi1_passive_grabs.push(crate::server::Xi1PassiveGrab {
+        owner: ClientId(1),
+        deviceid: 2,
+        grab_window: ResourceId(WIN),
+        detail: 0,
+        modifiers: 0x8000,
+        owner_events: false,
+        this_mode: 1,
+        other_mode: 1,
+        is_key: false,
+    });
+    let master = Some(crate::xinput::DEVICEID_MASTER_POINTER);
+    let pointer = crate::xinput::DEVICEID_MASTER_POINTER;
+    assert!(
+        state
+            .find_passive_grab(ResourceId(WIN), 1, 0, pointer, master)
+            .is_some(),
+        "the grab matches before the destroy"
+    );
+
+    let mut backend = RecordingBackend::new();
+    handle_destroy_window(
+        &mut state,
+        &mut backend,
+        None,
+        ClientId(1),
+        SequenceNumber(1),
+        &WIN.to_le_bytes(),
+    )
+    .expect("handle_destroy_window");
+    assert!(state.button_grabs.is_empty());
+    assert!(state.key_grabs.is_empty());
+    assert!(state.xi1_passive_grabs.is_empty());
+
+    create(&mut state);
+    assert!(
+        state
+            .find_passive_grab(ResourceId(WIN), 1, 0, pointer, master)
+            .is_none(),
+        "the recycled id does not match the destroyed window's grab"
+    );
+}

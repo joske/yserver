@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod cleanup;
+mod destroy;
 mod gc;
 mod picture_font_cursor;
 mod pixmap_props;
@@ -10,6 +11,7 @@ mod tree;
 mod types;
 mod window;
 
+pub use destroy::*;
 pub use gc::*;
 pub use picture_font_cursor::*;
 pub use pixmap_props::*;

@@ -2,7 +2,8 @@ use crate::{
     backend::Backend,
     core_loop::process_request::{
         RequestOutcome, drawable_exists, emit_x11_error, emit_x11_error_with_minor,
-        windows::{destroy_window_subtree, handle_create_window, handle_map_window},
+        window_destroy::destroy_window_subtree,
+        windows::{handle_create_window, handle_map_window},
         write_to_client,
     },
     resources::ROOT_WINDOW,
@@ -335,7 +336,8 @@ fn destroy_screen_saver_window(state: &mut ServerState, backend: &mut dyn Backen
         .window(crate::resources::SCREEN_SAVER_WINDOW)
         .is_some()
     {
-        destroy_window_subtree(state, backend, None, crate::resources::SCREEN_SAVER_WINDOW);
+        // Never the COW: preparation cannot fail.
+        let _ = destroy_window_subtree(state, backend, None, crate::resources::SCREEN_SAVER_WINDOW);
     }
 }
 

@@ -25,6 +25,8 @@ mod focus;
 mod grabs;
 mod props;
 
+pub(in crate::core_loop::process_request) use grabs::deactivate_xi2_device_grab;
+
 use crate::{
     backend::{Backend, OriginContext},
     core_loop::process_request::{

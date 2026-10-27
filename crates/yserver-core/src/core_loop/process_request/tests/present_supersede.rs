@@ -1684,7 +1684,7 @@ fn scrap_then_window_destroy_purge_releases_exactly_once() {
     // Now destroy the window: the by-XID purge scans
     // `present_pending_exec` for this window and finds nothing (the
     // entry is already gone), so it must not touch the backend again.
-    destroy_window_subtree(&mut state, &mut backend, None, ResourceId(WINDOW));
+    destroy_window_subtree(&mut state, &mut backend, None, ResourceId(WINDOW)).expect("destroy");
 
     assert_eq!(
         backend.triggered_dri3_fences,

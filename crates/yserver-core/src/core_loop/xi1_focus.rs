@@ -184,6 +184,23 @@ pub fn revert_focus_for_dying_subtree(state: &mut ServerState, dying_root: Resou
     }
 }
 
+/// Revert every device focus on `w`, one window of the subtree `dying_root`
+/// being destroyed (Xi/exevents.c:3041-3095, per window from
+/// `DeleteWindowFromAnyEvents`). Devices in id order.
+pub fn revert_focus_on_dying_window(
+    state: &mut ServerState,
+    w: ResourceId,
+    dying_root: ResourceId,
+) {
+    let mut devices: Vec<u16> = state.xi1_device_focus.keys().copied().collect();
+    devices.sort_unstable();
+    for dev in devices {
+        if resolve_raw_window_only(device_focus(state, dev).focus) == Xi1FocusTarget::Window(w) {
+            do_revert(state, dev, w, Some(dying_root));
+        }
+    }
+}
+
 /// Raw → target without FollowKeyboard resolution: revert checks care
 /// about the *stored* window, not what FollowKeyboard points at (a
 /// FollowKeyboard focus never reverts — the core focus does).
