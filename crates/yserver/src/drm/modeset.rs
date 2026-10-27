@@ -705,16 +705,46 @@ pub(crate) fn probe_connector_snapshots(
 
 /// One connected connector along with its candidate CRTCs and primary planes.
 ///
-/// `candidate_planes` is each plane paired with the set of CRTCs that plane
-/// can drive (i.e. the plane's `possible_crtcs` mask, already filtered to
-/// `resources.crtcs()`). `assign_outputs` uses this to verify the final
-/// (CRTC, plane) pairing for each connector.
+/// `candidate_planes` lists each primary plane with the set of CRTCs it can
+/// drive (its `possible_crtcs` mask, already filtered to `resources.crtcs()`)
+/// and the CRTC it is currently bound to. `assign_outputs` uses this to pick
+/// and verify the final (CRTC, plane) pairing for each connector.
 pub(crate) struct ConnectorCandidate {
     pub connector: connector::Handle,
     pub connector_name: String,
     pub encoder: encoder::Handle,
     pub candidate_crtcs: Vec<crtc::Handle>,
-    pub candidate_planes: Vec<(plane::Handle, HashSet<crtc::Handle>)>,
+    pub candidate_planes: Vec<PrimaryPlane>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PrimaryPlane {
+    pub handle: plane::Handle,
+    pub drivable: HashSet<crtc::Handle>,
+    /// The plane's `CRTC_ID` when it was probed, e.g. fbcon's primary plane.
+    pub current_crtc: Option<crtc::Handle>,
+}
+
+/// The primary plane for `crtc` among `planes`, skipping `excluded`. Like
+/// Xorg's `drmmode_crtc_create_planes`, the plane already bound to `crtc`
+/// wins over the first drivable one: a different plane would leave the
+/// bound one (fbcon's console) enabled on the CRTC, and it can stack above
+/// ours.
+fn primary_plane_for_crtc(
+    planes: &[PrimaryPlane],
+    crtc: crtc::Handle,
+    excluded: impl Fn(plane::Handle) -> bool,
+) -> Option<plane::Handle> {
+    let mut usable = planes
+        .iter()
+        .filter(|plane| !excluded(plane.handle) && plane.drivable.contains(&crtc));
+    let first = usable.clone().next()?;
+    Some(
+        usable
+            .find(|plane| plane.current_crtc == Some(crtc))
+            .unwrap_or(first)
+            .handle,
+    )
 }
 
 #[derive(Debug)]
@@ -729,7 +759,7 @@ pub(crate) struct Assignment {
 fn primary_plane_candidates(
     device: &Device,
     resources: &ResourceHandles,
-) -> io::Result<Vec<(plane::Handle, HashSet<crtc::Handle>)>> {
+) -> io::Result<Vec<PrimaryPlane>> {
     let mut primary_planes = Vec::new();
     for handle in device.plane_handles()? {
         let info = device.get_plane(handle)?;
@@ -750,7 +780,16 @@ fn primary_plane_candidates(
             .filter_crtcs(info.possible_crtcs())
             .into_iter()
             .collect();
-        primary_planes.push((handle, drivable));
+        let current_crtc = map
+            .get("CRTC_ID")
+            .and_then(|info| props.iter().find(|(h, _)| **h == info.handle()))
+            .and_then(|(_, v)| u32::try_from(*v).ok())
+            .and_then(::drm::control::from_u32);
+        primary_planes.push(PrimaryPlane {
+            handle,
+            drivable,
+            current_crtc,
+        });
     }
     Ok(primary_planes)
 }
@@ -758,7 +797,7 @@ fn primary_plane_candidates(
 fn connector_candidate(
     device: &Device,
     resources: &ResourceHandles,
-    primary_planes: &[(plane::Handle, HashSet<crtc::Handle>)],
+    primary_planes: &[PrimaryPlane],
     handle: connector::Handle,
     info: &connector::Info,
 ) -> io::Result<ConnectorCandidate> {
@@ -787,7 +826,12 @@ fn connector_candidate(
     let candidate_crtc_set: HashSet<crtc::Handle> = candidate_crtcs.iter().copied().collect();
     let candidate_planes = primary_planes
         .iter()
-        .filter(|(_, drivable)| drivable.iter().any(|c| candidate_crtc_set.contains(c)))
+        .filter(|plane| {
+            plane
+                .drivable
+                .iter()
+                .any(|c| candidate_crtc_set.contains(c))
+        })
         .cloned()
         .collect();
 
@@ -821,11 +865,9 @@ fn assign_output_avoiding(
         if reserved_crtcs.contains(&crtc) {
             continue;
         }
-        let Some(&(plane, _)) = candidate
-            .candidate_planes
-            .iter()
-            .find(|(plane, drivable)| !reserved_planes.contains(plane) && drivable.contains(&crtc))
-        else {
+        let Some(plane) = primary_plane_for_crtc(&candidate.candidate_planes, crtc, |plane| {
+            reserved_planes.contains(&plane)
+        }) else {
             continue;
         };
         return Ok(Assignment {
@@ -863,11 +905,9 @@ fn assign_outputs(connectors: &[ConnectorCandidate]) -> Result<Vec<Assignment>, 
         else {
             return Err(cand.connector_name.clone());
         };
-        let Some(&(plane, _)) = cand
-            .candidate_planes
-            .iter()
-            .find(|(p, drivable)| !claimed_planes.contains(p) && drivable.contains(&crtc))
-        else {
+        let Some(plane) = primary_plane_for_crtc(&cand.candidate_planes, crtc, |plane| {
+            claimed_planes.contains(&plane)
+        }) else {
             return Err(cand.connector_name.clone());
         };
         claimed_crtcs.insert(crtc);
@@ -1029,10 +1069,9 @@ fn exact_assignment_from_candidate(
             ),
         ));
     }
-    let plane_drives_crtc = candidate
-        .candidate_planes
-        .iter()
-        .any(|(candidate_plane, drivable)| *candidate_plane == plane && drivable.contains(&crtc));
+    let plane_drives_crtc = candidate.candidate_planes.iter().any(|candidate_plane| {
+        candidate_plane.handle == plane && candidate_plane.drivable.contains(&crtc)
+    });
     if !plane_drives_crtc {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1120,8 +1159,9 @@ pub(crate) fn output_for_exact_probe_assignment(
     let candidate_crtc_set: HashSet<_> = candidate_crtcs.iter().copied().collect();
     let candidate_planes = primary_planes
         .into_iter()
-        .filter(|(_, drivable)| {
-            drivable
+        .filter(|plane| {
+            plane
+                .drivable
                 .iter()
                 .any(|crtc| candidate_crtc_set.contains(crtc))
         })
@@ -2568,7 +2608,11 @@ mod tests {
             candidate_crtcs: crtcs,
             candidate_planes: planes
                 .into_iter()
-                .map(|(p, cs)| (p, cs.iter().copied().collect()))
+                .map(|(p, cs)| PrimaryPlane {
+                    handle: p,
+                    drivable: cs.iter().copied().collect(),
+                    current_crtc: None,
+                })
                 .collect(),
         }
     }
@@ -2699,6 +2743,33 @@ mod tests {
         assert_eq!(asg[1].connector_name, "HDMI-2");
         assert_eq!(asg[1].crtc, c1);
         assert_eq!(asg[1].plane, p1);
+    }
+
+    #[test]
+    fn prefers_the_primary_plane_already_bound_to_the_crtc() {
+        // msm/DPU on the Yoga Slim 7x: every primary plane can drive the eDP
+        // CRTC and fbcon sits on plane-3, not on the first one.
+        let crtc = rh(113);
+        let mut candidate = cand(
+            1,
+            "eDP-1",
+            vec![crtc],
+            vec![(ph(50), &[crtc]), (ph(68), &[crtc]), (ph(74), &[crtc])],
+        );
+        candidate.candidate_planes[1].current_crtc = Some(crtc);
+
+        let asg = assign_outputs(std::slice::from_ref(&candidate)).expect("assignment succeeds");
+        assert_eq!(asg[0].plane, ph(68));
+        let targeted = assign_output_avoiding(&candidate, &[]).expect("a route exists");
+        assert_eq!(targeted.plane, ph(68));
+
+        candidate.candidate_planes[1].current_crtc = Some(rh(110));
+        let asg = assign_outputs(std::slice::from_ref(&candidate)).expect("assignment succeeds");
+        assert_eq!(
+            asg[0].plane,
+            ph(50),
+            "a plane bound elsewhere is no preference"
+        );
     }
 
     #[test]
