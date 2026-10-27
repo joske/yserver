@@ -1405,6 +1405,63 @@ pub(super) fn deactivate_core_keyboard_grab(state: &mut ServerState, client_id: 
     }
 }
 
+/// Xorg `ReleaseActiveGrabs` (`dix/events.c:1995-2012`), from `CloseDownClient`
+/// (`dix/dispatch.c:3496`): every device whose active grab is `client_id`'s
+/// is deactivated as an explicit ungrab would, in device-list order (master
+/// pointer, master keyboard, then the rest by id), so the survivors get the
+/// `NotifyUngrab` crossings and focus events. Returns whether an XI 1.x
+/// device grab was among them.
+pub(crate) fn release_active_grabs(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+) -> bool {
+    use crate::xinput::{DEVICEID_MASTER_KEYBOARD, DEVICEID_MASTER_POINTER};
+    if state
+        .active_pointer_grab
+        .is_some_and(|g| g.owner == client_id)
+    {
+        deactivate_core_pointer_grab(state, backend, client_id);
+    }
+    if state
+        .active_keyboard_grab
+        .is_some_and(|g| g.owner == client_id)
+    {
+        deactivate_core_keyboard_grab(state, client_id);
+    }
+    let owned = |dev: &u16, owner: ClientId| (owner == client_id).then_some(*dev);
+    let mut devices: Vec<u16> = (state.xi2_pointer_grabs.iter())
+        .filter_map(|(dev, g)| owned(dev, g.owner))
+        .chain((state.xi2_keyboard_grabs.iter()).filter_map(|(dev, g)| owned(dev, g.owner)))
+        .chain((state.xi1_active_grabs.iter()).filter_map(|(dev, g)| owned(dev, g.owner)))
+        .collect();
+    devices.sort_unstable_by_key(|&dev| match dev {
+        DEVICEID_MASTER_POINTER => (0, dev),
+        DEVICEID_MASTER_KEYBOARD => (1, dev),
+        _ => (2, dev),
+    });
+    devices.dedup();
+    let mut released_xi1 = false;
+    for dev in devices {
+        if state.xi2_pointer_grabs.contains_key(&dev) {
+            super::xi::deactivate_xi2_device_grab(
+                state, backend, None, client_id, dev, false, false,
+            );
+        }
+        if state.xi2_keyboard_grabs.contains_key(&dev) {
+            super::xi::deactivate_xi2_device_grab(
+                state, backend, None, client_id, dev, true, false,
+            );
+        }
+        if state.xi1_active_grabs.contains_key(&dev) {
+            // As UngrabDevice does.
+            crate::core_loop::pointer_fanout::xi1_deactivate_device_grab(state, dev);
+            released_xi1 = true;
+        }
+    }
+    released_xi1
+}
+
 /// Xorg `DeleteWindowFromAnyEvents` grab leg: an active core grab
 /// whose grab window stopped being viewable (unmap of it or an
 /// ancestor, or destroy) deactivates. Call after the map-state /

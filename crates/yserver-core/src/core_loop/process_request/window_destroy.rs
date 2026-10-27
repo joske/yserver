@@ -12,6 +12,7 @@ use crate::{
         process_request::{
             focus_pointer::revert_core_focus_from,
             grabs::{deactivate_core_keyboard_grab, deactivate_core_pointer_grab},
+            present_ext::fire_present_window_destroyed,
             selection::drop_selections_owned_by_windows,
             windows::{
                 free_pictures_on_destroyed_windows, purge_present_for_destroyed_windows,
@@ -153,8 +154,10 @@ pub(crate) fn execute_destroy(
         state.xi1_passive_grabs.retain(|g| g.grab_window != window);
         state.drop_window_subscriptions(&[window]);
         // `(*pScreen->DestroyWindow)` (`dix/window.c:1018`): `present_destroy_window`
-        // (`present/present_screen.c:89`). The purge can trigger idle fences,
-        // and a fired SYNC await sends CounterNotify.
+        // (`present/present_screen.c:89-120`) sends PresentWindowDestroyed,
+        // then frees the window's selections. The purge can trigger idle
+        // fences, and a fired SYNC await sends CounterNotify.
+        fire_present_window_destroyed(state, window);
         purge_present_for_destroyed_windows(state, backend, &[window]);
     }
 

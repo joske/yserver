@@ -3404,6 +3404,26 @@ fn destroy_window_on_root_is_a_no_op() {
 
 const ORDER_T: u32 = 0x0010_0001;
 const ORDER_C: u32 = 0x0010_0002;
+const ORDER_PRESENT_EID_T: u32 = 0x0030_0001;
+const ORDER_PRESENT_EID_C: u32 = 0x0030_0002;
+
+/// A stream of events as `tools/destroy-order-probe.c` prints them; a
+/// GenericEvent carries its extra length.
+fn describe_order_events(bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = bytes;
+    while rest.len() >= 32 {
+        let len = if rest[0] & 0x7f == 35 {
+            32 + 4 * u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]) as usize
+        } else {
+            32
+        };
+        out.push(describe_order_event(&rest[..len]));
+        rest = &rest[len..];
+    }
+    assert!(rest.is_empty(), "a trailing partial event");
+    out
+}
 
 /// One event as `tools/destroy-order-probe.c` prints it.
 fn describe_order_event(ev: &[u8]) -> String {
@@ -3478,6 +3498,25 @@ fn describe_order_event(ev: &[u8]) -> String {
             nm(u32_at(4)),
             nm(u32_at(8)),
             ev[12],
+        ),
+        35 => format!(
+            "PresentConfigureNotify(eid={} window={} x={} y={} w={} h={} off={},{} pixmap={}x{} \
+             flags=0x{:x})",
+            match u32_at(12) {
+                ORDER_PRESENT_EID_T => "eT".to_owned(),
+                ORDER_PRESENT_EID_C => "eC".to_owned(),
+                eid => format!("0x{eid:x}"),
+            },
+            nm(u32_at(16)),
+            i16_at(20),
+            i16_at(22),
+            u16_at(24),
+            u16_at(26),
+            i16_at(28),
+            i16_at(30),
+            u16_at(32),
+            u16_at(34),
+            u32_at(36),
         ),
         t if t == crate::nested::XFIXES_FIRST_EVENT => format!(
             "XFixesSelectionNotify(subtype={} window={} owner={})",
@@ -3628,10 +3667,7 @@ fn destroy_t_and_read_order_stream(state: &mut ServerState, obs: &mut UnixStream
         &ORDER_T.to_le_bytes(),
     )
     .expect("handle_destroy_window");
-    read_all_or_buffered(state, 3, obs)
-        .chunks_exact(32)
-        .map(describe_order_event)
-        .collect()
+    describe_order_events(&read_all_or_buffered(state, 3, obs))
 }
 
 /// `DeleteWindowFromAnyEvents(w, TRUE)` frees the passive grabs on the
@@ -3792,10 +3828,239 @@ fn disconnect_app_and_read_order_stream(
     let mut backend = RecordingBackend::new();
     crate::core_loop::process_disconnect::process_disconnect(state, &mut backend, ClientId(1));
     assert!(!state.clients.contains_key(&1));
-    read_all_or_buffered(state, 3, obs)
-        .chunks_exact(32)
-        .map(describe_order_event)
-        .collect()
+    describe_order_events(&read_all_or_buffered(state, 3, obs))
+}
+
+/// [`destroy_order_fixture`] with the probe's `present` modifier: C has a 3px
+/// border and `obs` selects PresentConfigureNotify on T and C.
+fn present_order_fixture(pointer: (i16, i16)) -> (ServerState, UnixStream, UnixStream) {
+    use yserver_protocol::x11::present as x11present;
+    let (mut state, grb, obs) = destroy_order_fixture(pointer);
+    state
+        .resources
+        .window_mut(ResourceId(ORDER_C))
+        .unwrap()
+        .border_width = 3;
+    for (eid, window) in [
+        (ORDER_PRESENT_EID_T, ORDER_T),
+        (ORDER_PRESENT_EID_C, ORDER_C),
+    ] {
+        state.present_event_selections.insert(
+            eid,
+            crate::server::PresentEventSelection {
+                owner: ClientId(3),
+                window: ResourceId(window),
+                event_mask: x11present::EVENT_MASK_CONFIGURE_NOTIFY,
+            },
+        );
+    }
+    (state, grb, obs)
+}
+
+/// `tools/destroy-order-probe t destroy-present`, measured on Xephyr: each
+/// window's `PresentConfigureNotify(PresentWindowDestroyed)` comes from the
+/// screen `DestroyWindow` hook at the end of its `FreeWindowResources`
+/// (`dix/window.c:1018`, `present/present_screen.c:96-103`), so after its
+/// DestroyNotify and SelectionWindowDestroy. x/y are `drawable.x/y`, the
+/// absolute origin inside the border (C: 100 + 50 + 3); w/h and the pixmap
+/// size are the inside size; flags `PresentWindowDestroyed`
+/// (`present/present_event.c:105-130`). The two backend crossings are left
+/// out as in [`destroy_window_event_order_matches_xorg`].
+#[test]
+fn destroy_window_sends_present_window_destroyed_in_xorg_order() {
+    let (mut state, mut grb, mut obs) = present_order_fixture((110, 110));
+    assert_eq!(
+        destroy_t_and_read_order_stream(&mut state, &mut obs),
+        [
+            "UnmapNotify(event=T window=T fromConfigure=0)",
+            "UnmapNotify(event=root window=T fromConfigure=0)",
+            "LeaveNotify(event=C child=None detail=Ancestor mode=Ungrab root=110,110 event=-43,-43 sf=0x3)",
+            "EnterNotify(event=T child=None detail=Inferior mode=Ungrab root=110,110 event=10,10 sf=0x2)",
+            "FocusOut(event=C detail=Ancestor mode=Normal)",
+            "FocusOut(event=T detail=Virtual mode=Normal)",
+            "FocusIn(event=root detail=Inferior mode=Normal)",
+            "Expose(root 100,100 200x200 count=0)",
+            "DestroyNotify(event=C window=C)",
+            "XFixesSelectionNotify(subtype=1 window=root owner=None)",
+            "PresentConfigureNotify(eid=eC window=C x=153 y=153 w=100 h=100 off=0,0 pixmap=100x100 flags=0x1)",
+            "DestroyNotify(event=T window=T)",
+            "DestroyNotify(event=root window=T)",
+            "PresentConfigureNotify(eid=eT window=T x=100 y=100 w=200 h=200 off=0,0 pixmap=200x200 flags=0x1)",
+        ]
+    );
+    assert!(read_all_or_buffered(&mut state, 2, &mut grb).is_empty());
+    assert!(state.present_event_selections.is_empty());
+}
+
+/// `tools/destroy-order-probe t disconnect-present-appsel`, measured on
+/// Xephyr: the same per-window notifies when the owner's disconnect destroys
+/// T, to a surviving selector.
+#[test]
+fn disconnect_sends_present_window_destroyed_in_xorg_order() {
+    let (mut state, mut grb, mut obs) = present_order_fixture((110, 110));
+    assert_eq!(
+        disconnect_app_and_read_order_stream(&mut state, &mut obs),
+        [
+            "XFixesSelectionNotify(subtype=2 window=root owner=None)",
+            "UnmapNotify(event=T window=T fromConfigure=0)",
+            "UnmapNotify(event=root window=T fromConfigure=0)",
+            "LeaveNotify(event=C child=None detail=Ancestor mode=Ungrab root=110,110 event=-43,-43 sf=0x3)",
+            "EnterNotify(event=T child=None detail=Inferior mode=Ungrab root=110,110 event=10,10 sf=0x2)",
+            "FocusOut(event=C detail=Ancestor mode=Normal)",
+            "FocusOut(event=T detail=Virtual mode=Normal)",
+            "FocusIn(event=root detail=Inferior mode=Normal)",
+            "Expose(root 100,100 200x200 count=0)",
+            "DestroyNotify(event=C window=C)",
+            "PresentConfigureNotify(eid=eC window=C x=153 y=153 w=100 h=100 off=0,0 pixmap=100x100 flags=0x1)",
+            "DestroyNotify(event=T window=T)",
+            "DestroyNotify(event=root window=T)",
+            "PresentConfigureNotify(eid=eT window=T x=100 y=100 w=200 h=200 off=0,0 pixmap=200x200 flags=0x1)",
+        ]
+    );
+    assert!(read_all_or_buffered(&mut state, 2, &mut grb).is_empty());
+    assert!(state.present_event_selections.is_empty());
+}
+
+/// The probe's `kbd` modifier: the departing `app` also holds a keyboard grab
+/// on T, the focus still on C.
+fn grab_keyboard_on_t_for_app(state: &mut ServerState) {
+    state.active_keyboard_grab = Some(crate::server::ActiveKeyboardGrab {
+        owner: ClientId(1),
+        grab_window: ResourceId(ORDER_T),
+        source: crate::server::ActiveKeyboardGrabSource::Explicit,
+        owner_events: false,
+        via_xi2: false,
+        xi2_mask: 0,
+    });
+}
+
+/// `tools/destroy-order-probe t disconnect-kbd-appsel`, measured on Xephyr:
+/// `ReleaseActiveGrabs` (`dix/dispatch.c:3496`) runs after
+/// `DeleteClientFromAnySelections` (`:3495`) and before any window goes; it
+/// deactivates the departing client's keyboard grab through
+/// `DeactivateKeyboardGrab` (`dix/events.c:1995-2012`, `:1781-1822`), whose
+/// `DoFocusEvents(grab T → focus C, NotifyUngrab)` reaches the survivors.
+///
+/// Ignored: the leading `FocusOut(C, Pointer, Ungrab)` is Xorg's
+/// `CoreFocusOutNotifyPointerEvents` (`dix/enterleave.c:957-979`) on
+/// `PointerWindows[dev]`, the window of the last core EnterNotify, which
+/// `grb`'s pointer-grab crossings moved to C. yserver takes the NotifyPointer
+/// window from the sprite position (T here), a divergence of every focus
+/// transition under a pointer grab, not of the disconnect path; with the
+/// pointer in C the two agree (the test below).
+#[test]
+#[ignore = "NotifyPointer focus events use the sprite window, not Xorg's PointerWindows"]
+fn disconnect_releasing_a_keyboard_grab_sends_ungrab_focus_events() {
+    let (mut state, mut grb, mut obs) = destroy_order_fixture((110, 110));
+    grab_keyboard_on_t_for_app(&mut state);
+    assert_eq!(
+        disconnect_app_and_read_order_stream(&mut state, &mut obs),
+        [
+            "XFixesSelectionNotify(subtype=2 window=root owner=None)",
+            "FocusOut(event=C detail=Pointer mode=Ungrab)",
+            "FocusOut(event=T detail=Inferior mode=Ungrab)",
+            "FocusIn(event=C detail=Ancestor mode=Ungrab)",
+            "UnmapNotify(event=T window=T fromConfigure=0)",
+            "UnmapNotify(event=root window=T fromConfigure=0)",
+            "LeaveNotify(event=C child=None detail=Ancestor mode=Ungrab root=110,110 event=-40,-40 sf=0x3)",
+            "EnterNotify(event=T child=None detail=Inferior mode=Ungrab root=110,110 event=10,10 sf=0x2)",
+            "FocusOut(event=C detail=Ancestor mode=Normal)",
+            "FocusOut(event=T detail=Virtual mode=Normal)",
+            "FocusIn(event=root detail=Inferior mode=Normal)",
+            "Expose(root 100,100 200x200 count=0)",
+            "DestroyNotify(event=C window=C)",
+            "DestroyNotify(event=T window=T)",
+            "DestroyNotify(event=root window=T)",
+        ]
+    );
+    assert!(read_all_or_buffered(&mut state, 2, &mut grb).is_empty());
+    assert!(state.active_keyboard_grab.is_none());
+}
+
+/// `tools/destroy-order-probe c disconnect-kbd-appsel`, measured on Xephyr.
+/// The three backend crossings between the Expose and DestroyNotify(C) are
+/// left out (see [`destroy_window_event_order_matches_xorg`]).
+#[test]
+fn disconnect_releasing_a_keyboard_grab_with_the_pointer_in_c_sends_ungrab_focus_events() {
+    let (mut state, mut grb, mut obs) = destroy_order_fixture((200, 200));
+    grab_keyboard_on_t_for_app(&mut state);
+    assert_eq!(
+        disconnect_app_and_read_order_stream(&mut state, &mut obs),
+        [
+            "XFixesSelectionNotify(subtype=2 window=root owner=None)",
+            "FocusOut(event=C detail=Pointer mode=Ungrab)",
+            "FocusOut(event=T detail=Inferior mode=Ungrab)",
+            "FocusIn(event=C detail=Ancestor mode=Ungrab)",
+            "UnmapNotify(event=T window=T fromConfigure=0)",
+            "UnmapNotify(event=root window=T fromConfigure=0)",
+            "FocusOut(event=C detail=Ancestor mode=Normal)",
+            "FocusOut(event=T detail=Virtual mode=Normal)",
+            "FocusIn(event=root detail=Inferior mode=Normal)",
+            "Expose(root 100,100 200x200 count=0)",
+            "DestroyNotify(event=C window=C)",
+            "DestroyNotify(event=T window=T)",
+            "DestroyNotify(event=root window=T)",
+        ]
+    );
+    assert!(read_all_or_buffered(&mut state, 2, &mut grb).is_empty());
+    assert!(state.active_keyboard_grab.is_none());
+}
+
+/// `tools/destroy-order-probe c disconnect-ptr-appsel`, measured on Xephyr:
+/// the departing client's own pointer grab on T, the pointer in C.
+/// `ReleaseActiveGrabs` → `DeactivatePointerGrab` (`dix/events.c:1659-1714`)
+/// sends `DoEnterLeaveEvents(grab T → sprite C, NotifyUngrab)` to the
+/// survivors before any window goes. The three backend crossings are left
+/// out as above.
+#[test]
+fn disconnect_releasing_a_pointer_grab_sends_ungrab_crossings() {
+    let (mut state, mut grb, mut obs) = destroy_order_fixture((200, 200));
+    set_test_pointer_grab(&mut state, 1, ORDER_T, false, false);
+    assert_eq!(
+        disconnect_app_and_read_order_stream(&mut state, &mut obs),
+        [
+            "XFixesSelectionNotify(subtype=2 window=root owner=None)",
+            "LeaveNotify(event=T child=None detail=Inferior mode=Ungrab root=200,200 event=100,100 sf=0x2)",
+            "EnterNotify(event=C child=None detail=Ancestor mode=Ungrab root=200,200 event=50,50 sf=0x3)",
+            "UnmapNotify(event=T window=T fromConfigure=0)",
+            "UnmapNotify(event=root window=T fromConfigure=0)",
+            "FocusOut(event=C detail=Ancestor mode=Normal)",
+            "FocusOut(event=T detail=Virtual mode=Normal)",
+            "FocusIn(event=root detail=Inferior mode=Normal)",
+            "Expose(root 100,100 200x200 count=0)",
+            "DestroyNotify(event=C window=C)",
+            "DestroyNotify(event=T window=T)",
+            "DestroyNotify(event=root window=T)",
+        ]
+    );
+    assert!(read_all_or_buffered(&mut state, 2, &mut grb).is_empty());
+    assert!(state.active_pointer_grab.is_none());
+}
+
+/// `tools/destroy-order-probe t disconnect-ptr-appsel`, measured on Xephyr:
+/// the pointer already in the grab window T, so the deactivation's
+/// `DoEnterLeaveEvents(T, T)` sends nothing (`dix/enterleave.c:602-603`).
+#[test]
+fn disconnect_releasing_a_pointer_grab_with_the_pointer_in_the_grab_window_sends_no_crossings() {
+    let (mut state, mut grb, mut obs) = destroy_order_fixture((110, 110));
+    set_test_pointer_grab(&mut state, 1, ORDER_T, false, false);
+    assert_eq!(
+        disconnect_app_and_read_order_stream(&mut state, &mut obs),
+        [
+            "XFixesSelectionNotify(subtype=2 window=root owner=None)",
+            "UnmapNotify(event=T window=T fromConfigure=0)",
+            "UnmapNotify(event=root window=T fromConfigure=0)",
+            "FocusOut(event=C detail=Ancestor mode=Normal)",
+            "FocusOut(event=T detail=Virtual mode=Normal)",
+            "FocusIn(event=root detail=Inferior mode=Normal)",
+            "Expose(root 100,100 200x200 count=0)",
+            "DestroyNotify(event=C window=C)",
+            "DestroyNotify(event=T window=T)",
+            "DestroyNotify(event=root window=T)",
+        ]
+    );
+    assert!(read_all_or_buffered(&mut state, 2, &mut grb).is_empty());
+    assert!(state.active_pointer_grab.is_none());
 }
 
 /// X owns mapped T; survivor Y owns its mapped child C and an unrelated
@@ -3873,14 +4138,15 @@ fn disconnect_destroys_a_survivors_child_and_sends_the_departing_client_nothing(
     let mut backend = RecordingBackend::new();
     crate::core_loop::process_disconnect::process_disconnect(&mut state, &mut backend, ClientId(X));
 
+    // Y's PresentConfigureNotify selection on C (mask 1) gets C's
+    // PresentWindowDestroyed after C's DestroyNotify (`dix/window.c:1018`,
+    // `present/present_screen.c:96-103`).
     assert_eq!(
-        read_all_or_buffered(&mut state, Y, &mut y_peer)
-            .chunks_exact(32)
-            .map(describe_order_event)
-            .collect::<Vec<_>>(),
+        describe_order_events(&read_all_or_buffered(&mut state, Y, &mut y_peer)),
         [
             "UnmapNotify(event=root window=T fromConfigure=0)",
             "DestroyNotify(event=C window=C)",
+            "PresentConfigureNotify(eid=0x200020 window=C x=0 y=0 w=50 h=50 off=0,0 pixmap=50x50 flags=0x1)",
             "DestroyNotify(event=root window=T)",
         ]
     );

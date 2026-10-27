@@ -1,0 +1,115 @@
+==> probe.log <==
+== t destroy-present
+destroy T
+  obs: UnmapNotify(event=T window=T fromConfigure=0)
+  obs: UnmapNotify(event=root window=T fromConfigure=0)
+  obs: LeaveNotify(event=C child=None detail=Ancestor mode=Ungrab root=110,110 event=-43,-43 sf=0x3)
+  obs: EnterNotify(event=T child=None detail=Inferior mode=Ungrab root=110,110 event=10,10 sf=0x2)
+  obs: FocusOut(event=C detail=Ancestor mode=Normal)
+  obs: FocusOut(event=T detail=Virtual mode=Normal)
+  obs: FocusIn(event=root detail=Inferior mode=Normal)
+  obs: Expose(root 100,100 200x200 count=0)
+  obs: LeaveNotify(event=T child=None detail=Ancestor mode=Normal root=110,110 event=10,10 sf=0x3)
+  obs: EnterNotify(event=root child=None detail=Inferior mode=Normal root=110,110 event=110,110 sf=0x3)
+  obs: DestroyNotify(event=C window=C)
+  obs: XFixesSelectionNotify(subtype=1 window=root owner=None)
+  obs: PresentConfigureNotify(eid=eC window=C x=153 y=153 w=100 h=100 off=0,0 pixmap=100x100 flags=0x1)
+  obs: DestroyNotify(event=T window=T)
+  obs: DestroyNotify(event=root window=T)
+  obs: PresentConfigureNotify(eid=eT window=T x=100 y=100 w=200 h=200 off=0,0 pixmap=200x200 flags=0x1)
+focus after: root revert=0
+grab by another client after: Success
+== c destroy-present
+destroy T
+  obs: UnmapNotify(event=T window=T fromConfigure=0)
+  obs: UnmapNotify(event=root window=T fromConfigure=0)
+  obs: FocusOut(event=C detail=Ancestor mode=Normal)
+  obs: FocusOut(event=T detail=Virtual mode=Normal)
+  obs: FocusIn(event=root detail=Inferior mode=Normal)
+  obs: Expose(root 100,100 200x200 count=0)
+  obs: LeaveNotify(event=C child=None detail=Ancestor mode=Normal root=200,200 event=47,47 sf=0x3)
+  obs: LeaveNotify(event=T child=C detail=Virtual mode=Normal root=200,200 event=100,100 sf=0x3)
+  obs: EnterNotify(event=root child=None detail=Inferior mode=Normal root=200,200 event=200,200 sf=0x3)
+  obs: DestroyNotify(event=C window=C)
+  obs: XFixesSelectionNotify(subtype=1 window=root owner=None)
+  obs: PresentConfigureNotify(eid=eC window=C x=153 y=153 w=100 h=100 off=0,0 pixmap=100x100 flags=0x1)
+  obs: DestroyNotify(event=T window=T)
+  obs: DestroyNotify(event=root window=T)
+  obs: PresentConfigureNotify(eid=eT window=T x=100 y=100 w=200 h=200 off=0,0 pixmap=200x200 flags=0x1)
+focus after: root revert=0
+grab by another client after: Success
+== t disconnect-present-appsel
+disconnect app
+  obs: XFixesSelectionNotify(subtype=2 window=root owner=None)
+  obs: UnmapNotify(event=T window=T fromConfigure=0)
+  obs: UnmapNotify(event=root window=T fromConfigure=0)
+  obs: LeaveNotify(event=C child=None detail=Ancestor mode=Ungrab root=110,110 event=-43,-43 sf=0x3)
+  obs: EnterNotify(event=T child=None detail=Inferior mode=Ungrab root=110,110 event=10,10 sf=0x2)
+  obs: FocusOut(event=C detail=Ancestor mode=Normal)
+  obs: FocusOut(event=T detail=Virtual mode=Normal)
+  obs: FocusIn(event=root detail=Inferior mode=Normal)
+  obs: Expose(root 100,100 200x200 count=0)
+  obs: LeaveNotify(event=T child=None detail=Ancestor mode=Normal root=110,110 event=10,10 sf=0x3)
+  obs: EnterNotify(event=root child=None detail=Inferior mode=Normal root=110,110 event=110,110 sf=0x3)
+  obs: DestroyNotify(event=C window=C)
+  obs: PresentConfigureNotify(eid=eC window=C x=153 y=153 w=100 h=100 off=0,0 pixmap=100x100 flags=0x1)
+  obs: DestroyNotify(event=T window=T)
+  obs: DestroyNotify(event=root window=T)
+  obs: PresentConfigureNotify(eid=eT window=T x=100 y=100 w=200 h=200 off=0,0 pixmap=200x200 flags=0x1)
+focus after: root revert=0
+grab by another client after: Success
+== c disconnect-kbd-appsel
+disconnect app
+  obs: XFixesSelectionNotify(subtype=2 window=root owner=None)
+  obs: FocusOut(event=C detail=Pointer mode=Ungrab)
+  obs: FocusOut(event=T detail=Inferior mode=Ungrab)
+  obs: FocusIn(event=C detail=Ancestor mode=Ungrab)
+  obs: UnmapNotify(event=T window=T fromConfigure=0)
+  obs: UnmapNotify(event=root window=T fromConfigure=0)
+  obs: FocusOut(event=C detail=Ancestor mode=Normal)
+  obs: FocusOut(event=T detail=Virtual mode=Normal)
+  obs: FocusIn(event=root detail=Inferior mode=Normal)
+  obs: Expose(root 100,100 200x200 count=0)
+  obs: LeaveNotify(event=C child=None detail=Ancestor mode=Normal root=200,200 event=50,50 sf=0x3)
+  obs: LeaveNotify(event=T child=C detail=Virtual mode=Normal root=200,200 event=100,100 sf=0x3)
+  obs: EnterNotify(event=root child=None detail=Inferior mode=Normal root=200,200 event=200,200 sf=0x3)
+  obs: DestroyNotify(event=C window=C)
+  obs: DestroyNotify(event=T window=T)
+  obs: DestroyNotify(event=root window=T)
+focus after: root revert=0
+grab by another client after: Success
+== t disconnect-ptr-appsel
+disconnect app
+  obs: XFixesSelectionNotify(subtype=2 window=root owner=None)
+  obs: UnmapNotify(event=T window=T fromConfigure=0)
+  obs: UnmapNotify(event=root window=T fromConfigure=0)
+  obs: FocusOut(event=C detail=Ancestor mode=Normal)
+  obs: FocusOut(event=T detail=Virtual mode=Normal)
+  obs: FocusIn(event=root detail=Inferior mode=Normal)
+  obs: Expose(root 100,100 200x200 count=0)
+  obs: LeaveNotify(event=T child=None detail=Ancestor mode=Normal root=110,110 event=10,10 sf=0x3)
+  obs: EnterNotify(event=root child=None detail=Inferior mode=Normal root=110,110 event=110,110 sf=0x3)
+  obs: DestroyNotify(event=C window=C)
+  obs: DestroyNotify(event=T window=T)
+  obs: DestroyNotify(event=root window=T)
+focus after: root revert=0
+grab by another client after: Success
+== c disconnect-ptr-appsel
+disconnect app
+  obs: XFixesSelectionNotify(subtype=2 window=root owner=None)
+  obs: LeaveNotify(event=T child=None detail=Inferior mode=Ungrab root=200,200 event=100,100 sf=0x2)
+  obs: EnterNotify(event=C child=None detail=Ancestor mode=Ungrab root=200,200 event=50,50 sf=0x3)
+  obs: UnmapNotify(event=T window=T fromConfigure=0)
+  obs: UnmapNotify(event=root window=T fromConfigure=0)
+  obs: FocusOut(event=C detail=Ancestor mode=Normal)
+  obs: FocusOut(event=T detail=Virtual mode=Normal)
+  obs: FocusIn(event=root detail=Inferior mode=Normal)
+  obs: Expose(root 100,100 200x200 count=0)
+  obs: LeaveNotify(event=C child=None detail=Ancestor mode=Normal root=200,200 event=50,50 sf=0x3)
+  obs: LeaveNotify(event=T child=C detail=Virtual mode=Normal root=200,200 event=100,100 sf=0x3)
+  obs: EnterNotify(event=root child=None detail=Inferior mode=Normal root=200,200 event=200,200 sf=0x3)
+  obs: DestroyNotify(event=C window=C)
+  obs: DestroyNotify(event=T window=T)
+  obs: DestroyNotify(event=root window=T)
+focus after: root revert=0
+grab by another client after: Success

@@ -189,101 +189,13 @@ pub fn process_disconnect_reporting(
 
     // Xorg `ReleaseActiveGrabs` (`dix/dispatch.c:3496`) runs before
     // `FreeClientResources` (`:3551`): the client's own grabs are gone before
-    // any of its windows.
+    // any of its windows, with the survivors told as for an ungrab.
     state.button_grabs.retain(|g| g.owner != client_id);
     state.key_grabs.retain(|g| g.owner != client_id);
-    let dynamic_pointer_grabs: Vec<u16> = state
-        .xi2_pointer_grabs
-        .iter()
-        .filter_map(|(device, grab)| (grab.owner == client_id).then_some(*device))
-        .collect();
-    let dynamic_keyboard_grabs: Vec<u16> = state
-        .xi2_keyboard_grabs
-        .iter()
-        .filter_map(|(device, grab)| (grab.owner == client_id).then_some(*device))
-        .collect();
-    for device in dynamic_pointer_grabs {
-        state.xi2_pointer_grabs.remove(&device);
-        if let Some(freeze) = state.xi1_frozen.get_mut(&device) {
-            freeze.state = crate::server::Xi1SyncState::Thawed;
-            freeze.stored = None;
-        }
-        crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(state, device, client_id);
-        state.reattach_xi2_slave(device);
-    }
-    for device in dynamic_keyboard_grabs {
-        state.xi2_keyboard_grabs.remove(&device);
-        if let Some(freeze) = state.xi1_frozen.get_mut(&device) {
-            freeze.state = crate::server::Xi1SyncState::Thawed;
-            freeze.stored = None;
-        }
-        crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(state, device, client_id);
-        state.reattach_xi2_slave(device);
-    }
-    let released_pointer_grab = state
-        .active_pointer_grab
-        .is_some_and(|grab| grab.owner == client_id);
-    if released_pointer_grab {
-        state.clear_pointer_grab();
-        if let Some(freeze) = state
-            .xi1_frozen
-            .get_mut(&crate::xinput::DEVICEID_MASTER_POINTER)
-        {
-            freeze.stored = None;
-            freeze.state = crate::server::Xi1SyncState::Thawed;
-            freeze.other = None;
-        }
-        crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(
-            state,
-            crate::xinput::DEVICEID_MASTER_POINTER,
-            client_id,
-        );
-    }
-    // Xorg ReleaseActiveGrabs (CloseDownClient): a disconnecting
-    // client's ACTIVE grabs must go too, or the stale record makes
-    // every later GrabPointer/GrabKeyboard return AlreadyGrabbed.
-    if released_pointer_grab {
-        // Xorg DeactivatePointerGrab on client teardown reverts the
-        // sprite from the grab cursor back to the window/default cursor.
-        let _ = backend.set_grab_cursor(None, None);
-    }
-    if state
-        .active_keyboard_grab
-        .is_some_and(|g| g.owner == client_id)
-    {
-        state.active_keyboard_grab = None;
-        if let Some(freeze) = state
-            .xi1_frozen
-            .get_mut(&crate::xinput::DEVICEID_MASTER_KEYBOARD)
-        {
-            freeze.stored = None;
-            freeze.state = crate::server::Xi1SyncState::Thawed;
-            freeze.other = None;
-        }
-        crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(
-            state,
-            crate::xinput::DEVICEID_MASTER_KEYBOARD,
-            client_id,
-        );
-    }
-    // XI 1.x grab teardown: drop the client's passive grabs, release
-    // its active device grabs, and thaw any devices its grabs froze —
-    // a leaked freeze queues device events forever and hangs every
-    // later test/client waiting on input.
     state.xi1_passive_grabs.retain(|g| g.owner != client_id);
-    let released: Vec<u16> = state
-        .xi1_active_grabs
-        .iter()
-        .filter(|(_, g)| g.owner == client_id)
-        .map(|(d, _)| *d)
-        .collect();
-    for dev in &released {
-        // Deactivation resets the device's sync state, releases the
-        // paired device if it was held on this grab's behalf
-        // (other_devices_mode), and flushes the queues.
-        crate::core_loop::pointer_fanout::xi1_deactivate_device_grab(state, *dev);
-    }
-    if released.is_empty() && state.xi1_active_grabs.is_empty() {
+    let released_xi1 =
+        crate::core_loop::process_request::release_active_grabs(state, backend, client_id);
+    if !released_xi1 && state.xi1_active_grabs.is_empty() {
         // No active grabs anywhere, yet freezes linger (e.g. a sync
         // passive grab's owner died between activation and release):
         // clear them, or device events queue forever and every later

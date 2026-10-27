@@ -2594,6 +2594,43 @@ pub(crate) fn fire_present_configure_notify_for_window(
     window_id: ResourceId,
     geometry: yserver_protocol::x11::Geometry,
 ) {
+    send_present_configure_notify(
+        state,
+        window_id,
+        (geometry.x, geometry.y, geometry.width, geometry.height),
+        0,
+    );
+}
+
+/// Xorg `present_destroy_window` (`present/present_screen.c:96-103`): a
+/// destroyed window's `ConfigureNotify(PresentWindowDestroyed)`, with its
+/// `drawable` x/y (absolute, inside the border) and inside size. Call while
+/// `window` is still in the tree, before its selections are purged.
+pub(crate) fn fire_present_window_destroyed(state: &mut ServerState, window_id: ResourceId) {
+    const PRESENT_WINDOW_DESTROYED: u32 = 1 << 0;
+    let Some(window) = state.resources.window(window_id) else {
+        return;
+    };
+    let (width, height) = (window.width, window.height);
+    let (x, y) = state.resources.window_absolute_position(window_id);
+    // Xorg's `xPresentConfigureNotify` x/y are INT16, truncated from `int`.
+    #[allow(clippy::cast_possible_truncation)]
+    let (x, y) = (x as i16, y as i16);
+    send_present_configure_notify(
+        state,
+        window_id,
+        (x, y, width, height),
+        PRESENT_WINDOW_DESTROYED,
+    );
+}
+
+/// `present_send_config_notify` (`present/present_event.c:105-130`).
+fn send_present_configure_notify(
+    state: &mut ServerState,
+    window_id: ResourceId,
+    (x, y, width, height): (i16, i16, u16, u16),
+    pixmap_flags: u32,
+) {
     use yserver_protocol::x11::present as x11present;
     const PRESENT_MAJOR_OPCODE: u8 = 145;
 
@@ -2622,21 +2659,21 @@ pub(crate) fn fire_present_configure_notify_for_window(
             PRESENT_MAJOR_OPCODE,
             eid,
             window_id.0,
-            geometry.x,
-            geometry.y,
-            geometry.width,
-            geometry.height,
+            x,
+            y,
+            width,
+            height,
             0,
             0,
-            geometry.width,
-            geometry.height,
-            0,
+            width,
+            height,
+            pixmap_flags,
         );
         let _ = write_to_client(client, owner, &ev);
         debug!(
             "PRESENT ConfigureNotify -> client {} eid=0x{eid:x} window=0x{:x} \
-             geom=({},{} {}x{})",
-            owner.0, window_id.0, geometry.x, geometry.y, geometry.width, geometry.height,
+             geom=({x},{y} {width}x{height}) flags=0x{pixmap_flags:x}",
+            owner.0, window_id.0,
         );
     }
 }

@@ -1,7 +1,7 @@
 /* destroy-order-probe — the client-visible event stream of DestroyWindow on
  *                       a mapped subtree (window-destroy plan, phase 1).
  *
- *   ./destroy-order-probe c | t [destroy | disconnect | disconnect-appsel | disconnect-kbd]
+ *   ./destroy-order-probe c | t [destroy | disconnect][-appsel][-kbd][-ptr][-present]
  *
  * `app` owns mapped T (child of root) and its mapped child C; the pointer is
  * warped into C (c) or into T outside C (t). `grb` owns a selection on C, holds an active pointer grab on
@@ -12,10 +12,13 @@
  * printed, one per line, in arrival order.
  *
  * `disconnect`: `app` closes its connection instead of destroying T.
- * `disconnect-appsel`: the same, but `app` sets the selection owner on C.
- * `disconnect-kbd`: as `disconnect`, with `app` also holding a keyboard grab on T.
+ * Modifiers, joined to `destroy`/`disconnect` with `-` (e.g. `disconnect-kbd-appsel`):
+ *   `appsel`  `app`, not `grb`, sets the selection owner on C;
+ *   `kbd`     `app` also holds a keyboard grab on T;
+ *   `ptr`     the active pointer grab is `app`'s, on T, instead of `grb`'s on C;
+ *   `present` C gets a 3px border and `obs` selects PresentConfigureNotify on T and C.
  *
- *   cc -O1 -o destroy-order-probe destroy-order-probe.c -lxcb -lxcb-xfixes
+ *   cc -O1 -o destroy-order-probe destroy-order-probe.c -lxcb -lxcb-xfixes -lxcb-present
  */
 #include <poll.h>
 #include <stdio.h>
@@ -23,11 +26,13 @@
 #include <string.h>
 #include <unistd.h>
 #include <xcb/xcb.h>
+#include <xcb/present.h>
 #include <xcb/xfixes.h>
 
 static xcb_connection_t *app, *grb, *obs;
 static xcb_window_t root, T, C;
-static uint8_t xfixes_ev;
+static uint8_t xfixes_ev, present_op;
+static uint32_t eT, eC;
 
 static const char *nm(uint32_t id)
 {
@@ -106,6 +111,13 @@ static void drain(xcb_connection_t *c, const char *who)
             xcb_xfixes_selection_notify_event_t *e = (void *)ev;
             printf("XFixesSelectionNotify(subtype=%u window=%s owner=%s)", e->subtype, nm(e->window),
                    nm(e->owner));
+        } else if (t == XCB_GE_GENERIC && ((xcb_ge_generic_event_t *)ev)->extension == present_op &&
+                   ((xcb_ge_generic_event_t *)ev)->event_type == XCB_PRESENT_CONFIGURE_NOTIFY) {
+            xcb_present_configure_notify_event_t *e = (void *)ev;
+            printf("PresentConfigureNotify(eid=%s window=%s x=%d y=%d w=%u h=%u off=%d,%d pixmap=%ux%u "
+                   "flags=0x%x)",
+                   e->event == eT ? "eT" : e->event == eC ? "eC" : "?", nm(e->window), e->x, e->y, e->width,
+                   e->height, e->off_x, e->off_y, e->pixmap_width, e->pixmap_height, e->pixmap_flags);
         } else {
             printf("event%u", t);
         }
@@ -129,8 +141,10 @@ int main(int argc, char **argv)
     int in_t = argc > 1 && strcmp(argv[1], "t") == 0;
     const char *how = argc > 2 ? argv[2] : "destroy";
     int disconnect = strncmp(how, "disconnect", 10) == 0;
-    int app_sel = strcmp(how, "disconnect-appsel") == 0;
-    int app_kbd = strcmp(how, "disconnect-kbd") == 0;
+    int app_sel = strstr(how, "appsel") != NULL;
+    int app_kbd = strstr(how, "kbd") != NULL;
+    int app_ptr = strstr(how, "ptr") != NULL;
+    int present = strstr(how, "present") != NULL;
     app = conn();
     grb = conn();
     obs = conn();
@@ -150,7 +164,8 @@ int main(int argc, char **argv)
     xcb_create_window(app, XCB_COPY_FROM_PARENT, T, root, 100, 100, 200, 200, 0,
                       XCB_WINDOW_CLASS_INPUT_OUTPUT, XCB_COPY_FROM_PARENT,
                       XCB_CW_BACK_PIXEL | XCB_CW_OVERRIDE_REDIRECT, v);
-    xcb_create_window(app, XCB_COPY_FROM_PARENT, C, T, 50, 50, 100, 100, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
+    xcb_create_window(app, XCB_COPY_FROM_PARENT, C, T, 50, 50, 100, 100, present ? 3 : 0,
+                      XCB_WINDOW_CLASS_INPUT_OUTPUT,
                       XCB_COPY_FROM_PARENT, XCB_CW_BACK_PIXEL, v);
     xcb_map_window(app, C);
     xcb_map_window(app, T);
@@ -172,6 +187,19 @@ int main(int argc, char **argv)
                                       XCB_XFIXES_SELECTION_EVENT_MASK_SET_SELECTION_OWNER |
                                           XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_WINDOW_DESTROY |
                                           XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_CLIENT_CLOSE);
+    if (present) {
+        const xcb_query_extension_reply_t *p = xcb_get_extension_data(obs, &xcb_present_id);
+        if (!p || !p->present) {
+            fprintf(stderr, "no Present\n");
+            return 1;
+        }
+        present_op = p->major_opcode;
+        free(xcb_present_query_version_reply(obs, xcb_present_query_version(obs, 1, 2), NULL));
+        eT = xcb_generate_id(obs);
+        eC = xcb_generate_id(obs);
+        xcb_present_select_input(obs, eT, T, XCB_PRESENT_EVENT_MASK_CONFIGURE_NOTIFY);
+        xcb_present_select_input(obs, eC, C, XCB_PRESENT_EVENT_MASK_CONFIGURE_NOTIFY);
+    }
     rt(obs);
 
     xcb_warp_pointer(app, XCB_NONE, root, 0, 0, 0, 0, in_t ? 110 : 200, in_t ? 110 : 200);
@@ -180,9 +208,10 @@ int main(int argc, char **argv)
     xcb_set_selection_owner(app_sel ? app : grb, C, sel, XCB_CURRENT_TIME);
     rt(app);
     xcb_grab_pointer_reply_t *g = xcb_grab_pointer_reply(
-        grb,
-        xcb_grab_pointer(grb, 0, C, XCB_EVENT_MASK_ENTER_WINDOW | XCB_EVENT_MASK_LEAVE_WINDOW,
-                         XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC, XCB_NONE, XCB_NONE, XCB_CURRENT_TIME),
+        app_ptr ? app : grb,
+        xcb_grab_pointer(app_ptr ? app : grb, 0, app_ptr ? T : C,
+                         XCB_EVENT_MASK_ENTER_WINDOW | XCB_EVENT_MASK_LEAVE_WINDOW, XCB_GRAB_MODE_ASYNC,
+                         XCB_GRAB_MODE_ASYNC, XCB_NONE, XCB_NONE, XCB_CURRENT_TIME),
         NULL);
     if (!g || g->status != XCB_GRAB_STATUS_SUCCESS) {
         fprintf(stderr, "grab failed\n");
