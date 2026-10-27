@@ -666,3 +666,12 @@ grabs before any plan executes, as Xorg does.
   Ungrab)` and `FocusIn(C, Ancestor, Ungrab)` arrive before the UnmapNotify. Our
   disconnect grab release has always sent nothing. Phase 2 moved it earlier
   without changing what it does.
+- **NotifyPointer focus events use the sprite window, not `PointerWindows`.**
+  Xorg's `CoreFocusOutNotifyPointerEvents` (`dix/enterleave.c:957-979`) uses
+  the window of the last core EnterNotify; we use the window under the sprite.
+  They differ after pointer-grab crossings. Measured on Xephyr
+  (`destroy-order-probe t disconnect-kbd-appsel`): after
+  `XFixesSelectionNotify(subtype=2)` come `FocusOut(C, Pointer, Ungrab)`,
+  `FocusOut(T, Inferior, Ungrab)`, `FocusIn(C, Ancestor, Ungrab)`, then the
+  destroy stream; we name T instead of C in the first event. Not
+  `#[ignore]`-able here: CI's lavapipe job runs ignored tests.

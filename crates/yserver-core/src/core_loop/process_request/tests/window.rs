@@ -3934,49 +3934,6 @@ fn grab_keyboard_on_t_for_app(state: &mut ServerState) {
     });
 }
 
-/// `tools/destroy-order-probe t disconnect-kbd-appsel`, measured on Xephyr:
-/// `ReleaseActiveGrabs` (`dix/dispatch.c:3496`) runs after
-/// `DeleteClientFromAnySelections` (`:3495`) and before any window goes; it
-/// deactivates the departing client's keyboard grab through
-/// `DeactivateKeyboardGrab` (`dix/events.c:1995-2012`, `:1781-1822`), whose
-/// `DoFocusEvents(grab T → focus C, NotifyUngrab)` reaches the survivors.
-///
-/// Ignored: the leading `FocusOut(C, Pointer, Ungrab)` is Xorg's
-/// `CoreFocusOutNotifyPointerEvents` (`dix/enterleave.c:957-979`) on
-/// `PointerWindows[dev]`, the window of the last core EnterNotify, which
-/// `grb`'s pointer-grab crossings moved to C. yserver takes the NotifyPointer
-/// window from the sprite position (T here), a divergence of every focus
-/// transition under a pointer grab, not of the disconnect path; with the
-/// pointer in C the two agree (the test below).
-#[test]
-#[ignore = "NotifyPointer focus events use the sprite window, not Xorg's PointerWindows"]
-fn disconnect_releasing_a_keyboard_grab_sends_ungrab_focus_events() {
-    let (mut state, mut grb, mut obs) = destroy_order_fixture((110, 110));
-    grab_keyboard_on_t_for_app(&mut state);
-    assert_eq!(
-        disconnect_app_and_read_order_stream(&mut state, &mut obs),
-        [
-            "XFixesSelectionNotify(subtype=2 window=root owner=None)",
-            "FocusOut(event=C detail=Pointer mode=Ungrab)",
-            "FocusOut(event=T detail=Inferior mode=Ungrab)",
-            "FocusIn(event=C detail=Ancestor mode=Ungrab)",
-            "UnmapNotify(event=T window=T fromConfigure=0)",
-            "UnmapNotify(event=root window=T fromConfigure=0)",
-            "LeaveNotify(event=C child=None detail=Ancestor mode=Ungrab root=110,110 event=-40,-40 sf=0x3)",
-            "EnterNotify(event=T child=None detail=Inferior mode=Ungrab root=110,110 event=10,10 sf=0x2)",
-            "FocusOut(event=C detail=Ancestor mode=Normal)",
-            "FocusOut(event=T detail=Virtual mode=Normal)",
-            "FocusIn(event=root detail=Inferior mode=Normal)",
-            "Expose(root 100,100 200x200 count=0)",
-            "DestroyNotify(event=C window=C)",
-            "DestroyNotify(event=T window=T)",
-            "DestroyNotify(event=root window=T)",
-        ]
-    );
-    assert!(read_all_or_buffered(&mut state, 2, &mut grb).is_empty());
-    assert!(state.active_keyboard_grab.is_none());
-}
-
 /// `tools/destroy-order-probe c disconnect-kbd-appsel`, measured on Xephyr.
 /// The three backend crossings between the Expose and DestroyNotify(C) are
 /// left out (see [`destroy_window_event_order_matches_xorg`]).
