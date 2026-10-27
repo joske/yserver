@@ -2625,16 +2625,18 @@ pub(super) fn unmap_window(
     }
 }
 
-/// Drop `dev`'s XI1 active grab and thaw the device: the unmap and destroy
-/// deactivation of a grab whose window stops being viewable.
+/// Deactivate `dev`'s XI1 active grab when its window stops being viewable
+/// or is destroyed, as UngrabDevice does: thaw the device, release the
+/// paired device held on the grab's behalf, then replay what the freeze
+/// withheld (Xorg `DeactivateGrab`, `dix/events.c:1694-1700`, `:1819`).
 pub(super) fn release_xi1_active_grab(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     dev: u16,
 ) {
-    state.xi1_active_grabs.remove(&dev);
+    crate::core_loop::pointer_fanout::xi1_deactivate_device_grab(state, dev);
     let xid_map = backend.xid_map().clone();
-    crate::core_loop::pointer_fanout::xi1_thaw_device(state, backend, &xid_map, dev);
+    crate::core_loop::pointer_fanout::xi1_compute_freezes(state, backend, &xid_map);
 }
 
 pub(super) fn handle_unmap_subwindows(

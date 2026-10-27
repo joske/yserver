@@ -2971,6 +2971,16 @@ fn run_core_with_inventory(
             }
         }
 
+        // A client teardown could not complete (`fatal_teardown`): that
+        // client's windows, resources and ID range are still in place, so
+        // the session cannot go on. Shut down as `-terminate` does.
+        if let Some(cause) = state.fatal_teardown.clone() {
+            log::error!("core loop: terminating, {cause}");
+            setup_thread::shutdown_all(&setup_registry);
+            cancel_all_pending_backend_requests(backend, &mut pending_backend_requests);
+            return Err(std::io::Error::other(cause));
+        }
+
         // The generation boundary. Reached only from an action the
         // trigger LATCHED earlier in this iteration — a departure that
         // drained an armed generation, or a SIGHUP — never from a state
@@ -3053,7 +3063,10 @@ fn run_core_with_inventory(
                 let Some(generation) = outcome else {
                     setup_thread::shutdown_all(&setup_registry);
                     cancel_all_pending_backend_requests(backend, &mut pending_backend_requests);
-                    return Ok(());
+                    return state
+                        .fatal_teardown
+                        .clone()
+                        .map_or(Ok(()), |cause| Err(io::Error::other(cause)));
                 };
                 // Disarm for the generation just installed. Without
                 // this the empty client set the reset leaves behind

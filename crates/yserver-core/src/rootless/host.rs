@@ -78,8 +78,12 @@ pub(crate) fn kill_client_as_server(
         return;
     }
     if state.zombie_clients.contains_key(&owner.0) {
-        crate::core_loop::process_disconnect::destroy_zombie_resources(state, backend, owner);
-        state.zombie_clients.remove(&owner.0);
+        // On `Err` the zombie stays recorded; the server is shutting down.
+        if crate::core_loop::process_disconnect::destroy_zombie_resources(state, backend, owner)
+            .is_ok()
+        {
+            state.zombie_clients.remove(&owner.0);
+        }
     } else if state.clients.contains_key(&owner.0) {
         crate::core_loop::process_disconnect::process_disconnect(state, backend, owner);
     }

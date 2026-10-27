@@ -39,6 +39,33 @@ impl<P: Platform> XBackend<P> {
         }
     }
 
+    /// The projection of a newly created COW: a mapped, borderless,
+    /// screen-sized root child at (0,0), stacked above every window so far
+    /// (Xorg `compCreateOverlayWindow`, `compoverlay.c:147-158`).
+    fn fresh_cow_geometry(&mut self) -> WindowGeometry {
+        let (fb_w, fb_h) = self.platform.fb_size();
+        WindowGeometry {
+            border_width: 0,
+            border_pixel: None,
+            border_pixmap: None,
+            x: 0,
+            y: 0,
+            width: fb_w.max(1),
+            height: fb_h.max(1),
+            depth: 24,
+            mapped: true,
+            viewable: true,
+            // `parent: None` matches windows's convention for a
+            // direct child of the root (root is not itself tracked
+            // in windows — see register_top_level).
+            parent: None,
+            stack_rank: self.alloc_window_stack_rank(),
+            bg_pixel: None,
+            bg_pixmap: None,
+            cursor: None,
+        }
+    }
+
     /// Stage 4d — Composite Overlay Window allocation.
     ///
     /// Core calls this only while it has no COW record (Xorg
@@ -79,6 +106,13 @@ impl<P: Platform> XBackend<P> {
                  backend have drifted",
             );
             self.deferred_cow_release = false;
+            // Only the storage outlives the old COW. The new one is a
+            // fresh root child (Xorg `compCreateOverlayWindow`,
+            // `compoverlay.c:147-158`), whatever the old one was
+            // reparented, moved or unmapped to.
+            let geom = self.fresh_cow_geometry();
+            self.windows
+                .insert(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0, geom);
             // The destroy unregistered the COW (`unregister_host_window`);
             // re-register it as the fresh path below does.
             self.core.xid_map.insert(
@@ -155,27 +189,7 @@ impl<P: Platform> XBackend<P> {
         // window does. The xid is the well-known protocol xid; v2
         // keys windows on host xid directly.
         let cow_host_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
-        let rank = self.alloc_window_stack_rank();
-        let geom = WindowGeometry {
-            border_width: 0,
-            border_pixel: None,
-            border_pixmap: None,
-            x: 0,
-            y: 0,
-            width: fb_w,
-            height: fb_h,
-            depth: 24,
-            mapped: true,
-            viewable: true,
-            // `parent: None` matches windows's convention for a
-            // direct child of the root (root is not itself tracked
-            // in windows — see register_top_level).
-            parent: None,
-            stack_rank: rank,
-            bg_pixel: None,
-            bg_pixmap: None,
-            cursor: None,
-        };
+        let geom = self.fresh_cow_geometry();
         self.windows.insert(cow_host_xid, geom);
         // The COW takes the pointer until its input region is emptied, so
         // crossings resolve it like any window (Nonlinear to a sibling).

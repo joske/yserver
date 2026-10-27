@@ -141,6 +141,12 @@ pub fn process_disconnect_reporting(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return;
     };
+    // Already gone and still here: an earlier teardown of this client hit a
+    // fatal failure and stopped (`fatal_teardown`); the server is shutting
+    // down, and nothing may run that teardown again.
+    if client.gone {
+        return;
+    }
     // Xorg `clientGone` (`dix/dispatch.c:3518`): nothing emitted from here on
     // reaches the departing client.
     client.gone = true;
@@ -326,7 +332,13 @@ pub fn process_disconnect_reporting(
         );
     }
 
-    let (all_destroyed, attr_pixmap_xids) = destroy_owned_windows(state, backend, client_id);
+    let (all_destroyed, attr_pixmap_xids) = match destroy_owned_windows(state, backend, client_id) {
+        Ok(destroyed) => destroyed,
+        Err(err) => {
+            abort_teardown(state, "disconnect", client_id, &err);
+            return;
+        }
+    };
 
     let removed = if retain {
         // Resources keep their original `owner: ClientId`. Tracking
@@ -673,15 +685,28 @@ pub(crate) fn unrealize_redirect_backing(
 /// resource through `DeleteWindow`, `dix/resource.c:1146-1154`). Returns the
 /// destroyed windows, survivors' windows under them included, and their
 /// attribute pixmaps for the orphan gate.
+///
+/// # Errors
+/// A plan holding the COW (the compositor reparented it under one of
+/// `client`'s windows) failed to prepare. That root goes first, so nothing
+/// was destroyed.
 fn destroy_owned_windows(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     client: ClientId,
-) -> (Vec<ResourceId>, Vec<u32>) {
+) -> std::io::Result<(Vec<ResourceId>, Vec<u32>)> {
     let mut owned_roots: Vec<ResourceId> = Vec::new();
     state
         .resources
         .collect_owned_window_roots(client, &mut owned_roots);
+    // Root order is free (hash order in Xorg too); the only fallible one
+    // goes first.
+    owned_roots.sort_by_key(|root| {
+        !state
+            .resources
+            .plan_destroy(*root)
+            .is_some_and(|plan| plan.contains_cow())
+    });
     let mut destroyed = Vec::new();
     let mut attr_pixmaps = Vec::new();
     for root in owned_roots {
@@ -689,22 +714,26 @@ fn destroy_owned_windows(
         let Some(plan) = state.resources.plan_destroy(root) else {
             continue;
         };
-        // Preparation fails only for a plan holding the COW, i.e. one the
-        // compositor reparented under this client's window; that subtree
-        // then stays, with the overlay still up.
-        let prepared = match plan.prepare(backend) {
-            Ok(prepared) => prepared,
-            Err(err) => {
-                log::error!("disconnect: prepare destroy of 0x{:x}: {err}", root.0);
-                continue;
-            }
-        };
+        let prepared = plan.prepare(backend).map_err(|err| {
+            std::io::Error::other(format!(
+                "cannot destroy window 0x{:x}, which holds the composite overlay: {err}",
+                root.0
+            ))
+        })?;
         let outcome =
             crate::core_loop::process_request::execute_destroy(state, backend, None, prepared);
         destroyed.extend(outcome.windows);
         attr_pixmaps.extend(outcome.attr_pixmaps);
     }
-    (destroyed, attr_pixmaps)
+    Ok((destroyed, attr_pixmaps))
+}
+
+/// A client teardown that cannot complete: leave its record, resources and
+/// resource-ID range in place and have the core loop shut the server down.
+fn abort_teardown(state: &mut ServerState, what: &str, client: ClientId, err: &std::io::Error) {
+    let cause = format!("{what} of client {}: {err}", client.0);
+    log::error!("{cause}; teardown stopped, shutting the server down");
+    state.fatal_teardown.get_or_insert(cause);
 }
 
 /// Destroy every resource owned by a zombie client — invoked by
@@ -714,24 +743,37 @@ fn destroy_owned_windows(
 /// (there is no `state.clients` entry, no reader thread, no
 /// connection-tied extension state — those were torn down at the
 /// original disconnect). The caller must remove `zombie` from
-/// `state.zombie_clients` after this returns.
+/// `state.zombie_clients` after this returns `Ok`.
+///
+/// # Errors
+/// The zombie's windows could not be destroyed; nothing of it was freed and
+/// `state.fatal_teardown` is set. The zombie must stay recorded.
 pub fn destroy_zombie_resources(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     zombie: ClientId,
-) {
-    destroy_zombie_resources_reporting(state, backend, zombie, None);
+) -> std::io::Result<()> {
+    destroy_zombie_resources_reporting(state, backend, zombie, None)
 }
 
 /// [`destroy_zombie_resources`], reporting its host-pixmap frees the same way
 /// [`process_disconnect_reporting`] does.
+///
+/// # Errors
+/// As [`destroy_zombie_resources`].
 pub fn destroy_zombie_resources_reporting(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     zombie: ClientId,
     host_pixmap_frees: Option<&mut HostPixmapFrees>,
-) {
-    let (_destroyed, attr_pixmap_xids) = destroy_owned_windows(state, backend, zombie);
+) -> std::io::Result<()> {
+    let (_destroyed, attr_pixmap_xids) = match destroy_owned_windows(state, backend, zombie) {
+        Ok(destroyed) => destroyed,
+        Err(err) => {
+            abort_teardown(state, "zombie cleanup", zombie, &err);
+            return Err(err);
+        }
+    };
 
     let removed = state.resources.remove_non_window_resources_owned_by(zombie);
 
@@ -775,6 +817,7 @@ pub fn destroy_zombie_resources_reporting(
             );
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1503,7 +1546,7 @@ mod tests {
         );
 
         let mut backend = RecordingBackend::new();
-        destroy_zombie_resources(&mut state, &mut backend, ClientId(7));
+        destroy_zombie_resources(&mut state, &mut backend, ClientId(7)).expect("zombie cleanup");
         assert!(
             !backend
                 .calls()
@@ -1560,7 +1603,7 @@ mod tests {
         assert!(backend.dri3_syncobj_owners.contains_key(&XID));
         assert_eq!(state.zombie_clients.get(&7), Some(&1));
 
-        destroy_zombie_resources(&mut state, &mut backend, ClientId(7));
+        destroy_zombie_resources(&mut state, &mut backend, ClientId(7)).expect("zombie cleanup");
         assert!(!state.resources.xid_in_use(ResourceId(XID)));
         assert!(!backend.dri3_syncobj_owners.contains_key(&XID));
     }
@@ -1585,7 +1628,7 @@ mod tests {
 
         // This is the operation KillClient(AllTemporary) performs for each
         // mode-2 zombie.
-        destroy_zombie_resources(&mut state, &mut backend, ClientId(7));
+        destroy_zombie_resources(&mut state, &mut backend, ClientId(7)).expect("zombie cleanup");
         assert!(!state.resources.xid_in_use(ResourceId(XID)));
         assert!(!backend.dri3_syncobj_owners.contains_key(&XID));
     }
@@ -1621,7 +1664,7 @@ mod tests {
         state.zombie_clients.insert(32, 1);
         state.zombie_clients.insert(33, 1);
 
-        destroy_zombie_resources(&mut state, &mut backend, ClientId(32));
+        destroy_zombie_resources(&mut state, &mut backend, ClientId(32)).expect("zombie cleanup");
 
         assert!(
             state
@@ -1908,5 +1951,170 @@ mod tests {
         );
         process_disconnect(&mut state, &mut backend, ClientId(1));
         assert!(state.pointer_barriers.is_empty());
+    }
+
+    /// Drive one core or extension request from `client`.
+    fn request(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        opcode: u8,
+        data: u8,
+        body: &[u8],
+    ) {
+        crate::core_loop::process_request::process_request(
+            state,
+            backend,
+            ClientId(client),
+            yserver_protocol::x11::SequenceNumber(1),
+            yserver_protocol::x11::RequestHeader {
+                opcode,
+                data,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).expect("length"),
+            },
+            body,
+            None,
+        )
+        .expect("process_request");
+    }
+
+    /// Compositor client 2 takes the overlay and reparents it under `w`
+    /// (ReparentWindow, opcode 7); then the overlay release starts failing.
+    fn cow_under(state: &mut ServerState, backend: &mut RecordingBackend, w: u32) {
+        use crate::resources::COMPOSITE_OVERLAY_WINDOW;
+        request(
+            state,
+            backend,
+            2,
+            144,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &ROOT_WINDOW.0.to_le_bytes(),
+        );
+        let mut body = COMPOSITE_OVERLAY_WINDOW.0.to_le_bytes().to_vec();
+        body.extend_from_slice(&w.to_le_bytes());
+        body.extend_from_slice(&[0; 4]);
+        request(state, backend, 2, 7, 0, &body);
+        assert_eq!(
+            state
+                .resources
+                .window(COMPOSITE_OVERLAY_WINDOW)
+                .map(|cow| cow.parent),
+            Some(ResourceId(w)),
+            "precondition: the COW is under the client's window"
+        );
+        backend.cow_teardown_fails = true;
+    }
+
+    fn create_window_owned_by(state: &mut ServerState, owner: u32, w: u32, pixmap: u32) {
+        state.resources.create_window(
+            ClientId(owner),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(w),
+                parent: ROOT_WINDOW,
+                width: 100,
+                height: 100,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(w));
+        state.resources.create_pixmap(
+            ClientId(owner),
+            CreatePixmapRequest {
+                pixmap: ResourceId(pixmap),
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+                depth: 24,
+            },
+        );
+    }
+
+    fn assert_teardown_stopped_intact(state: &ServerState, owner: u32, w: u32, pixmap: u32) {
+        use crate::resources::COMPOSITE_OVERLAY_WINDOW;
+        assert_eq!(
+            state.resources.window(ResourceId(w)).map(|w| w.owner),
+            Some(ClientId(owner)),
+            "the client's window survives, still its own"
+        );
+        assert_eq!(
+            state
+                .resources
+                .window(COMPOSITE_OVERLAY_WINDOW)
+                .map(|cow| cow.parent),
+            Some(ResourceId(w)),
+            "the COW survives where it was"
+        );
+        assert_eq!(
+            state.resources.resource_owner(ResourceId(pixmap)),
+            Some(ClientId(owner)),
+            "the client's other resources were not freed"
+        );
+        assert!(
+            state.fatal_teardown.is_some(),
+            "the shutdown request is raised"
+        );
+    }
+
+    /// A disconnect whose window holds the COW, with the overlay release
+    /// failing: the teardown stops before anything of the client is freed,
+    /// its record and resource-ID range stay, and the server is asked to
+    /// shut down (the terminal policy in
+    /// `docs/superpowers/plans/2026-10-27-window-destroy-plan.md`).
+    #[test]
+    fn disconnect_whose_window_holds_a_cow_that_cannot_be_released_stops_and_terminates() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let (base, mask) = state.id_allocator.allocate().expect("a base");
+        install_client(&mut state, 1);
+        let client = state.clients.get_mut(&1).expect("client 1");
+        client.resource_id_base = base;
+        client.resource_id_mask = mask;
+        install_client(&mut state, 2);
+        let (w, pixmap) = (base | 1, base | 2);
+        create_window_owned_by(&mut state, 1, w, pixmap);
+        cow_under(&mut state, &mut backend, w);
+
+        process_disconnect(&mut state, &mut backend, ClientId(1));
+
+        assert_teardown_stopped_intact(&state, 1, w, pixmap);
+        assert!(state.clients.contains_key(&1), "the client record stays");
+        assert_ne!(
+            state.id_allocator.allocate().map(|(b, _)| b),
+            Some(base),
+            "the client's resource-ID range is not handed out again"
+        );
+
+        // A second disconnect of the same client (the reader's EOF racing
+        // the first) does not run the teardown again.
+        backend.calls.lock().expect("calls").clear();
+        process_disconnect(&mut state, &mut backend, ClientId(1));
+        let calls = backend.calls.lock().expect("calls");
+        assert!(calls.is_empty(), "nothing ran: {calls:?}");
+    }
+
+    /// The same failure on a zombie's window, through KillClient (opcode
+    /// 113) of a resource the zombie owns: nothing is freed and the zombie
+    /// stays recorded.
+    #[test]
+    fn zombie_cleanup_whose_window_holds_a_cow_that_cannot_be_released_stops_and_terminates() {
+        const ZOMBIE: u32 = 7;
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        install_client(&mut state, 2);
+        let (w, pixmap) = (0x0070_0001, 0x0070_0002);
+        create_window_owned_by(&mut state, ZOMBIE, w, pixmap);
+        state.zombie_clients.insert(ZOMBIE, 1);
+        cow_under(&mut state, &mut backend, w);
+
+        request(&mut state, &mut backend, 2, 113, 0, &pixmap.to_le_bytes());
+
+        assert_teardown_stopped_intact(&state, ZOMBIE, w, pixmap);
+        assert!(
+            state.zombie_clients.contains_key(&ZOMBIE),
+            "the zombie stays recorded"
+        );
     }
 }

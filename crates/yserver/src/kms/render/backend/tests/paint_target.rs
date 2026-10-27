@@ -3094,6 +3094,96 @@ fn get_overlay_window_before_deferred_retirement_reuses_the_backend_cow() {
     assert!(b.windows.contains_key(&cow_xid));
 }
 
+/// A COW reparented under a moved window, destroyed under direct scanout,
+/// then reacquired before the deferred retirement: Xorg creates the new
+/// overlay as a mapped, borderless, screen-sized root child at (0,0)
+/// (`compoverlay.c:147-158`), so the reused backend identity must carry
+/// that geometry, not the old parent and position.
+#[test]
+fn get_overlay_window_before_deferred_retirement_resets_the_cow_projection() {
+    use yserver_core::resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_WINDOW};
+    let cow_xid = COMPOSITE_OVERLAY_WINDOW.0;
+    let mut state = yserver_core::server::ServerState::new();
+    let mut b = KmsBackend::for_tests();
+    let fb_w = b.platform.fb_w;
+    let fb_h = b.platform.fb_h;
+    let child = cow_with_child_under_direct_scanout(&mut state, &mut b);
+    let cow_id = b.cow_id.expect("COW id");
+
+    let holder = create_live_window(
+        &mut state,
+        &mut b,
+        yserver_protocol::x11::ResourceId(0x0020_0002),
+        ROOT_WINDOW,
+        40,
+        50,
+        300,
+        200,
+    )
+    .as_raw();
+    // ReparentWindow(COW, holder, 7, 9).
+    let mut body = Vec::new();
+    body.extend_from_slice(&cow_xid.to_le_bytes());
+    body.extend_from_slice(&0x0020_0002u32.to_le_bytes());
+    body.extend_from_slice(&7i16.to_le_bytes());
+    body.extend_from_slice(&9i16.to_le_bytes());
+    dispatch_for_cow_test(&mut state, &mut b, 7, 0, &body);
+    assert_eq!(
+        b.windows.get(&cow_xid).and_then(|g| g.parent),
+        Some(holder),
+        "precondition: the backend saw the reparent"
+    );
+
+    dispatch_for_cow_test(&mut state, &mut b, 4, 0, &cow_xid.to_le_bytes());
+    assert!(b.deferred_cow_release, "precondition: retirement deferred");
+
+    dispatch_for_cow_test(
+        &mut state,
+        &mut b,
+        144,
+        yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+        &ROOT_WINDOW.0.to_le_bytes(),
+    );
+
+    assert_eq!(state.cow_claims.len(), 2, "DestroyWindow left the claim");
+    assert!(!b.deferred_cow_release);
+    assert_eq!(b.cow_id, Some(cow_id), "backend identity reused");
+    let record = state
+        .resources
+        .window(COMPOSITE_OVERLAY_WINDOW)
+        .expect("core COW record");
+    assert_eq!(record.parent, ROOT_WINDOW);
+    assert!(record.children.is_empty());
+    assert!(
+        !b.windows.contains_key(&child),
+        "old child not brought back"
+    );
+    assert_eq!(
+        b.core.xid_map.get(&cow_xid).copied(),
+        Some(COMPOSITE_OVERLAY_WINDOW)
+    );
+    let geom = b.windows.get(&cow_xid).expect("COW projection");
+    assert_eq!(geom.parent, None, "a fresh COW is a root child");
+    assert_eq!((geom.x, geom.y), (0, 0));
+    assert_eq!((geom.width, geom.height), (fb_w, fb_h));
+    assert_eq!(geom.border_width, 0);
+    assert!(geom.mapped && geom.viewable, "the COW is created mapped");
+    let holder_rank = b.windows.get(&holder).expect("holder").stack_rank;
+    assert!(
+        geom.stack_rank > holder_rank,
+        "the new COW stacks above the existing root children"
+    );
+    assert_eq!(
+        b.core.top_level_order.last().copied(),
+        Some(cow_xid),
+        "the new COW is the topmost root child"
+    );
+
+    b.stop_direct_after_scanout_replaced("reset COW projection test replacement");
+    assert_eq!(b.cow_id, Some(cow_id), "a reacquired COW is not retired");
+    assert_eq!(b.windows.get(&cow_xid).and_then(|g| g.parent), None);
+}
+
 /// An unshaped COW takes the pointer (Xorg `compCreateOverlayWindow`), so
 /// moving between it and a root sibling crosses Nonlinear both ways, as
 /// measured on Xvfb 21.1 (tools/vng-scenarios/cow-input-shape).

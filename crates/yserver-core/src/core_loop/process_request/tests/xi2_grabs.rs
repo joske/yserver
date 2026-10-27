@@ -3684,3 +3684,143 @@ fn destroy_window_releases_xi2_active_grabs_on_it() {
         Some(crate::xinput::DEVICEID_MASTER_POINTER)
     );
 }
+
+/// A mapped window `win` with a mapped child `win + 1`, both owned by client
+/// 1, and client 1's active XI1 grab on the master pointer with the child as
+/// grab window, `this_device_mode` Async and `other_devices_mode` Sync. As
+/// GrabDevice activates it (`xi1_check_grab_for_syncs(this = false, other =
+/// true)`), the paired master keyboard is held on the grab's behalf (Xorg
+/// `CheckGrabForSyncs`, `dix/events.c:1424-1450`). A key event withheld by
+/// that hold sits in the sync queue.
+fn xi1_grab_holding_the_paired_keyboard(win: u32) -> (ServerState, RecordingBackend) {
+    use crate::{
+        host_x11::HostKeyEvent,
+        server::{PendingSyncEvent, QueuedInputEvent, Xi1ActiveGrab},
+        xinput::{DEVICEID_MASTER_KEYBOARD as KBD, DEVICEID_MASTER_POINTER as PTR},
+    };
+    let mut state = ServerState::new();
+    let _peer = install_client(&mut state, 1);
+    let backend = RecordingBackend::new();
+    state.resources.create_window(
+        ClientId(1),
+        CreateWindowRequest {
+            depth: 24,
+            window: ResourceId(win),
+            parent: ROOT_WINDOW,
+            width: 100,
+            height: 100,
+            class: 1,
+            visual: crate::resources::ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    let _ = state.resources.map_window(ResourceId(win));
+    state.resources.create_window(
+        ClientId(1),
+        CreateWindowRequest {
+            depth: 24,
+            window: ResourceId(win + 1),
+            parent: ResourceId(win),
+            width: 50,
+            height: 50,
+            class: 1,
+            visual: crate::resources::ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    let _ = state.resources.map_window(ResourceId(win + 1));
+    state.xi1_active_grabs.insert(
+        PTR,
+        Xi1ActiveGrab {
+            owner: ClientId(1),
+            deviceid: PTR,
+            grab_window: ResourceId(win + 1),
+            owner_events: false,
+            this_mode: 1,
+            other_mode: 0,
+            passive_detail: None,
+        },
+    );
+    crate::core_loop::pointer_fanout::xi1_check_grab_for_syncs(
+        &mut state,
+        PTR,
+        ClientId(1),
+        false,
+        true,
+    );
+    assert!(
+        state.xi1_frozen[&KBD].frozen(),
+        "precondition: keyboard held"
+    );
+    state.sync_pending.push_back(PendingSyncEvent {
+        device: KBD,
+        event: QueuedInputEvent::HostKey(HostKeyEvent {
+            origin: crate::core_loop::InputOrigin::NestedHost,
+            pressed: false,
+            keycode: 38,
+            time: 0x1000,
+            root_x: 5,
+            root_y: 5,
+            event_x: 5,
+            event_y: 5,
+            state: 0,
+        }),
+    });
+    (state, backend)
+}
+
+fn assert_xi1_grab_and_paired_hold_released(state: &ServerState) {
+    use crate::xinput::{DEVICEID_MASTER_KEYBOARD as KBD, DEVICEID_MASTER_POINTER as PTR};
+    assert!(!state.xi1_active_grabs.contains_key(&PTR), "grab released");
+    assert!(
+        !state.xi1_frozen.get(&KBD).is_some_and(|f| f.frozen()),
+        "the paired keyboard is thawed"
+    );
+    assert!(
+        state.sync_pending.is_empty(),
+        "the withheld key event is replayed"
+    );
+}
+
+/// Destroying the grab window's parent: `UnrealizeTree` runs
+/// `DeleteWindowFromAnyEvents` on every realized window of the subtree
+/// (`dix/window.c:2806`), which deactivates the XI1 grab on the child
+/// through the device's `DeactivateGrab` (`dix/events.c:5927-5931`). That
+/// clears every `sync.other` naming the grab and calls `ComputeFreezes`
+/// (`dix/events.c:1697-1700`, `:1819`): the paired keyboard thaws.
+#[test]
+fn destroy_window_releases_an_xi1_grabs_paired_device_hold() {
+    const WIN: u32 = 0x0010_0131;
+    let (mut state, mut backend) = xi1_grab_holding_the_paired_keyboard(WIN);
+    process_dynamic_request(
+        &mut state,
+        &mut backend,
+        ClientId(1),
+        SequenceNumber(1),
+        4, // DestroyWindow
+        0,
+        &WIN.to_le_bytes(),
+    );
+    assert!(state.resources.window(ResourceId(WIN)).is_none());
+    assert!(state.resources.window(ResourceId(WIN + 1)).is_none());
+    assert_xi1_grab_and_paired_hold_released(&state);
+}
+
+/// Unmapping the grab window's parent unrealizes the child and takes the same
+/// `DeleteWindowFromAnyEvents` path (`dix/window.c:2806`).
+#[test]
+fn unmap_window_releases_an_xi1_grabs_paired_device_hold() {
+    const WIN: u32 = 0x0010_0132;
+    let (mut state, mut backend) = xi1_grab_holding_the_paired_keyboard(WIN);
+    process_dynamic_request(
+        &mut state,
+        &mut backend,
+        ClientId(1),
+        SequenceNumber(1),
+        10, // UnmapWindow
+        0,
+        &WIN.to_le_bytes(),
+    );
+    assert!(state.resources.window(ResourceId(WIN)).is_some());
+    assert_xi1_grab_and_paired_hold_released(&state);
+}

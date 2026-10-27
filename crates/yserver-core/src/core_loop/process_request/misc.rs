@@ -417,11 +417,17 @@ pub(super) fn handle_kill_client(
             .filter_map(|(&id, &mode)| (mode == 2).then_some(id))
             .collect();
         for zid in temp_zombies {
-            crate::core_loop::process_disconnect::destroy_zombie_resources(
+            // On `Err` the zombie stays recorded and the rest wait: the
+            // server is shutting down (`fatal_teardown`).
+            if crate::core_loop::process_disconnect::destroy_zombie_resources(
                 state,
                 backend,
                 ClientId(zid),
-            );
+            )
+            .is_err()
+            {
+                break;
+            }
             state.zombie_clients.remove(&zid);
         }
         return Ok(RequestOutcome::Handled);
@@ -441,8 +447,12 @@ pub(super) fn handle_kill_client(
         return Ok(RequestOutcome::Handled);
     }
     if state.zombie_clients.contains_key(&owner.0) {
-        crate::core_loop::process_disconnect::destroy_zombie_resources(state, backend, owner);
-        state.zombie_clients.remove(&owner.0);
+        // On `Err` the zombie stays recorded; the server is shutting down.
+        if crate::core_loop::process_disconnect::destroy_zombie_resources(state, backend, owner)
+            .is_ok()
+        {
+            state.zombie_clients.remove(&owner.0);
+        }
         return Ok(RequestOutcome::Handled);
     }
     if owner == client_id {

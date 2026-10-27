@@ -253,8 +253,8 @@ The equivalent here:
 - Screensaver: plan, prepare, execute. It cannot contain the COW, so `prepare`
   does nothing and cannot fail.
 - Disconnect/zombie: one plan per owned root, prepared and executed in turn.
-  These plans cannot contain the COW either (it is server-owned, parented to
-  root), so `prepare` cannot fail. Xorg
+  A plan contains the COW only if a compositor reparented it under the
+  client's window; then a `prepare` failure is terminal (failure table). Xorg
   `FreeClientResources` deletes each window resource through `DeleteWindow`, so
   each root's events go out before the next root's; phase 0 confirms the order.
   The client-level work (resources, SYNC, GLX, …) stays in `process_disconnect`.
@@ -292,8 +292,8 @@ fn retire_overlay_window(&mut self, origin: Option<OriginContext>);
 
 **Every plan that contains the COW takes the overlay path, whoever asked for
 it.** Three requests can destroy the COW: ReleaseOverlayWindow on the last
-claim, `DestroyWindow(COW)`, and `DestroySubwindows(root)`. A disconnect cannot,
-because the COW is owned by the server and its parent is root. The overlay
+claim, `DestroyWindow(COW)`, and `DestroySubwindows(root)`. A disconnect does only when
+the COW was reparented under the departing client's window. The overlay
 handling therefore lives in the plan and the executor, not in
 `teardown_overlay`:
 
@@ -337,6 +337,7 @@ requests only covers allocation errors at a very coarse level"), so:
 | Disconnect of the last claimant | claim dropped, `cow_teardown_failed` (today's behaviour) |
 | `DestroyWindow(COW)` | BadAlloc, nothing changed: no event, COW and subtree intact |
 | `DestroySubwindows(root)` | BadAlloc, nothing changed: no child unmapped or destroyed |
+| Disconnect / zombie cleanup, COW reparented under the client's window | terminal: teardown stops before any window, resource, client record or ID range is freed (the COW-holding root is tried first); `state.fatal_teardown` is set and the core loop shuts down (`run_core` returns `Err`) |
 
 `DestroySubwindows` builds and prepares **all** child plans before its unmap
 pass (`unmap_subwindows_with_delta`), then executes them. Xorg deletes the

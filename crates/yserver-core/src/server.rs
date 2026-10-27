@@ -1424,6 +1424,12 @@ pub struct ServerState {
     /// `ServerState` gives it the right lifetime under `-noreset` — as
     /// long as the server, which is as long as the orphaned overlay.
     pub cow_teardown_failed: bool,
+    /// Terminal: a client's windows could not be destroyed (a plan holding
+    /// the COW failed to prepare), so its teardown stopped with the client
+    /// record, its resources and its resource-ID range still in place. The
+    /// core loop shuts the server down at the end of the iteration. Holds
+    /// the cause for the shutdown log.
+    pub fatal_teardown: Option<String>,
     /// SYNC `Await` / `AwaitFence` in progress, keyed by client id. A client
     /// with an entry is suspended (Xorg `IgnoreClient`): the core loop's
     /// fair request queue keeps its later requests queued until the entry
@@ -1857,6 +1863,7 @@ impl ServerState {
             zombie_clients: HashMap::new(),
             cow_claims: Vec::new(),
             cow_teardown_failed: false,
+            fatal_teardown: None,
             scroll_axis_value: [0; 2],
             unpublished_pointer_buttons_down: HashMap::new(),
             key_down_by_device: HashMap::new(),

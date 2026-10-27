@@ -224,6 +224,11 @@ pub fn force_destroy_all_clients(state: &mut ServerState, backend: &mut dyn Back
         // entry reads as DestroyAll.
         state.close_down_modes.remove(&id);
         process_disconnect_reporting(state, backend, ClientId(id), Some(&mut frees));
+        // A teardown that could not complete stops the forced one too; the
+        // boundary then refuses (step 5) and the server shuts down.
+        if state.fatal_teardown.is_some() {
+            return;
+        }
     }
     backend.note_client_count(state.counted_clients());
 
@@ -233,7 +238,11 @@ pub fn force_destroy_all_clients(state: &mut ServerState, backend: &mut dyn Back
     let mut zombies: Vec<u32> = state.zombie_clients.keys().copied().collect();
     zombies.sort_unstable();
     for id in zombies {
-        destroy_zombie_resources_reporting(state, backend, ClientId(id), Some(&mut frees));
+        if destroy_zombie_resources_reporting(state, backend, ClientId(id), Some(&mut frees))
+            .is_err()
+        {
+            return;
+        }
     }
     state.zombie_clients.clear();
     state.close_down_modes.clear();
@@ -395,6 +404,13 @@ pub(crate) fn reset_generation(
     // lives in `ServerState`, so a check after the swap reads a fresh state
     // with the flag clear: the reset would destroy the evidence and then
     // proceed on the strength of its absence.
+    if let Some(cause) = &state.fatal_teardown {
+        log::error!(
+            "reset: refusing to install {generation:?} -- a client teardown \
+             could not complete ({cause}). Terminating."
+        );
+        return None;
+    }
     if state.cow_teardown_failed || !state.cow_claims.is_empty() {
         log::error!(
             "reset: refusing to install {generation:?} -- the composite overlay \
