@@ -302,11 +302,7 @@ pub(crate) fn refuse_root_redirect(
     {
         return false;
     }
-    request.value_mask &= (1 << 11) - 1;
-    request.event_mask = None;
-    request.do_not_propagate_mask = None;
-    request.colormap = None;
-    request.cursor = None;
+    request.truncate_at_event_mask();
     true
 }
 

@@ -4131,3 +4131,319 @@ fn disconnect_destroys_a_survivors_child_and_sends_the_departing_client_nothing(
         .collect();
     assert_eq!(present, [ResourceId(OTHER)]);
 }
+
+// ── At-most-one-client event-mask bits ─────────────────────────────
+//
+// Xorg `dix/events.c:4624-4636` (`EventSelectForWindow`): a client may not
+// select SubstructureRedirect, ResizeRedirect or ButtonPress on a window
+// where ANOTHER client already has that bit; the error value is the window
+// (set by the lookup, `dix/resource.c:1217`). Expected values below are
+// `tools/redirect-exclusive-probe.c` against Xephyr; case numbers quote it.
+
+const SUBSTRUCTURE_REDIRECT: u32 = 0x0010_0000;
+const SUBSTRUCTURE_NOTIFY: u32 = 0x0008_0000;
+const RESIZE_REDIRECT: u32 = 0x0004_0000;
+const BUTTON_PRESS: u32 = 0x0004;
+const BUTTON_RELEASE: u32 = 0x0008;
+const CW_EVENT_MASK: u32 = 0x0800;
+
+/// Sends a ChangeWindowAttributes and returns the error it produced as
+/// (code, bad value, major), or `None` on success.
+fn cwa(
+    state: &mut ServerState,
+    peer: &mut UnixStream,
+    client: u32,
+    window: u32,
+    value_mask: u32,
+    values: &[u32],
+) -> Option<(u8, u32, u8)> {
+    let body = border_cwa_body(window, value_mask, values);
+    let mut backend = RecordingBackend::new();
+    process_request(
+        state,
+        &mut backend,
+        ClientId(client),
+        SequenceNumber(1),
+        RequestHeader {
+            opcode: 2,
+            data: 0,
+            length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+        },
+        &body,
+        None,
+    )
+    .expect("process_request");
+    wire_packets(peer).iter().find(|p| p[0] == 0).map(|p| {
+        let (code, value, _, major) = error_fields(p);
+        (code, value, major)
+    })
+}
+
+fn mask_of(state: &ServerState, client: u32, window: u32) -> u32 {
+    state.clients[&client]
+        .event_masks
+        .get(&ResourceId(window))
+        .copied()
+        .unwrap_or(0)
+}
+
+#[test]
+fn second_client_substructure_redirect_on_root_is_bad_access() {
+    const A: u32 = 1;
+    const B: u32 = 2;
+    const ROOT: u32 = ROOT_WINDOW.0;
+    let mut state = ServerState::new();
+    let mut a = install_client(&mut state, A);
+    let mut b = install_client(&mut state, B);
+    let denied = Some((x11::error::BAD_ACCESS, ROOT, 2));
+
+    // 1, 2: a takes SubstructureRedirect; b is refused.
+    assert_eq!(
+        cwa(
+            &mut state,
+            &mut a,
+            A,
+            ROOT,
+            CW_EVENT_MASK,
+            &[SUBSTRUCTURE_REDIRECT]
+        ),
+        None
+    );
+    assert_eq!(
+        cwa(
+            &mut state,
+            &mut b,
+            B,
+            ROOT,
+            CW_EVENT_MASK,
+            &[SUBSTRUCTURE_REDIRECT]
+        ),
+        denied
+    );
+    // 3: the holder may re-select it.
+    let both = SUBSTRUCTURE_REDIRECT | SUBSTRUCTURE_NOTIFY;
+    assert_eq!(
+        cwa(&mut state, &mut a, A, ROOT, CW_EVENT_MASK, &[both]),
+        None
+    );
+    // 4, 5: b may select other bits, but not alongside the held one; its
+    // mask is left as it was.
+    assert_eq!(
+        cwa(
+            &mut state,
+            &mut b,
+            B,
+            ROOT,
+            CW_EVENT_MASK,
+            &[SUBSTRUCTURE_NOTIFY]
+        ),
+        None
+    );
+    assert_eq!(
+        cwa(&mut state, &mut b, B, ROOT, CW_EVENT_MASK, &[both]),
+        denied
+    );
+    assert_eq!(mask_of(&state, B, ROOT), SUBSTRUCTURE_NOTIFY);
+    // 6, 7, 8: once a drops it b gets it, and then a is refused.
+    assert_eq!(
+        cwa(
+            &mut state,
+            &mut a,
+            A,
+            ROOT,
+            CW_EVENT_MASK,
+            &[SUBSTRUCTURE_NOTIFY]
+        ),
+        None
+    );
+    assert_eq!(
+        cwa(
+            &mut state,
+            &mut b,
+            B,
+            ROOT,
+            CW_EVENT_MASK,
+            &[SUBSTRUCTURE_REDIRECT]
+        ),
+        None
+    );
+    assert_eq!(
+        cwa(
+            &mut state,
+            &mut a,
+            A,
+            ROOT,
+            CW_EVENT_MASK,
+            &[SUBSTRUCTURE_REDIRECT]
+        ),
+        denied
+    );
+    assert_eq!(mask_of(&state, A, ROOT), SUBSTRUCTURE_NOTIFY);
+}
+
+#[test]
+fn disconnected_redirect_holder_releases_the_bit() {
+    const B: u32 = 2;
+    const C: u32 = 3;
+    const ROOT: u32 = ROOT_WINDOW.0;
+    let mut state = ServerState::new();
+    let mut b = install_client(&mut state, B);
+    let mut c = install_client(&mut state, C);
+    // 10, 11, 12.
+    assert_eq!(
+        cwa(
+            &mut state,
+            &mut c,
+            C,
+            ROOT,
+            CW_EVENT_MASK,
+            &[SUBSTRUCTURE_REDIRECT]
+        ),
+        None
+    );
+    assert_eq!(
+        cwa(
+            &mut state,
+            &mut b,
+            B,
+            ROOT,
+            CW_EVENT_MASK,
+            &[SUBSTRUCTURE_REDIRECT]
+        ),
+        Some((x11::error::BAD_ACCESS, ROOT, 2))
+    );
+    crate::core_loop::process_disconnect::process_disconnect(
+        &mut state,
+        &mut RecordingBackend::new(),
+        ClientId(C),
+    );
+    assert_eq!(
+        cwa(
+            &mut state,
+            &mut b,
+            B,
+            ROOT,
+            CW_EVENT_MASK,
+            &[SUBSTRUCTURE_REDIRECT]
+        ),
+        None
+    );
+}
+
+#[test]
+fn button_press_and_resize_redirect_are_exclusive_per_window() {
+    const A: u32 = 1;
+    const B: u32 = 2;
+    const W: u32 = 0x0020_0000;
+    let mut state = ServerState::new();
+    let mut a = install_client(&mut state, A);
+    let mut b = install_client(&mut state, B);
+    seed_window(&mut state, ResourceId(W), ROOT_WINDOW, 50, 50);
+    // 14: a selected ButtonPress on W (as CreateWindow's CWEventMask does).
+    state
+        .clients
+        .get_mut(&A)
+        .unwrap()
+        .event_masks
+        .insert(ResourceId(W), BUTTON_PRESS);
+    let denied = Some((x11::error::BAD_ACCESS, W, 2));
+
+    // 15-18.
+    assert_eq!(
+        cwa(&mut state, &mut b, B, W, CW_EVENT_MASK, &[BUTTON_PRESS]),
+        denied
+    );
+    assert_eq!(
+        cwa(&mut state, &mut b, B, W, CW_EVENT_MASK, &[BUTTON_RELEASE]),
+        None
+    );
+    assert_eq!(
+        cwa(
+            &mut state,
+            &mut b,
+            B,
+            W,
+            CW_EVENT_MASK,
+            &[SUBSTRUCTURE_REDIRECT]
+        ),
+        None
+    );
+    let press_release = BUTTON_PRESS | BUTTON_RELEASE;
+    assert_eq!(
+        cwa(&mut state, &mut a, A, W, CW_EVENT_MASK, &[press_release]),
+        None
+    );
+    // 19-21: b's ResizeRedirect bars a from it, alone or combined.
+    assert_eq!(
+        cwa(&mut state, &mut b, B, W, CW_EVENT_MASK, &[RESIZE_REDIRECT]),
+        None
+    );
+    assert_eq!(
+        cwa(&mut state, &mut a, A, W, CW_EVENT_MASK, &[RESIZE_REDIRECT]),
+        denied
+    );
+    let resize_press = RESIZE_REDIRECT | BUTTON_PRESS;
+    assert_eq!(
+        cwa(&mut state, &mut a, A, W, CW_EVENT_MASK, &[resize_press]),
+        denied
+    );
+    // 21': a's mask is untouched.
+    assert_eq!(mask_of(&state, A, W), press_release);
+}
+
+#[test]
+fn refused_event_mask_applies_only_the_attributes_before_it() {
+    const A: u32 = 1;
+    const B: u32 = 2;
+    const W: u32 = 0x0020_0000;
+    const CW_BIT_GRAVITY: u32 = 0x0010;
+    const CW_WIN_GRAVITY: u32 = 0x0020;
+    const CW_OVERRIDE_REDIRECT: u32 = 0x0200;
+    const CW_DONT_PROPAGATE: u32 = 0x1000;
+    const KEY_PRESS: u32 = 0x0001;
+    let mut state = ServerState::new();
+    let _a = install_client(&mut state, A);
+    let mut b = install_client(&mut state, B);
+    seed_window(&mut state, ResourceId(W), ROOT_WINDOW, 50, 50);
+    state
+        .clients
+        .get_mut(&A)
+        .unwrap()
+        .event_masks
+        .insert(ResourceId(W), BUTTON_PRESS);
+    state
+        .clients
+        .get_mut(&B)
+        .unwrap()
+        .event_masks
+        .insert(ResourceId(W), RESIZE_REDIRECT);
+
+    // 22: bit gravity Static, win gravity SouthEast, override-redirect,
+    // conflicting ButtonPress, then dont-propagate KeyPress.
+    let mask =
+        CW_BIT_GRAVITY | CW_WIN_GRAVITY | CW_OVERRIDE_REDIRECT | CW_EVENT_MASK | CW_DONT_PROPAGATE;
+    assert_eq!(
+        cwa(
+            &mut state,
+            &mut b,
+            B,
+            W,
+            mask,
+            &[10, 9, 1, BUTTON_PRESS, KEY_PRESS]
+        ),
+        Some((x11::error::BAD_ACCESS, W, 2))
+    );
+    // 22': bit_gravity=10 win_gravity=9 override_redirect=1 your_mask=0x40000
+    // do_not_propagate=0x0.
+    let w = state.resources.window(ResourceId(W)).unwrap();
+    assert_eq!(
+        (
+            w.bit_gravity,
+            w.win_gravity,
+            w.override_redirect,
+            w.do_not_propagate_mask
+        ),
+        (10, 9, true, 0)
+    );
+    assert_eq!(mask_of(&state, B, W), RESIZE_REDIRECT);
+}

@@ -1169,7 +1169,11 @@ pub(super) fn handle_change_window_attributes(
     {
         return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, 2);
     }
-    let refused = crate::rootless::refuse_root_redirect(state, &mut request);
+    let refused = crate::rootless::refuse_root_redirect(state, &mut request)
+        || exclusive_event_mask_conflict(state, client_id, &request);
+    if refused {
+        request.truncate_at_event_mask();
+    }
     // Resource-id validation of attribute values, mirroring Xorg's
     // `dix/window.c::ChangeWindowAttributes` per-attribute
     // `dixLookupResource`. Values 0 and 1 on CWBackPixmap are reserved
@@ -1464,9 +1468,36 @@ pub(super) fn handle_change_window_attributes(
         client_id.0, sequence.0
     );
     if refused {
-        return emit_x11_error(state, client_id, sequence, x11::error::BAD_ACCESS, 0, 2);
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_ACCESS,
+            target_window.0,
+            2,
+        );
     }
     Ok(RequestOutcome::Handled)
+}
+
+/// Xorg `dix/events.c:4528` `AtMostOneClient`: SubstructureRedirect,
+/// ResizeRedirect and ButtonPress may each be selected on a window by one
+/// client only. `EventSelectForWindow` (:4624-4636) refuses a bit another
+/// client already holds; re-selecting your own is fine.
+fn exclusive_event_mask_conflict(
+    state: &ServerState,
+    client_id: ClientId,
+    request: &x11::ChangeWindowAttributesRequest,
+) -> bool {
+    const AT_MOST_ONE_CLIENT: u32 = 0x0010_0000 | 0x0004_0000 | 0x0004;
+    let Some(check) = request.event_mask.map(|m| m & AT_MOST_ONE_CLIENT) else {
+        return false;
+    };
+    check != 0
+        && state.clients.iter().any(|(&id, c)| {
+            id != client_id.0
+                && c.event_masks.get(&request.window).copied().unwrap_or(0) & check != 0
+        })
 }
 
 /// #133 step 2 (P3): flatten a window's border source into the

@@ -257,6 +257,19 @@ pub struct ChangeWindowAttributesRequest {
     pub cursor: Option<ResourceId>,
 }
 
+impl ChangeWindowAttributesRequest {
+    /// Drop CWEventMask and every later attribute: Xorg's
+    /// `ChangeWindowAttributes` applies the value list in bit order and stops
+    /// at a failing event mask (`dix/window.c:1372-1377`, :1569-1574).
+    pub fn truncate_at_event_mask(&mut self) {
+        self.value_mask &= (1 << 11) - 1;
+        self.event_mask = None;
+        self.do_not_propagate_mask = None;
+        self.colormap = None;
+        self.cursor = None;
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ConfigureWindowRequest {
     pub window: ResourceId,
