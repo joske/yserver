@@ -875,7 +875,8 @@ fn final_cow_release_defers_storage_until_direct_replacement() {
     // Vulkan while exercising the ownership/deferral transition itself.
     b.pstate.scanout_m2.unflip_shadow_ready = true;
 
-    let final_release = b.release_overlay_window(None).expect("final COW release");
+    let final_release = b.prepare_overlay_release(None).expect("final COW release");
+    b.retire_overlay_window(None);
 
     assert!(final_release);
     assert!(b.deferred_cow_release);
@@ -913,7 +914,7 @@ fn final_cow_release_materialization_failure_keeps_cow_and_pins() {
         install_direct_frame_for_target_test(&mut b, target_xid, redirected_fallback, true);
 
     let error = b
-        .release_overlay_window(None)
+        .prepare_overlay_release(None)
         .expect_err("test backend has no Vulkan engine for fallback materialization");
 
     assert!(error.to_string().contains("NoVk"), "{error}");
@@ -939,7 +940,8 @@ fn get_cow_during_deferred_release_reuses_backend_identity() {
     let cow_id = b.cow_id.expect("COW id");
     let _ = install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
     b.pstate.scanout_m2.unflip_shadow_ready = true;
-    assert!(b.release_overlay_window(None).expect("final release"));
+    assert!(b.prepare_overlay_release(None).expect("final release"));
+    b.retire_overlay_window(None);
 
     let rematerialized = b.get_overlay_window(None).expect("reclaim deferred COW");
 

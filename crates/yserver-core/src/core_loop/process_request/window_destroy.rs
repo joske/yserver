@@ -21,7 +21,7 @@ use crate::{
             xi::deactivate_xi2_device_grab,
         },
     },
-    resources::{MapState, PreparedDestroy, ROOT_WINDOW},
+    resources::{COMPOSITE_OVERLAY_WINDOW, MapState, PreparedDestroy, ROOT_WINDOW},
     server::ServerState,
 };
 
@@ -163,7 +163,19 @@ pub(crate) fn execute_destroy(
     release_redirects_on_destroyed_windows(state, backend, origin, &windows);
     let attr_pixmaps = state.resources.collect_attribute_pixmap_host_xids(top);
     state.resources.apply_destroy(plan);
+    if plan.contains_cow() {
+        state.destroy_cow_input_shape();
+    }
     for entry in &captured {
+        // CrushTree order puts the COW's children first, so they are torn
+        // down while the backend COW still exists.
+        if entry.window == COMPOSITE_OVERLAY_WINDOW && prepared.retires_overlay() {
+            if let Some(xid) = entry.host_xid {
+                backend.unregister_host_window(xid.as_raw());
+            }
+            backend.retire_overlay_window(origin);
+            continue;
+        }
         if let Some(xid) = entry.host_xid {
             backend.unregister_host_window(xid.as_raw());
             let _ = backend.update_host_event_mask(

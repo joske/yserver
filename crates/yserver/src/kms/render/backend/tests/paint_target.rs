@@ -2639,12 +2639,13 @@ fn cow_final_release_drops_storage() {
     let mut b = KmsBackend::for_tests();
     b.get_overlay_window(None).expect("get");
 
-    let tore_down = b.release_overlay_window(None).expect("release");
+    let tore_down = b.prepare_overlay_release(None).expect("release");
     assert!(
         tore_down,
-        "release_overlay_window must report Ok(true) when it destroyed a \
-             COW, so core mirrors the resources-side record down with it",
+        "prepare_overlay_release must report Ok(true) for a materialized \
+             COW, so core retires it instead of destroy_subwindow",
     );
+    b.retire_overlay_window(None);
 
     assert!(b.cow_id.is_none(), "cow_id must clear on the teardown edge");
     assert!(
@@ -2673,12 +2674,13 @@ fn cow_release_without_prior_get_is_noop() {
     let mut b = KmsBackend::for_tests();
     assert!(b.cow_id.is_none());
 
-    let tore_down = b.release_overlay_window(None).expect("noop release");
+    let tore_down = b.prepare_overlay_release(None).expect("noop release");
     assert!(
         !tore_down,
-        "with nothing materialized there is nothing for core to mirror \
-             down, so the backend reports Ok(false)",
+        "with nothing materialized there is nothing to retire, so the \
+             backend reports Ok(false)",
     );
+    b.retire_overlay_window(None);
 
     assert!(
         b.cow_id.is_none(),
@@ -2871,11 +2873,9 @@ fn resolve_paint_target_after_reparent_out_routes_to_new_redirected_ancestor() {
 }
 
 // ────────────────────────────────────────────────────────────────
-// COW structural redesign — Phase 2 Task 2.2: get/release_overlay_window
-// own the FULL backend lifecycle (storage + windows +
-// top_level_order). The bool return signals the 0→1 / 1→0
-// transition so the core handler drives the symmetric resources-
-// side materialization once per lifecycle event.
+// COW structural redesign — Phase 2 Task 2.2: get_overlay_window and
+// prepare/retire_overlay_window own the FULL backend lifecycle (storage +
+// windows + top_level_order).
 // ────────────────────────────────────────────────────────────────
 
 #[test]
@@ -2907,13 +2907,14 @@ fn get_overlay_window_first_claim_materializes_full_backend_state() {
 }
 
 #[test]
-fn release_overlay_window_final_release_tears_down_full_backend_state() {
+fn retire_overlay_window_without_direct_scanout_tears_down_full_backend_state() {
     let mut b = KmsBackend::for_tests();
     b.get_overlay_window(None).expect("get");
     let cow_host_xid = b.cow_host_xid().expect("present");
 
-    let was_final_release = b.release_overlay_window(None).expect("release");
-    assert!(was_final_release, "1→0 transition must return Ok(true)");
+    let was_final_release = b.prepare_overlay_release(None).expect("release");
+    assert!(was_final_release, "a materialized COW prepares to Ok(true)");
+    b.retire_overlay_window(None);
     assert!(
         !b.windows.contains_key(&cow_host_xid),
         "COW removed from windows on final release"
@@ -2930,6 +2931,167 @@ fn release_overlay_window_final_release_tears_down_full_backend_state() {
         b.core.xid_map.contains_key(&cow_host_xid),
         "COW stays in the pointer xid map until core unregisters it"
     );
+}
+
+fn dispatch_for_cow_test(
+    state: &mut yserver_core::server::ServerState,
+    b: &mut KmsBackend,
+    opcode: u8,
+    minor: u8,
+    body: &[u8],
+) {
+    use yserver_core::{backend::Backend, core_loop::process_request};
+    process_request::process_request(
+        state,
+        b as &mut dyn Backend,
+        yserver_protocol::x11::ClientId(14),
+        yserver_protocol::x11::SequenceNumber(1),
+        yserver_protocol::x11::RequestHeader {
+            opcode,
+            data: minor,
+            length_units: u32::try_from(1 + body.len() / 4).expect("length"),
+        },
+        body,
+        None,
+    )
+    .expect("process_request");
+}
+
+/// A claimed COW with a mapped child under it, and a direct frame whose
+/// fallback is the COW on screen. Returns the child's host xid.
+fn cow_with_child_under_direct_scanout(
+    state: &mut yserver_core::server::ServerState,
+    b: &mut KmsBackend,
+) -> u32 {
+    use yserver_core::resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_WINDOW};
+    use yserver_protocol::x11::composite::GET_OVERLAY_WINDOW;
+    install_client_for_render(state, 14);
+    dispatch_for_cow_test(
+        state,
+        b,
+        144,
+        GET_OVERLAY_WINDOW,
+        &ROOT_WINDOW.0.to_le_bytes(),
+    );
+    assert!(state.resources.window(COMPOSITE_OVERLAY_WINDOW).is_some());
+    let child = create_live_window(
+        state,
+        b,
+        yserver_protocol::x11::ResourceId(0x0020_0001),
+        COMPOSITE_OVERLAY_WINDOW,
+        0,
+        0,
+        64,
+        64,
+    )
+    .as_raw();
+    let target_xid = 0x5900;
+    let _target = seed_window(b, target_xid, None, 0, 0);
+    let cow_id = b.cow_id.expect("COW id");
+    let _ = install_direct_frame_for_target_test(b, target_xid, cow_id, true);
+    // Keep this free of Vulkan: the shadow is what `prepare_cow_release` makes.
+    b.pstate.scanout_m2.unflip_shadow_ready = true;
+    child
+}
+
+/// The last release while direct scanout is active: the core resources go
+/// and the child's backend window with them, but the backend COW entry and
+/// storage stay until the scanout retires, then go.
+#[test]
+fn last_release_under_direct_scanout_defers_backend_retirement() {
+    use yserver_core::resources::COMPOSITE_OVERLAY_WINDOW;
+    let cow_xid = COMPOSITE_OVERLAY_WINDOW.0;
+    let mut state = yserver_core::server::ServerState::new();
+    let mut b = KmsBackend::for_tests();
+    let child = cow_with_child_under_direct_scanout(&mut state, &mut b);
+    let cow_id = b.cow_id.expect("COW id");
+
+    dispatch_for_cow_test(
+        &mut state,
+        &mut b,
+        144,
+        yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+        &cow_xid.to_le_bytes(),
+    );
+
+    assert!(state.cow_claims.is_empty());
+    assert!(state.resources.window(COMPOSITE_OVERLAY_WINDOW).is_none());
+    assert!(
+        state
+            .resources
+            .window(yserver_protocol::x11::ResourceId(0x0020_0001))
+            .is_none()
+    );
+    assert!(
+        !b.windows.contains_key(&child),
+        "child backend window destroyed"
+    );
+    assert!(b.deferred_cow_release);
+    assert_eq!(b.cow_id, Some(cow_id));
+    assert!(
+        b.windows.contains_key(&cow_xid),
+        "COW entry waits for scanout"
+    );
+    assert!(
+        b.store.get(cow_id).is_some(),
+        "COW storage waits for scanout"
+    );
+    assert!(b.pstate.scanout_m2.unflip_requested);
+
+    b.stop_direct_after_scanout_replaced("deferred COW retirement test");
+
+    assert!(!b.deferred_cow_release);
+    assert!(b.cow_id.is_none());
+    assert!(!b.windows.contains_key(&cow_xid));
+    assert!(b.store.get(cow_id).is_none());
+}
+
+/// `DestroyWindow(COW)` keeps the claim; the next GetOverlayWindow before
+/// the deferred retirement re-adopts the backend identity, rematerializes
+/// the core record, and the old child stays gone.
+#[test]
+fn get_overlay_window_before_deferred_retirement_reuses_the_backend_cow() {
+    use yserver_core::resources::COMPOSITE_OVERLAY_WINDOW;
+    let cow_xid = COMPOSITE_OVERLAY_WINDOW.0;
+    let mut state = yserver_core::server::ServerState::new();
+    let mut b = KmsBackend::for_tests();
+    let child = cow_with_child_under_direct_scanout(&mut state, &mut b);
+    let cow_id = b.cow_id.expect("COW id");
+
+    dispatch_for_cow_test(&mut state, &mut b, 4, 0, &cow_xid.to_le_bytes());
+    assert!(state.resources.window(COMPOSITE_OVERLAY_WINDOW).is_none());
+    assert_eq!(state.cow_claims.len(), 1, "DestroyWindow leaves the claim");
+    assert!(b.deferred_cow_release);
+
+    dispatch_for_cow_test(
+        &mut state,
+        &mut b,
+        144,
+        yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+        &yserver_core::resources::ROOT_WINDOW.0.to_le_bytes(),
+    );
+
+    assert_eq!(state.cow_claims.len(), 2);
+    let record = state
+        .resources
+        .window(COMPOSITE_OVERLAY_WINDOW)
+        .expect("core COW record rematerialized");
+    assert!(record.children.is_empty());
+    assert!(!b.deferred_cow_release);
+    assert_eq!(b.cow_id, Some(cow_id), "backend identity reused");
+    assert!(
+        !b.windows.contains_key(&child),
+        "old child not brought back"
+    );
+    assert_eq!(
+        b.core.xid_map.get(&cow_xid).copied(),
+        Some(COMPOSITE_OVERLAY_WINDOW),
+        "the reused COW resolves for crossings again"
+    );
+
+    b.stop_direct_after_scanout_replaced("reacquired COW test replacement");
+    assert_eq!(b.cow_id, Some(cow_id), "a reacquired COW is not retired");
+    assert!(b.windows.contains_key(&cow_xid));
 }
 
 /// An unshaped COW takes the pointer (Xorg `compCreateOverlayWindow`), so

@@ -137,10 +137,15 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn scanout_allowed(_b: &XBackend<Self>) -> bool {
         true
     }
-    /// The final COW release while a direct frame still owns the screen:
-    /// defer the teardown and return `true`, or `false` to tear down now.
-    fn defer_cow_release(_b: &mut XBackend<Self>) -> io::Result<bool> {
-        Ok(false)
+    /// The fallible part of a COW release: what must exist before a direct
+    /// frame's buffers can go. Must leave nothing that needs undoing.
+    fn prepare_cow_release(_b: &mut XBackend<Self>) -> io::Result<()> {
+        Ok(())
+    }
+    /// The COW release while a direct frame still owns the screen: defer
+    /// the teardown and return `true`, or `false` to tear down now.
+    fn defer_cow_release(_b: &mut XBackend<Self>) -> bool {
+        false
     }
     /// A pixmap backing lost a reference; drop its dma-buf export if unused.
     fn maybe_teardown_export(_b: &mut XBackend<Self>, _id: DrawableId) {}

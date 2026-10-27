@@ -361,16 +361,19 @@ pub(super) fn handle_composite_request(
             let overlay = COMPOSITE_OVERLAY_WINDOW.0;
             // Core owns the claim list; the backend counts nothing. Each
             // Get records one claim owned by the calling client (Xorg's
-            // per-Get `CompOverlayClientRec`), and only the 0 → 1 edge
-            // reaches the backend.
+            // per-Get `CompOverlayClientRec`), and materializes the overlay
+            // whenever it does not exist, whatever the claims: a
+            // `DestroyWindow(COW)` leaves them (`compext.c:303`,
+            // `compwindow.c:624-626`).
             //
-            // Transactional: record the claim, materialize, and roll the
-            // claim back if materialization fails. A claim recorded
-            // against an overlay that does not exist is the
-            // desynchronisation this design exists to remove.
-            let first_claim = state.cow_claims.is_empty();
+            // Transactional: on failure only this Get's claim goes
+            // (`compext.c:305`).
+            let exists = state
+                .resources
+                .window(crate::resources::COMPOSITE_OVERLAY_WINDOW)
+                .is_some();
             state.cow_claims.push(client_id);
-            if first_claim
+            if !exists
                 && let Err(err) =
                     crate::core_loop::composite_overlay::materialize_overlay(state, backend, origin)
             {
@@ -431,7 +434,7 @@ pub(super) fn handle_composite_request(
                 // Final release: tear down FIRST and keep the claim unless
                 // it succeeds. The claim is what keeps the overlay alive,
                 // so dropping it before the overlay is gone is precisely
-                // the leak.
+                // the leak. A COW already destroyed just loses the claim.
                 if let Err(err) =
                     crate::core_loop::composite_overlay::teardown_overlay(state, backend, origin)
                 {

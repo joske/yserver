@@ -49,7 +49,7 @@ mod shape_xfixes;
 mod sync_ext;
 mod vidmode;
 mod window_destroy;
-pub(crate) use window_destroy::execute_destroy;
+pub(crate) use window_destroy::{destroy_window_subtree, execute_destroy};
 mod windows;
 mod xi;
 mod xkb;

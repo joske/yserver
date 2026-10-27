@@ -689,11 +689,13 @@ fn destroy_owned_windows(
         let Some(plan) = state.resources.plan_destroy(root) else {
             continue;
         };
-        // A client never owns the COW, so preparation has nothing to fail.
+        // Preparation fails only for a plan holding the COW, i.e. one the
+        // compositor reparented under this client's window; that subtree
+        // then stays, with the overlay still up.
         let prepared = match plan.prepare(backend) {
             Ok(prepared) => prepared,
             Err(err) => {
-                log::warn!("disconnect: prepare destroy of 0x{:x}: {err}", root.0);
+                log::error!("disconnect: prepare destroy of 0x{:x}: {err}", root.0);
                 continue;
             }
         };

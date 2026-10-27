@@ -862,21 +862,12 @@ impl<P: Platform> Backend for XBackend<P> {
         Self::backend_overlay_get_overlay_window(self, _origin)
     }
 
-    /// Stage 4d — Composite Overlay Window release.
-    ///
-    /// The **1 → 0 claim edge only**: core owns the claim list, so every
-    /// call here is the final release. Decrefs the store storage and
-    /// clears `self.cow_id`. If direct scanout is active, the logical
-    /// release succeeds immediately but physical teardown is deferred
-    /// until the composed replacement retires.
-    /// `DrawableStore::decref` removes the xid mapping (immediately on
-    /// synchronous-destroy, deferred on `PendingFence`) so the next
-    /// `GetOverlayWindow` reallocates fresh storage at the same xid.
-    ///
-    /// Returns `Ok(false)` when nothing was materialized — defensive
-    /// only; core does not call this without a claim.
-    fn release_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
-        Self::backend_overlay_release_overlay_window(self, _origin)
+    fn prepare_overlay_release(&mut self, origin: Option<OriginContext>) -> io::Result<bool> {
+        Self::backend_overlay_prepare_overlay_release(self, origin)
+    }
+
+    fn retire_overlay_window(&mut self, origin: Option<OriginContext>) {
+        Self::backend_overlay_retire_overlay_window(self, origin);
     }
 
     fn cow_host_xid(&self) -> Option<u32> {

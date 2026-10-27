@@ -977,7 +977,8 @@ fn cow_paint_appears_on_scanout() {
 
     // Step 5: release drops the storage; the xid must no longer
     // resolve.
-    b.release_overlay_window(None).expect("release");
+    assert!(b.prepare_overlay_release(None).expect("release"));
+    b.retire_overlay_window(None);
     let img_after = b.get_image_pixels_for_tests(cow_xid, 2, 0, 0, 2, 2, !0);
     assert!(
         img_after.is_err() || img_after.as_ref().unwrap().is_none(),

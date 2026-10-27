@@ -1388,8 +1388,9 @@ pub struct ServerState {
     /// This is the **single** authority on how many holds the overlay
     /// has; the backend deliberately counts nothing. Two counters that
     /// can disagree is what leaked the overlay across a compositor
-    /// crash. The backend sees exactly two edges: `get_overlay_window`
-    /// on 0 → 1 and `release_overlay_window` on 1 → 0.
+    /// crash. Claims do not decide existence: GetOverlayWindow
+    /// materializes whenever the COW record is absent, and
+    /// `DestroyWindow(COW)` leaves the claims (Xorg `compwindow.c:624-626`).
     ///
     /// Repeated Gets from one client push repeated entries, matching
     /// Xorg's N-`CompOverlayClientRec` model
@@ -3124,8 +3125,8 @@ pub struct EventTarget {
 
 impl ServerState {
     /// Drop the COW's shapes with the overlay: Xorg frees them in
-    /// DeleteWindow, so the next overlay starts unshaped. Called from the
-    /// `ReleaseOverlayWindow` handler on the 1→0 transition.
+    /// DeleteWindow, so the next overlay starts unshaped. Called by the
+    /// destroy executor for a plan holding the COW.
     pub fn destroy_cow_input_shape(&mut self) {
         self.shape_windows.remove(&COMPOSITE_OVERLAY_WINDOW);
     }

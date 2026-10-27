@@ -311,18 +311,26 @@ impl Platform for PlatformBackend {
         b.scanout_allowed()
     }
 
-    fn defer_cow_release(b: &mut KmsBackend) -> io::Result<bool> {
+    fn prepare_cow_release(b: &mut KmsBackend) -> io::Result<()> {
         if b.pstate.scanout_m2.active() {
             // Do this while cow_id and its storage owner are authoritative.
             // Failure leaves the COW and the direct pins untouched, so core
             // can keep the caller's claim and let the compositor retry, or
-            // fail safely without freeing a scanned buffer.
+            // fail safely without freeing a scanned buffer. Success only
+            // copies the scanned frame into its fallback target early, as
+            // any unflip does (`submit_composed_unflip`); nothing to undo.
             b.materialize_direct_shadow_for_unflip()?;
+        }
+        Ok(())
+    }
+
+    fn defer_cow_release(b: &mut KmsBackend) -> bool {
+        if b.pstate.scanout_m2.active() {
             b.request_direct_unflip("release_last_overlay_window");
             b.deferred_cow_release = true;
-            return Ok(true);
+            return true;
         }
-        Ok(false)
+        false
     }
 
     fn maybe_teardown_export(b: &mut KmsBackend, id: DrawableId) {

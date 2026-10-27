@@ -140,9 +140,8 @@ impl Default for ResourceTable {
         );
 
         // COW is NOT pre-seeded. Per the COW lifecycle spec (invariant 4),
-        // the overlay window exists fully or not at all; it is materialized
-        // on the 0→1 refcount transition of `GetOverlayWindow` and torn
-        // down on the 1→0 of `ReleaseOverlayWindow`.
+        // the overlay window exists fully or not at all; `GetOverlayWindow`
+        // materializes it when absent and a destroy plan tears it down.
 
         // Seed the visual + colormap tables with the same pair the setup
         // reply advertises. `host_visual_xid` / `host_colormap_xid` stay

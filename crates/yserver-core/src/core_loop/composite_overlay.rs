@@ -8,8 +8,11 @@
 //! `CompOverlayClientRec` owned by the calling client
 //! (`composite/compoverlay.c`) and the resource system frees them all
 //! when that client goes away. We keep the equivalent list in
-//! [`ServerState::cow_claims`] and the backend counts nothing: it sees
-//! only the 0 → 1 materialize edge and the 1 → 0 teardown edge.
+//! [`ServerState::cow_claims`] and the backend counts nothing. Existence
+//! is separate, as in Xorg: the overlay exists while its core record does.
+//! GetOverlayWindow materializes it whenever the record is absent, and it
+//! is destroyed through a destroy plan, by the last release or by
+//! `DestroyWindow` / `DestroySubwindows`, which leave the claims alone.
 //!
 //! Two things in the tree carry confusingly similar names and are **not**
 //! this: `scene.root_overlay` / `root_overlay_on_disconnect`
@@ -25,11 +28,10 @@ use crate::{
     server::ServerState,
 };
 
-const STRUCTURE_NOTIFY: u32 = 0x0002_0000;
 const SUBSTRUCTURE_NOTIFY: u32 = 0x0008_0000;
 
 /// Ask the backend to materialize the overlay, then mirror it on the
-/// resources side. Called on the 0 → 1 claim edge only.
+/// resources side. Called only while no core COW record exists.
 ///
 /// The caller must have already recorded the claim, and must roll it
 /// back if this returns `Err` — a claim recorded against an overlay that
@@ -110,107 +112,28 @@ pub(crate) fn materialize_overlay(
     Ok(())
 }
 
-/// Tear the overlay down: backend first, then the resources-side mirror.
-///
-/// Called on the 1 → 0 claim edge only. Backend first is load-bearing:
-/// the claim is the thing keeping the overlay alive, so a caller must not
-/// drop the last claim unless this succeeded.
+/// Destroy the overlay on the last claim's release: plan, prepare,
+/// execute, as any destroy of the COW (Xorg `compDestroyOverlayWindow`,
+/// `composite/compoverlay.c:167-173`, frees it through `DeleteWindow`).
+/// A COW already destroyed by `DestroyWindow` / `DestroySubwindows` leaves
+/// nothing to do (`FreeResource` of a freed id, `dix/resource.c:906-924`).
 ///
 /// # Errors
 ///
-/// From the backend's teardown — on `KmsBackend` the
-/// `materialize_direct_shadow_for_unflip` allocation that has to succeed
-/// before a scanned-out buffer can be released.
+/// From the plan's preparation — on `KmsBackend` the unflip shadow that
+/// has to exist before a scanned-out buffer can be released. Nothing
+/// changed: the overlay is still up.
 pub(crate) fn teardown_overlay(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     origin: Option<OriginContext>,
 ) -> std::io::Result<()> {
-    let cow_host_xid = backend.cow_host_xid();
-    if !backend.release_overlay_window(origin)? {
-        // Backend never materialized a COW (v1, ynest, trait default):
-        // nothing to mirror down either, because nothing ever reached
-        // `materialize_cow_resource`.
-        return Ok(());
-    }
-    // Xorg frees the overlay through DeleteWindow (dix/window.c:1070): an
-    // UnmapNotify then a DestroyNotify, each to the COW's StructureNotify
-    // and root's SubstructureNotify listeners.
-    let cow_mapped = state
-        .resources
-        .window(COMPOSITE_OVERLAY_WINDOW)
-        .is_some_and(|w| w.map_state != crate::resources::MapState::Unmapped);
-    let targets = [
-        (COMPOSITE_OVERLAY_WINDOW, STRUCTURE_NOTIFY),
-        (ROOT_WINDOW, SUBSTRUCTURE_NOTIFY),
-    ];
-    if cow_mapped {
-        for (event_window, mask) in targets {
-            let _dropped = emit_window_event_to_state(state, event_window, mask, |buf, seq, o| {
-                yserver_protocol::x11::encode_unmap_notify_event(
-                    buf,
-                    seq,
-                    o,
-                    event_window,
-                    COMPOSITE_OVERLAY_WINDOW,
-                    false,
-                );
-            });
-        }
-        let clips_before = crate::core_loop::clip_list::with_borders(
-            state,
-            crate::core_loop::clip_list::clip_lists_under(state, COMPOSITE_OVERLAY_WINDOW),
-        );
-        // DeleteWindow's UnmapWindow re-evaluates the pointer while the
-        // overlay still exists (`dix/window.c:2871`).
-        let _ = state.resources.unmap_window(COMPOSITE_OVERLAY_WINDOW);
-        // ... and exposes what the overlay covered (`dix/window.c:2856-2866`).
-        let after = crate::core_loop::clip_list::with_borders(
-            state,
-            crate::core_loop::clip_list::clip_lists_under(state, COMPOSITE_OVERLAY_WINDOW),
-        );
-        crate::core_loop::process_request::send_exposures(
-            state,
-            backend,
-            origin,
-            crate::core_loop::clip_list::newly_exposed(&clips_before, after, None),
-            None,
-        );
-        backend.windows_restructured(state);
-    }
-    for (event_window, mask) in targets {
-        let _dropped = emit_window_event_to_state(state, event_window, mask, |buf, seq, o| {
-            yserver_protocol::x11::encode_destroy_notify_event(
-                buf,
-                seq,
-                o,
-                event_window,
-                COMPOSITE_OVERLAY_WINDOW,
-            );
-        });
-    }
-    // Xorg frees the overlay through DeleteWindow, so its Pictures die with it.
-    crate::core_loop::process_request::free_pictures_on_destroyed_windows(
+    crate::core_loop::process_request::destroy_window_subtree(
         state,
         backend,
         origin,
-        &[COMPOSITE_OVERLAY_WINDOW],
-    );
-    crate::core_loop::process_request::purge_present_for_destroyed_windows(
-        state,
-        backend,
-        &[COMPOSITE_OVERLAY_WINDOW],
-    );
-    state.resources.destroy_cow_resource();
-    // Unregistered only now: the unmap's crossings above still name the COW.
-    if let Some(xid) = cow_host_xid {
-        backend.unregister_host_window(xid);
-    }
-    state.destroy_cow_input_shape();
-    // The COW is no longer a core root child; reproject so it leaves the
-    // backend top-level order.
-    backend.sync_top_level_order(state);
-    Ok(())
+        COMPOSITE_OVERLAY_WINDOW,
+    )
 }
 
 /// Release **every** overlay claim held by `client`, and tear the overlay

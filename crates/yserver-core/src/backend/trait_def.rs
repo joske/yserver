@@ -1762,14 +1762,14 @@ pub trait Backend {
         Ok(())
     }
 
-    /// Composite Overlay Window materialization — the **0 → 1 claim
-    /// edge**, and nothing else.
+    /// Composite Overlay Window materialization.
     ///
     /// Core owns the claim list ([`crate::server::ServerState::cow_claims`])
     /// and is the single authority on how many holds the overlay has;
     /// **the backend must not count**. Two counters that can disagree is
     /// what leaked the overlay across a compositor crash. Core calls this
-    /// only when the claim list goes empty → non-empty, so an
+    /// from GetOverlayWindow whenever the core COW record is absent,
+    /// whatever the claim count (Xorg `compext.c:303`), so an
     /// implementation may assume no COW of its own is live (bar a
     /// physical teardown it deferred behind direct scanout, which it
     /// re-adopts here).
@@ -1808,38 +1808,41 @@ pub trait Backend {
         Ok(false)
     }
 
-    /// Composite Overlay Window teardown — the **1 → 0 claim edge**, and
-    /// nothing else.
+    /// Composite Overlay Window teardown, part 1: everything that can fail.
     ///
-    /// The mirror of [`Backend::get_overlay_window`]: core calls this
-    /// only when the last claim is about to go, so this is always a final
-    /// teardown. Non-final Releases never reach the backend, and the
-    /// backend keeps no count of its own.
+    /// Core calls this when a destroy plan contains the COW (the last
+    /// ReleaseOverlayWindow, `DestroyWindow(COW)`, `DestroySubwindows(root)`),
+    /// before anything of the destroy happens, and follows `Ok(true)` with
+    /// [`Backend::retire_overlay_window`] in the same request.
     ///
-    /// Free the storage and unregister the `windows` entry plus the COW's
-    /// slot in `top_level_order` — the mirror of what the materialize
-    /// edge installs. Single hook owns the lifecycle in both directions;
-    /// there is no separate `destroy_cow` API.
+    /// Returns `Ok(false)` when this backend has no materialized COW (v1,
+    /// ynest, the trait default): core then gives the COW the ordinary
+    /// backend teardown.
     ///
-    /// Returns `Ok(true)` when the backend tore a COW down, so core
-    /// mirrors it with `destroy_cow_resource()`: the resources-side
-    /// Window record and its slot in `root.children` come down together
-    /// with the backend storage. `Ok(false)` means this backend has no
-    /// COW implementation (v1, ynest, the trait default) or had nothing
-    /// materialized, so there is nothing for core to mirror down.
-    ///
-    /// On `Err` **the overlay is still up**, and core keeps the caller's
-    /// claim: the claim is what keeps the overlay alive, so dropping it
-    /// before the overlay is gone is precisely the leak.
+    /// On `Err` nothing changed: the overlay is still up, and core answers
+    /// `BadAlloc` or keeps the caller's claim. An `Ok` that is never
+    /// followed by the retirement must leave nothing that needs undoing.
     ///
     /// # Errors
     ///
-    /// Backend-internal failures — on `KmsBackend`, the shadow-buffer
-    /// allocation that must succeed before a scanned-out buffer can be
-    /// released.
-    fn release_overlay_window(&mut self, origin: Option<OriginContext>) -> io::Result<bool> {
+    /// Backend-internal failures — on `KmsBackend`, the unflip shadow
+    /// (`materialize_direct_shadow_for_unflip`) that must exist before a
+    /// scanned-out buffer can be released.
+    fn prepare_overlay_release(&mut self, origin: Option<OriginContext>) -> io::Result<bool> {
         let _ = origin;
         Ok(false)
+    }
+
+    /// Composite Overlay Window teardown, part 2: cannot fail.
+    ///
+    /// Called by the destroy executor in place of `destroy_subwindow` for
+    /// the COW, after its children's backend teardown and only after
+    /// [`Backend::prepare_overlay_release`] returned `Ok(true)`. Frees the
+    /// storage and the `windows` entry, or defers both behind direct
+    /// scanout until the composed replacement retires; a
+    /// [`Backend::get_overlay_window`] before then re-adopts them.
+    fn retire_overlay_window(&mut self, origin: Option<OriginContext>) {
+        let _ = origin;
     }
 
     /// Stage 4e — return the host xid the backend has assigned to the

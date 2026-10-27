@@ -176,11 +176,10 @@ impl ResourceTable {
     /// the topmost child via `cow_aware_top_index`.
     ///
     /// **Precondition: COW is not currently materialized.** Called by
-    /// the core `GetOverlayWindow` handler only on the 0→1 refcount
-    /// transition (the backend's `get_overlay_window` returned
-    /// `Ok(true)`). Panics if a COW resource record already exists;
-    /// repeated `GetOverlayWindow` calls without an intervening release
-    /// are refcount-only and never reach this function. This guard is
+    /// the core `GetOverlayWindow` handler only when no COW record
+    /// exists and the backend's `get_overlay_window` returned
+    /// `Ok(true)`. Panics if a COW resource record already exists. This
+    /// guard is
     /// load-bearing: the COW's resource record may carry live state
     /// across an interactive session (event-mask selections, properties,
     /// children — the compositor stage gets reparented under it),
@@ -189,8 +188,7 @@ impl ResourceTable {
         assert!(
             !self.windows.contains_key(&COMPOSITE_OVERLAY_WINDOW.0),
             "materialize_cow_resource: COW already materialized; \
-             core handler must only call this on get_overlay_window's \
-             Ok(true) (0→1) return, never on subsequent claims"
+             core handler must only call this while no COW record exists"
         );
         // Build the resource record. Geometry mirrors Xorg
         // `compoverlay.c:compCreateOverlayWindow`: full screen, depth =
@@ -223,20 +221,6 @@ impl ResourceTable {
             let idx = cow_aware_top_index(root);
             root.children.insert(idx, COMPOSITE_OVERLAY_WINDOW);
         }
-    }
-
-    /// Stage 4e — symmetric teardown. Remove the COW from root.children
-    /// and drop the resource record. Called by the core
-    /// `ReleaseOverlayWindow` handler only on the 1→0 refcount
-    /// transition (`backend.release_overlay_window` returned
-    /// `Ok(true)`). Drops any live COW-local state (event-mask
-    /// selections, property store, child window list) — by definition
-    /// the compositor has explicitly released, so this is intentional.
-    pub fn destroy_cow_resource(&mut self) {
-        if let Some(root) = self.windows.get_mut(&ROOT_WINDOW.0) {
-            root.children.retain(|&c| c != COMPOSITE_OVERLAY_WINDOW);
-        }
-        self.windows.remove(&COMPOSITE_OVERLAY_WINDOW.0);
     }
 
     #[must_use]

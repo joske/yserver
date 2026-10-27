@@ -2085,8 +2085,11 @@ fn vrr_cow_owner_never_enables() {
             &[],
         );
         finish_direct_scanout(&mut fixture, &direct, fd);
-        Backend::release_overlay_window(&mut fixture.events.backend, None)
-            .expect("release compositor overlay window");
+        if Backend::prepare_overlay_release(&mut fixture.events.backend, None)
+            .expect("release compositor overlay window")
+        {
+            Backend::retire_overlay_window(&mut fixture.events.backend, None);
+        }
         fixture.finish_after_normal_drain();
     }
 }

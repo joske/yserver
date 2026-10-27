@@ -99,6 +99,8 @@ pub enum RecordedCall {
         host_xid: u32,
     },
     UnregisterHostWindow(u32),
+    /// `retire_overlay_window`: the COW's backend step of a destroy.
+    RetireOverlayWindow,
     CreatePixmap {
         depth: u8,
         width: u16,
@@ -307,18 +309,23 @@ pub struct RecordingBackend {
     /// page-flip ever occurs (project_reclamation_starvation_leak).
     pub before_block_count: std::sync::atomic::AtomicU32,
     /// COW: whether the backend currently owns a materialized overlay.
-    /// A plain bool, not a count — core owns the claim list and this
-    /// backend is only ever driven on the 0 → 1 and 1 → 0 edges. Plain
+    /// A plain bool, not a count — core owns the claim list. Plain
     /// `bool` not `AtomicBool` — `Backend` methods take `&mut self`, so
     /// the test thread already has exclusive access.
     pub cow_materialized: bool,
     /// Failure injection: `get_overlay_window` returns `Err` instead of
     /// materializing, so tests can drive the claim-rollback path.
     pub cow_materialize_fails: bool,
-    /// Failure injection: `release_overlay_window` returns `Err` with the
+    /// Failure injection: `prepare_overlay_release` returns `Err` with the
     /// overlay left up, modelling `KmsBackend`'s
-    /// `materialize_direct_shadow_for_unflip` failing on the 1 → 0 edge.
+    /// `materialize_direct_shadow_for_unflip` failing.
     pub cow_teardown_fails: bool,
+    /// `retire_overlay_window` defers, as `KmsBackend` does behind direct
+    /// scanout: the COW stays materialized with `cow_release_deferred` set
+    /// until a test clears it or `get_overlay_window` re-adopts it.
+    pub cow_release_defers: bool,
+    /// A retirement deferred by `cow_release_defers` is outstanding.
+    pub cow_release_deferred: bool,
     /// Phase 2 (reparent reconciliation): lets tests opt in to
     /// claiming `supports_redirect_activation = true` so the
     /// production reconciliation block in `handle_reparent_window`
@@ -630,6 +637,8 @@ impl RecordingBackend {
             cow_materialized: false,
             cow_materialize_fails: false,
             cow_teardown_fails: false,
+            cow_release_defers: false,
+            cow_release_deferred: false,
             redirect_activation_supported: false,
             composite_opcode: None,
             query_pointer_mask: 0,
@@ -2630,12 +2639,17 @@ impl Backend for RecordingBackend {
         Ok((0, Vec::new()))
     }
 
-    /// COW materialize edge (core 0 → 1). Core guarantees no COW is live
-    /// when this runs, so it is an unconditional materialize.
+    /// COW materialize: core calls this only with no core COW record, so
+    /// a live COW here must be a deferred retirement, which is re-adopted.
     fn get_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
         if self.cow_materialize_fails {
             return Err(io::Error::other("test-injected COW materialize failure"));
         }
+        assert!(
+            !self.cow_materialized || self.cow_release_deferred,
+            "get_overlay_window with a live, undeferred COW: core and backend drifted"
+        );
+        self.cow_release_deferred = false;
         self.cow_materialized = true;
         Ok(true)
     }
@@ -2652,19 +2666,28 @@ impl Backend for RecordingBackend {
         }
     }
 
-    /// COW teardown edge (core 1 → 0). Always a final teardown; clears
-    /// `cow_materialized` so `cow_host_xid` reverts to `None`. On
-    /// injected failure the overlay stays up, as `KmsBackend`'s does when
-    /// the unflip shadow cannot be allocated.
-    fn release_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
+    /// The fallible half of the COW teardown. On injected failure the
+    /// overlay stays up, as `KmsBackend`'s does when the unflip shadow
+    /// cannot be made.
+    fn prepare_overlay_release(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
         if !self.cow_materialized {
             return Ok(false);
         }
         if self.cow_teardown_fails {
             return Err(io::Error::other("test-injected COW teardown failure"));
         }
-        self.cow_materialized = false;
         Ok(true)
+    }
+
+    /// Retire now (`cow_host_xid` reverts to `None`), or defer when
+    /// `cow_release_defers` is set.
+    fn retire_overlay_window(&mut self, _origin: Option<OriginContext>) {
+        self.record(RecordedCall::RetireOverlayWindow);
+        if self.cow_release_defers {
+            self.cow_release_deferred = true;
+        } else {
+            self.cow_materialized = false;
+        }
     }
 
     fn dpms_capable(&self) -> bool {

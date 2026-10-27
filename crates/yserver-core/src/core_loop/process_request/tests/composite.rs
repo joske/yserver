@@ -1471,6 +1471,419 @@ fn disconnect_teardown_failure_sets_cow_teardown_failed() {
     );
 }
 
+// ---------------- the COW on the destroy executor ----------------
+//
+// Expected streams are Xorg `DeleteWindow` (`dix/window.c:1070-1086`):
+// UnmapNotify of the top (`:2854`, `DeliverEvents` = the window's
+// StructureNotify, then the parent's SubstructureNotify), then
+// `CrushTree`'s DestroyNotify per inferior (`:1037-1042`), then the top's
+// (`:1080-1084`). A COW destroy leaves the claims (`compwindow.c:624-626`).
+
+const COW_COMPOSITOR: u32 = 1;
+const COW_APP: u32 = 2;
+const COW_LISTENER: u32 = 3;
+const COW_CHILD: ResourceId = ResourceId(0x0020_0001);
+const COW_CHILD_HOST: u32 = 0xC1;
+const COW_SIBLING: ResourceId = ResourceId(0x0020_0002);
+const COW_SIBLING_HOST: u32 = 0xD1;
+
+struct CowFixture {
+    state: ServerState,
+    backend: RecordingBackend,
+    compositor: std::os::unix::net::UnixStream,
+    app: std::os::unix::net::UnixStream,
+    listener: std::os::unix::net::UnixStream,
+}
+
+/// The compositor holds the COW; another client's mapped child sits under
+/// it and a mapped root sibling under the COW; direct scanout is active
+/// (the backend defers retirement). The listener selects SubstructureNotify
+/// on root and StructureNotify on the COW and the child.
+fn cow_fixture() -> CowFixture {
+    const STRUCTURE_NOTIFY: u32 = 0x0002_0000;
+    const SUBSTRUCTURE_NOTIFY: u32 = 0x0008_0000;
+    let cow = crate::resources::COMPOSITE_OVERLAY_WINDOW;
+    let mut state = ServerState::new();
+    let mut compositor = install_client(&mut state, COW_COMPOSITOR);
+    let mut app = install_client(&mut state, COW_APP);
+    let mut listener = install_client(&mut state, COW_LISTENER);
+    let mut backend = RecordingBackend::new();
+    for (window, parent, host) in [
+        (COW_SIBLING, ROOT_WINDOW, COW_SIBLING_HOST),
+        (COW_CHILD, cow, COW_CHILD_HOST),
+    ] {
+        if parent == cow {
+            dispatch_composite_minor(
+                &mut state,
+                &mut backend,
+                ClientId(COW_COMPOSITOR),
+                1,
+                yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+                &ROOT_WINDOW.0.to_le_bytes(),
+            );
+        }
+        state.resources.create_window(
+            ClientId(COW_APP),
+            CreateWindowRequest {
+                depth: 24,
+                window,
+                parent,
+                width: 64,
+                height: 64,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.window_mut(window).expect("window").host_xid =
+            Some(crate::backend::WindowHandle::from_raw_for_test(host));
+        let _ = state.resources.map_window(window);
+    }
+    let masks = &mut state
+        .clients
+        .get_mut(&COW_LISTENER)
+        .expect("listener")
+        .event_masks;
+    masks.insert(ROOT_WINDOW, SUBSTRUCTURE_NOTIFY);
+    masks.insert(cow, STRUCTURE_NOTIFY);
+    masks.insert(COW_CHILD, STRUCTURE_NOTIFY);
+    backend.cow_release_defers = true;
+    let _ = take_calls(&backend);
+    for peer in [&mut compositor, &mut app, &mut listener] {
+        let _ = read_all_available(peer);
+    }
+    CowFixture {
+        state,
+        backend,
+        compositor,
+        app,
+        listener,
+    }
+}
+
+fn take_calls(backend: &RecordingBackend) -> Vec<crate::backend::recording::RecordedCall> {
+    std::mem::take(&mut *backend.calls.lock().unwrap())
+}
+
+/// `(code, event window, window)` of each event; replies and errors kept
+/// as their code so nothing slips through unseen.
+fn notify_events(bytes: &[u8]) -> Vec<(u8, u32, u32)> {
+    let word = |e: &[u8], at: usize| u32::from_le_bytes([e[at], e[at + 1], e[at + 2], e[at + 3]]);
+    bytes
+        .chunks_exact(32)
+        .map(|e| (e[0] & 0x7f, word(e, 4), word(e, 8)))
+        .collect()
+}
+
+/// DeleteWindow(COW) with the fixture's child, as the listener sees it.
+fn cow_teardown_stream() -> Vec<(u8, u32, u32)> {
+    let cow = crate::resources::COMPOSITE_OVERLAY_WINDOW.0;
+    vec![
+        (18, cow, cow),
+        (18, ROOT_WINDOW.0, cow),
+        (17, COW_CHILD.0, COW_CHILD.0),
+        (17, cow, cow),
+        (17, ROOT_WINDOW.0, cow),
+    ]
+}
+
+fn assert_cow_intact(f: &CowFixture) {
+    let cow = crate::resources::COMPOSITE_OVERLAY_WINDOW;
+    let record = f.state.resources.window(cow).expect("COW record kept");
+    assert_eq!(record.map_state, MapState::Viewable);
+    assert_eq!(
+        f.state.resources.window(COW_CHILD).map(|w| w.parent),
+        Some(cow),
+        "the child is still under the COW"
+    );
+    assert!(f.backend.cow_materialized && !f.backend.cow_release_deferred);
+    assert_eq!(f.state.cow_claims, vec![ClientId(COW_COMPOSITOR)]);
+}
+
+fn destroy_window_request(f: &mut CowFixture, window: ResourceId) {
+    handle_destroy_window(
+        &mut f.state,
+        &mut f.backend,
+        None,
+        ClientId(COW_APP),
+        SequenceNumber(5),
+        &window.0.to_le_bytes(),
+    )
+    .expect("DestroyWindow");
+}
+
+fn destroy_subwindows_request(f: &mut CowFixture) {
+    handle_destroy_subwindows(
+        &mut f.state,
+        &mut f.backend,
+        None,
+        ClientId(COW_APP),
+        SequenceNumber(5),
+        &ROOT_WINDOW.0.to_le_bytes(),
+    )
+    .expect("DestroySubwindows");
+}
+
+/// The COW's backend step is the retirement, after the child's ordinary
+/// teardown, and the COW never takes `destroy_subwindow`.
+fn assert_overlay_backend_path(calls: &[crate::backend::recording::RecordedCall]) {
+    use crate::backend::recording::RecordedCall;
+    let child = calls
+        .iter()
+        .position(|c| *c == RecordedCall::DestroySubwindow(COW_CHILD_HOST))
+        .expect("child destroyed in the backend");
+    let retire = calls
+        .iter()
+        .position(|c| *c == RecordedCall::RetireOverlayWindow)
+        .expect("COW retired");
+    assert!(child < retire, "children go while the backend COW exists");
+    assert!(!calls.contains(&RecordedCall::DestroySubwindow(
+        crate::resources::COMPOSITE_OVERLAY_WINDOW.0
+    )));
+}
+
+#[test]
+fn final_release_whose_preparation_fails_changes_nothing() {
+    let mut f = cow_fixture();
+    f.backend.cow_teardown_fails = true;
+    dispatch_composite_minor(
+        &mut f.state,
+        &mut f.backend,
+        ClientId(COW_COMPOSITOR),
+        2,
+        yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+        &[],
+    );
+    assert_error_code(
+        &read_all_available(&mut f.compositor),
+        yserver_protocol::x11::error::BAD_ALLOC,
+        "ReleaseOverlayWindow whose preparation failed",
+    );
+    assert_cow_intact(&f);
+    assert!(read_all_available(&mut f.listener).is_empty(), "no event");
+    assert!(take_calls(&f.backend).is_empty(), "backend untouched");
+}
+
+#[test]
+fn destroy_window_of_the_cow_keeps_claims_and_next_get_recreates_it() {
+    let cow = crate::resources::COMPOSITE_OVERLAY_WINDOW;
+    let mut f = cow_fixture();
+    destroy_window_request(&mut f, cow);
+
+    assert!(read_all_available(&mut f.app).is_empty(), "no error");
+    assert_eq!(
+        notify_events(&read_all_available(&mut f.listener)),
+        cow_teardown_stream()
+    );
+    assert!(f.state.resources.window(cow).is_none());
+    assert!(f.state.resources.window(COW_CHILD).is_none());
+    assert_eq!(f.state.cow_claims, vec![ClientId(COW_COMPOSITOR)]);
+    assert!(
+        f.backend.cow_release_deferred,
+        "retirement waits for scanout"
+    );
+    assert_overlay_backend_path(&take_calls(&f.backend));
+
+    // `compext.c:303`: no overlay, so this Get creates one, whatever the claims.
+    dispatch_composite_minor(
+        &mut f.state,
+        &mut f.backend,
+        ClientId(COW_COMPOSITOR),
+        6,
+        yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+        &ROOT_WINDOW.0.to_le_bytes(),
+    );
+    let reply = read_all_available(&mut f.compositor);
+    assert_eq!(reply[0], 1, "reply");
+    assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), cow.0);
+    let record = f.state.resources.window(cow).expect("core COW record");
+    assert_eq!(record.map_state, MapState::Viewable);
+    assert!(
+        record.children.is_empty(),
+        "the old child does not come back"
+    );
+    assert_eq!(
+        f.state.cow_claims,
+        vec![ClientId(COW_COMPOSITOR), ClientId(COW_COMPOSITOR)]
+    );
+    assert!(
+        !f.backend.cow_release_deferred,
+        "backend re-adopted its COW"
+    );
+    // `compCreateOverlayWindow` (`compoverlay.c:125-141`): CreateWindow, MapWindow.
+    assert_eq!(
+        notify_events(&read_all_available(&mut f.listener)),
+        vec![(16, ROOT_WINDOW.0, cow.0), (19, ROOT_WINDOW.0, cow.0)]
+    );
+}
+
+#[test]
+fn destroy_window_of_the_cow_whose_preparation_fails_is_badalloc() {
+    let mut f = cow_fixture();
+    f.backend.cow_teardown_fails = true;
+    destroy_window_request(&mut f, crate::resources::COMPOSITE_OVERLAY_WINDOW);
+    assert_error_code(
+        &read_all_available(&mut f.app),
+        yserver_protocol::x11::error::BAD_ALLOC,
+        "DestroyWindow(COW) whose preparation failed",
+    );
+    assert_cow_intact(&f);
+    assert!(read_all_available(&mut f.listener).is_empty(), "no event");
+    assert!(take_calls(&f.backend).is_empty(), "backend untouched");
+}
+
+#[test]
+fn destroy_subwindows_of_root_destroys_the_cow_through_the_overlay_path() {
+    let cow = crate::resources::COMPOSITE_OVERLAY_WINDOW;
+    let mut f = cow_fixture();
+    destroy_subwindows_request(&mut f);
+
+    assert!(read_all_available(&mut f.app).is_empty(), "no error");
+    // `DestroySubwindows` (`dix/window.c:1104-1124`): `UnmapSubwindows`
+    // stops at `RealChildHead` (the COW), then `lastChild` (bottom) first.
+    let mut expected = vec![
+        (18, ROOT_WINDOW.0, COW_SIBLING.0),
+        (17, ROOT_WINDOW.0, COW_SIBLING.0),
+    ];
+    expected.extend(cow_teardown_stream());
+    assert_eq!(
+        notify_events(&read_all_available(&mut f.listener)),
+        expected
+    );
+    assert!(f.state.resources.children(ROOT_WINDOW).is_empty());
+    assert!(f.state.resources.window(cow).is_none());
+    assert_eq!(f.state.cow_claims, vec![ClientId(COW_COMPOSITOR)]);
+    assert!(f.backend.cow_release_deferred);
+    let calls = take_calls(&f.backend);
+    assert!(
+        calls.contains(&crate::backend::recording::RecordedCall::DestroySubwindow(
+            COW_SIBLING_HOST
+        ))
+    );
+    assert_overlay_backend_path(&calls);
+}
+
+#[test]
+fn destroy_subwindows_of_root_whose_cow_preparation_fails_changes_nothing() {
+    let mut f = cow_fixture();
+    f.backend.cow_teardown_fails = true;
+    destroy_subwindows_request(&mut f);
+    assert_error_code(
+        &read_all_available(&mut f.app),
+        yserver_protocol::x11::error::BAD_ALLOC,
+        "DestroySubwindows(root) whose COW preparation failed",
+    );
+    assert_cow_intact(&f);
+    assert_eq!(
+        f.state.resources.window(COW_SIBLING).map(|w| w.map_state),
+        Some(MapState::Viewable),
+        "no child unmapped"
+    );
+    assert!(read_all_available(&mut f.listener).is_empty(), "no event");
+    assert!(take_calls(&f.backend).is_empty(), "backend untouched");
+}
+
+#[test]
+fn failed_recreation_after_the_cow_was_destroyed_rolls_back_only_its_own_claim() {
+    let cow = crate::resources::COMPOSITE_OVERLAY_WINDOW;
+    let mut f = cow_fixture();
+    f.backend.cow_release_defers = false;
+    destroy_window_request(&mut f, cow);
+    assert!(!f.backend.cow_materialized);
+    f.backend.cow_materialize_fails = true;
+    let _ = read_all_available(&mut f.app);
+
+    dispatch_composite_minor(
+        &mut f.state,
+        &mut f.backend,
+        ClientId(COW_APP),
+        6,
+        yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+        &ROOT_WINDOW.0.to_le_bytes(),
+    );
+    // `compext.c:303-307`: BadAlloc, and only this Get's claim is freed.
+    assert_error_code(
+        &read_all_available(&mut f.app),
+        yserver_protocol::x11::error::BAD_ALLOC,
+        "GetOverlayWindow whose recreation failed",
+    );
+    assert_eq!(f.state.cow_claims, vec![ClientId(COW_COMPOSITOR)]);
+    assert!(f.state.resources.window(cow).is_none(), "no partial COW");
+    assert!(!f.state.resources.children(ROOT_WINDOW).contains(&cow));
+}
+
+#[test]
+fn last_release_after_the_cow_was_destroyed_just_drops_the_claim() {
+    let mut f = cow_fixture();
+    destroy_window_request(&mut f, crate::resources::COMPOSITE_OVERLAY_WINDOW);
+    let _ = read_all_available(&mut f.listener);
+    let _ = take_calls(&f.backend);
+
+    dispatch_composite_minor(
+        &mut f.state,
+        &mut f.backend,
+        ClientId(COW_COMPOSITOR),
+        6,
+        yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+        &[],
+    );
+    assert!(read_all_available(&mut f.compositor).is_empty(), "success");
+    assert!(f.state.cow_claims.is_empty());
+    assert!(
+        read_all_available(&mut f.listener).is_empty(),
+        "no teardown"
+    );
+    assert!(take_calls(&f.backend).is_empty(), "no teardown");
+}
+
+/// Divergence 7: the last release crushes the COW's subtree, a child owned
+/// by another client included (`compDestroyOverlayWindow` → `DeleteWindow`).
+#[test]
+fn last_release_destroys_another_clients_child_under_the_cow() {
+    let mut f = cow_fixture();
+    dispatch_composite_minor(
+        &mut f.state,
+        &mut f.backend,
+        ClientId(COW_COMPOSITOR),
+        2,
+        yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+        &[],
+    );
+    assert!(read_all_available(&mut f.compositor).is_empty(), "success");
+    assert_eq!(
+        notify_events(&read_all_available(&mut f.listener)),
+        cow_teardown_stream()
+    );
+    assert!(f.state.cow_claims.is_empty());
+    assert!(f.state.resources.window(COW_CHILD).is_none());
+    let mut left = Vec::new();
+    f.state
+        .resources
+        .collect_owned_window_roots(ClientId(COW_APP), &mut left);
+    assert_eq!(left, vec![COW_SIBLING], "only the root sibling survives");
+    assert_overlay_backend_path(&take_calls(&f.backend));
+}
+
+/// The same through the last claimant's disconnect; the departing
+/// compositor gets nothing, the listener the whole stream.
+#[test]
+fn last_claimants_disconnect_destroys_another_clients_child_under_the_cow() {
+    let mut f = cow_fixture();
+    crate::core_loop::process_disconnect::process_disconnect(
+        &mut f.state,
+        &mut f.backend,
+        ClientId(COW_COMPOSITOR),
+    );
+    assert_eq!(
+        notify_events(&read_all_available(&mut f.listener)),
+        cow_teardown_stream()
+    );
+    assert!(f.state.cow_claims.is_empty());
+    assert!(f.state.resources.window(COW_CHILD).is_none());
+    assert!(!f.state.cow_teardown_failed);
+    assert_overlay_backend_path(&take_calls(&f.backend));
+}
+
 // ---------------- rotate_redirected_backing_on_resize ----------------
 //
 // Marco-with-compositing resizes the top mate-panel from 25 → 28 px

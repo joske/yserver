@@ -25,7 +25,7 @@ impl<P: Platform> XBackend<P> {
             self.platform.gpu_mut(),
             crate::kms::render::engine::RenderFlushReason::Other,
         ) {
-            log::warn!("render release_overlay_window: flush_render_batch failed: {e:?}");
+            log::warn!("render retire_overlay_window: flush_render_batch failed: {e:?}");
         }
         self.drain_render_telemetry();
         if let Some(id) = self.cow_id.take() {
@@ -41,8 +41,8 @@ impl<P: Platform> XBackend<P> {
 
     /// Stage 4d — Composite Overlay Window allocation.
     ///
-    /// The **0 → 1 claim edge only**: core owns the claim list and this
-    /// backend counts nothing, so every call here is a first claim.
+    /// Core calls this only while it has no COW record (Xorg
+    /// `compext.c:303`); this backend counts no claims.
     /// Allocates screen-extent depth-24 storage at xid
     /// `COMPOSITE_OVERLAY_WINDOW` (0x103) and stores the resulting
     /// `DrawableId` on `self.cow_id`. The drawable stays off the normal
@@ -65,20 +65,27 @@ impl<P: Platform> XBackend<P> {
         _origin: Option<OriginContext>,
     ) -> io::Result<bool> {
         if self.cow_id.is_some() {
-            // Core only calls this on the 0 → 1 claim edge, so a live
-            // `cow_id` here can only be a physical teardown the previous
-            // final release deferred behind direct scanout: the protocol
+            // Core only calls this with no COW record, so a live `cow_id`
+            // here can only be a physical teardown the previous release
+            // deferred behind direct scanout: the protocol
             // resource was logically destroyed but the backend identity
             // and storage stayed alive for their safe replacement. Reuse
             // that identity and ask core to materialize the protocol
             // resource again.
             debug_assert!(
                 self.deferred_cow_release,
-                "get_overlay_window is the 0 → 1 edge; a live cow_id here \
-                 without a deferred release means core and the backend have \
-                 drifted",
+                "get_overlay_window runs with no core COW record; a live \
+                 cow_id here without a deferred release means core and the \
+                 backend have drifted",
             );
             self.deferred_cow_release = false;
+            // The destroy unregistered the COW (`unregister_host_window`);
+            // re-register it as the fresh path below does.
+            self.core.xid_map.insert(
+                yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0,
+                yserver_core::resources::COMPOSITE_OVERLAY_WINDOW,
+            );
+            self.scene.mark_scene_structure_dirty();
             return Ok(true);
         }
         let fb_w = self.platform.fb_size().0.max(1);
@@ -185,31 +192,38 @@ impl<P: Platform> XBackend<P> {
         Ok(true)
     }
 
-    /// Stage 4d — Composite Overlay Window release.
+    /// Stage 4d — Composite Overlay Window release, fallible half.
     ///
-    /// The **1 → 0 claim edge only**: core owns the claim list, so every
-    /// call here is the final release. Decrefs the store storage and
-    /// clears `self.cow_id`. If direct scanout is active, the logical
-    /// release succeeds immediately but physical teardown is deferred
-    /// until the composed replacement retires.
-    /// `DrawableStore::decref` removes the xid mapping (immediately on
-    /// synchronous-destroy, deferred on `PendingFence`) so the next
-    /// `GetOverlayWindow` reallocates fresh storage at the same xid.
-    ///
-    /// Returns `Ok(false)` when nothing was materialized — defensive
-    /// only; core does not call this without a claim.
-    pub(in crate::kms::render::backend) fn backend_overlay_release_overlay_window(
+    /// `Ok(false)` when nothing is materialized. With direct scanout
+    /// active, the unflip shadow must exist before the release
+    /// (`P::prepare_cow_release`).
+    pub(in crate::kms::render::backend) fn backend_overlay_prepare_overlay_release(
         &mut self,
         _origin: Option<OriginContext>,
     ) -> io::Result<bool> {
         if self.cow_id.is_none() {
             return Ok(false);
         }
-        if P::defer_cow_release(self)? {
-            return Ok(true);
+        P::prepare_cow_release(self)?;
+        Ok(true)
+    }
+
+    /// Stage 4d — Composite Overlay Window release, infallible half.
+    ///
+    /// Decrefs the store storage and clears `self.cow_id`, or, with direct
+    /// scanout active, requests the unflip and defers that until the
+    /// composed replacement retires (`finish_deferred_cow_release`).
+    /// `DrawableStore::decref` removes the xid mapping (immediately on
+    /// synchronous-destroy, deferred on `PendingFence`) so the next
+    /// `GetOverlayWindow` reallocates fresh storage at the same xid.
+    pub(in crate::kms::render::backend) fn backend_overlay_retire_overlay_window(
+        &mut self,
+        _origin: Option<OriginContext>,
+    ) {
+        if self.cow_id.is_none() || P::defer_cow_release(self) {
+            return;
         }
         self.finish_cow_release();
-        Ok(true)
     }
 
     pub(in crate::kms::render::backend) fn backend_overlay_cow_host_xid(&self) -> Option<u32> {

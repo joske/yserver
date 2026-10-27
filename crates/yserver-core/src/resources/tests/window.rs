@@ -1191,11 +1191,12 @@ fn materialize_cow_resource_panics_if_already_materialized() {
 }
 
 #[test]
-fn destroy_cow_resource_removes_record_and_root_child() {
+fn applied_cow_plan_removes_record_and_root_child() {
     let mut t = ResourceTable::new();
     let host_xid = crate::backend::WindowHandle::from_raw_panicking(COMPOSITE_OVERLAY_WINDOW.0);
     t.materialize_cow_resource(host_xid);
-    t.destroy_cow_resource();
+    let plan = t.plan_destroy(COMPOSITE_OVERLAY_WINDOW).expect("COW plan");
+    t.apply_destroy(&plan);
     assert!(t.window(COMPOSITE_OVERLAY_WINDOW).is_none());
     assert!(
         !t.window(ROOT_WINDOW)

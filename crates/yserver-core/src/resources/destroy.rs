@@ -37,13 +37,17 @@ impl DestroyPlan {
         self.contains_cow
     }
 
-    /// Make the plan executable. Nothing to prepare for any plan yet; the
-    /// COW's fallible overlay release lands here.
-    pub fn prepare(
-        self,
-        _backend: &mut dyn crate::backend::Backend,
-    ) -> io::Result<PreparedDestroy> {
-        Ok(PreparedDestroy { plan: self })
+    /// Make the plan executable: a plan containing the COW runs the
+    /// backend's fallible overlay release first.
+    ///
+    /// # Errors
+    /// From `prepare_overlay_release`; nothing changed.
+    pub fn prepare(self, backend: &mut dyn crate::backend::Backend) -> io::Result<PreparedDestroy> {
+        let overlay = self.contains_cow && backend.prepare_overlay_release(None)?;
+        Ok(PreparedDestroy {
+            plan: self,
+            overlay,
+        })
     }
 }
 
@@ -52,12 +56,20 @@ impl DestroyPlan {
 #[derive(Debug)]
 pub struct PreparedDestroy {
     plan: DestroyPlan,
+    overlay: bool,
 }
 
 impl PreparedDestroy {
     #[must_use]
     pub fn plan(&self) -> &DestroyPlan {
         &self.plan
+    }
+
+    /// The backend owns the planned COW: its backend step is
+    /// `retire_overlay_window`, not `destroy_subwindow`.
+    #[must_use]
+    pub fn retires_overlay(&self) -> bool {
+        self.overlay
     }
 }
 
