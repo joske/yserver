@@ -152,6 +152,7 @@ impl ProtoFixture {
             outbound: VecDeque::new(),
             watching_writable: false,
             write_failed: false,
+            gone: false,
             focused_window: ROOT_WINDOW,
             reader_control: None,
             is_local: true,

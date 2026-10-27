@@ -920,6 +920,7 @@ fn present_request_state(
             outbound: Default::default(),
             watching_writable: false,
             write_failed: false,
+            gone: false,
             focused_window: ROOT_WINDOW,
             reader_control: None,
         },

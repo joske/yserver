@@ -171,12 +171,6 @@ impl ResourceTable {
         }
     }
 
-    pub fn destroy_window(&mut self, id: ResourceId) -> Vec<ResourceId> {
-        let mut destroyed = Vec::new();
-        self.destroy_window_inner(id, &mut destroyed);
-        destroyed
-    }
-
     /// Stage 4e — create the Composite Overlay Window resource record
     /// as a child of root, populate its `host_xid`, and insert it as
     /// the topmost child via `cow_aware_top_index`.
@@ -292,33 +286,6 @@ impl ResourceTable {
         }
         for child in &window.children {
             self.collect_attribute_pixmap_host_xids_inner(*child, out);
-        }
-    }
-
-    fn destroy_window_inner(&mut self, id: ResourceId, destroyed: &mut Vec<ResourceId>) {
-        // X11 spec: "If the argument window is a root window, then this
-        // request has no effect." Without this guard a misbehaved client
-        // (or xts5 Xlib4/XDestroyWindow assertion 5, which calls
-        // `XDestroyWindow(root)` and verifies the root and a sibling
-        // window are still valid) would silently delete the root entry
-        // from the windows table — leaving every subsequent client to
-        // receive `BadWindow` from `GetGeometry` / `QueryTree` /
-        // `GetWindowAttributes` on `ROOT_WINDOW`.
-        if id == ROOT_WINDOW {
-            return;
-        }
-        let Some(window) = self.windows.remove(&id.0) else {
-            return;
-        };
-        if let Some(parent) = self.windows.get_mut(&window.parent.0) {
-            parent.children.retain(|child| *child != id);
-        }
-        if let Some(host) = window.cursor_host {
-            self.dropped_cursor_hosts.push(host.as_raw());
-        }
-        destroyed.push(id);
-        for child in window.children {
-            self.destroy_window_inner(child, destroyed);
         }
     }
 

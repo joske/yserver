@@ -29,7 +29,6 @@ use crate::{
 /// window-scoped.
 pub(crate) struct DestroyOutcome {
     /// Exactly the plan's windows, CrushTree order.
-    #[allow(dead_code, reason = "for the disconnect teardown's cleanup")]
     pub windows: Vec<ResourceId>,
     /// Background/border host pixmaps the destroyed windows held; candidates
     /// for the orphan gate, not yet freed.

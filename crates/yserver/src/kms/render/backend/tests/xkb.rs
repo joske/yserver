@@ -38,6 +38,7 @@ fn xkb_use_extension_from_a_big_endian_client_is_refused_in_its_byte_order() {
             outbound: VecDeque::new(),
             watching_writable: false,
             write_failed: false,
+            gone: false,
             focused_window: yserver_core::resources::ROOT_WINDOW,
             reader_control: None,
             is_local: true,

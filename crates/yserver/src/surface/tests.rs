@@ -687,6 +687,7 @@ fn add_client(state: &mut ServerState, id: u32, mask: u32) -> std::os::unix::net
             outbound: VecDeque::new(),
             watching_writable: false,
             write_failed: false,
+            gone: false,
             focused_window: ROOT_WINDOW,
             reader_control: None,
             is_local: true,

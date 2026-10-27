@@ -4602,6 +4602,7 @@ fn handle_client_setup_complete(
             outbound: std::collections::VecDeque::new(),
             watching_writable: false,
             write_failed: false,
+            gone: false,
             focused_window: crate::resources::ROOT_WINDOW,
             reader_control: Some(reader_control_tx),
             is_local,

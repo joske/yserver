@@ -1483,6 +1483,7 @@ mod tests {
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     write_failed: false,
+                    gone: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
                     is_local: true,

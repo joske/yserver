@@ -658,3 +658,10 @@ grabs before any plan executes, as Xorg does.
 - **XFIXES ClientClose is keyed on the window's owner, not the setting client.**
   The fix needs the setting client recorded in `state.selections`.
 - **The deferred-name `free_pixmap` question in item 6.**
+- **Releasing the departing client's grabs sends no Ungrab events.** Xorg's
+  `ReleaseActiveGrabs` goes through `DeactivateKeyboardGrab` /
+  `DeactivatePointerGrab`. Measured on Xephyr (`destroy-order-probe t
+  disconnect-kbd`): `FocusOut(C, Pointer, Ungrab)`, `FocusOut(T, Inferior,
+  Ungrab)` and `FocusIn(C, Ancestor, Ungrab)` arrive before the UnmapNotify. Our
+  disconnect grab release has always sent nothing. Phase 2 moved it earlier
+  without changing what it does.

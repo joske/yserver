@@ -3726,3 +3726,185 @@ fn destroy_window_drops_passive_grabs_and_a_recycled_id_does_not_match_them() {
         "the recycled id does not match the destroyed window's grab"
     );
 }
+
+/// `tools/destroy-order-probe t disconnect-appsel`, measured on Xephyr: `app`
+/// closes its connection instead of destroying T. `app` set the selection, so
+/// `DeleteClientFromAnySelections` (`dix/dispatch.c:3495`) sends
+/// SelectionClientClose first and no SelectionWindowDestroy follows; the rest
+/// is `DestroyWindow(T)`'s stream. The two backend crossings are left out as
+/// in [`destroy_window_event_order_matches_xorg`].
+#[test]
+fn disconnect_event_order_matches_xorg() {
+    let (mut state, mut grb, mut obs) = destroy_order_fixture((110, 110));
+    assert_eq!(
+        disconnect_app_and_read_order_stream(&mut state, &mut obs),
+        [
+            "XFixesSelectionNotify(subtype=2 window=root owner=None)",
+            "UnmapNotify(event=T window=T fromConfigure=0)",
+            "UnmapNotify(event=root window=T fromConfigure=0)",
+            "LeaveNotify(event=C child=None detail=Ancestor mode=Ungrab root=110,110 event=-40,-40 sf=0x3)",
+            "EnterNotify(event=T child=None detail=Inferior mode=Ungrab root=110,110 event=10,10 sf=0x2)",
+            "FocusOut(event=C detail=Ancestor mode=Normal)",
+            "FocusOut(event=T detail=Virtual mode=Normal)",
+            "FocusIn(event=root detail=Inferior mode=Normal)",
+            "Expose(root 100,100 200x200 count=0)",
+            "DestroyNotify(event=C window=C)",
+            "DestroyNotify(event=T window=T)",
+            "DestroyNotify(event=root window=T)",
+        ]
+    );
+    assert!(read_all_or_buffered(&mut state, 2, &mut grb).is_empty());
+    // A survivor's grab on a window of the departing client's subtree is
+    // released (`dix/events.c:5915-5931`); probe epilogue as above.
+    assert!(state.active_pointer_grab.is_none());
+    assert_eq!(state.core_focus.raw, ROOT_WINDOW.0);
+    assert_eq!(state.core_focus.revert_to, 0);
+}
+
+/// `tools/destroy-order-probe c disconnect-appsel`, measured on Xephyr.
+#[test]
+fn disconnect_event_order_with_the_pointer_in_the_grab_window_matches_xorg() {
+    let (mut state, mut grb, mut obs) = destroy_order_fixture((200, 200));
+    assert_eq!(
+        disconnect_app_and_read_order_stream(&mut state, &mut obs),
+        [
+            "XFixesSelectionNotify(subtype=2 window=root owner=None)",
+            "UnmapNotify(event=T window=T fromConfigure=0)",
+            "UnmapNotify(event=root window=T fromConfigure=0)",
+            "FocusOut(event=C detail=Ancestor mode=Normal)",
+            "FocusOut(event=T detail=Virtual mode=Normal)",
+            "FocusIn(event=root detail=Inferior mode=Normal)",
+            "Expose(root 100,100 200x200 count=0)",
+            "DestroyNotify(event=C window=C)",
+            "DestroyNotify(event=T window=T)",
+            "DestroyNotify(event=root window=T)",
+        ]
+    );
+    assert!(read_all_or_buffered(&mut state, 2, &mut grb).is_empty());
+    assert!(state.active_pointer_grab.is_none());
+}
+
+/// Client 1 disconnects; what client 3 (`obs`) received.
+fn disconnect_app_and_read_order_stream(
+    state: &mut ServerState,
+    obs: &mut UnixStream,
+) -> Vec<String> {
+    let mut backend = RecordingBackend::new();
+    crate::core_loop::process_disconnect::process_disconnect(state, &mut backend, ClientId(1));
+    assert!(!state.clients.contains_key(&1));
+    read_all_or_buffered(state, 3, obs)
+        .chunks_exact(32)
+        .map(describe_order_event)
+        .collect()
+}
+
+/// X owns mapped T; survivor Y owns its mapped child C and an unrelated
+/// top-level. X's disconnect destroys C with T (`DeleteWindow` crushes the
+/// whole subtree, `dix/window.c:1023-1050`); Y gets T's UnmapNotify through
+/// root (`:2855`), C's DestroyNotify and T's; X gets nothing (`clientGone`,
+/// `dix/dispatch.c:3518`). Y's state on C goes, on its other window stays.
+#[test]
+fn disconnect_destroys_a_survivors_child_and_sends_the_departing_client_nothing() {
+    const X: u32 = 1;
+    const Y: u32 = 2;
+    const OTHER: u32 = 0x0020_0003;
+    let mut state = ServerState::new();
+    let mut x_peer = install_capture_client(&mut state, X);
+    let mut y_peer = install_client(&mut state, Y);
+    for (owner, window, parent) in [
+        (X, ORDER_T, ROOT_WINDOW.0),
+        (Y, ORDER_C, ORDER_T),
+        (Y, OTHER, ROOT_WINDOW.0),
+    ] {
+        state.resources.create_window(
+            ClientId(owner),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(window),
+                parent: ResourceId(parent),
+                width: 50,
+                height: 50,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(window));
+    }
+    // X: SubstructureNotify on T. Y: StructureNotify on C and OTHER,
+    // SubstructureNotify on root.
+    state
+        .clients
+        .get_mut(&X)
+        .unwrap()
+        .event_masks
+        .insert(ResourceId(ORDER_T), 0x0008_0000);
+    let y_masks = &mut state.clients.get_mut(&Y).unwrap().event_masks;
+    y_masks.insert(ResourceId(ORDER_C), 0x0002_0000);
+    y_masks.insert(ResourceId(OTHER), 0x0002_0000);
+    y_masks.insert(ROOT_WINDOW, 0x0008_0000);
+    for (damage, window) in [(0x0020_0010, ORDER_C), (0x0020_0011, OTHER)] {
+        state.damage_objects.insert(
+            damage,
+            crate::server::DamageObject {
+                owner: ClientId(Y),
+                drawable: ResourceId(window),
+                level: 3,
+                rects: Vec::new(),
+                pending_notify_fired: false,
+                last_reported_geometry: None,
+                list_pos: 0,
+                created: 0,
+            },
+        );
+        state
+            .shape_select_masks
+            .insert((Y, ResourceId(window)), true);
+        state.present_event_selections.insert(
+            damage + 0x10,
+            crate::server::PresentEventSelection {
+                owner: ClientId(Y),
+                window: ResourceId(window),
+                event_mask: 1,
+            },
+        );
+    }
+
+    let mut backend = RecordingBackend::new();
+    crate::core_loop::process_disconnect::process_disconnect(&mut state, &mut backend, ClientId(X));
+
+    assert_eq!(
+        read_all_or_buffered(&mut state, Y, &mut y_peer)
+            .chunks_exact(32)
+            .map(describe_order_event)
+            .collect::<Vec<_>>(),
+        [
+            "UnmapNotify(event=root window=T fromConfigure=0)",
+            "DestroyNotify(event=C window=C)",
+            "DestroyNotify(event=root window=T)",
+        ]
+    );
+    assert!(
+        read_all_available(&mut x_peer).is_empty(),
+        "the departing client gets nothing"
+    );
+    assert!(!state.clients.contains_key(&X));
+    let y = &state.clients[&Y];
+    assert!(!y.write_failed);
+    assert!(!y.event_masks.contains_key(&ResourceId(ORDER_C)));
+    assert!(y.event_masks.contains_key(&ResourceId(OTHER)));
+    assert!(state.resources.window(ResourceId(ORDER_C)).is_none());
+    assert!(state.resources.window(ResourceId(OTHER)).is_some());
+    let damaged: Vec<ResourceId> = state.damage_objects.values().map(|d| d.drawable).collect();
+    assert_eq!(damaged, [ResourceId(OTHER)]);
+    assert_eq!(
+        state.shape_select_masks.keys().copied().collect::<Vec<_>>(),
+        [(Y, ResourceId(OTHER))]
+    );
+    let present: Vec<ResourceId> = state
+        .present_event_selections
+        .values()
+        .map(|s| s.window)
+        .collect();
+    assert_eq!(present, [ResourceId(OTHER)]);
+}

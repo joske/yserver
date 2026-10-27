@@ -50,6 +50,10 @@ pub enum WriteOutcome {
 /// Write `bytes` to the client. Drains any already-buffered outbound
 /// first so wire ordering is preserved.
 pub fn write_or_buffer(client: &mut ClientState, bytes: &[u8]) -> io::Result<WriteOutcome> {
+    // Xorg `WriteToClient` drops output to a gone client (`os/io.c:700`).
+    if client.gone {
+        return Ok(WriteOutcome::Done);
+    }
     if client.write_failed {
         return Ok(WriteOutcome::Disconnect);
     }
@@ -61,7 +65,7 @@ pub fn write_or_buffer(client: &mut ClientState, bytes: &[u8]) -> io::Result<Wri
 pub fn failed_writers(clients: &std::collections::HashMap<u32, ClientState>) -> Vec<ClientId> {
     let mut failed: Vec<ClientId> = clients
         .iter()
-        .filter(|(_, client)| client.write_failed)
+        .filter(|(_, client)| client.write_failed && !client.gone)
         .map(|(id, _)| ClientId(*id))
         .collect();
     failed.sort_unstable_by_key(|id| id.0);
@@ -135,6 +139,10 @@ fn buffer_or_disconnect(client: &mut ClientState, bytes: &[u8]) -> WriteOutcome 
 /// blocking. Returns `Done` if the queue is now empty, `WouldBlock` if
 /// some bytes remain, `Disconnect` if the peer is gone.
 pub fn drain_outbound(client: &mut ClientState) -> io::Result<WriteOutcome> {
+    if client.gone {
+        client.outbound.clear();
+        return Ok(WriteOutcome::Done);
+    }
     if client.write_failed {
         return Ok(WriteOutcome::Disconnect);
     }
@@ -216,6 +224,7 @@ mod tests {
             outbound: VecDeque::new(),
             watching_writable: false,
             write_failed: false,
+            gone: false,
             focused_window: ResourceId(0),
             reader_control: None,
             is_local: true,
@@ -338,6 +347,29 @@ mod tests {
             WriteOutcome::Disconnect
         );
         assert!(c.write_failed);
+    }
+
+    /// A gone client's output is dropped (Xorg `WriteToClient`, `os/io.c:700`;
+    /// `output_pending_clear`, `dix/dispatch.c:3522`): a write to its
+    /// shut-down socket neither fails nor queues it for another disconnect.
+    #[test]
+    fn gone_client_drops_output_and_is_not_queued_for_disconnect() {
+        let (a, b) = UnixStream::pair().unwrap();
+        drop(b);
+        let mut c = make_client(a);
+        c.outbound.extend([0u8; 32]);
+        c.gone = true;
+        assert_eq!(
+            write_or_buffer(&mut c, &[1u8; 32]).unwrap(),
+            WriteOutcome::Done
+        );
+        assert_eq!(drain_outbound(&mut c).unwrap(), WriteOutcome::Done);
+        assert!(c.outbound.is_empty());
+        assert!(!c.write_failed);
+        c.write_failed = true;
+        let mut clients = HashMap::new();
+        clients.insert(9, c);
+        assert!(failed_writers(&clients).is_empty());
     }
 
     #[test]

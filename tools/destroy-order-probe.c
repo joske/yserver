@@ -1,7 +1,7 @@
 /* destroy-order-probe — the client-visible event stream of DestroyWindow on
  *                       a mapped subtree (window-destroy plan, phase 1).
  *
- *   ./destroy-order-probe c | t
+ *   ./destroy-order-probe c | t [destroy | disconnect | disconnect-appsel | disconnect-kbd]
  *
  * `app` owns mapped T (child of root) and its mapped child C; the pointer is
  * warped into C (c) or into T outside C (t). `grb` owns a selection on C, holds an active pointer grab on
@@ -11,12 +11,17 @@
  * the selection. Then `app` destroys T; every event `obs` and `grb` receive is
  * printed, one per line, in arrival order.
  *
+ * `disconnect`: `app` closes its connection instead of destroying T.
+ * `disconnect-appsel`: the same, but `app` sets the selection owner on C.
+ * `disconnect-kbd`: as `disconnect`, with `app` also holding a keyboard grab on T.
+ *
  *   cc -O1 -o destroy-order-probe destroy-order-probe.c -lxcb -lxcb-xfixes
  */
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <xcb/xcb.h>
 #include <xcb/xfixes.h>
 
@@ -122,6 +127,10 @@ static xcb_connection_t *conn(void)
 int main(int argc, char **argv)
 {
     int in_t = argc > 1 && strcmp(argv[1], "t") == 0;
+    const char *how = argc > 2 ? argv[2] : "destroy";
+    int disconnect = strncmp(how, "disconnect", 10) == 0;
+    int app_sel = strcmp(how, "disconnect-appsel") == 0;
+    int app_kbd = strcmp(how, "disconnect-kbd") == 0;
     app = conn();
     grb = conn();
     obs = conn();
@@ -168,7 +177,8 @@ int main(int argc, char **argv)
     xcb_warp_pointer(app, XCB_NONE, root, 0, 0, 0, 0, in_t ? 110 : 200, in_t ? 110 : 200);
     rt(app);
 
-    xcb_set_selection_owner(grb, C, sel, XCB_CURRENT_TIME);
+    xcb_set_selection_owner(app_sel ? app : grb, C, sel, XCB_CURRENT_TIME);
+    rt(app);
     xcb_grab_pointer_reply_t *g = xcb_grab_pointer_reply(
         grb,
         xcb_grab_pointer(grb, 0, C, XCB_EVENT_MASK_ENTER_WINDOW | XCB_EVENT_MASK_LEAVE_WINDOW,
@@ -181,17 +191,34 @@ int main(int argc, char **argv)
     free(g);
     xcb_set_input_focus(grb, XCB_INPUT_FOCUS_PARENT, C, XCB_CURRENT_TIME);
     rt(grb);
+    if (app_kbd) {
+        xcb_grab_keyboard_reply_t *k = xcb_grab_keyboard_reply(
+            app, xcb_grab_keyboard(app, 0, T, XCB_CURRENT_TIME, XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC),
+            NULL);
+        if (!k || k->status != XCB_GRAB_STATUS_SUCCESS) {
+            fprintf(stderr, "keyboard grab failed\n");
+            return 1;
+        }
+        free(k);
+    }
     rt(obs);
 
     printf("setup\n");
     drain(obs, "obs");
     drain(grb, "grb");
 
-    xcb_destroy_window(app, T);
-    rt(app);
+    if (disconnect) {
+        xcb_disconnect(app);
+        usleep(200000);
+        app = conn();
+        rt(app);
+    } else {
+        xcb_destroy_window(app, T);
+        rt(app);
+    }
     rt(grb);
     rt(obs);
-    printf("destroy T\n");
+    printf("%s\n", disconnect ? "disconnect app" : "destroy T");
     drain(obs, "obs");
     drain(grb, "grb");
 

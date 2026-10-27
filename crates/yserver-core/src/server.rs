@@ -3061,6 +3061,10 @@ pub struct ClientState {
     /// flagged client (`client_io::failed_writers`) and nothing more is
     /// written to it meanwhile.
     pub write_failed: bool,
+    /// The client is being closed down: nothing more is written to it (Xorg
+    /// `clientGone`, `dix/dispatch.c:3518`). The entry stays until the
+    /// disconnect removes it.
+    pub gone: bool,
     /// Window the client's pointer/key events route through; demoted off
     /// `Arc<Mutex<ResourceId>>` in D3.
     pub focused_window: ResourceId,
@@ -3538,6 +3542,7 @@ impl ServerState {
     pub fn subscribers(&self, window: ResourceId, mask_bit: u32) -> Vec<EventTarget> {
         self.clients
             .values()
+            .filter(|c| !c.gone)
             .filter_map(|c| {
                 let mask = c.event_masks.get(&window).copied().unwrap_or(0);
                 if mask & mask_bit != 0 {
@@ -3599,6 +3604,7 @@ impl ServerState {
     ) -> Vec<EventTarget> {
         self.clients
             .values()
+            .filter(|c| !c.gone)
             .filter_map(|c| {
                 let mask = c.event_masks.get(&window).copied().unwrap_or(0);
                 if mask & event_mask != 0 {
@@ -3614,6 +3620,7 @@ impl ServerState {
     pub fn client_target(&self, client_id: ClientId) -> Option<EventTarget> {
         self.clients
             .get(&client_id.0)
+            .filter(|c| !c.gone)
             .map(Self::event_target_for_client)
     }
 
@@ -3773,7 +3780,7 @@ impl ServerState {
 }
 
 /// Like `emit_window_event` but operates on a pre-snapshotted target list (use when the lock has
-/// already been dropped — e.g. after `destroy_window`).
+/// already been dropped).
 pub fn fanout_event(
     targets: &[EventTarget],
     encode: impl Fn(&mut Vec<u8>, SequenceNumber, ClientByteOrder),
@@ -4212,7 +4219,7 @@ fn pointer_event_fanout_inner(
             let mut xi2_targets = Vec::new();
             let mut xi2_raw_targets = Vec::new();
             if xi2_evtype != 0 {
-                for (cid, c) in g.clients.iter() {
+                for (cid, c) in g.clients.iter().filter(|(_, c)| !c.gone) {
                     let mask = xi2_mask_for_client(
                         c,
                         target,

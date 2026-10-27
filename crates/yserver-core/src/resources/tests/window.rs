@@ -1330,7 +1330,8 @@ fn apply_destroy_panics_on_a_stale_plan() {
     make_window(&mut t, top);
     make_child(&mut t, child, top, 0, 0);
     let plan = t.plan_destroy(ResourceId(top)).expect("plan");
-    let _ = t.destroy_window(ResourceId(child));
+    let child_plan = t.plan_destroy(ResourceId(child)).expect("child plan");
+    t.apply_destroy(&child_plan);
     t.apply_destroy(&plan);
 }
 

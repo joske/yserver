@@ -49,6 +49,7 @@ mod shape_xfixes;
 mod sync_ext;
 mod vidmode;
 mod window_destroy;
+pub(crate) use window_destroy::execute_destroy;
 mod windows;
 mod xi;
 mod xkb;
@@ -733,6 +734,9 @@ fn send_reply_with_fd(
     bytes: &[u8],
     fd: std::os::fd::RawFd,
 ) -> io::Result<()> {
+    if client.gone {
+        return Ok(());
+    }
     if !client.fd_passing {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
