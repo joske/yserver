@@ -1031,11 +1031,11 @@ pub trait Backend {
     /// Default: no-op.
     fn set_input_sender(&mut self, _sender: crate::core_loop::CoreSender) {}
 
-    /// Tell the backend that something that could affect on-screen
-    /// pixels has changed since the last composite. KMS uses this to
-    /// gate `composite_and_flip` so an idle server doesn't burn
-    /// vsync-paced composite cycles. Default is a no-op for backends
-    /// (e.g. host-X11) that don't drive their own composite loop.
+    /// Ask the next composite to re-inspect the scene after core-driven
+    /// paint outside request handling (Present execution, server reset).
+    /// Not called per request: backend calls that change on-screen pixels
+    /// or scene structure raise their own wake. Default is a no-op for
+    /// backends (e.g. host-X11) that don't drive their own composite loop.
     fn mark_dirty(&mut self) {}
 
     /// Submit drawing before exposing its damage to an external compositor,

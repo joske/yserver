@@ -1217,7 +1217,6 @@ fn drive_xi_config_lane(
                         let _ = crate::core_loop::process_request::emit_property_change(
                             state, facet_id, property, what,
                         );
-                        backend.mark_dirty();
                         pending.unblock_xi_config(client);
                         grant_request_credit(state, client, queued.request_wire_bytes);
                     }
@@ -1514,7 +1513,6 @@ pub(super) fn dispatch_host_input(
             current_generation,
         );
     }
-    backend.mark_dirty();
 }
 
 fn finish_xi_config_result(
@@ -1547,7 +1545,6 @@ fn finish_xi_config_result(
                         let _ = crate::core_loop::process_request::emit_property_change(
                             state, facet_id, property, what,
                         );
-                        backend.mark_dirty();
                     }
                     Err(error) => {
                         warn!(
@@ -1601,7 +1598,6 @@ fn finish_xi_config_result(
                     let _ = crate::core_loop::process_request::emit_property_change(
                         state, facet_id, property, what,
                     );
-                    backend.mark_dirty();
                     if let Some(protocol) = protocol.as_ref() {
                         let client = protocol.validated.request.client;
                         pending.unblock_xi_config(client);
@@ -1929,7 +1925,7 @@ fn drain_vt_release_requests(
 }
 
 /// Process one X protocol request and run its post-handler bookkeeping
-/// (mark_dirty + disconnect-on-error). Factored so the two drain paths
+/// (damage-notify flush + XFIXES cursor notify). Factored so the two drain paths
 /// in `run_core` (the deferred queue at the top of each iteration and
 /// the channel drain inside `NOTIFY_TOKEN`) share identical semantics.
 ///
@@ -1996,11 +1992,9 @@ fn process_request_inline(
         RequestOutcome::PendingCrtcConfig(_)
             | RequestOutcome::PendingDri3Export(_)
             | RequestOutcome::PendingXiConfig(_)
-    ) {
-        if std::mem::take(&mut state.damage_notify_flush_pending) {
-            backend.flush_before_damage_notify();
-        }
-        backend.mark_dirty();
+    ) && std::mem::take(&mut state.damage_notify_flush_pending)
+    {
+        backend.flush_before_damage_notify();
     }
     // A request that changed the displayed cursor (DefineCursor, a grab,
     // XFIXES ChangeCursor, a map under the pointer) reports it before the
@@ -2054,7 +2048,6 @@ pub(crate) fn drain_ready_crtc_configs(
         if std::mem::take(&mut state.damage_notify_flush_pending) {
             backend.flush_before_damage_notify();
         }
-        backend.mark_dirty();
         match outcome {
             RequestOutcome::Disconnect(client) => {
                 disconnect_with_pending_cleanup(
@@ -2919,28 +2912,14 @@ fn run_core_with_inventory(
         // this iteration. Fanout runs at the outermost stack frame
         // — no `wait_for_reply` is on the stack here — so handlers
         // that issue further host requests are safe.
-        if dispatch_pending_host_events(state, backend) {
-            // Host events (pointer, expose, configure) can change
-            // visible state; mark dirty so the KMS gate re-arms. No-op
-            // for backends without their own composite loop.
-            backend.mark_dirty();
-        }
+        dispatch_pending_host_events(state, backend);
 
         // Auto-repeat: if a key is held and its `next_fire` has
         // elapsed (either because the poll woke on the timeout, or
         // because an unrelated event arrived after the deadline),
         // fan out a synthetic KeyRelease+KeyPress pair.
         if !state.key_repeats.is_empty() {
-            // Only poke the compositor when a repeat actually fired.
-            // `fire_pending_repeats` returns false when the armed key
-            // is merely not-yet-due (the common case every iteration
-            // while a key is held) — an unconditional `mark_dirty()`
-            // here re-dirtied the scene at the loop-iteration rate,
-            // busy-spinning the compositor (and never letting it idle
-            // when a phantom key is stuck armed).
-            if fire_pending_repeats(state, backend) {
-                backend.mark_dirty();
-            }
+            fire_pending_repeats(state, backend);
         }
 
         // DPMS: evaluate idle-cascade transitions.
@@ -4444,14 +4423,7 @@ fn update_repeat_state_at(state: &mut ServerState, ev: &HostInputEvent, now: Ins
 /// path the original press took, matching classic X11 auto-repeat
 /// (every client handles it without opting into XKB
 /// DetectableAutoRepeat).
-/// Returns `true` iff a repeat was actually fanned out this call. The
-/// caller uses this to decide whether to poke the compositor: a call
-/// that merely observes an armed-but-not-yet-due key (or disarms a
-/// no-longer-repeating one) produces no events and must NOT re-dirty
-/// the scene — doing so unconditionally every loop iteration while a
-/// key is held (or while a phantom key is stuck armed) busy-spins the
-/// compositor at the iteration rate instead of the repeat rate
-/// (idle free-run, [[project_idle_compositor_redraw_loop]] cut 2a).
+/// Returns `true` iff a repeat was actually fanned out this call.
 pub fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) -> bool {
     fire_pending_repeats_at(state, backend, Instant::now())
 }

@@ -166,23 +166,12 @@ impl<P: Platform> Backend for XBackend<P> {
     }
 
     fn mark_dirty(&mut self) {
-        // The core loop calls mark_dirty after every handled X request, even
-        // when the request changed no scene state. The platform predicate is
-        // scoped to the tearing owner's outputs; during that cap this generic
-        // wake must not turn XTest motion fan-out (and MotionNotify replies)
-        // into ordinary scene damage. Real paint damage, repaint obligations,
-        // and structural changes retain their own wakes.
+        // Capped tearing (scoped to the tearing owner's outputs): the paint
+        // behind this call already carries its own wake, and an ordinary one
+        // here would erase the cursor-only cause.
         if P::tearing_cursor_compose_cap_applies(self) {
-            // Paint damage and repaint obligations are already scheduler
-            // inputs; structural mutations mark the scene directly, and
-            // pointer motion records its cursor-only cause. This generic hook
-            // runs after every X request, so it must not turn any of those
-            // existing causes into ordinary damage or erase the cursor cap.
             return;
         }
-
-        // Outside the cursor-cap case, preserve the established generic
-        // request wake behavior without inventing full-output damage.
         self.scene.wake_for_damage();
     }
 

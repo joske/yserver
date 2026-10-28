@@ -3153,12 +3153,8 @@ fn handle_host_input_arms_repeat_state() {
     assert!(state.key_repeats.is_empty());
 }
 
-/// Regression guard for the idle free-run fix (cut 2a): the caller
-/// pokes the compositor (`mark_dirty`) only when a repeat actually
-/// fires. `fire_pending_repeats` must return `false` on the
-/// every-iteration "armed but not yet due" path (else a held/stuck
-/// key busy-spins the compositor at the loop rate) and `true` only
-/// when it fans out.
+/// `fire_pending_repeats` returns `false` on the every-iteration "armed but
+/// not yet due" path and `true` only when it fans out.
 #[test]
 fn fire_pending_repeats_reports_whether_it_fired() {
     use std::time::{Duration, Instant};
@@ -4483,4 +4479,46 @@ fn platform_event_message_reaches_the_backend() {
         sender.send(Message::Shutdown).unwrap();
     });
     assert_eq!(backend.platform_events, 2);
+}
+
+/// A handled request leaves the composite wake to the backend calls it made:
+/// the request path itself never calls `mark_dirty`.
+#[test]
+fn handled_request_does_not_mark_the_backend_dirty() {
+    use crate::backend::recording::{RecordedCall, RecordingBackend};
+    use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+    let mut state = ServerState::new();
+    let _peer = install_xi_config_test_client(&mut state, 7);
+    let mut backend = RecordingBackend::new();
+    for (opcode, body) in [
+        (127u8, Vec::new()),                           // NoOperation
+        (43, Vec::new()),                              // GetInputFocus
+        (16, [&[4u8, 0, 0, 0][..], b"WAKE"].concat()), // InternAtom "WAKE"
+    ] {
+        let outcome = process_request_inline(
+            &mut state,
+            &mut backend,
+            ClientId(7),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode,
+                data: 0,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            &body,
+            None,
+        );
+        assert!(
+            matches!(outcome, RequestOutcome::Handled),
+            "opcode {opcode}"
+        );
+    }
+    assert!(
+        !backend
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::MarkDirty)),
+        "no request may wake the composite generically"
+    );
 }

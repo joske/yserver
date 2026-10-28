@@ -87,8 +87,8 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn cursor_motion_during_tearing(_b: &mut XBackend<Self>, _cursor_visible: bool) {}
     /// Record the current root pointer position for delayed platform cursor shows.
     fn note_root_pointer_position(_b: &mut XBackend<Self>, _x: i32, _y: i32) {}
-    /// Whether generic request wakeups should leave a cursor-only tearing cap
-    /// intact instead of converting them into scene damage.
+    /// Whether `mark_dirty` should leave a cursor-only tearing cap intact
+    /// instead of converting it into scene damage.
     fn tearing_cursor_compose_cap_applies(_b: &XBackend<Self>) -> bool {
         false
     }
