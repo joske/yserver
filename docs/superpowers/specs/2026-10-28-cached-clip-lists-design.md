@@ -1,6 +1,7 @@
 # Clip lists: linear region algebra, single-pass sibling clipping, cache
 
-Status: design, for review. Branch `perf/cached-clip-lists`. Refs #155.
+Status: design, revised after codex review (`a432a2b6` reviewed). Branch
+`perf/cached-clip-lists`. Refs #155.
 
 ## Problem
 
@@ -27,11 +28,14 @@ aggregated with inlining off) attributes 88% to request processing:
 
 Three costs compound:
 
-1. **Region operations are super-linear.** `nested::subtract_regions`
+1. **Region operations do avoidable work.** `nested::subtract_regions`
    splits every rect against every rect, `normalize_region_rects` scans all
    rects once per y band (O(k^2)), and `clip_list::canonical` normalises
-   again. pixman, which Xorg uses, combines two y-x banded regions in one
-   merge pass (`pixman_op`), linear in their rect counts.
+   again, on every operation, although the inputs are already canonical.
+   pixman, which Xorg uses, combines two y-x banded regions band by band
+   (`pixman_op`) without re-normalising. (Its output can still be large: an
+   intersection can produce n*m rects and a running universe can fragment;
+   the win is dropping the repeated normalisation, not a size bound.)
 2. **Each sibling's clip is computed from scratch.** `uncovered_in_child_space`
    subtracts every higher sibling for every child it is asked about, so a
    pass over n siblings is O(n^2) region operations. Xorg's
@@ -47,6 +51,12 @@ The KMS backend has its own, independent occlusion computations over its
 window mirror (`copy_area_shared_backing_occluders` scans the whole window
 map per ancestor level, `compute_copy_area_scissors` re-subtracts children
 uncached); `subwindow_mode_clip` already has a single-entry generation cache.
+Ordinary drawing (PolyFillRectangle and friends, `drawing.rs:918` on) goes
+through that backend path and never asks core for a clip list, so the core
+phases below cannot by themselves explain or fix the `-rect10`-style drawing
+ratios. They help ClearArea, GraphicsExpose and CopyArea's core clip
+queries, and the exposure paths of tree changes. Unifying the two window
+representations is not part of this work.
 
 ## Goal and invariants
 
@@ -71,6 +81,15 @@ empty/contains tests.
 
 - The output is pixman's canonical form directly, so `canonical()` and the
   `normalize_region_rects` pass disappear from the clip path.
+- Two entry points, kept apart: building a `Region` from arbitrary rects
+  (SHAPE/XFIXES input: unsorted, overlapping) normalises once, at that
+  boundary; binary operations take and return canonical `Region`s and
+  never normalise. Shapes are stored as `Region`s so a clip query does not
+  re-normalise them.
+- Coordinates are `i32` internally; conversion to the wire's `i16` origin and
+  `u16` extent happens where rects leave (events, replies), with today's
+  clamping. Any deliberate fix to an existing extreme-coordinate
+  discrepancy is a separate commit, not part of the parity swap.
 - `clip_list.rs` switches to it first (it is the hot path and already
   speaks canonical form). The SHAPE/XFIXES users of `nested::*_regions`
   follow in the same phase if the swap is mechanical, else stay as they are.
@@ -86,16 +105,39 @@ regions (coordinates in a small grid so that edges coincide often):
 
 Plus hand-written cases from pixman's own region test expectations where
 they pin coalescing (two bands with equal spans merge; a hole splits into
-four rects).
+four rects), and boundary cases the small grid does not reach: negative
+origins (borders left/above the parent), extents near the `u16` limit,
+translations that hit the `i16` wire limits, empty and degenerate regions,
+and deep ancestor offsets.
 
 ## Phase 2: one top-down pass over siblings
 
 Restructure `clip_list.rs` the way `miComputeClips` walks children: for a
 parent with universe U, visit its children top-most first, give each child
-`U ∩ borderSize(child)` (cut to its winSize for the clip/universe it hands
-down), then `U -= borderSize(child)` when the child is viewable and not
-transparent. One region operation per sibling instead of one per sibling
-pair.
+its `borderClip = U ∩ borderSize(child)` (cut to its winSize for the
+universe it hands down), then `U -= borderSize(child)` when the child is
+viewable and not transparent. One region operation per sibling instead of
+one per sibling pair.
+
+Redirected children keep today's exception explicitly
+(`not_clipped_by_children` `clip_list.rs:168`, `child_universe_with`
+`:217`; `miComputeClips` resets a redirected window's universe to its own
+`borderSize` after saving the external clip):
+
+- an Automatic or Manual redirected child draws into its own backing, so
+  the universe it hands to its subtree is its own winSize, whatever U is,
+  even when U is empty or a higher sibling covers it;
+- only a Manual redirected child is transparent: it does not shrink U for
+  the siblings below it or for its parent's clip list. An Automatic one
+  does.
+
+Border visibility comes out of the same pass. Today `with_borders` calls
+`border_ring_clip` for every entry, which scans the higher siblings again
+and keeps the work quadratic for bordered windows. The pass already has
+each child's `borderClip`; the ring is `borderClip − winSize`, so the pass
+produces the full `ClipEntry` (clip list and ring) directly. `clip_lists_of`
+tests membership with a set (or an ordered merge) instead of
+`members.contains` per child.
 
 - `walk`, `clip_lists_of`, `subtree_clip_lists`, `clip_lists_under` and
   `clip_list_from` use the running universe.
@@ -106,9 +148,18 @@ pair.
 - `send_map_exposures` for MapSubwindows computes the parent's universe once
   for the whole batch instead of once per mapped child.
 
-Same tests as above; no new oracle needed, the outputs must not change.
+The outputs must not change, so the existing exposure tests are the oracle.
+Equivalence cases added for the redirect rules: a redirected child covered
+by a higher sibling, one clipped away by its parent, each with Automatic
+and Manual redirection, with and without borders. A scaling check runs
+the old and new traversal at 50/100/200/400 siblings, plain and with
+shaped (fragmented) siblings.
 
-## Phase 3: a per-window cache keyed on a tree generation
+## Phase 3: a per-window cache (only if the profile after Phase 2 asks)
+
+Re-profile after Phases 1-2. Every move or resize invalidates a coarse
+cache, so if repeated core clip queries no longer show up, skip this phase.
+If they do:
 
 `ServerState` gets a `tree_generation: u64` and a cache
 `HashMap<ResourceId, CachedClip>` holding `not_clipped_by_children`,
@@ -123,8 +174,8 @@ profile and the ratios point:
 
 - within one request (TreeChange after, CopyArea source/destination,
   ClearArea, exposure fan-out all reading the same windows' clips);
-- across the drawing requests between two tree changes (the 6-127x drawing
-  ratios).
+- across the ClearArea/CopyArea requests between two tree changes. Not
+  ordinary fills, which clip in the backend (see Problem).
 
 What bumps it (from the mutation inventory):
 
@@ -138,11 +189,29 @@ What bumps it (from the mutation inventory):
   transparent) and to `Window.redirected_backing`;
 - root and COW resizes on a screen size change.
 
-To make the bump hard to forget, the writers move behind methods that bump
-(`window_mut` bumps like the backend's `TrackedWindows::deref_mut`; the
-shape and redirect maps get the same wrapper). In debug and test builds a
-check recomputes on every cache hit and asserts equality, so a missing bump
-fails the existing exposure tests instead of shipping a stale clip.
+Enforcement, not convention. `ResourceTable`'s own methods
+(`configure_window`, `map_window`, `reparent_window`, `apply_destroy`, the
+gravity and promote/demote helpers, ...) write `self.windows` directly with
+`get_mut`/`insert`/`remove`, bypassing `window_mut`. So the authoritative
+window map itself is wrapped: the only mutable access to it bumps the
+generation, as the backend's `TrackedWindows::deref_mut` does. The shape map
+and `CompositeRedirects` get the same wrapper; the cache key is the one
+`tree_generation` all three bump, and server reset clears the cache.
+
+Inputs that are not tree state stay out of the cache: a query such as
+`not_clipped_by_children_while(still_redirected)` computes uncached (or with
+the extra input in its key), never sharing an entry with the plain query.
+
+Eviction: invalidation is lazy, so entries of an old generation are dropped
+when the generation changes (the whole map is cleared on the first lookup
+after a bump), and destroyed windows can never pile up.
+
+Tests: in debug and test builds every cache hit is also recomputed and
+compared. That only catches a missed bump if a test warms the cache,
+mutates, and reads again, so a compact warm/mutate/read matrix covers
+geometry, stacking, map with promotion and demotion, gravity, bounding and
+clip shape, redirect and unredirect, destroy with XID reuse, COW and root
+resize, and reset.
 
 If the coarse scheme leaves `-move` dominated by recomputation (every move
 bumps), measure before refining: the TreeChange before/after pair is then
@@ -150,7 +219,8 @@ two Phase 2 passes over the touched layer, which should already be cheap.
 
 ## Phase 4: the backend occluders (measure first)
 
-After Phases 1-3, re-profile `-create` and `-copywinwin10`. If
+After Phases 1-2 (and 3 if it happened), profile the drawing tests on their
+own (`-rect10`, `-copywinwin10`) and `-create`. If
 `copy_area_shared_backing_occluders` / `compute_copy_area_scissors` /
 `resolve_paint_target` still dominate:
 
@@ -162,7 +232,9 @@ After Phases 1-3, re-profile `-create` and `-copywinwin10`. If
 - share the child subtraction between `compute_copy_area_scissors` and
   `compute_subwindow_mode_clip`.
 
-Not designed further here; the profile after Phase 3 decides.
+Not designed further here; that profile decides. Backend clips cannot
+simply reuse core exposure clips: shared-backing and redirect routing add
+their own coordinates and ownership rules.
 
 ## Out of scope
 
@@ -172,6 +244,13 @@ Not designed further here; the profile after Phase 3 decides.
   request, and has its own capped `Region`.
 - Fine-grained invalidation (Xorg's marking) unless Phase 3's measurement
   asks for it.
+- Merging the core window tree and the backend mirror.
+
+## Delivery
+
+One PR per phase: region algebra; complete top-down traversal; then, as the
+profile decides, the core cache and/or the backend occluders. Each keeps
+behaviour and is measured on its own.
 
 ## Measurement plan
 
