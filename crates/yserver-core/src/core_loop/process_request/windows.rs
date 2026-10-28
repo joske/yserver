@@ -235,16 +235,14 @@ fn send_map_exposures(
     origin: Option<OriginContext>,
     tops: &[ResourceId],
 ) {
-    for top in tops {
-        for (w, region) in crate::core_loop::clip_list::subtree_clip_lists(state, *top) {
-            let _dropped = accumulate_damage_border_to_state(state, w);
-            if state.resources.window_resolved_background(w).is_some()
-                && !background_paint_inhibited(state, w)
-            {
-                let _dropped = accumulate_damage_region_to_state(state, w, &region);
-            }
-            send_window_exposures(state, backend, origin, w, &region, false);
+    for (w, region) in crate::core_loop::clip_list::subtrees_clip_lists(state, tops) {
+        let _dropped = accumulate_damage_border_to_state(state, w);
+        if state.resources.window_resolved_background(w).is_some()
+            && !background_paint_inhibited(state, w)
+        {
+            let _dropped = accumulate_damage_region_to_state(state, w, &region);
         }
+        send_window_exposures(state, backend, origin, w, &region, false);
     }
 }
 
@@ -497,10 +495,7 @@ pub(super) fn handle_reparent_window(
             let _ = backend.unmap_subwindow(origin, host);
         }
         let clips_before = if map_state == MapState::Viewable {
-            crate::core_loop::clip_list::with_borders(
-                state,
-                crate::core_loop::clip_list::clip_lists_under(state, window),
-            )
+            crate::core_loop::clip_list::clip_entries_under(state, window)
         } else {
             Vec::new()
         };
@@ -517,10 +512,7 @@ pub(super) fn handle_reparent_window(
         // What it covered in the old place is exposed (`UnmapWindow`,
         // `dix/window.c:2856-2866`).
         if map_state == MapState::Viewable {
-            let after = crate::core_loop::clip_list::with_borders(
-                state,
-                crate::core_loop::clip_list::clip_lists_under(state, window),
-            );
+            let after = crate::core_loop::clip_list::clip_entries_under(state, window);
             send_exposures(
                 state,
                 backend,
@@ -2570,10 +2562,7 @@ pub(super) fn unmap_window(
         .window(window)
         .is_some_and(|w| w.map_state == MapState::Viewable);
     let clips_before = if viewable_before && !from_configure {
-        crate::core_loop::clip_list::with_borders(
-            state,
-            crate::core_loop::clip_list::clip_lists_under(state, window),
-        )
+        crate::core_loop::clip_list::clip_entries_under(state, window)
     } else {
         Vec::new()
     };
@@ -2624,10 +2613,7 @@ pub(super) fn unmap_window(
         // (`UnmapWindow`, `dix/window.c:2856-2866`). From a configure the
         // caller's validation exposes it.
         if viewable_before && !from_configure {
-            let after = crate::core_loop::clip_list::with_borders(
-                state,
-                crate::core_loop::clip_list::clip_lists_under(state, window),
-            );
+            let after = crate::core_loop::clip_list::clip_entries_under(state, window);
             send_exposures(
                 state,
                 backend,

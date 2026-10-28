@@ -110,17 +110,13 @@ fn build(specs: &[Spec]) -> (ServerState, Vec<ResourceId>) {
 // oracle's.
 
 fn new_entries_under(state: &ServerState, w: ResourceId) -> Vec<(ResourceId, Rects, Rects)> {
-    super::with_borders(state, super::clip_lists_under(state, w))
+    rings_as_rects(super::clip_entries_under(state, w))
 }
 
-fn new_newly_exposed(
-    before: &[(ResourceId, Rects, Rects)],
-    after: Vec<(ResourceId, Rects, Rects)>,
-    whole: Option<ResourceId>,
-) -> Vec<(ResourceId, Rects, Rects)> {
-    super::newly_exposed(before, after, whole)
+fn rings_as_rects(entries: Vec<super::ClipEntry>) -> Vec<(ResourceId, Rects, Rects)> {
+    entries
         .into_iter()
-        .map(|e| (e.window, e.region, e.border))
+        .map(|(w, clip, ring)| (w, clip.to_rects(), ring.to_rects()))
         .collect()
 }
 
@@ -137,9 +133,7 @@ fn new_exposed(
 }
 
 fn new_batch(state: &ServerState, tops: &[ResourceId]) -> Vec<(ResourceId, Rects)> {
-    tops.iter()
-        .flat_map(|t| super::subtree_clip_lists(state, *t))
-        .collect()
+    super::subtrees_clip_lists(state, tops)
 }
 
 fn old_exposed(
@@ -252,11 +246,19 @@ fn assert_change_matches(
 
 /// An unmap of `w` diffed both ways, as UnmapWindow and DestroyWindow do.
 fn assert_unmap_matches(state: &mut ServerState, w: ResourceId) {
-    let new_before = new_entries_under(state, w);
+    let new_before = super::clip_entries_under(state, w);
     let old_before = old_entries_under(state, w);
-    assert_eq!(new_before, old_before, "before unmapping {w:?}");
+    assert_eq!(
+        rings_as_rects(new_before.clone()),
+        old_before,
+        "before unmapping {w:?}"
+    );
     let _ = state.resources.unmap_window(w);
-    let new = new_newly_exposed(&new_before, new_entries_under(state, w), None);
+    let new: Vec<(ResourceId, Rects, Rects)> =
+        super::newly_exposed(&new_before, super::clip_entries_under(state, w), None)
+            .into_iter()
+            .map(|e| (e.window, e.region, e.border))
+            .collect();
     let old: Vec<(ResourceId, Rects, Rects)> =
         oracle::newly_exposed(&old_before, old_entries_under(state, w), None)
             .into_iter()

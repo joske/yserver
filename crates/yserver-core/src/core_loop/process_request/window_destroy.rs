@@ -95,10 +95,7 @@ pub(crate) fn execute_destroy(
         });
         let realized = top_map_state == MapState::Viewable;
         let clips_before = if realized {
-            crate::core_loop::clip_list::with_borders(
-                state,
-                crate::core_loop::clip_list::clip_lists_under(state, top),
-            )
+            crate::core_loop::clip_list::clip_entries_under(state, top)
         } else {
             Vec::new()
         };
@@ -112,10 +109,7 @@ pub(crate) fn execute_destroy(
         let _ = state.resources.unmap_window(top);
         if realized {
             // HandleExposures, then WindowsRestructured (`:2864-2872`).
-            let after = crate::core_loop::clip_list::with_borders(
-                state,
-                crate::core_loop::clip_list::clip_lists_under(state, top),
-            );
+            let after = crate::core_loop::clip_list::clip_entries_under(state, top);
             send_exposures(
                 state,
                 backend,

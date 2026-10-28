@@ -8,6 +8,8 @@
 //! Regions are in a window's content space and in pixman's canonical form
 //! ([`canonical`]), so the rects a client is sent match Xorg's one for one.
 
+use std::collections::{HashMap, HashSet};
+
 use yserver_protocol::x11::{ResourceId, xfixes::RegionRect};
 
 use crate::{
@@ -110,45 +112,63 @@ fn transparent(state: &ServerState, w: ResourceId) -> bool {
 /// Xorg's `borderSize` of `w` in its parent's content space: its outer
 /// rect, cut to its bounding shape (`SetBorderSize`, `dix/window.c:1747`).
 pub(crate) fn border_size_in_parent(state: &ServerState, w: ResourceId) -> Vec<RegionRect> {
+    border_size(state, w).to_rects()
+}
+
+fn border_size(state: &ServerState, w: ResourceId) -> Region {
     let Some(win) = state.resources.window(w) else {
-        return Vec::new();
+        return Region::default();
     };
     let bw2 = win.border_width.saturating_mul(2);
-    let outer = RegionRect {
+    let outer = Region::rect(RegionRect {
         x: win.x,
         y: win.y,
         width: win.width.saturating_add(bw2),
         height: win.height.saturating_add(bw2),
-    };
-    match state.shape_windows.get(&w).and_then(|s| s.bounding.clone()) {
+    });
+    match state
+        .shape_windows
+        .get(&w)
+        .and_then(|s| s.bounding.as_ref())
+    {
         Some(shape) => {
             let bw = i32::from(win.border_width);
-            let shape = translate(shape, i32::from(win.x) + bw, i32::from(win.y) + bw);
-            intersect(&[outer], &shape)
+            let shape =
+                Region::from_rects(shape).translate(i32::from(win.x) + bw, i32::from(win.y) + bw);
+            outer.intersect(&shape)
         }
-        None => vec![outer],
+        None => outer,
     }
 }
 
 /// Xorg's `winSize` of `w` in its own content space, short of its
 /// parent's: its content rect cut to its bounding and clip shapes
 /// (`SetWinSize`, `dix/window.c:1710`).
-fn win_size(state: &ServerState, w: ResourceId) -> Vec<RegionRect> {
+fn win_size(state: &ServerState, w: ResourceId) -> Region {
     let Some(win) = state.resources.window(w) else {
-        return Vec::new();
+        return Region::default();
     };
-    let mut region = vec![RegionRect {
+    let mut region = Region::rect(RegionRect {
         x: 0,
         y: 0,
         width: win.width,
         height: win.height,
-    }];
+    });
     if let Some(shape) = state.shape_windows.get(&w) {
         for s in [&shape.bounding, &shape.clip].into_iter().flatten() {
-            region = intersect(&region, s);
+            region = region.intersect(&Region::from_rects(s));
         }
     }
     region
+}
+
+/// `w`'s offset from its parent's content origin to its own: its position
+/// plus its border.
+fn content_offset(state: &ServerState, w: ResourceId) -> Option<(i32, i32, i32)> {
+    state.resources.window(w).map(|c| {
+        let bw = i32::from(c.border_width);
+        (i32::from(c.x) + bw, i32::from(c.y) + bw, bw)
+    })
 }
 
 /// What of `w` shows, its inferiors included, in its content space:
@@ -158,30 +178,34 @@ fn win_size(state: &ServerState, w: ResourceId) -> Vec<RegionRect> {
 /// 239`); every other window's is its parent's less the windows stacked
 /// above it there.
 pub(crate) fn not_clipped_by_children(state: &ServerState, w: ResourceId) -> Vec<RegionRect> {
+    universe(state, w).to_rects()
+}
+
+fn universe(state: &ServerState, w: ResourceId) -> Region {
     if !viewable(state, w) {
-        return Vec::new();
+        return Region::default();
     }
     if w == ROOT_WINDOW {
         return state
             .resources
             .window(ROOT_WINDOW)
-            .map_or_else(Vec::new, |r| {
-                vec![RegionRect {
+            .map_or_else(Region::default, |r| {
+                Region::rect(RegionRect {
                     x: 0,
                     y: 0,
                     width: r.width,
                     height: r.height,
-                }]
+                })
             });
     }
     if state.composite_redirects.window_mode(w).is_some() {
         return win_size(state, w);
     }
     let Some(parent) = state.resources.window(w).map(|win| win.parent) else {
-        return Vec::new();
+        return Region::default();
     };
-    let universe = not_clipped_by_children(state, parent);
-    child_universe(state, &universe, parent, w)
+    let universe = universe(state, parent);
+    child_universe(state, &universe, parent, w, &[])
 }
 
 /// [`not_clipped_by_children`] of `w` while the `still_redirected` windows,
@@ -199,119 +223,162 @@ pub(crate) fn not_clipped_by_children_while(
     if w == ROOT_WINDOW || state.composite_redirects.window_mode(w).is_some() {
         return not_clipped_by_children(state, w);
     }
-    let universe = not_clipped_by_children(state, parent);
-    child_universe_with(state, &universe, parent, w, still_redirected)
+    let universe = universe(state, parent);
+    child_universe(state, &universe, parent, w, still_redirected).to_rects()
 }
 
-/// [`not_clipped_by_children`] of `child` from its parent's.
+/// The universe of the single `child` from its parent's: the parent's less
+/// `child`'s higher siblings, one subtraction per sibling. A whole layer
+/// goes through [`split_universe`] instead.
 fn child_universe(
     state: &ServerState,
-    parent_universe: &[RegionRect],
-    parent: ResourceId,
-    child: ResourceId,
-) -> Vec<RegionRect> {
-    child_universe_with(state, parent_universe, parent, child, &[])
-}
-
-fn child_universe_with(
-    state: &ServerState,
-    parent_universe: &[RegionRect],
+    parent_universe: &Region,
     parent: ResourceId,
     child: ResourceId,
     also_transparent: &[ResourceId],
-) -> Vec<RegionRect> {
+) -> Region {
     if !viewable(state, child) {
-        return Vec::new();
+        return Region::default();
     }
     if state.composite_redirects.window_mode(child).is_some() {
         return win_size(state, child);
     }
     if parent_universe.is_empty() {
-        return Vec::new();
+        return Region::default();
     }
-    let universe =
-        uncovered_in_child_space(state, parent_universe, parent, child, also_transparent);
-    intersect(&universe, &win_size(state, child))
+    uncovered_in_child_space(state, parent_universe, parent, child, also_transparent)
+        .intersect(&win_size(state, child))
 }
 
 /// `parent_universe` less `child`'s higher siblings, in `child`'s content
 /// space: what its `borderSize` is cut to (`miComputeClips`).
 fn uncovered_in_child_space(
     state: &ServerState,
-    parent_universe: &[RegionRect],
+    parent_universe: &Region,
     parent: ResourceId,
     child: ResourceId,
     also_transparent: &[ResourceId],
-) -> Vec<RegionRect> {
-    let Some((x, y, bw)) = state
-        .resources
-        .window(child)
-        .map(|c| (i32::from(c.x), i32::from(c.y), i32::from(c.border_width)))
-    else {
-        return Vec::new();
+) -> Region {
+    let Some((dx, dy, _)) = content_offset(state, child) else {
+        return Region::default();
     };
-    let mut universe = parent_universe.to_vec();
+    let mut universe = parent_universe.clone();
     let siblings = state.resources.children(parent);
     if let Some(at) = siblings.iter().position(|s| *s == child) {
         for s in &siblings[at + 1..] {
+            if universe.is_empty() {
+                break;
+            }
             if viewable(state, *s) && !transparent(state, *s) && !also_transparent.contains(s) {
-                universe = subtract(&universe, &border_size_in_parent(state, *s));
+                universe = universe.subtract(&border_size(state, *s));
             }
         }
     }
-    translate(universe, -(x + bw), -(y + bw))
+    universe.translate(-dx, -dy)
 }
 
 /// The visible part of `w`'s border, in its content space: Xorg's
 /// `borderClip − winSize` (`mi/mivaltree.c:362-380`). A redirected window's
 /// `borderClip` is its own `borderSize` (`mi/mivaltree.c:233-239`). Empty
 /// without a border (`HasBorder`).
+#[cfg(test)]
 pub(crate) fn border_ring_clip(state: &ServerState, w: ResourceId) -> Vec<RegionRect> {
+    border_ring(state, w).to_rects()
+}
+
+fn border_ring(state: &ServerState, w: ResourceId) -> Region {
     if w == ROOT_WINDOW || !viewable(state, w) {
-        return Vec::new();
+        return Region::default();
     }
-    let Some((x, y, bw, parent)) = state.resources.window(w).map(|c| {
-        (
-            i32::from(c.x),
-            i32::from(c.y),
-            i32::from(c.border_width),
-            c.parent,
-        )
-    }) else {
-        return Vec::new();
+    let Some(parent) = state.resources.window(w).map(|c| c.parent) else {
+        return Region::default();
+    };
+    let Some((dx, dy, bw)) = content_offset(state, w) else {
+        return Region::default();
     };
     if bw == 0 {
-        return Vec::new();
+        return Region::default();
     }
-    let own = translate(border_size_in_parent(state, w), -(x + bw), -(y + bw));
+    let own = border_size(state, w).translate(-dx, -dy);
     let clip = if state.composite_redirects.window_mode(w).is_some() {
         own
     } else {
-        let universe = not_clipped_by_children(state, parent);
-        intersect(
-            &uncovered_in_child_space(state, &universe, parent, w, &[]),
-            &own,
-        )
+        let universe = universe(state, parent);
+        uncovered_in_child_space(state, &universe, parent, w, &[]).intersect(&own)
     };
-    subtract(&clip, &win_size(state, w))
+    clip.subtract(&win_size(state, w))
+}
+
+/// One viewable child's share of its parent's universe, from
+/// [`split_universe`]: its own universe and visible border ring, both in
+/// its content space.
+struct ChildClip {
+    window: ResourceId,
+    universe: Region,
+    ring: Region,
+}
+
+/// `miComputeClips` over `parent`'s children: walk them once, top-most
+/// first, carrying what of `universe` (the parent's) they leave uncovered.
+/// Each viewable child for which `want` (its index in `children`, its id
+/// and its `borderSize`) holds gets its universe, `borderClip ∩ winSize`,
+/// and, with `borders`, its ring, `borderClip − winSize`. A redirected
+/// child's are its own (`mi/mivaltree.c:233-239`). A child then covers the
+/// rest of the parent unless it is Manual-redirected. What is left at the
+/// end is the parent's clip list.
+fn split_universe(
+    state: &ServerState,
+    parent: ResourceId,
+    universe: Region,
+    borders: bool,
+    mut want: impl FnMut(usize, ResourceId, &Region) -> bool,
+) -> (Region, Vec<ChildClip>) {
+    let mut uncovered = universe;
+    let mut wanted = Vec::new();
+    let children = state.resources.children(parent);
+    for (i, &c) in children.iter().enumerate().rev() {
+        if !viewable(state, c) {
+            continue;
+        }
+        let Some((dx, dy, bw)) = content_offset(state, c) else {
+            continue;
+        };
+        let size = border_size(state, c);
+        if want(i, c, &size) {
+            let win = win_size(state, c);
+            let redirected = state.composite_redirects.window_mode(c).is_some();
+            // `borderClip`, in the child's content space.
+            let border_clip = if redirected {
+                size.clone()
+            } else {
+                uncovered.intersect(&size)
+            }
+            .translate(-dx, -dy);
+            let ring = if borders && bw != 0 {
+                border_clip.subtract(&win)
+            } else {
+                Region::default()
+            };
+            let universe = if redirected {
+                win
+            } else {
+                border_clip.intersect(&win)
+            };
+            wanted.push(ChildClip {
+                window: c,
+                universe,
+                ring,
+            });
+        }
+        if !uncovered.is_empty() && !transparent(state, c) {
+            uncovered = uncovered.subtract(&size);
+        }
+    }
+    (uncovered, wanted)
 }
 
 /// One window's clip list and visible border ring, for an exposure diff.
-pub(crate) type ClipEntry = (ResourceId, Vec<RegionRect>, Vec<RegionRect>);
-
-/// `clips` with each window's [`border_ring_clip`] alongside.
-pub(crate) fn with_borders(
-    state: &ServerState,
-    clips: Vec<(ResourceId, Vec<RegionRect>)>,
-) -> Vec<ClipEntry> {
-    clips
-        .into_iter()
-        .map(|(w, clip)| {
-            let ring = border_ring_clip(state, w);
-            (w, clip, ring)
-        })
-        .collect()
-}
+pub(crate) type ClipEntry = (ResourceId, Region, Region);
 
 /// What a change exposes of one window: `region` of its content and
 /// `border` of its border (`after.exposed` and `after.borderExposed`).
@@ -325,24 +392,16 @@ pub(crate) struct Exposure {
 /// `w`'s clip list in its content space: what of it shows and is not under
 /// a child (ClipByChildren).
 pub(crate) fn clip_list(state: &ServerState, w: ResourceId) -> Vec<RegionRect> {
-    clip_list_from(state, w, not_clipped_by_children(state, w))
-}
-
-fn clip_list_from(
-    state: &ServerState,
-    w: ResourceId,
-    universe: Vec<RegionRect>,
-) -> Vec<RegionRect> {
-    let mut region = universe;
+    let mut region = universe(state, w);
     for c in state.resources.children(w) {
         if region.is_empty() {
             break;
         }
         if viewable(state, *c) && !transparent(state, *c) {
-            region = subtract(&region, &border_size_in_parent(state, *c));
+            region = region.subtract(&border_size(state, *c));
         }
     }
-    region
+    region.to_rects()
 }
 
 /// The clip lists of `w` and every viewable window inside it, in the order
@@ -353,56 +412,104 @@ pub(crate) fn subtree_clip_lists(
     w: ResourceId,
 ) -> Vec<(ResourceId, Vec<RegionRect>)> {
     let mut out = Vec::new();
-    let universe = not_clipped_by_children(state, w);
-    walk(state, w, universe, &mut out);
-    out
+    walk(
+        state,
+        w,
+        universe(state, w),
+        Region::default(),
+        false,
+        &mut out,
+    );
+    without_rings(out)
 }
 
+/// [`subtree_clip_lists`] of each of `tops` in turn, siblings mapped
+/// together (MapSubwindows): their parent's universe is split among them
+/// once instead of once per window.
+pub(crate) fn subtrees_clip_lists(
+    state: &ServerState,
+    tops: &[ResourceId],
+) -> Vec<(ResourceId, Vec<RegionRect>)> {
+    let parent = tops
+        .first()
+        .and_then(|t| state.resources.window(*t))
+        .map(|w| w.parent);
+    let siblings = tops.len() > 1
+        && tops
+            .iter()
+            .all(|t| *t != ROOT_WINDOW && state.resources.window(*t).map(|w| w.parent) == parent);
+    let (Some(parent), true) = (parent, siblings) else {
+        return tops
+            .iter()
+            .flat_map(|t| subtree_clip_lists(state, *t))
+            .collect();
+    };
+    let members: HashSet<ResourceId> = tops.iter().copied().collect();
+    let (_, kids) = split_universe(state, parent, universe(state, parent), false, |_, c, _| {
+        members.contains(&c)
+    });
+    let mut universes: HashMap<ResourceId, Region> =
+        kids.into_iter().map(|k| (k.window, k.universe)).collect();
+    let mut out = Vec::new();
+    for t in tops {
+        if let Some(u) = universes.remove(t) {
+            walk(state, *t, u, Region::default(), false, &mut out);
+        }
+    }
+    without_rings(out)
+}
+
+fn without_rings(entries: Vec<ClipEntry>) -> Vec<(ResourceId, Vec<RegionRect>)> {
+    entries
+        .into_iter()
+        .map(|(w, clip, _)| (w, clip.to_rects()))
+        .collect()
+}
+
+/// Push the entries of `w` (its clip list, from `universe`, and `ring`) and
+/// of its viewable inferiors in exposure order.
 fn walk(
     state: &ServerState,
     w: ResourceId,
-    universe: Vec<RegionRect>,
-    out: &mut Vec<(ResourceId, Vec<RegionRect>)>,
+    universe: Region,
+    ring: Region,
+    borders: bool,
+    out: &mut Vec<ClipEntry>,
 ) {
     if !viewable(state, w) {
         return;
     }
-    let children: Vec<ResourceId> = state.resources.children(w).iter().rev().copied().collect();
-    let child_universes: Vec<(ResourceId, Vec<RegionRect>)> = children
-        .iter()
-        .map(|c| (*c, child_universe(state, &universe, w, *c)))
-        .collect();
-    out.push((w, clip_list_from(state, w, universe)));
-    for (c, u) in child_universes {
-        walk(state, c, u, out);
+    let (clip, kids) = split_universe(state, w, universe, borders, |_, _, _| true);
+    out.push((w, clip, ring));
+    for k in kids {
+        walk(state, k.window, k.universe, k.ring, borders, out);
     }
 }
 
-/// The clip lists unmapping `w` can grow, before or after it: its
-/// parent's and those of the siblings stacked under it that it overlaps,
-/// with their subtrees, in exposure order (`UnmapWindow` validates and
-/// exposes from the parent, `dix/window.c:2856-2866`).
-pub(crate) fn clip_lists_under(
-    state: &ServerState,
-    w: ResourceId,
-) -> Vec<(ResourceId, Vec<RegionRect>)> {
-    let mut out = Vec::new();
+/// The clip lists and border rings unmapping `w` can grow, before or after
+/// it: its parent's and those of the siblings stacked under it that it
+/// overlaps, with their subtrees, in exposure order (`UnmapWindow`
+/// validates and exposes from the parent, `dix/window.c:2856-2866`).
+pub(crate) fn clip_entries_under(state: &ServerState, w: ResourceId) -> Vec<ClipEntry> {
     let Some(parent) = state.resources.window(w).map(|win| win.parent) else {
-        return out;
+        return Vec::new();
     };
-    let universe = not_clipped_by_children(state, parent);
-    out.push((parent, clip_list_from(state, parent, universe.clone())));
-    let footprint = border_size_in_parent(state, w);
-    let siblings = state.resources.children(parent);
-    let Some(at) = siblings.iter().position(|s| *s == w) else {
-        return out;
-    };
-    for s in siblings[..at].iter().rev() {
-        if intersect(&border_size_in_parent(state, *s), &footprint).is_empty() {
-            continue;
-        }
-        let u = child_universe(state, &universe, parent, *s);
-        walk(state, *s, u, &mut out);
+    let footprint = border_size(state, w);
+    let at = state
+        .resources
+        .children(parent)
+        .iter()
+        .position(|s| *s == w);
+    let (clip, kids) = split_universe(
+        state,
+        parent,
+        universe(state, parent),
+        true,
+        |i, _, size| at.is_some_and(|at| i < at) && !size.intersect(&footprint).is_empty(),
+    );
+    let mut out = vec![(parent, clip, border_ring(state, parent))];
+    for k in kids {
+        walk(state, k.window, k.universe, k.ring, true, &mut out);
     }
     out
 }
@@ -432,21 +539,21 @@ fn overlaps(a: RegionRect, b: RegionRect) -> bool {
         && by < ay + i32::from(a.height)
 }
 
-/// The clip lists of `parent` and of those of its children in `members`
-/// with their subtrees, in exposure order (`miHandleValidateExposures`
-/// from the layer's parent): the parent, then the members top-most first.
-fn clip_lists_of(
+/// The clip lists and rings of `parent` and of those of its children in
+/// `members` with their subtrees, in exposure order
+/// (`miHandleValidateExposures` from the layer's parent): the parent, then
+/// the members top-most first.
+fn clip_entries_of(
     state: &ServerState,
     parent: ResourceId,
-    members: &[ResourceId],
-) -> Vec<(ResourceId, Vec<RegionRect>)> {
-    let universe = not_clipped_by_children(state, parent);
-    let mut out = vec![(parent, clip_list_from(state, parent, universe.clone()))];
-    for c in state.resources.children(parent).iter().rev() {
-        if members.contains(c) {
-            let u = child_universe(state, &universe, parent, *c);
-            walk(state, *c, u, &mut out);
-        }
+    members: &HashSet<ResourceId>,
+) -> Vec<ClipEntry> {
+    let (clip, kids) = split_universe(state, parent, universe(state, parent), true, |_, c, _| {
+        members.contains(&c)
+    });
+    let mut out = vec![(parent, clip, border_ring(state, parent))];
+    for k in kids {
+        walk(state, k.window, k.universe, k.ring, true, &mut out);
     }
     out
 }
@@ -461,7 +568,7 @@ fn clip_lists_of(
 /// depends on the change.
 pub(crate) struct TreeChange {
     parent: ResourceId,
-    members: Vec<ResourceId>,
+    members: HashSet<ResourceId>,
     before: Vec<ClipEntry>,
 }
 
@@ -480,7 +587,7 @@ impl TreeChange {
         let parent = state.resources.window(w)?.parent;
         let mut extent = vec![outer_rect(state, w)?];
         extent.extend(reach);
-        let members: Vec<ResourceId> = state
+        let members: HashSet<ResourceId> = state
             .resources
             .children(parent)
             .iter()
@@ -492,7 +599,7 @@ impl TreeChange {
                             .is_some_and(|r| extent.iter().any(|e| overlaps(r, *e))))
             })
             .collect();
-        let before = with_borders(state, clip_lists_of(state, parent, &members));
+        let before = clip_entries_of(state, parent, &members);
         Some(Self {
             parent,
             members,
@@ -506,7 +613,7 @@ impl TreeChange {
     /// its entire clip list instead: a resized window's contents are
     /// forfeit (`mi/miwindow.c:466-472`).
     pub(crate) fn exposed(self, state: &ServerState, whole: Option<ResourceId>) -> Vec<Exposure> {
-        let after = with_borders(state, clip_lists_of(state, self.parent, &self.members));
+        let after = clip_entries_of(state, self.parent, &self.members);
         newly_exposed(&self.before, after, whole)
     }
 }
@@ -521,22 +628,26 @@ pub(crate) fn newly_exposed(
     after: Vec<ClipEntry>,
     whole: Option<ResourceId>,
 ) -> Vec<Exposure> {
+    let mut index: HashMap<ResourceId, usize> = HashMap::with_capacity(before.len());
+    for (i, (w, _, _)) in before.iter().enumerate() {
+        index.entry(*w).or_insert(i);
+    }
     after
         .into_iter()
         .filter_map(|(w, region, ring)| {
-            let old = before.iter().find(|(b, _, _)| *b == w);
+            let old = index.get(&w).map(|i| &before[*i]);
             let region = match old.filter(|_| Some(w) != whole) {
-                Some((_, old, _)) => subtract(&region, old),
+                Some((_, old, _)) => region.subtract(old),
                 None => region,
             };
             let border = match old {
-                Some((_, _, old_ring)) => subtract(&ring, old_ring),
+                Some((_, _, old_ring)) => ring.subtract(old_ring),
                 None => ring,
             };
-            (!region.is_empty() || !border.is_empty()).then_some(Exposure {
+            (!region.is_empty() || !border.is_empty()).then(|| Exposure {
                 window: w,
-                region,
-                border,
+                region: region.to_rects(),
+                border: border.to_rects(),
             })
         })
         .collect()
@@ -868,9 +979,9 @@ mod tests {
         window(&mut state, c, ResourceId(w), (10, 10, 50, 50), 1);
         set_border(&mut state, c, 4);
         window(&mut state, sib, ResourceId(w), (0, 0, 30, 30), 1);
-        let before = with_borders(&state, clip_lists_under(&state, ResourceId(sib)));
+        let before = clip_entries_under(&state, ResourceId(sib));
         let _ = state.resources.unmap_window(ResourceId(sib));
-        let after = with_borders(&state, clip_lists_under(&state, ResourceId(sib)));
+        let after = clip_entries_under(&state, ResourceId(sib));
         let got = borders(newly_exposed(&before, after, None));
         assert_eq!(got, vec![(c, vec![r(-4, -4, 20, 4), r(-4, 0, 4, 16)])]);
     }
@@ -883,9 +994,9 @@ mod tests {
         window(&mut state, w, ROOT_WINDOW, (0, 0, 120, 120), 1);
         window(&mut state, c, ResourceId(w), (10, 10, 50, 50), 1);
         window(&mut state, sib, ResourceId(w), (0, 0, 30, 30), 1);
-        let before = with_borders(&state, clip_lists_under(&state, ResourceId(sib)));
+        let before = clip_entries_under(&state, ResourceId(sib));
         let _ = state.resources.unmap_window(ResourceId(sib));
-        let after = with_borders(&state, clip_lists_under(&state, ResourceId(sib)));
+        let after = clip_entries_under(&state, ResourceId(sib));
         assert!(borders(newly_exposed(&before, after, None)).is_empty());
     }
 }

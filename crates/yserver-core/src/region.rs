@@ -67,6 +67,31 @@ impl Region {
         }
     }
 
+    /// The region of one rect: empty if it has no area.
+    pub(crate) fn rect(r: RegionRect) -> Self {
+        let b = Box32::from_rect(r);
+        if b.x1 < b.x2 && b.y1 < b.y2 {
+            Self { boxes: vec![b] }
+        } else {
+            Self::default()
+        }
+    }
+
+    /// The region moved by `(dx, dy)`; moving keeps it canonical.
+    pub(crate) fn translate(mut self, dx: i32, dy: i32) -> Self {
+        if dx != 0 || dy != 0 {
+            for b in &mut self.boxes {
+                *b = Box32 {
+                    x1: b.x1 + dx,
+                    y1: b.y1 + dy,
+                    x2: b.x2 + dx,
+                    y2: b.y2 + dy,
+                };
+            }
+        }
+        self
+    }
+
     pub(crate) fn to_rects(&self) -> Vec<RegionRect> {
         self.boxes.iter().map(|b| b.to_rect()).collect()
     }
