@@ -143,8 +143,8 @@ tests membership with a set (or an ordered merge) instead of
   `clip_list_from` use the running universe.
 - `not_clipped_by_children(w)` for a single window still has to account for
   w's higher siblings at each ancestor level; it subtracts them once per
-  level (as today) but with Phase 1 operations. Phase 3 makes the repeated
-  calls cheap.
+  level (as today) but with Phase 1 operations. If repeated calls still
+  show in the profile, Phase 3 caches them.
 - `send_map_exposures` for MapSubwindows computes the parent's universe once
   for the whole batch instead of once per mapped child.
 
