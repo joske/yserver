@@ -16,6 +16,7 @@ mod randr;
 mod render_clip;
 mod render_picture;
 mod root_scanout;
+mod scene_wake;
 mod server_scanout;
 mod stacking;
 mod tearing;
