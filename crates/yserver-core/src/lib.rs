@@ -9,6 +9,7 @@ pub mod nested;
 pub mod present_scheduler;
 pub mod properties;
 pub mod randr;
+pub(crate) mod region;
 pub mod resources;
 pub mod rootless;
 pub mod server;

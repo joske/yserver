@@ -11,6 +11,7 @@
 use yserver_protocol::x11::{ResourceId, xfixes::RegionRect};
 
 use crate::{
+    region::Region,
     resources::{MapState, ROOT_WINDOW, WindowClass},
     server::{CompositeRedirectMode, ServerState},
 };
@@ -61,12 +62,16 @@ pub(crate) fn canonical(rects: Vec<RegionRect>) -> Vec<RegionRect> {
 
 /// `a ∩ b`, canonical.
 pub(crate) fn intersect(a: &[RegionRect], b: &[RegionRect]) -> Vec<RegionRect> {
-    canonical(crate::nested::intersect_regions(a, b))
+    Region::from_rects(a)
+        .intersect(&Region::from_rects(b))
+        .to_rects()
 }
 
 /// `a − b`, canonical.
 pub(crate) fn subtract(a: &[RegionRect], b: &[RegionRect]) -> Vec<RegionRect> {
-    canonical(crate::nested::subtract_regions(a, b))
+    Region::from_rects(a)
+        .subtract(&Region::from_rects(b))
+        .to_rects()
 }
 
 /// `rects` moved by `(dx, dy)`, saturating at the wire's range.
@@ -80,7 +85,11 @@ pub(crate) fn translate(mut rects: Vec<RegionRect>, dx: i32, dy: i32) -> Vec<Reg
 
 /// Whether `rect` lies wholly inside `region` (`RegionContainsRect == rgnIN`).
 pub(crate) fn contains(region: &[RegionRect], rect: RegionRect) -> bool {
-    rect.width == 0 || rect.height == 0 || subtract(&[rect], region).is_empty()
+    rect.width == 0
+        || rect.height == 0
+        || Region::from_rects(&[rect])
+            .subtract(&Region::from_rects(region))
+            .is_empty()
 }
 
 /// A viewable `InputOutput` window: what takes part in clipping. An
