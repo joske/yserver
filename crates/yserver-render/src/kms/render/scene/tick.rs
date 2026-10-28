@@ -242,6 +242,7 @@ impl SceneCompositor {
         );
         let mut composed = Vec::new();
         let mut clear_dirty = true;
+        let mut carried_out = false;
         // Idle free-run fix (cut 2b): union of sampled sources drawn
         // across all outputs, and whether every output actually walked
         // `build_scene`. Only reconcile `offscreen_no_draw` when all
@@ -331,6 +332,7 @@ impl SceneCompositor {
                         // structure damage; keep the scheduler awake for it.
                         if fan_out_carried_damage(inner, output_idx, &carried) {
                             clear_dirty = false;
+                            carried_out = true;
                         }
                     } else {
                         clear_dirty &= outcome.clears_scene_structure_dirty();
@@ -379,6 +381,11 @@ impl SceneCompositor {
         }
         if clear_dirty {
             *scene_structure_dirty = false;
+            *cursor_only_wake = false;
+        } else if carried_out {
+            // Raise, not just keep: this tick may have run on presentation
+            // damage alone, which the composing output's retire acks.
+            *scene_structure_dirty = true;
             *cursor_only_wake = false;
         }
         // Vulkan may export the already-signalled SYNC_FD sentinel (`fd=-1`).

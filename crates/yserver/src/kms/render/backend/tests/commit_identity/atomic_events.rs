@@ -906,3 +906,84 @@ fn p1_recording_scene_smoke_completes_through_backend() {
     assert!(fixture.events.backend.store.lookup(root).is_none());
     fixture.finish();
 }
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: hand carried damage over without raising the scene dirty bit.
+fn paint_carried_to_a_flipping_output_stays_scheduled_after_the_composer_retires() {
+    let Some(mut fixture) =
+        RecordingSceneFixture::new(2).expect("two-output recording scene fixture construction")
+    else {
+        return;
+    };
+    let fd = fixture.events.backend.platform.devices[0]
+        .device
+        .as_fd()
+        .as_raw_fd();
+    let first = submit_damaged_frame(&mut fixture);
+    assert_eq!(first.len(), 2, "both outputs compose the first paint");
+    let (composer, flipping) = (&first[0].1, &first[1].1);
+    let composer_crtc = composer.events[0].crtc;
+    complete_recorded_attempt(
+        &mut fixture,
+        fd,
+        composer,
+        accepted_event_id(composer).expect("accepted"),
+        71,
+    );
+
+    // The second paint reaches only the output whose flip retired.
+    fixture.events.backend.scene.scene_structure_dirty = false;
+    let second = submit_damaged_frame(&mut fixture);
+    assert_eq!(second.len(), 1, "the flipping output cannot compose yet");
+    assert_eq!(second[0].1.events[0].crtc, composer_crtc);
+    complete_recorded_attempt(
+        &mut fixture,
+        fd,
+        &second[0].1,
+        accepted_event_id(&second[0].1).expect("accepted"),
+        72,
+    );
+    complete_recorded_attempt(
+        &mut fixture,
+        fd,
+        flipping,
+        accepted_event_id(flipping).expect("accepted"),
+        73,
+    );
+    assert!(
+        !fixture
+            .events
+            .backend
+            .store
+            .has_pending_presentation_damage(),
+        "the composer's retire acked the second paint"
+    );
+    assert!(
+        fixture.events.backend.scene_wants_scene(),
+        "the other output still owes the second paint"
+    );
+
+    let before = fixture.events.recorders[&fd].records().len();
+    Backend::maybe_composite(&mut fixture.events.backend).expect("compose through Backend");
+    let carried: Vec<_> = fixture.events.recorders[&fd]
+        .records()
+        .into_iter()
+        .skip(before)
+        .filter(|record| accepted_event_id(record).is_some())
+        .collect();
+    assert_eq!(
+        carried.len(),
+        1,
+        "the owed output composes the carried paint"
+    );
+    assert_ne!(carried[0].events[0].crtc, composer_crtc);
+    complete_recorded_attempt(
+        &mut fixture,
+        fd,
+        &carried[0],
+        accepted_event_id(&carried[0]).expect("accepted"),
+        74,
+    );
+    fixture.finish_after_normal_drain();
+}
