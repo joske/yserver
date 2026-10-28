@@ -135,7 +135,11 @@ Border visibility comes out of the same pass. Today `with_borders` calls
 `border_ring_clip` for every entry, which scans the higher siblings again
 and keeps the work quadratic for bordered windows. The pass already has
 each child's `borderClip`; the ring is `borderClip − winSize`, so the pass
-produces the full `ClipEntry` (clip list and ring) directly. `clip_lists_of`
+produces the full `ClipEntry` (clip list and ring) directly. A redirected
+child's ring comes from its private clip, its own `borderSize` after the
+reset, not from the external `borderClip` the parent's universe gives it
+(as `border_ring_clip` does today, `clip_list.rs:277-279`); the
+bordered-redirect equivalence cases pin that. `clip_lists_of`
 tests membership with a set (or an ordered merge) instead of
 `members.contains` per child.
 
@@ -245,6 +249,8 @@ their own coordinates and ownership rules.
 - Fine-grained invalidation (Xorg's marking) unless Phase 3's measurement
   asks for it.
 - Merging the core window tree and the backend mirror.
+- Core-font text (`-ftext` 1/420 of Xorg) and RENDER text (`-aa10text`
+  1/7): separate investigations.
 
 ## Delivery
 
