@@ -55,16 +55,31 @@ impl Region {
 
     /// The region `rects` cover. Rects already in canonical form are taken
     /// as they are; anything else (SHAPE and XFIXES input: unsorted,
-    /// overlapping) is normalised once here.
+    /// overlapping) is normalised once here, in `i32` throughout: each
+    /// non-empty rect becomes a one-box region and the regions are unioned
+    /// pairwise, a tree of `log n` rounds.
     pub(crate) fn from_rects(rects: &[RegionRect]) -> Self {
-        let boxes: Vec<Box32> = rects.iter().map(|r| Box32::from_rect(*r)).collect();
+        let mut boxes: Vec<Box32> = rects.iter().map(|r| Box32::from_rect(*r)).collect();
         if is_canonical(&boxes) {
             return Self { boxes };
         }
-        let canonical = crate::core_loop::clip_list::canonical(rects.to_vec());
-        Self {
-            boxes: canonical.into_iter().map(Box32::from_rect).collect(),
+        boxes.retain(|b| b.x1 < b.x2 && b.y1 < b.y2);
+        // Sorted, neighbours in the tree mostly share bands, which keeps
+        // the intermediate regions small.
+        boxes.sort_unstable_by_key(|b| (b.y1, b.x1));
+        let mut level: Vec<Self> = boxes.into_iter().map(|b| Self { boxes: vec![b] }).collect();
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            let mut it = level.into_iter();
+            while let Some(a) = it.next() {
+                next.push(match it.next() {
+                    Some(b) => a.union(&b),
+                    None => a,
+                });
+            }
+            level = next;
         }
+        level.pop().unwrap_or_default()
     }
 
     /// The region of one rect: empty if it has no area.
@@ -110,7 +125,6 @@ impl Region {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // the single-pass traversal (Phase 2) unions
     pub(crate) fn union(&self, other: &Self) -> Self {
         if self.is_empty() {
             return other.clone();
@@ -182,7 +196,6 @@ fn is_canonical(boxes: &[Box32]) -> bool {
 
 #[derive(Clone, Copy)]
 enum Overlap {
-    #[cfg_attr(not(test), allow(dead_code))]
     Union,
     Intersect,
     Subtract,

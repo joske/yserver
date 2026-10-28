@@ -37,6 +37,36 @@ fn raster(rects: &[RegionRect]) -> Vec<bool> {
     cells
 }
 
+/// The cells of `GRID` moved by `(bx, by)` that `boxes` cover.
+fn raster_boxes(boxes: &[Box32], bx: i32, by: i32) -> Vec<bool> {
+    let mut cells = Vec::new();
+    for y in GRID {
+        for x in GRID {
+            let (x, y) = (x + bx, y + by);
+            cells.push(
+                boxes
+                    .iter()
+                    .any(|b| b.x1 <= x && x < b.x2 && b.y1 <= y && y < b.y2),
+            );
+        }
+    }
+    cells
+}
+
+/// Grid origins at the wire's limits as well as at zero.
+fn bases() -> impl Strategy<Value = i32> {
+    prop_oneof![
+        Just(0),
+        Just(i32::from(i16::MIN) + 3),
+        Just(i32::from(i16::MAX) - 8),
+        Just(i32::from(i16::MAX) - 2),
+    ]
+}
+
+fn wire(v: i32) -> i16 {
+    v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+}
+
 fn check(
     a: &[RegionRect],
     b: &[RegionRect],
@@ -85,6 +115,33 @@ proptest! {
             .collect();
         prop_assert!(is_canonical(&new.boxes));
         prop_assert_eq!(raster(&new.to_rects()), want);
+    }
+
+    /// Arbitrary input becomes canonical boxes covering exactly its pixels,
+    /// and, in the wire's range, the same rects as the wire normaliser.
+    #[test]
+    fn from_rects_normalises_to_the_raster(a in rects()) {
+        let region = Region::from_rects(&a);
+        prop_assert!(is_canonical(&region.boxes), "not canonical: {:?}", region.boxes);
+        prop_assert_eq!(raster_boxes(&region.boxes, 0, 0), raster(&a));
+        prop_assert_eq!(region.to_rects(), canonical(a));
+    }
+
+    /// The same near the wire's limits, where boxes end past `i16::MAX`:
+    /// checked on the internal boxes, which are never clamped.
+    #[test]
+    fn from_rects_keeps_pixels_past_the_wire_limits(
+        (bx, by) in (bases(), bases()),
+        offsets in prop::collection::vec((-3i32..9, -3i32..9, 0u16..7, 0u16..7), 0..7),
+    ) {
+        let a: Vec<RegionRect> = offsets
+            .into_iter()
+            .map(|(x, y, w, h)| r(wire(bx + x), wire(by + y), w, h))
+            .collect();
+        let region = Region::from_rects(&a);
+        prop_assert!(is_canonical(&region.boxes), "not canonical: {:?}", region.boxes);
+        let rects: Vec<Box32> = a.iter().map(|r| Box32::from_rect(*r)).collect();
+        prop_assert_eq!(raster_boxes(&region.boxes, bx, by), raster_boxes(&rects, bx, by), "a={:?}", a);
     }
 
     #[test]
@@ -178,4 +235,33 @@ fn empty_regions() {
     assert_eq!(a.subtract(&e), a);
     assert!(e.subtract(&a).is_empty());
     assert!(Region::from_rects(&[r(0, 0, 0, 0)]).is_empty());
+}
+
+/// Input whose pieces start past `i16::MAX` keeps every pixel and stays
+/// canonical: the constructor never goes through the wire's range.
+#[test]
+fn arbitrary_input_keeps_internal_bands_above_wire_origin_limit() {
+    let input = [r(0, 32760, 10, 20), r(20, 32767, 10, 10)];
+    let region = Region::from_rects(&input);
+    for y in 32760..32780 {
+        for x in 0..30 {
+            let want = input.iter().any(|r| {
+                let b = Box32::from_rect(*r);
+                b.x1 <= x && x < b.x2 && b.y1 <= y && y < b.y2
+            });
+            let got = region
+                .boxes
+                .iter()
+                .any(|b| b.x1 <= x && x < b.x2 && b.y1 <= y && y < b.y2);
+            assert_eq!(
+                got, want,
+                "constructor changed the pixel set at ({x},{y}): {:?}",
+                region.boxes
+            );
+        }
+    }
+    assert!(
+        is_canonical(&region.boxes),
+        "constructor must always return canonical boxes"
+    );
 }
