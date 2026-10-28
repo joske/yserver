@@ -3,7 +3,11 @@
 //! in the same order.
 
 use proptest::prelude::*;
-use yserver_protocol::x11::{ClientId, ResourceId, xfixes::RegionRect};
+use yserver_protocol::x11::{
+    ClientId, ResourceId,
+    shape::{KIND_BOUNDING, KIND_CLIP},
+    xfixes::RegionRect,
+};
 
 use super::oracle;
 use crate::{
@@ -90,8 +94,8 @@ fn create(state: &mut ServerState, w: ResourceId, parent: ResourceId, s: &Spec) 
     }
     if s.bounding.is_some() || s.clip.is_some() {
         let shape = state.shape_windows.entry(w).or_default();
-        shape.bounding.clone_from(&s.bounding);
-        shape.clip.clone_from(&s.clip);
+        shape.set_rects(KIND_BOUNDING, s.bounding.clone());
+        shape.set_rects(KIND_CLIP, s.clip.clone());
     }
 }
 
@@ -271,7 +275,11 @@ fn assert_unmap_matches(state: &mut ServerState, w: ResourceId) {
 fn assert_shape_matches(state: &mut ServerState, w: ResourceId, bounding: Option<Rects>) {
     let new = super::TreeChange::begin(state, w, None);
     let old = oracle::TreeChange::begin(state, w, None);
-    state.shape_windows.entry(w).or_default().bounding = bounding;
+    state
+        .shape_windows
+        .entry(w)
+        .or_default()
+        .set_rects(KIND_BOUNDING, bounding);
     if let (Some(new), Some(old)) = (new, old) {
         assert_eq!(
             new_exposed(new, state, None),
@@ -357,6 +365,75 @@ fn bordered_and_shaped_siblings_match_the_oracle() {
     assert_shape_matches(&mut state, ids[2], Some(vec![r(5, 5, 20, 10)]));
     assert_shape_matches(&mut state, ids[2], None);
     assert_unmap_matches(&mut state, ids[1]);
+    assert_queries_match(&state, &ids);
+}
+
+/// A shape stored as the request path stores it (banded, bands with the
+/// same spans not merged, so not canonical): the cached regions give the
+/// clips the stored rects give, before and after a change.
+#[test]
+fn shapes_stored_by_the_request_path_match_the_oracle() {
+    let specs = vec![
+        spec(ROOT, (0, 0, 40, 30), 1),
+        spec(ROOT, (10, 10, 30, 20), 2),
+        spec(1, (3, 3, 10, 10), 1),
+    ];
+    let (mut state, ids) = build(&specs);
+    let bands = vec![
+        r(0, 0, 10, 5),
+        r(0, 5, 10, 5),
+        r(12, 0, 4, 10),
+        r(-2, 12, 40, 4),
+    ];
+    assert!(crate::nested::set_shape_rects(
+        &mut state,
+        ids[1],
+        KIND_BOUNDING,
+        bands.clone()
+    ));
+    assert!(crate::nested::set_shape_rects(
+        &mut state,
+        ids[1],
+        KIND_CLIP,
+        vec![r(1, 1, 8, 3), r(1, 4, 8, 3), r(20, 1, 4, 6)]
+    ));
+    let shape = &state.shape_windows[&ids[1]];
+    let stored = shape.bounding().unwrap();
+    let canonical = crate::region::Region::from_rects(stored);
+    assert_ne!(
+        &canonical.to_rects(),
+        stored,
+        "the stored shape is meant to be non-canonical"
+    );
+    assert_eq!(shape.bounding_region(), Some(&canonical));
+    assert_eq!(
+        shape.clip_region(),
+        Some(&crate::region::Region::from_rects(shape.clip().unwrap()))
+    );
+    assert_queries_match(&state, &ids);
+
+    let new = super::TreeChange::begin(&state, ids[1], None).unwrap();
+    let old = oracle::TreeChange::begin(&state, ids[1], None).unwrap();
+    crate::nested::set_shape_rects(
+        &mut state,
+        ids[1],
+        KIND_BOUNDING,
+        vec![r(0, 0, 6, 6), r(0, 6, 6, 6), r(8, 2, 20, 2)],
+    );
+    assert_eq!(
+        new_exposed(new, &state, None),
+        old_exposed(old, &state, None)
+    );
+    assert_queries_match(&state, &ids);
+
+    let new = super::TreeChange::begin(&state, ids[1], None).unwrap();
+    let old = oracle::TreeChange::begin(&state, ids[1], None).unwrap();
+    crate::nested::clear_shape_rects(&mut state, ids[1], KIND_BOUNDING);
+    assert_eq!(state.shape_windows[&ids[1]].bounding_region(), None);
+    assert_eq!(
+        new_exposed(new, &state, None),
+        old_exposed(old, &state, None)
+    );
     assert_queries_match(&state, &ids);
 }
 

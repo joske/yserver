@@ -439,10 +439,10 @@ fn handle_shape_request_ops(
                 let dest = ResourceId(req.dest);
                 let mut translated = false;
                 if let Some(s) = state.shape_windows.get_mut(&dest)
-                    && let Some(slot) = s.rects_mut(req.dest_kind)
-                    && let Some(rects) = slot.as_mut()
+                    && let Some(mut rects) = s.rects(req.dest_kind).cloned()
                 {
-                    crate::nested::translate_region(rects, req.x_off, req.y_off);
+                    crate::nested::translate_region(&mut rects, req.x_off, req.y_off);
+                    s.set_rects(req.dest_kind, Some(rects));
                     translated = true;
                 }
                 if translated {

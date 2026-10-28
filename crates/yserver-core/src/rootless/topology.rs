@@ -94,10 +94,7 @@ fn shapes_of(
     bw: u16,
 ) -> (Option<Vec<Rect>>, Option<Vec<Rect>>) {
     state.shape_windows.get(&window).map_or((None, None), |s| {
-        (
-            to_backing(s.bounding.as_ref(), bw),
-            to_backing(s.input.as_ref(), bw),
-        )
+        (to_backing(s.bounding(), bw), to_backing(s.input(), bw))
     })
 }
 

@@ -976,11 +976,7 @@ fn bounding_in_parent(
     (x, y, width, height, border_width): (i16, i16, u16, u16, u16),
 ) -> Vec<x11::xfixes::RegionRect> {
     let outer = outer_rect(x, y, width, height, border_width);
-    let Some(shape) = state
-        .shape_windows
-        .get(&window)
-        .and_then(|s| s.bounding.as_ref())
-    else {
+    let Some(shape) = state.shape_windows.get(&window).and_then(|s| s.bounding()) else {
         return vec![outer];
     };
     let bw = i16::try_from(border_width).unwrap_or(i16::MAX);

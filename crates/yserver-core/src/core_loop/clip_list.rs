@@ -129,12 +129,13 @@ fn border_size(state: &ServerState, w: ResourceId) -> Region {
     match state
         .shape_windows
         .get(&w)
-        .and_then(|s| s.bounding.as_ref())
+        .and_then(|s| s.bounding_region())
     {
         Some(shape) => {
             let bw = i32::from(win.border_width);
-            let shape =
-                Region::from_rects(shape).translate(i32::from(win.x) + bw, i32::from(win.y) + bw);
+            let shape = shape
+                .clone()
+                .translate(i32::from(win.x) + bw, i32::from(win.y) + bw);
             outer.intersect(&shape)
         }
         None => outer,
@@ -155,8 +156,11 @@ fn win_size(state: &ServerState, w: ResourceId) -> Region {
         height: win.height,
     });
     if let Some(shape) = state.shape_windows.get(&w) {
-        for s in [&shape.bounding, &shape.clip].into_iter().flatten() {
-            region = region.intersect(&Region::from_rects(s));
+        for s in [shape.bounding_region(), shape.clip_region()]
+            .into_iter()
+            .flatten()
+        {
+            region = region.intersect(s);
         }
     }
     region

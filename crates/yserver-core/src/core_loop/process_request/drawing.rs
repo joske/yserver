@@ -1245,7 +1245,7 @@ fn copy_exposed_region(
         && let Some(shape) = state
             .shape_windows
             .get(&src)
-            .and_then(|s| s.clip.as_ref().or(s.bounding.as_ref()))
+            .and_then(|s| s.clip().or(s.bounding()))
         && !clip_list::contains(shape, src_box)
     {
         extents = false;

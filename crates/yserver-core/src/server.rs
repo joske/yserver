@@ -2745,11 +2745,17 @@ pub struct PointerBarrier {
     pub last_timestamp: u32,
 }
 
+/// A window's SHAPE regions as clients set them. The bounding and clip
+/// shapes also keep their canonical [`Region`](crate::region::Region),
+/// built once per change for the clip lists; the fields are private so
+/// that no write can leave it stale.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ShapeWindowState {
-    pub bounding: Option<Vec<xfixes::RegionRect>>,
-    pub clip: Option<Vec<xfixes::RegionRect>>,
-    pub input: Option<Vec<xfixes::RegionRect>>,
+    bounding: Option<Vec<xfixes::RegionRect>>,
+    clip: Option<Vec<xfixes::RegionRect>>,
+    input: Option<Vec<xfixes::RegionRect>>,
+    bounding_region: Option<crate::region::Region>,
+    clip_region: Option<crate::region::Region>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3015,13 +3021,55 @@ impl Default for SyncAlarm {
 }
 
 impl ShapeWindowState {
-    pub fn rects_mut(&mut self, kind: u8) -> Option<&mut Option<Vec<xfixes::RegionRect>>> {
+    /// Set (or, with `None`, unset) the shape of `kind`; an unknown kind
+    /// is ignored.
+    pub fn set_rects(&mut self, kind: u8, rects: Option<Vec<xfixes::RegionRect>>) {
+        let region = |r: &Option<Vec<xfixes::RegionRect>>| {
+            r.as_deref().map(crate::region::Region::from_rects)
+        };
         match kind {
-            shape::KIND_BOUNDING => Some(&mut self.bounding),
-            shape::KIND_CLIP => Some(&mut self.clip),
-            shape::KIND_INPUT => Some(&mut self.input),
-            _ => None,
+            shape::KIND_BOUNDING => {
+                self.bounding_region = region(&rects);
+                self.bounding = rects;
+            }
+            shape::KIND_CLIP => {
+                self.clip_region = region(&rects);
+                self.clip = rects;
+            }
+            shape::KIND_INPUT => self.input = rects,
+            _ => {}
         }
+    }
+
+    #[must_use]
+    pub fn bounding(&self) -> Option<&Vec<xfixes::RegionRect>> {
+        self.bounding.as_ref()
+    }
+
+    #[must_use]
+    pub fn clip(&self) -> Option<&Vec<xfixes::RegionRect>> {
+        self.clip.as_ref()
+    }
+
+    #[must_use]
+    pub fn input(&self) -> Option<&Vec<xfixes::RegionRect>> {
+        self.input.as_ref()
+    }
+
+    /// The bounding shape's canonical region.
+    pub(crate) fn bounding_region(&self) -> Option<&crate::region::Region> {
+        self.bounding_region.as_ref()
+    }
+
+    /// The clip shape's canonical region.
+    pub(crate) fn clip_region(&self) -> Option<&crate::region::Region> {
+        self.clip_region.as_ref()
+    }
+
+    /// No shape of any kind is set.
+    #[must_use]
+    pub fn is_unshaped(&self) -> bool {
+        self.bounding.is_none() && self.clip.is_none() && self.input.is_none()
     }
 
     #[must_use]

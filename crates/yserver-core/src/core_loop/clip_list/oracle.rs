@@ -39,7 +39,11 @@ pub(super) fn border_size_in_parent(state: &ServerState, w: ResourceId) -> Vec<R
         width: win.width.saturating_add(bw2),
         height: win.height.saturating_add(bw2),
     };
-    match state.shape_windows.get(&w).and_then(|s| s.bounding.clone()) {
+    match state
+        .shape_windows
+        .get(&w)
+        .and_then(|s| s.bounding().cloned())
+    {
         Some(shape) => {
             let bw = i32::from(win.border_width);
             let shape = translate(shape, i32::from(win.x) + bw, i32::from(win.y) + bw);
@@ -63,7 +67,7 @@ fn win_size(state: &ServerState, w: ResourceId) -> Vec<RegionRect> {
         height: win.height,
     }];
     if let Some(shape) = state.shape_windows.get(&w) {
-        for s in [&shape.bounding, &shape.clip].into_iter().flatten() {
+        for s in [shape.bounding(), shape.clip()].into_iter().flatten() {
             region = intersect(&region, s);
         }
     }

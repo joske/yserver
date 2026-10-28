@@ -915,15 +915,19 @@ pub(crate) fn set_shape_rects(
     kind: u8,
     rects: Vec<x11xfixes::RegionRect>,
 ) -> bool {
+    if !matches!(
+        kind,
+        x11shape::KIND_BOUNDING | x11shape::KIND_CLIP | x11shape::KIND_INPUT
+    ) {
+        return false;
+    }
     let normalized = normalize_region_rects(rects);
     let state = server.shape_windows.entry(window).or_default();
-    if let Some(slot) = state.rects_mut(kind) {
-        let changed = slot.as_deref() != Some(normalized.as_slice());
-        *slot = Some(normalized);
-        changed
-    } else {
-        false
+    let changed = state.rects(kind).map(Vec::as_slice) != Some(normalized.as_slice());
+    if changed {
+        state.set_rects(kind, Some(normalized));
     }
+    changed
 }
 
 /// Resolve `window`'s host XID and current per-kind rect list, then forward
@@ -943,12 +947,9 @@ pub(crate) fn clear_shape_rects(server: &mut ServerState, window: ResourceId, ki
     let Some(state) = server.shape_windows.get_mut(&window) else {
         return false;
     };
-    let Some(slot) = state.rects_mut(kind) else {
-        return false;
-    };
-    let changed = slot.is_some();
-    *slot = None;
-    if state.bounding.is_none() && state.clip.is_none() && state.input.is_none() {
+    let changed = state.rects(kind).is_some();
+    state.set_rects(kind, None);
+    if state.is_unshaped() {
         server.shape_windows.remove(&window);
     }
     changed
@@ -1354,7 +1355,11 @@ mod tests {
         fn clear_shape_rects_reverts_to_default_region() {
             let mut server = ServerState::new();
             let window = ROOT_WINDOW;
-            server.shape_windows.entry(window).or_default().bounding = Some(vec![r(1, 2, 3, 4)]);
+            server
+                .shape_windows
+                .entry(window)
+                .or_default()
+                .set_rects(shape::KIND_BOUNDING, Some(vec![r(1, 2, 3, 4)]));
 
             assert!(shape_kind_is_set(&server, window, shape::KIND_BOUNDING));
             clear_shape_rects(&mut server, window, shape::KIND_BOUNDING);

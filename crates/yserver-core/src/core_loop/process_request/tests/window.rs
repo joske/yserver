@@ -317,7 +317,7 @@ fn translate_coordinates_skips_empty_input_shaped_cow() {
         .shape_windows
         .entry(COMPOSITE_OVERLAY_WINDOW)
         .or_default()
-        .input = Some(Vec::new());
+        .set_rects(yserver_protocol::x11::shape::KIND_INPUT, Some(Vec::new()));
     assert_eq!(
         translate(&mut state),
         popup.0,
