@@ -543,6 +543,11 @@ pub(crate) fn newly_exposed(
 }
 
 #[cfg(test)]
+mod equivalence;
+#[cfg(test)]
+mod oracle;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
