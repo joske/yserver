@@ -98,7 +98,11 @@ two drafts; its answers are folded in below.
     burst of 8 (marco's two buffers, with room for compositor restarts)
     refills one token per 30 s (`SERVER_SCANOUT_PROMOTE_REFILL`). A per-epoch
     count would end a healthy long session on the composed path; the bucket
-    still bounds a restart loop to one 6–8 ms promotion per 30 s;
+    still bounds a restart loop to one 6–8 ms promotion per 30 s. Tokens
+    are spent per A/B rotation, not per buffer: a newly observed rotation
+    promotes only when two tokens are available, and stays on the Copy path
+    otherwise. One token would leave the double buffer half promoted, so A
+    flips while B's Present requests an unflip (codex review 3);
   - live: at most 4 promoted drawables alive at once (bounds the memory of
     non-pooled linear root-sized storage).
 
@@ -433,7 +437,10 @@ Tests (recording backend, fake promoter):
   attempted until a topology-epoch change.
 - Eight successes in a burst exhaust the success bucket; the ninth is
   refused until 30 s of test time refill one token, and a topology change
-  does not refill it. Five live promoted drawables are refused by the live
+  does not refill it. With one token available, an alternating A/B
+  rotation promotes neither buffer and every Present stays on Copy; after a
+  second token refills, both promote and A/B alternate direct flips with no
+  unflip. Five live promoted drawables are refused by the live
   cap, and freeing one reopens it.
 - A promoter error leaves storage untouched (the fake asserts no flush and
   no swap) and the Present takes the Copy path.
@@ -477,10 +484,13 @@ Changes:
   `server_export_deadline_teardown`, run
   `teardown_direct_before_topology_requery("server_source_export_deadline")`
   then `relight_after_direct_teardown`, and complete the token with the fd
-  once `stop_direct_after_scanout_replaced` has run. If either step fails:
+  once `stop_direct_after_scanout_replaced` has run. If the teardown fails:
   complete with `BadPixmap` (`C/process_request/dri3.rs:349-367`,
   `:435-449`), count `server_export_deadline_fail`, release the credit and
-  the token's pin, and keep the frame's framebuffer and source pins.
+  the token's pin, and keep the frame's framebuffer and source pins. If the
+  teardown succeeds but relight fails, the teardown has already released
+  the direct frame and its pins, so the source is off every plane: complete
+  the token with the fd.
 - An unreferenced drawable is answered immediately, and its M1 entry and
   descriptor are dropped in the same call.
 
@@ -536,10 +546,14 @@ Changes:
   (it writes the snapshot image, not a drawable). Classification:
   `ClipSnapshotRefresh` and `GlyphUpload` (atlas) write no drawable;
   `LayoutTransition` writes its `drawable_id` (a layout transition is a
-  write access); every other variant writes its `dst_id`. At the
-  `engine/frame.rs:443-455` flush, a `debug_assert!` checks that every
+  write access, which Vulkan allows to read and write bound memory; the
+  variant is only constructed in a test today, so this is a conservative
+  rule for the future); every other variant writes its `dst_id`. The check
+  runs in `close_open_frame` (`R/render/engine/frame.rs:525`), which still
+  owns `open_frame.ops`, before the flush: a `debug_assert!` that every
   op's written id that is in `scanout_fenced` was stamped by
-  `touch_render_write` (is in `scanout_writes`).
+  `touch_render_write` (is in `scanout_writes`). `flush_submit_group` cannot
+  see the ops.
 - `scanout_fenced: HashSet<DrawableId>`, and
   `scanout_write_fence: HashMap<DrawableId, ScanoutWriteFence>` with the D8
   tri-state. Promotion (Task 6) inserts `NoPendingWrite`; retirement and
