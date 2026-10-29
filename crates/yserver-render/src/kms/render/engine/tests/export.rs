@@ -439,3 +439,155 @@ fn scanout_promoted_storage_is_never_pooled() {
     assert_eq!(accepted(), before + 1, "promoted storage is not pooled");
     engine.drain_all(&mut gpu);
 }
+
+/// Submit everything recorded so far.
+fn submit_all(engine: &mut RenderEngine, store: &mut DrawableStore, gpu: &mut GpuCore) {
+    engine
+        .close_open_frame(
+            store,
+            gpu,
+            crate::kms::render::frame_builder::CloseReason::SyncWait,
+        )
+        .expect("close frame");
+    engine
+        .flush_render_batch(
+            store,
+            gpu,
+            crate::kms::render::engine::RenderFlushReason::Present,
+        )
+        .expect("flush batch");
+    engine
+        .flush_submit_group(
+            store,
+            gpu,
+            crate::kms::render::submit_group::FlushReason::SyncBoundary,
+        )
+        .expect("flush group");
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn only_the_destination_of_a_read_gets_a_scanout_write() {
+    use crate::kms::render::store::ScanoutWriteFence;
+
+    let Some((mut gpu, _vk)) = scanout_capable_gpu() else {
+        return;
+    };
+    let mut store = DrawableStore::new();
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
+    let dst = alloc_drawable_3a(&gpu, &mut store, 0x40, W, H);
+    let src = alloc_drawable_3a(&gpu, &mut store, 0x41, W, H);
+    let mask = alloc_drawable_3a(&gpu, &mut store, 0x42, W, H);
+    put(&mut engine, &mut store, &mut gpu, src, &gradient(1));
+    put(&mut engine, &mut store, &mut gpu, mask, &gradient(2));
+    submit_all(&mut engine, &mut store, &mut gpu);
+    for id in [dst, src, mask] {
+        store.track_scanout_writes(id);
+    }
+
+    engine
+        .copy_area(
+            &mut store,
+            &mut gpu,
+            Src::server_internal(src),
+            Dst::server_internal(dst),
+            full_rect(),
+            vk::Offset2D::default(),
+        )
+        .expect("copy_area");
+    let rect = [crate::kms::vk::ops::render::CompositeRect {
+        src_x: 0,
+        src_y: 0,
+        mask_x: 0,
+        mask_y: 0,
+        dst_x: 0,
+        dst_y: 0,
+        width: u32::from(W),
+        height: u32::from(H),
+    }];
+    engine
+        .render_composite(
+            &mut store,
+            &mut gpu,
+            3,
+            ResolvedSource::Drawable(SourceDrawable::whole(src)),
+            ResolvedSource::Drawable(SourceDrawable::whole(mask)),
+            Dst::server_internal(dst),
+            &rect,
+            None,
+            Repeat::None,
+            Repeat::None,
+            None,
+            None,
+            false,
+            0,
+            0,
+            0,
+        )
+        .expect("render_composite");
+    assert!(store.has_unsubmitted_scanout_write(dst));
+    assert!(
+        !store.has_unsubmitted_scanout_write(src),
+        "a CopyArea and Composite source"
+    );
+    assert!(
+        !store.has_unsubmitted_scanout_write(mask),
+        "a Composite mask"
+    );
+
+    submit_all(&mut engine, &mut store, &mut gpu);
+    assert!(!store.has_unsubmitted_scanout_write(dst));
+    assert!(matches!(
+        store.scanout_write_fence(dst),
+        Some(ScanoutWriteFence::Fence(_) | ScanoutWriteFence::ExportFailed)
+    ));
+    for read in [src, mask] {
+        assert!(matches!(
+            store.scanout_write_fence(read),
+            Some(ScanoutWriteFence::NoPendingWrite)
+        ));
+    }
+    engine.drain_all(&mut gpu);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn one_submit_group_fences_every_scanout_drawable_it_wrote() {
+    use crate::kms::render::store::ScanoutWriteFence;
+    use std::os::fd::AsRawFd as _;
+
+    let Some((mut gpu, vk)) = scanout_capable_gpu() else {
+        return;
+    };
+    if !vk.supports_sync_fd() {
+        eprintln!("skipping: this Vulkan ICD exports no SYNC_FD");
+        return;
+    }
+    let mut store = DrawableStore::new();
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
+    let a = alloc_drawable_3a(&gpu, &mut store, 0x50, W, H);
+    let b = alloc_drawable_3a(&gpu, &mut store, 0x51, W, H);
+    store.track_scanout_writes(a);
+    store.track_scanout_writes(b);
+    put(&mut engine, &mut store, &mut gpu, a, &gradient(3));
+    put(&mut engine, &mut store, &mut gpu, b, &gradient(4));
+    submit_all(&mut engine, &mut store, &mut gpu);
+
+    let (Some(ScanoutWriteFence::Fence(fa)), Some(ScanoutWriteFence::Fence(fb))) =
+        (store.scanout_write_fence(a), store.scanout_write_fence(b))
+    else {
+        panic!("both written drawables carry the submit's sync_file");
+    };
+    assert!(Arc::ptr_eq(fa, fb), "one sync_file serves the whole group");
+    let fd = Arc::clone(fa);
+    engine.drain_all(&mut gpu);
+    let mut poll = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd for the duration of the call.
+    let ready = unsafe { libc::poll(&raw mut poll, 1, 1000) };
+    assert_eq!(ready, 1, "the sync_file signals once the submit completes");
+    assert_ne!(poll.revents & libc::POLLIN, 0);
+}

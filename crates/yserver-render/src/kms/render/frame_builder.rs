@@ -1131,6 +1131,28 @@ impl RecordedOp {
     }
 }
 
+impl RecordedOp {
+    /// The drawable this op writes, for scanout write fencing (D7). Not
+    /// [`Self::dst_id`]: `ClipSnapshotRefresh` reads its live mask and
+    /// writes only the snapshot image. A layout transition is a write
+    /// access. No wildcard arm: a new variant must be classified here.
+    pub(crate) fn written_drawable(&self) -> Option<DrawableId> {
+        match self {
+            RecordedOp::CompositeGlyphs(g) => Some(g.dst_id),
+            RecordedOp::RenderComposite(rc) => Some(rc.dst_id),
+            RecordedOp::GlyphUpload(_) | RecordedOp::ClipSnapshotRefresh(_) => None,
+            RecordedOp::LayoutTransition(lt) => Some(lt.drawable_id),
+            RecordedOp::CopyArea(ca) => Some(ca.dst_id),
+            RecordedOp::PutImage(pi) => Some(pi.dst_id),
+            RecordedOp::FillRect(fr) => Some(fr.dst_id),
+            RecordedOp::LogicFill(lf) => Some(lf.dst_id),
+            RecordedOp::ImageText(it) => Some(it.dst_id),
+            RecordedOp::RenderTrapsOrTris(rt) => Some(rt.dst_id),
+            RecordedOp::MaskedCopyArea(m) => Some(m.dst_id),
+        }
+    }
+}
+
 impl OpenFrame {
     /// Phase B.2 Pitfall 6 / codex round 4 finding 3: append a recorded
     /// op and apply the post-op overlay updates in a SINGLE critical
@@ -1459,6 +1481,7 @@ mod op_tests {
             damage_rect: None,
         });
         assert_eq!(composite_glyphs.dst_id(), Some(id7));
+        assert_eq!(composite_glyphs.written_drawable(), Some(id7));
 
         // GlyphUpload → None (utility variant — writes to atlas).
         let glyph_upload = RecordedOp::GlyphUpload(RecordedGlyphUpload {
@@ -1483,6 +1506,7 @@ mod op_tests {
             },
         });
         assert_eq!(glyph_upload.dst_id(), None);
+        assert_eq!(glyph_upload.written_drawable(), None);
 
         // LayoutTransition → None (utility variant).
         let layout_transition = RecordedOp::LayoutTransition(RecordedLayoutTransition {
@@ -1494,6 +1518,7 @@ mod op_tests {
             target_layout: vk::ImageLayout::UNDEFINED,
         });
         assert_eq!(layout_transition.dst_id(), None);
+        assert_eq!(layout_transition.written_drawable(), Some(id7));
 
         // CopyArea → Some(id7).
         let copy_area = RecordedOp::CopyArea(Box::new(RecordedCopyArea {
@@ -1511,6 +1536,7 @@ mod op_tests {
             self_overlap_scratch: None,
         }));
         assert_eq!(copy_area.dst_id(), Some(id7));
+        assert_eq!(copy_area.written_drawable(), Some(id7));
 
         // PutImage → Some(id7).
         let put_image = RecordedOp::PutImage(Box::new(RecordedPutImage {
@@ -1522,6 +1548,7 @@ mod op_tests {
             staging_pin_idx: PinnedStagingIdx(0),
         }));
         assert_eq!(put_image.dst_id(), Some(id7));
+        assert_eq!(put_image.written_drawable(), Some(id7));
 
         // FillRect → Some(id7).
         let fill_rect = RecordedOp::FillRect(Box::new(RecordedFillRect {
@@ -1534,6 +1561,7 @@ mod op_tests {
             rects: Vec::new(),
         }));
         assert_eq!(fill_rect.dst_id(), Some(id7));
+        assert_eq!(fill_rect.written_drawable(), Some(id7));
 
         // LogicFill → Some(id7).
         let logic_fill = RecordedOp::LogicFill(Box::new(RecordedLogicFill {
@@ -1548,6 +1576,7 @@ mod op_tests {
             rects: Vec::new(),
         }));
         assert_eq!(logic_fill.dst_id(), Some(id7));
+        assert_eq!(logic_fill.written_drawable(), Some(id7));
 
         // ImageText → Some(id7).
         let image_text = RecordedOp::ImageText(Box::new(RecordedImageText {
@@ -1560,6 +1589,7 @@ mod op_tests {
             instance_count: 0,
         }));
         assert_eq!(image_text.dst_id(), Some(id7));
+        assert_eq!(image_text.written_drawable(), Some(id7));
 
         // RenderTrapsOrTris → Some(id7).
         let render_traps = RecordedOp::RenderTrapsOrTris(Box::new(RecordedRenderTrapsOrTris {
@@ -1590,6 +1620,87 @@ mod op_tests {
             vertex_pin: PinnedUploadIdx(0),
         }));
         assert_eq!(render_traps.dst_id(), Some(id7));
+        assert_eq!(render_traps.written_drawable(), Some(id7));
+    }
+
+    /// The variants `b3_recorded_op_dst_id_covers_every_variant` does not
+    /// build. A clip snapshot refresh names its live mask as `dst_id` but
+    /// writes no drawable.
+    #[test]
+    fn written_drawable_covers_the_remaining_variants() {
+        let id7 = DrawableId::for_tests(7);
+        let render_composite = RecordedOp::RenderComposite(Box::new(RecordedRenderComposite {
+            op: 3,
+            dst_id: id7,
+            dst_image: vk::Image::null(),
+            dst_view: vk::ImageView::null(),
+            dst_extent: vk::Extent2D::default(),
+            dst_format: vk::Format::B8G8R8A8_UNORM,
+            dst_has_alpha: false,
+            dst_old_layout: vk::ImageLayout::UNDEFINED,
+            src_view: vk::ImageView::null(),
+            mask_view: vk::ImageView::null(),
+            src_alias_view: None,
+            dst_readback_view: None,
+            attrs: crate::kms::vk::ops::render::CompositeAttrs {
+                src_extent: vk::Extent2D::default(),
+                mask_extent: vk::Extent2D::default(),
+                src_offset: [0, 0],
+                mask_offset: [0, 0],
+                src_repeat: 0,
+                mask_repeat: 0,
+                src_force_opaque: false,
+                mask_force_opaque: false,
+                src_xform: crate::kms::vk::ops::render::AffineXform::IDENTITY,
+                mask_xform: crate::kms::vk::ops::render::AffineXform::IDENTITY,
+            },
+            src_clear_color: None,
+            mask_clear_color: None,
+            mask_component_alpha: false,
+            needs_dst_readback: false,
+            rects: Box::new([]),
+            clip_rects: None,
+            dst_bounds: None,
+            descriptor_set: vk::DescriptorSet::null(),
+        }));
+        assert_eq!(render_composite.written_drawable(), Some(id7));
+
+        let masked_copy = RecordedOp::MaskedCopyArea(Box::new(RecordedMaskedCopyArea {
+            dst_id: id7,
+            src_id: DrawableId::for_tests(8),
+            dst_format: vk::Format::B8G8R8A8_UNORM,
+            dst_image: vk::Image::null(),
+            dst_view: vk::ImageView::null(),
+            dst_extent: vk::Extent2D::default(),
+            src_image: vk::Image::null(),
+            src_old_layout: vk::ImageLayout::UNDEFINED,
+            live_src_offset: [0, 0],
+            sample_view: vk::ImageView::null(),
+            sample_extent: vk::Extent2D::default(),
+            mask_image: vk::Image::null(),
+            mask_view: vk::ImageView::null(),
+            mask_extent: vk::Extent2D::default(),
+            clip_origin: [0, 0],
+            copy_offset: [0, 0],
+            dst_rect: vk::Rect2D::default(),
+            scissors: Vec::new(),
+            dst_old_layout: vk::ImageLayout::UNDEFINED,
+            mask_old_layout: vk::ImageLayout::UNDEFINED,
+            self_overlap_scratch: None,
+        }));
+        assert_eq!(masked_copy.written_drawable(), Some(id7));
+
+        let clip_refresh = RecordedOp::ClipSnapshotRefresh(Box::new(RecordedClipSnapshotRefresh {
+            snapshot_id: super::super::engine::SnapshotId(1),
+            snapshot_image: vk::Image::null(),
+            snapshot_old_layout: vk::ImageLayout::UNDEFINED,
+            live_mask_id: id7,
+            live_mask_image: vk::Image::null(),
+            live_mask_old_layout: vk::ImageLayout::UNDEFINED,
+            copy_extent: vk::Extent2D::default(),
+        }));
+        assert_eq!(clip_refresh.dst_id(), Some(id7));
+        assert_eq!(clip_refresh.written_drawable(), None);
     }
 
     #[test]

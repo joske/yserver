@@ -1305,6 +1305,7 @@ impl KmsBackend {
             awaiting_outputs: HashSet::new(),
             accepted_event_id: None,
             async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
+            in_fence: None,
         };
 
         if self

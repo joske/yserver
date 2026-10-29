@@ -135,7 +135,7 @@ impl RenderEngine {
             open.touched.first_touch(target, prior_dst_ticket);
             open.layouts.first_touch_drawable(target, dst_pre_layout);
         }
-        store.touch_render_fence(target, frame_ticket.clone());
+        store.touch_render_write(target, frame_ticket.clone());
         for r in &clamped {
             store.damage(target, *r);
         }
@@ -385,7 +385,7 @@ impl RenderEngine {
             open.touched.first_touch(target, prior_dst_ticket);
             open.layouts.first_touch_drawable(target, dst_pre_layout);
         }
-        store.touch_render_fence(target, frame_ticket.clone());
+        store.touch_render_write(target, frame_ticket.clone());
         for r in &vk_rects {
             store.damage(target, *r);
         }
@@ -551,7 +551,7 @@ impl RenderEngine {
                 open.layouts.first_touch_drawable(src, src_pre_layout);
             }
         }
-        store.touch_render_fence(dst, frame_ticket.clone());
+        store.touch_render_write(dst, frame_ticket.clone());
         if src != dst {
             store.touch_render_fence(src, frame_ticket.clone());
         }
@@ -773,7 +773,7 @@ impl RenderEngine {
         if let Some(sid) = mask.snapshot_id {
             snapshot_first_touch(inner, sid);
         }
-        store.touch_render_fence(dst, frame_ticket.clone());
+        store.touch_render_write(dst, frame_ticket.clone());
         if src != dst {
             store.touch_render_fence(src, frame_ticket.clone());
         }

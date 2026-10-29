@@ -407,7 +407,7 @@ impl RenderEngine {
             // a window where an intervening FreePixmap(src) before
             // flush would destroy the VkImage while the batch CB
             // still samples it.
-            store.touch_render_fence(dst_id, ticket.clone());
+            store.touch_render_write(dst_id, ticket.clone());
             store.touch_render_fence(src_id, ticket.clone());
             if let Some(mid) = mask_id_opt {
                 store.touch_render_fence(mid, ticket.clone());
@@ -554,7 +554,7 @@ impl RenderEngine {
         end_and_submit_op(inner, gpu, batch.cb, &batch.ticket)?;
 
         // CPU bookkeeping.
-        store.touch_render_fence(batch.key.dst, batch.ticket.clone());
+        store.touch_render_write(batch.key.dst, batch.ticket.clone());
         for tid in &batch.touched_drawables {
             store.touch_render_fence(*tid, batch.ticket.clone());
         }

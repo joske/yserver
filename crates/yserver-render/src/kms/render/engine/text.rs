@@ -247,7 +247,7 @@ impl RenderEngine {
             open.layouts
                 .first_touch_drawable(target, dst_pre_frame_layout);
         }
-        store.touch_render_fence(target, frame_ticket.clone());
+        store.touch_render_write(target, frame_ticket.clone());
 
         // (7) N7 atlas transactional discipline (LOAD-BEARING): snapshot
         //     atlas_prev_ticket + atlas layout on the FIRST atlas-touching op

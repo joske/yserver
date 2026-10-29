@@ -1238,6 +1238,7 @@ fn direct_scanout_probe_tests_the_request_it_commits() {
         src_y: 0,
         src_w: u32::from(platform.outputs[0].width),
         src_h: u32::from(platform.outputs[0].height),
+        in_fence_fd: None,
     }];
     let device = &platform.devices[0].device;
     let sink = &platform.devices[0].atomic_commit_sink;

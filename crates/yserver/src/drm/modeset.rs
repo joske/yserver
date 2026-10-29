@@ -2006,6 +2006,9 @@ pub(crate) struct DirectScanoutPlaneState<'a> {
     pub(crate) src_y: u32,
     pub(crate) src_w: u32,
     pub(crate) src_h: u32,
+    /// `IN_FENCE_FD` of a server-owned source's last write; the caller owns
+    /// the fd. `None` omits the property.
+    pub(crate) in_fence_fd: Option<std::os::fd::BorrowedFd<'a>>,
 }
 
 /// One primary-plane assignment used to leave a shared direct-scanout
@@ -2222,7 +2225,7 @@ pub(crate) fn submit_direct_scanout(
         crate::drm::async_flip::FlipTiming::Vsync => cursor_positions,
         crate::drm::async_flip::FlipTiming::Async => &[],
     };
-    let mut request = direct_scanout_request(fb, planes, cursor_positions);
+    let mut request = direct_scanout_request(fb, planes, cursor_positions)?;
     let crtc_properties = if timing == crate::drm::async_flip::FlipTiming::Vsync {
         append_pending_crtc_properties(
             device,
@@ -2285,7 +2288,7 @@ pub(crate) fn test_direct_scanout(
     atomic_commit_sink.test_only(
         device,
         cursor_commit_kind(cursor_positions),
-        direct_scanout_request(fb, planes, cursor_positions),
+        direct_scanout_request(fb, planes, cursor_positions)?,
     )
 }
 
@@ -2301,7 +2304,7 @@ fn direct_scanout_request(
     fb: framebuffer::Handle,
     planes: &[DirectScanoutPlaneState<'_>],
     cursor_positions: &[CursorPlanePosition],
-) -> AtomicCommitRequest {
+) -> io::Result<AtomicCommitRequest> {
     let mut request = AtomicCommitRequest::new();
     for state in planes {
         let output = state.output;
@@ -2347,11 +2350,18 @@ fn direct_scanout_request(
             output.plane_crtc_h_prop,
             u64::from(state.src_h),
         );
+        if let Some(fd) = state.in_fence_fd {
+            let prop = output
+                .plane_in_fence_fd_prop
+                .ok_or_else(|| io::Error::other("scanout M2: plane has no IN_FENCE_FD"))?;
+            let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
+            request.add_raw_property(output.plane.into(), prop, raw as i64 as u64);
+        }
     }
     for position in cursor_positions {
         request.add_cursor_position(*position);
     }
-    request
+    Ok(request)
 }
 
 /// Replace every primary plane in a direct-scanout output set atomically.

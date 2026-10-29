@@ -471,7 +471,7 @@ impl RenderEngine {
             open.touched.first_touch(dst_id, prior_dst_ticket);
             open.layouts.first_touch_drawable(dst_id, dst_pre_layout);
         }
-        store.touch_render_fence(dst_id, frame_ticket.clone());
+        store.touch_render_write(dst_id, frame_ticket.clone());
 
         // src (only when Drawable): SAME three mutations on the src DrawableId.
         // Skipping these is a lifetime bug per codex round-9 CRITICAL.

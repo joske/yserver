@@ -168,7 +168,7 @@ impl RenderEngine {
             open.layouts.first_touch_drawable(target, dst_pre_layout);
             open.pins.pin_staging(Arc::clone(&staging))
         };
-        store.touch_render_fence(target, frame_ticket.clone());
+        store.touch_render_write(target, frame_ticket.clone());
         store.damage(target, dst_rect);
 
         // Phase B.3 (N1): push the op and set the terminal layout

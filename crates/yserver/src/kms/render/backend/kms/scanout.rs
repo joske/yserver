@@ -367,6 +367,7 @@ pub(in crate::kms::render::backend) fn scanout_m1_plane_states<'a>(
                 src_y,
                 src_w: u32::from(layout.width),
                 src_h: u32::from(layout.height),
+                in_fence_fd: None,
             }
         })
         .collect()
@@ -1278,7 +1279,13 @@ impl KmsBackend {
             .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
             .ok_or_else(|| io::Error::other("direct successor framebuffer disappeared"))?;
         let output_indices = self.direct_scope_outputs(scope);
-        let plane_states = scanout_m1_plane_states(&self.platform.outputs, &output_indices, scope);
+        let mut plane_states =
+            scanout_m1_plane_states(&self.platform.outputs, &output_indices, scope);
+        // A server-owned source's write fence gates every plane of the commit (D8).
+        let in_fence_fd = frame.in_fence.as_ref().map(std::os::fd::AsFd::as_fd);
+        for state in &mut plane_states {
+            state.in_fence_fd = in_fence_fd;
+        }
         let (device, atomic_commit_sink) = self
             .platform
             .primary_device()
@@ -2909,26 +2916,7 @@ impl KmsBackend {
             return;
         }
 
-        let plane_states: Vec<crate::drm::modeset::DirectScanoutPlaneState<'_>> = output_indices
-            .iter()
-            .map(|&output_idx| {
-                let layout = &self.platform.outputs[output_idx];
-                let (src_x, src_y) = match scope {
-                    DirectScope::Root => (
-                        u32::try_from(layout.x).expect("root geometry validated non-negative"),
-                        u32::try_from(layout.y).expect("root geometry validated non-negative"),
-                    ),
-                    DirectScope::Output(_) => (0, 0),
-                };
-                crate::drm::modeset::DirectScanoutPlaneState {
-                    output: &layout.output,
-                    src_x,
-                    src_y,
-                    src_w: u32::from(layout.width),
-                    src_h: u32::from(layout.height),
-                }
-            })
-            .collect();
+        let plane_states = scanout_m1_plane_states(&self.platform.outputs, &output_indices, scope);
         let prober = self.pstate.scanout_m1_prober;
         match prober(self, source_id, scope, &plane_states) {
             Ok(entry) => {

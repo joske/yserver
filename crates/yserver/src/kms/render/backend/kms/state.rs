@@ -383,6 +383,12 @@ pub(in crate::kms::render::backend) struct ServerScanoutSources {
     /// Topology signature the failure count belongs to.
     pub(in crate::kms::render::backend) failure_epoch: u64,
     pub(in crate::kms::render::backend) tokens: PromoteTokens,
+    /// The D8 CPU-wait fallback has been logged.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "server-owned flips (plan Task 9) read it")
+    )]
+    pub(in crate::kms::render::backend) fence_cpu_wait_warned: bool,
 }
 
 impl ServerScanoutSources {
@@ -393,6 +399,7 @@ impl ServerScanoutSources {
             failures: 0,
             failure_epoch: 0,
             tokens: PromoteTokens::new(now),
+            fence_cpu_wait_warned: false,
         }
     }
 
@@ -551,6 +558,9 @@ pub(in crate::kms::render::backend) struct DirectPresentFrame {
     /// directly constructed frames have no event identity.
     pub(in crate::kms::render::backend) accepted_event_id: Option<u64>,
     pub(in crate::kms::render::backend) async_outcome: crate::drm::async_flip::AsyncOutcome,
+    /// `IN_FENCE_FD` for a server-owned source: the sync_file of the last
+    /// submit that wrote it, captured when this Present was taken (D8).
+    pub(in crate::kms::render::backend) in_fence: Option<OwnedFd>,
 }
 
 /// A successful server-owned promotion: the descriptor and the accepted

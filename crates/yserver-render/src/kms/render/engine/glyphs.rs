@@ -360,7 +360,7 @@ impl RenderEngine {
             open.layouts
                 .first_touch_drawable(dst_id, dst_pre_frame_layout);
         }
-        store.touch_render_fence(dst_id, frame_ticket.clone());
+        store.touch_render_write(dst_id, frame_ticket.clone());
 
         // (5) Snapshot atlas prev ticket + atlas layout (first-touch
         //     only). The atlas snapshot is the rollback target if the
@@ -491,7 +491,7 @@ impl RenderEngine {
                 open.atlas_prev_ticket_snapshot = Some(atlas_pre_ticket_reopened);
                 open.layouts.first_touch_atlas(atlas_pre_layout_reopened);
             }
-            store.touch_render_fence(dst_id, frame_ticket_reopened);
+            store.touch_render_write(dst_id, frame_ticket_reopened);
             // If the SINGLE call still exceeds the ceiling — drop
             // excess glyphs. The spec accepts atlas-slot leakage in
             // the rare-failure regime; we extend that to "pathological

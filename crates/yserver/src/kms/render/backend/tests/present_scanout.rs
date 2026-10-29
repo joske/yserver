@@ -1587,6 +1587,7 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
         awaiting_outputs: std::collections::HashSet::from([0, 1]),
         accepted_event_id: Some(0x5a),
         async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
+        in_fence: None,
     });
 
     let reference = PresentClockSample {

@@ -440,10 +440,17 @@ impl RenderEngine {
         // recorded exported writes and the eventual real submit would skip
         // their wait/publish. Leaving them queued lets the next non-empty
         // flush pick them up.
-        let exported = if gpu.submit_group_size() > 0 {
-            store.take_exported_writes()
+        let (exported, scanout_written) = if gpu.submit_group_size() > 0 {
+            // Writes recorded into the open frame or render batch are not
+            // in this group yet; they stay queued for the submit that has
+            // them.
+            let held = self.writes_outside_submit_group();
+            (
+                store.take_exported_writes(),
+                store.take_scanout_writes(&held),
+            )
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let exported_borrows: Vec<(std::os::fd::BorrowedFd<'_>, bool)> = {
             use std::os::fd::AsFd as _;
@@ -452,7 +459,28 @@ impl RenderEngine {
                 .map(|(f, prewaited)| (f.as_fd(), *prewaited))
                 .collect()
         };
-        let result = gpu.flush_submit_group_with_exports(reason, &exported_borrows);
+        let result = gpu
+            .flush_submit_group_with_exports(reason, &exported_borrows, !scanout_written.is_empty())
+            .map(|(outcome, sync_fd)| {
+                if !scanout_written.is_empty() {
+                    let fence = sync_fd.map_or(
+                        crate::kms::render::store::ScanoutWriteFence::ExportFailed,
+                        |fd| {
+                            crate::kms::render::store::ScanoutWriteFence::Fence(
+                                std::sync::Arc::new(fd),
+                            )
+                        },
+                    );
+                    store.set_scanout_write_fence(&scanout_written, &fence);
+                }
+                outcome
+            })
+            .inspect_err(|_| {
+                store.set_scanout_write_fence(
+                    &scanout_written,
+                    &crate::kms::render::store::ScanoutWriteFence::ExportFailed,
+                );
+            });
         // Drain the platform's last_flush_outcome regardless of Ok/Err
         // — both branches in platform's flush_submit_group populate it
         // before returning. The engine queues it for backend telemetry
@@ -482,6 +510,29 @@ impl RenderEngine {
                 Err(e)
             }
         }
+    }
+
+    /// Drawables written by work recorded but not yet appended to the submit
+    /// group: the open frame's ops and the pending render batch's target.
+    fn writes_outside_submit_group(&self) -> std::collections::HashSet<DrawableId> {
+        let Some(inner) = self.inner.as_ref() else {
+            return std::collections::HashSet::new();
+        };
+        let mut held: std::collections::HashSet<DrawableId> = inner
+            .frame_builder
+            .open
+            .as_ref()
+            .map(|open| {
+                open.ops
+                    .iter()
+                    .filter_map(crate::kms::render::frame_builder::RecordedOp::written_drawable)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(batch) = inner.pending_render_batch.as_ref() {
+            held.insert(batch.key.dst);
+        }
+        held
     }
 
     /// Phase A: check whether the platform's SubmitGroup has hit its
@@ -540,6 +591,15 @@ impl RenderEngine {
             (*open_frame_box, inner.frame_seq)
         };
         let frame_ticket = open_frame.ticket.clone();
+        debug_assert!(
+            open_frame
+                .ops
+                .iter()
+                .filter_map(crate::kms::render::frame_builder::RecordedOp::written_drawable)
+                .filter(|id| store.is_scanout_fenced(*id))
+                .all(|id| store.has_unsubmitted_scanout_write(id)),
+            "a frame op wrote a scanout-fenced drawable without touch_render_write"
+        );
         if let Some(filter) = Self::frame_builder_trace_filter() {
             Self::trace_frame_ops(store, frame_seq, &open_frame.ops, filter);
         }

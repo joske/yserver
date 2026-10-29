@@ -157,6 +157,7 @@ impl KmsBackend {
             unreachable!("matched Promoted above");
         };
         *state = ServerScanoutState::Disqualified(Some(descriptor));
+        self.store.untrack_scanout_writes(source_id);
         let server = &mut self.pstate.scanout_m0.server;
         server.reject_exported = server.reject_exported.saturating_add(1);
         log::info!(
@@ -187,6 +188,114 @@ impl KmsBackend {
             self.pstate.request_direct_unflip(reason);
         }
         self.release_unreferenced_server_scanout();
+    }
+
+    /// Before a direct commit of promoted `source_id`: submit its unsubmitted
+    /// writes, then return the `IN_FENCE_FD` the commit carries (D8). `None`
+    /// means no fence is needed, either because nothing wrote the source
+    /// since promotion or because the CPU already waited. A failed CPU wait
+    /// unflips and errs: the Present takes the Copy path.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "server-owned flips (plan Task 9) call it")
+    )]
+    pub(in crate::kms::render::backend) fn server_direct_source_fence(
+        &mut self,
+        source_id: DrawableId,
+    ) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+        use crate::kms::render::store::ScanoutWriteFence;
+
+        if self.store.has_unsubmitted_scanout_write(source_id) {
+            self.flush_for_direct_source()?;
+            let server = &mut self.pstate.scanout_m0.server;
+            server.direct_flush_added = server.direct_flush_added.saturating_add(1);
+        } else {
+            let server = &mut self.pstate.scanout_m0.server;
+            server.direct_flush_reused = server.direct_flush_reused.saturating_add(1);
+        }
+        let fence = self.store.scanout_write_fence(source_id).cloned();
+        let explicit = match fence {
+            None | Some(ScanoutWriteFence::NoPendingWrite) => {
+                let server = &mut self.pstate.scanout_m0.server;
+                server.fence_none = server.fence_none.saturating_add(1);
+                return Ok(None);
+            }
+            Some(ScanoutWriteFence::Fence(fd)) => self
+                .platform
+                .outputs
+                .iter()
+                .all(|output| output.output.plane_in_fence_fd_prop.is_some())
+                .then(|| fd.try_clone().ok())
+                .flatten(),
+            Some(ScanoutWriteFence::ExportFailed) => None,
+        };
+        if let Some(fd) = explicit {
+            let server = &mut self.pstate.scanout_m0.server;
+            server.fence_explicit = server.fence_explicit.saturating_add(1);
+            return Ok(Some(fd));
+        }
+        self.wait_for_direct_source_on_cpu(source_id)?;
+        Ok(None)
+    }
+
+    /// Submit recorded work: render batch, open frame, submit group.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "server-owned flips (plan Task 9) call it")
+    )]
+    fn flush_for_direct_source(&mut self) -> std::io::Result<()> {
+        self.engine
+            .flush_render_batch(
+                &mut self.store,
+                &mut self.platform.gpu,
+                crate::kms::render::engine::RenderFlushReason::Present,
+            )
+            .map_err(|error| std::io::Error::other(format!("direct source flush: {error:?}")))?;
+        self.engine
+            .close_open_frame(
+                &mut self.store,
+                &mut self.platform.gpu,
+                crate::kms::render::frame_builder::CloseReason::PresentCompletionSignal,
+            )
+            .map_err(|error| std::io::Error::other(format!("direct source frame: {error:?}")))?;
+        self.engine
+            .flush_submit_group(
+                &mut self.store,
+                &mut self.platform.gpu,
+                crate::kms::render::submit_group::FlushReason::PresentCompletionSignal,
+            )
+            .map_err(|error| std::io::Error::other(format!("direct source submit: {error:?}")))?;
+        Ok(())
+    }
+
+    /// The D8 fallback: no usable sync_file or no `IN_FENCE_FD` property, so
+    /// wait for the source's last render ticket, which may name a later read.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "server-owned flips (plan Task 9) call it")
+    )]
+    fn wait_for_direct_source_on_cpu(&mut self, source_id: DrawableId) -> std::io::Result<()> {
+        let server = &mut self.pstate.scanout_m0.server;
+        server.fence_cpu_wait = server.fence_cpu_wait.saturating_add(1);
+        if !std::mem::replace(&mut self.pstate.server_scanout.fence_cpu_wait_warned, true) {
+            log::warn!(
+                target: "yserver::scanout_server",
+                "direct scanout of a server-owned source waits for its writes on the CPU",
+            );
+        }
+        let ticket = self
+            .store
+            .get(source_id)
+            .and_then(|drawable| drawable.last_render_ticket.clone());
+        let result = match (ticket, self.platform.gpu.vk()) {
+            (Some(ticket), Some(vk)) => ticket.wait(vk),
+            _ => Ok(()),
+        };
+        result.map_err(|error| {
+            self.pstate
+                .request_direct_unflip("server_source_fence_failed");
+            std::io::Error::other(format!("direct source fence wait: {error:?}"))
+        })
     }
 
     /// Whether a direct frame (pending, queued or current) names `id` as its
@@ -520,6 +629,7 @@ impl KmsBackend {
                         .server_scanout
                         .sources
                         .insert(id, ServerScanoutState::Promoted(descriptor));
+                    self.store.track_scanout_writes(id);
                 }
                 Err(error) => {
                     server.promote_fail = server.promote_fail.saturating_add(1);

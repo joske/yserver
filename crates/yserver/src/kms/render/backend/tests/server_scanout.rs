@@ -1068,3 +1068,299 @@ fn a_failed_deadline_teardown_fails_the_export_and_keeps_the_frame() {
         "a failed export does not keep the loop spinning"
     );
 }
+
+// ── Task 8: server-write fence on direct plane commits ───────────────────
+
+fn recording_sink(
+    b: &mut KmsBackend,
+) -> Rc<crate::drm::atomic::tests_support::RecordingAtomicCommitExecutor> {
+    let recorder =
+        Rc::new(crate::drm::atomic::tests_support::RecordingAtomicCommitExecutor::default());
+    b.platform.devices[0].atomic_commit_sink =
+        Rc::new(crate::drm::atomic::AtomicCommitSink::new(recorder.clone()));
+    recorder
+}
+
+const IN_FENCE_PROP: u32 = 0x7701;
+
+fn in_fence_values(
+    record: &crate::drm::atomic::tests_support::AtomicCommitRecord,
+) -> Vec<(u32, u64)> {
+    record
+        .properties
+        .iter()
+        .filter(|update| u32::from(update.property) == IN_FENCE_PROP)
+        .map(|update| (u32::from(update.object), update.value))
+        .collect()
+}
+
+fn dev_null_fd() -> std::os::fd::OwnedFd {
+    std::fs::File::open("/dev/null")
+        .expect("open /dev/null")
+        .into()
+}
+
+fn raw_value(fd: &std::os::fd::OwnedFd) -> u64 {
+    i64::from(std::os::fd::AsRawFd::as_raw_fd(fd)) as u64
+}
+
+#[test]
+fn a_fenced_direct_commit_sets_in_fence_on_every_plane() {
+    use std::os::fd::AsFd as _;
+
+    let mut b = KmsBackend::for_tests();
+    let recorder = recording_sink(&mut b);
+    push_test_output(&mut b, 0x51);
+    for output in &mut b.platform.outputs {
+        output.output.plane_in_fence_fd_prop =
+            Some(::drm::control::from_u32(IN_FENCE_PROP).expect("handle"));
+    }
+    let fence = dev_null_fd();
+    for in_fence in [Some(fence.as_fd()), None] {
+        let platform = &b.platform;
+        let planes: Vec<_> = platform
+            .outputs
+            .iter()
+            .map(|layout| crate::drm::modeset::DirectScanoutPlaneState {
+                output: &layout.output,
+                src_x: 0,
+                src_y: 0,
+                src_w: u32::from(layout.width),
+                src_h: u32::from(layout.height),
+                in_fence_fd: in_fence,
+            })
+            .collect();
+        crate::drm::modeset::submit_direct_scanout(
+            &platform.devices[0].device,
+            &platform.devices[0].atomic_commit_sink,
+            ::drm::control::from_u32(91).expect("fb"),
+            &planes,
+            &[],
+            false,
+            crate::drm::async_flip::FlipTiming::Vsync,
+            crate::drm::atomic::TearingCommitContext::NONE,
+        )
+        .expect("record the direct commit");
+    }
+    let records = recorder.records();
+    let planes: Vec<u32> = b
+        .platform
+        .outputs
+        .iter()
+        .map(|layout| u32::from(layout.output.plane))
+        .collect();
+    let fenced: Vec<_> = planes
+        .iter()
+        .map(|plane| (*plane, raw_value(&fence)))
+        .collect();
+    assert_eq!(in_fence_values(&records[0]), fenced, "one fence per plane");
+    assert!(
+        in_fence_values(&records[1]).is_empty(),
+        "no fence, no property"
+    );
+}
+
+/// An imported source with an accepted probe entry, and a pending direct
+/// frame of it awaiting output 0; returns the source xid.
+fn pending_imported_frame(b: &mut KmsBackend) -> u32 {
+    let (fallback_xid, source_xid) = (0x0063_0000, 0x0063_0001);
+    seed_window(b, fallback_xid, None, 0, 0);
+    let mut storage = Storage::for_tests_null(
+        ash::vk::Extent2D {
+            width: 100,
+            height: 100,
+        },
+        ash::vk::Format::B8G8R8A8_UNORM,
+    );
+    storage.imported_dmabuf = Some(imported_dmabuf_for_test(100, 100));
+    let source = b
+        .store
+        .allocate(source_xid, DrawableKind::Pixmap, 24, false, storage)
+        .expect("imported source");
+    b.pstate.scanout_m1.entries.insert(
+        source,
+        ScanoutM1ProbeEntry::accepted(
+            crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(fake_framebuffer_handle(
+                source,
+            )),
+        ),
+    );
+    retain_direct_frame_from_source_test(b, source_xid, fallback_xid, 100, 100);
+    let mut pending = b.pstate.direct.root_mut().current.take().expect("frame");
+    pending.awaiting_outputs = std::iter::once(0).collect();
+    b.pstate.direct.root_mut().pending = Some(pending);
+    source_xid
+}
+
+#[test]
+fn a_queued_successor_commits_the_fence_of_its_own_present() {
+    let mut b = KmsBackend::for_tests();
+    let recorder = recording_sink(&mut b);
+    b.platform.outputs[0].output.plane_in_fence_fd_prop =
+        Some(::drm::control::from_u32(IN_FENCE_PROP).expect("handle"));
+    let source_xid = pending_imported_frame(&mut b);
+    let fallback_xid = 0x0063_0000;
+    retain_direct_frame_from_source_test(&mut b, source_xid, fallback_xid, 100, 100);
+    let mut successor = b
+        .pstate
+        .direct
+        .root_mut()
+        .current
+        .take()
+        .expect("successor");
+    let own = dev_null_fd();
+    let own_raw = raw_value(&own);
+    successor.in_fence = Some(own);
+    b.queue_direct_successor(successor);
+    // A later write leaves a newer fence; the queued Present keeps its own.
+    let later = dev_null_fd();
+    assert_ne!(raw_value(&later), own_raw);
+
+    let clock = yserver_core::backend::PresentClockSample {
+        msc: 4,
+        ust: 400,
+        source: yserver_core::backend::PresentClockSource::PageFlip,
+    };
+    assert!(b.retire_direct_output(0, None, clock));
+    assert!(
+        b.pstate.direct.root().pending.is_some(),
+        "the successor flipped"
+    );
+    let records = recorder.records();
+    let plane = u32::from(b.platform.outputs[0].output.plane);
+    assert_eq!(
+        in_fence_values(records.last().expect("commit")),
+        [(plane, own_raw)]
+    );
+}
+
+#[test]
+fn an_imported_direct_commit_carries_no_fence() {
+    let mut b = KmsBackend::for_tests();
+    let recorder = recording_sink(&mut b);
+    b.platform.outputs[0].output.plane_in_fence_fd_prop =
+        Some(::drm::control::from_u32(IN_FENCE_PROP).expect("handle"));
+    let source_xid = pending_imported_frame(&mut b);
+    retain_direct_frame_from_source_test(&mut b, source_xid, 0x0063_0000, 100, 100);
+    let successor = b
+        .pstate
+        .direct
+        .root_mut()
+        .current
+        .take()
+        .expect("successor");
+    b.queue_direct_successor(successor);
+    let clock = yserver_core::backend::PresentClockSample {
+        msc: 4,
+        ust: 400,
+        source: yserver_core::backend::PresentClockSource::PageFlip,
+    };
+    assert!(b.retire_direct_output(0, None, clock));
+    assert!(b.pstate.direct.root().pending.is_some());
+    assert!(in_fence_values(recorder.records().last().expect("commit")).is_empty());
+}
+
+#[test]
+fn the_direct_source_fence_follows_the_write_state() {
+    use crate::kms::render::store::ScanoutWriteFence;
+
+    let a_xid = 0x0063_0101;
+    let (mut b, _, a) = promoted_backend(a_xid);
+    assert!(b.store.is_scanout_fenced(a), "promotion fences the writes");
+    let server = |b: &KmsBackend| {
+        let s = &b.pstate.scanout_m0.server;
+        (
+            s.direct_flush_added,
+            s.direct_flush_reused,
+            s.fence_explicit,
+            s.fence_none,
+            s.fence_cpu_wait,
+        )
+    };
+
+    // No write since promotion: no fence and no flush.
+    assert!(b.server_direct_source_fence(a).expect("fence").is_none());
+    assert_eq!(server(&b), (0, 1, 0, 1, 0));
+
+    // An unsubmitted write is flushed first.
+    b.store
+        .touch_render_write(a, crate::kms::render::gpu::FenceTicket::for_tests_stub());
+    assert!(b.store.has_unsubmitted_scanout_write(a));
+    assert!(b.server_direct_source_fence(a).expect("fence").is_none());
+    assert_eq!(server(&b), (1, 1, 0, 2, 0), "the flush was added");
+    b.store.untrack_scanout_writes(a);
+    b.store.track_scanout_writes(a);
+
+    // A sync_file, but a plane without IN_FENCE_FD: wait on the CPU.
+    b.store.for_tests_set_scanout_write_fence(
+        a,
+        ScanoutWriteFence::Fence(std::sync::Arc::new(dev_null_fd())),
+    );
+    assert!(b.server_direct_source_fence(a).expect("fence").is_none());
+    assert_eq!(server(&b), (1, 2, 0, 2, 1));
+
+    // Every plane takes IN_FENCE_FD: the commit carries a dup.
+    b.platform.outputs[0].output.plane_in_fence_fd_prop =
+        Some(::drm::control::from_u32(IN_FENCE_PROP).expect("handle"));
+    assert!(b.server_direct_source_fence(a).expect("fence").is_some());
+    assert_eq!(server(&b), (1, 3, 1, 2, 1));
+
+    // The writing submit exported no sync_file: wait on the CPU.
+    b.store
+        .for_tests_set_scanout_write_fence(a, ScanoutWriteFence::ExportFailed);
+    assert!(b.server_direct_source_fence(a).expect("fence").is_none());
+    assert_eq!(server(&b), (1, 4, 1, 2, 2));
+    assert!(b.pstate.server_scanout.fence_cpu_wait_warned);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn an_unsubmitted_write_is_flushed_before_the_direct_commit_fence() {
+    use crate::kms::render::store::ScanoutWriteFence;
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    if !b.platform.gpu.vk().is_some_and(|vk| vk.supports_sync_fd()) {
+        eprintln!("skipping: this Vulkan ICD exports no SYNC_FD");
+        return;
+    }
+    for output in &mut b.platform.outputs {
+        output.output.plane_in_fence_fd_prop =
+            Some(::drm::control::from_u32(IN_FENCE_PROP).expect("handle"));
+    }
+    let pixmap = Backend::create_pixmap(&mut b, None, 24, 8, 8).expect("pixmap");
+    let id = b.store.lookup(pixmap.as_raw()).expect("store entry");
+    b.store.track_scanout_writes(id);
+    Backend::put_image(&mut b, None, pixmap.as_raw(), 24, 1, 1, 0, 0, &[1, 2, 3, 0])
+        .expect("write the source");
+    assert!(b.store.has_unsubmitted_scanout_write(id));
+
+    let fence = b.server_direct_source_fence(id).expect("fence");
+    assert!(fence.is_some(), "the flushed write's sync_file");
+    assert!(
+        !b.store.has_unsubmitted_scanout_write(id),
+        "the write was submitted"
+    );
+    assert!(matches!(
+        b.store.scanout_write_fence(id),
+        Some(ScanoutWriteFence::Fence(_))
+    ));
+    let server = &b.pstate.scanout_m0.server;
+    assert_eq!(
+        (server.direct_flush_added, server.direct_flush_reused),
+        (1, 0)
+    );
+    assert_eq!(server.fence_explicit, 1);
+
+    assert!(b.server_direct_source_fence(id).expect("fence").is_some());
+    let server = &b.pstate.scanout_m0.server;
+    assert_eq!(
+        (server.direct_flush_added, server.direct_flush_reused),
+        (1, 1)
+    );
+}

@@ -620,7 +620,7 @@ impl RenderEngine {
             open.layouts
                 .first_touch_drawable(dst_id, dst_pre_frame_layout);
         }
-        store.touch_render_fence(dst_id, frame_ticket.clone());
+        store.touch_render_write(dst_id, frame_ticket.clone());
 
         // (5) Resolve solid scratch views directly — these are 1×1
         //     engine-owned `SolidColorImage`s that never grow, so no

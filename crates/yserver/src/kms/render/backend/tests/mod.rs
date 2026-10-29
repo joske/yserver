@@ -1003,6 +1003,7 @@ pub(super) fn retain_direct_frame_from_source_test(
         awaiting_outputs: std::collections::HashSet::new(),
         accepted_event_id: None,
         async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
+        in_fence: None,
     });
     b.pstate.direct.root_mut().hold_direct = true;
 }
@@ -1266,6 +1267,7 @@ pub(super) fn install_direct_frame_for_target_test(
             std::collections::HashSet::from([0])
         },
         async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
+        in_fence: None,
     };
     if current {
         b.pstate.direct.root_mut().current = Some(frame);
