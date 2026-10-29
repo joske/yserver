@@ -1299,32 +1299,28 @@ fn an_imported_direct_commit_carries_no_fence() {
 
 #[test]
 fn the_direct_source_fence_follows_the_write_state() {
-    use crate::kms::render::store::ScanoutWriteFence;
+    use crate::kms::render::{
+        backend::{ServerFenceKind, ServerFenceTally},
+        store::ScanoutWriteFence,
+    };
 
     let a_xid = 0x0063_0101;
     let (mut b, _, a) = promoted_backend(a_xid);
     assert!(b.store.is_scanout_fenced(a), "promotion fences the writes");
-    let server = |b: &KmsBackend| {
-        let s = &b.pstate.scanout_m0.server;
-        (
-            s.direct_flush_added,
-            s.direct_flush_reused,
-            s.fence_explicit,
-            s.fence_none,
-            s.fence_cpu_wait,
-        )
+    let fence = |b: &mut KmsBackend| {
+        let (fd, tally) = b.server_direct_source_fence(a).expect("fence");
+        (fd.is_some(), tally)
     };
+    let tally = |flush_added, kind| ServerFenceTally { flush_added, kind };
 
     // No write since promotion: no fence and no flush.
-    assert!(b.server_direct_source_fence(a).expect("fence").is_none());
-    assert_eq!(server(&b), (0, 1, 0, 1, 0));
+    assert_eq!(fence(&mut b), (false, tally(false, ServerFenceKind::None)));
 
     // An unsubmitted write is flushed first.
     b.store
         .touch_render_write(a, crate::kms::render::gpu::FenceTicket::for_tests_stub());
     assert!(b.store.has_unsubmitted_scanout_write(a));
-    assert!(b.server_direct_source_fence(a).expect("fence").is_none());
-    assert_eq!(server(&b), (1, 1, 0, 2, 0), "the flush was added");
+    assert_eq!(fence(&mut b), (false, tally(true, ServerFenceKind::None)));
     b.store.untrack_scanout_writes(a);
     b.store.track_scanout_writes(a);
 
@@ -1333,27 +1329,49 @@ fn the_direct_source_fence_follows_the_write_state() {
         a,
         ScanoutWriteFence::Fence(std::sync::Arc::new(dev_null_fd())),
     );
-    assert!(b.server_direct_source_fence(a).expect("fence").is_none());
-    assert_eq!(server(&b), (1, 2, 0, 2, 1));
+    assert_eq!(
+        fence(&mut b),
+        (false, tally(false, ServerFenceKind::CpuWait))
+    );
 
     // Every plane takes IN_FENCE_FD: the commit carries a dup.
     b.platform.outputs[0].output.plane_in_fence_fd_prop =
         Some(::drm::control::from_u32(IN_FENCE_PROP).expect("handle"));
-    assert!(b.server_direct_source_fence(a).expect("fence").is_some());
-    assert_eq!(server(&b), (1, 3, 1, 2, 1));
+    assert_eq!(
+        fence(&mut b),
+        (true, tally(false, ServerFenceKind::Explicit))
+    );
 
     // The writing submit exported no sync_file: wait on the CPU.
     b.store
         .for_tests_set_scanout_write_fence(a, ScanoutWriteFence::ExportFailed);
-    assert!(b.server_direct_source_fence(a).expect("fence").is_none());
-    assert_eq!(server(&b), (1, 4, 1, 2, 2));
+    assert_eq!(
+        fence(&mut b),
+        (false, tally(false, ServerFenceKind::CpuWait))
+    );
     assert!(b.pstate.server_scanout.fence_cpu_wait_warned);
+
+    let server = &b.pstate.scanout_m0.server;
+    assert_eq!(
+        (
+            server.direct_flush_added,
+            server.direct_flush_reused,
+            server.fence_explicit,
+            server.fence_none,
+            server.fence_cpu_wait,
+        ),
+        (0, 0, 0, 0, 0),
+        "nothing was committed"
+    );
 }
 
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn an_unsubmitted_write_is_flushed_before_the_direct_commit_fence() {
-    use crate::kms::render::store::ScanoutWriteFence;
+    use crate::kms::render::{
+        backend::{ServerFenceKind, ServerFenceTally},
+        store::ScanoutWriteFence,
+    };
 
     let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
@@ -1377,7 +1395,7 @@ fn an_unsubmitted_write_is_flushed_before_the_direct_commit_fence() {
         .expect("write the source");
     assert!(b.store.has_unsubmitted_scanout_write(id));
 
-    let fence = b.server_direct_source_fence(id).expect("fence");
+    let (fence, tally) = b.server_direct_source_fence(id).expect("fence");
     assert!(fence.is_some(), "the flushed write's sync_file");
     assert!(
         !b.store.has_unsubmitted_scanout_write(id),
@@ -1387,19 +1405,17 @@ fn an_unsubmitted_write_is_flushed_before_the_direct_commit_fence() {
         b.store.scanout_write_fence(id),
         Some(ScanoutWriteFence::Fence(_))
     ));
-    let server = &b.pstate.scanout_m0.server;
     assert_eq!(
-        (server.direct_flush_added, server.direct_flush_reused),
-        (1, 0)
+        tally,
+        ServerFenceTally {
+            flush_added: true,
+            kind: ServerFenceKind::Explicit,
+        }
     );
-    assert_eq!(server.fence_explicit, 1);
 
-    assert!(b.server_direct_source_fence(id).expect("fence").is_some());
-    let server = &b.pstate.scanout_m0.server;
-    assert_eq!(
-        (server.direct_flush_added, server.direct_flush_reused),
-        (1, 1)
-    );
+    let (fence, tally) = b.server_direct_source_fence(id).expect("fence");
+    assert!(fence.is_some());
+    assert!(!tally.flush_added, "the write was already submitted");
 }
 
 // ── Task 9: direct flips of server-owned sources ──────────────────────────
@@ -1556,6 +1572,12 @@ fn a_present_during_a_pending_flip_queues_as_latest_wins_successor() {
     retire_flip(&mut b);
     assert_eq!(completions(&b), [(10, FLIP), (11, SKIP)]);
     assert_eq!(submitted(), [(a, false), (b_id, true)]);
+    let server = &b.pstate.scanout_m0.server;
+    assert_eq!(
+        (server.fence_none, server.fence_explicit),
+        (1, 1),
+        "the skipped Present 11 counts no fence"
+    );
 }
 
 #[test]
@@ -1860,4 +1882,295 @@ fn shutdown_drops_the_entry_before_the_descriptor() {
         Some(fd),
         "the fd outlives the framebuffer"
     );
+}
+
+// ── Task 11: revalidation, fallbacks and the COW shadow ──────────────────
+
+/// Marco's A/B with A on screen after a retired direct flip of Present 10.
+fn live_server_owned_frame(a_xid: u32, b_xid: u32) -> (KmsBackend, DrawableId, DrawableId) {
+    let (mut b, a, b_id) = flipping_double_buffer(a_xid, b_xid);
+    assert!(present(&mut b, 10, a_xid, STAGE));
+    retire_flip(&mut b);
+    let current = b.pstate.direct.root().current.as_ref().expect("A is live");
+    assert_eq!(current.source_id, a);
+    assert_eq!(
+        current.target,
+        crate::kms::render::backend::ScanoutM0Target::CowDescendant,
+        "marco's stage under the COW"
+    );
+    (b, a, b_id)
+}
+
+fn unflip_reason(b: &KmsBackend) -> Option<&'static str> {
+    b.pstate.direct.root().unflip_reason
+}
+
+#[test]
+fn a_cow_shape_change_unflips_a_server_owned_frame() {
+    use yserver_protocol::x11::xfixes::RegionRect;
+
+    let (a_xid, b_xid) = (0x0066_0001, 0x0066_0002);
+    let (mut b, _, _) = live_server_owned_frame(a_xid, b_xid);
+    let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+    let (w, h) = (b.platform.fb_w, b.platform.fb_h);
+    let half = RegionRect {
+        x: 0,
+        y: 0,
+        width: w / 2,
+        height: h,
+    };
+    Backend::set_shape_rectangles(&mut b, None, cow, 0, Some(&[half])).expect("shape");
+    assert_eq!(unflip_reason(&b), Some("shape_clips_direct_frame"));
+    assert!(!present(&mut b, 11, b_xid, STAGE), "Copy");
+    assert_eq!(submitted().len(), 1);
+}
+
+// This fixture has no scene, so `cursor_mode()` is `Sw` and every composite
+// tick of a live direct frame unflips on the cursor; these two triggers are
+// proved at the Present gate, which reads the cursor and the root overlay.
+
+#[test]
+fn a_visible_software_cursor_sends_the_next_present_to_copy() {
+    let (a_xid, b_xid) = (0x0066_0011, 0x0066_0012);
+    let (mut b, _, _) = live_server_owned_frame(a_xid, b_xid);
+    assert!(b.direct_cursor_eligible());
+    Backend::set_cursor_hidden(&mut b, false);
+    assert!(!b.direct_cursor_eligible(), "the cursor left the plane");
+    assert!(!present(&mut b, 11, b_xid, STAGE), "Copy");
+    assert_eq!(
+        unflip_reason(&b),
+        Some("ineligible_authoritative_root_present")
+    );
+    assert_eq!(submitted().len(), 1);
+}
+
+#[test]
+fn a_root_overlay_sends_the_next_present_to_copy() {
+    let (a_xid, b_xid) = (0x0066_0021, 0x0066_0022);
+    let (mut b, _, _) = live_server_owned_frame(a_xid, b_xid);
+    b.scene.root_overlay_toggle(
+        yserver_protocol::x11::ClientId(7),
+        0xff_ffff,
+        &[ash::vk::Rect2D {
+            offset: ash::vk::Offset2D { x: 10, y: 10 },
+            extent: ash::vk::Extent2D {
+                width: 40,
+                height: 20,
+            },
+        }],
+    );
+    assert!(!present(&mut b, 11, b_xid, STAGE), "Copy");
+    assert_eq!(
+        unflip_reason(&b),
+        Some("ineligible_authoritative_root_present")
+    );
+    assert_eq!(submitted().len(), 1);
+}
+
+#[test]
+fn a_restack_beneath_the_cow_keeps_a_server_owned_frame() {
+    // The COW stays above every root child (`compGetWindowTopmostChild`),
+    // so a mapped and raised panel reaches the screen through marco's frame.
+    let (a_xid, b_xid) = (0x0066_0031, 0x0066_0032);
+    let (mut b, _, _) = live_server_owned_frame(a_xid, b_xid);
+    let panel = 0x0066_0039;
+    seed_window(&mut b, panel, None, 0, 0);
+    Backend::map_subwindow(&mut b, None, panel).expect("map the panel");
+    b.core.top_level_order = vec![panel];
+    Backend::sync_top_level_order(&mut b, &yserver_core::server::ServerState::new());
+    assert_eq!(unflip_reason(&b), None);
+    assert!(present(&mut b, 11, b_xid, STAGE), "still direct");
+}
+
+#[test]
+fn unmapping_the_destination_unflips_a_server_owned_frame() {
+    let (a_xid, b_xid) = (0x0066_0041, 0x0066_0042);
+    let (mut b, _, _) = live_server_owned_frame(a_xid, b_xid);
+    Backend::unmap_subwindow(&mut b, None, STAGE).expect("unmap");
+    assert_eq!(unflip_reason(&b), Some("unmap_direct_frame_drawable"));
+    assert!(!present(&mut b, 11, b_xid, STAGE), "Copy");
+}
+
+#[test]
+fn releasing_the_overlay_window_unflips_a_server_owned_frame() {
+    let (a_xid, b_xid) = (0x0066_0051, 0x0066_0052);
+    let (mut b, _, _) = live_server_owned_frame(a_xid, b_xid);
+    let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+    b.cow_id = b.store.lookup(cow);
+    b.pstate.direct.root_mut().unflip_shadow_ready = true;
+    assert!(Backend::prepare_overlay_release(&mut b, None).expect("prepare"));
+    Backend::retire_overlay_window(&mut b, None);
+    assert_eq!(unflip_reason(&b), Some("release_last_overlay_window"));
+    assert!(b.cow_id.is_some(), "the COW outlives the direct frame");
+    unflip_and_retire(&mut b);
+    assert!(b.cow_id.is_none());
+}
+
+#[test]
+fn a_rejected_reprobe_takes_copy_until_an_invalidation() {
+    let a_xid = 0x0066_0061;
+    let (mut b, a, recorder) = reprobing_backend(a_xid);
+    let test_only =
+        |recorder: &crate::drm::atomic::tests_support::RecordingAtomicCommitExecutor| {
+            recorder
+                .records()
+                .iter()
+                .filter(|record| {
+                    record
+                        .flags
+                        .contains(::drm::control::AtomicCommitFlags::TEST_ONLY)
+                })
+                .count()
+        };
+    change_mode_clock(&mut b);
+    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
+    observe(&mut b, a_xid, STAGE);
+    assert_eq!(test_only(&recorder), 1);
+    let entry = b
+        .pstate
+        .scanout_m1
+        .entries
+        .get(&a)
+        .expect("a negative entry");
+    assert!(entry.framebuffer().is_none());
+    assert!(is_promoted(&b, a), "the descriptor stays");
+
+    for id in 20..30 {
+        assert!(
+            !present(&mut b, id, a_xid, STAGE),
+            "Present {id} takes Copy"
+        );
+    }
+    assert_eq!(
+        test_only(&recorder),
+        1,
+        "no re-probe before an invalidation"
+    );
+
+    change_mode_clock(&mut b);
+    observe(&mut b, a_xid, STAGE);
+    assert_eq!(test_only(&recorder), 2, "re-probed after the invalidation");
+    assert!(accepted_framebuffer(&b, a).is_some());
+    assert_eq!(attempts(&b), 1, "never promoted again");
+}
+
+#[test]
+fn a_failed_source_fence_takes_copy_and_unflips() {
+    use crate::kms::render::store::ScanoutWriteFence;
+
+    fn failing_waiter(_b: &KmsBackend, _id: DrawableId) -> std::io::Result<()> {
+        Err(std::io::Error::other("scripted fence wait failure"))
+    }
+
+    let (a_xid, b_xid) = (0x0066_0071, 0x0066_0072);
+    let (mut b, _, b_id) = live_server_owned_frame(a_xid, b_xid);
+    b.pstate.direct_source_cpu_waiter = failing_waiter;
+    b.store
+        .for_tests_set_scanout_write_fence(b_id, ScanoutWriteFence::ExportFailed);
+    assert!(!present(&mut b, 11, b_xid, STAGE), "Copy");
+    assert_eq!(unflip_reason(&b), Some("server_source_fence_failed"));
+    let root = b.pstate.direct.root();
+    assert_eq!(root.unflip_fallback_source, Some(b_id));
+    assert!(root.queued_successor.is_none() && root.pending.is_none());
+    assert_eq!(submitted().len(), 1, "only Present 10 was committed");
+    let server = &b.pstate.scanout_m0.server;
+    assert_eq!(
+        (server.fence_none, server.fence_cpu_wait),
+        (1, 0),
+        "the failed Present counts no fence"
+    );
+}
+
+#[test]
+fn a_present_that_falls_to_copy_after_its_fence_counts_nothing() {
+    let (a_xid, b_xid) = (0x0066_0081, 0x0066_0082);
+    let (mut b, _, _) = flipping_double_buffer(a_xid, b_xid);
+    b.scene.test_set_flip_in_flight(true);
+    assert!(
+        !present(&mut b, 10, a_xid, STAGE),
+        "a scene flip is pending"
+    );
+    let counts = |b: &KmsBackend| {
+        let server = &b.pstate.scanout_m0.server;
+        (
+            server.direct_flush_added + server.direct_flush_reused,
+            server.fence_none + server.fence_explicit + server.fence_cpu_wait,
+        )
+    };
+    assert_eq!(counts(&b), (0, 0));
+    b.scene.test_set_flip_in_flight(false);
+    assert!(present(&mut b, 11, a_xid, STAGE));
+    assert_eq!(counts(&b), (1, 1));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn the_unflip_shadow_of_a_promoted_source_holds_its_pixels() {
+    let (w, h) = (32_u16, 16_u16);
+    let mut b = match KmsBackend::for_tests_with_vk_dimensions(w, h) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let source = Backend::create_pixmap(&mut b, None, 24, w, h).expect("source");
+    let fallback = Backend::create_pixmap(&mut b, None, 24, w, h).expect("fallback target");
+    let source_id = b.store.lookup(source.as_raw()).expect("source entry");
+    if let Err(error) = b.engine.promote_drawable_for_scanout(
+        &mut b.platform.gpu,
+        &mut b.store,
+        source_id,
+        &[],
+        |_| Ok::<(), ()>(()),
+    ) {
+        eprintln!("skipping: this Vulkan ICD cannot promote for scanout ({error:?})");
+        return;
+    }
+    assert!(
+        b.store
+            .get(source_id)
+            .is_some_and(|drawable| drawable.storage.is_exportable()),
+        "the source is promoted linear storage"
+    );
+
+    let mut written = Vec::with_capacity(usize::from(w) * usize::from(h) * 4);
+    for y in 0..h {
+        for x in 0..w {
+            let (x, y) = (x as u8, y as u8);
+            written.extend_from_slice(&[x.wrapping_mul(7), y.wrapping_mul(13), x ^ y, 0]);
+        }
+    }
+    Backend::put_image(&mut b, None, source.as_raw(), 24, w, h, 0, 0, &written)
+        .expect("write the source");
+    retain_direct_frame_from_source_test(&mut b, source.as_raw(), fallback.as_raw(), w, h);
+    b.materialize_direct_shadow_for_unflip()
+        .expect("materialize the unflip shadow");
+    assert!(b.pstate.direct.root().unflip_shadow_ready);
+
+    let fallback_id = b.store.lookup(fallback.as_raw()).expect("fallback entry");
+    let shadow = b
+        .engine
+        .get_image(
+            &mut b.store,
+            &mut b.platform.gpu,
+            crate::kms::render::target::Src::server_internal(fallback_id),
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D::default(),
+                extent: ash::vk::Extent2D {
+                    width: u32::from(w),
+                    height: u32::from(h),
+                },
+            },
+            24,
+        )
+        .expect("read the shadow");
+    // Depth 24: the fourth byte of each pixel is padding, not pixel data.
+    let colour = |bytes: &[u8]| -> Vec<[u8; 3]> {
+        bytes
+            .chunks_exact(4)
+            .map(|pixel| [pixel[0], pixel[1], pixel[2]])
+            .collect()
+    };
+    assert_eq!(colour(&shadow), colour(&written));
 }

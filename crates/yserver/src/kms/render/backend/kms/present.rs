@@ -1287,9 +1287,9 @@ impl KmsBackend {
             return Ok(false);
         }
         // Fence a promoted source's writes before this Present is submitted or queued (D8).
-        let in_fence = if self.pstate.server_scanout.is_promoted(source_id) {
+        let (in_fence, fence_tally) = if self.pstate.server_scanout.is_promoted(source_id) {
             match self.server_direct_source_fence(source_id) {
-                Ok(fence) => fence,
+                Ok((fence, tally)) => (fence, Some(tally)),
                 Err(error) => {
                     log::warn!(
                         target: "yserver::scanout_server",
@@ -1305,7 +1305,7 @@ impl KmsBackend {
                 }
             }
         } else {
-            None
+            (None, None)
         };
 
         let source_pin = self.pin_direct_source(source_id);
@@ -1327,6 +1327,7 @@ impl KmsBackend {
             accepted_event_id: None,
             async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
             in_fence,
+            fence_tally,
         };
 
         if self

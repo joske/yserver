@@ -1588,6 +1588,7 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
         accepted_event_id: Some(0x5a),
         async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
         in_fence: None,
+        fence_tally: None,
     });
 
     let reference = PresentClockSample {

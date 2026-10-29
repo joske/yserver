@@ -1004,6 +1004,7 @@ pub(super) fn retain_direct_frame_from_source_test(
         accepted_event_id: None,
         async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
         in_fence: None,
+        fence_tally: None,
     });
     b.pstate.direct.root_mut().hold_direct = true;
 }
@@ -1268,6 +1269,7 @@ pub(super) fn install_direct_frame_for_target_test(
         },
         async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
         in_fence: None,
+        fence_tally: None,
     };
     if current {
         b.pstate.direct.root_mut().current = Some(frame);

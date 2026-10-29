@@ -1,8 +1,9 @@
 use crate::kms::render::{
     backend::{
         KmsBackend, KmsBackendState, RotationState, SERVER_SCANOUT_FAILURE_CAP,
-        SERVER_SCANOUT_LIVE_CAP, ScanoutM0Target, ScanoutSourceLayout, ServerScanoutDescriptor,
-        ServerScanoutPromoteError, ServerScanoutPromotion, ServerScanoutState,
+        SERVER_SCANOUT_LIVE_CAP, ScanoutM0Target, ScanoutSourceLayout, ServerFenceKind,
+        ServerFenceTally, ServerScanoutDescriptor, ServerScanoutPromoteError,
+        ServerScanoutPromotion, ServerScanoutState,
         kms::scanout::{
             DRM_FORMAT_XRGB8888, scanout_m1_outputs_cover_root, scanout_m1_plane_states,
             scanout_m1_validate,
@@ -192,30 +193,26 @@ impl KmsBackend {
     }
 
     /// Before a direct commit of promoted `source_id`: submit its unsubmitted
-    /// writes, then return the `IN_FENCE_FD` the commit carries (D8). `None`
-    /// means no fence is needed, either because nothing wrote the source
-    /// since promotion or because the CPU already waited. A failed CPU wait
-    /// unflips and errs: the Present takes the Copy path.
+    /// writes, then return the `IN_FENCE_FD` the commit carries (D8) and how
+    /// it was obtained. `None` means no fence is needed, either because
+    /// nothing wrote the source since promotion or because the CPU already
+    /// waited. A failed CPU wait unflips and errs: the Present takes the Copy
+    /// path. Nothing is counted until the frame is committed.
     pub(in crate::kms::render::backend) fn server_direct_source_fence(
         &mut self,
         source_id: DrawableId,
-    ) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+    ) -> std::io::Result<(Option<std::os::fd::OwnedFd>, ServerFenceTally)> {
         use crate::kms::render::store::ScanoutWriteFence;
 
-        if self.store.has_unsubmitted_scanout_write(source_id) {
+        let flush_added = self.store.has_unsubmitted_scanout_write(source_id);
+        if flush_added {
             self.flush_for_direct_source()?;
-            let server = &mut self.pstate.scanout_m0.server;
-            server.direct_flush_added = server.direct_flush_added.saturating_add(1);
-        } else {
-            let server = &mut self.pstate.scanout_m0.server;
-            server.direct_flush_reused = server.direct_flush_reused.saturating_add(1);
         }
+        let tally = |kind| ServerFenceTally { flush_added, kind };
         let fence = self.store.scanout_write_fence(source_id).cloned();
         let explicit = match fence {
             None | Some(ScanoutWriteFence::NoPendingWrite) => {
-                let server = &mut self.pstate.scanout_m0.server;
-                server.fence_none = server.fence_none.saturating_add(1);
-                return Ok(None);
+                return Ok((None, tally(ServerFenceKind::None)));
             }
             Some(ScanoutWriteFence::Fence(fd)) => self
                 .platform
@@ -227,12 +224,26 @@ impl KmsBackend {
             Some(ScanoutWriteFence::ExportFailed) => None,
         };
         if let Some(fd) = explicit {
-            let server = &mut self.pstate.scanout_m0.server;
-            server.fence_explicit = server.fence_explicit.saturating_add(1);
-            return Ok(Some(fd));
+            return Ok((Some(fd), tally(ServerFenceKind::Explicit)));
         }
         self.wait_for_direct_source_on_cpu(source_id)?;
-        Ok(None)
+        Ok((None, tally(ServerFenceKind::CpuWait)))
+    }
+
+    /// Count the D8 fence of a committed server-owned direct frame.
+    pub(in crate::kms::render::backend) fn count_server_fence(&mut self, tally: ServerFenceTally) {
+        let server = &mut self.pstate.scanout_m0.server;
+        if tally.flush_added {
+            server.direct_flush_added = server.direct_flush_added.saturating_add(1);
+        } else {
+            server.direct_flush_reused = server.direct_flush_reused.saturating_add(1);
+        }
+        let counter = match tally.kind {
+            ServerFenceKind::None => &mut server.fence_none,
+            ServerFenceKind::Explicit => &mut server.fence_explicit,
+            ServerFenceKind::CpuWait => &mut server.fence_cpu_wait,
+        };
+        *counter = counter.saturating_add(1);
     }
 
     /// Submit recorded work: render batch, open frame, submit group.
@@ -264,27 +275,33 @@ impl KmsBackend {
     /// The D8 fallback: no usable sync_file or no `IN_FENCE_FD` property, so
     /// wait for the source's last render ticket, which may name a later read.
     fn wait_for_direct_source_on_cpu(&mut self, source_id: DrawableId) -> std::io::Result<()> {
-        let server = &mut self.pstate.scanout_m0.server;
-        server.fence_cpu_wait = server.fence_cpu_wait.saturating_add(1);
         if !std::mem::replace(&mut self.pstate.server_scanout.fence_cpu_wait_warned, true) {
             log::warn!(
                 target: "yserver::scanout_server",
                 "direct scanout of a server-owned source waits for its writes on the CPU",
             );
         }
-        let ticket = self
+        let wait = self.pstate.direct_source_cpu_waiter;
+        wait(self, source_id).inspect_err(|_| {
+            self.pstate
+                .request_direct_unflip("server_source_fence_failed");
+        })
+    }
+
+    /// Production [`DirectSourceCpuWaiter`](crate::kms::render::backend::DirectSourceCpuWaiter).
+    pub(in crate::kms::render::backend) fn wait_for_direct_source_ticket_live(
+        b: &KmsBackend,
+        source_id: DrawableId,
+    ) -> std::io::Result<()> {
+        let ticket = b
             .store
             .get(source_id)
             .and_then(|drawable| drawable.last_render_ticket.clone());
-        let result = match (ticket, self.platform.gpu.vk()) {
+        match (ticket, b.platform.gpu.vk()) {
             (Some(ticket), Some(vk)) => ticket.wait(vk),
             _ => Ok(()),
-        };
-        result.map_err(|error| {
-            self.pstate
-                .request_direct_unflip("server_source_fence_failed");
-            std::io::Error::other(format!("direct source fence wait: {error:?}"))
-        })
+        }
+        .map_err(|error| std::io::Error::other(format!("direct source fence wait: {error:?}")))
     }
 
     /// Whether a direct frame (pending, queued or current) names `id` as its

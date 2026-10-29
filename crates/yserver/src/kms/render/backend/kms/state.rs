@@ -553,6 +553,26 @@ pub(in crate::kms::render::backend) struct DirectPresentFrame {
     /// `IN_FENCE_FD` for a server-owned source: the sync_file of the last
     /// submit that wrote it, captured when this Present was taken (D8).
     pub(in crate::kms::render::backend) in_fence: Option<OwnedFd>,
+    /// How `in_fence` was produced; counted once this frame is committed.
+    pub(in crate::kms::render::backend) fence_tally: Option<ServerFenceTally>,
+}
+
+/// How a server-owned direct Present was fenced (D8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::kms::render::backend) struct ServerFenceTally {
+    /// Unsubmitted writes were flushed for this Present.
+    pub(in crate::kms::render::backend) flush_added: bool,
+    pub(in crate::kms::render::backend) kind: ServerFenceKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::kms::render::backend) enum ServerFenceKind {
+    /// No write since promotion.
+    None,
+    /// The commit carries the writing submit's sync_file.
+    Explicit,
+    /// The CPU waited for the source's last render ticket.
+    CpuWait,
 }
 
 /// A successful server-owned promotion: the descriptor and the accepted
@@ -592,6 +612,10 @@ pub(in crate::kms::render::backend) type ScanoutM1Importer =
         std::os::fd::BorrowedFd<'_>,
         &ScanoutSourceLayout,
     ) -> io::Result<crate::drm::modeset::DirectScanoutProbeFramebuffer>;
+
+/// Waits on the CPU for a server-owned source's last render; a seam for tests.
+pub(in crate::kms::render::backend) type DirectSourceCpuWaiter =
+    fn(&KmsBackend, DrawableId) -> io::Result<()>;
 
 /// Exports one drawable for DRI3; a seam for tests.
 pub(in crate::kms::render::backend) type Dri3DrawableExporter =
@@ -1343,6 +1367,7 @@ pub struct KmsBackendState {
     pub(in crate::kms::render::backend) server_scanout: ServerScanoutSources,
     /// Promotes one server-owned source for scanout; a seam for tests.
     pub(in crate::kms::render::backend) server_scanout_promoter: ServerScanoutPromoter,
+    pub(in crate::kms::render::backend) direct_source_cpu_waiter: DirectSourceCpuWaiter,
     pub(in crate::kms::render::backend) server_scanout_exports: DeferredServerScanoutExports,
     pub(in crate::kms::render::backend) dri3_drawable_exporter: Dri3DrawableExporter,
     pub(in crate::kms::render::backend) vt_resume_executor:

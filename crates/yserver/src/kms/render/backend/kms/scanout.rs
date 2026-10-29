@@ -1258,7 +1258,11 @@ impl KmsBackend {
             return Err(io::Error::other("direct source was exported"));
         }
         let submitter = self.pstate.direct_frame_submitter;
-        submitter(self, frame, scope, timing)
+        let outcome = submitter(self, frame, scope, timing)?;
+        if let Some(tally) = frame.fence_tally.take() {
+            self.count_server_fence(tally);
+        }
+        Ok(outcome)
     }
 
     pub(in crate::kms::render::backend) fn submit_direct_frame_live(
