@@ -440,6 +440,10 @@ Changes:
 - Task 9's admission of a server-owned source requires its destination's
   rotation to be `Complete`; a `Promoted` member of an `Observing` or
   `Failed` rotation takes the Copy path.
+- Invariant: when a member is exported (Task 7) or retired, its rotation
+  leaves `Complete` immediately and requests an unflip, so a surviving
+  member never alternates between direct flips and Copy. When the
+  destination window is retired, its rotation is removed.
 - `promote_drawable_for_scanout` is reached through a function pointer in
   `pstate`, like `direct_frame_submitter` (`K/state.rs:248`). Recording
   tests install a fake that returns a descriptor with a memfd, or an error.
