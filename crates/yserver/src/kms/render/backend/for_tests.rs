@@ -649,6 +649,7 @@ impl KmsBackend {
             vrr_proc_root: std::path::PathBuf::from("/proc"),
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
+            scanout_m1_importer: KmsBackend::import_scanout_m1_framebuffer_live,
             direct: DirectOwners::default(),
             tearing: Tearing::new(),
             direct_frame_submitter: KmsBackend::submit_direct_frame_live,

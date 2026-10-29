@@ -2128,6 +2128,37 @@ pub(crate) fn probe_direct_scanout_test_only(
     if planes.is_empty() {
         return Err(io::Error::other("scanout M1: empty plane transaction"));
     }
+    let framebuffer = import_direct_scanout_framebuffer(
+        Rc::clone(&device),
+        dma_buf,
+        width,
+        height,
+        fourcc_code,
+        modifier,
+        offset,
+        pitch,
+    )?;
+    test_direct_scanout_framebuffer(
+        framebuffer,
+        &device,
+        atomic_commit_sink,
+        planes,
+        cursor_positions,
+    )
+}
+
+/// The PRIME import and `AddFB2` half of the M1 probe.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn import_direct_scanout_framebuffer(
+    device: Rc<Device>,
+    dma_buf: BorrowedFd<'_>,
+    width: u32,
+    height: u32,
+    fourcc_code: u32,
+    modifier: u64,
+    offset: u64,
+    pitch: u32,
+) -> io::Result<DirectScanoutProbeFramebuffer> {
     let fourcc = DrmFourcc::try_from(fourcc_code).map_err(|_| {
         io::Error::other(format!(
             "scanout M1: unknown DRM fourcc 0x{fourcc_code:08x}"
@@ -2186,16 +2217,34 @@ pub(crate) fn probe_direct_scanout_test_only(
         }
     };
 
-    match test_direct_scanout(&device, atomic_commit_sink, fb, planes, cursor_positions) {
-        Ok(()) => Ok(DirectScanoutTestResult::Accepted(
-            DirectScanoutProbeFramebuffer {
-                fb,
-                backing: Some(DirectScanoutProbeBacking { device, gem }),
-            },
-        )),
+    Ok(DirectScanoutProbeFramebuffer {
+        fb,
+        backing: Some(DirectScanoutProbeBacking { device, gem }),
+    })
+}
+
+/// The atomic `TEST_ONLY` half of the M1 probe; a rejected framebuffer is
+/// dropped, which removes it and closes its GEM handle.
+pub(crate) fn test_direct_scanout_framebuffer(
+    framebuffer: DirectScanoutProbeFramebuffer,
+    device: &Device,
+    atomic_commit_sink: &AtomicCommitSink,
+    planes: &[DirectScanoutPlaneState<'_>],
+    cursor_positions: &[CursorPlanePosition],
+) -> io::Result<DirectScanoutTestResult> {
+    if planes.is_empty() {
+        return Err(io::Error::other("scanout M1: empty plane transaction"));
+    }
+    match test_direct_scanout(
+        device,
+        atomic_commit_sink,
+        framebuffer.fb,
+        planes,
+        cursor_positions,
+    ) {
+        Ok(()) => Ok(DirectScanoutTestResult::Accepted(framebuffer)),
         Err(error) => {
-            let _ = device.destroy_framebuffer(fb);
-            let _ = device.close_buffer(gem);
+            drop(framebuffer);
             Ok(DirectScanoutTestResult::Rejected(io::Error::new(
                 error.kind(),
                 format!("scanout M1 atomic TEST_ONLY rejected: {error}"),

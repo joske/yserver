@@ -1602,3 +1602,262 @@ fn a_promoted_source_is_no_probe_reject_and_reprobes_after_a_clear() {
     assert_eq!(b.pstate.scanout_m0.reject_server_owned, before);
     assert_eq!(attempts(&b), 1, "never promoted again");
 }
+
+// ── Task 10: invalidation and framebuffer lifetime ───────────────────────
+
+thread_local! {
+    /// Each fake M1 import: the framebuffer handle it returned.
+    static IMPORTS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Imports every probe source as a synthetic framebuffer, so the M1 probe
+/// reaches `TEST_ONLY` on the recording sink.
+fn fake_importer(
+    _device: Rc<crate::drm::Device>,
+    _fd: std::os::fd::BorrowedFd<'_>,
+    _layout: &ScanoutSourceLayout,
+) -> std::io::Result<crate::drm::modeset::DirectScanoutProbeFramebuffer> {
+    let raw = IMPORTS.with_borrow_mut(|imports| {
+        let raw = 0xA000 + u32::try_from(imports.len()).expect("few imports");
+        imports.push(raw);
+        raw
+    });
+    Ok(
+        crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(
+            ::drm::control::from_u32(raw).expect("nonzero test handle"),
+        ),
+    )
+}
+
+fn imports() -> Vec<u32> {
+    IMPORTS.with_borrow(Clone::clone)
+}
+
+/// [`promoted_backend`] with the fake importer and a recording sink.
+fn reprobing_backend(
+    xid: u32,
+) -> (
+    KmsBackend,
+    DrawableId,
+    Rc<crate::drm::atomic::tests_support::RecordingAtomicCommitExecutor>,
+) {
+    IMPORTS.with_borrow_mut(Vec::clear);
+    let (mut b, _, id) = promoted_backend(xid);
+    b.pstate.scanout_m1_importer = fake_importer;
+    let recorder = recording_sink(&mut b);
+    (b, id, recorder)
+}
+
+/// The raw fd of `id`'s descriptor and whether it is still an open fd.
+fn descriptor_fd(b: &KmsBackend, id: DrawableId) -> Option<(i32, bool)> {
+    use std::os::fd::AsRawFd as _;
+    let raw = b.pstate.server_scanout.descriptor(id)?.fd.as_raw_fd();
+    // SAFETY: F_GETFD only queries the descriptor flags.
+    let open = unsafe { libc::fcntl(raw, libc::F_GETFD) } != -1;
+    Some((raw, open))
+}
+
+/// A same-size mode change: the topology signature moves, the root does not.
+fn change_mode_clock(b: &mut KmsBackend) {
+    b.platform.outputs[0].output.picked.clock_khz += 1;
+}
+
+/// The direct frame is replaced on output 0 and released.
+fn unflip_and_retire(b: &mut KmsBackend) {
+    b.pstate.request_direct_unflip("test_unflip");
+    await_composed_replacement(b, &[0]);
+    retire_composed_replacement(b, 0);
+    assert!(!b.pstate.direct.root().active());
+}
+
+#[test]
+fn promotion_replaces_a_rejected_probe_entry() {
+    let (mut b, _) = backend();
+    let a_xid = 0x0065_0001;
+    let a = root_pixmap(&mut b, a_xid);
+    b.pstate
+        .scanout_m1
+        .entries
+        .insert(a, ScanoutM1ProbeEntry::rejected());
+    observe(&mut b, a_xid, STAGE);
+    assert_eq!(accepted_framebuffer(&b, a), None);
+    observe(&mut b, a_xid, STAGE);
+    assert!(is_promoted(&b, a));
+    assert_eq!(
+        accepted_framebuffer(&b, a),
+        Some(fake_framebuffer_handle(a))
+    );
+}
+
+#[test]
+fn a_retired_source_drops_its_entry_descriptor_and_fence_state() {
+    let a_xid = 0x0065_0011;
+    let (mut b, _, a) = promoted_backend(a_xid);
+    assert!(b.store.is_scanout_fenced(a));
+    b.store_decref_with_invalidate(a);
+    assert!(b.store.get(a).is_none());
+    assert!(!b.pstate.scanout_m1.entries.contains_key(&a));
+    assert!(!b.pstate.server_scanout.sources.contains_key(&a));
+    assert!(!b.store.is_scanout_fenced(a));
+    assert!(b.store.scanout_write_fence(a).is_none());
+}
+
+#[test]
+fn a_freed_source_keeps_its_framebuffer_while_scanned_out() {
+    let a_xid = 0x0065_0021;
+    let (mut b, _, a) = promoted_backend(a_xid);
+    scan_out(&mut b, a_xid);
+    let fd = descriptor_fd(&b, a).expect("descriptor");
+    b.store_decref_with_invalidate(a);
+    assert!(
+        b.store.get(a).is_some(),
+        "the direct frame pins the storage"
+    );
+    assert_eq!(
+        accepted_framebuffer(&b, a),
+        Some(fake_framebuffer_handle(a))
+    );
+    assert_eq!(descriptor_fd(&b, a), Some(fd));
+
+    unflip_and_retire(&mut b);
+    assert!(b.store.get(a).is_none());
+    assert!(!b.pstate.scanout_m1.entries.contains_key(&a));
+    assert!(!b.pstate.server_scanout.sources.contains_key(&a));
+}
+
+#[test]
+fn a_topology_change_keeps_a_live_server_owned_framebuffer_until_its_crtc_is_replaced() {
+    // Mutation: drop the active-owner check in sync_scanout_m1_topology (#311).
+    let a_xid = 0x0065_0031;
+    let (mut b, a, _) = reprobing_backend(a_xid);
+    scan_out(&mut b, a_xid);
+    let signature = b.pstate.scanout_m1.topology_signature;
+    let fd = descriptor_fd(&b, a).expect("descriptor");
+    assert!(fd.1);
+
+    change_mode_clock(&mut b);
+    observe(&mut b, a_xid, STAGE);
+    assert_eq!(
+        accepted_framebuffer(&b, a),
+        Some(fake_framebuffer_handle(a)),
+        "the CRTC still scans the framebuffer"
+    );
+    assert_eq!(b.pstate.scanout_m1.topology_signature, signature);
+    assert_eq!(descriptor_fd(&b, a), Some(fd));
+    assert!(imports().is_empty());
+
+    unflip_and_retire(&mut b);
+    assert!(b.sync_scanout_m1_topology());
+    assert!(
+        !b.pstate.scanout_m1.entries.contains_key(&a),
+        "the entry goes once no CRTC scans it"
+    );
+    assert!(is_promoted(&b, a), "the descriptor stays");
+    assert_eq!(descriptor_fd(&b, a), Some(fd));
+}
+
+#[test]
+fn after_a_topology_change_a_promoted_source_reprobes_from_its_descriptor() {
+    let a_xid = 0x0065_0041;
+    let (mut b, a, recorder) = reprobing_backend(a_xid);
+    change_mode_clock(&mut b);
+    observe(&mut b, a_xid, STAGE);
+    assert_eq!(imports(), [0xA000]);
+    assert_eq!(
+        accepted_framebuffer(&b, a).map(u32::from),
+        Some(0xA000),
+        "re-probed from the descriptor"
+    );
+    let test_only = recorder
+        .records()
+        .iter()
+        .filter(|record| {
+            record
+                .flags
+                .contains(::drm::control::AtomicCommitFlags::TEST_ONLY)
+        })
+        .count();
+    assert_eq!(test_only, 1);
+    assert_eq!(attempts(&b), 1, "never promoted again");
+    observe(&mut b, a_xid, STAGE);
+    assert_eq!(imports().len(), 1, "the accepted entry is cached");
+}
+
+#[test]
+fn a_crtc_config_change_drops_the_entry_after_the_crtcs_leave_it() {
+    let a_xid = 0x0065_0051;
+    let (mut b, _, a) = promoted_backend(a_xid);
+    b.platform
+        .for_tests_set_output_power_executor(Rc::new(RecordingPower { fail: false }));
+    scan_out(&mut b, a_xid);
+    b.pstate.direct.root_mut().unflip_shadow_ready = true;
+    let fd = descriptor_fd(&b, a).expect("descriptor");
+    let name = b.platform.outputs[0].key.connector_name.clone();
+    let id = Backend::randr_outputs_and_modes(&mut b)
+        .0
+        .into_iter()
+        .find(|output| output.name == name)
+        .expect("output in the RandR projection")
+        .output_id;
+
+    // The fd-less fixture cannot relight; only the teardown matters.
+    let _ = Backend::apply_crtc_config(&mut b, id, &name, None, 0, 0);
+    assert!(DISABLED.get() > 0, "the CRTCs were turned off");
+    assert!(!b.pstate.direct.root().active());
+    assert!(!b.pstate.scanout_m1.entries.contains_key(&a));
+    assert!(is_promoted(&b, a));
+    assert_eq!(descriptor_fd(&b, a), Some(fd));
+}
+
+#[test]
+fn vt_suspend_drops_the_entry_and_keeps_the_descriptor() {
+    let a_xid = 0x0065_0061;
+    let (mut b, _, a) = promoted_backend(a_xid);
+    b.platform
+        .for_tests_set_output_power_executor(Rc::new(RecordingPower { fail: false }));
+    scan_out(&mut b, a_xid);
+    b.pstate.direct.root_mut().unflip_shadow_ready = true;
+    let fd = descriptor_fd(&b, a).expect("descriptor");
+    let mut state = yserver_core::server::ServerState::new();
+    b.inject_seat_event_for_test(&mut state, false);
+    assert!(DISABLED.get() > 0);
+    assert!(!b.pstate.direct.root().active());
+    assert!(!b.pstate.scanout_m1.entries.contains_key(&a));
+    assert!(is_promoted(&b, a));
+    assert_eq!(descriptor_fd(&b, a), Some(fd));
+}
+
+#[test]
+fn dpms_off_drops_the_entry_and_keeps_the_descriptor() {
+    let a_xid = 0x0065_0071;
+    let (mut b, _, a) = promoted_backend(a_xid);
+    b.platform
+        .for_tests_set_output_power_executor(Rc::new(RecordingPower { fail: false }));
+    scan_out(&mut b, a_xid);
+    b.pstate.direct.root_mut().unflip_shadow_ready = true;
+    let fd = descriptor_fd(&b, a).expect("descriptor");
+    Backend::set_dpms_power(&mut b, 3).expect("DPMS off");
+    assert!(DISABLED.get() > 0);
+    assert!(!b.pstate.direct.root().active());
+    assert!(!b.pstate.scanout_m1.entries.contains_key(&a));
+    assert!(is_promoted(&b, a));
+    assert_eq!(descriptor_fd(&b, a), Some(fd));
+}
+
+#[test]
+fn shutdown_drops_the_entry_before_the_descriptor() {
+    let a_xid = 0x0065_0081;
+    let (mut b, _, a) = promoted_backend(a_xid);
+    b.platform
+        .for_tests_set_output_power_executor(Rc::new(RecordingPower { fail: false }));
+    scan_out(&mut b, a_xid);
+    let fd = descriptor_fd(&b, a).expect("descriptor");
+    b.disable_output().expect("shutdown");
+    assert!(!b.pstate.direct.root().active());
+    assert!(!b.pstate.scanout_m1.entries.contains_key(&a));
+    assert_eq!(
+        descriptor_fd(&b, a),
+        Some(fd),
+        "the fd outlives the framebuffer"
+    );
+}

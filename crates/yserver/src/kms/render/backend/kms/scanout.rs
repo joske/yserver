@@ -3077,8 +3077,28 @@ impl KmsBackend {
         let cursor_positions = self
             .platform
             .cursor_plane_atomic_positions_for_outputs(output_indices);
-        Some(crate::drm::modeset::probe_direct_scanout_test_only(
-            Rc::clone(&primary.device),
+        let import = self.pstate.scanout_m1_importer;
+        Some(
+            import(Rc::clone(&primary.device), fd, layout).and_then(|framebuffer| {
+                crate::drm::modeset::test_direct_scanout_framebuffer(
+                    framebuffer,
+                    &primary.device,
+                    primary.atomic_commit_sink.as_ref(),
+                    planes,
+                    &cursor_positions,
+                )
+            }),
+        )
+    }
+
+    /// Production [`ScanoutM1Importer`](crate::kms::render::backend::ScanoutM1Importer).
+    pub(in crate::kms::render::backend) fn import_scanout_m1_framebuffer_live(
+        device: Rc<crate::drm::Device>,
+        fd: std::os::fd::BorrowedFd<'_>,
+        layout: &ScanoutSourceLayout,
+    ) -> io::Result<crate::drm::modeset::DirectScanoutProbeFramebuffer> {
+        crate::drm::modeset::import_direct_scanout_framebuffer(
+            device,
             fd,
             u32::from(layout.width),
             u32::from(layout.height),
@@ -3086,10 +3106,7 @@ impl KmsBackend {
             layout.modifier,
             layout.offset,
             layout.pitch,
-            primary.atomic_commit_sink.as_ref(),
-            planes,
-            &cursor_positions,
-        ))
+        )
     }
 
     /// An accepted M1 entry for `layout`, with the async-flip shape over the

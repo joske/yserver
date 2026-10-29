@@ -585,6 +585,14 @@ impl std::fmt::Display for ServerScanoutPromoteError {
 pub(in crate::kms::render::backend) type ServerScanoutPromoter =
     fn(&mut KmsBackend, DrawableId) -> Result<ServerScanoutPromotion, ServerScanoutPromoteError>;
 
+/// Imports an M1 probe source as a framebuffer (PRIME + `AddFB2`); a seam for tests.
+pub(in crate::kms::render::backend) type ScanoutM1Importer =
+    fn(
+        std::rc::Rc<crate::drm::Device>,
+        std::os::fd::BorrowedFd<'_>,
+        &ScanoutSourceLayout,
+    ) -> io::Result<crate::drm::modeset::DirectScanoutProbeFramebuffer>;
+
 /// Exports one drawable for DRI3; a seam for tests.
 pub(in crate::kms::render::backend) type Dri3DrawableExporter =
     fn(&mut KmsBackend, DrawableId, u32) -> io::Result<yserver_core::backend::Dri3PixmapExport>;
@@ -1323,6 +1331,7 @@ pub struct KmsBackendState {
     /// drawable pin, submits DRM work, or affects Present capabilities.
     pub(in crate::kms::render::backend) scanout_m0: ScanoutM0Telemetry,
     pub(in crate::kms::render::backend) scanout_m1: ScanoutM1ProbeCache,
+    pub(in crate::kms::render::backend) scanout_m1_importer: ScanoutM1Importer,
     pub(in crate::kms::render::backend) direct: DirectOwners,
     pub(in crate::kms::render::backend) tearing: Tearing,
     /// Monotonic clock for KMS cursor-composition pacing.
@@ -1330,6 +1339,7 @@ pub struct KmsBackendState {
         std::rc::Rc<dyn Fn() -> std::time::Instant>,
     pub(in crate::kms::render::backend) direct_frame_submitter: DirectFrameSubmitter,
     pub(in crate::kms::render::backend) scanout_m1_prober: ScanoutM1Prober,
+    /// Declared after `scanout_m1`: probe framebuffers drop before descriptor fds (D9).
     pub(in crate::kms::render::backend) server_scanout: ServerScanoutSources,
     /// Promotes one server-owned source for scanout; a seam for tests.
     pub(in crate::kms::render::backend) server_scanout_promoter: ServerScanoutPromoter,
