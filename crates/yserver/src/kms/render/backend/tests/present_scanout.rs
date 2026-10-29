@@ -2325,6 +2325,58 @@ fn scanout_m1_rejects_gap_overlap_bounds_and_mode_mismatch() {
     ));
 }
 
+fn m1_valid_layout() -> crate::kms::render::backend::ScanoutSourceLayout {
+    crate::kms::render::backend::ScanoutSourceLayout {
+        fourcc: 0x3432_5258,
+        vk_format: ash::vk::Format::B8G8R8A8_UNORM,
+        depth: 24,
+        bpp: 32,
+        width: 5120,
+        height: 1440,
+        plane_count: 1,
+        offset: 0,
+        pitch: 20480,
+        modifier: 0,
+    }
+}
+
+fn m1_validate(
+    layout: &crate::kms::render::backend::ScanoutSourceLayout,
+    output_modifiers: &[&[u64]],
+) -> Result<(), crate::kms::render::backend::ScanoutM1Reject> {
+    crate::kms::render::backend::scanout_m1_validate(layout, (5120, 1440), output_modifiers)
+}
+
+#[test]
+fn scanout_m1_validate_accepts_scope_sized_xrgb_linear() {
+    assert_eq!(m1_validate(&m1_valid_layout(), &[&[0], &[]]), Ok(()));
+}
+
+#[test]
+fn scanout_m1_validate_names_each_reject() {
+    use crate::kms::render::backend::ScanoutM1Reject as R;
+    let any: [&[u64]; 2] = [&[], &[]];
+    let with = |edit: fn(&mut crate::kms::render::backend::ScanoutSourceLayout)| {
+        let mut layout = m1_valid_layout();
+        edit(&mut layout);
+        m1_validate(&layout, &any)
+    };
+    assert_eq!(with(|l| l.fourcc = 0x3432_4152), Err(R::Fourcc));
+    assert_eq!(
+        with(|l| l.vk_format = ash::vk::Format::R8G8B8A8_UNORM),
+        Err(R::VkFormat)
+    );
+    assert_eq!(with(|l| l.plane_count = 2), Err(R::PlaneCount));
+    assert_eq!(with(|l| l.depth = 32), Err(R::Depth));
+    assert_eq!(with(|l| l.bpp = 24), Err(R::Bpp));
+    assert_eq!(with(|l| l.pitch = 0), Err(R::ZeroPitch));
+    assert_eq!(with(|l| l.width = 2560), Err(R::ScopeSizeMismatch));
+    assert_eq!(
+        m1_validate(&m1_valid_layout(), &[&[0], &[0x0100_0000_0000_0001]]),
+        Err(R::Modifier)
+    );
+}
+
 #[test]
 fn scanout_m1_redirected_game_and_region_present_never_reach_probe_cache() {
     use yserver_core::backend::PresentScanoutCandidate;

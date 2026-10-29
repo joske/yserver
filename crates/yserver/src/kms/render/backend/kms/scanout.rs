@@ -1,8 +1,9 @@
 use crate::kms::render::{
     backend::{
         DirectFrameSlot, DirectPresentFrame, DirectScope, KmsBackend, ScanoutM0Coverage,
-        ScanoutM0Shape, ScanoutM0Target, ScanoutM1OutputGeometry, ScanoutM1ProbeEntry, WindowsMap,
-        kms::randr::effective_refresh_matches,
+        ScanoutM0Shape, ScanoutM0Target, ScanoutM1DescriptorError, ScanoutM1OutputGeometry,
+        ScanoutM1ProbeEntry, ScanoutM1Reject, ScanoutSourceDescriptor, ScanoutSourceLayout,
+        WindowsMap, kms::randr::effective_refresh_matches,
     },
     scene::CursorUploadOutcome,
     store::DrawableId,
@@ -337,6 +338,77 @@ pub(in crate::kms::render::backend) fn scanout_m1_output_is_unoverlapped(
         let other_y1 = other_y0 + i64::from(other.height);
         x1 <= other_x0 || other_x1 <= x0 || y1 <= other_y0 || other_y1 <= y0
     })
+}
+
+pub(in crate::kms::render::backend) const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
+
+/// One full-output primary-plane state per output of `output_indices`. Root
+/// sources each output's rectangle of a root-sized buffer, Output the whole
+/// output-sized buffer.
+pub(in crate::kms::render::backend) fn scanout_m1_plane_states<'a>(
+    outputs: &'a [crate::kms::backend::ActiveOutput],
+    output_indices: &[usize],
+    scope: DirectScope,
+) -> Vec<crate::drm::modeset::DirectScanoutPlaneState<'a>> {
+    output_indices
+        .iter()
+        .map(|&output_idx| {
+            let layout = &outputs[output_idx];
+            let (src_x, src_y) = match scope {
+                DirectScope::Root => (
+                    u32::try_from(layout.x).expect("root geometry validated non-negative"),
+                    u32::try_from(layout.y).expect("root geometry validated non-negative"),
+                ),
+                DirectScope::Output(_) => (0, 0),
+            };
+            crate::drm::modeset::DirectScanoutPlaneState {
+                output: &layout.output,
+                src_x,
+                src_y,
+                src_w: u32::from(layout.width),
+                src_h: u32::from(layout.height),
+            }
+        })
+        .collect()
+}
+
+/// M1's format and size checks for one source, before any `AddFB2`.
+/// `expected` is the scope's size (root or output); `output_modifiers`
+/// holds each scanned-out output's modifiers, where empty means unknown and
+/// leaves the decision to `TEST_ONLY`.
+pub(in crate::kms::render::backend) fn scanout_m1_validate(
+    layout: &ScanoutSourceLayout,
+    expected: (u32, u32),
+    output_modifiers: &[&[u64]],
+) -> Result<(), ScanoutM1Reject> {
+    if layout.fourcc != DRM_FORMAT_XRGB8888 {
+        return Err(ScanoutM1Reject::Fourcc);
+    }
+    if layout.vk_format != vk::Format::B8G8R8A8_UNORM {
+        return Err(ScanoutM1Reject::VkFormat);
+    }
+    if layout.plane_count != 1 {
+        return Err(ScanoutM1Reject::PlaneCount);
+    }
+    if layout.depth != 24 {
+        return Err(ScanoutM1Reject::Depth);
+    }
+    if layout.bpp != 32 {
+        return Err(ScanoutM1Reject::Bpp);
+    }
+    if layout.pitch == 0 {
+        return Err(ScanoutM1Reject::ZeroPitch);
+    }
+    if (u32::from(layout.width), u32::from(layout.height)) != expected {
+        return Err(ScanoutM1Reject::ScopeSizeMismatch);
+    }
+    if output_modifiers
+        .iter()
+        .any(|modifiers| !modifiers.is_empty() && !modifiers.contains(&layout.modifier))
+    {
+        return Err(ScanoutM1Reject::Modifier);
+    }
+    Ok(())
 }
 
 impl KmsBackend {
@@ -1190,26 +1262,7 @@ impl KmsBackend {
             .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
             .ok_or_else(|| io::Error::other("direct successor framebuffer disappeared"))?;
         let output_indices = self.direct_scope_outputs(scope);
-        let plane_states: Vec<crate::drm::modeset::DirectScanoutPlaneState<'_>> = output_indices
-            .iter()
-            .map(|&output_idx| {
-                let layout = &self.platform.outputs[output_idx];
-                let (src_x, src_y) = match scope {
-                    DirectScope::Root => (
-                        u32::try_from(layout.x).expect("M1 validated non-negative x"),
-                        u32::try_from(layout.y).expect("M1 validated non-negative y"),
-                    ),
-                    DirectScope::Output(_) => (0, 0),
-                };
-                crate::drm::modeset::DirectScanoutPlaneState {
-                    output: &layout.output,
-                    src_x,
-                    src_y,
-                    src_w: u32::from(layout.width),
-                    src_h: u32::from(layout.height),
-                }
-            })
-            .collect();
+        let plane_states = scanout_m1_plane_states(&self.platform.outputs, &output_indices, scope);
         let (device, atomic_commit_sink) = self
             .platform
             .primary_device()
@@ -2806,27 +2859,7 @@ impl KmsBackend {
         }
 
         let root = (u32::from(self.platform.fb_w), u32::from(self.platform.fb_h));
-        let output_geometry: Vec<ScanoutM1OutputGeometry> = self
-            .platform
-            .outputs
-            .iter()
-            .map(|layout| {
-                let (mode_width, mode_height) = match scope {
-                    DirectScope::Root => layout.output.mode.size(),
-                    DirectScope::Output(_) => {
-                        (layout.output.picked.width, layout.output.picked.height)
-                    }
-                };
-                ScanoutM1OutputGeometry {
-                    x: layout.x,
-                    y: layout.y,
-                    width: u32::from(layout.width),
-                    height: u32::from(layout.height),
-                    mode_width: u32::from(mode_width),
-                    mode_height: u32::from(mode_height),
-                }
-            })
-            .collect();
+        let output_geometry = self.scanout_m1_output_geometry(scope);
         let geometry_eligible = match scope {
             DirectScope::Root => scanout_m1_outputs_cover_root(root, &output_geometry),
             DirectScope::Output(output_idx) => {
@@ -2905,6 +2938,154 @@ impl KmsBackend {
         }
     }
 
+    /// Every active output's placement within the root, as M1 validates it
+    /// for `scope`: Root compares the CRTC's current mode, Output the
+    /// selected one.
+    pub(in crate::kms::render::backend) fn scanout_m1_output_geometry(
+        &self,
+        scope: DirectScope,
+    ) -> Vec<ScanoutM1OutputGeometry> {
+        self.platform
+            .outputs
+            .iter()
+            .map(|layout| {
+                let (mode_width, mode_height) = match scope {
+                    DirectScope::Root => layout.output.mode.size(),
+                    DirectScope::Output(_) => {
+                        (layout.output.picked.width, layout.output.picked.height)
+                    }
+                };
+                ScanoutM1OutputGeometry {
+                    x: layout.x,
+                    y: layout.y,
+                    width: u32::from(layout.width),
+                    height: u32::from(layout.height),
+                    mode_width: u32::from(mode_width),
+                    mode_height: u32::from(mode_height),
+                }
+            })
+            .collect()
+    }
+
+    /// The scanout descriptor of `source_id`: its imported dma-buf layout and
+    /// a dup of its fd.
+    pub(in crate::kms::render::backend) fn scanout_m1_descriptor(
+        &self,
+        source_id: DrawableId,
+    ) -> Result<ScanoutSourceDescriptor, ScanoutM1DescriptorError> {
+        let drawable = self
+            .store
+            .get(source_id)
+            .ok_or(ScanoutM1DescriptorError::Unavailable)?;
+        let metadata = drawable
+            .storage
+            .imported_dmabuf
+            .as_ref()
+            .ok_or(ScanoutM1DescriptorError::Unavailable)?;
+        // A layout guessed by the legacy import path (`PixmapFromBuffer`)
+        // cannot safely reach KMS: scanning a tiled buffer out as linear
+        // puts garbage on the display, and `AddFB2` may well accept it.
+        if metadata.implicit_layout {
+            return Err(ScanoutM1DescriptorError::Unavailable);
+        }
+        let plane = metadata
+            .planes
+            .first()
+            .ok_or(ScanoutM1DescriptorError::Unavailable)?;
+        let fd = drawable
+            .storage
+            .imported_drawable
+            .as_ref()
+            .and_then(|imported| imported.imported_dma_buf_fd())
+            .ok_or(ScanoutM1DescriptorError::Unavailable)?;
+        let layout = ScanoutSourceLayout {
+            fourcc: metadata.fourcc,
+            vk_format: metadata.vk_format,
+            depth: metadata.depth,
+            bpp: metadata.bpp,
+            width: metadata.width,
+            height: metadata.height,
+            plane_count: metadata.planes.len(),
+            offset: plane.offset,
+            pitch: plane.pitch,
+            modifier: metadata.modifier,
+        };
+        match fd.try_clone_to_owned() {
+            Ok(fd) => Ok(ScanoutSourceDescriptor { fd, layout }),
+            Err(error) => Err(ScanoutM1DescriptorError::FdDup { layout, error }),
+        }
+    }
+
+    /// The size a source must have to be scanned out by `scope`: the root
+    /// for Root, the output for Output. `None` for a missing output.
+    pub(in crate::kms::render::backend) fn scanout_m1_scope_size(
+        &self,
+        scope: DirectScope,
+    ) -> Option<(u32, u32)> {
+        match scope {
+            DirectScope::Root => {
+                Some((u32::from(self.platform.fb_w), u32::from(self.platform.fb_h)))
+            }
+            DirectScope::Output(output_idx) => self
+                .platform
+                .outputs
+                .get(output_idx)
+                .map(|output| (u32::from(output.width), u32::from(output.height))),
+        }
+    }
+
+    /// M1's exact `AddFB2` + primary-plane atomic `TEST_ONLY` of one dma-buf
+    /// on `planes` (the planes of `output_indices`). `None` without a
+    /// primary DRM device.
+    pub(in crate::kms::render::backend) fn scanout_m1_test_only(
+        &self,
+        fd: std::os::fd::BorrowedFd<'_>,
+        layout: &ScanoutSourceLayout,
+        planes: &[crate::drm::modeset::DirectScanoutPlaneState<'_>],
+        output_indices: &[usize],
+    ) -> Option<io::Result<crate::drm::modeset::DirectScanoutTestResult>> {
+        let primary = self.platform.primary_device()?;
+        let cursor_positions = self
+            .platform
+            .cursor_plane_atomic_positions_for_outputs(output_indices);
+        Some(crate::drm::modeset::probe_direct_scanout_test_only(
+            Rc::clone(&primary.device),
+            fd,
+            u32::from(layout.width),
+            u32::from(layout.height),
+            layout.fourcc,
+            layout.modifier,
+            layout.offset,
+            layout.pitch,
+            primary.atomic_commit_sink.as_ref(),
+            planes,
+            &cursor_positions,
+        ))
+    }
+
+    /// An accepted M1 entry for `layout`, with the async-flip shape over the
+    /// CRTCs of `planes`.
+    pub(in crate::kms::render::backend) fn scanout_m1_accepted_entry(
+        framebuffer: crate::drm::modeset::DirectScanoutProbeFramebuffer,
+        layout: &ScanoutSourceLayout,
+        planes: &[crate::drm::modeset::DirectScanoutPlaneState<'_>],
+    ) -> ScanoutM1ProbeEntry {
+        let mut crtcs: Vec<_> = planes.iter().map(|state| state.output.crtc).collect();
+        crtcs.sort_by_key(|crtc| u32::from(*crtc));
+        ScanoutM1ProbeEntry::accepted_with_shape(
+            framebuffer,
+            crate::drm::async_flip::AsyncShape {
+                fourcc: layout.fourcc,
+                modifier: layout.modifier,
+                pitch: layout.pitch,
+                width: u32::from(layout.width),
+                height: u32::from(layout.height),
+                crtcs,
+                direct: true,
+            },
+        )
+    }
+
     pub(in crate::kms::render::backend) fn probe_direct_scanout_m1_live(
         &self,
         source_id: DrawableId,
@@ -2913,103 +3094,45 @@ impl KmsBackend {
     ) -> io::Result<ScanoutM1ProbeEntry> {
         use std::os::fd::AsFd as _;
 
-        let Some(drawable) = self.store.get(source_id) else {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "M1 source retired"));
-        };
-        let Some(metadata) = drawable.storage.imported_dmabuf.as_ref() else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "M1 source is not dma-buf",
-            ));
-        };
-        // A layout guessed by the legacy import path cannot safely reach KMS.
-        if metadata.implicit_layout {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "M1 source has an implicit layout",
-            ));
-        }
-        let Some(plane) = metadata.planes.first() else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "M1 source has no plane",
-            ));
-        };
-        let Some(fd) = drawable
-            .storage
-            .imported_drawable
-            .as_ref()
-            .and_then(|imported| imported.imported_dma_buf_fd())
-        else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "M1 source fd unavailable",
-            ));
-        };
-        let fd = fd
-            .try_clone_to_owned()
-            .map_err(|error| io::Error::other(format!("M1 dma-buf dup failed: {error}")))?;
-        let (expected_width, expected_height) = match scope {
-            DirectScope::Root => (u32::from(self.platform.fb_w), u32::from(self.platform.fb_h)),
-            DirectScope::Output(output_idx) => {
-                let Some(output) = self.platform.outputs.get(output_idx) else {
-                    return Ok(ScanoutM1ProbeEntry::rejected());
-                };
-                (u32::from(output.width), u32::from(output.height))
+        let descriptor = match self.scanout_m1_descriptor(source_id) {
+            Ok(descriptor) => descriptor,
+            Err(ScanoutM1DescriptorError::Unavailable) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "M1 source has no scanout descriptor",
+                ));
+            }
+            Err(ScanoutM1DescriptorError::FdDup { layout, error }) => {
+                return Err(io::Error::other(format!(
+                    "M1 dma-buf dup failed ({layout:?}): {error}"
+                )));
             }
         };
-        const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
-        if metadata.fourcc != DRM_FORMAT_XRGB8888
-            || metadata.vk_format != vk::Format::B8G8R8A8_UNORM
-            || metadata.planes.len() != 1
-            || metadata.depth != 24
-            || metadata.bpp != 32
-            || plane.pitch == 0
-            || (u32::from(metadata.width), u32::from(metadata.height))
-                != (expected_width, expected_height)
-            || planes.iter().any(|state| {
-                !state.output.scanout_modifiers.is_empty()
-                    && !state.output.scanout_modifiers.contains(&metadata.modifier)
-            })
-        {
-            return Ok(ScanoutM1ProbeEntry::rejected());
-        }
-        let Some(primary) = self.platform.primary_device() else {
+        let layout = descriptor.layout;
+        let Some(expected) = self.scanout_m1_scope_size(scope) else {
             return Ok(ScanoutM1ProbeEntry::rejected());
         };
+        let output_modifiers: Vec<&[u64]> = planes
+            .iter()
+            .map(|state| state.output.scanout_modifiers.as_slice())
+            .collect();
+        if let Err(reason) = scanout_m1_validate(&layout, expected, &output_modifiers) {
+            log::debug!(
+                "scanout_m1: source_id={} {scope:?} skipped ({reason:?}): {layout:?}",
+                source_id.as_u64(),
+            );
+            return Ok(ScanoutM1ProbeEntry::rejected());
+        }
         let output_indices = self.direct_scope_outputs(scope);
-        let cursor_positions = self
-            .platform
-            .cursor_plane_atomic_positions_for_outputs(&output_indices);
-        match crate::drm::modeset::probe_direct_scanout_test_only(
-            Rc::clone(&primary.device),
-            fd.as_fd(),
-            u32::from(metadata.width),
-            u32::from(metadata.height),
-            metadata.fourcc,
-            metadata.modifier,
-            plane.offset,
-            plane.pitch,
-            primary.atomic_commit_sink.as_ref(),
-            planes,
-            &cursor_positions,
-        )? {
-            crate::drm::modeset::DirectScanoutTestResult::Accepted(framebuffer) => {
-                let mut crtcs: Vec<_> = planes.iter().map(|state| state.output.crtc).collect();
-                crtcs.sort_by_key(|crtc| u32::from(*crtc));
-                Ok(ScanoutM1ProbeEntry::accepted_with_shape(
-                    framebuffer,
-                    crate::drm::async_flip::AsyncShape {
-                        fourcc: metadata.fourcc,
-                        modifier: metadata.modifier,
-                        pitch: plane.pitch,
-                        width: u32::from(metadata.width),
-                        height: u32::from(metadata.height),
-                        crtcs,
-                        direct: true,
-                    },
-                ))
-            }
+        let Some(result) =
+            self.scanout_m1_test_only(descriptor.fd.as_fd(), &layout, planes, &output_indices)
+        else {
+            return Ok(ScanoutM1ProbeEntry::rejected());
+        };
+        match result? {
+            crate::drm::modeset::DirectScanoutTestResult::Accepted(framebuffer) => Ok(
+                Self::scanout_m1_accepted_entry(framebuffer, &layout, planes),
+            ),
             crate::drm::modeset::DirectScanoutTestResult::Rejected(error) => {
                 log::debug!("scanout_m1: TEST_ONLY rejected {scope:?}: {error}");
                 Ok(ScanoutM1ProbeEntry::rejected())

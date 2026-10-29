@@ -592,6 +592,54 @@ pub(in crate::kms::render::backend) struct ScanoutM1OutputGeometry {
     pub(in crate::kms::render::backend) mode_height: u32,
 }
 
+/// Format and plane-0 layout of a direct-scanout source, as M1 validates it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::kms::render::backend) struct ScanoutSourceLayout {
+    pub(in crate::kms::render::backend) fourcc: u32,
+    pub(in crate::kms::render::backend) vk_format: vk::Format,
+    pub(in crate::kms::render::backend) depth: u8,
+    pub(in crate::kms::render::backend) bpp: u8,
+    pub(in crate::kms::render::backend) width: u16,
+    pub(in crate::kms::render::backend) height: u16,
+    pub(in crate::kms::render::backend) plane_count: usize,
+    pub(in crate::kms::render::backend) offset: u64,
+    pub(in crate::kms::render::backend) pitch: u32,
+    pub(in crate::kms::render::backend) modifier: u64,
+}
+
+/// A direct-scanout source's layout plus an fd the M1 probe may import.
+#[derive(Debug)]
+pub(in crate::kms::render::backend) struct ScanoutSourceDescriptor {
+    pub(in crate::kms::render::backend) fd: OwnedFd,
+    pub(in crate::kms::render::backend) layout: ScanoutSourceLayout,
+}
+
+/// Why no [`ScanoutSourceDescriptor`] could be built for a source.
+#[derive(Debug)]
+pub(in crate::kms::render::backend) enum ScanoutM1DescriptorError {
+    /// No scanout-capable dma-buf metadata (server-owned or implicit layout).
+    Unavailable,
+    /// The layout is known but duplicating its fd failed.
+    FdDup {
+        layout: ScanoutSourceLayout,
+        error: io::Error,
+    },
+}
+
+/// The M1 format/size check a source failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::kms::render::backend) enum ScanoutM1Reject {
+    Fourcc,
+    VkFormat,
+    PlaneCount,
+    Depth,
+    Bpp,
+    ZeroPitch,
+    /// Not the size of the scope's area: the root, or the output.
+    ScopeSizeMismatch,
+    Modifier,
+}
+
 /// Monotonic device-qualified RANDR connector registry.
 ///
 /// Authoritative store for every connector yserver has ever seen:
