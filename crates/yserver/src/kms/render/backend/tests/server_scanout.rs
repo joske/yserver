@@ -8,7 +8,7 @@ use super::{
 };
 use crate::kms::render::{
     backend::{
-        RotationState, SERVER_SCANOUT_PROMOTE_BURST, SERVER_SCANOUT_PROMOTE_REFILL,
+        DirectScope, RotationState, SERVER_SCANOUT_PROMOTE_BURST, SERVER_SCANOUT_PROMOTE_REFILL,
         ScanoutM1ProbeEntry, ScanoutSourceLayout, ServerScanoutDescriptor,
         ServerScanoutPromoteError, ServerScanoutPromotion, ServerScanoutState,
     },
@@ -248,7 +248,7 @@ fn accepted_framebuffer(
     b.pstate
         .scanout_m1
         .entries
-        .get(&id)
+        .get(&(id, DirectScope::Root))
         .and_then(ScanoutM1ProbeEntry::framebuffer)
         .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
 }
@@ -361,7 +361,7 @@ fn marco_double_buffer_promotes_both_on_its_fourth_present() {
         .allocate(c_xid, DrawableKind::Pixmap, 24, false, storage)
         .expect("imported source");
     b.pstate.scanout_m1.entries.insert(
-        c,
+        (c, DirectScope::Root),
         ScanoutM1ProbeEntry::accepted(
             crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(fake_framebuffer_handle(
                 c,
@@ -419,7 +419,12 @@ fn second_buffer_failure_fails_the_rotation_and_refunds_its_token() {
     let s = &b.store.get(b_id).expect("B").storage;
     assert_eq!((s.image, s.memory), storage_before);
     assert!(!s.is_exportable());
-    assert!(!b.pstate.scanout_m1.entries.contains_key(&b_id));
+    assert!(
+        !b.pstate
+            .scanout_m1
+            .entries
+            .contains_key(&(b_id, DirectScope::Root))
+    );
 
     let sources: Vec<u32> = [a_xid, b_xid].repeat(6);
     assert_eq!(present_all(&mut b, 10, &sources, STAGE), 0);
@@ -482,7 +487,12 @@ fn retiring_a_member_leaves_complete_and_unflips() {
     b.store_decref_with_invalidate(a);
     assert!(b.store.get(a).is_none());
     assert!(!b.pstate.server_scanout.sources.contains_key(&a));
-    assert!(!b.pstate.scanout_m1.entries.contains_key(&a));
+    assert!(
+        !b.pstate
+            .scanout_m1
+            .entries
+            .contains_key(&(a, DirectScope::Root))
+    );
     assert_eq!(rotation_state(&b, STAGE), Some(RotationState::Observing));
     let dest = b.store.lookup(STAGE).expect("stage");
     assert!(!b.pstate.server_scanout.rotation_complete(dest, b_id));
@@ -875,7 +885,12 @@ fn dri3_export_of_the_live_direct_source_waits_for_its_replacement() {
     let export = Backend::finish_dri3_export(&mut b, token).expect("the deferred export");
     assert_eq!(u32::from(export.width), u32::from(b.platform.fb_w));
     assert_eq!(EXPORTS.with_borrow(Clone::clone), [(a, false, 0)]);
-    assert!(!b.pstate.scanout_m1.entries.contains_key(&a));
+    assert!(
+        !b.pstate
+            .scanout_m1
+            .entries
+            .contains_key(&(a, DirectScope::Root))
+    );
     assert_eq!(disqualified_holding_descriptor(&b, a), Some(false));
 
     let pins = b.present_source_pins.len();
@@ -914,7 +929,7 @@ fn an_exported_source_never_flips_again() {
     b.pstate.direct.root_mut().pending = Some(pending);
     scan_out(&mut b, a_xid);
     let successor = b.pstate.direct.root_mut().current.take().expect("A again");
-    b.queue_direct_successor(successor);
+    b.queue_direct_successor(DirectScope::Root, successor);
 
     let token = pending_token(begin_export(&mut b, a_xid));
     let clock = yserver_core::backend::PresentClockSample {
@@ -942,7 +957,12 @@ fn an_exported_source_never_flips_again() {
     }
     assert!(!b.pstate.direct.root().active());
     assert_eq!(b.pstate.scanout_m0.server.candidates, candidates);
-    assert!(!b.pstate.scanout_m1.entries.contains_key(&a));
+    assert!(
+        !b.pstate
+            .scanout_m1
+            .entries
+            .contains_key(&(a, DirectScope::Root))
+    );
 }
 
 #[test]
@@ -971,7 +991,12 @@ fn glx_bind_and_acquire_disqualify_without_parking() {
         Some(false),
         "an unreferenced source drops its framebuffer and descriptor at once"
     );
-    assert!(!b.pstate.scanout_m1.entries.contains_key(&b_id));
+    assert!(
+        !b.pstate
+            .scanout_m1
+            .entries
+            .contains_key(&(b_id, DirectScope::Root))
+    );
     assert!(b.pstate.server_scanout_exports.parked.is_empty());
     assert_eq!(b.pstate.scanout_m0.server.reject_exported, 2);
     assert_eq!(
@@ -1215,7 +1240,7 @@ fn pending_imported_frame(b: &mut KmsBackend) -> u32 {
         .allocate(source_xid, DrawableKind::Pixmap, 24, false, storage)
         .expect("imported source");
     b.pstate.scanout_m1.entries.insert(
-        source,
+        (source, DirectScope::Root),
         ScanoutM1ProbeEntry::accepted(
             crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(fake_framebuffer_handle(
                 source,
@@ -1248,7 +1273,7 @@ fn a_queued_successor_commits_the_fence_of_its_own_present() {
     let own = dev_null_fd();
     let own_raw = raw_value(&own);
     successor.in_fence = Some(own);
-    b.queue_direct_successor(successor);
+    b.queue_direct_successor(DirectScope::Root, successor);
     // A later write leaves a newer fence; the queued Present keeps its own.
     let later = dev_null_fd();
     assert_ne!(raw_value(&later), own_raw);
@@ -1286,7 +1311,7 @@ fn an_imported_direct_commit_carries_no_fence() {
         .current
         .take()
         .expect("successor");
-    b.queue_direct_successor(successor);
+    b.queue_direct_successor(DirectScope::Root, successor);
     let clock = yserver_core::backend::PresentClockSample {
         msc: 4,
         ust: 400,
@@ -1308,7 +1333,9 @@ fn the_direct_source_fence_follows_the_write_state() {
     let (mut b, _, a) = promoted_backend(a_xid);
     assert!(b.store.is_scanout_fenced(a), "promotion fences the writes");
     let fence = |b: &mut KmsBackend| {
-        let (fd, tally) = b.server_direct_source_fence(a).expect("fence");
+        let (fd, tally) = b
+            .server_direct_source_fence(a, DirectScope::Root)
+            .expect("fence");
         (fd.is_some(), tally)
     };
     let tally = |flush_added, kind| ServerFenceTally { flush_added, kind };
@@ -1395,7 +1422,9 @@ fn an_unsubmitted_write_is_flushed_before_the_direct_commit_fence() {
         .expect("write the source");
     assert!(b.store.has_unsubmitted_scanout_write(id));
 
-    let (fence, tally) = b.server_direct_source_fence(id).expect("fence");
+    let (fence, tally) = b
+        .server_direct_source_fence(id, DirectScope::Root)
+        .expect("fence");
     assert!(fence.is_some(), "the flushed write's sync_file");
     assert!(
         !b.store.has_unsubmitted_scanout_write(id),
@@ -1413,7 +1442,9 @@ fn an_unsubmitted_write_is_flushed_before_the_direct_commit_fence() {
         }
     );
 
-    let (fence, tally) = b.server_direct_source_fence(id).expect("fence");
+    let (fence, tally) = b
+        .server_direct_source_fence(id, DirectScope::Root)
+        .expect("fence");
     assert!(fence.is_some());
     assert!(!tally.flush_added, "the write was already submitted");
 }
@@ -1430,12 +1461,13 @@ thread_local! {
 fn recording_submitter(
     b: &mut KmsBackend,
     frame: &mut crate::kms::render::backend::DirectPresentFrame,
+    scope: DirectScope,
     timing: crate::drm::async_flip::FlipTiming,
 ) -> std::io::Result<crate::drm::async_flip::AsyncOutcome> {
     SUBMITTED.with_borrow_mut(|submitted| {
         submitted.push((frame.source_id, frame.in_fence.is_some()));
     });
-    KmsBackend::submit_direct_frame_for_tests(b, frame, timing)
+    KmsBackend::submit_direct_frame_for_tests(b, frame, scope, timing)
 }
 
 fn submitted() -> Vec<(DrawableId, bool)> {
@@ -1617,7 +1649,10 @@ fn a_promoted_source_is_no_probe_reject_and_reprobes_after_a_clear() {
     b.pstate.scanout_m1.clear("test topology change");
     observe(&mut b, a_xid, STAGE);
     assert!(
-        b.pstate.scanout_m1.entries.contains_key(&a),
+        b.pstate
+            .scanout_m1
+            .entries
+            .contains_key(&(a, DirectScope::Root)),
         "re-probed from the descriptor"
     );
     assert_eq!(b.pstate.scanout_m0.m1_gate_reject_import, gate_before);
@@ -1700,7 +1735,7 @@ fn promotion_replaces_a_rejected_probe_entry() {
     b.pstate
         .scanout_m1
         .entries
-        .insert(a, ScanoutM1ProbeEntry::rejected());
+        .insert((a, DirectScope::Root), ScanoutM1ProbeEntry::rejected());
     observe(&mut b, a_xid, STAGE);
     assert_eq!(accepted_framebuffer(&b, a), None);
     observe(&mut b, a_xid, STAGE);
@@ -1718,7 +1753,12 @@ fn a_retired_source_drops_its_entry_descriptor_and_fence_state() {
     assert!(b.store.is_scanout_fenced(a));
     b.store_decref_with_invalidate(a);
     assert!(b.store.get(a).is_none());
-    assert!(!b.pstate.scanout_m1.entries.contains_key(&a));
+    assert!(
+        !b.pstate
+            .scanout_m1
+            .entries
+            .contains_key(&(a, DirectScope::Root))
+    );
     assert!(!b.pstate.server_scanout.sources.contains_key(&a));
     assert!(!b.store.is_scanout_fenced(a));
     assert!(b.store.scanout_write_fence(a).is_none());
@@ -1743,7 +1783,12 @@ fn a_freed_source_keeps_its_framebuffer_while_scanned_out() {
 
     unflip_and_retire(&mut b);
     assert!(b.store.get(a).is_none());
-    assert!(!b.pstate.scanout_m1.entries.contains_key(&a));
+    assert!(
+        !b.pstate
+            .scanout_m1
+            .entries
+            .contains_key(&(a, DirectScope::Root))
+    );
     assert!(!b.pstate.server_scanout.sources.contains_key(&a));
 }
 
@@ -1771,7 +1816,10 @@ fn a_topology_change_keeps_a_live_server_owned_framebuffer_until_its_crtc_is_rep
     unflip_and_retire(&mut b);
     assert!(b.sync_scanout_m1_topology());
     assert!(
-        !b.pstate.scanout_m1.entries.contains_key(&a),
+        !b.pstate
+            .scanout_m1
+            .entries
+            .contains_key(&(a, DirectScope::Root)),
         "the entry goes once no CRTC scans it"
     );
     assert!(is_promoted(&b, a), "the descriptor stays");
@@ -1826,7 +1874,12 @@ fn a_crtc_config_change_drops_the_entry_after_the_crtcs_leave_it() {
     let _ = Backend::apply_crtc_config(&mut b, id, &name, None, 0, 0);
     assert!(DISABLED.get() > 0, "the CRTCs were turned off");
     assert!(!b.pstate.direct.root().active());
-    assert!(!b.pstate.scanout_m1.entries.contains_key(&a));
+    assert!(
+        !b.pstate
+            .scanout_m1
+            .entries
+            .contains_key(&(a, DirectScope::Root))
+    );
     assert!(is_promoted(&b, a));
     assert_eq!(descriptor_fd(&b, a), Some(fd));
 }
@@ -1844,7 +1897,12 @@ fn vt_suspend_drops_the_entry_and_keeps_the_descriptor() {
     b.inject_seat_event_for_test(&mut state, false);
     assert!(DISABLED.get() > 0);
     assert!(!b.pstate.direct.root().active());
-    assert!(!b.pstate.scanout_m1.entries.contains_key(&a));
+    assert!(
+        !b.pstate
+            .scanout_m1
+            .entries
+            .contains_key(&(a, DirectScope::Root))
+    );
     assert!(is_promoted(&b, a));
     assert_eq!(descriptor_fd(&b, a), Some(fd));
 }
@@ -1861,7 +1919,12 @@ fn dpms_off_drops_the_entry_and_keeps_the_descriptor() {
     Backend::set_dpms_power(&mut b, 3).expect("DPMS off");
     assert!(DISABLED.get() > 0);
     assert!(!b.pstate.direct.root().active());
-    assert!(!b.pstate.scanout_m1.entries.contains_key(&a));
+    assert!(
+        !b.pstate
+            .scanout_m1
+            .entries
+            .contains_key(&(a, DirectScope::Root))
+    );
     assert!(is_promoted(&b, a));
     assert_eq!(descriptor_fd(&b, a), Some(fd));
 }
@@ -1876,7 +1939,12 @@ fn shutdown_drops_the_entry_before_the_descriptor() {
     let fd = descriptor_fd(&b, a).expect("descriptor");
     b.disable_output().expect("shutdown");
     assert!(!b.pstate.direct.root().active());
-    assert!(!b.pstate.scanout_m1.entries.contains_key(&a));
+    assert!(
+        !b.pstate
+            .scanout_m1
+            .entries
+            .contains_key(&(a, DirectScope::Root))
+    );
     assert_eq!(
         descriptor_fd(&b, a),
         Some(fd),
@@ -1933,9 +2001,12 @@ fn a_cow_shape_change_unflips_a_server_owned_frame() {
 fn a_visible_software_cursor_sends_the_next_present_to_copy() {
     let (a_xid, b_xid) = (0x0066_0011, 0x0066_0012);
     let (mut b, _, _) = live_server_owned_frame(a_xid, b_xid);
-    assert!(b.direct_cursor_eligible());
+    assert!(b.direct_cursor_eligible_for(&b.direct_scope_outputs(DirectScope::Root)));
     Backend::set_cursor_hidden(&mut b, false);
-    assert!(!b.direct_cursor_eligible(), "the cursor left the plane");
+    assert!(
+        !b.direct_cursor_eligible_for(&b.direct_scope_outputs(DirectScope::Root)),
+        "the cursor left the plane"
+    );
     assert!(!present(&mut b, 11, b_xid, STAGE), "Copy");
     assert_eq!(
         unflip_reason(&b),
@@ -2030,7 +2101,7 @@ fn a_rejected_reprobe_takes_copy_until_an_invalidation() {
         .pstate
         .scanout_m1
         .entries
-        .get(&a)
+        .get(&(a, DirectScope::Root))
         .expect("a negative entry");
     assert!(entry.framebuffer().is_none());
     assert!(is_promoted(&b, a), "the descriptor stays");
@@ -2144,7 +2215,7 @@ fn the_unflip_shadow_of_a_promoted_source_holds_its_pixels() {
     Backend::put_image(&mut b, None, source.as_raw(), 24, w, h, 0, 0, &written)
         .expect("write the source");
     retain_direct_frame_from_source_test(&mut b, source.as_raw(), fallback.as_raw(), w, h);
-    b.materialize_direct_shadow_for_unflip()
+    b.materialize_direct_shadow_for_unflip(DirectScope::Root)
         .expect("materialize the unflip shadow");
     assert!(b.pstate.direct.root().unflip_shadow_ready);
 
@@ -2173,4 +2244,61 @@ fn the_unflip_shadow_of_a_promoted_source_holds_its_pixels() {
             .collect()
     };
     assert_eq!(colour(&shadow), colour(&written));
+}
+
+/// Move the frame `install_direct_frame_for_target_test` left on the Root
+/// owner to the `Output(output_idx)` owner, as #310's per-output admission
+/// would hold it.
+fn hold_on_output_owner(b: &mut KmsBackend, output_idx: usize, source: Option<DrawableId>) {
+    let fallback = b.store.lookup(STAGE).expect("the stage window");
+    install_direct_frame_for_target_test(b, 0x0067_0001, fallback, true);
+    let root = b.pstate.direct.root_mut();
+    let mut frame = root.current.take().expect("the installed frame");
+    root.hold_direct = false;
+    if let Some(source) = source {
+        frame.source_id = source;
+    }
+    b.pstate.direct.sync_output_count(b.platform.outputs.len());
+    let owner = &mut b.pstate.direct.outputs[output_idx];
+    owner.current = Some(frame);
+    owner.hold_direct = true;
+    assert_eq!(
+        b.pstate.direct.active_scopes(),
+        vec![DirectScope::Output(output_idx)]
+    );
+}
+
+#[test]
+fn disqualification_leaves_an_unrelated_output_owner_direct() {
+    // Mutation: request_direct_unflip_referencing unflips every active owner.
+    let a_xid = 0x0067_0011;
+    let (mut b, _, _) = promoted_backend(a_xid);
+    hold_on_output_owner(&mut b, 0, None);
+    let begin = begin_export(&mut b, a_xid);
+    assert!(
+        matches!(begin, yserver_core::backend::Dri3ExportBegin::Ready(_)),
+        "no owner shows the source: the export is not deferred"
+    );
+    let owner = &b.pstate.direct.outputs[0];
+    assert!(
+        !owner.unflip_requested,
+        "the output owner shows another client"
+    );
+}
+
+#[test]
+fn an_output_owner_holding_a_promoted_source_defers_its_export_and_unflips() {
+    // Mutation: direct_scopes_referencing_drawable reads only the Root owner.
+    let a_xid = 0x0067_0021;
+    let (mut b, _, a) = promoted_backend(a_xid);
+    hold_on_output_owner(&mut b, 0, Some(a));
+    assert!(b.direct_frame_references_drawable(a));
+    let _token = pending_token(begin_export(&mut b, a_xid));
+    let owner = &b.pstate.direct.outputs[0];
+    assert!(
+        owner.unflip_requested,
+        "the owner showing the source unflips"
+    );
+    assert_eq!(owner.unflip_reason, Some("server_source_exported"));
+    assert!(!b.pstate.direct.root().unflip_requested);
 }

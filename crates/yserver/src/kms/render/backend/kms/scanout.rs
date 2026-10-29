@@ -643,9 +643,7 @@ impl KmsBackend {
     }
 
     pub(in crate::kms::render::backend) fn request_direct_unflip(&mut self, reason: &'static str) {
-        for scope in self.pstate.direct.active_scopes() {
-            self.request_direct_unflip_for(scope, reason);
-        }
+        self.pstate.request_direct_unflip(reason);
     }
 
     pub(in crate::kms::render::backend) fn request_direct_unflip_for_outputs(
@@ -678,25 +676,7 @@ impl KmsBackend {
         scope: DirectScope,
         reason: &'static str,
     ) {
-        let Some(owner) = self.pstate.direct.get_mut(scope) else {
-            return;
-        };
-        if !owner.active() {
-            return;
-        }
-        if !owner.unflip_requested {
-            owner.unflip_reason = Some(reason);
-            *self
-                .pstate
-                .scanout_m0
-                .server
-                .unflip_reasons
-                .entry(reason)
-                .or_default() += 1;
-        }
-        owner.unflip_requested = true;
-        owner.unflip_last_reason = Some(reason);
-        owner.hold_direct = false;
+        self.pstate.request_direct_unflip_for(scope, reason);
     }
 
     pub(in crate::kms::render::backend) fn direct_scopes_referencing_host_drawable(
@@ -1272,7 +1252,7 @@ impl KmsBackend {
         timing: crate::drm::async_flip::FlipTiming,
     ) -> io::Result<crate::drm::async_flip::AsyncOutcome> {
         let dest_id = self.store.lookup(frame.candidate.paint_dst_host_xid);
-        if !self.direct_source_ready(frame.source_id, dest_id) {
+        if !self.direct_source_ready(frame.source_id, dest_id, scope) {
             return Err(io::Error::other("direct source is not ready for scanout"));
         }
         let fb = self

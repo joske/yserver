@@ -1,6 +1,6 @@
 use crate::kms::render::{
     backend::{
-        KmsBackend, KmsBackendState, RotationState, SERVER_SCANOUT_FAILURE_CAP,
+        DirectScope, KmsBackend, KmsBackendState, RotationState, SERVER_SCANOUT_FAILURE_CAP,
         SERVER_SCANOUT_LIVE_CAP, ScanoutM0Target, ScanoutSourceLayout, ServerFenceKind,
         ServerFenceTally, ServerScanoutDescriptor, ServerScanoutPromoteError,
         ServerScanoutPromotion, ServerScanoutState,
@@ -17,13 +17,27 @@ use std::rc::Rc;
 use yserver_core::backend::PresentScanoutCandidate;
 
 impl KmsBackendState {
-    /// Ask the active direct frame to hand the screen back to the scene.
+    /// Ask every active direct owner to hand its outputs back to the scene.
     pub(in crate::kms::render::backend) fn request_direct_unflip(&mut self, reason: &'static str) {
-        if !self.direct.root().active() {
+        for scope in self.direct.active_scopes() {
+            self.request_direct_unflip_for(scope, reason);
+        }
+    }
+
+    /// Ask the owner of `scope` to hand its outputs back to the scene.
+    pub(in crate::kms::render::backend) fn request_direct_unflip_for(
+        &mut self,
+        scope: DirectScope,
+        reason: &'static str,
+    ) {
+        let Some(owner) = self.direct.get_mut(scope) else {
+            return;
+        };
+        if !owner.active() {
             return;
         }
-        if !self.direct.root().unflip_requested {
-            self.direct.root_mut().unflip_reason = Some(reason);
+        if !owner.unflip_requested {
+            owner.unflip_reason = Some(reason);
             *self
                 .scanout_m0
                 .server
@@ -31,17 +45,74 @@ impl KmsBackendState {
                 .entry(reason)
                 .or_default() += 1;
         }
-        self.direct.root_mut().unflip_requested = true;
-        self.direct.root_mut().unflip_last_reason = Some(reason);
-        self.direct.root_mut().hold_direct = false;
+        owner.unflip_requested = true;
+        owner.unflip_last_reason = Some(reason);
+        owner.hold_direct = false;
+    }
+
+    /// The active owners whose pending, queued or current frame names `id`
+    /// as its source or fallback target.
+    pub(in crate::kms::render::backend) fn direct_scopes_referencing_drawable(
+        &self,
+        id: DrawableId,
+    ) -> Vec<DirectScope> {
+        self.direct
+            .active_scopes()
+            .into_iter()
+            .filter(|&scope| {
+                self.direct.get(scope).is_some_and(|owner| {
+                    [
+                        owner.pending.as_ref(),
+                        owner.queued_successor.as_ref(),
+                        owner.current.as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|frame| frame.source_id == id || frame.fallback_target.backing_id() == id)
+                })
+            })
+            .collect()
+    }
+
+    /// Unflip every owner that holds one of `ids`, and only those.
+    pub(in crate::kms::render::backend) fn request_direct_unflip_referencing(
+        &mut self,
+        ids: &[DrawableId],
+        reason: &'static str,
+    ) {
+        let mut scopes: Vec<DirectScope> = Vec::new();
+        for &id in ids {
+            for scope in self.direct_scopes_referencing_drawable(id) {
+                if !scopes.contains(&scope) {
+                    scopes.push(scope);
+                }
+            }
+        }
+        for scope in scopes {
+            self.request_direct_unflip_for(scope, reason);
+        }
+    }
+
+    /// Every member of a `Complete` rotation that holds `id`, and `id`.
+    fn complete_rotation_members_with(&self, id: DrawableId) -> Vec<DrawableId> {
+        let mut members = vec![id];
+        for rotation in self.server_scanout.rotations.values() {
+            if rotation.state == RotationState::Complete
+                && rotation.members.iter().any(|(member, _)| *member == id)
+            {
+                members.extend(rotation.members.iter().map(|(member, _)| *member));
+            }
+        }
+        members
     }
 
     /// A drawable is gone: drop its probe framebuffer, then its scanout
     /// descriptor (D9), and leave any `Complete` rotation it belonged to.
     pub(in crate::kms::render::backend) fn retire_scanout_drawable(&mut self, id: DrawableId) {
         self.scanout_m1.remove(id);
+        let members = self.complete_rotation_members_with(id);
         if self.server_scanout.retire(id) {
-            self.request_direct_unflip("server_source_retired");
+            self.request_direct_unflip_referencing(&members, "server_source_retired");
         }
     }
 }
@@ -90,10 +161,19 @@ impl KmsBackend {
         }
         let server = &mut self.pstate.scanout_m0.server;
         server.candidates = server.candidates.saturating_add(1);
+        let previous_members: Vec<DrawableId> = self
+            .pstate
+            .server_scanout
+            .rotations
+            .get(&dest_id)
+            .map(|rotation| rotation.members.iter().map(|(id, _)| *id).collect())
+            .unwrap_or_default();
         let observation = self.pstate.server_scanout.observe(dest_id, source_id);
         if observation.left_complete {
-            self.pstate
-                .request_direct_unflip("server_source_rotation_changed");
+            self.pstate.request_direct_unflip_referencing(
+                &previous_members,
+                "server_source_rotation_changed",
+            );
         }
         if observation.identified {
             self.promote_server_rotation(dest_id);
@@ -101,7 +181,8 @@ impl KmsBackend {
     }
 
     /// Server-owned, depth-24 BGRA, root-sized, Presented whole to the COW or
-    /// a COW descendant that passes the M2 gate.
+    /// a COW descendant that passes the M2 gate as a `Root` candidate. A
+    /// promoted source is only ever scanned out by the `Root` owner (D11).
     fn server_scanout_source_shaped(
         &self,
         candidate: PresentScanoutCandidate,
@@ -129,8 +210,12 @@ impl KmsBackend {
                 target,
                 ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant
             )
-            && self.direct_candidate_gate(candidate, target, unbordered, true)
-            && scanout_m1_outputs_cover_root(root, &self.scanout_m1_output_geometry())
+            && self.direct_candidate_scope(candidate, target) == Some(DirectScope::Root)
+            && self.direct_candidate_gate(candidate, target, DirectScope::Root, unbordered, true)
+            && scanout_m1_outputs_cover_root(
+                root,
+                &self.scanout_m1_output_geometry(DirectScope::Root),
+            )
     }
 
     /// Whether a client holds, or may hold, an fd of `source_id` (D6).
@@ -177,6 +262,7 @@ impl KmsBackend {
                 ),
             );
         }
+        let held = self.pstate.complete_rotation_members_with(source_id);
         let mut left_complete = false;
         for rotation in self.pstate.server_scanout.rotations.values_mut() {
             if rotation.state == RotationState::Complete
@@ -186,8 +272,12 @@ impl KmsBackend {
                 left_complete = true;
             }
         }
-        if left_complete || self.direct_frame_references_drawable(source_id) {
-            self.pstate.request_direct_unflip(reason);
+        // Unflip whichever owner shows the source, or the rotation it left.
+        if left_complete {
+            self.pstate.request_direct_unflip_referencing(&held, reason);
+        } else {
+            self.pstate
+                .request_direct_unflip_referencing(&[source_id], reason);
         }
         self.release_unreferenced_server_scanout();
     }
@@ -201,6 +291,7 @@ impl KmsBackend {
     pub(in crate::kms::render::backend) fn server_direct_source_fence(
         &mut self,
         source_id: DrawableId,
+        scope: DirectScope,
     ) -> std::io::Result<(Option<std::os::fd::OwnedFd>, ServerFenceTally)> {
         use crate::kms::render::store::ScanoutWriteFence;
 
@@ -214,11 +305,16 @@ impl KmsBackend {
             None | Some(ScanoutWriteFence::NoPendingWrite) => {
                 return Ok((None, tally(ServerFenceKind::None)));
             }
+            // The fence goes on every plane of the owner's commit.
             Some(ScanoutWriteFence::Fence(fd)) => self
-                .platform
-                .outputs
+                .direct_scope_outputs(scope)
                 .iter()
-                .all(|output| output.output.plane_in_fence_fd_prop.is_some())
+                .all(|&output_idx| {
+                    self.platform
+                        .outputs
+                        .get(output_idx)
+                        .is_some_and(|output| output.output.plane_in_fence_fd_prop.is_some())
+                })
                 .then(|| fd.try_clone().ok())
                 .flatten(),
             Some(ScanoutWriteFence::ExportFailed) => None,
@@ -284,7 +380,7 @@ impl KmsBackend {
         let wait = self.pstate.direct_source_cpu_waiter;
         wait(self, source_id).inspect_err(|_| {
             self.pstate
-                .request_direct_unflip("server_source_fence_failed");
+                .request_direct_unflip_referencing(&[source_id], "server_source_fence_failed");
         })
     }
 
@@ -304,34 +400,31 @@ impl KmsBackend {
         .map_err(|error| std::io::Error::other(format!("direct source fence wait: {error:?}")))
     }
 
-    /// Whether a direct frame (pending, queued or current) names `id` as its
-    /// source or fallback target.
+    /// Whether any owner's direct frame (pending, queued or current) names
+    /// `id` as its source or fallback target.
     pub(in crate::kms::render::backend) fn direct_frame_references_drawable(
         &self,
         id: DrawableId,
     ) -> bool {
-        let root = self.pstate.direct.root();
-        [
-            root.pending.as_ref(),
-            root.queued_successor.as_ref(),
-            root.current.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|frame| frame.source_id == id || frame.fallback_target.backing_id() == id)
+        !self
+            .pstate
+            .direct_scopes_referencing_drawable(id)
+            .is_empty()
     }
 
-    /// Whether M2 may scan `source_id`, Presented to `dest_id`, out from its cached framebuffer.
+    /// Whether `scope`'s owner may scan `source_id`, Presented to `dest_id`,
+    /// out from its cached framebuffer.
     pub(in crate::kms::render::backend) fn direct_source_ready(
         &self,
         source_id: DrawableId,
         dest_id: Option<DrawableId>,
+        scope: DirectScope,
     ) -> bool {
         let has_framebuffer = self
             .pstate
             .scanout_m1
             .entries
-            .get(&source_id)
+            .get(&(source_id, scope))
             .and_then(crate::kms::render::backend::ScanoutM1ProbeEntry::framebuffer)
             .is_some();
         let imported = self.store.get(source_id).is_some_and(|drawable| {
@@ -627,9 +720,20 @@ impl KmsBackend {
                         layout.pitch,
                         layout.offset,
                     );
-                    let entry = self.scanout_m1_accepted_entry(framebuffer, &layout);
-                    self.pstate.scanout_m1.entries.remove(&id);
-                    self.pstate.scanout_m1.entries.insert(id, entry);
+                    let entry = {
+                        let output_indices = self.direct_scope_outputs(DirectScope::Root);
+                        let planes = scanout_m1_plane_states(
+                            &self.platform.outputs,
+                            &output_indices,
+                            DirectScope::Root,
+                        );
+                        KmsBackend::scanout_m1_accepted_entry(framebuffer, &layout, &planes)
+                    };
+                    self.pstate.scanout_m1.remove(id);
+                    self.pstate
+                        .scanout_m1
+                        .entries
+                        .insert((id, DirectScope::Root), entry);
                     self.pstate
                         .server_scanout
                         .sources
@@ -684,8 +788,12 @@ impl KmsBackend {
             .map(|drawable| drawable.depth)
             .ok_or_else(|| ServerScanoutPromoteError::Engine("drawable gone".into()))?;
         let root = (u32::from(b.platform.fb_w), u32::from(b.platform.fb_h));
-        let output_geometry = b.scanout_m1_output_geometry();
-        let output_indices: Vec<_> = (0..b.platform.outputs.len()).collect();
+        if !scanout_m1_outputs_cover_root(root, &b.scanout_m1_output_geometry(DirectScope::Root)) {
+            return Err(ServerScanoutPromoteError::ProbeRejected(
+                "outputs do not tile the root".into(),
+            ));
+        }
+        let output_indices = b.direct_scope_outputs(DirectScope::Root);
         let cursor_positions = b
             .platform
             .cursor_plane_atomic_positions_for_outputs(&output_indices);
@@ -705,7 +813,8 @@ impl KmsBackend {
             .iter()
             .map(|output| output.output.scanout_modifiers.as_slice())
             .collect();
-        let plane_states = scanout_m1_plane_states(&platform.outputs);
+        let plane_states =
+            scanout_m1_plane_states(&platform.outputs, &output_indices, DirectScope::Root);
         let mut layout_seen = None;
         let promotion = b.engine.promote_drawable_for_scanout(
             &mut platform.gpu,
@@ -725,14 +834,8 @@ impl KmsBackend {
                     pitch: candidate.pitch,
                     modifier: candidate.modifier,
                 };
-                scanout_m1_validate(
-                    &layout,
-                    root,
-                    (layout.width, layout.height),
-                    &output_geometry,
-                    &output_modifiers,
-                )
-                .map_err(|reason| format!("validate: {reason:?}"))?;
+                scanout_m1_validate(&layout, root, &output_modifiers)
+                    .map_err(|reason| format!("validate: {reason:?}"))?;
                 let result = crate::drm::modeset::probe_direct_scanout_test_only(
                     Rc::clone(&primary.0),
                     candidate.fd,

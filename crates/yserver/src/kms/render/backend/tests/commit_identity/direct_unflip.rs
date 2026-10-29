@@ -229,6 +229,8 @@ pub(crate) fn output_owner_frame(
         awaiting_outputs: HashSet::new(),
         accepted_event_id: None,
         async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
+        in_fence: None,
+        fence_tally: None,
     }
 }
 
@@ -356,13 +358,15 @@ fn reconfigure_root_present_as_output(
     .expect("resize direct window through Backend");
 
     let source_xid = 0x7e00 + u32::try_from(present_id).expect("Present id fits XID");
-    let source_storage = fixture
+    let mut source_storage = fixture
         .events
         .backend
         .platform
         .gpu
         .allocate_drawable_storage(width, height, 24)
         .expect("allocate output-sized Present source");
+    // Direct sources model imported client buffers.
+    source_storage.imported_dmabuf = Some(super::super::imported_dmabuf_for_test(width, height));
     let source_id = fixture
         .events
         .backend
@@ -2725,13 +2729,17 @@ fn resize_root_direct_present_before_unflip() -> Option<ResizePendingUnflip> {
     .expect("configure the target through the core request dispatcher");
 
     let source_host_xid = direct.target_xid + 2;
-    let source_storage = fixture
+    let mut source_storage = fixture
         .events
         .backend
         .platform
         .gpu
         .allocate_drawable_storage(new_size.0, new_size.1, 24)
         .expect("allocate new-root-sized Present source");
+    // Direct sources model imported client buffers.
+    source_storage.imported_dmabuf = Some(super::super::imported_dmabuf_for_test(
+        new_size.0, new_size.1,
+    ));
     let new_source_id = fixture
         .events
         .backend

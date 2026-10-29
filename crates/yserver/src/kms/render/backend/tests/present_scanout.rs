@@ -2066,6 +2066,8 @@ fn output_present_in_flight_policy() {
             awaiting_outputs: HashSet::from([output_idx]),
             accepted_event_id: Some(0xD120),
             async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
+            in_fence: None,
+            fence_tally: None,
         };
         let owner = &mut backend.pstate.direct.outputs[output_idx];
         if phase == 0 {
@@ -2873,22 +2875,18 @@ fn scoped_crtc_admission() {
             )
             .expect("allocate null fallback storage");
 
+        let mut source_storage = Storage::for_tests_null(
+            ash::vk::Extent2D {
+                width: u32::from(width),
+                height: 600,
+            },
+            ash::vk::Format::B8G8R8A8_UNORM,
+        );
+        source_storage.imported_dmabuf = Some(imported_dmabuf_for_test(width, 600));
         let source_id = backend
             .store
-            .allocate(
-                source_xid,
-                DrawableKind::Pixmap,
-                24,
-                false,
-                Storage::for_tests_null(
-                    ash::vk::Extent2D {
-                        width: u32::from(width),
-                        height: 600,
-                    },
-                    ash::vk::Format::B8G8R8A8_UNORM,
-                ),
-            )
-            .expect("allocate null source storage");
+            .allocate(source_xid, DrawableKind::Pixmap, 24, false, source_storage)
+            .expect("allocate imported source storage");
         assert_eq!(
             backend
                 .store
@@ -2975,6 +2973,7 @@ fn scoped_crtc_admission() {
                     src_y,
                     src_w: u32::from(layout.width),
                     src_h: u32::from(layout.height),
+                    in_fence_fd: None,
                 }
             })
             .collect();

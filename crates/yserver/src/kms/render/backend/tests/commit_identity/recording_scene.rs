@@ -336,11 +336,14 @@ impl RecordingSceneFixture {
             .store
             .allocate(target_xid, DrawableKind::Window, 24, true, target_storage)
             .expect("register output-sized direct fallback image");
-        let source_storage = backend
+        let mut source_storage = backend
             .platform
             .gpu
             .allocate_drawable_storage(width, height, 24)
             .expect("allocate output-sized direct source image");
+        // Direct sources model imported client buffers.
+        source_storage.imported_dmabuf =
+            Some(super::super::imported_dmabuf_for_test(width, height));
         let source_id = backend
             .store
             .allocate(source_xid, DrawableKind::Pixmap, 24, false, source_storage)

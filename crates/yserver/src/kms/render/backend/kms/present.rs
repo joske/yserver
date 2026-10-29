@@ -1,7 +1,7 @@
 use crate::kms::render::{
     backend::{
         ABSOLUTE_SEQ_TAG, DirectPresentFrame, DirectScope, KmsBackend, ScanoutM0Target,
-        ScanoutM1ProbeEntry, TEARING_ENTRY_PROBATION, TearingState,
+        TEARING_ENTRY_PROBATION, TearingState,
         kms::scanout::{
             phase_b_flip_in_flight_for_scheduler, scanout_direct_eligible,
             scanout_m2_is_authoritative_root,
@@ -1281,14 +1281,14 @@ impl KmsBackend {
                 owner.unflip_fallback_source = None;
             }
         }
-        let framebuffer_ready = self.direct_source_ready(source_id, leaf_id);
+        let framebuffer_ready = self.direct_source_ready(source_id, leaf_id, scope);
         if !framebuffer_ready {
             self.request_direct_unflip_for(scope, "eligible_direct_successor_framebuffer_missing");
             return Ok(false);
         }
         // Fence a promoted source's writes before this Present is submitted or queued (D8).
         let (in_fence, fence_tally) = if self.pstate.server_scanout.is_promoted(source_id) {
-            match self.server_direct_source_fence(source_id) {
+            match self.server_direct_source_fence(source_id, scope) {
                 Ok((fence, tally)) => (fence, Some(tally)),
                 Err(error) => {
                     log::warn!(
@@ -1296,10 +1296,12 @@ impl KmsBackend {
                         "direct Present of server-owned source_id={} takes Copy: {error}",
                         source_id.as_u64(),
                     );
-                    self.request_direct_unflip("server_source_fence_failed");
-                    if self.pstate.direct.root().active() {
-                        self.pstate.direct.root_mut().unflip_fallback_source = Some(source_id);
-                        self.pstate.direct.root_mut().unflip_shadow_ready = false;
+                    self.request_direct_unflip_for(scope, "server_source_fence_failed");
+                    if let Some(owner) = self.pstate.direct.get_mut(scope)
+                        && owner.active()
+                    {
+                        owner.unflip_fallback_source = Some(source_id);
+                        owner.unflip_shadow_ready = false;
                     }
                     return Ok(false);
                 }
