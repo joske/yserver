@@ -150,3 +150,4 @@ Design remarks from the probe, addressed in the plan:
   `ExportableImage::into_raw_parts` drops the queried offset.
 - The M1 probe cache keys on `DrawableId`; promotion swaps storage under the
   same id, so the key needs a storage generation.
+- Plan review: the probe cache keeps its `DrawableId` key; a one-swap invariant replaces the storage generation of point 3 (plan D10).
