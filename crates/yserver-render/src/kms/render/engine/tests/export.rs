@@ -63,3 +63,26 @@ fn promoted_export_reports_driver_plane_offset() {
     assert_eq!(u64::from(export.offset), layout.offset);
     assert_eq!(u64::from(export.stride), layout.row_pitch);
 }
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn promoting_a_promoted_drawable_keeps_its_storage() {
+    let Some((mut gpu, _vk)) = export_capable_gpu() else {
+        return;
+    };
+    let mut store = DrawableStore::new();
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
+    let id = alloc_drawable_3a(&gpu, &mut store, 0x11, 64, 32);
+    engine
+        .promote_drawable_exportable(&mut gpu, &mut store, id)
+        .expect("first promote");
+    let before = {
+        let s = &store.get(id).expect("drawable").storage;
+        (s.image, s.memory)
+    };
+    engine
+        .promote_drawable_exportable(&mut gpu, &mut store, id)
+        .expect("second promote");
+    let s = &store.get(id).expect("drawable").storage;
+    assert_eq!((s.image, s.memory), before);
+}

@@ -369,6 +369,8 @@ impl Storage {
         export_offset: u64,
         export_modifier: u64,
     ) -> RetiredImage {
+        // One swap per drawable: the M1 probe cache keys on `DrawableId` alone.
+        debug_assert!(!self.promoted_exportable, "storage already promoted");
         let retired = RetiredImage {
             image: self.image,
             memory: self.memory,
@@ -2391,5 +2393,33 @@ mod tests {
         assert_eq!(metadata.depth, 24);
         assert_eq!(metadata.bpp, 32);
         assert!(stub_storage().imported_dmabuf.is_none());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "storage already promoted")]
+    fn adopt_exportable_twice_panics() {
+        let mut storage = stub_storage();
+        let null = || {
+            (
+                vk::Image::null(),
+                vk::DeviceMemory::null(),
+                vk::ImageView::null(),
+            )
+        };
+        for _ in 0..2 {
+            let (image, memory, view) = null();
+            let _ = storage.adopt_exportable(
+                image,
+                memory,
+                view,
+                view,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                256,
+                4096,
+                0,
+                0,
+            );
+        }
     }
 }

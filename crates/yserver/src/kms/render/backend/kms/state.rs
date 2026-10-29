@@ -189,6 +189,9 @@ impl ScanoutM1ProbeEntry {
     }
 }
 
+/// M1 probe results keyed by `DrawableId` alone. Sound because a drawable's
+/// storage is swapped at most once, non-exportable to exportable
+/// (`Storage::adopt_exportable`); a second swap would need a generation key.
 pub(in crate::kms::render::backend) struct ScanoutM1ProbeCache {
     pub(in crate::kms::render::backend) topology_signature: u64,
     pub(in crate::kms::render::backend) entries:
