@@ -78,12 +78,24 @@ New:
 Each is also marked inline in the task that implements it. Codex reviewed
 two drafts; its answers are folded in below.
 
-- **D1 Promotion trigger.** Promote on the **second** eligible Present of
-  the same drawable. That identifies marco's reused buffers: each promotes
-  on its second Present. It is not a general amortization guarantee: M2
-  probation is one global streak, so it does not prove per-buffer reuse.
-  The caps in D3 bound what a client can make us pay. Cost: two extra
-  composed frames at startup.
+- **D1 Promotion trigger: per rotation, not per drawable.** A *rotation* is
+  keyed by the Present destination (the COW or COW descendant) and holds the
+  distinct eligible source ids seen on it, in order, at most two (A, or A
+  and B). It is *identified* once every member has had a second eligible
+  Present with no third source in between; marco's double buffer is
+  identified at its fourth Present (A, B, A, B). Identification reserves
+  one token per member (D3) up front, then promotes every not-yet-promoted
+  member in that same call, so A is never promoted without B being
+  attempted. Server-owned sources on that destination may flip (M2) only
+  while the rotation is *complete*: every member `Promoted` and probed. If a
+  member fails after another succeeded, the successful swap cannot be
+  undone: that member stays `Promoted`, the rotation is `Failed`, every
+  Present on the destination stays Copy, and the unused reservation is
+  returned. A third source on the destination resets the rotation (unflip if
+  direct; members that are already `Promoted` need no new token). It is not
+  a general amortization guarantee: M2 probation is one global streak, so it
+  does not prove per-buffer reuse. The caps in D3 bound what a client can
+  make us pay. Cost: three to four composed frames at startup.
 - **D2 Synchronous promotion.** Keep promotion synchronous, inside
   `observe_scanout_m0` and before `maybe_probe_scanout_m1`. The same Present
   then flips eligibility, and its Copy reads the new storage (probe remark
@@ -99,10 +111,10 @@ two drafts; its answers are folded in below.
     refills one token per 30 s (`SERVER_SCANOUT_PROMOTE_REFILL`). A per-epoch
     count would end a healthy long session on the composed path; the bucket
     still bounds a restart loop to one 6–8 ms promotion per 30 s. Tokens
-    are spent per A/B rotation, not per buffer: a newly observed rotation
-    promotes only when two tokens are available, and stays on the Copy path
-    otherwise. One token would leave the double buffer half promoted, so A
-    flips while B's Present requests an unflip (codex review 3);
+    are reserved per rotation at identification (D1), one per member not yet
+    promoted: a rotation whose reservation cannot be met stays on Copy and
+    spends nothing. One token for a two-buffer rotation would leave it half
+    promoted, so A flips while B's Present requests an unflip;
   - live: at most 4 promoted drawables alive at once (bounds the memory of
     non-pooled linear root-sized storage).
 
@@ -391,9 +403,12 @@ Changes:
 - `KmsBackendState` gets `server_scanout: ServerScanoutSources`. Per
   `DrawableId` it records `eligible_presents: u8` and a state:
   `Candidate | Promoted(ServerScanoutDescriptor) | Failed(reason) |
-  Disqualified`. It also holds the D3 state: failures per topology epoch,
-  the success token bucket (its methods take `now: Instant`, so tests drive
-  time) and the live count.
+  Disqualified`. Per Present destination (window id) it records a
+  `Rotation { members: ArrayVec<DrawableId, 2>, state: Observing |
+  Complete | Failed }` (D1). It also holds the D3 state: failures per
+  topology epoch, the success token bucket (its methods take `now:
+  Instant`, so tests drive time, and it has `reserve(n)` / `refund(n)`) and
+  the live count.
 - In `observe_scanout_m0` (`K/scanout.rs:2767`), before
   `maybe_probe_scanout_m1` (call at `:2899`), add
   `observe_server_scanout_candidate`. It admits a source only when:
@@ -410,12 +425,21 @@ Changes:
     transform, the CRTC epoch, VT and outputs active, the hardware cursor
     and an empty root overlay;
   - `scanout_m1_outputs_cover_root` (`K/scanout.rs:289`) holds.
-- On the second admitted Present (D1), with all three caps open (D3), it
-  calls `promote_drawable_for_scanout` with a probe closure that builds the
-  descriptor and runs `scanout_m1_validate` + `scanout_m1_test_only`
-  (Task 3). On `Ok` it removes any M1 entry for the id, inserts the
-  accepted entry with the returned framebuffer and the current topology
-  signature, and stores `Promoted(desc)`. On `Err` it records `Failed`.
+- Each admitted Present updates the destination's rotation (D1). When the
+  rotation is identified and the failure and live caps are open (D3), it
+  reserves one token per member not yet `Promoted`; if the bucket cannot
+  cover them all, nothing is promoted and the Present stays Copy. Otherwise
+  it calls `promote_drawable_for_scanout` for each such member in turn, with
+  a probe closure that builds the descriptor and runs
+  `scanout_m1_validate` + `scanout_m1_test_only` (Task 3). On `Ok` it
+  removes any M1 entry for the id, inserts the accepted entry with the
+  returned framebuffer and the current topology signature, and stores
+  `Promoted(desc)`. On `Err` it records `Failed`, marks the rotation
+  `Failed` and refunds the reservations not yet spent. The rotation is
+  `Complete` only when every member is `Promoted`.
+- Task 9's admission of a server-owned source requires its destination's
+  rotation to be `Complete`; a `Promoted` member of an `Observing` or
+  `Failed` rotation takes the Copy path.
 - `promote_drawable_for_scanout` is reached through a function pointer in
   `pstate`, like `direct_frame_submitter` (`K/state.rs:248`). Recording
   tests install a fake that returns a descriptor with a memfd, or an error.
@@ -427,9 +451,19 @@ Changes:
 
 Tests (recording backend, fake promoter):
 
-- The first eligible Present does not promote. The second promotes, and the
-  same Present's M1 entry is the accepted one from promotion.
-- A third Present does not promote again.
+- A single-buffer rotation (A, A): the first eligible Present does not
+  promote; the second promotes, and that Present's M1 entry is the
+  accepted one from promotion. A third Present does not promote again.
+- An A/B rotation (A, B, A, B): nothing promotes before the fourth
+  Present, which promotes both A and B and spends two tokens; from then on
+  A and B alternate direct flips with no unflip.
+- Second-buffer failure: the fake promoter succeeds for A and fails for B.
+  A stays `Promoted`, B is `Failed`, the rotation is `Failed`, one token is
+  spent and one refunded, every later Present on the destination takes
+  Copy, and no flip or unflip is ever requested.
+- A third source C on the destination resets the rotation and, if direct,
+  requests an unflip; a new rotation including an already `Promoted`
+  member reserves tokens only for the others.
 - A depth-32 source, an `Unredirected` target, a non-root extent, a nonzero
   `x_off`, a bordered target, a non-empty root overlay, a GLX-bound and a
   DRI3-exported pixmap never promote.
