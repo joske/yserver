@@ -5,6 +5,7 @@ mod glyph_runs;
 mod handoff;
 mod memory_frame;
 mod pixel_clamp;
+mod put_image_arena;
 mod render_composite;
 use super::*;
 use crate::kms::{

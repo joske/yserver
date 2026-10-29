@@ -5,12 +5,23 @@ use crate::kms::render::{
         frame::{begin_op_cb, end_and_submit_op},
         pixels::{pack_from_storage, unpack_to_staging},
     },
+    frame_builder::PutImageSrc,
     gpu::GpuCore,
     store::DrawableStore,
     target::{Dst, Src},
 };
 use ash::vk;
 use std::sync::Arc;
+
+/// PutImages of at most this many staging bytes are copied into the open
+/// frame's upload arena; larger ones use a pooled staging buffer.
+pub(crate) const PUT_IMAGE_ARENA_MAX_BYTES: u64 = 64 * 1024;
+
+/// A PutImage's unpacked pixels before they are pinned into the frame.
+enum PutImageBytes {
+    Arena(Vec<u8>),
+    Pooled(Arc<StagingBuffer>),
+}
 
 impl RenderEngine {
     /// Drain the accumulated `get_image` phase totals, zeroing them.
@@ -27,8 +38,9 @@ impl RenderEngine {
     /// Upload `src_bytes` (interpreted per `src_depth`) into
     /// `target` at `dst_pos`. Stage 2c supports depths 1, 8, 24,
     /// 32 with the byte layouts the X11 dispatcher emits (see
-    /// the inline conversion table). Per-op staging buffer; no
-    /// arena coalescing yet.
+    /// the inline conversion table). Images up to
+    /// [`PUT_IMAGE_ARENA_MAX_BYTES`] share the open frame's upload
+    /// arena; larger ones take a pooled staging buffer each.
     ///
     /// # Errors
     ///
@@ -113,31 +125,49 @@ impl RenderEngine {
             return Ok(());
         }
 
-        // Phase B.3 (N8-style ordering): allocate the staging buffer BEFORE
-        // any open-frame mutation so an allocation failure leaves the frame
-        // untouched (no rollback needed).
-        // #nvidia perf: reuse a pooled upload staging buffer instead of a fresh
-        // vkCreateBuffer+vkAllocateMemory per put_image (costly on NVIDIA).
-        // Returned to the pool at retire (poll_retired). Clone vk to a local
-        // first so the &mut borrow of `inner.staging_pool` doesn't alias `inner.vk`.
-        let staging_vk = inner.vk.clone();
-        let staging = Arc::new(
-            inner
-                .staging_pool
-                .acquire(&staging_vk, staging_size.max(1))?,
-        );
-        // Convert src_bytes → staging according to (depth, dst_format).
+        // Small images go through the open frame's upload arena (a few
+        // shared blocks reused across frames) instead of one pooled
+        // VkBuffer + VkDeviceMemory each: the pool keeps at most
+        // `STAGING_POOL_BUCKET_CAP` buffers per size, fewer than a frame of
+        // small puts holds in flight, so the rest were allocated and freed.
         let (sx, sy) = src_origin_in_input;
-        unpack_to_staging(
-            src_bytes,
-            src_extent,
-            sx,
-            sy,
-            copy_w,
-            copy_h,
-            src_depth,
-            staging.mapped.as_ptr(),
-        )?;
+        let source = if staging_size <= PUT_IMAGE_ARENA_MAX_BYTES {
+            let len = usize::try_from(staging_size).expect("small put fits usize");
+            let mut bytes = vec![0u8; len];
+            unpack_to_staging(
+                src_bytes,
+                src_extent,
+                sx,
+                sy,
+                copy_w,
+                copy_h,
+                src_depth,
+                bytes.as_mut_ptr(),
+            )?;
+            PutImageBytes::Arena(bytes)
+        } else {
+            // Phase B.3 (N8-style ordering): allocate the staging buffer
+            // BEFORE any open-frame mutation so an allocation failure leaves
+            // the frame untouched (no rollback needed). #nvidia perf: reuse a
+            // pooled upload staging buffer instead of a fresh
+            // vkCreateBuffer+vkAllocateMemory per put_image. Returned to the
+            // pool at retire (poll_retired). Clone vk to a local first so the
+            // &mut borrow of `inner.staging_pool` doesn't alias `inner.vk`.
+            let staging_vk = inner.vk.clone();
+            let staging = Arc::new(inner.staging_pool.acquire(&staging_vk, staging_size)?);
+            // Convert src_bytes → staging according to (depth, dst_format).
+            unpack_to_staging(
+                src_bytes,
+                src_extent,
+                sx,
+                sy,
+                copy_w,
+                copy_h,
+                src_depth,
+                staging.mapped.as_ptr(),
+            )?;
+            PutImageBytes::Pooled(staging)
+        };
 
         // Open the frame if not already open. Phase B.2 Mechanism 2: bump
         // acquire_generation at open + capture on OpenFrame. (Same pattern as
@@ -162,12 +192,23 @@ impl RenderEngine {
         // Phase B.3 (N2): pin the staging Arc into the frame pin-set BEFORE
         // any `store` mutation (first_touch + damage happen after pinning so
         // that a pin-failure doesn't leave store state inconsistent).
-        let staging_pin_idx = {
+        // An arena allocation failure also leaves the frame's pins unchanged.
+        let src = match source {
+            PutImageBytes::Arena(bytes) => PutImageSrc::Upload(inner.upload_to_frame(
+                &bytes,
+                inner.upload_copy_align,
+                crate::kms::vk::mem_accounting::ChurnClass::StagingPool,
+            )?),
+            PutImageBytes::Pooled(staging) => {
+                let open = inner.frame_builder.open.as_mut().expect("open");
+                PutImageSrc::Staging(open.pins.pin_staging(staging))
+            }
+        };
+        {
             let open = inner.frame_builder.open.as_mut().expect("open");
             open.touched.first_touch(target, prior_dst_ticket);
             open.layouts.first_touch_drawable(target, dst_pre_layout);
-            open.pins.pin_staging(Arc::clone(&staging))
-        };
+        }
         store.touch_render_write(target, frame_ticket.clone());
         store.damage(target, dst_rect);
 
@@ -179,7 +220,7 @@ impl RenderEngine {
             dst_image,
             dst_extent,
             dst_old_layout: dst_pre_layout,
-            staging_pin_idx,
+            src,
         });
         {
             let open = inner.frame_builder.open.as_mut().expect("open");

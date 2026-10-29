@@ -871,9 +871,9 @@ pub(crate) struct RecordedMaskedCopyArea {
     pub(crate) self_overlap_scratch: Option<super::engine::SampledScratchImage>,
 }
 
-/// Phase B.3 (TRANSFER family — N1, N2). Staging buffer is pinned via
-/// `open.pins.pin_staging` at append; emit fetches the buffer handle from
-/// `pins.staging_buffers[staging_pin_idx.0 as usize].buffer`.
+/// Phase B.3 (TRANSFER family — N1, N2). The source pixels are pinned at
+/// append, in the frame's upload arena or as a pooled staging buffer
+/// ([`PutImageSrc`]); emit copies from the pinned buffer and offset.
 #[derive(Debug)]
 #[allow(
     dead_code,
@@ -886,7 +886,15 @@ pub(crate) struct RecordedPutImage {
     pub(crate) dst_image: vk::Image,
     pub(crate) dst_extent: vk::Extent2D,
     pub(crate) dst_old_layout: vk::ImageLayout,
-    pub(crate) staging_pin_idx: PinnedStagingIdx,
+    pub(crate) src: PutImageSrc,
+}
+
+/// Where a recorded PutImage's pixels sit: a pooled staging buffer (large
+/// images) or a slice of the frame's upload arena (small ones).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PutImageSrc {
+    Staging(PinnedStagingIdx),
+    Upload(PinnedUploadIdx),
 }
 
 /// Phase B.3 (FILL family — N4). One variant covers both `fill_rect`
@@ -1545,7 +1553,7 @@ mod op_tests {
             dst_image: vk::Image::null(),
             dst_extent: vk::Extent2D::default(),
             dst_old_layout: vk::ImageLayout::UNDEFINED,
-            staging_pin_idx: PinnedStagingIdx(0),
+            src: PutImageSrc::Staging(PinnedStagingIdx(0)),
         }));
         assert_eq!(put_image.dst_id(), Some(id7));
         assert_eq!(put_image.written_drawable(), Some(id7));

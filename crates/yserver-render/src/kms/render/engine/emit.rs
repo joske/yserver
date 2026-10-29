@@ -904,9 +904,17 @@ fn emit_recorded_put_image_into_cb(
         vk::AccessFlags2::TRANSFER_WRITE,
     );
     // N2: read the staging buffer handle from the frame pin-set.
-    let staging_buffer = pins.staging_buffers[pi.staging_pin_idx.0 as usize].buffer;
+    let (staging_buffer, buffer_offset) = match pi.src {
+        crate::kms::render::frame_builder::PutImageSrc::Staging(idx) => {
+            (pins.staging_buffers[idx.0 as usize].buffer, 0)
+        }
+        crate::kms::render::frame_builder::PutImageSrc::Upload(idx) => {
+            let slice = pins.upload_slices[idx.0 as usize];
+            (slice.buffer, slice.offset)
+        }
+    };
     let region = [vk::BufferImageCopy::default()
-        .buffer_offset(0)
+        .buffer_offset(buffer_offset)
         .buffer_row_length(0)
         .buffer_image_height(0)
         .image_subresource(
