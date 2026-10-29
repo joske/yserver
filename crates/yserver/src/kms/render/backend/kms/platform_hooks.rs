@@ -487,7 +487,9 @@ impl Platform for PlatformBackend {
         candidate: PresentScanoutCandidate,
         event: yserver_core::backend::CompletedPresentEvent,
     ) -> io::Result<bool> {
-        KmsBackend::backend_present_try_present_direct(b, candidate, event)
+        let result = KmsBackend::backend_present_try_present_direct(b, candidate, event);
+        b.note_present_outcome(candidate.src_host_xid, matches!(result, Ok(true)));
+        result
     }
 
     fn arm_present_source_wait(

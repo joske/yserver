@@ -685,6 +685,13 @@ impl KmsBackend {
         }
         if !owner.unflip_requested {
             owner.unflip_reason = Some(reason);
+            *self
+                .pstate
+                .scanout_m0
+                .server
+                .unflip_reasons
+                .entry(reason)
+                .or_default() += 1;
         }
         owner.unflip_requested = true;
         owner.unflip_last_reason = Some(reason);
@@ -3584,6 +3591,41 @@ impl KmsBackend {
                 diag.m1_probe_reject,
                 diag.m1_probe_error,
             );
+            let server = std::mem::take(&mut diag.server);
+            let mut unflip_reasons: Vec<_> = server.unflip_reasons.iter().collect();
+            unflip_reasons.sort_unstable();
+            log::debug!(
+                "scanout_server_summary candidates={} promote[attempts={} ok={} fail={} \
+                 us_max={} present_us_max={}] reject[exported={} cap_fail={} cap_success={} \
+                 cap_live={}] export[deferred={} defer_us_max={} deadline_teardown={} \
+                 deadline_fail={}] probe[accept={} reject={}] presents[direct_imported={} \
+                 direct_server={} copy={}] fence[explicit={} none={} cpu_wait={}] \
+                 direct_flush[added={} reused={}] unflip_reasons={unflip_reasons:?}",
+                server.candidates,
+                server.promote_attempts,
+                server.promote_ok,
+                server.promote_fail,
+                server.promote_us_max,
+                server.promote_present_us_max,
+                server.reject_exported,
+                server.reject_cap_fail,
+                server.reject_cap_success,
+                server.reject_cap_live,
+                server.export_deferred,
+                server.export_defer_us_max,
+                server.export_deadline_teardown,
+                server.export_deadline_fail,
+                server.probe_accept,
+                server.probe_reject,
+                server.presents_direct_imported,
+                server.presents_direct_server,
+                server.presents_copy,
+                server.fence_explicit,
+                server.fence_none,
+                server.fence_cpu_wait,
+                server.direct_flush_added,
+                server.direct_flush_reused,
+            );
             diag.interval_start = std::time::Instant::now();
             diag.interval_sources.clear();
             diag.presents = 0;
@@ -3608,6 +3650,26 @@ impl KmsBackend {
             diag.m1_probe_reject = 0;
             diag.m1_probe_error = 0;
         }
+    }
+
+    /// Count one Present's outcome: a direct flip (by source origin) or Copy.
+    pub(in crate::kms::render::backend) fn note_present_outcome(
+        &mut self,
+        src_host_xid: u32,
+        direct: bool,
+    ) {
+        let imported = self
+            .store
+            .lookup(src_host_xid)
+            .and_then(|id| self.store.get(id))
+            .is_some_and(|drawable| drawable.storage.imported_dmabuf.is_some());
+        let server = &mut self.pstate.scanout_m0.server;
+        let counter = match (direct, imported) {
+            (true, true) => &mut server.presents_direct_imported,
+            (true, false) => &mut server.presents_direct_server,
+            (false, _) => &mut server.presents_copy,
+        };
+        *counter = counter.saturating_add(1);
     }
 
     /// True only when `vt_state` is `Active` — i.e. we hold DRM master

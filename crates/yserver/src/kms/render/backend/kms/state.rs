@@ -112,6 +112,40 @@ pub(in crate::kms::render::backend) struct ScanoutM0Telemetry {
     pub(in crate::kms::render::backend) m1_probe_pass: u64,
     pub(in crate::kms::render::backend) m1_probe_reject: u64,
     pub(in crate::kms::render::backend) m1_probe_error: u64,
+    pub(in crate::kms::render::backend) server: ServerScanoutTelemetry,
+}
+
+/// Per-interval counters for direct scanout of server-owned Present sources,
+/// plus the Present outcome split and unflip reasons.
+#[derive(Debug, Default)]
+pub(in crate::kms::render::backend) struct ServerScanoutTelemetry {
+    /// Eligible-shaped server-owned Presents.
+    pub(in crate::kms::render::backend) candidates: u64,
+    pub(in crate::kms::render::backend) promote_attempts: u64,
+    pub(in crate::kms::render::backend) promote_ok: u64,
+    pub(in crate::kms::render::backend) promote_fail: u64,
+    pub(in crate::kms::render::backend) promote_us_max: u64,
+    /// Receipt to Copy submit of the Present that promoted.
+    pub(in crate::kms::render::backend) promote_present_us_max: u64,
+    pub(in crate::kms::render::backend) reject_exported: u64,
+    pub(in crate::kms::render::backend) reject_cap_fail: u64,
+    pub(in crate::kms::render::backend) reject_cap_success: u64,
+    pub(in crate::kms::render::backend) reject_cap_live: u64,
+    pub(in crate::kms::render::backend) export_deferred: u64,
+    pub(in crate::kms::render::backend) export_defer_us_max: u64,
+    pub(in crate::kms::render::backend) export_deadline_teardown: u64,
+    pub(in crate::kms::render::backend) export_deadline_fail: u64,
+    pub(in crate::kms::render::backend) probe_accept: u64,
+    pub(in crate::kms::render::backend) probe_reject: u64,
+    pub(in crate::kms::render::backend) presents_direct_imported: u64,
+    pub(in crate::kms::render::backend) presents_direct_server: u64,
+    pub(in crate::kms::render::backend) presents_copy: u64,
+    pub(in crate::kms::render::backend) fence_explicit: u64,
+    pub(in crate::kms::render::backend) fence_none: u64,
+    pub(in crate::kms::render::backend) fence_cpu_wait: u64,
+    pub(in crate::kms::render::backend) direct_flush_added: u64,
+    pub(in crate::kms::render::backend) direct_flush_reused: u64,
+    pub(in crate::kms::render::backend) unflip_reasons: HashMap<&'static str, u64>,
 }
 
 impl Default for ScanoutM0Telemetry {
@@ -142,6 +176,7 @@ impl Default for ScanoutM0Telemetry {
             m1_probe_pass: 0,
             m1_probe_reject: 0,
             m1_probe_error: 0,
+            server: ServerScanoutTelemetry::default(),
         }
     }
 }

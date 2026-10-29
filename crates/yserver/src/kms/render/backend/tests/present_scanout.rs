@@ -4390,10 +4390,31 @@ fn prepare_atomic_cursor_direct_present_with_extent(
     width: u16,
     height: u16,
 ) -> AtomicCursorDirectPresent {
-    use ash::vk;
+    prepare_atomic_cursor_direct_present_with_storage(
+        backend,
+        present_id,
+        width,
+        height,
+        crate::kms::render::store::Storage::for_tests_null(
+            ash::vk::Extent2D {
+                width: u32::from(width),
+                height: u32::from(height),
+            },
+            ash::vk::Format::B8G8R8A8_UNORM,
+        ),
+    )
+}
+
+fn prepare_atomic_cursor_direct_present_with_storage(
+    backend: &mut KmsBackend,
+    present_id: u64,
+    width: u16,
+    height: u16,
+    storage: crate::kms::render::store::Storage,
+) -> AtomicCursorDirectPresent {
     use yserver_core::backend::{CompletedPresentEvent, PresentScanoutCandidate, PresentWake};
 
-    use crate::kms::render::store::{DrawableKind, Storage};
+    use crate::kms::render::store::DrawableKind;
 
     let suffix = u32::try_from(present_id).expect("test Present id fits in XID");
     let target_xid = 0x7300 + suffix * 0x10;
@@ -4410,19 +4431,7 @@ fn prepare_atomic_cursor_direct_present_with_extent(
     backend.core.top_level_order.push(target_xid);
     let source_id = backend
         .store
-        .allocate(
-            source_xid,
-            DrawableKind::Pixmap,
-            24,
-            false,
-            Storage::for_tests_null(
-                vk::Extent2D {
-                    width: u32::from(width),
-                    height: u32::from(height),
-                },
-                vk::Format::B8G8R8A8_UNORM,
-            ),
-        )
+        .allocate(source_xid, DrawableKind::Pixmap, 24, false, storage)
         .expect("allocate fullscreen Present source");
     backend.pstate.scanout_m1.entries.insert(
         (source_id, crate::kms::render::backend::DirectScope::Root),
@@ -5300,6 +5309,74 @@ fn shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs() {
             .platform
             .for_tests_atomic_position_is_unsent(position.device_key, position.crtc)
     }));
+}
+
+#[test]
+fn present_outcome_telemetry_counts_a_copy_present() {
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
+    let stage = 0x0040_0021;
+    seed_cow_stage(&mut b, stage);
+    let (presented, _) = try_present_root_pixmap_for_shape_test(&mut b, 1, 0x0040_0121, stage, 0);
+    assert!(!presented, "a first Present is inside M2 probation");
+    let server = &b.pstate.scanout_m0.server;
+    assert_eq!(
+        (
+            server.presents_copy,
+            server.presents_direct_imported,
+            server.presents_direct_server
+        ),
+        (1, 0, 0)
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn present_outcome_telemetry_counts_an_imported_direct_present() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut backend) = atomic_cursor_hidden_scanout_backend() else {
+        return;
+    };
+    let _recorder = atomic_cursor_recording_sink(&mut backend);
+    Backend::set_cursor_hidden(&mut backend, true);
+    Backend::maybe_composite(&mut backend).expect("schedule hidden-cursor scene");
+
+    let mut storage = crate::kms::render::store::Storage::for_tests_null(
+        ash::vk::Extent2D {
+            width: 1600,
+            height: 600,
+        },
+        ash::vk::Format::B8G8R8A8_UNORM,
+    );
+    storage.imported_dmabuf = Some(crate::kms::render::store::ImportedDmabufMetadata {
+        fourcc: 0x3432_5258,
+        vk_format: ash::vk::Format::B8G8R8A8_UNORM,
+        modifier: 0,
+        implicit_layout: false,
+        planes: vec![crate::kms::render::store::ImportedDmabufPlane {
+            offset: 0,
+            pitch: 1600 * 4,
+        }],
+        width: 1600,
+        height: 600,
+        depth: 24,
+        bpp: 32,
+    });
+    let direct =
+        prepare_atomic_cursor_direct_present_with_storage(&mut backend, 92, 1600, 600, storage);
+    assert!(
+        Backend::try_present_direct(&mut backend, direct.candidate, direct.event)
+            .expect("eligible fullscreen Present"),
+    );
+    let server = &backend.pstate.scanout_m0.server;
+    assert_eq!(
+        (
+            server.presents_direct_imported,
+            server.presents_direct_server,
+            server.presents_copy
+        ),
+        (1, 0, 0)
+    );
 }
 
 #[path = "present_scanout_a3.rs"]
