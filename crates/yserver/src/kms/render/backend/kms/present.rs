@@ -1281,14 +1281,7 @@ impl KmsBackend {
                 owner.unflip_fallback_source = None;
             }
         }
-        let framebuffer_ready = self
-            .pstate
-            .scanout_m1
-            .entries
-            .get(&(source_id, scope))
-            .and_then(ScanoutM1ProbeEntry::framebuffer)
-            .is_some()
-            && self.direct_source_flip_admitted(source_id);
+        let framebuffer_ready = self.direct_source_ready(source_id);
         if !framebuffer_ready {
             self.request_direct_unflip_for(scope, "eligible_direct_successor_framebuffer_missing");
             return Ok(false);

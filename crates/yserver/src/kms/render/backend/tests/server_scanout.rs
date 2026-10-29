@@ -325,9 +325,31 @@ fn marco_double_buffer_promotes_both_on_its_fourth_present() {
     assert!(!b.pstate.direct.root().active());
     assert_eq!(attempts(&b), 2);
 
-    // Control: the same stream flips once the sources are not promoted.
-    b.pstate.server_scanout.sources.clear();
-    assert!(present(&mut b, 30, a_xid, STAGE));
+    // Control: an imported root-sized source with an accepted probe entry
+    // flips on the same destination.
+    let c_xid = 0x0061_0013;
+    let (w, h) = (b.platform.fb_w, b.platform.fb_h);
+    let mut storage = Storage::for_tests_null(
+        ash::vk::Extent2D {
+            width: u32::from(w),
+            height: u32::from(h),
+        },
+        ash::vk::Format::B8G8R8A8_UNORM,
+    );
+    storage.imported_dmabuf = Some(imported_dmabuf_for_test(w, h));
+    let c = b
+        .store
+        .allocate(c_xid, DrawableKind::Pixmap, 24, false, storage)
+        .expect("imported source");
+    b.pstate.scanout_m1.entries.insert(
+        c,
+        ScanoutM1ProbeEntry::accepted(
+            crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(fake_framebuffer_handle(
+                c,
+            )),
+        ),
+    );
+    assert!(present(&mut b, 30, c_xid, STAGE));
 }
 
 #[test]
@@ -649,4 +671,400 @@ fn promoted_source_reprobes_from_its_descriptor() {
     let descriptor = b.scanout_m1_descriptor(a).expect("promoted descriptor");
     assert_eq!(descriptor.layout.pitch, u32::from(b.platform.fb_w) * 4);
     assert_eq!(descriptor.layout.modifier, 0);
+}
+
+// ── Task 7: export disqualification and the deferred DRI3 reply ──────────
+
+thread_local! {
+    /// Output disables seen by [`RecordingPower`].
+    static DISABLED: Cell<usize> = const { Cell::new(0) };
+    /// Each fake export: the drawable, whether a direct frame still
+    /// referenced it, and the output disables seen before it ran.
+    static EXPORTS: std::cell::RefCell<Vec<(DrawableId, bool, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Records the export it was asked for; the drawable must still be alive.
+fn fake_exporter(
+    b: &mut KmsBackend,
+    id: DrawableId,
+    _host_xid: u32,
+) -> std::io::Result<yserver_core::backend::Dri3PixmapExport> {
+    let drawable = b.store.get(id).expect("the exported storage is pinned");
+    let (width, height) = (
+        drawable.storage.extent.width,
+        drawable.storage.extent.height,
+    );
+    let referenced = b.direct_frame_references_drawable(id);
+    EXPORTS.with_borrow_mut(|exports| exports.push((id, referenced, DISABLED.get())));
+    Ok(yserver_core::backend::Dri3PixmapExport {
+        size: width * height * 4,
+        width: u16::try_from(width).expect("test width"),
+        height: u16::try_from(height).expect("test height"),
+        stride: width * 4,
+        offset: 0,
+        depth: 24,
+        bpp: 32,
+        modifier: 0,
+        fd: std::fs::File::open("/dev/null")
+            .expect("open /dev/null")
+            .into(),
+    })
+}
+
+struct RecordingPower {
+    fail: bool,
+}
+
+impl crate::kms::render::platform::power::OutputPowerExecutor for RecordingPower {
+    fn disable(
+        &self,
+        _device: &crate::drm::Device,
+        _output: &crate::platform::drm::Output,
+    ) -> std::io::Result<()> {
+        if self.fail {
+            return Err(std::io::Error::other("scripted all-off failure"));
+        }
+        DISABLED.set(DISABLED.get() + 1);
+        Ok(())
+    }
+
+    fn enable(
+        &self,
+        _device: &crate::drm::Device,
+        _output: &crate::platform::drm::Output,
+        _framebuffer: ::drm::control::framebuffer::Handle,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn disable_device(&self, _device: &crate::drm::Device) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The Task 6 fixture with the fake exporter, and source `xid` promoted.
+fn promoted_backend(xid: u32) -> (KmsBackend, Rc<Cell<std::time::Duration>>, DrawableId) {
+    DISABLED.set(0);
+    EXPORTS.with_borrow_mut(Vec::clear);
+    let (mut b, clock) = backend();
+    b.pstate.dri3_drawable_exporter = fake_exporter;
+    let id = root_pixmap(&mut b, xid);
+    observe(&mut b, xid, STAGE);
+    observe(&mut b, xid, STAGE);
+    assert!(is_promoted(&b, id));
+    (b, clock, id)
+}
+
+/// A live direct frame of `xid`, as the M2 flip leaves it in `current`.
+fn scan_out(b: &mut KmsBackend, xid: u32) {
+    let (w, h) = (b.platform.fb_w, b.platform.fb_h);
+    retain_direct_frame_from_source_test(b, xid, STAGE, w, h);
+}
+
+fn begin_export(b: &mut KmsBackend, xid: u32) -> yserver_core::backend::Dri3ExportBegin {
+    Backend::dri3_begin_export_pixmap_buffers(b, xid).expect("begin the DRI3 export")
+}
+
+fn pending_token(
+    begin: yserver_core::backend::Dri3ExportBegin,
+) -> yserver_core::backend::Dri3ExportToken {
+    match begin {
+        yserver_core::backend::Dri3ExportBegin::Pending(token) => token,
+        yserver_core::backend::Dri3ExportBegin::Ready(_) => {
+            panic!("the export of a scanned-out source must wait")
+        }
+    }
+}
+
+/// The composed replacement of the direct frame is committed on `outputs`.
+fn await_composed_replacement(b: &mut KmsBackend, outputs: &[usize]) {
+    let root = b.pstate.direct.root_mut();
+    for &output in outputs {
+        root.unflip_outputs_to_replace.insert(output);
+        root.unflip_awaiting_outputs
+            .insert(output, 500 + u64::try_from(output).expect("small index"));
+    }
+}
+
+/// The composed replacement retires on `output`.
+fn retire_composed_replacement(b: &mut KmsBackend, output: usize) {
+    let event = 500 + u64::try_from(output).expect("small index");
+    let clock = yserver_core::backend::PresentClockSample {
+        msc: 4,
+        ust: 400,
+        source: yserver_core::backend::PresentClockSource::PageFlip,
+    };
+    assert!(b.retire_direct_output(output, Some(event), clock));
+}
+
+fn disqualified_holding_descriptor(b: &KmsBackend, id: DrawableId) -> Option<bool> {
+    match b.pstate.server_scanout.sources.get(&id) {
+        Some(ServerScanoutState::Disqualified(descriptor)) => Some(descriptor.is_some()),
+        _ => None,
+    }
+}
+
+#[test]
+fn dri3_export_of_the_live_direct_source_waits_for_its_replacement() {
+    let a_xid = 0x0062_0001;
+    let (mut b, _, a) = promoted_backend(a_xid);
+    scan_out(&mut b, a_xid);
+
+    let token = pending_token(begin_export(&mut b, a_xid));
+    assert!(b.pstate.direct.root().unflip_requested);
+    assert_eq!(
+        b.pstate.direct.root().unflip_reason,
+        Some("server_source_exported")
+    );
+    assert_eq!(b.pstate.scanout_m0.server.export_deferred, 1);
+    assert_eq!(b.pstate.scanout_m0.server.reject_exported, 1);
+    assert_eq!(disqualified_holding_descriptor(&b, a), Some(true));
+    assert_eq!(
+        accepted_framebuffer(&b, a),
+        Some(fake_framebuffer_handle(a)),
+        "the framebuffer stays while the CRTC scans it"
+    );
+    assert!(Backend::drain_ready_dri3_exports(&mut b).is_empty());
+    assert!(
+        Backend::next_wakeup(&b).is_some(),
+        "the deadline wakes the loop"
+    );
+
+    await_composed_replacement(&mut b, &[0]);
+    retire_composed_replacement(&mut b, 0);
+    assert_eq!(Backend::drain_ready_dri3_exports(&mut b), [token]);
+    assert!(Backend::drain_ready_dri3_exports(&mut b).is_empty());
+    let export = Backend::finish_dri3_export(&mut b, token).expect("the deferred export");
+    assert_eq!(u32::from(export.width), u32::from(b.platform.fb_w));
+    assert_eq!(EXPORTS.with_borrow(Clone::clone), [(a, false, 0)]);
+    assert!(!b.pstate.scanout_m1.entries.contains_key(&a));
+    assert_eq!(disqualified_holding_descriptor(&b, a), Some(false));
+
+    let pins = b.present_source_pins.len();
+    Backend::release_dri3_export(&mut b, token);
+    assert_eq!(b.present_source_pins.len(), pins - 1);
+    assert!(b.pstate.server_scanout_exports.parked.is_empty());
+}
+
+#[test]
+fn dri3_export_waits_for_every_crtc() {
+    let a_xid = 0x0062_0011;
+    let (mut b, _, _) = promoted_backend(a_xid);
+    push_test_output(&mut b, 0x51);
+    b.pstate.direct.sync_output_count(b.platform.outputs.len());
+    scan_out(&mut b, a_xid);
+
+    let token = pending_token(begin_export(&mut b, a_xid));
+    await_composed_replacement(&mut b, &[0, 1]);
+    retire_composed_replacement(&mut b, 0);
+    assert!(
+        Backend::drain_ready_dri3_exports(&mut b).is_empty(),
+        "the second CRTC still scans the source"
+    );
+    retire_composed_replacement(&mut b, 1);
+    assert_eq!(Backend::drain_ready_dri3_exports(&mut b), [token]);
+}
+
+#[test]
+fn an_exported_source_never_flips_again() {
+    let a_xid = 0x0062_0021;
+    let (mut b, _, a) = promoted_backend(a_xid);
+    // A pending flip of A with a successor of A queued behind it.
+    scan_out(&mut b, a_xid);
+    let mut pending = b.pstate.direct.root_mut().current.take().expect("A");
+    pending.awaiting_outputs = std::iter::once(0).collect();
+    b.pstate.direct.root_mut().pending = Some(pending);
+    scan_out(&mut b, a_xid);
+    let successor = b.pstate.direct.root_mut().current.take().expect("A again");
+    b.queue_direct_successor(successor);
+
+    let token = pending_token(begin_export(&mut b, a_xid));
+    let clock = yserver_core::backend::PresentClockSample {
+        msc: 4,
+        ust: 400,
+        source: yserver_core::backend::PresentClockSource::PageFlip,
+    };
+    assert!(b.retire_direct_output(0, None, clock));
+    assert!(
+        b.pstate.direct.root().pending.is_none(),
+        "the successor queued before the export must not flip"
+    );
+    await_composed_replacement(&mut b, &[0]);
+    retire_composed_replacement(&mut b, 0);
+    assert_eq!(Backend::drain_ready_dri3_exports(&mut b), [token]);
+    Backend::finish_dri3_export(&mut b, token).expect("export");
+    Backend::release_dri3_export(&mut b, token);
+
+    let candidates = b.pstate.scanout_m0.server.candidates;
+    for id in 40..60 {
+        assert!(
+            !present(&mut b, id, a_xid, STAGE),
+            "Present {id} takes Copy"
+        );
+    }
+    assert!(!b.pstate.direct.root().active());
+    assert_eq!(b.pstate.scanout_m0.server.candidates, candidates);
+    assert!(!b.pstate.scanout_m1.entries.contains_key(&a));
+}
+
+#[test]
+fn glx_bind_and_acquire_disqualify_without_parking() {
+    let (a_xid, b_xid) = (0x0062_0031, 0x0062_0032);
+    let (mut b, _, a) = promoted_backend(a_xid);
+    let b_id = root_pixmap(&mut b, b_xid);
+    let stage2 = 0x0060_0003;
+    add_stage(&mut b, stage2);
+    observe(&mut b, b_xid, stage2);
+    observe(&mut b, b_xid, stage2);
+    assert!(is_promoted(&b, b_id));
+    scan_out(&mut b, a_xid);
+
+    b.promote_pixmap_exportable(a_xid);
+    assert_eq!(disqualified_holding_descriptor(&b, a), Some(true));
+    assert_eq!(
+        b.pstate.direct.root().unflip_reason,
+        Some("server_source_exported")
+    );
+    assert!(accepted_framebuffer(&b, a).is_some(), "still scanned out");
+
+    b.acquire_glx_pixmap_export(b_xid);
+    assert_eq!(
+        disqualified_holding_descriptor(&b, b_id),
+        Some(false),
+        "an unreferenced source drops its framebuffer and descriptor at once"
+    );
+    assert!(!b.pstate.scanout_m1.entries.contains_key(&b_id));
+    assert!(b.pstate.server_scanout_exports.parked.is_empty());
+    assert_eq!(b.pstate.scanout_m0.server.reject_exported, 2);
+    assert_eq!(
+        rotation_state(&b, STAGE),
+        Some(RotationState::Failed),
+        "a disqualified member's rotation leaves Complete"
+    );
+}
+
+#[test]
+fn releasing_a_parked_export_releases_its_pin() {
+    let a_xid = 0x0062_0041;
+    let (mut b, _, a) = promoted_backend(a_xid);
+    scan_out(&mut b, a_xid);
+    let refcount = |b: &KmsBackend| b.store.get(a).map(|d| d.refcount);
+    let before = refcount(&b);
+    let token = pending_token(begin_export(&mut b, a_xid));
+    assert_eq!(refcount(&b), before.map(|count| count + 1));
+    // The client went away: the core releases without finishing.
+    Backend::release_dri3_export(&mut b, token);
+    assert_eq!(refcount(&b), before);
+    assert!(b.pstate.server_scanout_exports.parked.is_empty());
+    await_composed_replacement(&mut b, &[0]);
+    retire_composed_replacement(&mut b, 0);
+    assert!(Backend::drain_ready_dri3_exports(&mut b).is_empty());
+    assert!(EXPORTS.with_borrow(Vec::is_empty));
+}
+
+#[test]
+fn a_parked_export_survives_another_client_freeing_the_pixmap() {
+    let a_xid = 0x0062_0051;
+    let (mut b, _, a) = promoted_backend(a_xid);
+    scan_out(&mut b, a_xid);
+    let token = pending_token(begin_export(&mut b, a_xid));
+
+    let refcount = |b: &KmsBackend| b.store.get(a).map(|d| d.refcount);
+    let before = refcount(&b).expect("A");
+    Backend::free_pixmap(&mut b, None, a_xid).expect("FreePixmap");
+    assert_eq!(
+        refcount(&b),
+        Some(before - 1),
+        "the client's reference is gone"
+    );
+    await_composed_replacement(&mut b, &[0]);
+    retire_composed_replacement(&mut b, 0);
+    assert_eq!(refcount(&b), Some(1), "only the export pin");
+
+    assert_eq!(Backend::drain_ready_dri3_exports(&mut b), [token]);
+    Backend::finish_dri3_export(&mut b, token).expect("the pinned storage exports");
+    assert_eq!(EXPORTS.with_borrow(Clone::clone), [(a, false, 0)]);
+    assert!(b.store.get(a).is_some());
+    Backend::release_dri3_export(&mut b, token);
+    assert!(b.store.get(a).is_none(), "freed once the pin is released");
+    assert!(!b.pstate.server_scanout.sources.contains_key(&a));
+}
+
+#[test]
+fn the_export_deadline_tears_direct_scanout_down_first() {
+    let a_xid = 0x0062_0061;
+    let (mut b, clock, a) = promoted_backend(a_xid);
+    b.platform
+        .for_tests_set_output_power_executor(Rc::new(RecordingPower { fail: false }));
+    scan_out(&mut b, a_xid);
+    b.pstate.direct.root_mut().unflip_shadow_ready = true;
+    let token = pending_token(begin_export(&mut b, a_xid));
+    let deadline = b.pstate.server_scanout_exports.parked[&token].deadline;
+    assert_eq!(
+        deadline - (b.pstate.monotonic_clock)(),
+        crate::kms::render::backend::SERVER_SCANOUT_EXPORT_WAIT
+    );
+    assert!(Backend::next_wakeup(&b).is_some_and(|wake| wake <= deadline));
+
+    let mut state = yserver_core::server::ServerState::new();
+    clock.set(crate::kms::render::backend::SERVER_SCANOUT_EXPORT_WAIT / 2);
+    Backend::poll_deferred_input(&mut b, &mut state);
+    assert!(Backend::drain_ready_dri3_exports(&mut b).is_empty());
+    assert_eq!(DISABLED.get(), 0);
+
+    clock.set(crate::kms::render::backend::SERVER_SCANOUT_EXPORT_WAIT);
+    Backend::poll_deferred_input(&mut b, &mut state);
+    assert_eq!(b.pstate.scanout_m0.server.export_deadline_teardown, 1);
+    assert!(!b.pstate.direct.root().active());
+    assert_eq!(Backend::drain_ready_dri3_exports(&mut b), [token]);
+    Backend::finish_dri3_export(&mut b, token).expect("one reply with the fd");
+    let outputs = b.platform.outputs.len();
+    assert_eq!(
+        EXPORTS.with_borrow(Clone::clone),
+        [(a, false, outputs)],
+        "every plane was off before the export ran"
+    );
+    assert!(Backend::drain_ready_dri3_exports(&mut b).is_empty());
+}
+
+#[test]
+fn a_failed_deadline_teardown_fails_the_export_and_keeps_the_frame() {
+    let a_xid = 0x0062_0071;
+    let (mut b, clock, a) = promoted_backend(a_xid);
+    b.platform
+        .for_tests_set_output_power_executor(Rc::new(RecordingPower { fail: true }));
+    scan_out(&mut b, a_xid);
+    b.pstate.direct.root_mut().unflip_shadow_ready = true;
+    let frame_pins = {
+        let frame = b.pstate.direct.root().current.as_ref().expect("frame");
+        (frame.source_pin, frame.fallback_target_pin)
+    };
+    let token = pending_token(begin_export(&mut b, a_xid));
+    let token_pin = b.pstate.server_scanout_exports.parked[&token].pin;
+
+    clock.set(crate::kms::render::backend::SERVER_SCANOUT_EXPORT_WAIT);
+    let mut state = yserver_core::server::ServerState::new();
+    Backend::poll_deferred_input(&mut b, &mut state);
+    assert_eq!(b.pstate.scanout_m0.server.export_deadline_fail, 1);
+    assert_eq!(Backend::drain_ready_dri3_exports(&mut b), [token]);
+    assert!(Backend::finish_dri3_export(&mut b, token).is_err());
+    assert!(
+        EXPORTS.with_borrow(Vec::is_empty),
+        "no fd while a plane may scan it"
+    );
+
+    Backend::release_dri3_export(&mut b, token);
+    assert!(!b.present_source_pins.contains_key(&token_pin));
+    assert!(b.present_source_pins.contains_key(&frame_pins.0));
+    assert!(b.present_source_pins.contains_key(&frame_pins.1));
+    assert!(b.pstate.direct.root().current.is_some());
+    assert_eq!(
+        accepted_framebuffer(&b, a),
+        Some(fake_framebuffer_handle(a))
+    );
+    assert!(
+        Backend::next_wakeup(&b).is_none_or(|wake| wake > (b.pstate.monotonic_clock)()),
+        "a failed export does not keep the loop spinning"
+    );
 }

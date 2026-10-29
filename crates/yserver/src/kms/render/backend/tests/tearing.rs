@@ -347,7 +347,7 @@ fn prepare_direct_present_for_ids_with_storage(
     {
         backend.core.top_level_order.push(host_window_xid);
     }
-    let source_storage = if allocate_live_storage {
+    let mut source_storage = if allocate_live_storage {
         backend
             .platform
             .gpu
@@ -362,6 +362,8 @@ fn prepare_direct_present_for_ids_with_storage(
             vk::Format::B8G8R8A8_UNORM,
         )
     };
+    // Direct sources model imported client buffers.
+    source_storage.imported_dmabuf = Some(super::imported_dmabuf_for_test(width, height));
     let source_id = backend
         .store
         .allocate(source_xid, DrawableKind::Pixmap, 24, false, source_storage)

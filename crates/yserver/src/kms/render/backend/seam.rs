@@ -512,6 +512,33 @@ pub trait Platform: OutputSink + Sized + 'static {
         ))
     }
 
+    fn dri3_begin_export_pixmap_buffers(
+        b: &mut XBackend<Self>,
+        host_xid: u32,
+    ) -> io::Result<yserver_core::backend::Dri3ExportBegin> {
+        Self::dri3_export_pixmap_buffers(b, host_xid)
+            .map(yserver_core::backend::Dri3ExportBegin::Ready)
+    }
+
+    fn drain_ready_dri3_exports(
+        _b: &mut XBackend<Self>,
+    ) -> Vec<yserver_core::backend::Dri3ExportToken> {
+        Vec::new()
+    }
+
+    fn finish_dri3_export(
+        _b: &mut XBackend<Self>,
+        _token: yserver_core::backend::Dri3ExportToken,
+    ) -> io::Result<Dri3PixmapExport> {
+        Err(io::Error::other("unknown deferred DRI3 export token"))
+    }
+
+    fn release_dri3_export(
+        _b: &mut XBackend<Self>,
+        _token: yserver_core::backend::Dri3ExportToken,
+    ) {
+    }
+
     fn dri3_fence_from_fd(
         _b: &mut XBackend<Self>,
         _fence_xid: u32,

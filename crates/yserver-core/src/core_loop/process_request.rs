@@ -102,6 +102,8 @@ use crate::core_loop::process_request::{
     xshm::handle_mit_shm_request,
     xtest::handle_xtest_request,
 };
+pub(crate) use dri3::complete_dri3_export;
+pub use dri3::{Dri3ExportOp, PendingDri3Export};
 pub(crate) use focus_pointer::*;
 pub(crate) use grabs::*;
 pub use present_ext::*;
@@ -200,6 +202,9 @@ pub enum RequestOutcome {
     /// request's flow-control credit and park later requests from the same
     /// client until the token becomes ready.
     PendingCrtcConfig(PendingCrtcConfig),
+    /// A DRI3 export waits until its pixmap leaves every CRTC. Parked like
+    /// [`Self::PendingCrtcConfig`].
+    PendingDri3Export(PendingDri3Export),
     /// A recognized physical libinput property write. The core runner owns
     /// validation, source-targeted application, and commit ordering.
     PendingXiConfig(crate::core_loop::message::XiConfigRequest),

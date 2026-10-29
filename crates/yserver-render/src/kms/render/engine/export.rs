@@ -74,7 +74,7 @@ impl RenderEngine {
         // (a) allocate exportable target.
         let exp =
             crate::kms::vk::target::allocate_exportable(&vk, extent.width, extent.height, format)?;
-        self.adopt_candidate(gpu, store, id, exp)
+        self.adopt_candidate(gpu, store, id, exp, None)
             .map_err(|(error, _candidate)| error)
     }
 
@@ -141,7 +141,9 @@ impl RenderEngine {
             })
             .map_err(ScanoutPromoteError::Probe)?
         };
-        match self.adopt_candidate(gpu, store, id, candidate) {
+        // Scanout storage is not an external export until a client takes it.
+        let category = Some(crate::kms::vk::mem_accounting::MemCategory::Scanout);
+        match self.adopt_candidate(gpu, store, id, candidate, category) {
             Ok(()) => Ok(ScanoutPromotion { export, accepted }),
             Err((error, candidate)) => {
                 drop(accepted);
@@ -163,13 +165,15 @@ impl RenderEngine {
     /// their guarding fence signals.
     ///
     /// On error the candidate is handed back unconsumed and the storage is
-    /// unchanged.
+    /// unchanged. `category` accounts the new memory; `None` takes the
+    /// export category of the storage it replaces.
     fn adopt_candidate(
         &mut self,
         gpu: &mut GpuCore,
         store: &mut DrawableStore,
         id: DrawableId,
         exp: crate::kms::vk::target::ExportableImage,
+        category: Option<crate::kms::vk::mem_accounting::MemCategory>,
     ) -> Result<(), (RenderError, crate::kms::vk::target::ExportableImage)> {
         // Submit-boundary (codex review): any open frame / parked submit
         // group may hold CBs that captured cached views of the OLD image
@@ -245,9 +249,11 @@ impl RenderEngine {
         // A promoted redirect backing stays distinguishable from other exports.
         crate::kms::vk::mem_accounting::recategorise(
             exp_memory,
-            crate::kms::vk::mem_accounting::export_category_for(
-                crate::kms::vk::mem_accounting::category_of(d.storage.memory),
-            ),
+            category.unwrap_or_else(|| {
+                crate::kms::vk::mem_accounting::export_category_for(
+                    crate::kms::vk::mem_accounting::category_of(d.storage.memory),
+                )
+            }),
         );
         let retired = d.storage.adopt_exportable(
             exp_image,

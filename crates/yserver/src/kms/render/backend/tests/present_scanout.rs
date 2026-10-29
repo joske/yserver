@@ -4393,19 +4393,15 @@ fn prepare_atomic_cursor_direct_present_with_extent(
     width: u16,
     height: u16,
 ) -> AtomicCursorDirectPresent {
-    prepare_atomic_cursor_direct_present_with_storage(
-        backend,
-        present_id,
-        width,
-        height,
-        crate::kms::render::store::Storage::for_tests_null(
-            ash::vk::Extent2D {
-                width: u32::from(width),
-                height: u32::from(height),
-            },
-            ash::vk::Format::B8G8R8A8_UNORM,
-        ),
-    )
+    let mut storage = crate::kms::render::store::Storage::for_tests_null(
+        ash::vk::Extent2D {
+            width: u32::from(width),
+            height: u32::from(height),
+        },
+        ash::vk::Format::B8G8R8A8_UNORM,
+    );
+    storage.imported_dmabuf = Some(imported_dmabuf_for_test(width, height));
+    prepare_atomic_cursor_direct_present_with_storage(backend, present_id, width, height, storage)
 }
 
 fn prepare_atomic_cursor_direct_present_with_storage(
@@ -5119,13 +5115,17 @@ fn eligible_fullscreen_present_records_cursor_positions_for_both_outputs() {
             crate::kms::render::store::DrawableKind::Pixmap,
             24,
             false,
-            Storage::for_tests_null(
-                ash::vk::Extent2D {
-                    width: 1600,
-                    height: 600,
-                },
-                ash::vk::Format::B8G8R8A8_UNORM,
-            ),
+            {
+                let mut storage = Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 1600,
+                        height: 600,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                );
+                storage.imported_dmabuf = Some(imported_dmabuf_for_test(1600, 600));
+                storage
+            },
         )
         .expect("fullscreen Present source");
     backend.pstate.scanout_m1.entries.insert(

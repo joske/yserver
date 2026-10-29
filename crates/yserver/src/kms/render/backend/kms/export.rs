@@ -180,6 +180,7 @@ impl KmsBackend {
         let Some(id) = self.store.lookup(host_xid) else {
             return;
         };
+        self.disqualify_server_scanout(id, "server_source_exported");
         let Some(backing) = PixmapHandle::from_raw(host_xid) else {
             return;
         };
@@ -241,6 +242,7 @@ impl KmsBackend {
         let Some(id) = self.store.lookup(host_xid) else {
             return false;
         };
+        self.disqualify_server_scanout(id, "server_source_exported");
         // Already exportable → idempotent no-op (the common rebind case).
         if self
             .store
@@ -623,7 +625,18 @@ impl KmsBackend {
         let id = self.store.lookup(host_xid).ok_or_else(|| {
             io::Error::other(format!("DRI3 export: unknown pixmap 0x{host_xid:x}"))
         })?;
+        self.disqualify_server_scanout(id, "server_source_exported");
+        self.dri3_export_drawable(id, host_xid)
+    }
 
+    /// Export drawable `id` (named `host_xid` by the client) for DRI3. The
+    /// export entry is recorded only while `host_xid` still names `id`: a
+    /// deferred export may complete after the client freed the pixmap.
+    pub(in crate::kms::render::backend) fn dri3_export_drawable(
+        &mut self,
+        id: crate::kms::render::store::DrawableId,
+        host_xid: u32,
+    ) -> io::Result<Dri3PixmapExport> {
         // Promote-if-needed: migrate server-owned pixmaps onto dma-buf-exportable
         // storage (glamor model). Idempotent — early-returns if already exportable.
         if !self
@@ -653,10 +666,12 @@ impl KmsBackend {
             io::Error::other(format!("DRI3 export: store entry missing 0x{host_xid:x}"))
         })?;
 
+        let attached = self.store.lookup(host_xid) == Some(id);
         let (depth, width, height) = self
             .core
             .alias_registry
             .get(PixmapHandle::from_raw_panicking(host_xid))
+            .filter(|_| attached)
             .map(|alias| (alias.depth, alias.width, alias.height))
             .unwrap_or_else(|| {
                 (
@@ -702,11 +717,12 @@ impl KmsBackend {
         // ORIGINAL fd to the client.
         let backing = PixmapHandle::from_raw(host_xid)
             .ok_or_else(|| io::Error::other(format!("DRI3 export: bad xid 0x{host_xid:x}")))?;
-        if self
-            .pstate
-            .exported_dmabufs
-            .get(&id)
-            .is_none_or(|e| e.fd.is_none())
+        if attached
+            && self
+                .pstate
+                .exported_dmabufs
+                .get(&id)
+                .is_none_or(|e| e.fd.is_none())
         {
             let dup = export.fd.try_clone()?;
             // Parallel sync-only dup for the engine flush chokepoint.

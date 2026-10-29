@@ -1704,6 +1704,28 @@ impl<P: Platform> Backend for XBackend<P> {
         P::dri3_export_pixmap_buffers(self, host_xid)
     }
 
+    fn dri3_begin_export_pixmap_buffers(
+        &mut self,
+        host_xid: u32,
+    ) -> io::Result<yserver_core::backend::Dri3ExportBegin> {
+        P::dri3_begin_export_pixmap_buffers(self, host_xid)
+    }
+
+    fn drain_ready_dri3_exports(&mut self) -> Vec<yserver_core::backend::Dri3ExportToken> {
+        P::drain_ready_dri3_exports(self)
+    }
+
+    fn finish_dri3_export(
+        &mut self,
+        token: yserver_core::backend::Dri3ExportToken,
+    ) -> io::Result<Dri3PixmapExport> {
+        P::finish_dri3_export(self, token)
+    }
+
+    fn release_dri3_export(&mut self, token: yserver_core::backend::Dri3ExportToken) {
+        P::release_dri3_export(self, token);
+    }
+
     fn dri3_fence_from_fd(&mut self, fence_xid: u32, fd: std::os::fd::OwnedFd) -> io::Result<()> {
         P::dri3_fence_from_fd(self, fence_xid, fd)
     }

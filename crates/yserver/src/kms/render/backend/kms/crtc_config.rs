@@ -1261,7 +1261,8 @@ impl KmsBackend {
 /// page-flip and cursor events before it falls back to the global quiesce.
 /// A flip retires within one refresh; a retirement may start one cursor
 /// transition, which retires on the next.
-const PER_CRTC_EVENT_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+pub(in crate::kms::render::backend) const PER_CRTC_EVENT_WAIT: std::time::Duration =
+    std::time::Duration::from_millis(250);
 
 /// A `SetCrtcConfig` that only touches the named CRTC, as Xorg's
 /// `xf86RandR12CrtcSet` → `drmmode_set_mode_major` does.

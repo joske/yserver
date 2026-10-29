@@ -381,6 +381,13 @@ pub struct RecordingBackend {
         std::collections::HashMap<CrtcConfigToken, Result<bool, io::ErrorKind>>,
     pub finished_crtc_configs: Vec<CrtcConfigToken>,
     pub cancelled_crtc_configs: Vec<CrtcConfigToken>,
+    /// When set, the next DRI3 export begins deferred under this token.
+    pub pending_dri3_export: Option<crate::backend::Dri3ExportToken>,
+    pub ready_dri3_exports: Vec<crate::backend::Dri3ExportToken>,
+    pub finished_dri3_exports: Vec<crate::backend::Dri3ExportToken>,
+    pub released_dri3_exports: Vec<crate::backend::Dri3ExportToken>,
+    /// Deferred exports that finish with an error.
+    pub failed_dri3_exports: Vec<crate::backend::Dri3ExportToken>,
     /// Startup input-probe model. Each inner `Vec` is one "dispatch
     /// round" the fake libinput would yield; `probe_input_devices`
     /// consumes the front round per iteration and seeds the registry,
@@ -658,6 +665,11 @@ impl RecordingBackend {
             crtc_config_results: std::collections::HashMap::new(),
             finished_crtc_configs: Vec::new(),
             cancelled_crtc_configs: Vec::new(),
+            pending_dri3_export: None,
+            ready_dri3_exports: Vec::new(),
+            finished_dri3_exports: Vec::new(),
+            released_dri3_exports: Vec::new(),
+            failed_dri3_exports: Vec::new(),
             probe_rounds: std::collections::VecDeque::new(),
             probe_rounds_run: std::cell::Cell::new(0),
             warped_to: None,
@@ -1486,6 +1498,47 @@ impl Backend for RecordingBackend {
     fn cancel_crtc_config(&mut self, token: CrtcConfigToken) {
         self.cancelled_crtc_configs.push(token);
         self.crtc_config_results.remove(&token);
+    }
+
+    fn dri3_begin_export_pixmap_buffers(
+        &mut self,
+        host_xid: u32,
+    ) -> io::Result<crate::backend::Dri3ExportBegin> {
+        match self.pending_dri3_export.take() {
+            Some(token) => Ok(crate::backend::Dri3ExportBegin::Pending(token)),
+            None => self
+                .dri3_export_pixmap_buffers(host_xid)
+                .map(crate::backend::Dri3ExportBegin::Ready),
+        }
+    }
+
+    fn drain_ready_dri3_exports(&mut self) -> Vec<crate::backend::Dri3ExportToken> {
+        std::mem::take(&mut self.ready_dri3_exports)
+    }
+
+    fn finish_dri3_export(
+        &mut self,
+        token: crate::backend::Dri3ExportToken,
+    ) -> io::Result<crate::backend::Dri3PixmapExport> {
+        self.finished_dri3_exports.push(token);
+        if self.failed_dri3_exports.contains(&token) {
+            return Err(io::Error::other("scripted deferred export failure"));
+        }
+        Ok(crate::backend::Dri3PixmapExport {
+            size: 64 * 4 * 16,
+            width: 64,
+            height: 16,
+            stride: 64 * 4,
+            offset: 0,
+            depth: 24,
+            bpp: 32,
+            modifier: 0,
+            fd: std::fs::File::open("/dev/null")?.into(),
+        })
+    }
+
+    fn release_dri3_export(&mut self, token: crate::backend::Dri3ExportToken) {
+        self.released_dri3_exports.push(token);
     }
 
     fn set_crtc_gamma(

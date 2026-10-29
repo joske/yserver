@@ -224,6 +224,9 @@ impl KmsBackend {
                 std::time::Instant::now(),
             ),
             server_scanout_promoter: KmsBackend::promote_server_scanout_live,
+            server_scanout_exports:
+                crate::kms::render::backend::DeferredServerScanoutExports::default(),
+            dri3_drawable_exporter: KmsBackend::dri3_export_drawable,
             vt_resume_executor: std::rc::Rc::new(DrmVtResumeExecutor),
             monotonic_clock: std::rc::Rc::new(std::time::Instant::now),
             armed_vblank_targets: std::collections::HashMap::new(),
@@ -985,6 +988,7 @@ impl KmsBackend {
             self.pstate.hotplug_rescan_deadline = None;
             self.run_display_rescan(state);
         }
+        self.service_server_scanout_export_deadlines();
     }
 
     pub(in crate::kms::render::backend) fn backend_session_start_device_config(

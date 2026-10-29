@@ -657,6 +657,9 @@ impl KmsBackend {
                 std::time::Instant::now(),
             ),
             server_scanout_promoter: KmsBackend::promote_server_scanout_live,
+            server_scanout_exports:
+                crate::kms::render::backend::DeferredServerScanoutExports::default(),
+            dri3_drawable_exporter: KmsBackend::dri3_export_drawable,
             vt_resume_executor: std::rc::Rc::new(
                 crate::kms::render::backend::kms::session::DrmVtResumeExecutor,
             ),

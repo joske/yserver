@@ -73,16 +73,14 @@ impl KmsBackend {
             return;
         }
         if self.server_scanout_source_exported(source_id) {
-            if self.pstate.server_scanout.is_promoted(source_id) {
-                self.disqualify_server_scanout_source(source_id);
-            }
+            self.disqualify_server_scanout(source_id, "server_source_exported");
             let server = &mut self.pstate.scanout_m0.server;
             server.reject_exported = server.reject_exported.saturating_add(1);
             return;
         }
         if matches!(
             self.pstate.server_scanout.sources.get(&source_id),
-            Some(ServerScanoutState::Disqualified)
+            Some(ServerScanoutState::Disqualified(_))
         ) {
             let server = &mut self.pstate.scanout_m0.server;
             server.reject_exported = server.reject_exported.saturating_add(1);
@@ -138,14 +136,44 @@ impl KmsBackend {
         self.store.is_exported(source_id) || self.pstate.exported_dmabufs.contains_key(&source_id)
     }
 
-    /// A promoted source was handed out: never flip it again, and leave any
-    /// complete rotation holding it (D6).
-    fn disqualify_server_scanout_source(&mut self, source_id: DrawableId) {
-        self.pstate.scanout_m1.remove(source_id);
-        self.pstate
-            .server_scanout
-            .sources
-            .insert(source_id, ServerScanoutState::Disqualified);
+    /// A promoted source is being handed to a client: never flip it again,
+    /// leave any complete rotation holding it and unflip (D6). Its probe
+    /// framebuffer and descriptor go once no direct frame references it.
+    /// A no-op for a source that was never promoted.
+    pub(in crate::kms::render::backend) fn disqualify_server_scanout(
+        &mut self,
+        source_id: DrawableId,
+        reason: &'static str,
+    ) {
+        let Some(state) = self.pstate.server_scanout.sources.get_mut(&source_id) else {
+            return;
+        };
+        let ServerScanoutState::Promoted(_) = state else {
+            return;
+        };
+        let ServerScanoutState::Promoted(descriptor) =
+            std::mem::replace(state, ServerScanoutState::Disqualified(None))
+        else {
+            unreachable!("matched Promoted above");
+        };
+        *state = ServerScanoutState::Disqualified(Some(descriptor));
+        let server = &mut self.pstate.scanout_m0.server;
+        server.reject_exported = server.reject_exported.saturating_add(1);
+        log::info!(
+            target: "yserver::scanout_server",
+            "promoted server-owned Present source drawable={} disqualified: {reason}",
+            source_id.as_u64(),
+        );
+        // From here the storage is an external export, not scanout memory.
+        if let Some(drawable) = self.store.get(source_id) {
+            let memory = drawable.storage.memory;
+            crate::kms::vk::mem_accounting::recategorise(
+                memory,
+                crate::kms::vk::mem_accounting::export_category_for(
+                    crate::kms::vk::mem_accounting::category_of(memory),
+                ),
+            );
+        }
         let mut left_complete = false;
         for rotation in self.pstate.server_scanout.rotations.values_mut() {
             if rotation.state == RotationState::Complete
@@ -155,8 +183,245 @@ impl KmsBackend {
                 left_complete = true;
             }
         }
-        if left_complete {
-            self.pstate.request_direct_unflip("server_source_exported");
+        if left_complete || self.direct_frame_references_drawable(source_id) {
+            self.pstate.request_direct_unflip(reason);
+        }
+        self.release_unreferenced_server_scanout();
+    }
+
+    /// Whether a direct frame (pending, queued or current) names `id` as its
+    /// source or fallback target.
+    pub(in crate::kms::render::backend) fn direct_frame_references_drawable(
+        &self,
+        id: DrawableId,
+    ) -> bool {
+        let root = self.pstate.direct.root();
+        [
+            root.pending.as_ref(),
+            root.queued_successor.as_ref(),
+            root.current.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|frame| frame.source_id == id || frame.fallback_target.backing_id() == id)
+    }
+
+    /// Whether M2 may scan `source_id` out from its cached framebuffer: an
+    /// imported source with an accepted probe entry, or a promoted
+    /// server-owned one that flips are admitted for.
+    pub(in crate::kms::render::backend) fn direct_source_ready(
+        &self,
+        source_id: DrawableId,
+    ) -> bool {
+        let has_framebuffer = self
+            .pstate
+            .scanout_m1
+            .entries
+            .get(&source_id)
+            .and_then(crate::kms::render::backend::ScanoutM1ProbeEntry::framebuffer)
+            .is_some();
+        let imported = self.store.get(source_id).is_some_and(|drawable| {
+            drawable.storage.imported_dmabuf.is_some()
+                || drawable.storage.imported_drawable.is_some()
+        });
+        has_framebuffer
+            && (imported || self.pstate.server_scanout.is_promoted(source_id))
+            && self.direct_source_flip_admitted(source_id)
+    }
+
+    /// Drop the probe framebuffer, then the descriptor, of every disqualified
+    /// source no direct frame references any more (D9), and run every parked
+    /// DRI3 export whose source left every plane.
+    pub(in crate::kms::render::backend) fn release_unreferenced_server_scanout(&mut self) {
+        let released: Vec<DrawableId> = self
+            .pstate
+            .server_scanout
+            .sources
+            .iter()
+            .filter(|(id, state)| {
+                matches!(state, ServerScanoutState::Disqualified(Some(_)))
+                    && !self.direct_frame_references_drawable(**id)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in released {
+            self.pstate.scanout_m1.remove(id);
+            if let Some(ServerScanoutState::Disqualified(descriptor)) =
+                self.pstate.server_scanout.sources.get_mut(&id)
+            {
+                drop(descriptor.take());
+            }
+        }
+        let runnable: Vec<_> = self
+            .pstate
+            .server_scanout_exports
+            .parked
+            .iter()
+            .filter(|(_, parked)| {
+                parked.result.is_none() && !self.direct_frame_references_drawable(parked.id)
+            })
+            .map(|(token, _)| *token)
+            .collect();
+        for token in runnable {
+            let Some(parked) = self.pstate.server_scanout_exports.parked.get(&token) else {
+                continue;
+            };
+            let (id, host_xid, parked_at) = (parked.id, parked.host_xid, parked.parked_at);
+            let exporter = self.pstate.dri3_drawable_exporter;
+            let result = exporter(self, id, host_xid);
+            let waited_us = u64::try_from(
+                self.monotonic_now()
+                    .saturating_duration_since(parked_at)
+                    .as_micros(),
+            )
+            .unwrap_or(u64::MAX);
+            let server = &mut self.pstate.scanout_m0.server;
+            server.export_defer_us_max = server.export_defer_us_max.max(waited_us);
+            self.complete_server_scanout_export(token, result);
+        }
+    }
+
+    fn complete_server_scanout_export(
+        &mut self,
+        token: yserver_core::backend::Dri3ExportToken,
+        result: std::io::Result<yserver_core::backend::Dri3PixmapExport>,
+    ) {
+        let exports = &mut self.pstate.server_scanout_exports;
+        if let Some(parked) = exports.parked.get_mut(&token) {
+            parked.result = Some(result);
+            exports.ready.push(token);
+        }
+    }
+
+    /// The DRI3 export of `host_xid`; deferred while a promoted source is
+    /// still referenced by a direct frame (D6).
+    pub(in crate::kms::render::backend) fn backend_export_dri3_begin_export(
+        &mut self,
+        host_xid: u32,
+    ) -> std::io::Result<yserver_core::backend::Dri3ExportBegin> {
+        use yserver_core::backend::{Dri3ExportBegin, Dri3ExportToken};
+
+        let id = self.store.lookup(host_xid).ok_or_else(|| {
+            std::io::Error::other(format!("DRI3 export: unknown pixmap 0x{host_xid:x}"))
+        })?;
+        let scanout_storage = self.pstate.server_scanout.is_promoted(id)
+            || self.pstate.server_scanout.awaits_release(id);
+        self.disqualify_server_scanout(id, "server_source_exported");
+        if !(scanout_storage && self.direct_frame_references_drawable(id)) {
+            let exporter = self.pstate.dri3_drawable_exporter;
+            return exporter(self, id, host_xid).map(Dri3ExportBegin::Ready);
+        }
+        let pin = self.pin_direct_source(id);
+        let parked_at = self.monotonic_now();
+        let exports = &mut self.pstate.server_scanout_exports;
+        exports.next_token = exports.next_token.wrapping_add(1).max(1);
+        let token = Dri3ExportToken(exports.next_token);
+        exports.parked.insert(
+            token,
+            crate::kms::render::backend::ParkedServerScanoutExport {
+                id,
+                host_xid,
+                pin,
+                parked_at,
+                deadline: parked_at + crate::kms::render::backend::SERVER_SCANOUT_EXPORT_WAIT,
+                result: None,
+            },
+        );
+        let server = &mut self.pstate.scanout_m0.server;
+        server.export_deferred = server.export_deferred.saturating_add(1);
+        log::debug!(
+            target: "yserver::scanout_server",
+            "DRI3 export of drawable={} deferred while it is scanned out",
+            id.as_u64(),
+        );
+        Ok(Dri3ExportBegin::Pending(token))
+    }
+
+    /// The earliest deadline of a parked export still waiting for the CRTCs.
+    pub(in crate::kms::render::backend) fn server_scanout_export_deadline(
+        &self,
+    ) -> Option<std::time::Instant> {
+        self.pstate
+            .server_scanout_exports
+            .parked
+            .values()
+            .filter(|parked| parked.result.is_none())
+            .map(|parked| parked.deadline)
+            .min()
+    }
+
+    /// Past its deadline a parked export tears direct scanout down safely and
+    /// re-lights the composed frame; the fd goes out only once every plane
+    /// left the source, else the export fails with the pins kept (D6).
+    pub(in crate::kms::render::backend) fn service_server_scanout_export_deadlines(&mut self) {
+        const CONTEXT: &str = "server_source_export_deadline";
+        self.release_unreferenced_server_scanout();
+        let now = self.monotonic_now();
+        let expired: Vec<_> = self
+            .pstate
+            .server_scanout_exports
+            .parked
+            .iter()
+            .filter(|(_, parked)| parked.result.is_none() && parked.deadline <= now)
+            .map(|(token, _)| *token)
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        let server = &mut self.pstate.scanout_m0.server;
+        server.export_deadline_teardown = server.export_deadline_teardown.saturating_add(1);
+        match self.teardown_direct_before_topology_requery(CONTEXT) {
+            Ok(relight) => {
+                // A failed relight already released the frame: the fd is safe.
+                let _ = self.relight_after_direct_teardown(relight, CONTEXT);
+                self.release_unreferenced_server_scanout();
+            }
+            Err(error) => {
+                log::error!(
+                    target: "yserver::scanout_server",
+                    "deferred DRI3 export: direct teardown failed: {error}",
+                );
+                for token in expired {
+                    let server = &mut self.pstate.scanout_m0.server;
+                    server.export_deadline_fail = server.export_deadline_fail.saturating_add(1);
+                    self.complete_server_scanout_export(
+                        token,
+                        Err(std::io::Error::other(format!(
+                            "DRI3 export: scanout teardown failed: {error}"
+                        ))),
+                    );
+                }
+            }
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn backend_export_drain_ready_dri3_exports(
+        &mut self,
+    ) -> Vec<yserver_core::backend::Dri3ExportToken> {
+        std::mem::take(&mut self.pstate.server_scanout_exports.ready)
+    }
+
+    pub(in crate::kms::render::backend) fn backend_export_finish_dri3_export(
+        &mut self,
+        token: yserver_core::backend::Dri3ExportToken,
+    ) -> std::io::Result<yserver_core::backend::Dri3PixmapExport> {
+        self.pstate
+            .server_scanout_exports
+            .parked
+            .get_mut(&token)
+            .and_then(|parked| parked.result.take())
+            .unwrap_or_else(|| Err(std::io::Error::other("DRI3 export token not ready")))
+    }
+
+    /// Forget `token` and release its storage pin.
+    pub(in crate::kms::render::backend) fn backend_export_release_dri3_export(
+        &mut self,
+        token: yserver_core::backend::Dri3ExportToken,
+    ) {
+        let exports = &mut self.pstate.server_scanout_exports;
+        exports.ready.retain(|ready| *ready != token);
+        if let Some(parked) = exports.parked.remove(&token) {
+            <Self as yserver_core::backend::Backend>::release_present_source(self, parked.pin);
         }
     }
 
@@ -170,7 +435,7 @@ impl KmsBackend {
         let sources = &self.pstate.server_scanout.sources;
         if let Some((id, state)) = members.iter().find_map(|id| match sources.get(id) {
             Some(ServerScanoutState::Failed(reason)) => Some((*id, reason.as_str())),
-            Some(ServerScanoutState::Disqualified) => Some((*id, "exported")),
+            Some(ServerScanoutState::Disqualified(_)) => Some((*id, "exported")),
             _ => None,
         }) {
             log::debug!(

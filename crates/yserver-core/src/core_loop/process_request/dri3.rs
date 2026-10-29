@@ -297,8 +297,21 @@ pub(super) fn handle_dri3_request(
                 }
             }
         }
-        x11dri3::BUFFER_FROM_PIXMAP => {
-            let Some(pixmap) = x11dri3::parse_buffer_from_pixmap(body) else {
+        x11dri3::BUFFER_FROM_PIXMAP | x11dri3::BUFFERS_FROM_PIXMAP => {
+            // op 3 is the single-fd, no-modifier subset of op 8. mesa's
+            // loader_dri3 uses op 8 whenever the server advertises DRI3 >= 1.2,
+            // and a modifier-tiled backing is unusable without the modifier op
+            // 8 carries. yserver exports a single plane, so op 8 has nfd=1.
+            let op = if minor == x11dri3::BUFFER_FROM_PIXMAP {
+                Dri3ExportOp::BufferFromPixmap
+            } else {
+                Dri3ExportOp::BuffersFromPixmap
+            };
+            let parsed = match op {
+                Dri3ExportOp::BufferFromPixmap => x11dri3::parse_buffer_from_pixmap(body),
+                Dri3ExportOp::BuffersFromPixmap => x11dri3::parse_buffers_from_pixmap(body),
+            };
+            let Some(pixmap) = parsed else {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -327,135 +340,29 @@ pub(super) fn handle_dri3_request(
                     );
                 }
             };
-            match backend.dri3_export_pixmap(host_xid) {
-                Ok((size, width, height, stride, depth, bpp, fd)) => {
+            let continuation = PendingDri3Export {
+                token: crate::backend::Dri3ExportToken(0),
+                op,
+                pixmap,
+            };
+            return match backend.dri3_begin_export_pixmap_buffers(host_xid) {
+                Ok(crate::backend::Dri3ExportBegin::Ready(export)) => {
+                    complete_dri3_export(state, client_id, sequence, continuation, Ok(export))
+                }
+                Ok(crate::backend::Dri3ExportBegin::Pending(token)) => {
                     debug!(
-                        "client {} #{} DRI3::BufferFromPixmap pixmap=0x{pixmap:x} size={size} {width}x{height} stride={stride} depth={depth} bpp={bpp}",
+                        "client {} #{} DRI3::{op:?} pixmap=0x{pixmap:x}: deferred while scanned out",
                         client_id.0, sequence.0
                     );
-                    let reply = x11dri3::encode_buffer_from_pixmap_reply(
-                        byte_order, sequence, size, width, height, stride, depth, bpp,
-                    );
-                    let Some(client) = state.clients.get_mut(&client_id.0) else {
-                        return Ok(RequestOutcome::Handled);
-                    };
-                    let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
-                    if let Err(e) = send_reply_with_fd(client, &reply, raw) {
-                        log::warn!("DRI3::BufferFromPixmap SCM_RIGHTS dispatch failed: {e}");
-                        return Ok(RequestOutcome::Disconnect(client_id));
-                    }
-                    drop(fd);
-                    return Ok(RequestOutcome::Handled);
+                    Ok(RequestOutcome::PendingDri3Export(PendingDri3Export {
+                        token,
+                        ..continuation
+                    }))
                 }
                 Err(err) => {
-                    // Xorg dri3/dri3_request.c:277 maps export failure to BadPixmap.
-                    // BadDrawable is reserved for the unresolvable-XID case above.
-                    // Note: Xorg returns BadAlloc when sending the fd fails; yserver
-                    // instead disconnects (see the send_reply_with_fd path above) —
-                    // a broken SCM_RIGHTS socket is unrecoverable for the client.
-                    debug!(
-                        "client {} #{} DRI3::BufferFromPixmap pixmap=0x{pixmap:x} -> BadPixmap ({err})",
-                        client_id.0, sequence.0
-                    );
-                    return emit_x11_error_with_minor(
-                        state,
-                        client_id,
-                        sequence,
-                        x11::error::BAD_PIXMAP,
-                        pixmap,
-                        u16::from(header.data),
-                        DRI3_MAJOR_OPCODE,
-                    );
-                }
-            }
-        }
-        x11dri3::BUFFERS_FROM_PIXMAP => {
-            // DRI3 op 8 (BUFFERS_FROM_PIXMAP). mesa's loader_dri3 uses op 8
-            // (not op 3) whenever the server advertises DRI3 >= 1.2 — and a
-            // modifier-tiled backing (the RADV export path) is unusable by the
-            // client without the modifier op 8 carries. yserver exports a
-            // single plane, so the reply has nfd=1.
-            let Some(pixmap) = x11dri3::parse_buffers_from_pixmap(body) else {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_LENGTH,
-                    0,
-                    u16::from(header.data),
-                    DRI3_MAJOR_OPCODE,
-                );
-            };
-            let host_xid = match state
-                .resources
-                .pixmap(yserver_protocol::x11::ResourceId(pixmap))
-                .and_then(|p| p.host_xid.map(|h| h.as_raw()))
-            {
-                Some(h) => h,
-                None => {
-                    return emit_x11_error_with_minor(
-                        state,
-                        client_id,
-                        sequence,
-                        x11::error::BAD_DRAWABLE,
-                        pixmap,
-                        u16::from(header.data),
-                        DRI3_MAJOR_OPCODE,
-                    );
+                    complete_dri3_export(state, client_id, sequence, continuation, Err(err))
                 }
             };
-            match backend.dri3_export_pixmap_buffers(host_xid) {
-                Ok(export) => {
-                    debug!(
-                        "client {} #{} DRI3::BuffersFromPixmap pixmap=0x{pixmap:x} {}x{} stride={} offset={} modifier=0x{:x} depth={} bpp={}",
-                        client_id.0,
-                        sequence.0,
-                        export.width,
-                        export.height,
-                        export.stride,
-                        export.offset,
-                        export.modifier,
-                        export.depth,
-                        export.bpp,
-                    );
-                    let reply = x11dri3::encode_buffers_from_pixmap_reply(
-                        byte_order,
-                        sequence,
-                        export.width,
-                        export.height,
-                        export.modifier,
-                        export.depth,
-                        export.bpp,
-                        &[export.stride],
-                        &[export.offset],
-                    );
-                    let Some(client) = state.clients.get_mut(&client_id.0) else {
-                        return Ok(RequestOutcome::Handled);
-                    };
-                    let raw = std::os::fd::AsRawFd::as_raw_fd(&export.fd);
-                    if let Err(e) = send_reply_with_fd(client, &reply, raw) {
-                        log::warn!("DRI3::BuffersFromPixmap SCM_RIGHTS dispatch failed: {e}");
-                        return Ok(RequestOutcome::Disconnect(client_id));
-                    }
-                    drop(export.fd);
-                    return Ok(RequestOutcome::Handled);
-                }
-                Err(err) => {
-                    debug!(
-                        "client {} #{} DRI3::BuffersFromPixmap pixmap=0x{pixmap:x} -> BadPixmap ({err})",
-                        client_id.0, sequence.0
-                    );
-                    return emit_x11_error_with_minor(
-                        state,
-                        client_id,
-                        sequence,
-                        x11::error::BAD_PIXMAP,
-                        pixmap,
-                        u16::from(header.data),
-                        DRI3_MAJOR_OPCODE,
-                    );
-                }
-            }
         }
         x11dri3::GET_SUPPORTED_MODIFIERS => {
             let req = match x11dri3::parse_get_supported_modifiers(body) {
@@ -805,5 +712,113 @@ pub(super) fn handle_dri3_request(
             );
         }
     }
+    Ok(RequestOutcome::Handled)
+}
+
+/// The DRI3 request a deferred export answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dri3ExportOp {
+    /// op 3.
+    BufferFromPixmap,
+    /// op 8.
+    BuffersFromPixmap,
+}
+
+/// Continuation of a DRI3 export the backend deferred.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingDri3Export {
+    pub token: crate::backend::Dri3ExportToken,
+    pub op: Dri3ExportOp,
+    pub pixmap: u32,
+}
+
+/// Send the reply (with the fd) or the error of one DRI3 export, now or
+/// after a deferral.
+pub(crate) fn complete_dri3_export(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    continuation: PendingDri3Export,
+    result: io::Result<crate::backend::Dri3PixmapExport>,
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::{ClientByteOrder, dri3 as x11dri3};
+    const DRI3_MAJOR_OPCODE: u8 = 147;
+    let PendingDri3Export { op, pixmap, .. } = continuation;
+    let minor = match op {
+        Dri3ExportOp::BufferFromPixmap => x11dri3::BUFFER_FROM_PIXMAP,
+        Dri3ExportOp::BuffersFromPixmap => x11dri3::BUFFERS_FROM_PIXMAP,
+    };
+    let export = match result {
+        Ok(export) => export,
+        Err(err) => {
+            // Xorg dri3/dri3_request.c:277 maps export failure to BadPixmap.
+            // BadDrawable is reserved for the unresolvable-XID case. Xorg
+            // returns BadAlloc when sending the fd fails; yserver disconnects
+            // instead, as a broken SCM_RIGHTS socket is unrecoverable.
+            debug!(
+                "client {} #{} DRI3::{op:?} pixmap=0x{pixmap:x} -> BadPixmap ({err})",
+                client_id.0, sequence.0
+            );
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_PIXMAP,
+                pixmap,
+                u16::from(minor),
+                DRI3_MAJOR_OPCODE,
+            );
+        }
+    };
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
+    debug!(
+        "client {} #{} DRI3::{op:?} pixmap=0x{pixmap:x} size={} {}x{} stride={} offset={} modifier=0x{:x} depth={} bpp={}",
+        client_id.0,
+        sequence.0,
+        export.size,
+        export.width,
+        export.height,
+        export.stride,
+        export.offset,
+        export.modifier,
+        export.depth,
+        export.bpp,
+    );
+    let reply = match op {
+        // op 3's stride is CARD16.
+        Dri3ExportOp::BufferFromPixmap => x11dri3::encode_buffer_from_pixmap_reply(
+            byte_order,
+            sequence,
+            export.size,
+            export.width,
+            export.height,
+            u16::try_from(export.stride).unwrap_or(u16::MAX),
+            export.depth,
+            export.bpp,
+        ),
+        Dri3ExportOp::BuffersFromPixmap => x11dri3::encode_buffers_from_pixmap_reply(
+            byte_order,
+            sequence,
+            export.width,
+            export.height,
+            export.modifier,
+            export.depth,
+            export.bpp,
+            &[export.stride],
+            &[export.offset],
+        ),
+    };
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    let raw = std::os::fd::AsRawFd::as_raw_fd(&export.fd);
+    if let Err(e) = send_reply_with_fd(client, &reply, raw) {
+        log::warn!("DRI3::{op:?} SCM_RIGHTS dispatch failed: {e}");
+        return Ok(RequestOutcome::Disconnect(client_id));
+    }
+    drop(export.fd);
     Ok(RequestOutcome::Handled)
 }

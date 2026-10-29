@@ -909,6 +909,28 @@ fn create_live_window(
 /// the DRM transaction. `source_xid` stands in for the client buffer the
 /// CRTCs are scanning out; the compositor's pools are left untouched,
 /// which is exactly what happens on hardware.
+/// Linear single-plane XRGB8888 dma-buf metadata, which makes a test
+/// source an imported one for M2.
+pub(super) fn imported_dmabuf_for_test(
+    width: u16,
+    height: u16,
+) -> crate::kms::render::store::ImportedDmabufMetadata {
+    crate::kms::render::store::ImportedDmabufMetadata {
+        fourcc: 0x3432_5258,
+        vk_format: ash::vk::Format::B8G8R8A8_UNORM,
+        modifier: 0,
+        implicit_layout: false,
+        planes: vec![crate::kms::render::store::ImportedDmabufPlane {
+            offset: 0,
+            pitch: u32::from(width) * 4,
+        }],
+        width,
+        height,
+        depth: 24,
+        bpp: 32,
+    }
+}
+
 pub(super) fn retain_direct_frame_from_source_test(
     b: &mut crate::kms::render::backend::KmsBackend,
     source_xid: u32,

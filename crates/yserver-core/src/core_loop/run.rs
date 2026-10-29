@@ -42,8 +42,9 @@ use super::{
         token_to_backend_index, token_to_client, token_to_listener_index,
     },
     process_request::{
-        PendingCrtcConfig, PropertyDispatchError, RequestOutcome, ValidatedXiChange,
-        complete_crtc_config, fire_present_configure_notify_for_window, process_request,
+        PendingCrtcConfig, PendingDri3Export, PropertyDispatchError, RequestOutcome,
+        ValidatedXiChange, complete_crtc_config, fire_present_configure_notify_for_window,
+        process_request,
     },
     reset::{GenerationLocals, ResetAction, ResetPolicy, ResetTrigger, reset_generation},
     sender::{CoreReceiver, CoreSender},
@@ -51,7 +52,7 @@ use super::{
     xdmcp::{XDMCP_TOKEN, XdmcpOutcome, XdmcpService},
 };
 use crate::{
-    backend::{Backend, BackendFdKind, CrtcConfigToken, HostSocketStatus},
+    backend::{Backend, BackendFdKind, CrtcConfigToken, Dri3ExportToken, HostSocketStatus},
     host_x11::HostEvent,
     server::{KeyRepeatState, ServerState},
     transport::{Listener, Transport},
@@ -594,18 +595,68 @@ struct ParkedCrtcConfig {
     request_wire_bytes: usize,
 }
 
+/// A DRI3 export the backend deferred while its pixmap is scanned out.
+struct ParkedDri3Export {
+    client_id: yserver_protocol::x11::ClientId,
+    sequence: yserver_protocol::x11::SequenceNumber,
+    continuation: PendingDri3Export,
+    request_wire_bytes: usize,
+}
+
 /// Backend waits indexed both by opaque token (completion) and by client
 /// (strict same-client FIFO blocking/cancellation).
 #[derive(Default)]
 pub(crate) struct PendingBackendRequests {
     crtc_by_token: HashMap<CrtcConfigToken, ParkedCrtcConfig>,
     crtc_by_client: HashMap<yserver_protocol::x11::ClientId, CrtcConfigToken>,
+    dri3_by_token: HashMap<Dri3ExportToken, ParkedDri3Export>,
+    dri3_by_client: HashMap<yserver_protocol::x11::ClientId, Dri3ExportToken>,
     xi_config_clients: HashSet<yserver_protocol::x11::ClientId>,
 }
 
 impl PendingBackendRequests {
     fn client_is_blocked(&self, client: yserver_protocol::x11::ClientId) -> bool {
-        self.crtc_by_client.contains_key(&client) || self.xi_config_clients.contains(&client)
+        self.crtc_by_client.contains_key(&client)
+            || self.dri3_by_client.contains_key(&client)
+            || self.xi_config_clients.contains(&client)
+    }
+
+    fn park_dri3(&mut self, parked: ParkedDri3Export) -> Result<(), &'static str> {
+        let client = parked.client_id;
+        let token = parked.continuation.token;
+        if self.crtc_by_client.contains_key(&client) || self.dri3_by_client.contains_key(&client) {
+            return Err("client already has a pending backend request");
+        }
+        if self.dri3_by_token.contains_key(&token) {
+            return Err("backend reused a live DRI3 export token");
+        }
+        self.dri3_by_client.insert(client, token);
+        self.dri3_by_token.insert(token, parked);
+        Ok(())
+    }
+
+    fn take_dri3(&mut self, token: Dri3ExportToken) -> Option<ParkedDri3Export> {
+        let parked = self.dri3_by_token.remove(&token)?;
+        self.dri3_by_client.remove(&parked.client_id);
+        Some(parked)
+    }
+
+    fn take_client_dri3(
+        &mut self,
+        client: yserver_protocol::x11::ClientId,
+    ) -> Option<Dri3ExportToken> {
+        let token = self.dri3_by_client.remove(&client)?;
+        self.dri3_by_token.remove(&token);
+        Some(token)
+    }
+
+    /// Whether `client` waits on a deferred DRI3 export.
+    #[cfg(test)]
+    pub(crate) fn dri3_export_is_parked_for_test(
+        &self,
+        client: yserver_protocol::x11::ClientId,
+    ) -> bool {
+        self.dri3_by_client.contains_key(&client)
     }
 
     fn block_xi_config(&mut self, client: yserver_protocol::x11::ClientId) -> bool {
@@ -627,7 +678,7 @@ impl PendingBackendRequests {
     fn park_crtc(&mut self, parked: ParkedCrtcConfig) -> Result<(), &'static str> {
         let client = parked.client_id;
         let token = parked.continuation.token;
-        if self.crtc_by_client.contains_key(&client) {
+        if self.crtc_by_client.contains_key(&client) || self.dri3_by_client.contains_key(&client) {
             return Err("client already has a pending backend request");
         }
         if self.crtc_by_token.contains_key(&token) {
@@ -685,12 +736,19 @@ impl PendingBackendRequests {
     pub(crate) fn is_empty(&self) -> bool {
         self.crtc_by_token.is_empty()
             && self.crtc_by_client.is_empty()
+            && self.dri3_by_token.is_empty()
+            && self.dri3_by_client.is_empty()
             && self.xi_config_clients.is_empty()
     }
 
     pub(crate) fn take_all_crtc_tokens(&mut self) -> Vec<CrtcConfigToken> {
         self.crtc_by_client.clear();
         self.crtc_by_token.drain().map(|(token, _)| token).collect()
+    }
+
+    pub(crate) fn take_all_dri3_tokens(&mut self) -> Vec<Dri3ExportToken> {
+        self.dri3_by_client.clear();
+        self.dri3_by_token.drain().map(|(token, _)| token).collect()
     }
 }
 
@@ -977,6 +1035,9 @@ pub(super) fn disconnect_with_pending_cleanup(
     if let Some(token) = pending.take_client_crtc(client) {
         backend.cancel_crtc_config(token);
     }
+    if let Some(token) = pending.take_client_dri3(client) {
+        backend.release_dri3_export(token);
+    }
     xi_config_lane
         .queued
         .retain(|queued| queued.request.client != client);
@@ -1126,7 +1187,11 @@ fn emit_xi_config_error(
                 client,
             ),
             Ok(RequestOutcome::Handled) => {}
-            Ok(RequestOutcome::PendingCrtcConfig(_) | RequestOutcome::PendingXiConfig(_)) => {
+            Ok(
+                RequestOutcome::PendingCrtcConfig(_)
+                | RequestOutcome::PendingDri3Export(_)
+                | RequestOutcome::PendingXiConfig(_),
+            ) => {
                 unreachable!("error emission cannot start backend work")
             }
             Err(err) => warn!("XI config error reply failed: {err}"),
@@ -1683,6 +1748,9 @@ pub(crate) fn cancel_all_pending_backend_requests(
     for token in pending.take_all_crtc_tokens() {
         backend.cancel_crtc_config(token);
     }
+    for token in pending.take_all_dri3_tokens() {
+        backend.release_dri3_export(token);
+    }
 }
 
 fn process_one_request(
@@ -1782,6 +1850,33 @@ fn process_one_request(
                 // An ordering/token contract violation cannot be replied to
                 // safely without overtaking an earlier request from this
                 // client. Disconnect it and cancel any older parked work.
+                disconnect_with_pending_cleanup(
+                    state,
+                    backend,
+                    pending,
+                    xi_config_lane,
+                    reset_trigger,
+                    req_client,
+                );
+            }
+        }
+        RequestOutcome::PendingDri3Export(continuation) => {
+            let token = continuation.token;
+            let parked = ParkedDri3Export {
+                client_id: req_client,
+                sequence: req.sequence,
+                continuation,
+                request_wire_bytes: req_wire_bytes,
+            };
+            if let Err(reason) = pending.park_dri3(parked) {
+                log::error!(
+                    "cannot park deferred DRI3 export for client {} token {}: {reason}",
+                    req_client.0,
+                    token.0,
+                );
+                if !pending.dri3_by_token.contains_key(&token) {
+                    backend.release_dri3_export(token);
+                }
                 disconnect_with_pending_cleanup(
                     state,
                     backend,
@@ -1947,7 +2042,9 @@ fn process_request_inline(
     // path performs this bookkeeping exactly once when the result is applied.
     if !matches!(
         &outcome,
-        RequestOutcome::PendingCrtcConfig(_) | RequestOutcome::PendingXiConfig(_)
+        RequestOutcome::PendingCrtcConfig(_)
+            | RequestOutcome::PendingDri3Export(_)
+            | RequestOutcome::PendingXiConfig(_)
     ) {
         if std::mem::take(&mut state.damage_notify_flush_pending) {
             backend.flush_before_damage_notify();
@@ -2021,8 +2118,70 @@ pub(crate) fn drain_ready_crtc_configs(
             RequestOutcome::Handled => {
                 grant_request_credit(state, parked.client_id, parked.request_wire_bytes)
             }
-            RequestOutcome::PendingCrtcConfig(_) | RequestOutcome::PendingXiConfig(_) => {
+            RequestOutcome::PendingCrtcConfig(_)
+            | RequestOutcome::PendingDri3Export(_)
+            | RequestOutcome::PendingXiConfig(_) => {
                 unreachable!("CRTC completion cannot start a second asynchronous request")
+            }
+        }
+    }
+}
+
+/// Answer every deferred DRI3 export the backend reports ready, then hand
+/// its token back so the backend can release the pixmap pin.
+pub(crate) fn drain_ready_dri3_exports(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: &mut PendingBackendRequests,
+    xi_config_lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+) {
+    for token in backend.drain_ready_dri3_exports() {
+        let Some(parked) = pending.take_dri3(token) else {
+            backend.release_dri3_export(token);
+            continue;
+        };
+        if !state.clients.contains_key(&parked.client_id.0) {
+            backend.release_dri3_export(token);
+            continue;
+        }
+        let result = backend.finish_dri3_export(token);
+        let outcome = match crate::core_loop::process_request::complete_dri3_export(
+            state,
+            parked.client_id,
+            parked.sequence,
+            parked.continuation,
+            result,
+        ) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                log::warn!(
+                    "DRI3 export completion error (client {} token {}): {err}",
+                    parked.client_id.0,
+                    token.0,
+                );
+                RequestOutcome::Handled
+            }
+        };
+        backend.release_dri3_export(token);
+        match outcome {
+            RequestOutcome::Disconnect(client) => {
+                disconnect_with_pending_cleanup(
+                    state,
+                    backend,
+                    pending,
+                    xi_config_lane,
+                    reset_trigger,
+                    client,
+                );
+            }
+            RequestOutcome::Handled => {
+                grant_request_credit(state, parked.client_id, parked.request_wire_bytes)
+            }
+            RequestOutcome::PendingCrtcConfig(_)
+            | RequestOutcome::PendingDri3Export(_)
+            | RequestOutcome::PendingXiConfig(_) => {
+                unreachable!("a DRI3 export completion cannot start backend work")
             }
         }
     }
@@ -2944,6 +3103,13 @@ fn run_core_with_inventory(
         );
 
         run_iteration_tail(state, backend);
+        drain_ready_dri3_exports(
+            state,
+            backend,
+            &mut pending_backend_requests,
+            &mut xi_config_lane,
+            &mut reset_trigger,
+        );
         // The tail delivers deferred input and Present events too: settle
         // again so nothing it buffered waits without WRITABLE interest.
         settle_client_output(

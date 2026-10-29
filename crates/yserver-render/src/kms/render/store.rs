@@ -1120,6 +1120,14 @@ impl DrawableStore {
         self.entries.get_mut(&id)
     }
 
+    /// Mark `id` as an imported dma-buf for tests that model one.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_tests_set_imported_dmabuf(&mut self, id: DrawableId, meta: ImportedDmabufMetadata) {
+        if let Some(d) = self.entries.get_mut(&id) {
+            d.storage.imported_dmabuf = Some(meta);
+        }
+    }
+
     pub fn incref(&mut self, id: DrawableId) {
         if let Some(d) = self.entries.get_mut(&id) {
             d.refcount = d.refcount.saturating_add(1);

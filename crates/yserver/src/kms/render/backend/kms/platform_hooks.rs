@@ -753,6 +753,28 @@ impl Platform for PlatformBackend {
         KmsBackend::backend_export_dri3_export_pixmap_buffers(b, host_xid)
     }
 
+    fn dri3_begin_export_pixmap_buffers(
+        b: &mut KmsBackend,
+        host_xid: u32,
+    ) -> io::Result<yserver_core::backend::Dri3ExportBegin> {
+        KmsBackend::backend_export_dri3_begin_export(b, host_xid)
+    }
+
+    fn drain_ready_dri3_exports(b: &mut KmsBackend) -> Vec<yserver_core::backend::Dri3ExportToken> {
+        KmsBackend::backend_export_drain_ready_dri3_exports(b)
+    }
+
+    fn finish_dri3_export(
+        b: &mut KmsBackend,
+        token: yserver_core::backend::Dri3ExportToken,
+    ) -> io::Result<Dri3PixmapExport> {
+        KmsBackend::backend_export_finish_dri3_export(b, token)
+    }
+
+    fn release_dri3_export(b: &mut KmsBackend, token: yserver_core::backend::Dri3ExportToken) {
+        KmsBackend::backend_export_release_dri3_export(b, token);
+    }
+
     fn dri3_fence_from_fd(
         b: &mut KmsBackend,
         fence_xid: u32,

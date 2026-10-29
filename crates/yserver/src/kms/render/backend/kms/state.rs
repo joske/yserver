@@ -282,8 +282,9 @@ pub(in crate::kms::render::backend) enum ServerScanoutState {
     Candidate,
     Promoted(ServerScanoutDescriptor),
     Failed(String),
-    /// Handed to a client after promotion; never flipped again (D6).
-    Disqualified,
+    /// Handed to a client after promotion; never flipped again (D6). Keeps
+    /// the descriptor until no direct frame references the source.
+    Disqualified(Option<ServerScanoutDescriptor>),
 }
 
 /// Whether a Present destination's source rotation may flip (D1).
@@ -407,6 +408,15 @@ impl ServerScanoutSources {
         matches!(self.sources.get(&id), Some(ServerScanoutState::Promoted(_)))
     }
 
+    /// Whether `id` is disqualified but its descriptor still waits for the
+    /// CRTCs to leave it.
+    pub(in crate::kms::render::backend) fn awaits_release(&self, id: DrawableId) -> bool {
+        matches!(
+            self.sources.get(&id),
+            Some(ServerScanoutState::Disqualified(Some(_)))
+        )
+    }
+
     pub(in crate::kms::render::backend) fn descriptor(
         &self,
         id: DrawableId,
@@ -486,6 +496,35 @@ impl ServerScanoutSources {
     }
 }
 
+/// A DRI3 export of a promoted source, parked until no direct frame
+/// references it (D6). The pin keeps the exact storage alive; completion
+/// never resolves the XID again.
+#[derive(Debug)]
+pub(in crate::kms::render::backend) struct ParkedServerScanoutExport {
+    pub(in crate::kms::render::backend) id: DrawableId,
+    pub(in crate::kms::render::backend) host_xid: u32,
+    pub(in crate::kms::render::backend) pin: u64,
+    pub(in crate::kms::render::backend) parked_at: std::time::Instant,
+    pub(in crate::kms::render::backend) deadline: std::time::Instant,
+    /// Set once the export ran (or failed); the token is then ready.
+    pub(in crate::kms::render::backend) result:
+        Option<io::Result<yserver_core::backend::Dri3PixmapExport>>,
+}
+
+/// How long a deferred DRI3 export waits for the CRTCs before the safe
+/// teardown (D6): the per-CRTC RANDR event wait.
+pub(in crate::kms::render::backend) const SERVER_SCANOUT_EXPORT_WAIT: std::time::Duration =
+    super::crtc_config::PER_CRTC_EVENT_WAIT;
+
+/// Deferred DRI3 exports of promoted server-owned sources.
+#[derive(Debug, Default)]
+pub(in crate::kms::render::backend) struct DeferredServerScanoutExports {
+    pub(in crate::kms::render::backend) parked:
+        HashMap<yserver_core::backend::Dri3ExportToken, ParkedServerScanoutExport>,
+    pub(in crate::kms::render::backend) ready: Vec<yserver_core::backend::Dri3ExportToken>,
+    pub(in crate::kms::render::backend) next_token: u64,
+}
+
 pub(in crate::kms::render::backend) struct DirectPresentFrame {
     pub(in crate::kms::render::backend) source_pin: u64,
     pub(in crate::kms::render::backend) fallback_target_pin: u64,
@@ -543,6 +582,10 @@ impl std::fmt::Display for ServerScanoutPromoteError {
 
 pub(in crate::kms::render::backend) type ServerScanoutPromoter =
     fn(&mut KmsBackend, DrawableId) -> Result<ServerScanoutPromotion, ServerScanoutPromoteError>;
+
+/// Exports one drawable for DRI3; a seam for tests.
+pub(in crate::kms::render::backend) type Dri3DrawableExporter =
+    fn(&mut KmsBackend, DrawableId, u32) -> io::Result<yserver_core::backend::Dri3PixmapExport>;
 
 pub(in crate::kms::render::backend) type DirectFrameSubmitter =
     fn(
@@ -1288,6 +1331,8 @@ pub struct KmsBackendState {
     pub(in crate::kms::render::backend) server_scanout: ServerScanoutSources,
     /// Promotes one server-owned source for scanout; a seam for tests.
     pub(in crate::kms::render::backend) server_scanout_promoter: ServerScanoutPromoter,
+    pub(in crate::kms::render::backend) server_scanout_exports: DeferredServerScanoutExports,
+    pub(in crate::kms::render::backend) dri3_drawable_exporter: Dri3DrawableExporter,
     pub(in crate::kms::render::backend) vt_resume_executor:
         std::rc::Rc<dyn super::session::VtResumeExecutor>,
 

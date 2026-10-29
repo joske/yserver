@@ -203,6 +203,11 @@ fn scanout_promotion_keeps_pixels() {
     assert_eq!(s.export_modifier, 0, "scanout promotion is linear");
     assert_eq!(seen, Some((s.export_offset, s.export_stride, 0)));
     assert_eq!(promotion.export.stride, s.export_stride);
+    assert_eq!(
+        crate::kms::vk::mem_accounting::category_of(s.memory),
+        Some(crate::kms::vk::mem_accounting::MemCategory::Scanout),
+        "scanout promotion is not an external export"
+    );
     assert_eq!(get(&mut engine, &mut store, &mut gpu, id), written);
     engine.drain_all(&mut gpu);
 }

@@ -1973,6 +1973,187 @@ fn ready_crtc_completion_replies_unblocks_and_returns_reader_credit() {
     assert!(!state.clients.contains_key(&client_id.0));
 }
 
+/// A deferred DRI3 export parks its client like a CRTC configuration:
+/// later requests from that client wait, the ready token answers with one
+/// reply, returns the reader credit and releases the token; a disconnect
+/// while parked releases it too.
+#[test]
+fn deferred_dri3_export_parks_replies_once_and_releases_its_token() {
+    use crate::{
+        backend::{Dri3ExportToken, recording::RecordingBackend},
+        core_loop::process_request::{Dri3ExportOp, process_request},
+        resources::ROOT_WINDOW,
+    };
+    use std::{io::Read, os::unix::net::UnixStream};
+    use yserver_protocol::x11::{
+        ClientId, CreatePixmapRequest, RequestHeader, ResourceId, SequenceNumber,
+    };
+
+    let client_id = ClientId(57);
+    let other = ClientId(12);
+    let token = Dri3ExportToken(7);
+    let (mut peer, writer) = UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    let (control_tx, control_rx) = crossbeam_channel::unbounded();
+    let mut state = ServerState::new();
+    let mut client = unix_client(writer, client_id.0, 0);
+    client.reader_control = Some(control_tx);
+    client.resource_id_base = 0;
+    client.resource_id_mask = u32::MAX;
+    state.clients.insert(client_id.0, client);
+    let pixmap = 0x1000;
+    state.resources.create_pixmap(
+        client_id,
+        CreatePixmapRequest {
+            depth: 24,
+            pixmap: ResourceId(pixmap),
+            drawable: ROOT_WINDOW,
+            width: 64,
+            height: 16,
+        },
+    );
+    assert!(state.resources.set_pixmap_host_xid(
+        ResourceId(pixmap),
+        crate::backend::PixmapHandle::from_raw(0xdead_cafe).unwrap(),
+    ));
+
+    let mut backend = RecordingBackend::new();
+    backend.pending_dri3_export = Some(token);
+    let outcome = process_request(
+        &mut state,
+        &mut backend,
+        client_id,
+        SequenceNumber(9),
+        RequestHeader {
+            opcode: 147,
+            data: 8,
+            length_units: 2,
+        },
+        &pixmap.to_le_bytes(),
+        None,
+    )
+    .unwrap();
+    let RequestOutcome::PendingDri3Export(continuation) = outcome else {
+        panic!("a scanned-out export must defer, got {outcome:?}");
+    };
+    assert_eq!(continuation.token, token);
+    assert_eq!(continuation.op, Dri3ExportOp::BuffersFromPixmap);
+    assert!(state.clients[&client_id.0].outbound.is_empty());
+
+    let mut pending = PendingBackendRequests::default();
+    pending
+        .park_dri3(ParkedDri3Export {
+            client_id,
+            sequence: SequenceNumber(9),
+            continuation,
+            request_wire_bytes: 8,
+        })
+        .unwrap();
+    let mut queue = FairRequestQueue::default();
+    queue.push_back(deferred_request(client_id.0, 2));
+    queue.push_back(deferred_request(other.0, 10));
+    let runnable = queue.pop_front_unblocked(&pending, &state).unwrap();
+    assert_eq!(runnable.id, other);
+    assert!(
+        queue.pop_front_unblocked(&pending, &state).is_none(),
+        "the parked client's later request must not dispatch"
+    );
+
+    let mut lane = XiConfigLane::default();
+    let mut reset = ResetTrigger::new(ResetPolicy::NoReset);
+    drain_ready_dri3_exports(
+        &mut state,
+        &mut backend,
+        &mut pending,
+        &mut lane,
+        &mut reset,
+    );
+    assert!(backend.finished_dri3_exports.is_empty(), "not ready yet");
+    assert!(pending.dri3_export_is_parked_for_test(client_id));
+
+    backend.ready_dri3_exports.push(token);
+    drain_ready_dri3_exports(
+        &mut state,
+        &mut backend,
+        &mut pending,
+        &mut lane,
+        &mut reset,
+    );
+    let mut reply = [0_u8; 32];
+    peer.read_exact(&mut reply).unwrap();
+    assert_eq!((reply[0], reply[1]), (1, 1), "a reply carrying one fd");
+    assert_eq!(u16::from_le_bytes([reply[2], reply[3]]), 9);
+    let extra = u32::from_le_bytes([reply[4], reply[5], reply[6], reply[7]]) as usize * 4;
+    peer.read_exact(&mut vec![0; extra]).unwrap();
+    assert_eq!(backend.finished_dri3_exports, [token]);
+    assert_eq!(backend.released_dri3_exports, [token]);
+    assert!(!pending.client_is_blocked(client_id));
+    assert!(matches!(
+        control_rx.try_recv(),
+        Ok(crate::server::ReaderControl::GrantRequestBytes(8))
+    ));
+    let next = queue.pop_front_unblocked(&pending, &state).unwrap();
+    assert_eq!((next.id, next.header.opcode), (client_id, 2));
+
+    // A failed deferred export answers BadPixmap and still frees the client.
+    let failed = Dri3ExportToken(9);
+    backend.failed_dri3_exports.push(failed);
+    pending
+        .park_dri3(ParkedDri3Export {
+            client_id,
+            sequence: SequenceNumber(10),
+            continuation: crate::core_loop::process_request::PendingDri3Export {
+                token: failed,
+                ..continuation
+            },
+            request_wire_bytes: 8,
+        })
+        .unwrap();
+    backend.ready_dri3_exports.push(failed);
+    drain_ready_dri3_exports(
+        &mut state,
+        &mut backend,
+        &mut pending,
+        &mut lane,
+        &mut reset,
+    );
+    peer.read_exact(&mut reply).unwrap();
+    assert_eq!(
+        (reply[0], reply[1]),
+        (0, yserver_protocol::x11::error::BAD_PIXMAP)
+    );
+    assert_eq!(backend.released_dri3_exports, [token, failed]);
+    assert!(!pending.client_is_blocked(client_id));
+    assert!(matches!(
+        control_rx.try_recv(),
+        Ok(crate::server::ReaderControl::GrantRequestBytes(8))
+    ));
+
+    let cancelled = Dri3ExportToken(8);
+    pending
+        .park_dri3(ParkedDri3Export {
+            client_id,
+            sequence: SequenceNumber(11),
+            continuation: crate::core_loop::process_request::PendingDri3Export {
+                token: cancelled,
+                ..continuation
+            },
+            request_wire_bytes: 8,
+        })
+        .unwrap();
+    disconnect_with_pending_cleanup(
+        &mut state,
+        &mut backend,
+        &mut pending,
+        &mut lane,
+        &mut reset,
+        client_id,
+    );
+    assert_eq!(backend.released_dri3_exports, [token, failed, cancelled]);
+    assert_eq!(backend.finished_dri3_exports, [token, failed]);
+    assert!(pending.is_empty());
+}
+
 /// The grab owner can be dropped by paths that carry no release check of
 /// their own — `process_disconnect` runs at two sites outside the message
 /// loop (a failed outbound write, and the writable-interest reconcile).

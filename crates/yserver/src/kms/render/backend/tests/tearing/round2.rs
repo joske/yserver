@@ -1786,6 +1786,10 @@ fn tearing_on_delayed_acquire_stream_survives_core_supersession() {
             .store
             .lookup(host_pixmap.as_raw())
             .expect("Present source has KMS storage");
+        backend.store.for_tests_set_imported_dmabuf(
+            source_id,
+            super::super::imported_dmabuf_for_test(width, height),
+        );
         backend.pstate.scanout_m1.entries.insert(
             (source_id, crate::kms::render::backend::DirectScope::Root),
             crate::kms::render::backend::ScanoutM1ProbeEntry::accepted_with_shape(

@@ -1250,6 +1250,12 @@ impl KmsBackend {
         scope: DirectScope,
         timing: crate::drm::async_flip::FlipTiming,
     ) -> io::Result<crate::drm::async_flip::AsyncOutcome> {
+        if matches!(
+            self.pstate.server_scanout.sources.get(&frame.source_id),
+            Some(crate::kms::render::backend::ServerScanoutState::Disqualified(_))
+        ) {
+            return Err(io::Error::other("direct source was exported"));
+        }
         let submitter = self.pstate.direct_frame_submitter;
         submitter(self, frame, scope, timing)
     }
@@ -1260,6 +1266,9 @@ impl KmsBackend {
         scope: DirectScope,
         timing: crate::drm::async_flip::FlipTiming,
     ) -> io::Result<crate::drm::async_flip::AsyncOutcome> {
+        if !self.direct_source_ready(frame.source_id) {
+            return Err(io::Error::other("direct source is not ready for scanout"));
+        }
         let fb = self
             .pstate
             .scanout_m1
@@ -1839,6 +1848,7 @@ impl KmsBackend {
         }
         <Self as Backend>::release_present_source(self, frame.source_pin);
         <Self as Backend>::release_present_source(self, frame.fallback_target_pin);
+        self.release_unreferenced_server_scanout();
     }
 
     fn defer_direct_successor_skip(&mut self, scope: DirectScope, mut frame: DirectPresentFrame) {
@@ -1963,6 +1973,7 @@ impl KmsBackend {
         if self.pstate.direct.active_scopes().is_empty() {
             self.finish_deferred_cow_release();
         }
+        self.release_unreferenced_server_scanout();
         log::debug!("scanout_m2: stopped after scanout replacement: {reason}");
     }
 
@@ -4131,6 +4142,7 @@ impl KmsBackend {
             .chain(vrr_cursor_deadline)
             .chain(source_wait_deadline)
             .chain(rescan_deadline)
+            .chain(self.server_scanout_export_deadline())
             // Not gated on `allow_kms_timers`: `maybe_composite` closes the
             // paint frame on its timeout while dark too (#177).
             .chain(self.gpu_work_deadline(now))

@@ -466,6 +466,23 @@ pub struct Dri3PixmapExport {
     pub fd: std::os::fd::OwnedFd,
 }
 
+/// Opaque identity of a DRI3 export the backend deferred.
+///
+/// Tokens stay unique until the core calls [`Backend::release_dri3_export`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Dri3ExportToken(pub u64);
+
+/// How a DRI3 pixmap export began.
+#[derive(Debug)]
+pub enum Dri3ExportBegin {
+    /// Exported now.
+    Ready(Dri3PixmapExport),
+    /// The pixmap's storage is still scanned out. The core parks the client
+    /// and finishes the token once [`Backend::drain_ready_dri3_exports`]
+    /// returns it.
+    Pending(Dri3ExportToken),
+}
+
 /// Stage 5 Task 6.1: opaque handle to a DRI3 xshmfence's underlying
 /// shared-memory segment. Concrete impl in `yserver::kms::xshmfence::
 /// FenceMapping`. Held as `Arc<dyn XshmfenceHandle>` by the deferred
@@ -2600,6 +2617,28 @@ pub trait Backend {
             "DRI3 BuffersFromPixmap unsupported on this backend",
         ))
     }
+
+    /// Begin a DRI3 export for `BufferFromPixmap` / `BuffersFromPixmap`.
+    /// A backend may defer it while the pixmap is on a CRTC.
+    fn dri3_begin_export_pixmap_buffers(&mut self, host_xid: u32) -> io::Result<Dri3ExportBegin> {
+        self.dri3_export_pixmap_buffers(host_xid)
+            .map(Dri3ExportBegin::Ready)
+    }
+
+    /// Deferred DRI3 exports whose result is ready for
+    /// [`Backend::finish_dri3_export`].
+    fn drain_ready_dri3_exports(&mut self) -> Vec<Dri3ExportToken> {
+        Vec::new()
+    }
+
+    /// The result of a ready deferred DRI3 export.
+    fn finish_dri3_export(&mut self, _token: Dri3ExportToken) -> io::Result<Dri3PixmapExport> {
+        Err(io::Error::other("unknown deferred DRI3 export token"))
+    }
+
+    /// The core is done with `token`: after its reply or error, or because
+    /// its client went away.
+    fn release_dri3_export(&mut self, _token: Dri3ExportToken) {}
 
     /// Import a `sync_file` fd as the backing of an XSync `Fence`
     /// resource. The fd ownership transfers into the backend; on
