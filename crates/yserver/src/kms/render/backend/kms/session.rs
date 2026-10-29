@@ -220,6 +220,10 @@ impl KmsBackend {
             tearing: Tearing::new(),
             direct_frame_submitter: KmsBackend::submit_direct_frame_live,
             scanout_m1_prober: KmsBackend::probe_direct_scanout_m1_live,
+            server_scanout: crate::kms::render::backend::ServerScanoutSources::new(
+                std::time::Instant::now(),
+            ),
+            server_scanout_promoter: KmsBackend::promote_server_scanout_live,
             vt_resume_executor: std::rc::Rc::new(DrmVtResumeExecutor),
             monotonic_clock: std::rc::Rc::new(std::time::Instant::now),
             armed_vblank_targets: std::collections::HashMap::new(),

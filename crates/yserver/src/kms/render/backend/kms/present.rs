@@ -133,7 +133,7 @@ impl KmsBackend {
         }
     }
 
-    fn direct_candidate_gate(
+    pub(in crate::kms::render::backend) fn direct_candidate_gate(
         &self,
         candidate: PresentScanoutCandidate,
         target: ScanoutM0Target,
@@ -1287,7 +1287,8 @@ impl KmsBackend {
             .entries
             .get(&(source_id, scope))
             .and_then(ScanoutM1ProbeEntry::framebuffer)
-            .is_some();
+            .is_some()
+            && self.direct_source_flip_admitted(source_id);
         if !framebuffer_ready {
             self.request_direct_unflip_for(scope, "eligible_direct_successor_framebuffer_missing");
             return Ok(false);

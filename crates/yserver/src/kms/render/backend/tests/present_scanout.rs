@@ -4,7 +4,7 @@ fn output_crtc_key(backend: &KmsBackend, output_idx: usize) -> CrtcKey {
     CrtcKey::for_output(&backend.platform.outputs[output_idx])
 }
 
-fn bind_test_randr_crtc(backend: &mut KmsBackend, output_idx: usize, crtc_id: u32) {
+pub(super) fn bind_test_randr_crtc(backend: &mut KmsBackend, output_idx: usize, crtc_id: u32) {
     let output_key = backend.platform.outputs[output_idx].key.clone();
     backend.pstate.crtc_key_by_id.insert(crtc_id, output_key);
     backend.refresh_present_crtc_clock_epochs();
@@ -3351,7 +3351,10 @@ fn scanout_direct_eligible_accepts_fullscreen_game_candidate() {
 }
 
 /// A root-sized stage under the COW, as muffin lays it out.
-fn seed_cow_stage(b: &mut crate::kms::render::backend::KmsBackend, stage: u32) -> (u32, u32) {
+pub(super) fn seed_cow_stage(
+    b: &mut crate::kms::render::backend::KmsBackend,
+    stage: u32,
+) -> (u32, u32) {
     let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
     let (w, h) = (b.platform.fb_w, b.platform.fb_h);
     let root_window = b.core.window_id;

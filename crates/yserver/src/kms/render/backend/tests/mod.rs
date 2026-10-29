@@ -16,6 +16,7 @@ mod randr;
 mod render_clip;
 mod render_picture;
 mod root_scanout;
+mod server_scanout;
 mod stacking;
 mod tearing;
 mod vblank_fallback;
@@ -908,7 +909,7 @@ fn create_live_window(
 /// the DRM transaction. `source_xid` stands in for the client buffer the
 /// CRTCs are scanning out; the compositor's pools are left untouched,
 /// which is exactly what happens on hardware.
-fn retain_direct_frame_from_source_test(
+pub(super) fn retain_direct_frame_from_source_test(
     b: &mut crate::kms::render::backend::KmsBackend,
     source_xid: u32,
     fallback_xid: u32,

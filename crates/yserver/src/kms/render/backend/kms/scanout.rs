@@ -2805,6 +2805,31 @@ impl KmsBackend {
             }
     }
 
+    /// Bring the M1 cache to the current output topology, dropping its
+    /// entries on a change. `false` while a direct owner is active across a
+    /// change (#311): the cache must not be touched then.
+    pub(in crate::kms::render::backend) fn sync_scanout_m1_topology(&mut self) -> bool {
+        let topology_signature = self.scanout_m1_topology_signature();
+        if self.pstate.scanout_m1.topology_signature != topology_signature {
+            if self.pstate.direct.root().active()
+                || self
+                    .pstate
+                    .direct
+                    .outputs
+                    .iter()
+                    .any(|owner| owner.active())
+            {
+                return false;
+            }
+            self.pstate.scanout_m1.clear("output topology changed");
+            self.pstate
+                .direct
+                .sync_output_count(self.platform.outputs.len());
+            self.pstate.scanout_m1.topology_signature = topology_signature;
+        }
+        true
+    }
+
     pub(in crate::kms::render::backend) fn maybe_probe_scanout_m1(
         &mut self,
         source_id: Option<DrawableId>,
@@ -2838,23 +2863,8 @@ impl KmsBackend {
             return;
         };
 
-        let topology_signature = self.scanout_m1_topology_signature();
-        if self.pstate.scanout_m1.topology_signature != topology_signature {
-            if self.pstate.direct.root().active()
-                || self
-                    .pstate
-                    .direct
-                    .outputs
-                    .iter()
-                    .any(|owner| owner.active())
-            {
-                return;
-            }
-            self.pstate.scanout_m1.clear("output topology changed");
-            self.pstate
-                .direct
-                .sync_output_count(self.platform.outputs.len());
-            self.pstate.scanout_m1.topology_signature = topology_signature;
+        if !self.sync_scanout_m1_topology() {
+            return;
         }
         if self
             .pstate
@@ -2974,12 +2984,24 @@ impl KmsBackend {
             .collect()
     }
 
-    /// The scanout descriptor of `source_id`: its imported dma-buf layout and
-    /// a dup of its fd.
+    /// The scanout descriptor of `source_id`: a promoted server-owned
+    /// source's, or its imported dma-buf layout, with a dup of the fd.
     pub(in crate::kms::render::backend) fn scanout_m1_descriptor(
         &self,
         source_id: DrawableId,
     ) -> Result<ScanoutSourceDescriptor, ScanoutM1DescriptorError> {
+        if let Some(descriptor) = self.pstate.server_scanout.descriptor(source_id) {
+            return match descriptor.fd.try_clone() {
+                Ok(fd) => Ok(ScanoutSourceDescriptor {
+                    fd,
+                    layout: descriptor.layout,
+                }),
+                Err(error) => Err(ScanoutM1DescriptorError::FdDup {
+                    layout: descriptor.layout,
+                    error,
+                }),
+            };
+        }
         let drawable = self
             .store
             .get(source_id)
@@ -3432,6 +3454,7 @@ impl KmsBackend {
             && root_overlay_empty
             && untransformed
             && source_id.is_some();
+        self.observe_server_scanout_candidate(candidate, source_id, leaf_id, paint_target, target);
         self.maybe_probe_scanout_m1(source_id, target, coverage, direct_scope, candidate);
         let diag = &mut self.pstate.scanout_m0;
         diag.presents = diag.presents.saturating_add(1);

@@ -42,7 +42,7 @@ impl Platform for PlatformBackend {
     }
 
     fn note_drawable_retired(st: &mut KmsBackendState, id: DrawableId) {
-        st.scanout_m1.remove(id);
+        st.retire_scanout_drawable(id);
     }
 
     fn set_keyboard_leds(st: &mut KmsBackendState, lit: u32) {
