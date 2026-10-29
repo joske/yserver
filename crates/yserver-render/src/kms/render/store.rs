@@ -185,6 +185,9 @@ pub struct Storage {
     /// image, captured at allocation time. `0` for non-promoted
     /// storage.
     pub export_size: u64,
+    /// Plane-0 byte offset of the exportable image, from the same
+    /// allocation-time layout query. `0` for non-promoted storage.
+    pub export_offset: u64,
     /// GLX-TFP (Phase 1): DRM format modifier of the exportable image,
     /// read back from `vkGetImageDrmFormatModifierPropertiesEXT` at
     /// promotion time. `DRM_FORMAT_MOD_LINEAR` (0) for the LINEAR path or
@@ -232,6 +235,7 @@ impl Storage {
             promoted_exportable: false,
             export_stride: 0,
             export_size: 0,
+            export_offset: 0,
             export_modifier: 0,
         }
     }
@@ -269,6 +273,7 @@ impl Storage {
             promoted_exportable: false,
             export_stride: 0,
             export_size: 0,
+            export_offset: 0,
             export_modifier: 0,
         }
     }
@@ -299,6 +304,7 @@ impl Storage {
             promoted_exportable: false,
             export_stride: 0,
             export_size: 0,
+            export_offset: 0,
             export_modifier: 0,
         }
     }
@@ -330,6 +336,7 @@ impl Storage {
             promoted_exportable: false,
             export_stride: 0,
             export_size: 0,
+            export_offset: 0,
             export_modifier: 0,
         }
     }
@@ -347,7 +354,7 @@ impl Storage {
     /// handles only after the old image's last render fence has
     /// signaled (see `RenderEngine::retire_image_after`).
     ///
-    /// `export_stride`/`export_size` come from the exportable image's
+    /// `export_stride`/`export_size`/`export_offset` come from the exportable image's
     /// `vkGetImageSubresourceLayout` at allocation time and are stored
     /// so the DRI3 export reply (Task 1.3) never has to re-query them.
     pub(crate) fn adopt_exportable(
@@ -359,6 +366,7 @@ impl Storage {
         new_layout: vk::ImageLayout,
         export_stride: u32,
         export_size: u64,
+        export_offset: u64,
         export_modifier: u64,
     ) -> RetiredImage {
         let retired = RetiredImage {
@@ -375,6 +383,7 @@ impl Storage {
         self.promoted_exportable = true;
         self.export_stride = export_stride;
         self.export_size = export_size;
+        self.export_offset = export_offset;
         self.export_modifier = export_modifier;
         retired
     }

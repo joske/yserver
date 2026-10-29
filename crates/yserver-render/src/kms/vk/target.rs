@@ -1312,17 +1312,18 @@ impl ExportableImage {
     /// the struct is wrapped in `ManuallyDrop` so `Drop` never fires on
     /// the Vk handles, then the `Arc<VkContext>` is read out and
     /// dropped normally, decrementing the strong-count as it should.
-    pub fn into_raw_parts(self) -> (vk::Image, vk::DeviceMemory, u32, u64, u64) {
+    pub fn into_raw_parts(self) -> (vk::Image, vk::DeviceMemory, u32, u64, u64, u64) {
         let mut md = std::mem::ManuallyDrop::new(self);
         let image = md.image;
         let memory = md.memory;
         let stride = md.stride;
         let size = md.size;
+        let offset = md.offset;
         let modifier = md.modifier;
         // Drop the Arc<VkContext> normally (decrement strong-count)
         // without destroying the Vk handles the caller now owns.
         unsafe { std::ptr::drop_in_place(&mut md.vk) };
-        (image, memory, stride, size, modifier)
+        (image, memory, stride, size, offset, modifier)
     }
 }
 

@@ -391,9 +391,8 @@ pub struct DmabufExport {
     pub fd: std::os::fd::OwnedFd,
     pub size: u32,
     pub stride: u32,
-    /// Byte offset of plane 0 in the dma-buf. Always 0 for yserver's
-    /// single-plane, dedicated-allocation exports; carried so the
-    /// `BuffersFromPixmap` (op 8) reply can report it per-plane.
+    /// Byte offset of plane 0 in the dma-buf, as the driver laid it out;
+    /// carried so the `BuffersFromPixmap` (op 8) reply can report it per-plane.
     pub offset: u32,
     /// DRM format modifier of the exported buffer. `DRM_FORMAT_MOD_LINEAR`
     /// (0) for LINEAR-tiled exports; the driver-chosen modifier for the
@@ -421,12 +420,13 @@ pub fn export_backing(
         .memory(img.memory)
         .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
     let raw_fd = unsafe { ext.get_memory_fd(&info)? };
+    let offset = u32::try_from(img.offset).map_err(|_| vk::Result::ERROR_FORMAT_NOT_SUPPORTED)?;
     let fd = super::owned_fd_from_vk(raw_fd, "vkGetMemoryFdKHR(DMA_BUF) export_backing")?;
     Ok(DmabufExport {
         fd,
         size: u32::try_from(img.size).unwrap_or(u32::MAX),
         stride: img.stride,
-        offset: 0,
+        offset,
         modifier: img.modifier,
     })
 }
@@ -436,7 +436,7 @@ pub fn export_backing(
 /// GLX-TFP (Task 1.2/1.3): once a pixmap has been promoted onto
 /// exportable storage, its raw `vk::DeviceMemory` handle lives on the
 /// `Storage` (the `ExportableImage` wrapper was decomposed via
-/// `into_raw_parts`), and the `stride`/`size` were captured at
+/// `into_raw_parts`), and the `stride`/`size`/`offset` were captured at
 /// allocation time. This exports that memory directly without
 /// reconstructing an `ExportableImage`. Requires
 /// `VK_KHR_external_memory_fd`.
@@ -445,6 +445,7 @@ pub fn export_promoted(
     memory: vk::DeviceMemory,
     stride: u32,
     size: u64,
+    offset: u64,
     modifier: u64,
 ) -> Result<DmabufExport, vk::Result> {
     let ext = vk
@@ -455,12 +456,13 @@ pub fn export_promoted(
         .memory(memory)
         .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
     let raw_fd = unsafe { ext.get_memory_fd(&info)? };
+    let offset = u32::try_from(offset).map_err(|_| vk::Result::ERROR_FORMAT_NOT_SUPPORTED)?;
     let fd = super::owned_fd_from_vk(raw_fd, "vkGetMemoryFdKHR(DMA_BUF) export_promoted")?;
     Ok(DmabufExport {
         fd,
         size: u32::try_from(size).unwrap_or(u32::MAX),
         stride,
-        offset: 0,
+        offset,
         modifier,
     })
 }

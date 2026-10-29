@@ -1,4 +1,5 @@
 mod core_ops;
+mod export;
 mod glyph_atlas;
 mod glyph_runs;
 mod handoff;

@@ -689,6 +689,7 @@ impl KmsBackend {
                 drawable.storage.memory,
                 drawable.storage.export_stride,
                 drawable.storage.export_size,
+                drawable.storage.export_offset,
                 drawable.storage.export_modifier,
             )
             .map_err(|e| io::Error::other(format!("DRI3 export_promoted: {e:?}")))?
