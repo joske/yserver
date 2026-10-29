@@ -1267,7 +1267,8 @@ impl KmsBackend {
         scope: DirectScope,
         timing: crate::drm::async_flip::FlipTiming,
     ) -> io::Result<crate::drm::async_flip::AsyncOutcome> {
-        if !self.direct_source_ready(frame.source_id) {
+        let dest_id = self.store.lookup(frame.candidate.paint_dst_host_xid);
+        if !self.direct_source_ready(frame.source_id, dest_id) {
             return Err(io::Error::other("direct source is not ready for scanout"));
         }
         let fb = self
@@ -3455,6 +3456,8 @@ impl KmsBackend {
             && source_id.is_some();
         self.observe_server_scanout_candidate(candidate, source_id, leaf_id, paint_target, target);
         self.maybe_probe_scanout_m1(source_id, target, coverage, direct_scope, candidate);
+        let promoted =
+            source_id.is_some_and(|id| self.pstate.server_scanout.descriptor(id).is_some());
         let diag = &mut self.pstate.scanout_m0;
         diag.presents = diag.presents.saturating_add(1);
         if authoritative {
@@ -3471,7 +3474,7 @@ impl KmsBackend {
                 diag.reject_geometry = diag.reject_geometry.saturating_add(1);
             }
         }
-        if !imported {
+        if !imported && !promoted {
             diag.reject_server_owned = diag.reject_server_owned.saturating_add(1);
         }
         if !offsets_ok {

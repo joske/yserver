@@ -46,14 +46,15 @@ impl KmsBackendState {
 }
 
 impl KmsBackend {
-    /// Whether M2 may flip `source_id` from its cached framebuffer. Imported
-    /// sources keep today's path; promoted server-owned sources do not flip
-    /// until their writes are fenced (plan Tasks 7–9).
+    /// Imported sources may flip; a promoted one only while its rotation on `dest_id` is `Complete` (D1).
     pub(in crate::kms::render::backend) fn direct_source_flip_admitted(
         &self,
         source_id: DrawableId,
+        dest_id: Option<DrawableId>,
     ) -> bool {
-        !self.pstate.server_scanout.is_promoted(source_id)
+        let server = &self.pstate.server_scanout;
+        !server.is_promoted(source_id)
+            || dest_id.is_some_and(|dest| server.rotation_complete(dest, source_id))
     }
 
     /// Track an M0-observed Present of a server-owned source and promote its
@@ -195,10 +196,6 @@ impl KmsBackend {
     /// means no fence is needed, either because nothing wrote the source
     /// since promotion or because the CPU already waited. A failed CPU wait
     /// unflips and errs: the Present takes the Copy path.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "server-owned flips (plan Task 9) call it")
-    )]
     pub(in crate::kms::render::backend) fn server_direct_source_fence(
         &mut self,
         source_id: DrawableId,
@@ -239,10 +236,6 @@ impl KmsBackend {
     }
 
     /// Submit recorded work: render batch, open frame, submit group.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "server-owned flips (plan Task 9) call it")
-    )]
     fn flush_for_direct_source(&mut self) -> std::io::Result<()> {
         self.engine
             .flush_render_batch(
@@ -270,10 +263,6 @@ impl KmsBackend {
 
     /// The D8 fallback: no usable sync_file or no `IN_FENCE_FD` property, so
     /// wait for the source's last render ticket, which may name a later read.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "server-owned flips (plan Task 9) call it")
-    )]
     fn wait_for_direct_source_on_cpu(&mut self, source_id: DrawableId) -> std::io::Result<()> {
         let server = &mut self.pstate.scanout_m0.server;
         server.fence_cpu_wait = server.fence_cpu_wait.saturating_add(1);
@@ -315,12 +304,11 @@ impl KmsBackend {
         .any(|frame| frame.source_id == id || frame.fallback_target.backing_id() == id)
     }
 
-    /// Whether M2 may scan `source_id` out from its cached framebuffer: an
-    /// imported source with an accepted probe entry, or a promoted
-    /// server-owned one that flips are admitted for.
+    /// Whether M2 may scan `source_id`, Presented to `dest_id`, out from its cached framebuffer.
     pub(in crate::kms::render::backend) fn direct_source_ready(
         &self,
         source_id: DrawableId,
+        dest_id: Option<DrawableId>,
     ) -> bool {
         let has_framebuffer = self
             .pstate
@@ -335,7 +323,7 @@ impl KmsBackend {
         });
         has_framebuffer
             && (imported || self.pstate.server_scanout.is_promoted(source_id))
-            && self.direct_source_flip_admitted(source_id)
+            && self.direct_source_flip_admitted(source_id, dest_id)
     }
 
     /// Drop the probe framebuffer, then the descriptor, of every disqualified

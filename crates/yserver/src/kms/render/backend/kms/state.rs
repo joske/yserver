@@ -384,10 +384,6 @@ pub(in crate::kms::render::backend) struct ServerScanoutSources {
     pub(in crate::kms::render::backend) failure_epoch: u64,
     pub(in crate::kms::render::backend) tokens: PromoteTokens,
     /// The D8 CPU-wait fallback has been logged.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "server-owned flips (plan Task 9) read it")
-    )]
     pub(in crate::kms::render::backend) fence_cpu_wait_warned: bool,
 }
 
@@ -436,10 +432,6 @@ impl ServerScanoutSources {
 
     /// Whether `source`'s rotation on `dest` is complete, the condition for
     /// a server-owned source to flip.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "server-owned flips (plan Task 9) admit on it")
-    )]
     pub(in crate::kms::render::backend) fn rotation_complete(
         &self,
         dest: DrawableId,

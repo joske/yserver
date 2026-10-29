@@ -1281,11 +1281,32 @@ impl KmsBackend {
                 owner.unflip_fallback_source = None;
             }
         }
-        let framebuffer_ready = self.direct_source_ready(source_id);
+        let framebuffer_ready = self.direct_source_ready(source_id, leaf_id);
         if !framebuffer_ready {
             self.request_direct_unflip_for(scope, "eligible_direct_successor_framebuffer_missing");
             return Ok(false);
         }
+        // Fence a promoted source's writes before this Present is submitted or queued (D8).
+        let in_fence = if self.pstate.server_scanout.is_promoted(source_id) {
+            match self.server_direct_source_fence(source_id) {
+                Ok(fence) => fence,
+                Err(error) => {
+                    log::warn!(
+                        target: "yserver::scanout_server",
+                        "direct Present of server-owned source_id={} takes Copy: {error}",
+                        source_id.as_u64(),
+                    );
+                    self.request_direct_unflip("server_source_fence_failed");
+                    if self.pstate.direct.root().active() {
+                        self.pstate.direct.root_mut().unflip_fallback_source = Some(source_id);
+                        self.pstate.direct.root_mut().unflip_shadow_ready = false;
+                    }
+                    return Ok(false);
+                }
+            }
+        } else {
+            None
+        };
 
         let source_pin = self.pin_direct_source(source_id);
         let fallback_target_pin = self.pin_direct_source(fallback_target.backing_id());
@@ -1305,7 +1326,7 @@ impl KmsBackend {
             awaiting_outputs: HashSet::new(),
             accepted_event_id: None,
             async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
-            in_fence: None,
+            in_fence,
         };
 
         if self

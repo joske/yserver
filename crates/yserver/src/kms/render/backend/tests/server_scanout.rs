@@ -318,11 +318,30 @@ fn marco_double_buffer_promotes_both_on_its_fourth_present() {
         Some(fake_framebuffer_handle(b_id))
     );
 
-    // Promoted server-owned sources stay on Copy until their writes are
-    // fenced (plan Tasks 7–9), past M2 probation too.
-    let sources: Vec<u32> = [a_xid, b_xid].repeat(6);
-    assert_eq!(present_all(&mut b, 10, &sources, STAGE), 0);
-    assert!(!b.pstate.direct.root().active());
+    // Past M2 probation, A and B alternate direct flips with no unflip.
+    // No scene to sync cursor planes with: treat them as bound.
+    b.pstate.direct.root_mut().cursor_bound_all = true;
+    let sources: Vec<u32> = [a_xid, b_xid].repeat(4);
+    assert_eq!(present_all(&mut b, 10, &sources, STAGE), 1, "the 8th flips");
+    for (n, xid) in [a_xid, b_xid].repeat(3).into_iter().enumerate() {
+        let id = 20 + u64::try_from(n).expect("small");
+        assert!(present(&mut b, id, xid, STAGE), "Present {id} flips");
+        retire_flip(&mut b);
+    }
+    retire_flip(&mut b);
+    assert_eq!(
+        b.pstate.scanout_m0.server.unflip_reasons,
+        Default::default()
+    );
+    let flipped: Vec<_> = b
+        .pstate
+        .direct
+        .root()
+        .completed
+        .iter()
+        .map(|event| event.present_id)
+        .collect();
+    assert_eq!(flipped, [17, 20, 21, 22, 23, 24, 25]);
     assert_eq!(attempts(&b), 2);
 
     // Control: an imported root-sized source with an accepted probe entry
@@ -350,6 +369,24 @@ fn marco_double_buffer_promotes_both_on_its_fourth_present() {
         ),
     );
     assert!(present(&mut b, 30, c_xid, STAGE));
+}
+
+/// Retire the pending direct flip on output 0.
+fn retire_flip(b: &mut KmsBackend) {
+    let event = b
+        .pstate
+        .direct
+        .root()
+        .pending
+        .as_ref()
+        .expect("a pending direct flip")
+        .accepted_event_id;
+    let clock = yserver_core::backend::PresentClockSample {
+        msc: 4,
+        ust: 400,
+        source: yserver_core::backend::PresentClockSource::PageFlip,
+    };
+    assert!(b.retire_direct_output(0, event, clock));
 }
 
 #[test]
@@ -403,7 +440,7 @@ fn third_source_resets_the_rotation_and_unflips() {
         observe(&mut b, xid, STAGE);
     }
     assert_eq!(rotation_state(&b, STAGE), Some(RotationState::Complete));
-    // Stand-in for a live direct frame of A (server-owned flips are Task 9).
+    // Stand-in for a live direct frame of A.
     let (w, h) = (b.platform.fb_w, b.platform.fb_h);
     retain_direct_frame_from_source_test(&mut b, a_xid, STAGE, w, h);
     assert!(b.pstate.direct.root().active());
@@ -1363,4 +1400,205 @@ fn an_unsubmitted_write_is_flushed_before_the_direct_commit_fence() {
         (server.direct_flush_added, server.direct_flush_reused),
         (1, 1)
     );
+}
+
+// ── Task 9: direct flips of server-owned sources ──────────────────────────
+
+thread_local! {
+    /// Each direct frame submitted: its source and whether it had a fence.
+    static SUBMITTED: std::cell::RefCell<Vec<(DrawableId, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The fake direct submitter, recording what it was handed.
+fn recording_submitter(
+    b: &mut KmsBackend,
+    frame: &mut crate::kms::render::backend::DirectPresentFrame,
+    timing: crate::drm::async_flip::FlipTiming,
+) -> std::io::Result<crate::drm::async_flip::AsyncOutcome> {
+    SUBMITTED.with_borrow_mut(|submitted| {
+        submitted.push((frame.source_id, frame.in_fence.is_some()));
+    });
+    KmsBackend::submit_direct_frame_for_tests(b, frame, timing)
+}
+
+fn submitted() -> Vec<(DrawableId, bool)> {
+    SUBMITTED.with_borrow(Clone::clone)
+}
+
+/// Marco's double buffer A/B promoted on `STAGE` and 7 of the 8 probation
+/// Presents spent: the next eligible Present flips.
+fn flipping_double_buffer(a_xid: u32, b_xid: u32) -> (KmsBackend, DrawableId, DrawableId) {
+    SUBMITTED.with_borrow_mut(Vec::clear);
+    let (mut b, _) = backend();
+    b.pstate.direct_frame_submitter = recording_submitter;
+    let a = root_pixmap(&mut b, a_xid);
+    let b_id = root_pixmap(&mut b, b_xid);
+    for xid in [a_xid, b_xid, a_xid, b_xid] {
+        observe(&mut b, xid, STAGE);
+    }
+    assert!(is_promoted(&b, a) && is_promoted(&b, b_id));
+    // No scene to sync cursor planes with: treat them as bound.
+    b.pstate.direct.root_mut().cursor_bound_all = true;
+    let probation = [b_xid, a_xid, b_xid, a_xid, b_xid, a_xid, b_xid];
+    assert_eq!(present_all(&mut b, 1, &probation, STAGE), 0);
+    assert!(submitted().is_empty());
+    (b, a, b_id)
+}
+
+fn completions(b: &KmsBackend) -> Vec<(u64, u32)> {
+    b.pstate
+        .direct
+        .root()
+        .completed
+        .iter()
+        .map(|event| (event.present_id, u32::from(event.completion_mode)))
+        .collect()
+}
+
+const FLIP: u32 = yserver_protocol::x11::present::COMPLETE_MODE_FLIP as u32;
+const SKIP: u32 = yserver_protocol::x11::present::COMPLETE_MODE_SKIP as u32;
+
+#[test]
+fn server_owned_double_buffer_flips_and_idles_after_the_next_flip() {
+    let (a_xid, b_xid) = (0x0064_0001, 0x0064_0002);
+    let (mut b, a, b_id) = flipping_double_buffer(a_xid, b_xid);
+
+    assert!(
+        present(&mut b, 10, a_xid, STAGE),
+        "the 8th eligible Present"
+    );
+    retire_flip(&mut b);
+    assert!(b.pstate.direct.root().idled.is_empty(), "A is on screen");
+    assert!(present(&mut b, 11, b_xid, STAGE));
+    assert!(
+        b.pstate.direct.root().idled.is_empty(),
+        "A stays busy until B's flip retires"
+    );
+    retire_flip(&mut b);
+    let idled: Vec<_> = b
+        .pstate
+        .direct
+        .root()
+        .idled
+        .iter()
+        .map(|event| event.present_id)
+        .collect();
+    assert_eq!(idled, [10]);
+    assert!(present(&mut b, 12, a_xid, STAGE));
+    retire_flip(&mut b);
+
+    assert_eq!(completions(&b), [(10, FLIP), (11, FLIP), (12, FLIP)]);
+    assert_eq!(
+        submitted(),
+        [(a, false), (b_id, false), (a, false)],
+        "every Present scans a promoted buffer out, none is composed"
+    );
+    assert!(b.pstate.scanout_m0.server.unflip_reasons.is_empty());
+    let server = &b.pstate.scanout_m0.server;
+    assert_eq!(
+        (
+            server.fence_none,
+            server.fence_explicit,
+            server.fence_cpu_wait
+        ),
+        (3, 0, 0),
+        "nothing wrote the sources since promotion"
+    );
+}
+
+#[test]
+fn a_server_owned_flip_carries_the_fence_of_its_writes() {
+    use crate::kms::render::store::ScanoutWriteFence;
+
+    let (a_xid, b_xid) = (0x0064_0011, 0x0064_0012);
+    let (mut b, a, _) = flipping_double_buffer(a_xid, b_xid);
+    let recorder = recording_sink(&mut b);
+    b.pstate.direct_frame_submitter = KmsBackend::submit_direct_frame_live;
+    for output in &mut b.platform.outputs {
+        output.output.plane_in_fence_fd_prop =
+            Some(::drm::control::from_u32(IN_FENCE_PROP).expect("handle"));
+    }
+    let fence = std::sync::Arc::new(dev_null_fd());
+    b.store
+        .for_tests_set_scanout_write_fence(a, ScanoutWriteFence::Fence(fence));
+    assert!(present(&mut b, 10, a_xid, STAGE));
+    let records = recorder.records();
+    let record = records.last().expect("the direct commit");
+    let output = &b.platform.outputs[0].output;
+    let fences = in_fence_values(record);
+    assert_eq!(fences.len(), 1);
+    assert_eq!(fences[0].0, u32::from(output.plane));
+    assert_eq!(b.pstate.scanout_m0.server.fence_explicit, 1);
+}
+
+#[test]
+fn a_present_during_a_pending_flip_queues_as_latest_wins_successor() {
+    use crate::kms::render::store::ScanoutWriteFence;
+
+    let (a_xid, b_xid) = (0x0064_0021, 0x0064_0022);
+    let (mut b, a, b_id) = flipping_double_buffer(a_xid, b_xid);
+    for output in &mut b.platform.outputs {
+        output.output.plane_in_fence_fd_prop =
+            Some(::drm::control::from_u32(IN_FENCE_PROP).expect("handle"));
+    }
+    assert!(present(&mut b, 10, a_xid, STAGE));
+    assert!(present(&mut b, 11, b_xid, STAGE));
+    // B is written after Present 11 was queued: Present 12 carries the fence.
+    b.store.for_tests_set_scanout_write_fence(
+        b_id,
+        ScanoutWriteFence::Fence(std::sync::Arc::new(dev_null_fd())),
+    );
+    assert!(present(&mut b, 12, b_xid, STAGE));
+    assert_eq!(submitted().len(), 1, "both wait behind the flip");
+    let queued = b.pstate.direct.root().queued_successor.as_ref();
+    assert_eq!(queued.map(|frame| frame.event.present_id), Some(12));
+    retire_flip(&mut b);
+    assert_eq!(completions(&b), [(10, FLIP), (11, SKIP)]);
+    assert_eq!(submitted(), [(a, false), (b_id, true)]);
+}
+
+#[test]
+fn a_third_source_unflips_and_its_promoted_members_take_copy() {
+    let (a_xid, b_xid, c_xid) = (0x0064_0031, 0x0064_0032, 0x0064_0033);
+    let (mut b, _, _) = flipping_double_buffer(a_xid, b_xid);
+    root_pixmap(&mut b, c_xid);
+    assert!(present(&mut b, 10, a_xid, STAGE));
+    retire_flip(&mut b);
+    assert!(!present(&mut b, 11, c_xid, STAGE));
+    assert_eq!(
+        b.pstate.direct.root().unflip_reason,
+        Some("server_source_rotation_changed")
+    );
+    assert_eq!(rotation_state(&b, STAGE), Some(RotationState::Observing));
+    assert!(
+        !present(&mut b, 12, b_xid, STAGE),
+        "B is promoted, not Complete"
+    );
+    assert_eq!(submitted().len(), 1);
+}
+
+#[test]
+fn a_promoted_source_is_no_probe_reject_and_reprobes_after_a_clear() {
+    let a_xid = 0x0064_0041;
+    let (mut b, _) = backend();
+    let a = root_pixmap(&mut b, a_xid);
+    observe(&mut b, a_xid, STAGE);
+    let before = b.pstate.scanout_m0.reject_server_owned;
+    assert_eq!(before, 1, "a candidate without a descriptor");
+    let gate_before = b.pstate.scanout_m0.m1_gate_reject_import;
+    observe(&mut b, a_xid, STAGE);
+    assert!(is_promoted(&b, a));
+    observe(&mut b, a_xid, STAGE);
+    assert_eq!(b.pstate.scanout_m0.reject_server_owned, before);
+
+    b.pstate.scanout_m1.clear("test topology change");
+    observe(&mut b, a_xid, STAGE);
+    assert!(
+        b.pstate.scanout_m1.entries.contains_key(&a),
+        "re-probed from the descriptor"
+    );
+    assert_eq!(b.pstate.scanout_m0.m1_gate_reject_import, gate_before);
+    assert_eq!(b.pstate.scanout_m0.reject_server_owned, before);
+    assert_eq!(attempts(&b), 1, "never promoted again");
 }
