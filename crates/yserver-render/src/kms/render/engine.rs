@@ -47,6 +47,7 @@ mod traps;
 use composite::*;
 #[cfg(test)]
 use emit::*;
+pub use export::{ScanoutCandidate, ScanoutPromoteError, ScanoutPromotion};
 pub use fill_copy::*;
 #[cfg(test)]
 use frame::*;

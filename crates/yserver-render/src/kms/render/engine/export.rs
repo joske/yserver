@@ -6,19 +6,47 @@ use crate::kms::render::{
 use ash::vk;
 use std::sync::Arc;
 
+/// A scanout candidate's exported layout, handed to the probe of
+/// [`RenderEngine::promote_drawable_for_scanout`] before any storage swap.
+#[derive(Debug)]
+pub struct ScanoutCandidate<'a> {
+    pub fd: std::os::fd::BorrowedFd<'a>,
+    pub width: u32,
+    pub height: u32,
+    pub format: vk::Format,
+    pub depth: u8,
+    pub offset: u64,
+    pub pitch: u32,
+    pub modifier: u64,
+}
+
+/// An adopted scanout promotion: the candidate's export (which owns its
+/// dma-buf fd) and what the probe returned.
+#[derive(Debug)]
+pub struct ScanoutPromotion<T> {
+    pub export: crate::kms::vk::dri3::DmabufExport,
+    pub accepted: T,
+}
+
+/// Why [`RenderEngine::promote_drawable_for_scanout`] kept the old storage.
+#[derive(Debug)]
+pub enum ScanoutPromoteError<E> {
+    /// The drawable is already exportable; nothing was allocated.
+    AlreadyExportable,
+    Allocate(vk::Result),
+    Export(vk::Result),
+    Probe(E),
+    Render(RenderError),
+}
+
 impl RenderEngine {
     /// GLX-TFP (Task 1.2): permanently migrate a server-owned pixmap
     /// onto dma-buf-exportable storage (glamor's model). Idempotent —
     /// returns early if the drawable is already exportable (DRI3 import
     /// or a prior promotion).
     ///
-    /// Steps: (a) allocate an exportable image; (b)+(c) copy the old
-    /// content into it and block until the copy completes; (d) build
-    /// fresh sample + attachment views over the new image; (e) swap the
-    /// `Storage` handles; (f) invalidate the drawable's cached views
-    /// (the cache keys on `DrawableId` and never re-checks the
-    /// `VkImage`, so a swap without this keeps sampling the old image);
-    /// (g) retire the old handles once their guarding fence signals.
+    /// Allocates an exportable image, then swaps it in through
+    /// [`Self::adopt_candidate`].
     ///
     /// # Errors
     ///
@@ -34,13 +62,115 @@ impl RenderEngine {
             return Err(RenderError::NoVk);
         }
         // Idempotency check first — avoid the flush cost if already done.
-        {
+        let (extent, format) = {
             let d = store.get(id).ok_or(RenderError::UnknownDrawable(id))?;
             if d.storage.is_exportable() {
                 return Ok(());
             }
-        }
+            (d.storage.extent, d.storage.format)
+        };
+        let vk = gpu.vk().ok_or(RenderError::NoVk)?.clone();
 
+        // (a) allocate exportable target.
+        let exp =
+            crate::kms::vk::target::allocate_exportable(&vk, extent.width, extent.height, format)?;
+        self.adopt_candidate(gpu, store, id, exp)
+            .map_err(|(error, _candidate)| error)
+    }
+
+    /// Promote a server-owned pixmap onto linear scanout storage, adopting
+    /// the candidate only after `probe` accepts its exported layout.
+    ///
+    /// Allocates with [`crate::kms::vk::target::allocate_scanout_pixmap`]
+    /// (never touching the GLX TFP tiling strategy), exports the candidate,
+    /// runs `probe` on that dma-buf, and only on `Ok` swaps it in through
+    /// [`Self::adopt_candidate`]. Any failure before the swap leaves the
+    /// drawable untouched: no frame close, no flush, no storage change.
+    /// On a failed adopt the probe result drops first, then the fd, then the
+    /// candidate image.
+    ///
+    /// # Errors
+    ///
+    /// [`ScanoutPromoteError`]; the drawable keeps its storage in every case.
+    pub fn promote_drawable_for_scanout<T, E>(
+        &mut self,
+        gpu: &mut GpuCore,
+        store: &mut DrawableStore,
+        id: DrawableId,
+        plane_modifiers: &[&[u64]],
+        probe: impl FnOnce(&ScanoutCandidate<'_>) -> Result<T, E>,
+    ) -> Result<ScanoutPromotion<T>, ScanoutPromoteError<E>> {
+        if self.inner.is_none() {
+            return Err(ScanoutPromoteError::Render(RenderError::NoVk));
+        }
+        let (extent, format, depth) =
+            {
+                let d = store.get(id).ok_or(ScanoutPromoteError::Render(
+                    RenderError::UnknownDrawable(id),
+                ))?;
+                if d.storage.is_exportable() {
+                    return Err(ScanoutPromoteError::AlreadyExportable);
+                }
+                (d.storage.extent, d.storage.format, d.storage.depth)
+            };
+        let vk = gpu
+            .vk()
+            .ok_or(ScanoutPromoteError::Render(RenderError::NoVk))?
+            .clone();
+        let candidate = crate::kms::vk::target::allocate_scanout_pixmap(
+            &vk,
+            extent.width,
+            extent.height,
+            format,
+            plane_modifiers,
+        )
+        .map_err(ScanoutPromoteError::Allocate)?;
+        let export = crate::kms::vk::dri3::export_backing(&vk, &candidate)
+            .map_err(ScanoutPromoteError::Export)?;
+        let accepted = {
+            use std::os::fd::AsFd as _;
+            probe(&ScanoutCandidate {
+                fd: export.fd.as_fd(),
+                width: extent.width,
+                height: extent.height,
+                format,
+                depth,
+                offset: candidate.offset,
+                pitch: export.stride,
+                modifier: candidate.modifier,
+            })
+            .map_err(ScanoutPromoteError::Probe)?
+        };
+        match self.adopt_candidate(gpu, store, id, candidate) {
+            Ok(()) => Ok(ScanoutPromotion { export, accepted }),
+            Err((error, candidate)) => {
+                drop(accepted);
+                drop(export);
+                drop(candidate);
+                Err(ScanoutPromoteError::Render(error))
+            }
+        }
+    }
+
+    /// Swap a freshly allocated exportable image in as `id`'s storage.
+    ///
+    /// Steps: close the open frame and flush the submit group; copy the old
+    /// content into the candidate and block until the copy completes; build
+    /// fresh sample + attachment views over it; swap the `Storage` handles;
+    /// invalidate the drawable's cached views (the cache keys on
+    /// `DrawableId` and never re-checks the `VkImage`, so a swap without
+    /// this keeps sampling the old image); retire the old handles once
+    /// their guarding fence signals.
+    ///
+    /// On error the candidate is handed back unconsumed and the storage is
+    /// unchanged.
+    fn adopt_candidate(
+        &mut self,
+        gpu: &mut GpuCore,
+        store: &mut DrawableStore,
+        id: DrawableId,
+        exp: crate::kms::vk::target::ExportableImage,
+    ) -> Result<(), (RenderError, crate::kms::vk::target::ExportableImage)> {
         // Submit-boundary (codex review): any open frame / parked submit
         // group may hold CBs that captured cached views of the OLD image
         // but have NOT been submitted to the queue yet. The copy below
@@ -53,81 +183,89 @@ impl RenderEngine {
         // `get_image`'s SyncWait close before its readback). After this,
         // `last_render_ticket` names the newest in-flight ticket that
         // touched the drawable.
-        self.close_open_frame(
+        if let Err(e) = self.close_open_frame(
             store,
             gpu,
             crate::kms::render::frame_builder::CloseReason::SyncWait,
-        )?;
-        self.flush_submit_group(
+        ) {
+            return Err((e, exp));
+        }
+        if let Err(e) = self.flush_submit_group(
             store,
             gpu,
             crate::kms::render::submit_group::FlushReason::SyncBoundary,
-        )?;
+        ) {
+            return Err((e.into(), exp));
+        }
 
         // Metadata read (post-close: current_layout reflects any
         // transition the frame close recorded).
-        let (extent, format, depth, old_layout, old_image) = {
-            let d = store.get(id).ok_or(RenderError::UnknownDrawable(id))?;
+        let Some((extent, format, depth, old_layout, old_image)) = store.get(id).map(|d| {
             let s = &d.storage;
             (s.extent, s.format, s.depth, s.current_layout, s.image)
+        }) else {
+            return Err((RenderError::UnknownDrawable(id), exp));
+        };
+        let Some(vk) = gpu.vk().cloned() else {
+            return Err((RenderError::NoVk, exp));
         };
 
-        let vk = gpu.vk().ok_or(RenderError::NoVk)?.clone();
-
-        // (a) allocate exportable target.
-        let exp =
-            crate::kms::vk::target::allocate_exportable(&vk, extent.width, extent.height, format)?;
-
-        // (b)+(c) copy old content → new image, block until complete.
-        self.copy_image_blocking(gpu, old_image, old_layout, exp.image, extent)?;
+        // Copy old content → new image, block until complete.
+        if let Err(e) = self.copy_image_blocking(gpu, old_image, old_layout, exp.image, extent) {
+            return Err((e, exp));
+        }
         let new_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
 
-        // (d) build new views (same depth-aware swizzle the store uses).
-        let sample_view = GpuCore::build_sample_view(&vk, exp.image, format, depth)?;
+        // Build new views (same depth-aware swizzle the store uses).
+        let sample_view = match GpuCore::build_sample_view(&vk, exp.image, format, depth) {
+            Ok(v) => v,
+            Err(e) => return Err((e.into(), exp)),
+        };
         let image_view = match GpuCore::build_attachment_view(&vk, exp.image, format) {
             Ok(v) => v,
             Err(e) => {
                 unsafe { vk.device.destroy_image_view(sample_view, None) };
-                return Err(e.into());
+                return Err((e.into(), exp));
             }
         };
 
-        // (e) swap storage, taking ownership of the exportable image's
-        //     raw handles. The drawable existence check happens BEFORE
-        //     `into_raw_parts` so an absent drawable can't leak the four
-        //     raw handles (`into_raw_parts` disarms `ExportableImage`'s
-        //     Drop, so a bail-out after it would orphan image/memory and
-        //     the two views). Unreachable in the single-threaded engine,
-        //     but cheap to make leak-proof.
-        let retired = {
-            let d = store.get_mut(id).ok_or(RenderError::UnknownDrawable(id))?;
-            let (exp_image, exp_memory, exp_stride, exp_size, exp_offset, exp_modifier) =
-                exp.into_raw_parts();
-            // A promoted redirect backing stays distinguishable from other exports.
-            crate::kms::vk::mem_accounting::recategorise(
-                exp_memory,
-                crate::kms::vk::mem_accounting::export_category_for(
-                    crate::kms::vk::mem_accounting::category_of(d.storage.memory),
-                ),
-            );
-            d.storage.adopt_exportable(
-                exp_image,
-                exp_memory,
-                sample_view,
-                image_view,
-                new_layout,
-                exp_stride,
-                exp_size,
-                exp_offset,
-                exp_modifier,
-            )
+        // Swap storage, taking ownership of the exportable image's raw
+        // handles. The drawable existence check happens BEFORE
+        // `into_raw_parts` so an absent drawable can't leak the four raw
+        // handles (`into_raw_parts` disarms `ExportableImage`'s Drop).
+        let Some(d) = store.get_mut(id) else {
+            unsafe {
+                vk.device.destroy_image_view(image_view, None);
+                vk.device.destroy_image_view(sample_view, None);
+            }
+            return Err((RenderError::UnknownDrawable(id), exp));
         };
+        let (exp_image, exp_memory, exp_stride, exp_size, exp_offset, exp_modifier) =
+            exp.into_raw_parts();
+        // A promoted redirect backing stays distinguishable from other exports.
+        crate::kms::vk::mem_accounting::recategorise(
+            exp_memory,
+            crate::kms::vk::mem_accounting::export_category_for(
+                crate::kms::vk::mem_accounting::category_of(d.storage.memory),
+            ),
+        );
+        let retired = d.storage.adopt_exportable(
+            exp_image,
+            exp_memory,
+            sample_view,
+            image_view,
+            new_layout,
+            exp_stride,
+            exp_size,
+            exp_offset,
+            exp_modifier,
+        );
 
-        // (f) invalidate the view cache for this DrawableId.
+        // Invalidate the view cache for this DrawableId.
         self.invalidate_drawable_views(id);
 
-        // (g) retire old handles once the old image's last render fence
-        //     signals (clone the ticket; None → retire eagerly).
+        // Retire old handles once the old image's last render fence
+        // signals (clone the ticket; None → retire eagerly).
         let guard = store.get(id).and_then(|d| d.last_render_ticket.clone());
         self.retire_image_after(retired, guard);
         Ok(())
