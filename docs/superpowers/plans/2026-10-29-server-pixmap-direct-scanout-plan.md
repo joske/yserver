@@ -1,6 +1,6 @@
 # Direct scanout of server-created compositor Present pixmaps — plan
 
-Date: 2026-10-29 (revised after codex review, same day)
+Date: 2026-10-29 (revised after two codex reviews, same day)
 Base: `origin/master` `52ea8822` (#311). Branch: `feat/server-pixmap-scanout`.
 Spec: `docs/superpowers/specs/2026-10-29-server-pixmap-direct-scanout.md`
 (option A, with the probe results appended there).
@@ -76,7 +76,7 @@ New:
 ## Decisions
 
 Each is also marked inline in the task that implements it. Codex reviewed
-the first draft; its answers are folded in below.
+two drafts; its answers are folded in below.
 
 - **D1 Promotion trigger.** Promote on the **second** eligible Present of
   the same drawable. That identifies marco's reused buffers: each promotes
@@ -94,8 +94,11 @@ the first draft; its answers are folded in below.
   reject counter:
   - failures: at most 4 per topology epoch, then no attempts until the next
     topology change;
-  - successes: at most 8 per topology epoch (marco's two buffers, with room
-    for compositor restarts);
+  - successes: a rate limit, not a per-epoch count. A token bucket with a
+    burst of 8 (marco's two buffers, with room for compositor restarts)
+    refills one token per 30 s (`SERVER_SCANOUT_PROMOTE_REFILL`). A per-epoch
+    count would end a healthy long session on the composed path; the bucket
+    still bounds a restart loop to one 6–8 ms promotion per 30 s;
   - live: at most 4 promoted drawables alive at once (bounds the memory of
     non-pooled linear root-sized storage).
 
@@ -135,7 +138,26 @@ the first draft; its answers are folded in below.
     replacing commit has retired on every CRTC and the frame is released
     (`stop_direct_after_scanout_replaced`). Then the M1 entry (framebuffer)
     and the descriptor are dropped, framebuffer first (D9). GLX bind and
-    acquire hand out no fd and do not wait.
+    acquire hand out no fd and do not wait;
+  - **the parked export pins its `DrawableId` and storage.** Same-client
+    FIFO does not stop another client from freeing the pixmap while the
+    reply waits. The pin is taken at park time and released after the
+    reply, the error or the cancellation; completion never resolves the
+    XID again;
+  - **the wait has a deadline,** `PER_CRTC_EVENT_WAIT` (250 ms,
+    `K/crtc_config.rs:1261`, the per-CRTC RANDR event wait) as the starting
+    threshold. On expiry the backend runs the established safe teardown,
+    `teardown_direct_before_topology_requery` (`K/scanout.rs:1656`: COW
+    shadow, every CRTC off, `stop_direct_after_scanout_replaced`, M1 clear)
+    and `relight_after_direct_teardown` (`:1629`). The fd is sent only after
+    every plane has left the source. If the teardown fails, the reply is
+    the existing export-failure error, `BadPixmap`
+    (`C/process_request/dri3.rs:349-367` for op 3, `:435-449` for op 8,
+    after Xorg `dri3_request.c:277`), the client's credit is released, and
+    the live framebuffer and source pins are kept for recovery (that
+    function already keeps them on failure; both helpers also
+    `request_exit()` on failure today, which stays). A timeout alone never
+    makes the fd safe to hand out.
 - **D7 Separate write registry.** Promoted scanout storage joins the flush
   chokepoint's signal-semaphore path through its own set, not through
   `exported_sync`. That keeps `is_exported` meaning "a client holds an fd"
@@ -291,7 +313,8 @@ Add to `ScanoutM0Telemetry` (`K/state.rs:88`), and to the periodic log
   Copy submit of the Present that promoted; the startup-hitch number);
 - `server_reject_exported` (D6), `server_reject_cap_fail`,
   `server_reject_cap_success`, `server_reject_cap_live` (D3);
-- `server_export_deferred`, `server_export_defer_us_max` (D6);
+- `server_export_deferred`, `server_export_defer_us_max`,
+  `server_export_deadline_teardown`, `server_export_deadline_fail` (D6);
 - `server_probe_accept`, `server_probe_reject`;
 - `presents_direct_imported`, `presents_direct_server`, `presents_copy`;
 - `server_fence_explicit`, `server_fence_none`, `server_fence_cpu_wait` (D8);
@@ -364,8 +387,9 @@ Changes:
 - `KmsBackendState` gets `server_scanout: ServerScanoutSources`. Per
   `DrawableId` it records `eligible_presents: u8` and a state:
   `Candidate | Promoted(ServerScanoutDescriptor) | Failed(reason) |
-  Disqualified`. It also holds the D3 counters (failures and successes per
-  topology epoch, live count).
+  Disqualified`. It also holds the D3 state: failures per topology epoch,
+  the success token bucket (its methods take `now: Instant`, so tests drive
+  time) and the live count.
 - In `observe_scanout_m0` (`K/scanout.rs:2767`), before
   `maybe_probe_scanout_m1` (call at `:2899`), add
   `observe_server_scanout_candidate`. It admits a source only when:
@@ -407,8 +431,10 @@ Tests (recording backend, fake promoter):
   DRI3-exported pixmap never promote.
 - Four failing promotions exhaust the failure cap: a fifth candidate is not
   attempted until a topology-epoch change.
-- Eight successes exhaust the success cap; five live promoted drawables are
-  refused by the live cap, and freeing one reopens it.
+- Eight successes in a burst exhaust the success bucket; the ninth is
+  refused until 30 s of test time refill one token, and a topology change
+  does not refill it. Five live promoted drawables are refused by the live
+  cap, and freeing one reopens it.
 - A promoter error leaves storage untouched (the fake asserts no flush and
   no swap) and the Present takes the Copy path.
 
@@ -437,6 +463,24 @@ Changes:
   the frame; completion builds the export (fd, offset, modifier) and the
   core sends the op 3 or op 8 reply. Then the M1 entry is removed,
   framebuffer before descriptor fd (D9).
+- Pin (D6): at park time the backend resolves the host XID once
+  (`store.lookup`) and takes a source pin as `pin_direct_source` does
+  (`K/scanout.rs:926`: `store.incref` + `present_source_pins`). The token
+  carries the `DrawableId` and the pin id; completion exports from that id
+  and never calls `lookup` again. The pin is released through
+  `backend_present_release_present_source`
+  (`B/portable/present.rs:190`, `store_decref_with_invalidate`) after the
+  reply or error is sent, or on cancellation.
+- Deadline (D6): the token records `parked_at + PER_CRTC_EVENT_WAIT`, and
+  the earliest token deadline joins `next_wakeup`
+  (`K/platform_hooks.rs:424`). On expiry, still referenced: count
+  `server_export_deadline_teardown`, run
+  `teardown_direct_before_topology_requery("server_source_export_deadline")`
+  then `relight_after_direct_teardown`, and complete the token with the fd
+  once `stop_direct_after_scanout_replaced` has run. If either step fails:
+  complete with `BadPixmap` (`C/process_request/dri3.rs:349-367`,
+  `:435-449`), count `server_export_deadline_fail`, release the credit and
+  the token's pin, and keep the frame's framebuffer and source pins.
 - An unreferenced drawable is answered immediately, and its M1 entry and
   descriptor are dropped in the same call.
 
@@ -452,7 +496,17 @@ Tests:
   - a Present of the disqualified drawable after the reply takes the Copy
     path, and no successor queued before the export flips it;
   - GLX bind and acquire on a promoted drawable disqualify without parking;
-  - the client disconnecting while parked cancels the token.
+  - the client disconnecting while parked cancels the token and releases
+    its pin;
+  - another client frees the pixmap while parked: the reply still exports
+    the pinned storage, and the store entry is freed only after the pin is
+    released (oracle: store refcount);
+  - deadline: a recording sink that never retires the replacement; at
+    `parked_at + PER_CRTC_EVENT_WAIT` the teardown runs, every plane is
+    off before the reply, and exactly one reply carries the fd;
+  - deadline with a failing all-off commit: one `BadPixmap` error, the
+    credit released (the next request dispatches), the frame's framebuffer
+    and source pins still held.
 - The existing DRI3 export tests stay green.
 
 ### Task 8 — server-write tracking and fence
@@ -469,7 +523,23 @@ Changes:
   `text.rs:250`; `composite.rs:623`; `put_get.rs:171` (all under
   `R/render/engine/`). Source, mask and sampled stamps stay
   `touch_render_fence`. Each site is checked against its own op before it
-  switches; the list is the audit start, not the result.
+  switches; the list is the audit start, not the result. The scene stamps
+  are reads (sampled sources) and stay: `scene/tick.rs:1333`, `:1418`;
+  `scene/transform.rs:293`; `scene/root_readback.rs:171`;
+  `composite.rs:789`, `:874` (codex found no missed write site).
+- Write classifier for recorded ops:
+  `RecordedOp::written_drawable(&self) -> Option<DrawableId>`
+  (`R/render/frame_builder.rs`, next to `dst_id`, `:1116`), an exhaustive
+  `match` with no wildcard arm, so a new variant does not compile until it
+  is classified. `dst_id()` is not a write classifier:
+  `ClipSnapshotRefresh` returns `live_mask_id` (`:1129`), which it reads
+  (it writes the snapshot image, not a drawable). Classification:
+  `ClipSnapshotRefresh` and `GlyphUpload` (atlas) write no drawable;
+  `LayoutTransition` writes its `drawable_id` (a layout transition is a
+  write access); every other variant writes its `dst_id`. At the
+  `engine/frame.rs:443-455` flush, a `debug_assert!` checks that every
+  op's written id that is in `scanout_fenced` was stamped by
+  `touch_render_write` (is in `scanout_writes`).
 - `scanout_fenced: HashSet<DrawableId>`, and
   `scanout_write_fence: HashMap<DrawableId, ScanoutWriteFence>` with the D8
   tri-state. Promotion (Task 6) inserts `NoPendingWrite`; retirement and
@@ -513,6 +583,10 @@ Tests:
 
 - Unit (store): a drawable only read (CopyArea source, Composite source and
   mask) gets no write; the destination does.
+- Unit (`frame_builder.rs`), mirroring
+  `b3_recorded_op_dst_id_covers_every_variant` (`:1439`): one case per
+  variant for `written_drawable`; for `ClipSnapshotRefresh` it is `None`
+  while `dst_id()` is `Some(live_mask_id)`.
 - Recording atomic sink:
   - a server-owned direct commit sets `IN_FENCE_FD` on every plane, for two
     outputs;
@@ -710,17 +784,16 @@ non-goals below. No PR body detail beyond symptom/cause/verification.
 3. Direct Presents flush pending source writes before the commit, and a
    counter measures whether that adds a submit (Task 8).
 4. A DRI3 export of a live promoted source waits until every CRTC has left
-   it, and export disqualifies for good (D6, Task 7).
-
-## Open questions
-
-1. A deferred DRI3 export waits on a page flip retiring. If a CRTC's flip
-   never completes (cf. the parked dead-CRTC Present stall), the client
-   stays parked. Is a deadline needed, and what would it reply?
-2. Success cap per topology epoch (8): a session with many compositor
-   restarts and no topology change ends on the composed path. Should the
-   success cap decay over time instead?
-3. `touch_render_write`: does any scene/composite site write into a
-   drawable that can be a promoted source (`composite.rs:789`, `:874`,
-   `scene/transform.rs:293` are reads today)? The Task 8 audit answers it;
-   flagged because a missed write site is a silent tearing bug.
+   it, and export disqualifies for good (D6, Task 7). The parked export
+   pins its `DrawableId` and storage, because same-client FIFO does not
+   stop another client freeing the pixmap (D6, Task 7).
+5. Deferred export deadline (former open question 1): `PER_CRTC_EVENT_WAIT`
+   (250 ms), then the safe all-off teardown; the fd goes out only after
+   every plane has left the source, else `BadPixmap` with the pins kept
+   (D6, Task 7).
+6. Success cap (former open question 2): a token bucket, burst 8, one
+   token per 30 s; the four-live memory cap stays (D3, Task 6).
+7. Write sites (former open question 3): no missed scene or composite
+   write site; the scene stamps are reads. `RecordedOp::written_drawable`
+   is an exhaustive classifier, because `dst_id()` reports a read for
+   `ClipSnapshotRefresh` (Task 8).
