@@ -419,8 +419,8 @@ pub fn export_backing(
     let info = vk::MemoryGetFdInfoKHR::default()
         .memory(img.memory)
         .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-    let raw_fd = unsafe { ext.get_memory_fd(&info)? };
     let offset = u32::try_from(img.offset).map_err(|_| vk::Result::ERROR_FORMAT_NOT_SUPPORTED)?;
+    let raw_fd = unsafe { ext.get_memory_fd(&info)? };
     let fd = super::owned_fd_from_vk(raw_fd, "vkGetMemoryFdKHR(DMA_BUF) export_backing")?;
     Ok(DmabufExport {
         fd,
@@ -455,8 +455,8 @@ pub fn export_promoted(
     let info = vk::MemoryGetFdInfoKHR::default()
         .memory(memory)
         .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-    let raw_fd = unsafe { ext.get_memory_fd(&info)? };
     let offset = u32::try_from(offset).map_err(|_| vk::Result::ERROR_FORMAT_NOT_SUPPORTED)?;
+    let raw_fd = unsafe { ext.get_memory_fd(&info)? };
     let fd = super::owned_fd_from_vk(raw_fd, "vkGetMemoryFdKHR(DMA_BUF) export_promoted")?;
     Ok(DmabufExport {
         fd,
