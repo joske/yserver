@@ -154,7 +154,11 @@ fn listen_tcp_binds_ipv4_display_port_after_loading_shared_auth() {
     TcpStream::connect(fixture.address()).unwrap();
     assert_eq!(
         auth.check(
-            core_loop::auth::AuthTransport::Tcp,
+            &yserver_core::peer::PeerIdentity {
+                transport: core_loop::auth::AuthTransport::Tcp,
+                addr: None,
+                cred: None,
+            },
             core_loop::generation::Generation::default(),
             MIT_MAGIC_COOKIE.as_bytes(),
             &COOKIE

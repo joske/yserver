@@ -113,7 +113,11 @@ fn input_startup_action(has_input_ctx: bool) -> InputStartup {
 /// and what makes the file cookies stop authorizing TCP clients. See
 /// `core_loop::auth::AuthState::new_with_xdmcp`.
 fn build_auth_state(opts: &launch::LaunchOptions) -> std::sync::Arc<core_loop::auth::AuthState> {
-    core_loop::auth::AuthState::new_with_xdmcp(opts.auth_file.clone(), opts.xdmcp.is_some())
+    core_loop::auth::AuthState::new_with(
+        opts.auth_file.clone(),
+        opts.xdmcp.is_some(),
+        opts.tcp_listen,
+    )
 }
 
 /// Validate TCP prerequisites before opening hardware or sockets, using the
@@ -1602,7 +1606,11 @@ mod tests {
         // check authorizes nobody.
         assert!(matches!(
             auth.check(
-                yserver_core::core_loop::auth::AuthTransport::Tcp,
+                &yserver_core::peer::PeerIdentity {
+                    transport: yserver_core::core_loop::auth::AuthTransport::Tcp,
+                    addr: None,
+                    cred: None,
+                },
                 yserver_core::core_loop::generation::Generation::default(),
                 yserver_core::xauth::MIT_MAGIC_COOKIE.as_bytes(),
                 &[0u8; 16],

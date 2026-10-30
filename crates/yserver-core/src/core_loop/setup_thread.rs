@@ -34,7 +34,7 @@ use yserver_protocol::x11::{self, ClientId};
 
 use crate::{
     core_loop::{
-        auth::{AuthState, AuthTransport, AuthVerdict},
+        auth::{AuthState, AuthVerdict},
         message::{Message, SetupAllocateResponse},
         sender::BoundSender,
     },
@@ -162,14 +162,8 @@ fn run_setup(
         id.0, setup.byte_order, setup.protocol_major, setup.protocol_minor
     );
 
-    // Authorization follows the actual socket, independently of extension
-    // capability metadata: TCP must never take the local-open fallback.
-    let auth_transport = match &stream {
-        Transport::Unix(_) => AuthTransport::Unix,
-        Transport::Tcp(_) => AuthTransport::Tcp,
-        #[cfg(test)]
-        Transport::Capture(_) => panic!("test capture transport cannot perform setup"),
-    };
+    // Authorization follows the socket `peer` was read from, independently
+    // of extension capability metadata: TCP never takes the host list.
     // The generation handed to `check` is THIS thread's producer binding,
     // captured at accept — never the counter's current value. An XDMCP
     // session credential is bound to the generation its `Accept` belonged to,
@@ -180,7 +174,7 @@ fn run_setup(
     // listener.
     if !internal
         && let AuthVerdict::Reject(reason) = auth.check(
-            auth_transport,
+            &peer,
             sender.generation(),
             &setup.auth_protocol_name,
             &setup.auth_protocol_data,
@@ -300,7 +294,10 @@ fn vendor_release() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{core_loop::sender::channel, xauth::MIT_MAGIC_COOKIE};
+    use crate::{
+        core_loop::{auth::AuthTransport, sender::channel},
+        xauth::MIT_MAGIC_COOKIE,
+    };
     use std::{
         io::{Read, Write},
         os::unix::net::UnixStream,

@@ -624,6 +624,11 @@ mod tests {
         auth::{AuthTransport, AuthVerdict},
     };
 
+    const TCP_PEER: crate::peer::PeerIdentity = crate::peer::PeerIdentity {
+        transport: AuthTransport::Tcp,
+        addr: None,
+        cred: None,
+    };
     const COOKIE: &[u8] = b"\x01\x02\x03\x04";
     const OTHER_COOKIE: &[u8] = b"\x09\x09\x09\x09";
     const SESSION: u32 = 0xfeed_face;
@@ -787,12 +792,8 @@ mod tests {
         }
 
         fn tcp_verdict(&self, cookie: &[u8]) -> AuthVerdict {
-            self.auth.check(
-                AuthTransport::Tcp,
-                self.now(),
-                b"MIT-MAGIC-COOKIE-1",
-                cookie,
-            )
+            self.auth
+                .check(&TCP_PEER, self.now(), b"MIT-MAGIC-COOKIE-1", cookie)
         }
     }
 
@@ -875,7 +876,7 @@ mod tests {
         assert!(matches!(h.tcp_verdict(COOKIE), AuthVerdict::Reject(_)));
         assert_eq!(
             h.auth
-                .check(AuthTransport::Tcp, previous, b"MIT-MAGIC-COOKIE-1", COOKIE),
+                .check(&TCP_PEER, previous, b"MIT-MAGIC-COOKIE-1", COOKIE),
             AuthVerdict::Allow,
             "the cookie was cleared rather than invalidated by generation"
         );
