@@ -4529,3 +4529,29 @@ fn handled_request_does_not_mark_the_backend_dirty() {
         "no request may wake the composite generically"
     );
 }
+
+#[test]
+fn run_core_installs_its_auth_state_as_the_host_access_handle() {
+    let mut state = ServerState::new();
+    let mut backend = crate::backend::recording::RecordingBackend::new();
+    let (poll, sender, receiver) = crate::core_loop::channel().expect("core channel");
+    let generation = receiver.current_generation();
+    let auth = AuthState::new(None);
+    assert!(!Arc::ptr_eq(&state.host_access.auth, &auth));
+    sender.send(Message::Shutdown).unwrap();
+    run_core(
+        poll,
+        receiver,
+        sender.clone_handle(),
+        &mut state,
+        &mut backend,
+        [],
+        &ClientIdAllocator::new(),
+        Arc::clone(&auth),
+        ResetPolicy::NoReset,
+        None,
+    )
+    .expect("run core to shutdown");
+    assert!(Arc::ptr_eq(&state.host_access.auth, &auth));
+    assert_eq!(state.host_access.generation, generation);
+}

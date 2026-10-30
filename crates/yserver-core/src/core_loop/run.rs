@@ -2124,6 +2124,10 @@ fn run_core_with_inventory(
     input_inventory: &mut InputInventory,
 ) -> io::Result<()> {
     let setup_registry = setup_thread::make_registry();
+    state.host_access = super::auth::HostAccessHandle {
+        auth: Arc::clone(&auth),
+        generation: rx.current_generation(),
+    };
     // The generation counter is shared with every `CoreSender`; the
     // receiver is the loop's sole handle to it, and the reset boundary
     // is the only thing that bumps it.

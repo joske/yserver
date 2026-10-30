@@ -442,6 +442,12 @@ pub(crate) fn reset_generation(
     // go backwards: a client reconnecting a millisecond after a reset
     // would otherwise see the server clock jump.
     fresh.start_instant = state.start_instant;
+    // The access state is process-lifetime; the new generation makes its
+    // next use apply Xorg's `ResetHosts` (`AuthState::check`'s `enter`).
+    fresh.host_access = crate::core_loop::auth::HostAccessHandle {
+        auth: std::sync::Arc::clone(&state.host_access.auth),
+        generation,
+    };
     // Rebuild physical facets from the process-lifetime inventory. Disabled
     // continuation facts remain registered but disabled, matching their live
     // state before the server-generation reset.
@@ -1096,6 +1102,34 @@ mod tests {
             "start_instant is the ONLY field that survives literally — \
              X11 timestamps must not go backwards across a reset"
         );
+    }
+
+    /// The access state outlives a reset: the fresh state holds the same
+    /// `AuthState`, tagged with the new generation.
+    #[test]
+    fn reset_generation_carries_the_host_access_handle_into_the_new_generation() {
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        let auth = std::sync::Arc::clone(&state.host_access.auth);
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+
+        let generation = reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        )
+        .expect("the reset must proceed: this test holds no overlay claim");
+
+        assert_eq!(state.host_access.generation, generation);
+        assert!(std::sync::Arc::ptr_eq(&state.host_access.auth, &auth));
     }
 
     /// Rootless (plan RL0 Task 3): a reset tells the host every mapped
