@@ -303,8 +303,8 @@ Tests (unit, in `host_access.rs`):
   `bob\0junk` → bob's id.
 - [Xorg `:2051-2093` for validation, decision 1 for matching] oversized and
   negative ids: `check_addr` accepts `localuser:#4294967296`,
-  `localuser:#-1` and `localgroup:#4294967296` (Xorg accepts them too), and
-  `si_matches_local` is false for all three against uid/gid 0 and against
+  `localuser:#-1`, `localgroup:#4294967296` and `localgroup:#-1` (Xorg
+  accepts them too), and `si_matches_local` is false for all four against uid/gid 0 and against
   uid/gid `u32::MAX`.
 - [Xorg `:1901-1966`] hostname validator: `a.b-c` ok, `a:b` ok, `.a`,
   `-a`, `a..b`, `a_b`, empty and 1025 bytes rejected, 1024 ok.
