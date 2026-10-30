@@ -226,10 +226,7 @@ fn run_setup(
         x11::SetupSuccess {
             protocol_major: setup.protocol_major,
             protocol_minor: setup.protocol_minor,
-            // Mirror a recent X.Org release (1.24.1.1 = 12401011).
-            // xts5 Xlib3.XVendorRelease keys on this; many apps use it
-            // for X.Org-specific compat workarounds.
-            release_number: 12_401_011,
+            release_number: vendor_release(),
             resource_id_base: resp.resource_id_base,
             resource_id_mask: resp.resource_id_mask,
             motion_buffer_size: 0,
@@ -240,10 +237,7 @@ fn run_setup(
             bitmap_format_scanline_pad: 32,
             min_keycode: 8,
             max_keycode: 255,
-            // xts5 Xlib3.XServerVendor expects this exact string. Real
-            // X.Org reports the same — using it here keeps Xlib clients
-            // that key off vendor for compat workarounds happy.
-            vendor: "The X.Org Foundation",
+            vendor: "yserver",
             root: x11::Screen {
                 root: ROOT_WINDOW,
                 default_colormap: ROOT_COLORMAP,
@@ -288,6 +282,15 @@ fn run_setup(
     Ok(())
 }
 
+/// Our own version, encoded the way Xorg encodes its release
+/// (major·10⁷ + minor·10⁵ + patch·10³): 1.8.0 → 10800000.
+fn vendor_release() -> u32 {
+    let part = |s: &str| s.parse::<u32>().unwrap_or(0);
+    part(env!("CARGO_PKG_VERSION_MAJOR")) * 10_000_000
+        + part(env!("CARGO_PKG_VERSION_MINOR")) * 100_000
+        + part(env!("CARGO_PKG_VERSION_PATCH")) * 1_000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +302,18 @@ mod tests {
         time::Instant,
     };
     use yserver_protocol::x11::ClientByteOrder;
+
+    #[test]
+    fn vendor_release_encodes_the_crate_version() {
+        let n = |s: &str| s.parse::<u32>().unwrap();
+        let expected = format!(
+            "{}{:02}{:02}000",
+            n(env!("CARGO_PKG_VERSION_MAJOR")),
+            n(env!("CARGO_PKG_VERSION_MINOR")),
+            n(env!("CARGO_PKG_VERSION_PATCH")),
+        );
+        assert_eq!(vendor_release().to_string(), expected);
+    }
 
     #[test]
     fn setup_on_a_nonblocking_accepted_socket_waits_for_the_late_request() {
