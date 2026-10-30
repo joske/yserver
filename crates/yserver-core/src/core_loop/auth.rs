@@ -985,8 +985,14 @@ mod tests {
     }
 
     /// Bump `path`'s mtime so the next `check` reloads it.
+    /// Push the file's mtime past every earlier `touch_later`: a rewrite in
+    /// the same clock tick gets the same mtime, so "mtime + 10 s" alone is
+    /// not strictly newer on coarse-clock systems (OpenBSD).
     fn touch_later(path: &Path) {
-        let later = fs::metadata(path).unwrap().modified().unwrap() + Duration::from_secs(10);
+        static STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let step = STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let later =
+            fs::metadata(path).unwrap().modified().unwrap() + Duration::from_secs(10 * step);
         fs::File::options()
             .write(true)
             .open(path)
