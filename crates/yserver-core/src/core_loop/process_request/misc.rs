@@ -1,10 +1,14 @@
 use crate::{
     backend::Backend,
-    core_loop::process_request::{
-        RequestOutcome, emit_x11_error, emit_x11_error_with_minor, motion_history_range,
-        write_to_client,
+    core_loop::{
+        auth::HostChangeError,
+        host_access::{BadValue, SystemResolver, encode_entries},
+        process_request::{
+            RequestOutcome, emit_x11_error, emit_x11_error_with_minor, motion_history_range,
+            write_to_client,
+        },
     },
-    server::ServerState,
+    server::{ClientState, ServerState},
 };
 use log::debug;
 use std::io;
@@ -300,19 +304,136 @@ pub(super) fn handle_ungrab_server(
     Ok(RequestOutcome::Handled)
 }
 
+/// Who may change the host list or the access mode: Xorg's
+/// `AuthorizedClient` without `-ac` (`os/access.c:1293-1307`). The hook point
+/// for SECURITY's `DixManageAccess`.
+fn may_manage_access(client: &ClientState) -> bool {
+    client.is_local
+}
+
+/// Who may list the hosts: anyone, as in Xorg (`dix/dispatch.c:3280-3283`).
+/// The hook point for SECURITY's `DixReadAccess`.
+fn may_read_access(_client: &ClientState) -> bool {
+    true
+}
+
+/// ListHosts (110): `enabled` and the entries, newest first
+/// (`dix/dispatch.c:3270-3304`).
 pub(super) fn handle_list_hosts(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} ListHosts", client_id.0, sequence.0);
+    let handle = state.host_access.clone();
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    if !may_read_access(client) {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_ACCESS, 0, 110);
+    }
     let byte_order = client.byte_order;
-    let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_list_hosts_reply(&mut buf, byte_order, sequence)?;
+    let (enabled, hosts) = handle.auth.list_hosts(handle.generation);
+    let (n_hosts, entries) = encode_entries(&hosts, byte_order);
+    let mut buf: Vec<u8> = Vec::with_capacity(32 + entries.len());
+    x11::write_list_hosts_reply(&mut buf, byte_order, sequence, enabled, n_hosts, &entries)?;
     Ok(write_to_client(client, client_id, &buf))
+}
+
+/// ChangeHosts (109): mode in `header.data`, then `family, pad,
+/// length:CARD16, address`. Xorg's order: mode (`dix/dispatch.c:3253-3267`),
+/// access, then family and address (`os/access.c:1313-1446`). `BadAccess`
+/// carries 0; Xorg sends whatever `errorValue` the client had last.
+pub(super) fn handle_change_hosts(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    let mode = header.data;
+    debug!(
+        "client {} #{} ChangeHosts mode={mode}",
+        client_id.0, sequence.0
+    );
+    if mode > 1 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(mode),
+            109,
+        );
+    }
+    let Some(client) = state.clients.get(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    if !may_manage_access(client) {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_ACCESS, 0, 109);
+    }
+    // The generic length check already matched the request length to the
+    // address length; the body is little-endian here.
+    let (Some(&family), Some(len)) = (body.first(), body.get(2..4)) else {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_LENGTH, 0, 109);
+    };
+    let len = u16::from_le_bytes([len[0], len[1]]);
+    let Some(addr) = body.get(4..4 + usize::from(len)) else {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_LENGTH, 0, 109);
+    };
+    let handle = state.host_access.clone();
+    let (code, value) =
+        match handle
+            .auth
+            .change_hosts(handle.generation, mode == 0, family, addr, &SystemResolver)
+        {
+            Ok(()) => return Ok(RequestOutcome::Handled),
+            Err(HostChangeError::Value(BadValue::Length)) => {
+                (x11::error::BAD_VALUE, u32::from(len))
+            }
+            Err(HostChangeError::Value(BadValue::Family)) => {
+                (x11::error::BAD_VALUE, u32::from(family))
+            }
+            Err(HostChangeError::Access) => (x11::error::BAD_ACCESS, 0),
+        };
+    emit_x11_error(state, client_id, sequence, code, value, 109)
+}
+
+/// SetAccessControl (111): mode 1 enables access control, 0 disables it
+/// (`xhost -`/`xhost +`). Mode, then access (`dix/dispatch.c:3307-3317`,
+/// `os/access.c:1616-1623`). Connected clients are not touched.
+pub(super) fn handle_set_access_control(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+) -> io::Result<RequestOutcome> {
+    let mode = header.data;
+    debug!(
+        "client {} #{} SetAccessControl mode={mode}",
+        client_id.0, sequence.0
+    );
+    if mode > 1 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(mode),
+            111,
+        );
+    }
+    let Some(client) = state.clients.get(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    if !may_manage_access(client) {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_ACCESS, 0, 111);
+    }
+    let handle = state.host_access.clone();
+    match handle.auth.set_access_enabled(handle.generation, mode == 1) {
+        Ok(()) => Ok(RequestOutcome::Handled),
+        Err(_) => emit_x11_error(state, client_id, sequence, x11::error::BAD_ACCESS, 0, 111),
+    }
 }
 
 /// SetCloseDownMode (112): mode is in header.data. Valid values are

@@ -1071,31 +1071,242 @@ fn recolor_cursor_forwards_colors_to_backend() {
     );
 }
 
+// ---- host access control: ChangeHosts / ListHosts / SetAccessControl ----
+
+/// Run one core request from `client` and return what it wrote.
+fn host_request(
+    state: &mut ServerState,
+    client: u32,
+    peer: &mut UnixStream,
+    sequence: u16,
+    opcode: u8,
+    data: u8,
+    body: &[u8],
+) -> Vec<u8> {
+    let mut backend = RecordingBackend::new();
+    process_request(
+        state,
+        &mut backend,
+        ClientId(client),
+        SequenceNumber(sequence),
+        RequestHeader {
+            opcode,
+            data,
+            length_units: u32::try_from((4 + body.len()).div_ceil(4)).unwrap(),
+        },
+        body,
+        None,
+    )
+    .expect("request through core dispatcher");
+    read_all_available(peer)
+}
+
+/// ChangeHosts body after the header: `family, pad, length, address, pad`.
+fn change_hosts_body(family: u8, addr: &[u8]) -> Vec<u8> {
+    let mut body = vec![family, 0];
+    body.extend_from_slice(&u16::try_from(addr.len()).unwrap().to_le_bytes());
+    body.extend_from_slice(addr);
+    body.resize(body.len().next_multiple_of(4), 0);
+    body
+}
+
+fn change_hosts(
+    state: &mut ServerState,
+    peer: &mut UnixStream,
+    mode: u8,
+    family: u8,
+    addr: &[u8],
+) -> Vec<u8> {
+    host_request(
+        state,
+        1,
+        peer,
+        20,
+        109,
+        mode,
+        &change_hosts_body(family, addr),
+    )
+}
+
+fn list_hosts(state: &mut ServerState, client: u32, peer: &mut UnixStream) -> Vec<u8> {
+    host_request(state, client, peer, 0x0a0b, 110, 0, &[])
+}
+
+/// `(code, bad value, major opcode)`.
+type HostError = (u8, u32, u8);
+
+/// The one error in `wire`.
+fn host_error(wire: &[u8]) -> HostError {
+    assert_eq!(wire.len(), 32, "one error: {wire:?}");
+    (
+        read_error(wire),
+        u32::from_le_bytes(wire[4..8].try_into().unwrap()),
+        wire[10],
+    )
+}
+
+/// `enabled = 1`, no hosts: what a fresh Xorg reports without `-ac`
+/// (`dix/dispatch.c:3270-3304`, `os/access.c:956-962`).
+const EMPTY_LIST_HOSTS_LE: [u8; 32] = [
+    1, 1, 0x0b, 0x0a, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0,
+];
+
 #[test]
-fn list_hosts_writes_reply() {
+fn list_hosts_on_a_fresh_server_is_enabled_and_empty() {
     let mut state = ServerState::new();
     let mut peer = install_client(&mut state, 1);
+    assert_eq!(list_hosts(&mut state, 1, &mut peer), EMPTY_LIST_HOSTS_LE);
+}
+
+#[test]
+fn change_hosts_inserts_newest_first_and_list_hosts_encodes_them() {
+    let user = b"localuser\0#1000";
+    let group = b"localgroup\0#1000";
+    let mut expected_le = vec![1, 1, 0x0b, 0x0a, 10, 0, 0, 0, 2, 0];
+    expected_le.extend_from_slice(&[0; 22]);
+    expected_le.extend_from_slice(&[5, 0, 16, 0]);
+    expected_le.extend_from_slice(group);
+    expected_le.extend_from_slice(&[5, 0, 15, 0]);
+    expected_le.extend_from_slice(user);
+    expected_le.push(0);
+    let mut expected_be = vec![1, 1, 0x0a, 0x0b, 0, 0, 0, 10, 0, 2];
+    expected_be.extend_from_slice(&[0; 22]);
+    expected_be.extend_from_slice(&[5, 0, 0, 16]);
+    expected_be.extend_from_slice(group);
+    expected_be.extend_from_slice(&[5, 0, 0, 15]);
+    expected_be.extend_from_slice(user);
+    expected_be.push(0);
+
+    for (byte_order, expected) in [
+        (ClientByteOrder::LittleEndian, expected_le),
+        (ClientByteOrder::BigEndian, expected_be),
+    ] {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.clients.get_mut(&1).unwrap().byte_order = byte_order;
+        assert!(change_hosts(&mut state, &mut peer, 0, 5, user).is_empty());
+        assert!(change_hosts(&mut state, &mut peer, 0, 5, group).is_empty());
+        assert_eq!(
+            list_hosts(&mut state, 1, &mut peer),
+            expected,
+            "{byte_order:?}"
+        );
+    }
+}
+
+#[test]
+fn local_host_entry_is_listed_once_and_deleted() {
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let mut one_entry = EMPTY_LIST_HOSTS_LE.to_vec();
+    one_entry[4] = 1; // length
+    one_entry[8] = 1; // nHosts
+    one_entry.extend_from_slice(&[0xfc, 0, 0, 0]);
+    assert!(change_hosts(&mut state, &mut peer, 0, 252, &[]).is_empty());
+    assert_eq!(list_hosts(&mut state, 1, &mut peer), one_entry);
+    assert!(change_hosts(&mut state, &mut peer, 0, 252, &[]).is_empty());
+    assert_eq!(list_hosts(&mut state, 1, &mut peer), one_entry);
+    assert!(change_hosts(&mut state, &mut peer, 1, 252, &[]).is_empty());
+    assert_eq!(list_hosts(&mut state, 1, &mut peer), EMPTY_LIST_HOSTS_LE);
+}
+
+#[test]
+fn host_requests_report_xorg_errors_and_change_nothing() {
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let unknown_user = b"localuser\0nosuchuser_305";
+    let cases: [(u8, u8, &[u8], HostError); 6] = [
+        (0, 5, b"foo\0bar", (x11::error::BAD_VALUE, 7, 109)),
+        (
+            0,
+            5,
+            unknown_user,
+            (
+                x11::error::BAD_VALUE,
+                u32::try_from(unknown_user.len()).unwrap(),
+                109,
+            ),
+        ),
+        (0, 1, &[1, 2, 3, 4], (x11::error::BAD_VALUE, 4, 109)),
+        (0, 7, &[1, 2, 3, 4], (x11::error::BAD_VALUE, 7, 109)),
+        (0, 6, &[1, 2, 3, 4], (x11::error::BAD_VALUE, 4, 109)),
+        (2, 0, &[127, 0, 0, 1], (x11::error::BAD_VALUE, 2, 109)),
+    ];
+    for (mode, family, addr, expected) in cases {
+        let wire = change_hosts(&mut state, &mut peer, mode, family, addr);
+        assert_eq!(host_error(&wire), expected, "mode {mode} family {family}");
+    }
+    let wire = host_request(&mut state, 1, &mut peer, 21, 111, 2, &[]);
+    assert_eq!(host_error(&wire), (x11::error::BAD_VALUE, 2, 111));
+
+    // ListHosts with one extra word.
     let mut backend = RecordingBackend::new();
-    let outcome = process_request(
+    process_request(
         &mut state,
         &mut backend,
         ClientId(1),
-        SequenceNumber(11),
+        SequenceNumber(22),
         RequestHeader {
             opcode: 110,
             data: 0,
-            length_units: 1,
+            length_units: 2,
         },
-        &[],
+        &[0; 4],
         None,
     )
     .unwrap();
-    assert!(matches!(outcome, RequestOutcome::Handled));
+    let wire = read_all_available(&mut peer);
+    assert_eq!(read_error(&wire), x11::error::BAD_LENGTH);
+    assert_eq!(wire[10], 110);
 
-    let mut buf = [0u8; 32];
-    peer.read_exact(&mut buf).unwrap();
-    assert_eq!(buf[0], 1, "Reply opcode");
-    assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 11);
+    assert_eq!(list_hosts(&mut state, 1, &mut peer), EMPTY_LIST_HOSTS_LE);
+}
+
+#[test]
+fn a_non_local_client_may_list_but_not_change() {
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    state.clients.get_mut(&1).unwrap().is_local = false;
+    let wire = change_hosts(&mut state, &mut peer, 0, 252, &[]);
+    assert_eq!(host_error(&wire), (x11::error::BAD_ACCESS, 0, 109));
+    let wire = host_request(&mut state, 1, &mut peer, 21, 111, 0, &[]);
+    assert_eq!(host_error(&wire), (x11::error::BAD_ACCESS, 0, 111));
+    // The mode is checked before access.
+    let wire = change_hosts(&mut state, &mut peer, 2, 252, &[]);
+    assert_eq!(host_error(&wire), (x11::error::BAD_VALUE, 2, 109));
+    assert_eq!(list_hosts(&mut state, 1, &mut peer), EMPTY_LIST_HOSTS_LE);
+}
+
+#[test]
+fn set_access_control_sets_the_enabled_flag() {
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    assert!(host_request(&mut state, 1, &mut peer, 21, 111, 0, &[]).is_empty());
+    assert_eq!(list_hosts(&mut state, 1, &mut peer)[1], 0);
+    assert!(host_request(&mut state, 1, &mut peer, 21, 111, 1, &[]).is_empty());
+    assert_eq!(list_hosts(&mut state, 1, &mut peer)[1], 1);
+}
+
+#[test]
+fn deleting_an_absent_entry_is_success() {
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    assert!(change_hosts(&mut state, &mut peer, 1, 0, &[192, 0, 2, 1]).is_empty());
+    assert_eq!(list_hosts(&mut state, 1, &mut peer), EMPTY_LIST_HOSTS_LE);
+}
+
+#[test]
+fn narrowing_access_leaves_connected_clients_alone() {
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let mut other = install_client(&mut state, 2);
+    assert!(change_hosts(&mut state, &mut peer, 0, 5, b"localuser\0#4242").is_empty());
+    assert!(change_hosts(&mut state, &mut peer, 1, 5, b"localuser\0#4242").is_empty());
+    assert!(host_request(&mut state, 1, &mut peer, 21, 111, 1, &[]).is_empty());
+    assert!(state.clients.contains_key(&1) && state.clients.contains_key(&2));
+    assert_eq!(list_hosts(&mut state, 1, &mut peer), EMPTY_LIST_HOSTS_LE);
+    assert_eq!(list_hosts(&mut state, 2, &mut other), EMPTY_LIST_HOSTS_LE);
 }
 
 #[test]

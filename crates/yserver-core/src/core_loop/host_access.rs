@@ -319,11 +319,19 @@ pub fn si_matches_local(
 /// length:CARD16, addr`, padded to 4 with zeros. Entries are counted until
 /// the running byte total reaches 1 MiB; the entry that reaches it is kept.
 /// Returns the entry count and the bytes.
+///
+/// Deliberately not Xorg: Xorg counts entries in an `int` and stores the
+/// count in the reply's CARD16 `nHosts`, so a list of more than 65535 short
+/// entries reports a truncated count over the full data. We stop at 65535
+/// entries, so the count and the data agree.
 #[must_use]
-pub fn encode_entries(hosts: &[HostEntry], byte_order: ClientByteOrder) -> (usize, Vec<u8>) {
+pub fn encode_entries(hosts: &[HostEntry], byte_order: ClientByteOrder) -> (u16, Vec<u8>) {
     let mut total = 0usize;
-    let mut count = 0usize;
+    let mut count = 0u16;
     for host in hosts {
+        if count == u16::MAX {
+            break;
+        }
         count += 1;
         total += 4 + host.addr.len().next_multiple_of(4);
         if total >= LIST_HOSTS_BYTE_CAP {
@@ -331,7 +339,7 @@ pub fn encode_entries(hosts: &[HostEntry], byte_order: ClientByteOrder) -> (usiz
         }
     }
     let mut bytes = Vec::with_capacity(total);
-    for host in &hosts[..count] {
+    for host in &hosts[..usize::from(count)] {
         // ChangeHosts carries the length as a CARD16, so a stored address
         // always fits.
         let len = u16::try_from(host.addr.len()).unwrap_or(u16::MAX);
@@ -683,5 +691,15 @@ mod tests {
         assert_eq!((n, bytes.len()), (16, 1 << 20));
         // Newest first: the 17th (oldest) entry is the one dropped.
         assert_eq!(bytes[(1 << 20) - 1], 15);
+    }
+
+    #[test]
+    fn encode_stops_at_65535_entries_so_the_count_fits_card16() {
+        // 65536 empty entries are 256 KiB, far below the byte cap.
+        let hosts = vec![entry(FAMILY_LOCAL_HOST, &[]); 65536];
+        let (n, bytes) = encode_entries(&hosts, ClientByteOrder::LittleEndian);
+        assert_eq!((n, bytes.len()), (u16::MAX, 4 * 65535));
+        let (n, bytes) = encode_entries(&hosts[..65535], ClientByteOrder::LittleEndian);
+        assert_eq!((n, bytes.len()), (u16::MAX, 4 * 65535));
     }
 }

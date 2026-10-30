@@ -3222,14 +3222,25 @@ pub fn write_query_text_extents_reply(
     writer.write_all(&reply)
 }
 
+/// `ListHosts` (`dix/dispatch.c:3270-3304`): `enabled` in byte 1, `nHosts`
+/// at offset 8, then `entries`, already encoded in the client's byte order
+/// and padded to 4 bytes each.
 pub fn write_list_hosts_reply(
     writer: &mut impl Write,
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
+    enabled: bool,
+    n_hosts: u16,
+    entries: &[u8],
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(byte_order, sequence, 0, 0);
-    write_u16(byte_order, &mut reply, 0);
+    if !entries.len().is_multiple_of(4) {
+        return Err(io::Error::other("ListHosts entries are not padded to 4"));
+    }
+    let length = u32::try_from(entries.len() / 4).map_err(io::Error::other)?;
+    let mut reply = fixed_reply(byte_order, sequence, u8::from(enabled), length);
+    write_u16(byte_order, &mut reply, n_hosts);
     reply.extend_from_slice(&[0; 22]);
+    reply.extend_from_slice(entries);
     writer.write_all(&reply)
 }
 

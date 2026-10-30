@@ -91,10 +91,11 @@ use crate::core_loop::process_request::{
         handle_query_keymap, handle_set_modifier_mapping, handle_set_pointer_mapping,
     },
     misc::{
-        handle_big_requests_request, handle_ge_request, handle_get_motion_events,
-        handle_grab_server, handle_kill_client, handle_list_extensions, handle_list_hosts,
-        handle_query_extension, handle_set_close_down_mode, handle_ungrab_server,
-        handle_x_resource_request, handle_xcmisc_request,
+        handle_big_requests_request, handle_change_hosts, handle_ge_request,
+        handle_get_motion_events, handle_grab_server, handle_kill_client, handle_list_extensions,
+        handle_list_hosts, handle_query_extension, handle_set_access_control,
+        handle_set_close_down_mode, handle_ungrab_server, handle_x_resource_request,
+        handle_xcmisc_request,
     },
     render::handle_render_request,
     vidmode::handle_xf86vidmode_request,
@@ -362,6 +363,9 @@ pub fn process_request(
         106 => handle_get_pointer_control(state, client_id, sequence),
         108 => handle_get_screen_saver(state, client_id, sequence),
         110 => handle_list_hosts(state, client_id, sequence),
+        // ── host access control (`xhost`) ──
+        109 => handle_change_hosts(state, client_id, sequence, header, body),
+        111 => handle_set_access_control(state, client_id, sequence, header),
         117 => handle_get_pointer_mapping(state, client_id, sequence),
         // ── replies backed by small or backend-owned state ──
         39 => handle_get_motion_events(state, client_id, sequence, body),
