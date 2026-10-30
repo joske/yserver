@@ -229,6 +229,8 @@ authorize a TCP client while XDMCP is driving the session. Honouring both
 would let a cookie in a local file authorize a client in a session it has
 nothing to do with, which defeats the per-session model this whole stage is
 built on. Unix clients are unaffected.
+(Correction 2026-10-30: unaffected as to file cookies only — like Xorg's
+`AccessUsingXdmcp`, XDMCP mode never opens cookie-less local access.)
 
 **"In XDMCP mode" is fixed at process start**, decided by the presence of an
 XDMCP option — not by whether an `Accept` has arrived (confirmed 2026-09-10).

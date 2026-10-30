@@ -2,7 +2,8 @@
 //!
 //! Faithful to X.Org's `os/auth.c` + `os/mitauth.c`: honor an auth file,
 //! validate each client's SetupRequest cookie, reject mismatches. No auth
-//! file (or zero cookies loaded) keeps local access open. See
+//! file (or zero cookies loaded) keeps local access open, except under XDMCP,
+//! where cookie-less local access is never opened (os/access.c:387). See
 //! docs/superpowers/specs/2026-06-25-xauth-server-auth-design.md.
 //!
 //! Beside the file cookies sits **one** in-memory *session credential*: the
@@ -61,7 +62,9 @@ pub struct AuthState {
     /// `-auth` file at startup (the cookie arrives later, in an `Accept`),
     /// and a TCP client is then authorized by the session credential
     /// **alone** — a cookie sitting in a local file must not admit a client
-    /// to a session it has nothing to do with. Unix clients are unaffected.
+    /// to a session it has nothing to do with. Unix clients still take file
+    /// cookies, but never the cookie-less local-open fallback (Xorg
+    /// `AccessUsingXdmcp`).
     xdmcp: bool,
     inner: Mutex<Inner>,
 }
@@ -128,7 +131,9 @@ enum LoadOutcome {
 }
 
 impl Inner {
-    fn apply_load_outcome(&mut self, outcome: LoadOutcome) {
+    /// `xdmcp` mirrors Xorg's `UsingXdmcp`: `EnableLocalHost` is then a no-op
+    /// (os/access.c:273-279), so a load may close local access but never open it.
+    fn apply_load_outcome(&mut self, outcome: LoadOutcome, xdmcp: bool) {
         match outcome {
             LoadOutcome::Loaded(mut cookies) => {
                 self.cookies.append(&mut cookies); // additive — os/auth.c never clears
@@ -137,11 +142,13 @@ impl Inner {
             }
             LoadOutcome::OpenedEmpty => {
                 // EnableLocalAccess, even if previously loaded (os/auth.c:197 quirk).
-                self.local_open = true;
+                if !xdmcp {
+                    self.local_open = true;
+                }
             }
             LoadOutcome::OpenFailed => {
                 // loadauth == -1: open only if never loaded; else unchanged.
-                if !self.ever_loaded {
+                if !self.ever_loaded && !xdmcp {
                     self.local_open = true;
                 }
             }
@@ -250,7 +257,8 @@ impl AuthState {
     /// is set. See [`AuthState::xdmcp`] for what the flag changes.
     pub fn new_with_xdmcp(file: Option<PathBuf>, xdmcp: bool) -> Arc<Self> {
         // Start open; the first successful load flips this to false (Xorg ShouldLoadAuth=TRUE → never-loaded+unopenable stays open).
-        let local_open = true;
+        // XDMCP starts closed and stays closed: AccessUsingXdmcp (os/access.c:387-391).
+        let local_open = !xdmcp;
         Arc::new(Self {
             file,
             xdmcp,
@@ -326,18 +334,18 @@ impl AuthState {
         // load even when `stat` fails so startup and runtime share precisely
         // the same load outcome.
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        Self::reload_if_needed(&mut inner, path, true);
+        Self::reload_if_needed(&mut inner, path, true, self.xdmcp);
         if inner.cookies.is_empty() {
             return Err("-listen tcp requires -auth with a MIT-MAGIC-COOKIE-1 cookie".into());
         }
         Ok(())
     }
 
-    fn reload_if_needed(inner: &mut Inner, path: &Path, force: bool) {
+    fn reload_if_needed(inner: &mut Inner, path: &Path, force: bool, xdmcp: bool) {
         let stat_mtime = fs::metadata(path).ok().and_then(|m| m.modified().ok());
         let changed = should_reload(stat_mtime, &mut inner.last_mtime);
         if force || changed {
-            inner.apply_load_outcome(load_outcome(path));
+            inner.apply_load_outcome(load_outcome(path), xdmcp);
         }
     }
 
@@ -360,7 +368,7 @@ impl AuthState {
         // (`local_open`, no file cookies) is already what such a server has,
         // and is never mutated. The session credential still applies.
         if let Some(path) = self.file.as_deref() {
-            Self::reload_if_needed(&mut inner, path, false);
+            Self::reload_if_needed(&mut inner, path, false, self.xdmcp);
         }
         inner.verdict(
             transport,
@@ -439,19 +447,19 @@ mod tests {
     #[test]
     fn loaded_enforces_and_appends() {
         let mut i = fresh_open();
-        i.apply_load_outcome(LoadOutcome::Loaded(vec![vec![1u8; 16]]));
+        i.apply_load_outcome(LoadOutcome::Loaded(vec![vec![1u8; 16]]), false);
         assert!(!i.local_open);
         assert!(i.ever_loaded);
         assert_eq!(i.cookies, vec![vec![1u8; 16]]);
         // A second load APPENDS (additive — Xorg never clears on reload).
-        i.apply_load_outcome(LoadOutcome::Loaded(vec![vec![2u8; 16]]));
+        i.apply_load_outcome(LoadOutcome::Loaded(vec![vec![2u8; 16]]), false);
         assert_eq!(i.cookies, vec![vec![1u8; 16], vec![2u8; 16]]);
     }
 
     #[test]
     fn empty_file_reopens_even_after_load() {
         let mut i = enforcing_with(vec![vec![1u8; 16]]);
-        i.apply_load_outcome(LoadOutcome::OpenedEmpty);
+        i.apply_load_outcome(LoadOutcome::OpenedEmpty, false);
         assert!(i.local_open, "empty file reopens local access (Xorg quirk)");
         assert_eq!(
             i.cookies,
@@ -463,7 +471,7 @@ mod tests {
     #[test]
     fn open_failed_after_load_keeps_enforcing() {
         let mut i = enforcing_with(vec![vec![1u8; 16]]);
-        i.apply_load_outcome(LoadOutcome::OpenFailed);
+        i.apply_load_outcome(LoadOutcome::OpenFailed, false);
         assert!(!i.local_open, "stays enforcing — does NOT reopen");
         assert_eq!(i.cookies, vec![vec![1u8; 16]]);
     }
@@ -479,7 +487,7 @@ mod tests {
             cookies: Vec::new(),
             session: None,
         };
-        i.apply_load_outcome(LoadOutcome::OpenFailed);
+        i.apply_load_outcome(LoadOutcome::OpenFailed, false);
         assert!(
             i.local_open,
             "OpenFailed before any load must enable local access"
@@ -969,10 +977,132 @@ mod tests {
             AuthVerdict::Reject(REASON_BAD_COOKIE),
             "an empty presentation must not match an empty slot"
         );
-        // Unix is unaffected: no -auth file, so local access is open as ever.
+        // Nor a cookie-less Unix client: XDMCP never opens local access.
         assert_eq!(
             auth.check(AuthTransport::Unix, generation, b"", b""),
+            AuthVerdict::Reject(REASON_NO_PROTO)
+        );
+    }
+
+    /// Bump `path`'s mtime so the next `check` reloads it.
+    fn touch_later(path: &Path) {
+        let later = fs::metadata(path).unwrap().modified().unwrap() + Duration::from_secs(10);
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+    }
+
+    #[test]
+    fn xdmcp_load_closes_local_access_but_never_opens_it() {
+        let mut i = fresh_open();
+        i.local_open = false;
+        i.apply_load_outcome(LoadOutcome::OpenedEmpty, true);
+        assert!(!i.local_open, "EnableLocalHost is a no-op under XDMCP");
+        i.apply_load_outcome(LoadOutcome::OpenFailed, true);
+        assert!(!i.local_open, "EnableLocalHost is a no-op under XDMCP");
+        i.local_open = true;
+        i.apply_load_outcome(LoadOutcome::Loaded(vec![vec![1u8; 16]]), true);
+        assert!(!i.local_open, "DisableLocalHost still applies");
+    }
+
+    #[test]
+    fn xdmcp_without_auth_file_refuses_cookieless_unix() {
+        let auth = AuthState::new_with_xdmcp(None, true);
+        let generation = Generation::default();
+        assert_eq!(
+            auth.check(AuthTransport::Unix, generation, b"", b""),
+            AuthVerdict::Reject(REASON_NO_PROTO)
+        );
+        assert_eq!(
+            auth.check(AuthTransport::Unix, generation, MIT, &[0u8; 16]),
+            AuthVerdict::Reject(REASON_BAD_COOKIE)
+        );
+    }
+
+    #[test]
+    fn xdmcp_empty_auth_file_refuses_cookieless_unix_across_reloads() {
+        let path = temp_path("xdmcp-empty");
+        fs::write(&path, b"").unwrap();
+        let generation = Generation::default();
+        let auth = AuthState::new_with_xdmcp(Some(path.clone()), true);
+        assert_eq!(
+            auth.check(AuthTransport::Unix, generation, b"", b""),
+            AuthVerdict::Reject(REASON_NO_PROTO),
+            "empty file at startup"
+        );
+
+        // A later reload of the still-empty file.
+        touch_later(&path);
+        assert_eq!(
+            auth.check(AuthTransport::Unix, generation, b"", b""),
+            AuthVerdict::Reject(REASON_NO_PROTO),
+            "reload of the still-empty file"
+        );
+
+        // A loaded cookie, then the file emptied: Xorg's reopen quirk must
+        // not apply under XDMCP; the loaded cookie keeps working.
+        let cookie = [0x3Cu8; 16];
+        fs::write(&path, xauth_bytes(b"7", &cookie)).unwrap();
+        touch_later(&path);
+        assert_eq!(
+            auth.check(AuthTransport::Unix, generation, MIT, &cookie),
             AuthVerdict::Allow
+        );
+        fs::write(&path, b"").unwrap();
+        touch_later(&path);
+        assert_eq!(
+            auth.check(AuthTransport::Unix, generation, b"", b""),
+            AuthVerdict::Reject(REASON_NO_PROTO),
+            "emptied after a load"
+        );
+        assert_eq!(
+            auth.check(AuthTransport::Unix, generation, MIT, &cookie),
+            AuthVerdict::Allow
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn xdmcp_unreadable_auth_file_refuses_cookieless_unix() {
+        let generation = Generation::default();
+
+        // stat succeeds, read fails: the never-loaded OpenFailed path.
+        let dir = temp_path("xdmcp-unreadable-dir");
+        let _ = fs::remove_dir(&dir);
+        fs::create_dir(&dir).unwrap();
+        let auth = AuthState::new_with_xdmcp(Some(dir.clone()), true);
+        assert_eq!(
+            auth.check(AuthTransport::Unix, generation, b"", b""),
+            AuthVerdict::Reject(REASON_NO_PROTO)
+        );
+        let _ = fs::remove_dir(dir);
+
+        // Missing entirely.
+        let missing = temp_path("xdmcp-missing");
+        let _ = fs::remove_file(&missing);
+        let auth = AuthState::new_with_xdmcp(Some(missing), true);
+        assert_eq!(
+            auth.check(AuthTransport::Unix, generation, b"", b""),
+            AuthVerdict::Reject(REASON_NO_PROTO)
+        );
+    }
+
+    #[test]
+    fn xdmcp_session_cookie_admits_unix() {
+        let auth = AuthState::new_with_xdmcp(None, true);
+        let generation = Generation::default();
+        let session = [0x4Du8; 16];
+        assert!(auth.install_session_cookie(generation, MIT, &session));
+        assert_eq!(
+            auth.check(AuthTransport::Unix, generation, MIT, &session),
+            AuthVerdict::Allow
+        );
+        assert_eq!(
+            auth.check(AuthTransport::Unix, generation, b"", b""),
+            AuthVerdict::Reject(REASON_NO_PROTO)
         );
     }
 
