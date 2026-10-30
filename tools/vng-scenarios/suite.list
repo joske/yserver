@@ -55,3 +55,4 @@ expose-order         guest=expose-order.sh           timeout=900
 redirected-backing   guest=redirected-backing.sh     timeout=300 golden=live
 prop-order           guest=prop-order.sh             timeout=300
 rootless-headless    guest=rootless-headless.sh      host=rootless-headless-host.sh      timeout=300
+xhost                guest=xhost.sh                  host=xhost-host.sh                  timeout=300

@@ -15,7 +15,7 @@
 #   LVP_ICD=/path/lvp_icd.json tools/vng-shot.sh --gpu none   # other lavapipe ICD
 #   VNG_OUT=target/elsewhere tools/vng-shot.sh    # artifacts in $VNG_OUT/<name>/
 #   tools/vng-shot.sh --root-hook hook.sh         # sourced as guest root once :7 listens
-#   tools/vng-shot.sh --server-arg --headless     # extra yserver argument, repeatable
+#   tools/vng-shot.sh --server-arg --headless     # extra server argument (Xorg too), repeatable
 #
 # The host root is read-only in the guest behind discarded overlays; only the
 # artifact directory is shared writable, at the same path inside and out, so
@@ -233,8 +233,9 @@ client=$out/client.sh
         # (Permission denied)"). We are already root in the guest, so run the
         # real binary and skip the wrapper.
         echo "${xorg_bin} :7 vt1 -keeptty -novtswitch \\"
-        echo "    -config '$out/xorg.conf' -logfile '$out/xorg-server.log' \\"
-        echo "    > xorg-stdio.log 2>&1 &"
+        printf "    -config '%s' -logfile '%s'" "$out/xorg.conf" "$out/xorg-server.log"
+        for a in ${server_args+"${server_args[@]}"}; do printf " '%s'" "$a"; done
+        echo " > xorg-stdio.log 2>&1 &"
     else
         printf "'%s' 7" "$binary"
         for a in ${server_args+"${server_args[@]}"}; do printf " '%s'" "$a"; done
