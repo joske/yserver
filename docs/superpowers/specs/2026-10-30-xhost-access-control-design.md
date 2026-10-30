@@ -253,16 +253,11 @@ built in:
   with no file, `!xdmcp`. An `xhost +local:` from the old generation
   therefore never survives a reset, with or without `-auth`.
 
-**XDMCP (fixes an existing divergence).** `AuthState::new_with_xdmcp`
-currently starts `local_open = true` whatever the `xdmcp` flag says. Under
-Xorg an XDMCP server never opens local access from the file path
-(`EnableLocalHost`, `:275`). So in yserver today, a local user on the
-terminal can connect cookie-less to the remote user's session. With `xdmcp`
-set, `local_open` must start `false`, and the reload paths that open it
-(an empty file, `auth.rs:139`; an unreadable never-loaded file, `:144`) must
-not open it. A loaded cookie still closes it, as in Xorg. After that only
-`FamilyLocalHost` writes it. This fix lands first, on its own branch; this
-design builds on it.
+**XDMCP (fixed in #319).** With `xdmcp` set, `local_open` starts `false`
+and the reload paths never open it (an empty file, an unreadable
+never-loaded file), matching Xorg's `EnableLocalHost` (`:275`). A loaded
+cookie still closes it. This design builds on that: under XDMCP only
+`FamilyLocalHost` opens local access.
 
 ### Admission decision table
 
