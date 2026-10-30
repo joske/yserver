@@ -142,11 +142,11 @@ These came out of reading `X/` for this plan. Steps below follow them.
   `:919-929`), copying `selfhosts` into `validhosts`, and
   `DisableLocalHost` removes the copies that were not explicitly requested
   (`:300-311`, the `requested` flag set in `NewHost`, `:1379-1386`). Not
-  mirrored here (see open question 2).
+  mirrored here (decision 2).
 - **Reset clears cookies.** `ResetAuthorization` calls each protocol's
   `Reset` (`X/os/auth.c:225-233`); `MitResetCookie` frees every MIT cookie
   (`X/os/mitauth.c:87-97`). Our `cookies` are process-lifetime and additive.
-  This is a pre-existing divergence (open question 3); Step 3 only makes
+  This is a pre-existing divergence (decision 3); Step 3 only makes
   the forced reload not duplicate entries.
 - **No auth file loads as zero cookies.** `LoadAuthorization` returns 0
   when `authorization_file` is NULL (`X/os/auth.c:117-119`), so the forced
@@ -158,7 +158,7 @@ These came out of reading `X/` for this plan. Steps below follow them.
   rejected, and the `long` result truncated to `int` (on LP64,
   `#4294967296` resolves to id 0). Names are copied and NUL-terminated
   (`:2059-2060`), so a value with an embedded NUL resolves the part before
-  it. See open question 1.
+  it. This plan keeps Xorg's validation but not the truncation (decision 1).
 - **The `hostname` validator accepts `:`**: the digit range is written
   `0x30..=0x3A` (`:1939`). Length must be `1..NI_MAXHOST` (`:1913`).
 - **`ipv6` validation** is `3 <= len < INET6_ADDRSTRLEN` plus `inet_pton`
@@ -225,7 +225,7 @@ These came out of reading `X/` for this plan. Steps below follow them.
   `address_is_ours` (`C/run.rs:4740-4745` explains why per call).
   `address_is_ours` moves next to it in `S/peer.rs` and keeps its own
   behaviour (any loopback counts as local). The spec restricted this rule to
-  IPv4; this plan follows Xorg's interface list (open question 4).
+  IPv4; this plan follows Xorg's interface list (decision 4).
 - **D8 Mode and family checks in the handler**, not in
   `W/request_lengths.rs` `invalid_value`. The order is length (already
   generic), then mode, then `may_manage_access`, then family and address.
@@ -272,12 +272,16 @@ Changes:
   - `SiEntry::parse(addr)`: type up to the first NUL, value after it, no
     trailing NUL. Types `localuser`, `localgroup`, `hostname`, `ipv6`, each
     with its validator as listed under "Xorg facts";
-  - `parse_cred_id(value, kind, resolver) -> Option<i32>`: `#` + `strtol`
-    base 0 with truncation to `i32` (open question 1), else a name lookup of
-    the bytes before the first NUL;
+  - `parse_cred_id(value, kind, resolver) -> Option<i64>`: `#` + `strtol`
+    base 0 into the full `long` (no truncation, decision 1), else a name
+    lookup of the bytes before the first NUL. Validation (`check_addr`)
+    only asks for `Some`, as Xorg does, so ChangeHosts accepts the same
+    values;
   - `si_matches_local(entry, cred, resolver) -> bool`: `localuser`
-    compares `uid as i32`, `localgroup` compares `gid as i32`, the others
-    are false for a local peer (`:1819-1846`, `:1970-1994`);
+    compares `i64::from(uid)` with the parsed id, `localgroup` the same
+    with `gid`, so an id outside `0..=u32::MAX` is stored but never
+    matches; the others are false for a local peer (`:1819-1846`,
+    `:1970-1994`);
   - `encode_entries(&[HostEntry]) -> (n_hosts, bytes)` applying the 1 MiB
     rule, and the entry layout `family, 0, length:CARD16, addr, zero pad`.
     Byte order is a parameter.
@@ -294,8 +298,14 @@ Tests (unit, in `host_access.rs`):
 - [Xorg `:2051-2093`] `parse_cred_id` with a fake resolver: `#1000`,
   `#0x3e8`, `#01750` → 1000; `#1000x` → 1000; `# 1000` and `#+1000` →
   1000; `#` and `#x` → `None`; `#99999999999999999999` (ERANGE) → `None`;
-  `#4294967296` → `Some(0)` (truncation, open question 1); a known name →
-  its id, an unknown one → `None`; `bob\0junk` → bob's id.
+  `#4294967296` → `Some(4294967296)` and `#-1` → `Some(-1)` (no
+  truncation, decision 1); a known name → its id, an unknown one → `None`;
+  `bob\0junk` → bob's id.
+- [Xorg `:2051-2093` for validation, decision 1 for matching] oversized and
+  negative ids: `check_addr` accepts `localuser:#4294967296`,
+  `localuser:#-1` and `localgroup:#4294967296` (Xorg accepts them too), and
+  `si_matches_local` is false for all three against uid/gid 0 and against
+  uid/gid `u32::MAX`.
 - [Xorg `:1901-1966`] hostname validator: `a.b-c` ok, `a:b` ok, `.a`,
   `-a`, `a..b`, `a_b`, empty and 1025 bytes rejected, 1024 ok.
 - [Xorg `:2013-2035`] ipv6 validator: `::1` ok, `::` rejected (length 2),
@@ -325,10 +335,14 @@ Changes:
   `PeerIdentity::unknown_unix()`.
 - Move `address_is_ours` from `C/run.rs:4750` into `S/peer.rs` as
   `pub(crate)`, and add `own_interface_addrs() -> Vec<HostEntry>` (both
-  families, as `{0, 4 bytes}`/`{6, 16 bytes}`) for Step 5. `run.rs` calls
-  the moved function; behaviour unchanged.
+  families, as `{0, 4 bytes}`/`{6, 16 bytes}`) for Step 5, built on a pure
+  `host_entry_of(&SocketAddr)` helper. `run.rs` calls the moved function;
+  behaviour unchanged.
 
 Tests (unit, in `peer.rs`, run on all four CI OSes):
+
+- [Xorg `:793-818`, decision 4] `host_entry_of` maps a V4 address to
+  `{0, 4 bytes}` and a V6 address to `{6, 16 bytes}` in network order.
 
 - [spec] A `UnixListener` bound in a temp dir, one `UnixStream::connect`,
   `accept`: `PeerIdentity::of` the accepted side has `cred.uid ==
@@ -439,7 +453,7 @@ Changes:
   2. if that rejected and `peer.transport == Unix` and `Access::Current`,
      evaluate `H` (Xorg `InvalidHost`, `X/os/access.c:1529-1570`):
      `!access_enabled`; `local_open`; with `tcp_listen`, any
-     `own_interface_addrs()` entry or `{252, []}` equal to a list entry
+     own-address entry (from the provider, production `own_interface_addrs()`) or `{252, []}` equal to a list entry
      (D7). If none of these holds, snapshot the SI entries and **release
      the lock**;
   3. outside the lock, `si_matches_local` over the snapshot with
@@ -476,6 +490,12 @@ hand):
   admits a cookie-less Unix peer after `local_open` was cleared by a reload,
   and so does a `{0, 127.0.0.1}` entry. Without `tcp_listen`, both → refused.
   A `{252, [1]}` entry (nonzero length) does not count as a selfhost.
+- [Xorg `:793-818`, decision 4] IPv6 selfhosts. The own-address list comes
+  through a provider (production: `own_interface_addrs`; tests: a fake), so
+  the test does not depend on the CI host's interfaces. With `tcp_listen`
+  and a fake list holding `{6, 2001:db8::1}`: an `inet6:2001:db8::1` entry
+  admits a cookie-less Unix peer after a reload cleared `local_open`;
+  `inet6:2001:db8::2` refuses; without `tcp_listen` both refuse.
 - [Xorg `:1322-1325`, `:300-311`] `+local:` then a cookie reload (newer
   mtime, one cookie): `local_open` false, the 252 entry still listed.
 - [Xorg `:1533-1535`, spec invariant 2] A valid cookie is admitted with
@@ -604,29 +624,28 @@ script green.
 ### Step 9 — docs
 
 - `docs/status.md`: entry for #305 (what landed, the deviations in
-  "Xorg facts" and D4/D7, open questions still open).
+  "Xorg facts" and D4/D7, decisions 1 and 2 as deliberate differences from
+  Xorg, and decision 3: cookies still survive a reset, fixed separately).
 - Sentences that become false, for jos to rewrite (prose is his):
   `docs/setup.md:337-340` ("There is no host-based access control") and
   `docs/man/yserver.1.scd:292` (`xhost(1)` "is not implemented yet"). The
   spec asks for one line in `docs/setup.md` on `xhost +host` admitting
   nothing over TCP.
 
-## Open questions
+## Decisions (review 2026-10-30)
 
-1. **`#<num>` truncation.** Xorg stores `strtol` into an `int`, so
-   `xhost +si:localuser:#4294967296` matches uid 0 on LP64. The plan copies
-   it (Step 1 test). Alternative: reject ids outside `i32` with
-   `BadValue(length)`. That diverges in an error reply but never matches
-   root by accident.
-2. **`AddLocalHosts` on local-access open.** Xorg copies `selfhosts` into
-   the list when local access opens, and removes the copies it did not
-   request when a reload closes it. For us that is reachable only with
-   `-auth F -listen tcp` and `F` later emptied, since `-listen tcp` needs a
-   cookie at startup and XDMCP never opens local access. Not mirrored; the
-   only visible effect would be extra `ListHosts` entries. Mirror it?
-3. **Cookies survive a reset** (pre-existing; Xorg clears them,
-   `X/os/mitauth.c:87-97`). Step 4 only deduplicates. Fix separately on its
-   own branch?
-4. **Selfhosts include IPv6 interface addresses** (D7), where the spec said
-   IPv4 only. The difference shows only with `-listen tcp` and an
-   `xhost +inet6:` entry for one of our addresses.
+1. **`#<num>` ids are not truncated.** Xorg stores `strtol` into an `int`,
+   so `xhost +si:localuser:#4294967296` matches uid 0 on LP64. We keep
+   Xorg's validation (ChangeHosts accepts the same values) but match on the
+   full value, so oversized and negative ids are stored, listed, and never
+   match anyone.
+2. **`AddLocalHosts` is not mirrored.** Xorg copies `selfhosts` into the
+   list when local access opens; for us that is reachable only with
+   `-auth F -listen tcp` and `F` later emptied, and the only effect would be
+   extra `ListHosts` entries.
+3. **Cookies surviving a reset** (pre-existing; Xorg clears them,
+   `X/os/mitauth.c:87-97`) is fixed on its own branch after #305. Step 4
+   only deduplicates; the status entry records the difference.
+4. **Selfhosts include IPv6 interface addresses** (D7), as Xorg does. Step 5
+   uses them to decide whether an `inet6:` entry admits a Unix client, and
+   tests that with a fake own-address list.
