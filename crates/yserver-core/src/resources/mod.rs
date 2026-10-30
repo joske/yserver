@@ -2,6 +2,7 @@
 
 mod cleanup;
 mod destroy;
+mod font;
 mod gc;
 mod picture_font_cursor;
 mod pixmap_props;
@@ -12,6 +13,7 @@ mod types;
 mod window;
 
 pub use destroy::*;
+pub use font::*;
 pub use gc::*;
 pub use picture_font_cursor::*;
 pub use pixmap_props::*;
@@ -75,7 +77,14 @@ pub struct ResourceTable {
     windows: HashMap<u32, Window>,
     pixmaps: HashMap<u32, Pixmap>,
     gcs: HashMap<u32, Gc>,
-    fonts: HashMap<u32, Font>,
+    /// Open client font ids; the fonts themselves live in `font_objects`.
+    fonts: HashMap<u32, FontRef>,
+    font_objects: HashMap<FontRef, font::FontObject>,
+    next_font_ref: u64,
+    /// The font new GCs start with; holds a reference of its own.
+    default_font: Option<FontRef>,
+    /// Host fonts released since [`Self::take_released_fonts`].
+    released_fonts: Vec<u32>,
     cursors: HashMap<u32, Cursor>,
     /// XFIXES cursor names keyed by host cursor handle. In Xorg the name
     /// lives on the cursor object, so it outlives the client's cursor XID
@@ -222,6 +231,10 @@ impl Default for ResourceTable {
             pixmaps: HashMap::new(),
             gcs: HashMap::new(),
             fonts: HashMap::new(),
+            font_objects: HashMap::new(),
+            next_font_ref: 1,
+            default_font: None,
+            released_fonts: Vec::new(),
             cursors: HashMap::new(),
             cursor_host_names: HashMap::new(),
             pictures: HashMap::new(),
@@ -319,16 +332,12 @@ impl ResourceTable {
     /// Seed a minimal Font into the resource table. For use in tests only.
     #[cfg(test)]
     pub fn seed_font_for_test(&mut self, owner: ClientId, id: ResourceId) {
-        use crate::backend::FontHandle;
-        self.fonts.insert(
-            id.0,
-            Font {
-                id,
-                name: String::new(),
-                host_xid: FontHandle::from_raw_for_test(1),
-                metrics: FontMetrics::default(),
-                owner,
-            },
+        self.install_font(
+            owner,
+            id,
+            String::new(),
+            crate::backend::FontHandle::from_raw_for_test(1),
+            FontMetrics::default(),
         );
     }
 

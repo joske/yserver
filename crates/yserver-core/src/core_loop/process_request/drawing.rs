@@ -630,6 +630,7 @@ pub(super) fn handle_poly_text8(
         }
         if let Some(font) = last_font {
             state.resources.set_gc_font(ResourceId(gc_id), font);
+            super::fonts::release_unreferenced_fonts(state, backend, origin);
         }
         let _dropped = accumulate_damage_full_to_state(state, drawable);
     }
@@ -674,6 +675,7 @@ pub(super) fn handle_poly_text16(
         }
         if let Some(font) = last_font {
             state.resources.set_gc_font(ResourceId(gc_id), font);
+            super::fonts::release_unreferenced_fonts(state, backend, origin);
         }
         let _dropped = accumulate_damage_full_to_state(state, drawable);
     }

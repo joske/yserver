@@ -211,37 +211,6 @@ fn query_font_on_a_fontless_gc_answers_with_the_default_font() {
     );
 }
 
-/// CloseFont of the server-owned default font answers Success (as Xorg
-/// does) and leaves it in place for every GC that holds it.
-#[test]
-fn close_font_of_the_default_font_keeps_it() {
-    let mut state = ServerState::new();
-    let mut peer = install_client(&mut state, 1);
-    let mut backend = RecordingBackend::new();
-    crate::core_loop::process_request::install_default_font(&mut state, &mut backend)
-        .expect("default font");
-    run_request(
-        &mut state,
-        &mut backend,
-        46,
-        1,
-        &crate::resources::DEFAULT_FONT.0.to_le_bytes(),
-    );
-    assert!(read_all_available(&mut peer).is_empty(), "no error");
-    assert!(
-        state
-            .resources
-            .font(crate::resources::DEFAULT_FONT)
-            .is_some()
-    );
-    assert!(
-        !backend
-            .calls()
-            .iter()
-            .any(|c| matches!(c, crate::backend::recording::RecordedCall::CloseFont(_)))
-    );
-}
-
 #[test]
 fn query_text_extents_invalid_fontable_returns_bad_font() {
     let mut state = ServerState::new();

@@ -151,15 +151,12 @@ fn disconnect_cleanup_drains_every_xid_in_use_map_for_owner() {
 
     // Font
     let font_id = ResourceId(0x0700_0003);
-    table.fonts.insert(
-        font_id.0,
-        Font {
-            id: font_id,
-            name: "fixed".to_string(),
-            host_xid: FontHandle::from_raw_for_test(0xa03),
-            metrics: FontMetrics::default(),
-            owner,
-        },
+    table.install_font(
+        owner,
+        font_id,
+        "fixed".to_string(),
+        FontHandle::from_raw_for_test(0xa03),
+        FontMetrics::default(),
     );
 
     // Cursor

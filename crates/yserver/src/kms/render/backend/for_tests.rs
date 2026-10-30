@@ -77,6 +77,13 @@ impl KmsBackend {
         }))
     }
 
+    /// Test accessor: fonts the backend holds open.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn open_font_count_for_tests(&self) -> usize {
+        self.core.fonts.len()
+    }
+
     /// #133 step 3 (P4) — test accessor: the WHOLE backing of a
     /// drawable's storage, ring included, read through the PRIVILEGED
     /// route. `get_image_pixels_for_tests` goes through the client path

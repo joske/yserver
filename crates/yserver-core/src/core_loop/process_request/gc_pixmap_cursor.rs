@@ -271,6 +271,9 @@ pub(super) fn handle_create_gc(
                 55,
             );
         }
+        if let Some(bad) = unknown_gc_font(state, request.font) {
+            return emit_x11_error(state, client_id, sequence, x11::error::BAD_FONT, bad, 55);
+        }
         state.resources.create_gc(client_id, request);
     }
     debug!("client {} #{} CreateGC", client_id.0, sequence.0);
@@ -295,6 +298,13 @@ pub(super) fn release_displaced_gc_pixmaps(
     }
 }
 
+/// GCFont naming no open font: Xorg `ChangeGCXIDs` (`dix/gc.c:430`) looks
+/// every XID up before changing anything, so the request does nothing.
+fn unknown_gc_font(state: &ServerState, font: Option<ResourceId>) -> Option<u32> {
+    font.filter(|id| state.resources.font(*id).is_none())
+        .map(|id| id.0)
+}
+
 pub(super) fn handle_change_gc(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -307,8 +317,12 @@ pub(super) fn handle_change_gc(
         if let Err((code, bad_value)) = validate_gc_only(state, request.gc) {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 56);
         }
+        if let Some(bad) = unknown_gc_font(state, request.font) {
+            return emit_x11_error(state, client_id, sequence, x11::error::BAD_FONT, bad, 56);
+        }
         let displaced = state.resources.change_gc(client_id, request);
         release_displaced_gc_pixmaps(state, backend, origin, displaced);
+        super::fonts::release_unreferenced_fonts(state, backend, origin);
     }
     debug!("client {} #{} ChangeGC", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
@@ -328,6 +342,7 @@ pub(super) fn handle_copy_gc(
         let value_mask = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
         let displaced = state.resources.copy_gc(src_gc, dst_gc, value_mask);
         release_displaced_gc_pixmaps(state, backend, origin, displaced);
+        super::fonts::release_unreferenced_fonts(state, backend, origin);
     }
     debug!("client {} #{} CopyGC", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
@@ -393,6 +408,7 @@ pub(super) fn handle_free_gc(
     }
     let displaced = state.resources.free_gc(gc);
     release_displaced_gc_pixmaps(state, backend, origin, displaced);
+    super::fonts::release_unreferenced_fonts(state, backend, origin);
     debug!(
         "client {} #{} FreeGC gc=0x{:x} freed",
         client_id.0, sequence.0, gc.0

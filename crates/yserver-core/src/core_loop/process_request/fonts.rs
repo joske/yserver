@@ -454,6 +454,9 @@ fn synthesize_font_properties(atoms: &mut crate::server::AtomTable, xlfd: &str) 
     out
 }
 
+/// Xorg `ProcCloseFont` (`dix/dispatch.c:1319`): an id that is not a font
+/// (a GContext included) is BadFont; otherwise the id is freed and the
+/// font goes once no GC holds it. The default font's id is no exception.
 pub(super) fn handle_close_font(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -462,21 +465,26 @@ pub(super) fn handle_close_font(
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    // The server's own fonts are not the client's to close: Xorg answers
-    // Success too, but GCs hold the font by refcount there, not by id.
-    if let Some(font) = x11::free_resource_id(body)
-        && state
-            .resources
-            .font(font)
-            .is_none_or(|f| f.owner != crate::resources::SERVER_OWNER)
-    {
-        let removed = state.resources.close_font(font);
-        if let Some(removed) = removed {
-            let _ = backend.close_font(origin, removed.host_xid.as_raw());
-        }
+    let Some(font) = x11::free_resource_id(body) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    if !state.resources.close_font(font) {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_FONT, font.0, 46);
     }
+    release_unreferenced_fonts(state, backend, origin);
     debug!("client {} #{} CloseFont", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
+}
+
+/// Close on the backend the fonts whose last reference (id or GC) just went.
+pub(super) fn release_unreferenced_fonts(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+) {
+    for host_xid in state.resources.take_released_fonts() {
+        let _ = backend.close_font(origin, host_xid);
+    }
 }
 
 pub(super) fn handle_query_font(

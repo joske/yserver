@@ -4,6 +4,7 @@ mod damage_ext;
 mod drawing;
 mod dri3_shm;
 mod expose_probe;
+mod fonts;
 mod gc_pixmap;
 mod glx;
 mod input_control;

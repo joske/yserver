@@ -514,7 +514,10 @@ fn create_gc_without_font_gets_the_default_font() {
     let mut t = ResourceTable::new();
     install_default_font(&mut t, 0x4141);
     install_dummy_gc(&mut t, 0x500);
-    assert_eq!(t.gc(ResourceId(0x500)).unwrap().font, Some(DEFAULT_FONT));
+    assert_eq!(
+        t.gc(ResourceId(0x500)).unwrap().font,
+        t.font_ref(DEFAULT_FONT)
+    );
     let font = t.fontable(ResourceId(0x500)).expect("GContext resolves");
     assert_eq!((font.id, font.metrics.font_ascent), (DEFAULT_FONT, 11));
     let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
@@ -531,7 +534,28 @@ fn create_gc_with_font_uses_the_given_font() {
     t.create_gc(ClientId(1), req);
     assert_eq!(
         t.gc(ResourceId(0x500)).unwrap().font,
-        Some(ResourceId(0x700))
+        t.font_ref(ResourceId(0x700))
     );
     assert_eq!(t.fontable(ResourceId(0x500)).unwrap().id, ResourceId(0x700));
+}
+
+/// Server reset drops every font, those only a GC still holds included
+/// (Xorg frees all resources each generation).
+#[test]
+fn take_all_fonts_includes_fonts_only_a_gc_holds() {
+    let mut t = ResourceTable::new();
+    install_default_font(&mut t, 0x4141);
+    install_font_with_host_xid(&mut t, 0x700, 0x4242);
+    let mut req = empty_create_gc_request(ResourceId(0x500), ROOT_WINDOW);
+    req.font = Some(ResourceId(0x700));
+    t.create_gc(ClientId(1), req);
+    assert!(t.close_font(ResourceId(0x700)));
+    assert!(t.take_released_fonts().is_empty(), "the GC holds it");
+    let mut all = t.take_all_fonts();
+    all.sort_unstable();
+    assert_eq!(all, [0x4141, 0x4242]);
+    assert_eq!(t.live_font_count(), 0);
+    assert!(t.fontable(ResourceId(0x500)).is_none());
+    t.free_gc(ResourceId(0x500));
+    assert!(t.take_released_fonts().is_empty(), "closed exactly once");
 }

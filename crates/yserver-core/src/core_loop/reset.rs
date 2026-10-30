@@ -34,7 +34,7 @@ use crate::{
         },
         setup_thread::{self, SetupRegistry},
     },
-    resources::{DEFAULT_FONT, ROOT_WINDOW},
+    resources::ROOT_WINDOW,
     server::ServerState,
 };
 
@@ -448,9 +448,10 @@ pub(crate) fn reset_generation(
     for info in inventory.devices_by_source() {
         fresh.xi_register_source(info);
     }
-    // The old generation's default font goes with it; step 7 reopens it.
-    if let Some(font) = state.resources.close_font(DEFAULT_FONT) {
-        let _ = backend.close_font(None, font.host_xid.as_raw());
+    // The old generation's fonts go with it, the default one included;
+    // step 7 reopens that.
+    for host_xid in state.resources.take_all_fonts() {
+        let _ = backend.close_font(None, host_xid);
     }
     *state = fresh;
 

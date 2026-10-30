@@ -1,5 +1,5 @@
 use crate::resources::ResourceTable;
-use yserver_protocol::x11::{ClientId, FontMetrics, ResourceId};
+use yserver_protocol::x11::{ClientId, ResourceId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PictureKind {
@@ -124,51 +124,6 @@ impl ResourceTable {
             self.host_glyphset_refcounts.remove(&host_xid);
             true
         }
-    }
-
-    pub fn install_font(
-        &mut self,
-        owner: ClientId,
-        id: ResourceId,
-        name: String,
-        host_xid: crate::backend::FontHandle,
-        metrics: FontMetrics,
-    ) {
-        self.fonts.insert(
-            id.0,
-            Font {
-                id,
-                name,
-                host_xid,
-                metrics,
-                owner,
-            },
-        );
-    }
-
-    pub fn close_font(&mut self, id: ResourceId) -> Option<Font> {
-        self.fonts.remove(&id.0)
-    }
-
-    /// Commit a PolyText embedded font-change to the GC (X11 §8:
-    /// "the font item ... is stored in the GC").
-    pub fn set_gc_font(&mut self, gc_id: ResourceId, font: ResourceId) {
-        if let Some(gc) = self.gcs.get_mut(&gc_id.0) {
-            gc.font = Some(font);
-        }
-    }
-
-    pub fn font(&self, id: ResourceId) -> Option<&Font> {
-        self.fonts.get(&id.0)
-    }
-
-    /// Resolve a FONTABLE id (either a Font or a GC carrying a font) to a `&Font`.
-    pub fn fontable(&self, id: ResourceId) -> Option<&Font> {
-        if let Some(font) = self.fonts.get(&id.0) {
-            return Some(font);
-        }
-        let gc_font = self.gcs.get(&id.0).and_then(|gc| gc.font)?;
-        self.fonts.get(&gc_font.0)
     }
 
     pub fn create_glyph_cursor(&mut self, owner: ClientId, id: ResourceId) {
@@ -348,15 +303,6 @@ impl ResourceTable {
     pub fn cursor_is_anim(&self, id: ResourceId) -> bool {
         self.cursors.get(&id.0).is_some_and(|c| c.anim)
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct Font {
-    pub id: ResourceId,
-    pub name: String,
-    pub host_xid: crate::backend::FontHandle,
-    pub metrics: FontMetrics,
-    pub owner: ClientId,
 }
 
 #[derive(Clone, Debug)]

@@ -25,7 +25,13 @@ impl ResourceTable {
             ("WINDOW", tally(&self.windows, owner, |w| w.owner)),
             ("PIXMAP", tally(&self.pixmaps, owner, |p| p.owner)),
             ("GC", tally(&self.gcs, owner, |g| g.owner)),
-            ("FONT", tally(&self.fonts, owner, |f| f.owner)),
+            (
+                "FONT",
+                self.font_ids_owned_by(owner)
+                    .len()
+                    .try_into()
+                    .unwrap_or(u32::MAX),
+            ),
             ("CURSOR", tally(&self.cursors, owner, |c| c.owner)),
             ("COLORMAP", tally(&self.colormaps, owner, |c| c.owner)),
             ("PICTURE", tally(&self.pictures, owner, |p| p.client)),
@@ -115,10 +121,12 @@ impl ResourceTable {
         if !name_ids.is_empty() {
             self.forget_composite_names(&name_ids);
         }
+        let mut gc_fonts = Vec::new();
         self.gcs.retain(|_, g| {
             if g.owner != client {
                 return true;
             }
+            gc_fonts.extend(g.font);
             freed_pixmaps.extend(
                 g.held_host_pixmaps()
                     .into_iter()
@@ -156,15 +164,15 @@ impl ResourceTable {
         freed_cursors.retain(|host| !self.cursor_host_referenced(*host));
         self.dropped_cursor_hosts
             .retain(|host| !freed_cursors.contains(host));
-        let mut closed_fonts = Vec::new();
-        self.fonts.retain(|_, f| {
-            if f.owner == client {
-                closed_fonts.push(f.host_xid.as_raw());
-                false
-            } else {
-                true
-            }
-        });
+        // GCs and ids drop their references in any order; a font another
+        // client's GC still holds survives (Xorg `FreeClientResources`).
+        for font in gc_fonts {
+            self.unref_font(font);
+        }
+        for id in self.font_ids_owned_by(client) {
+            self.close_font(id);
+        }
+        let closed_fonts = self.take_released_fonts();
         let mut freed_pictures: Vec<(u32, Option<u32>)> = Vec::new();
         self.pictures.retain(|_, p| {
             if p.client == client {
@@ -218,7 +226,7 @@ impl ResourceTable {
         if let Some(g) = self.gcs.get(&id.0) {
             return Some(g.owner);
         }
-        if let Some(f) = self.fonts.get(&id.0) {
+        if let Some(f) = self.font(id) {
             return Some(f.owner);
         }
         if let Some(c) = self.cursors.get(&id.0) {

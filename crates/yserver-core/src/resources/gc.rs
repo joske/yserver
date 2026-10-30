@@ -3,7 +3,7 @@ use crate::{
         ArcMode, CapStyle, ClipState, DrawState, FillRule, FillState, FillStyle, FontHandle,
         GcFunction, JoinStyle, LineStyle, SubwindowMode,
     },
-    resources::{DEFAULT_FONT, ResourceTable},
+    resources::{FontRef, ResourceTable},
 };
 use yserver_protocol::x11::{
     ClientId, ClipRectangles, CreateGcRequest, GcChange, ResourceId, SetClipRectanglesRequest,
@@ -35,10 +35,10 @@ impl ResourceTable {
         gc.clip_pixmap = clip_pixmap;
         gc.clip_pixmap_host_xid = clip_pixmap_host_xid;
         // Xorg `CreateGC` (`dix/gc.c:507`): the default font unless GCFont is given.
-        gc.font = self
-            .fonts
-            .contains_key(&DEFAULT_FONT.0)
-            .then_some(DEFAULT_FONT);
+        let font = request
+            .font
+            .and_then(|id| self.font_ref(id))
+            .or(self.default_font());
         Self::apply_gc_change(
             &mut gc,
             GcChangeView {
@@ -56,7 +56,6 @@ impl ResourceTable {
                 stipple: request.stipple,
                 tile_x_origin: request.tile_x_origin,
                 tile_y_origin: request.tile_y_origin,
-                font: request.font,
                 subwindow_mode: request.subwindow_mode,
                 graphics_exposures: request.graphics_exposures,
                 clip_x_origin: request.clip_x_origin,
@@ -73,6 +72,7 @@ impl ResourceTable {
             },
         );
         self.gcs.insert(request.gc.0, gc);
+        self.set_gc_font_ref(request.gc, font);
     }
 
     /// Apply a ChangeGC. Caller MUST have validated `request.gc`
@@ -124,7 +124,6 @@ impl ResourceTable {
                 stipple: request.stipple,
                 tile_x_origin: request.tile_x_origin,
                 tile_y_origin: request.tile_y_origin,
-                font: request.font,
                 subwindow_mode: request.subwindow_mode,
                 graphics_exposures: request.graphics_exposures,
                 clip_x_origin: request.clip_x_origin,
@@ -144,7 +143,11 @@ impl ResourceTable {
         if request.stipple.is_some() {
             gc.stipple_host_xid = stipple_host_xid;
         }
-        Gc::displaced(before, gc.held_host_pixmaps())
+        let displaced = Gc::displaced(before, gc.held_host_pixmaps());
+        if let Some(font) = request.font.and_then(|id| self.font_ref(id)) {
+            self.set_gc_font_ref(request.gc, Some(font));
+        }
+        displaced
     }
 
     /// Apply the `Some`-valued attributes of a CreateGC / ChangeGC
@@ -192,9 +195,6 @@ impl ResourceTable {
         }
         if let Some(y) = change.tile_y_origin {
             gc.tile_y_origin = y;
-        }
-        if let Some(font) = change.font {
-            gc.font = Some(font);
         }
         if let Some(submode) = change.subwindow_mode {
             gc.subwindow_mode = SubwindowMode::from_protocol(submode);
@@ -371,9 +371,6 @@ impl ResourceTable {
         if value_mask & 0x0000_2000 != 0 {
             dst_gc.tile_y_origin = src_gc.tile_y_origin;
         }
-        if value_mask & 0x0000_4000 != 0 {
-            dst_gc.font = src_gc.font;
-        }
         if value_mask & 0x0000_8000 != 0 {
             dst_gc.subwindow_mode = src_gc.subwindow_mode;
         }
@@ -404,15 +401,24 @@ impl ResourceTable {
         if value_mask & 0x0040_0000 != 0 {
             dst_gc.arc_mode = src_gc.arc_mode;
         }
-        Gc::displaced(before, dst_gc.held_host_pixmaps())
+        let displaced = Gc::displaced(before, dst_gc.held_host_pixmaps());
+        // GCFont: Xorg `CopyGC` moves the font's reference (`dix/gc.c:697`).
+        if value_mask & 0x0000_4000 != 0 {
+            self.set_gc_font_ref(dst, src_gc.font);
+        }
+        displaced
     }
 
     /// Returns the host pixmaps the GC held (Xorg `FreeGC`, `dix/gc.c:776-781`).
+    /// Also drops its font reference (`dix/gc.c:771`).
     pub fn free_gc(&mut self, id: ResourceId) -> Vec<crate::backend::PixmapHandle> {
-        self.gcs
-            .remove(&id.0)
-            .map(|gc| Gc::displaced(gc.held_host_pixmaps(), [None; 3]))
-            .unwrap_or_default()
+        let Some(gc) = self.gcs.remove(&id.0) else {
+            return Vec::new();
+        };
+        if let Some(font) = gc.font {
+            self.unref_font(font);
+        }
+        Gc::displaced(gc.held_host_pixmaps(), [None; 3])
     }
 
     pub fn gc(&self, id: ResourceId) -> Option<&Gc> {
@@ -547,7 +553,7 @@ impl ResourceTable {
 
         let font: Option<FontHandle> = gc
             .font
-            .and_then(|f| self.fonts.get(&f.0))
+            .and_then(|f| self.font_object(f))
             .map(|f| f.host_xid);
 
         Some(DrawState {
@@ -609,7 +615,8 @@ pub struct Gc {
     pub foreground: u32,
     pub background: u32,
     pub line_width: u16,
-    pub font: Option<ResourceId>,
+    /// Holds a reference: the font outlives a `CloseFont` of its id.
+    pub font: Option<FontRef>,
     pub clip_rectangles: Option<ClipRectangles>,
     /// Pixmap-based clip-mask, set via `ChangeGC` with `CPClipMask`. When
     /// `Some`, draws through the GC are clipped to the 1-bits of the
@@ -698,7 +705,6 @@ struct GcChangeView {
     stipple: Option<ResourceId>,
     tile_x_origin: Option<i16>,
     tile_y_origin: Option<i16>,
-    font: Option<ResourceId>,
     subwindow_mode: Option<u8>,
     graphics_exposures: Option<bool>,
     clip_x_origin: Option<i16>,
