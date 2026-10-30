@@ -254,13 +254,38 @@ pub(crate) fn address_is_ours(peer: IpAddr) -> bool {
     peer.is_loopback() || (peer.is_ipv4() && interface_ips().contains(&peer))
 }
 
+/// A Unix connection made through a bound listener and `accept`, the
+/// production path, rather than `socketpair`, whose peer credentials are not
+/// portable to every BSD. Returns `(accepted, client)`.
+#[cfg(test)]
+pub(crate) fn connected_unix_pair() -> (
+    std::os::unix::net::UnixStream,
+    std::os::unix::net::UnixStream,
+) {
+    use std::{
+        os::unix::net::{UnixListener, UnixStream},
+        sync::atomic::{AtomicU32, Ordering},
+    };
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "yserver-peer-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("sock");
+    let listener = UnixListener::bind(&path).expect("bind");
+    let client = UnixStream::connect(&path).expect("connect");
+    let (accepted, _) = listener.accept().expect("accept");
+    let _ = std::fs::remove_dir_all(&dir);
+    (accepted, client)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        net::{SocketAddrV4, SocketAddrV6, TcpListener, TcpStream},
-        os::unix::net::{UnixListener, UnixStream},
-    };
+    use std::net::{SocketAddrV4, SocketAddrV6, TcpListener, TcpStream};
 
     #[test]
     fn host_entry_of_maps_both_families_in_network_order() {
@@ -283,19 +308,10 @@ mod tests {
         );
     }
 
-    /// Listener + accept, the production path, rather than `socketpair`,
-    /// whose credentials are not portable to every BSD.
     #[test]
     fn unix_peer_reports_our_euid_egid_and_pid() {
-        let dir = std::env::temp_dir().join(format!("yserver-peer-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let path = dir.join("sock");
-        let listener = UnixListener::bind(&path).expect("bind");
-        let _client = UnixStream::connect(&path).expect("connect");
-        let (accepted, _) = listener.accept().expect("accept");
+        let (accepted, _client) = connected_unix_pair();
         let peer = PeerIdentity::of(&Transport::Unix(accepted));
-        let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(peer.transport, AuthTransport::Unix);
         assert_eq!(peer.addr, None);

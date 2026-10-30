@@ -13,52 +13,20 @@ use yserver_protocol::{
     x11::{ClientId, RequestHeader, ResourceId, SequenceNumber},
 };
 
-/// Peer PID of a local client's connection. X-Resource reports the same
-/// identity as `LocalClientPID`; Present uses it to apply per-process scanout
-/// policy without adding a cached field to every `ClientState` construction.
-/// FreeBSD's peer-credential API does not expose a PID, so `None` is expected.
-#[cfg(target_os = "linux")]
+/// Peer PID of a client's connection, as captured at setup. X-Resource
+/// reports the same identity as `LocalClientPID`; Present uses it to apply
+/// per-process scanout policy. `None` for TCP (no credentials) and where the
+/// platform reports no pid (FreeBSD).
 pub(super) fn client_peer_pid(client: &crate::server::ClientState) -> Option<u32> {
-    use std::os::fd::AsRawFd;
-    if !client.is_local {
-        return None;
-    }
-    let guard = client
-        .writer
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut cred = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut len = u32::try_from(std::mem::size_of::<libc::ucred>()).ok()?;
-    // SAFETY: `guard` keeps the socket alive for the call, and `cred`/`len`
-    // are the exact out-param types SO_PEERCRED documents.
-    let rc = unsafe {
-        libc::getsockopt(
-            guard.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            std::ptr::from_mut(&mut cred).cast(),
-            &mut len,
-        )
-    };
-    drop(guard);
-    (rc == 0 && cred.pid > 0).then(|| cred.pid.cast_unsigned())
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(super) fn client_peer_pid(_client: &crate::server::ClientState) -> Option<u32> {
-    None
+    client.peer.cred.and_then(|cred| cred.pid)
 }
 
 /// X-Resource (`Res`) extension. `QueryClients` returns the real list of
 /// connected clients (their XID ranges); `QueryClientResources` returns
 /// real per-type resource counts for a client (the two queries `xrestop`
 /// leans on). `QueryClientPixmapBytes` computes live padded pixmap storage.
-/// `QueryClientIds` reports ClientXID identities (PID identities are omitted
-/// because peer credentials are not retained). `QueryResourceBytes` remains
+/// `QueryClientIds` reports ClientXID identities and, where the peer's
+/// credentials carry one, its PID. `QueryResourceBytes` remains
 /// empty until yserver keeps recursive resource-size accounting.
 pub(super) fn handle_x_resource_request(
     state: &mut ServerState,

@@ -38,6 +38,7 @@ use crate::{
         message::{Message, SetupAllocateResponse},
         sender::BoundSender,
     },
+    peer::PeerIdentity,
     resources::{ARGB_VISUAL, GLMARK_VISUAL, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW},
     transport::Transport,
 };
@@ -150,6 +151,10 @@ fn run_setup(
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(SETUP_TIMEOUT))?;
     stream.set_write_timeout(Some(SETUP_TIMEOUT))?;
+
+    // The peer's identity, read once from the socket; the client never
+    // gets a say in it.
+    let peer = PeerIdentity::of(&stream);
 
     let setup = x11::read_setup_request(&mut stream)?;
     debug!(
@@ -277,6 +282,7 @@ fn run_setup(
         is_local,
         fd_passing,
         internal,
+        peer,
         setup_reply,
     })?;
     Ok(())
@@ -433,7 +439,9 @@ mod tests {
         let (poll, sender, rx) = channel().unwrap();
         let _ = poll; // keep the poll alive (waker borrows from registry)
         let registry = make_registry();
-        let (server_side, mut client_side) = UnixStream::pair().unwrap();
+        // Through a listener, so the peer credentials below are the
+        // production ones on every platform.
+        let (server_side, mut client_side) = crate::peer::connected_unix_pair();
         let id = ClientId(7);
 
         spawn(
@@ -498,12 +506,17 @@ mod tests {
                 resource_id_base,
                 resource_id_mask,
                 byte_order,
+                peer,
                 ..
             } => {
                 assert_eq!(got, id);
                 assert_eq!(resource_id_base, 0x0010_0000);
                 assert_eq!(resource_id_mask, 0x000F_FFFF);
                 assert_eq!(byte_order, ClientByteOrder::LittleEndian);
+                assert_eq!(peer.transport, AuthTransport::Unix);
+                // SAFETY: plain getter with no preconditions.
+                let euid = unsafe { libc::geteuid() };
+                assert_eq!(peer.cred.map(|cred| cred.uid), Some(euid));
             }
             other => panic!("expected ClientSetupComplete, got {other:?}"),
         }

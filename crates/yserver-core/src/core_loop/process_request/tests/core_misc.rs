@@ -366,7 +366,8 @@ fn x_resource_query_client_ids_omits_pid_for_nonlocal_client() {
 
     let mut state = ServerState::new();
     let mut peer = install_client(&mut state, 1);
-    state.clients.get_mut(&1).unwrap().is_local = false;
+    // A TCP peer carries no credentials.
+    state.clients.get_mut(&1).unwrap().peer.cred = None;
     let mut backend = RecordingBackend::new();
     let mut body = 1u32.to_le_bytes().to_vec();
     body.extend_from_slice(&0u32.to_le_bytes());
@@ -389,7 +390,7 @@ fn x_resource_query_client_ids_omits_pid_for_nonlocal_client() {
     assert_eq!(
         u32::from_le_bytes(reply[8..12].try_into().unwrap()),
         0,
-        "nonlocal clients have no LocalClientPID even if the underlying socket supports credentials"
+        "a client without peer credentials has no LocalClientPID"
     );
     assert_eq!(reply.len(), 32);
 }
@@ -456,51 +457,41 @@ fn x_resource_query_client_ids_reports_xid_and_pid_identities() {
         None,
     )
     .expect("QueryClientIds PID-only");
-    // On Linux, a PID-only spec suppresses the XID identity and yields one
+    // A PID-only spec suppresses the XID identity and yields one
     // LocalClientPID entry per client. Sizes derived from Xorg's encoder
     // (Xext/xres.c `ConstructClientIdValue`): a pid entry is the 12-byte
     // header plus one value word, `rep.length = 4` counted in BYTES, and
     // `num_ids` counts ENTRIES. Two clients => 2*16 = 32 body bytes, so
     // reply length = 32/4 = 8 and the whole reply is 64 bytes.
     let pids = read_all_available(&mut peer);
-    #[cfg(not(target_os = "linux"))]
-    {
-        // The current non-Linux implementation omits PID identities.
-        assert_eq!(pids.len(), 32);
-        assert_eq!(u32::from_le_bytes(pids[4..8].try_into().unwrap()), 0);
-        assert_eq!(u32::from_le_bytes(pids[8..12].try_into().unwrap()), 0);
-    }
-    #[cfg(target_os = "linux")]
-    {
-        assert_eq!(pids.len(), 64);
-        assert_eq!(u32::from_le_bytes(pids[4..8].try_into().unwrap()), 8);
-        assert_eq!(u32::from_le_bytes(pids[8..12].try_into().unwrap()), 2);
-        // Both test clients are socketpairs owned by this process, so
-        // SO_PEERCRED reports our own pid for each.
-        let self_pid = std::process::id();
-        for (i, base) in [0x0040_0000u32, 0x0080_0000].into_iter().enumerate() {
-            let at = 32 + i * 16;
-            assert_eq!(
-                u32::from_le_bytes(pids[at..at + 4].try_into().unwrap()),
-                base,
-                "entry {i} client",
-            );
-            assert_eq!(
-                u32::from_le_bytes(pids[at + 4..at + 8].try_into().unwrap()),
-                x11xres::LOCAL_CLIENT_PID_MASK,
-                "entry {i} mask",
-            );
-            assert_eq!(
-                u32::from_le_bytes(pids[at + 8..at + 12].try_into().unwrap()),
-                4,
-                "entry {i} length is in bytes",
-            );
-            assert_eq!(
-                u32::from_le_bytes(pids[at + 12..at + 16].try_into().unwrap()),
-                self_pid,
-                "entry {i} pid",
-            );
-        }
+    assert_eq!(pids.len(), 64);
+    assert_eq!(u32::from_le_bytes(pids[4..8].try_into().unwrap()), 8);
+    assert_eq!(u32::from_le_bytes(pids[8..12].try_into().unwrap()), 2);
+    // The fixture gives both test clients this process's pid; the
+    // OS call itself is tested in `peer.rs`.
+    let self_pid = std::process::id();
+    for (i, base) in [0x0040_0000u32, 0x0080_0000].into_iter().enumerate() {
+        let at = 32 + i * 16;
+        assert_eq!(
+            u32::from_le_bytes(pids[at..at + 4].try_into().unwrap()),
+            base,
+            "entry {i} client",
+        );
+        assert_eq!(
+            u32::from_le_bytes(pids[at + 4..at + 8].try_into().unwrap()),
+            x11xres::LOCAL_CLIENT_PID_MASK,
+            "entry {i} mask",
+        );
+        assert_eq!(
+            u32::from_le_bytes(pids[at + 8..at + 12].try_into().unwrap()),
+            4,
+            "entry {i} length is in bytes",
+        );
+        assert_eq!(
+            u32::from_le_bytes(pids[at + 12..at + 16].try_into().unwrap()),
+            self_pid,
+            "entry {i} pid",
+        );
     }
 }
 

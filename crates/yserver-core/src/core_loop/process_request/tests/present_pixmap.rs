@@ -5287,7 +5287,6 @@ fn present_candidate_reports_variable_refresh_property() {
         None,
         "Present does not intern the property atom"
     );
-    #[cfg(target_os = "linux")]
     assert_eq!(
         backend
             .present_direct_candidates
@@ -5295,17 +5294,7 @@ fn present_candidate_reports_variable_refresh_property() {
             .expect("initial Present reaches Backend")
             .client_pid,
         Some(std::process::id()),
-        "PresentScanoutCandidate carries the local socket peer PID"
-    );
-    #[cfg(not(target_os = "linux"))]
-    assert_eq!(
-        backend
-            .present_direct_candidates
-            .first()
-            .expect("initial Present reaches Backend")
-            .client_pid,
-        None,
-        "platforms without peer PID support leave the candidate unowned"
+        "PresentScanoutCandidate carries the peer PID captured at setup"
     );
     assert!(
         !backend

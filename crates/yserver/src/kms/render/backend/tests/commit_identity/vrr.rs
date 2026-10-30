@@ -990,6 +990,7 @@ fn add_present_test_client(state: &mut yserver_core::server::ServerState, client
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: yserver_core::peer::PeerIdentity::unknown_unix(),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
             resource_id_base: 0,

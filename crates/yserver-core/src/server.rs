@@ -3100,6 +3100,9 @@ pub struct ClientState {
     /// The server's own client (a window shell's clipboard bridge): not
     /// counted as connected for the shell or the last-client reset.
     pub internal: bool,
+    /// Who connected, read from the socket at setup. Immutable for the
+    /// connection's life.
+    pub peer: crate::peer::PeerIdentity,
     pub byte_order: ClientByteOrder,
     pub last_sequence: Arc<AtomicU16>,
     pub resource_id_base: u32,

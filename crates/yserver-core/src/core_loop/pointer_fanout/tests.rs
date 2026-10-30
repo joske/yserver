@@ -158,6 +158,7 @@ fn install_client(state: &mut ServerState, id: u32) -> UnixStream {
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         },
     );
     b
@@ -190,6 +191,7 @@ fn install_capture_client(state: &mut ServerState, id: u32) -> crate::transport:
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         },
     );
     peer

@@ -110,6 +110,8 @@ fn install_client_with_transport(
     id: u32,
     transport: crate::transport::Transport,
 ) {
+    // SAFETY: plain getters with no preconditions.
+    let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
     state.clients.insert(
         id,
         ClientState {
@@ -140,6 +142,18 @@ fn install_client_with_transport(
             is_local: true,
             fd_passing: true,
             internal: false,
+            // A local peer with this process's credentials, so request
+            // tests do not depend on per-OS socket APIs (`peer.rs` tests
+            // those).
+            peer: crate::peer::PeerIdentity {
+                transport: crate::core_loop::auth::AuthTransport::Unix,
+                addr: None,
+                cred: Some(crate::peer::PeerCred {
+                    uid: euid,
+                    gid: egid,
+                    pid: Some(std::process::id()),
+                }),
+            },
         },
     );
 }

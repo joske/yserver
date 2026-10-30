@@ -98,6 +98,7 @@ impl RecordingHost {
                 is_local: true,
                 fd_passing: true,
                 internal: false,
+                peer: crate::peer::PeerIdentity::unknown_unix(),
             },
         );
         self.peers.insert(id, peer);

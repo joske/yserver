@@ -185,6 +185,7 @@ fn subscribers_returns_clients_with_bit_set() {
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         },
     );
     state.clients.insert(
@@ -210,6 +211,7 @@ fn subscribers_returns_clients_with_bit_set() {
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         },
     );
     // PropertyChange = 0x0040_0000
@@ -243,6 +245,7 @@ fn subscribers_omits_other_windows() {
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         },
     );
     let subs = state.subscribers(ResourceId(0x100), 0x0040_0000);
@@ -273,6 +276,7 @@ fn xi2_pointer_mask_matches_exact_and_wildcard_devices() {
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         };
 
         assert_eq!(
@@ -317,6 +321,7 @@ fn xi2_mask_ors_masks_split_across_device_wildcards() {
         is_local: true,
         fd_passing: true,
         internal: false,
+        peer: crate::peer::PeerIdentity::unknown_unix(),
     };
 
     // Button bits come from device 0; motion bit from either. First-match
@@ -357,6 +362,7 @@ fn xi2_keyboard_mask_matches_exact_and_wildcard_devices() {
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         };
 
         assert_eq!(
@@ -392,6 +398,7 @@ fn subscribers_omits_disconnected_client() {
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         },
     );
     assert_eq!(state.subscribers(ResourceId(0x100), 0x0040_0000).len(), 1);
@@ -425,6 +432,7 @@ fn subscribers_intersecting_matches_any_selected_bit() {
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         },
     );
     state.clients.insert(
@@ -450,6 +458,7 @@ fn subscribers_intersecting_matches_any_selected_bit() {
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         },
     );
 
@@ -498,6 +507,7 @@ fn client_target_returns_connected_client() {
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         },
     );
 
@@ -545,6 +555,7 @@ fn xi_dynamic_reset_nested_host_pointer_uses_master_xi_ids() {
                 is_local: true,
                 fd_passing: true,
                 internal: false,
+                peer: crate::peer::PeerIdentity::unknown_unix(),
             },
         );
     }
@@ -693,6 +704,7 @@ fn unmap_notify_fanout_reaches_only_subscribed_clients() {
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         },
     );
     state.clients.insert(
@@ -718,6 +730,7 @@ fn unmap_notify_fanout_reaches_only_subscribed_clients() {
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         },
     );
 
@@ -786,6 +799,7 @@ fn drop_window_subscriptions_removes_entries_for_destroyed_windows() {
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         },
     );
     assert_eq!(state.subscribers(ResourceId(0x100), 0x0040_0000).len(), 1);
@@ -897,6 +911,7 @@ fn replay_pointer_delivers_to_button_press_window_not_grab_owner() {
                 is_local: true,
                 fd_passing: true,
                 internal: false,
+                peer: crate::peer::PeerIdentity::unknown_unix(),
             },
         );
         s.clients.insert(
@@ -922,6 +937,7 @@ fn replay_pointer_delivers_to_button_press_window_not_grab_owner() {
                 is_local: true,
                 fd_passing: true,
                 internal: false,
+                peer: crate::peer::PeerIdentity::unknown_unix(),
             },
         );
         s.set_pointer_grab(ActivePointerGrab {
@@ -1068,6 +1084,7 @@ fn passive_grab_owner_events_keeps_child_delivery_on_owned_windows() {
                 is_local: true,
                 fd_passing: true,
                 internal: false,
+                peer: crate::peer::PeerIdentity::unknown_unix(),
             },
         );
         s.clients.insert(
@@ -1093,6 +1110,7 @@ fn passive_grab_owner_events_keeps_child_delivery_on_owned_windows() {
                 is_local: true,
                 fd_passing: true,
                 internal: false,
+                peer: crate::peer::PeerIdentity::unknown_unix(),
             },
         );
         s.set_pointer_grab(ActivePointerGrab {
@@ -1241,6 +1259,7 @@ fn passive_grab_owner_events_keeps_descendant_delivery_even_when_child_owned_els
                 is_local: true,
                 fd_passing: true,
                 internal: false,
+                peer: crate::peer::PeerIdentity::unknown_unix(),
             },
         );
         s.clients.insert(
@@ -1266,6 +1285,7 @@ fn passive_grab_owner_events_keeps_descendant_delivery_even_when_child_owned_els
                 is_local: true,
                 fd_passing: true,
                 internal: false,
+                peer: crate::peer::PeerIdentity::unknown_unix(),
             },
         );
         s.set_pointer_grab(ActivePointerGrab {
@@ -1373,6 +1393,7 @@ fn pointer_event_fanout_filters_by_mask() {
                 is_local: true,
                 fd_passing: true,
                 internal: false,
+                peer: crate::peer::PeerIdentity::unknown_unix(),
             },
         );
         s.clients.insert(
@@ -1398,6 +1419,7 @@ fn pointer_event_fanout_filters_by_mask() {
                 is_local: true,
                 fd_passing: true,
                 internal: false,
+                peer: crate::peer::PeerIdentity::unknown_unix(),
             },
         );
         s.clients.insert(
@@ -1423,6 +1445,7 @@ fn pointer_event_fanout_filters_by_mask() {
                 is_local: true,
                 fd_passing: true,
                 internal: false,
+                peer: crate::peer::PeerIdentity::unknown_unix(),
             },
         );
     }
@@ -1529,6 +1552,7 @@ fn pointer_event_fanout_delivers_motion_under_button_motion_mask() {
                 is_local: true,
                 fd_passing: true,
                 internal: false,
+                peer: crate::peer::PeerIdentity::unknown_unix(),
             },
         );
         s.clients.insert(
@@ -1554,6 +1578,7 @@ fn pointer_event_fanout_delivers_motion_under_button_motion_mask() {
                 is_local: true,
                 fd_passing: true,
                 internal: false,
+                peer: crate::peer::PeerIdentity::unknown_unix(),
             },
         );
     }
@@ -1662,6 +1687,7 @@ fn pointer_event_fanout_drops_unknown_host_xid() {
                 is_local: true,
                 fd_passing: true,
                 internal: false,
+                peer: crate::peer::PeerIdentity::unknown_unix(),
             },
         );
     }
@@ -1858,6 +1884,7 @@ fn add_test_client(state: &mut ServerState, client_id: u32, base: u32) {
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         },
     );
 }
@@ -2325,6 +2352,7 @@ fn propagation_walk_up_undoes_the_border_term() {
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         },
     );
     let (win, px, py, _subs) = state

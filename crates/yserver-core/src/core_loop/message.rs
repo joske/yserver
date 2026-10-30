@@ -228,6 +228,8 @@ pub enum Message {
         fd_passing: bool,
         /// Connected through [`Message::InternalClient`].
         internal: bool,
+        /// Read from the socket once, before the setup request.
+        peer: crate::peer::PeerIdentity,
         /// The setup reply bytes the client received, for RECORD's
         /// ClientStarted.
         setup_reply: Vec<u8>,

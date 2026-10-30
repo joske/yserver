@@ -590,6 +590,7 @@ fn add_client(state: &mut ServerState) -> UnixStream {
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: yserver_core::peer::PeerIdentity::unknown_unix(),
         },
     );
     peer

@@ -1083,6 +1083,7 @@ pub(super) fn install_client_for_render(state: &mut yserver_core::server::Server
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: yserver_core::peer::PeerIdentity::unknown_unix(),
         },
     );
 }
@@ -1320,6 +1321,7 @@ fn kbd_map_client_id(
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: yserver_core::peer::PeerIdentity::unknown_unix(),
         },
     );
     peer

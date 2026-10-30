@@ -2542,6 +2542,7 @@ fn lightweight_active_disconnect_retains_crtc_then_heavy_detach_publishes_off() 
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: yserver_core::peer::PeerIdentity::unknown_unix(),
         },
     );
     state.randr_select_masks.insert(
@@ -3081,6 +3082,7 @@ fn subscribe_randr_client(state: &mut ServerState) -> std::os::unix::net::UnixSt
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: yserver_core::peer::PeerIdentity::unknown_unix(),
         },
     );
     state.randr_select_masks.insert(

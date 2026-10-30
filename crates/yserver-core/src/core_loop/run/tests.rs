@@ -32,6 +32,7 @@ fn install_xi_config_test_client(
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         },
     );
     peer
@@ -69,6 +70,7 @@ fn unix_client(
         is_local: true,
         fd_passing: true,
         internal: false,
+        peer: crate::peer::PeerIdentity::unknown_unix(),
     }
 }
 
@@ -1488,6 +1490,7 @@ fn randr_change_fanout_orders_screen_then_all_crtcs_then_all_outputs() {
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         },
     );
     state.randr_select_masks.insert(
@@ -1897,6 +1900,7 @@ fn ready_crtc_completion_replies_unblocks_and_returns_reader_credit() {
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         },
     );
 
@@ -2246,6 +2250,7 @@ fn reconcile_writable_interest_tracks_outbound_state() {
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         },
     );
 
@@ -2399,6 +2404,7 @@ fn reconcile_registers_an_unregistered_writer_only_while_output_waits() {
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         },
     );
 
@@ -2905,6 +2911,7 @@ fn an_orphaned_xdmcp_client_does_not_reset_the_generation() {
             is_local: false,
             fd_passing: false,
             internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
             setup_reply: Vec::new(),
         })
         .expect("send the racing completion");

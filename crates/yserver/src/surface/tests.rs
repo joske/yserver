@@ -693,6 +693,7 @@ fn add_client(state: &mut ServerState, id: u32, mask: u32) -> std::os::unix::net
             is_local: true,
             fd_passing: true,
             internal: false,
+            peer: yserver_core::peer::PeerIdentity::unknown_unix(),
         },
     );
     peer
