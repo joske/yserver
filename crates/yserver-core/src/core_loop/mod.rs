@@ -14,6 +14,7 @@ pub mod composite_overlay;
 pub mod damage_fanout;
 pub mod fanout;
 pub mod generation;
+pub mod host_access;
 pub mod input_inventory;
 pub mod key_fanout;
 pub mod message;

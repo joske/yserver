@@ -23,8 +23,9 @@ use super::message::Message;
 /// A generation ordinal. Cheap to copy/compare; carries no behaviour of
 /// its own. Numeric identity is deliberately not exposed — nothing
 /// outside this module needs to construct one except by reading a
-/// `GenerationCounter`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// `GenerationCounter`. Ordered, so that process-lifetime state can tell a
+/// newer session from a quarantined older one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Generation(u64);
 
 /// Shared, process-lifetime counter. `CoreSender` holds a clone to tag
@@ -122,6 +123,13 @@ mod tests {
         let next = counter.bump();
         assert_eq!(clone.current(), next);
         assert_ne!(clone.current(), Generation::default());
+    }
+
+    #[test]
+    fn bump_orders_after_the_previous_generation() {
+        let counter = GenerationCounter::new();
+        let before = counter.current();
+        assert!(counter.bump() > before);
     }
 
     #[test]
