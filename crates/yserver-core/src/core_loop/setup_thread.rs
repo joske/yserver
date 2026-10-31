@@ -181,8 +181,9 @@ fn run_setup(
         )
     {
         warn!(
-            "client {} auth rejected ({reason:?}); presented proto {:?}",
+            "client {} auth rejected ({:?}); presented proto {:?}",
             id.0,
+            reason.trim_end(),
             String::from_utf8_lossy(&setup.auth_protocol_name)
         );
         x11::write_setup_failed(&mut stream, setup.byte_order, reason)?;
