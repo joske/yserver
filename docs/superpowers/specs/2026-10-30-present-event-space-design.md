@@ -33,8 +33,10 @@ re-enabled.
 
 ## Goals
 
-- The number of outstanding Present vblank arms per CRTC is bounded by a small
-  constant, whatever clients queue.
+- In steady operation, each CRTC has at most two outstanding Present vblank
+  arms, whatever clients queue. A same-CRTC modeset can clear the local watch
+  while an old kernel event remains unread; repeated modesets therefore have
+  no strict upper bound.
 - A Present on a frozen CRTC completes, paced at the mode's refresh rate.
 - No change that a client can observe on a CRTC whose clock advances.
 
@@ -45,8 +47,10 @@ re-enabled.
 - Changing how RANDR applies modes. Whether yserver can avoid a real modeset in
   the `xrandr` sequence is a separate measurement.
 - Retrying commits that fail with `ENOMEM`.
-- Reading more than one buffer per iteration. With arms bounded, a backlog above
-  32 events cannot build up from this path, so this adds nothing.
+- Reading more than one buffer per iteration. In steady operation, bounded arms
+  prevent this path from building a backlog above 32 events; repeated same-CRTC
+  modesets are the exception because their unread kernel events can outlive the
+  local watches.
 
 ## Design
 
@@ -70,10 +74,13 @@ clock" uses the clock the completion sweep decides with: the selection in
 `fire_present_completions_sweep`, moved to a shared helper so the two cannot
 disagree. With no usable clock (`msc == 0`), a target counts as ahead.
 
-Outstanding Present arms per CRTC are then at most two, the idle slot and this
-one, across iterations, new arrivals and cancelled windows. A destroyed window
-leaves at most one wake that finds nothing to do. The cost is a wake every vblank
-while a distant target is parked, on top of the iterations the loop already runs.
+In steady operation, outstanding Present arms per CRTC are at most two: the idle
+slot and this one, across iterations, new arrivals and cancelled windows. A
+same-CRTC modeset clears its watch even if the old kernel event is still unread,
+so that event can overlap newly issued arms. Repeated modesets have no strict
+upper bound. A destroyed window leaves at most one wake that finds nothing to do.
+The cost is a wake every vblank while a distant target is parked, on top of the
+iterations the loop already runs.
 
 ### Software clock for a frozen CRTC
 
@@ -103,10 +110,12 @@ including VRR's lowest rate.
 
 **While frozen.** MSC comes from time alone, as in Xorg's fake vblank: the last MSC
 at the moment of marking, plus the whole frame periods of the current mode elapsed
-since then, with UST the time of that frame. So `frozen` maps each `CrtcKey` to that
-anchor, and a mode change on the same route re-anchors at the current value so the
-clock never goes back. Flip count has no effect: a head flipping asynchronously at
-600 Hz in a 60 Hz mode still advances 60 MSC per second.
+since then, with UST the time of that frame. UST anchors at the current
+`CLOCK_MONOTONIC` time in microseconds when marking, rather than the last kernel
+timestamp. So `frozen` maps each `CrtcKey` to that anchor, and a mode change on the
+same route re-anchors at the current value so the clock never goes back. Flip count
+has no effect: a head flipping asynchronously at 600 Hz in a 60 Hz mode still
+advances 60 MSC per second.
 
 The CRTC arms software vblanks instead of kernel ones, each deadline being the next
 frame boundary, and a software tick records this clock. A flip that completes keeps

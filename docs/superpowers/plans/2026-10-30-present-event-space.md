@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Bound outstanding Present vblank arms per CRTC, and complete Presents on a CRTC whose kernel clock froze.
+**Goal:** Keep outstanding Present vblank arms per CRTC to two in steady operation, and complete Presents on a CRTC whose kernel clock froze.
 
 **Architecture:** One shared tagged next-vblank slot per CRTC replaces per-target absolute arming. An arm that does not fire in one second marks the CRTC frozen, and the existing software vblank fallback then drives it with a clock derived from elapsed time.
 
@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Detection window: one second, a `const`, not an option.
-- Outstanding Present arms per CRTC: at most two (idle slot + tagged slot).
+- Outstanding Present arms per CRTC: two in steady operation (idle slot + tagged slot). A same-CRTC modeset can clear the local watch while an old kernel event remains unread; repeated modesets have no strict upper bound.
 - No `YSERVER_*` environment variables; no `cfg(test)` in production bodies.
 - Reuse first: new code only where existing code cannot reach the goal.
 - Tests: A end-state check, B driven through the core loop or the backend's production entry points, F run under CPU load (`nproc` busy loops).
@@ -137,7 +137,7 @@ Every caller and fixture moves to the new contract before the gate: `present_pix
 **Invariants:**
 - A slot's watch starts on its successful kernel arm. Only that slot's own event removes it: tagged events the `SharedWake` watch, untagged events the `Idle` one. Every path that clears a slot also removes its watch.
 - `mark_frozen_crtcs` runs from `poll_deferred_input`, reached through `next_wakeup`, the poll timeout and `run_iteration_tail` (`core_loop/run.rs:3140`), so silence reaches it. It reads no events: if the device's fd is readable (`PageFlipEventSource::events_ready(&self, device: &Device) -> io::Result<bool>`, a zero-timeout poll, added to the trait and its stubs), it defers the verdict to the next iteration, whose normal `on_page_flip_ready` handles them. It does nothing while `!scanout_allowed() || !kms_outputs_active`.
-- `frozen_clock_now`: `frames = (now - anchor_at) / interval`; `msc = anchor_msc + frames`; `ust = anchor_ust + frames * interval`. Marking anchors at the larger of the general and completion clocks' last MSC, so nothing goes back.
+- `frozen_clock_now`: `frames = (now - anchor_at) / interval`; `msc = anchor_msc + frames`; `ust = anchor_ust + frames * interval`. Marking anchors MSC at the larger of the general and completion clocks' last MSC and UST at the current `CLOCK_MONOTONIC` time, so neither clock goes back or inherits a stale driver timestamp.
 - `present_absolute_vblank_arm_supported` stays true on a frozen CRTC. There, `arm_present_shared_wake` and `arm_idle_vblanks_with` arm a software vblank instead of the ioctl and return true, so exec and completion work keep a wake during flips and composes, past the idle gate of `arm_present_completion_idle_vblanks`. Deadlines land on the next frame boundary of the frozen clock.
 - In `service_software_vblanks`, a frozen CRTC ignores `armed_msc` and flip-in-flight suppression, and records `frozen_clock_now` into both the general and the completion clock, so `present_get_completion_clock` advances. Non-frozen CRTCs keep today's path byte for byte.
 - In the flip path, a frozen CRTC discards `flip.frame` and `flip.ust` for clock purposes, and the sample uses `frozen_clock_now`. Buffer retirement and the returned completion are otherwise unchanged. `kernel_ust` in `FlipEventTimestamps` stays the kernel's value only if nothing computes Present timing from it; check its consumers and use the frozen UST otherwise.

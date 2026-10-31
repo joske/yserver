@@ -760,7 +760,7 @@ impl KmsBackend {
         if self.platform.vblank_fallback.frozen.contains_key(&crtc_key)
             || !self.kernel_vblank_arm_available(crtc_key)
         {
-            let now = (self.pstate.monotonic_clock)();
+            let now = (self.pstate.monotonic_clock)().0;
             return Ok(usize::from(
                 self.platform.arm_software_vblank(crtc_key, now),
             ));
@@ -778,7 +778,7 @@ impl KmsBackend {
             self.platform
                 .vblank_fallback
                 .kernel_arm_watch
-                .insert((crtc_key, slot), (self.pstate.monotonic_clock)());
+                .insert((crtc_key, slot), (self.pstate.monotonic_clock)().0);
             Ok(1)
         } else {
             Ok(0)
@@ -805,7 +805,7 @@ impl KmsBackend {
             return Ok(false);
         }
         if self.platform.vblank_fallback.frozen.contains_key(&crtc_key) {
-            let now = (self.pstate.monotonic_clock)();
+            let now = (self.pstate.monotonic_clock)().0;
             self.platform.arm_software_vblank(crtc_key, now);
             return Ok(self
                 .platform
@@ -829,7 +829,7 @@ impl KmsBackend {
             self.platform
                 .vblank_fallback
                 .kernel_arm_watch
-                .insert((crtc_key, slot), (self.pstate.monotonic_clock)());
+                .insert((crtc_key, slot), (self.pstate.monotonic_clock)().0);
             Ok(true)
         } else {
             Ok(false)
@@ -924,7 +924,7 @@ impl KmsBackend {
             self.platform.vblank_fallback.software.clear();
             return;
         }
-        let now = (self.pstate.monotonic_clock)();
+        let now = (self.pstate.monotonic_clock)().0;
         for (crtc_key, vblank) in self.platform.take_due_software_vblanks(now) {
             let Some(output_idx) = self.platform.output_index_for_crtc(crtc_key) else {
                 continue;
@@ -975,7 +975,9 @@ impl KmsBackend {
         if !self.scanout_allowed() || !self.kms_outputs_active {
             return;
         }
-        let now = (self.pstate.monotonic_clock)();
+        let (now, Some(monotonic_ust)) = (self.pstate.monotonic_clock)() else {
+            return;
+        };
         let due: HashSet<CrtcKey> = self
             .platform
             .vblank_fallback
@@ -1003,10 +1005,10 @@ impl KmsBackend {
             }
             let general = self.platform.present_get_ust_msc(crtc_key);
             let completion = self.platform.present_get_completion_clock(crtc_key);
-            let (anchor_msc, anchor_ust) = if completion.msc > general.0 {
-                (completion.msc, completion.ust)
+            let anchor_msc = if completion.msc > general.0 {
+                completion.msc
             } else {
-                general
+                general.0
             };
             let Some(interval) = self.platform.crtc_frame_interval(crtc_key) else {
                 continue;
@@ -1015,7 +1017,7 @@ impl KmsBackend {
                 crtc_key,
                 crate::kms::render::platform::vblank_fallback::FrozenClock {
                     anchor_msc,
-                    anchor_ust,
+                    anchor_ust: u64::try_from(monotonic_ust.as_micros()).unwrap_or(u64::MAX),
                     anchor_at: now,
                     interval,
                 },
@@ -2041,7 +2043,7 @@ impl KmsBackend {
     ) -> (u64, u64) {
         self.present_crtc_key(crtc_id).map_or((0, 0), |crtc_key| {
             self.platform
-                .frozen_clock_now(crtc_key, (self.pstate.monotonic_clock)())
+                .frozen_clock_now(crtc_key, (self.pstate.monotonic_clock)().0)
                 .unwrap_or_else(|| self.platform.present_get_ust_msc(crtc_key))
         })
     }
@@ -2060,7 +2062,7 @@ impl KmsBackend {
                 let mut sample = self.platform.present_get_completion_clock(crtc_key);
                 if let Some((msc, ust)) = self
                     .platform
-                    .frozen_clock_now(crtc_key, (self.pstate.monotonic_clock)())
+                    .frozen_clock_now(crtc_key, (self.pstate.monotonic_clock)().0)
                 {
                     sample.msc = msc;
                     sample.ust = ust;

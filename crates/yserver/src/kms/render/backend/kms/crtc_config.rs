@@ -1584,7 +1584,7 @@ impl KmsBackend {
         if let Some(crtc) = frozen_reanchor_key
             && CrtcKey::for_output(&self.platform.outputs[idx]) == crtc
         {
-            let now = (self.pstate.monotonic_clock)();
+            let now = (self.pstate.monotonic_clock)().0;
             if let (Some((anchor_msc, anchor_ust)), Some(interval)) = (
                 self.platform.frozen_clock_now(crtc, now),
                 self.platform.crtc_frame_interval(crtc),

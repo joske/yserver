@@ -658,7 +658,7 @@ impl KmsBackend {
             return;
         }
         let reserved = u32::try_from(needed.len()).expect("a rotation has at most two members");
-        let now = (self.pstate.monotonic_clock)();
+        let now = (self.pstate.monotonic_clock)().0;
         if !self.pstate.server_scanout.tokens.reserve(reserved, now) {
             let server = &mut self.pstate.scanout_m0.server;
             server.reject_cap_success = server.reject_cap_success.saturating_add(1);

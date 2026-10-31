@@ -7,6 +7,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
     os::fd::OwnedFd,
+    time::{Duration, Instant},
 };
 
 use ash::vk;
@@ -29,6 +30,15 @@ use crate::{
     },
     platform::drm::ModeIdentity,
 };
+
+/// One clock read in both the scheduling and Present UST domains. Keeping the
+/// paired values in one source lets frozen clocks use CLOCK_MONOTONIC without
+/// introducing a second clock provider.
+pub(in crate::kms::render::backend) type MonotonicClockSample = (Instant, Option<Duration>);
+
+pub(in crate::kms::render::backend) fn system_monotonic_clock_sample() -> MonotonicClockSample {
+    (Instant::now(), crate::drm::atomic::monotonic_timestamp())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::kms::render::backend) enum ScanoutM0Target {
@@ -1380,9 +1390,9 @@ pub struct KmsBackendState {
     pub(in crate::kms::render::backend) scanout_m1_importer: ScanoutM1Importer,
     pub(in crate::kms::render::backend) direct: DirectOwners,
     pub(in crate::kms::render::backend) tearing: Tearing,
-    /// Monotonic clock for KMS cursor-composition pacing.
+    /// Paired monotonic time for KMS scheduling and Present UST.
     pub(in crate::kms::render::backend) monotonic_clock:
-        std::rc::Rc<dyn Fn() -> std::time::Instant>,
+        std::rc::Rc<dyn Fn() -> MonotonicClockSample>,
     pub(in crate::kms::render::backend) direct_frame_submitter: DirectFrameSubmitter,
     pub(in crate::kms::render::backend) scanout_m1_prober: ScanoutM1Prober,
     /// Declared after `scanout_m1`: probe framebuffers drop before descriptor fds (D9).

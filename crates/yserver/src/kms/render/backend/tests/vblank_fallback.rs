@@ -140,6 +140,55 @@ fn frozen_clock_catches_up_after_a_stall() {
 }
 
 #[test]
+// Mutation: restore the driver's stale UST as the frozen clock anchor.
+fn frozen_clock_ust_uses_current_monotonic_time() {
+    let (mut b, second, now) = two_output_fixture();
+    let injected_start = now.get();
+    let injected_ust = Duration::from_secs(120);
+    let clock = Rc::clone(&now);
+    b.for_tests_set_monotonic_clock_sample(Rc::new(move || {
+        let instant = clock.get();
+        (
+            instant,
+            Some(injected_ust + instant.saturating_duration_since(injected_start)),
+        )
+    }));
+    let frozen = mark_frozen_at_watch_deadline(&mut b, second, &now);
+    let expected_detection_ust = injected_ust + Duration::from_secs(1);
+    let detected = Backend::present_get_ust_msc(&b, SECOND_CRTC_XID);
+    assert_eq!(detected.0, frozen.anchor_msc);
+    assert_eq!(
+        detected.1,
+        expected_detection_ust.as_micros() as u64,
+        "freeze detection anchors UST at the injected current CLOCK_MONOTONIC time"
+    );
+
+    let source = recording_source(&b);
+    let fd = b.platform.devices[0].device.as_fd().as_raw_fd();
+    let mut state = yserver_core::server::ServerState::new();
+    let elapsed = frozen.interval * 10;
+    now.set(frozen.anchor_at + elapsed);
+    let frames = elapsed.as_nanos() / frozen.interval.as_nanos();
+    let expected_ust = expected_detection_ust.as_micros() as u64
+        + (frames * frozen.interval.as_nanos() / 1_000) as u64;
+    assert_eq!(
+        Backend::present_get_ust_msc(&b, SECOND_CRTC_XID).1,
+        expected_ust,
+        "the injected monotonic time advances UST with the frozen frame clock"
+    );
+    source.queue_flip(second.crtc, 999);
+    Backend::on_page_flip_ready(&mut b, &mut state, fd);
+    assert_eq!(
+        b.platform.ust_msc[&second],
+        (frozen.anchor_msc + 10, expected_ust)
+    );
+    assert_eq!(
+        b.platform.completion_clocks[&second].ust, expected_ust,
+        "flip completion records the current frozen UST"
+    );
+}
+
+#[test]
 // Mutations: return the stored clock sample or omit divisor/remainder from the new target.
 fn frozen_clock_reads_are_current_after_inactivity() {
     use std::{
