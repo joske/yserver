@@ -144,7 +144,7 @@ See [`docs/extensions.txt`](docs/extensions.txt) for a list of all supported/imp
 - binary releases for Fedora/Debian/Ubuntu/Alpine
 - FreeBSD now works
 - Display hotplug now works
-- xauth support (no xhost ACL support - not needed as we're unix socket only)
+- xauth support, and xhost for local clients (`+si:localuser:`, `+local:`); over TCP only the cookie admits
 - XINERAMA support
 - RANDR gamma correction (redshift)
 - direct mode VT switch

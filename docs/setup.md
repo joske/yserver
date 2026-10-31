@@ -334,10 +334,12 @@ every interface, not only loopback. `-listen tcp` refuses to start without a
 `-auth` file containing a usable MIT-MAGIC-COOKIE-1, because the alternative
 would be an unauthenticated X server on the network.
 
-**There is no host-based access control.** `xhost` is not implemented, so the
-cookie is the entire boundary and there is no way to restrict which hosts may
-connect. The wire protocol is unencrypted, keystrokes included. Read the
-SECURITY section of `yserver(1)` before exposing a display this way.
+**Over TCP the cookie is the entire boundary.** `xhost` entries never admit a
+TCP client: `xhost +somehost` and even `xhost +` let no one in without the
+cookie (Xorg would). `xhost` only applies to the local socket, where
+`xhost +si:localuser:<user>` lets that user's clients in without a cookie. The
+wire protocol is unencrypted, keystrokes included. Read the SECURITY section of
+`yserver(1)` before exposing a display this way.
 
 For a client on another machine, the cookie has to be keyed to how that client
 names the display:

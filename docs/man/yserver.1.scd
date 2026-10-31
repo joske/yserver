@@ -288,9 +288,12 @@ socket's filesystem permissions are the access control.
 
 *-listen tcp* changes that completely. The server binds *0.0.0.0* — every
 interface — and the *only* thing standing between the network and the display
-is the MIT-MAGIC-COOKIE-1 cookie. There is no host-based access control:
-*xhost*(1) is not implemented yet, so there is nothing to restrict which hosts
-may connect, and no way to grant or revoke access per host.
+is the MIT-MAGIC-COOKIE-1 cookie. *xhost*(1) entries never admit a TCP
+client: neither a host entry nor *xhost +* lets anyone in without the cookie,
+unlike Xorg. On the UNIX socket, *xhost* works as usual:
+*xhost +si:localuser:*_user_ admits that user's clients without a cookie,
+*xhost +local:* admits every local client, and *xhost +* / *xhost -* switch
+the check off and on for local clients.
 
 Consequences worth being explicit about:
 
