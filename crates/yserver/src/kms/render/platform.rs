@@ -163,7 +163,7 @@ pub(crate) struct SequenceCompletion {
     /// only unique within one DRM device.
     pub(crate) device_key: crate::platform::drm::DrmDeviceKey,
     /// Echoed verbatim from the arm call: low 32 bits are the crtc_id,
-    /// the high bit optionally tags an absolute per-target arm
+    /// the high bit optionally tags the shared Present wake
     /// (`ABSOLUTE_SEQ_TAG` in `backend.rs`).
     pub(crate) user_data: u64,
     pub(crate) time_ns: i64,

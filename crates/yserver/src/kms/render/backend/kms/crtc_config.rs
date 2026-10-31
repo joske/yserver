@@ -1540,11 +1540,12 @@ impl KmsBackend {
         prepared_pool: Option<PreparedScanoutPool>,
     ) -> io::Result<bool> {
         let was_active = self.kms_outputs_active;
+        let existing_crtc_key =
+            existing_idx.map(|idx| CrtcKey::for_output(&self.platform.outputs[idx]));
+        let frozen_reanchor_key =
+            existing_crtc_key.filter(|key| self.platform.vblank_fallback.frozen.contains_key(key));
         if let Some(idx) = existing_idx {
             self.scene.drain_output(&mut self.platform, idx);
-            let crtc = CrtcKey::for_output(&self.platform.outputs[idx]);
-            self.pstate.armed_vblank_targets.remove(&crtc);
-            self.pstate.absolute_vblank_targets.remove(&crtc);
         }
         // `enable_connector` idles the GPU itself if it replaces the pool.
         self.pstate.scanout_m1.clear("per-CRTC RANDR change");
@@ -1573,6 +1574,32 @@ impl KmsBackend {
             .sync_output_count(self.platform.outputs.len());
 
         let idx = existing_idx.unwrap_or(self.platform.outputs.len() - 1);
+        if let Some(crtc) = existing_crtc_key {
+            self.platform
+                .vblank_fallback
+                .kernel_arm_watch
+                .retain(|(key, _), _| *key != crtc);
+            self.platform.vblank_fallback.software.remove(&crtc);
+        }
+        if let Some(crtc) = frozen_reanchor_key
+            && CrtcKey::for_output(&self.platform.outputs[idx]) == crtc
+        {
+            let now = (self.pstate.monotonic_clock)();
+            if let (Some((anchor_msc, anchor_ust)), Some(interval)) = (
+                self.platform.frozen_clock_now(crtc, now),
+                self.platform.crtc_frame_interval(crtc),
+            ) {
+                self.platform.vblank_fallback.frozen.insert(
+                    crtc,
+                    crate::kms::render::platform::vblank_fallback::FrozenClock {
+                        anchor_msc,
+                        anchor_ust,
+                        anchor_at: now,
+                        interval,
+                    },
+                );
+            }
+        }
         self.platform.invalidate_bo_generations_at(idx);
         if let Err(error) =
             self.scene

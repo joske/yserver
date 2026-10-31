@@ -4024,7 +4024,8 @@ impl KmsBackend {
             // state) but STILL run the sequence handler so the armed-target
             // map clears — leaving a stuck entry across suspend is exactly
             // the permanent-stall failure mode this guards against.
-            if let Ok((flips, sequences)) = self.platform.drain_page_flip_events(drm_fd) {
+            let now = (self.pstate.monotonic_clock)();
+            if let Ok((flips, sequences)) = self.platform.drain_page_flip_events(drm_fd, now) {
                 for (output_idx, _, timestamps) in flips {
                     let matched_event_id = self
                         .platform
@@ -4046,7 +4047,8 @@ impl KmsBackend {
             log::debug!("render on_page_flip_ready: skipped (seat not Active)");
             return;
         }
-        let (flipped, sequences) = match self.platform.drain_page_flip_events(drm_fd) {
+        let now = (self.pstate.monotonic_clock)();
+        let (flipped, sequences) = match self.platform.drain_page_flip_events(drm_fd, now) {
             Ok(pair) => pair,
             Err(e) => {
                 log::warn!("render: drain_page_flip_events failed: {e}");

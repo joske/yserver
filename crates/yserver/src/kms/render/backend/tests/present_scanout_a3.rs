@@ -4273,3 +4273,120 @@ fn queued_entry_cancelled_by_newer_copy_present() {
     );
     fixture.finish_after_normal_drain();
 }
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: retire the direct owner using the kernel flip clock after freezing.
+fn direct_scanout_retires_on_frozen_crtc() {
+    use std::{cell::Cell, rc::Rc, time::Instant};
+    use yserver_core::{backend::Backend, server::ServerState};
+    use yserver_protocol::x11::ResourceId;
+
+    let Some((fixture, direct)) = a3_output_fixture(1, 0x7d10) else {
+        eprintln!("SKIP direct_scanout_retires_on_frozen_crtc: Vulkan fixture unavailable");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let mut state = ServerState::new();
+    let output = &fixture.events.backend.platform.outputs[1];
+    a3_add_existing_window_to_state(
+        &mut state,
+        ResourceId(0x7d11),
+        direct.target_xid,
+        output.x as i16,
+        output.y as i16,
+        output.width,
+        output.height,
+        true,
+    );
+    Backend::sync_top_level_order(&mut fixture.events.backend, &state);
+    let fd = fixture.kms_fd(1);
+    let source = fixture.events.event_sources[&fd].clone();
+    let key = crate::kms::render::platform::CrtcKey::for_output(
+        &fixture.events.backend.platform.outputs[1],
+    );
+    let records = a3_admit_output_owner(&mut fixture, &direct, 1);
+    let projected = Backend::randr_outputs_and_modes(&mut fixture.events.backend).0;
+    let crtc_id = projected[1].crtc_id;
+    source.set_legacy_vblank(Ok(5));
+    fixture
+        .events
+        .backend
+        .pstate
+        .crtc_queue_sequence_unsupported_devices
+        .insert(key.device_key);
+    fixture
+        .events
+        .backend
+        .platform
+        .vblank_fallback
+        .pipes
+        .insert(key, 1);
+    let base = Instant::now();
+    let now = Rc::new(Cell::new(base));
+    let clock = Rc::clone(&now);
+    fixture
+        .events
+        .backend
+        .for_tests_set_monotonic_clock(Rc::new(move || clock.get()));
+    let backend = &mut fixture.events.backend;
+    assert!(
+        Backend::arm_present_shared_wake(backend, crtc_id)
+            .expect("direct scanout CRTC kernel wake")
+    );
+    now.set(base + crate::kms::render::backend::KmsBackend::FROZEN_VBLANK_WINDOW);
+    backend.poll_deferred_input(&mut state);
+    let frozen = backend.platform.vblank_fallback.frozen[&key];
+
+    now.set(frozen.anchor_at + frozen.interval);
+    for record in &records {
+        let Some(event_id) = super::commit_identity::accepted_event_id(record) else {
+            continue;
+        };
+        for event in &record.events {
+            fixture.events.queue_commit_completion(
+                fd,
+                event.crtc,
+                event_id,
+                60,
+                std::time::Duration::from_millis(600),
+            );
+        }
+    }
+    {
+        let events = fixture.events_mut();
+        Backend::on_page_flip_ready(&mut events.backend, &mut events.state, fd);
+    }
+    let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].present_id, direct.candidate.present_id);
+    let completion_clock = completed[0]
+        .completion_clock
+        .expect("direct retirement carries its completion clock");
+    assert_eq!(completion_clock.msc, frozen.anchor_msc + 1);
+    assert_eq!(
+        completion_clock.ust,
+        frozen.anchor_ust + u64::try_from(frozen.interval.as_micros()).unwrap()
+    );
+    assert_eq!(
+        Backend::present_get_ust_msc(&fixture.events.backend, crtc_id).0,
+        completion_clock.msc
+    );
+    Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
+        .expect("retire the held Output owner through Backend");
+    let cleanup = a3_tick(&mut fixture);
+    assert!(a3_has_scene_commit_for(
+        &cleanup,
+        fixture.events.backend.platform.outputs[1].output.crtc
+    ));
+    a3_retire_records(&mut fixture, &cleanup);
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_none(),
+        "the Output owner's direct buffer retires on its replacement flip"
+    );
+    let _ = Backend::drain_completed_present_events(&mut fixture.events.backend);
+    let _ = Backend::drain_retired_present_idle_events(&mut fixture.events.backend);
+    fixture.finish_after_normal_drain();
+}

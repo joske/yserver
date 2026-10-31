@@ -180,11 +180,11 @@ pub(crate) const DRM_VBLANK_NEXTONMISS: u32 = 0x1000_0000;
 pub(crate) const DRM_VBLANK_SECONDARY: u32 = 0x2000_0000;
 pub(crate) const DRM_VBLANK_HIGH_CRTC_SHIFT: u32 = 1;
 
-/// Legacy `signal` bit marking an absolute per-target arm. `signal` is an
+/// Legacy `signal` bit marking the shared Present wake. `signal` is an
 /// `unsigned long`, so the tag stays inside 32 bits.
 pub(crate) const LEGACY_VBLANK_ABSOLUTE_SIGNAL: u32 = 1 << 31;
 
-/// Sequence-event `user_data` tag the backend decodes as an absolute arm.
+/// Sequence-event `user_data` tag the backend decodes as a shared Present wake.
 pub(crate) const SEQUENCE_ABSOLUTE_USER_DATA: u64 = 1 << 63;
 
 #[allow(non_camel_case_types)]

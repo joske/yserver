@@ -533,18 +533,11 @@ pub struct RecordingBackend {
     /// Task 7: canned return for `present_scanout_blackout`. Default
     /// `false` matches the trait default.
     pub present_scanout_blackout: bool,
-    /// Controls what `arm_present_absolute_vblank` returns. `None`
-    /// (default) mimics a real always-succeeds arm: covers every target
-    /// it's given. `Some(Ok(n))` / `Some(Err(kind))` let a test pin the
-    /// `Ok(0)` / `Err` idle_fallback paths (spec §msc-due future-target
-    /// rung 1).
-    pub arm_present_absolute_vblank_result: Option<Result<usize, io::ErrorKind>>,
-    /// `targets` recorded per `arm_present_absolute_vblank` call, in call
-    /// order, so a test can assert exactly what was armed — the `-1` from
-    /// `eff` is core-side (Task 7), so this should read `eff - 1`, never
-    /// the raw `effective_target_msc`.
-    pub armed_absolute_vblank_targets: Vec<Vec<u64>>,
-    pub armed_absolute_vblank_crtcs: Vec<u32>,
+    /// Controls what `arm_present_shared_wake` returns. `None` (default)
+    /// mimics an available tagged next-vblank arm.
+    pub arm_present_shared_wake_result: Option<Result<bool, io::ErrorKind>>,
+    /// CRTC IDs passed to `arm_present_shared_wake`, in call order.
+    pub armed_shared_wake_crtcs: Vec<u32>,
     /// Domain-qualified calls made by the two idle-arm paths.
     pub armed_idle_vblank_targets: Vec<(u32, Vec<u64>)>,
     pub armed_completion_idle_vblank_targets: Vec<(u32, Vec<u64>)>,
@@ -711,9 +704,8 @@ impl RecordingBackend {
             present_absolute_vblank_arm_supported: false,
             present_absolute_vblank_arm_supported_by_crtc: std::collections::HashMap::new(),
             present_scanout_blackout: false,
-            arm_present_absolute_vblank_result: None,
-            armed_absolute_vblank_targets: Vec::new(),
-            armed_absolute_vblank_crtcs: Vec::new(),
+            arm_present_shared_wake_result: None,
+            armed_shared_wake_crtcs: Vec::new(),
             armed_idle_vblank_targets: Vec::new(),
             armed_completion_idle_vblank_targets: Vec::new(),
             arm_idle_vblanks_result: None,
@@ -1145,12 +1137,11 @@ impl Backend for RecordingBackend {
             .unwrap_or(self.present_absolute_vblank_arm_supported)
     }
 
-    fn arm_present_absolute_vblank(&mut self, crtc_id: u32, targets: &[u64]) -> io::Result<usize> {
-        self.armed_absolute_vblank_crtcs.push(crtc_id);
-        self.armed_absolute_vblank_targets.push(targets.to_vec());
-        match self.arm_present_absolute_vblank_result {
-            None => Ok(targets.len()),
-            Some(Ok(n)) => Ok(n),
+    fn arm_present_shared_wake(&mut self, crtc_id: u32) -> io::Result<bool> {
+        self.armed_shared_wake_crtcs.push(crtc_id);
+        match self.arm_present_shared_wake_result {
+            None => Ok(true),
+            Some(Ok(armed)) => Ok(armed),
             Some(Err(kind)) => Err(io::Error::from(kind)),
         }
     }

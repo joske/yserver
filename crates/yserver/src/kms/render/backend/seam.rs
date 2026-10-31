@@ -335,12 +335,8 @@ pub trait Platform: OutputSink + Sized + 'static {
         false
     }
 
-    fn arm_present_absolute_vblank(
-        _b: &mut XBackend<Self>,
-        _randr_crtc_id: u32,
-        _targets: &[u64],
-    ) -> io::Result<usize> {
-        Ok(0)
+    fn arm_present_shared_wake(_b: &mut XBackend<Self>, _randr_crtc_id: u32) -> io::Result<bool> {
+        Ok(false)
     }
 
     fn present_scanout_blackout(_b: &XBackend<Self>) -> bool {

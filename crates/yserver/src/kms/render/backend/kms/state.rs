@@ -1395,43 +1395,13 @@ pub struct KmsBackendState {
     pub(in crate::kms::render::backend) vt_resume_executor:
         std::rc::Rc<dyn super::session::VtResumeExecutor>,
 
-    /// Per-CRTC armed absolute MSC for idle vblank pacing. Keyed by the
-    /// stable `crtc::Handle`; presence means "a `DRM_CRTC_SEQUENCE` is
-    /// queued on this CRTC and we are waiting for it" (value `0` is the
-    /// relative-next-vblank sentinel this spike uses). A per-CRTC map
-    /// rather than a single bool so arming CRTC A can't suppress arming
-    /// CRTC B (the dual-monitor permanent-stall class).
-    ///
-    /// **Invariant (load-bearing):** every code path that drops or
-    /// completes an armed sequence MUST clear the matching entry —
-    /// `on_crtc_sequence_event` (unconditional clear-arm before
-    /// validating), `!scanout_allowed()` in `arm_idle_vblanks_with`,
-    /// `run_suspend` / DPMS-off (master loss drops queued sequences), and
-    /// output removal (`prune_armed_targets_to_live_outputs`). A stuck
-    /// entry = a permanent ~0 fps stall on that CRTC.
-    pub(crate) armed_vblank_targets: std::collections::HashMap<CrtcKey, u64>,
-
-    /// Per-CRTC absolute (per-target) armed MSCs for deferred Present
-    /// execution (spec §msc-due future-target rule). Keyed by raw
-    /// `crtc_id` (not `Handle` — `arm_present_absolute_vblank` deals in
-    /// the same `u32` ids `queue_crtc_sequence` takes). Own set,
-    /// entirely independent of `armed_vblank_targets`: multiple
-    /// in-flight `CRTC_QUEUE_SEQUENCE`s per CRTC are legal, and the
-    /// absolute arm must neither consume nor suppress the relative-1
-    /// idle arm (which a compositor parks every iteration — sharing the
-    /// slot would starve one arm kind or the other). Entries retire in
-    /// `on_crtc_sequence_event` when a tagged event's `sequence` reaches
-    /// the target; `clear_all_armed_vblank_targets` clears this
-    /// alongside `armed_vblank_targets` at the same lifecycle edges.
-    pub(crate) absolute_vblank_targets:
-        std::collections::HashMap<CrtcKey, std::collections::BTreeSet<u64>>,
-
     /// Latches true the first time `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` returns
     /// EOPNOTSUPP/ENOTTY (pre-4.14 kernels lack the ioctl). Once set we stop
-    /// attempting idle arming and degrade to flip-driven MSC only. Shared
+    /// attempting sequence arms and use WAIT_VBLANK where available; when
+    /// neither kernel source works, software vblanks take over. Shared
     /// between the relative idle arm (`arm_idle_vblanks_ioctl`) and the
-    /// absolute per-target arm (`arm_present_absolute_vblank`) — the ioctl
-    /// is either supported or not, independent of which caller issues it.
+    /// tagged shared Present wake (`arm_present_shared_wake`) — support for
+    /// the sequence ioctl is independent of which caller issues it.
     /// Logged once on transition; never resets within a process lifetime.
     pub(crate) crtc_queue_sequence_unsupported_devices: HashSet<crate::platform::drm::DrmDeviceKey>,
 
@@ -1639,12 +1609,10 @@ pub(in crate::kms::render::backend) struct ExportedBacking {
     pub(in crate::kms::render::backend) lifetime_via_alias: bool,
 }
 
-/// user_data tag for absolute (per-target) sequence arms. The kernel
-/// event carries no CRTC; the low 32 bits stay the crtc_id (matching the
-/// relative arm's `user_data = u64::from(crtc_id)`), the high bit
-/// discriminates the arm kind so `on_crtc_sequence_event` can tell an
-/// absolute-arm retirement apart from the single-slot relative idle arm
-/// (spec round-4 F2).
+/// user_data tag for the shared Present sequence wake. The kernel event
+/// carries no CRTC; the low 32 bits stay the crtc_id (matching the relative
+/// idle arm's `user_data = u64::from(crtc_id)`), and the high bit
+/// distinguishes this wake from that idle slot.
 pub(in crate::kms::render::backend) const ABSOLUTE_SEQ_TAG: u64 = 1 << 63;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

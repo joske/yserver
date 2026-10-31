@@ -490,6 +490,42 @@ pub(crate) fn cached_present_crtc_clock(
         })
 }
 
+/// Clock used both to decide when a Present completion is due and whether
+/// its CRTC needs another tagged wake. Keep the arming pass aligned with the
+/// completion sweep, including exact direct-scanout stamps and the immediate
+/// fallback when no completion sample exists.
+pub(crate) fn present_completion_due_clock(
+    state: &ServerState,
+    event: &crate::backend::CompletedPresentEvent,
+) -> crate::backend::PresentClockSample {
+    present_completion_due_clock_for_domain(
+        state,
+        event.crtc_id,
+        event.crtc_epoch,
+        event.completion_clock,
+    )
+}
+
+pub(crate) fn present_completion_due_clock_for_domain(
+    state: &ServerState,
+    crtc_id: u32,
+    crtc_epoch: u64,
+    exact: Option<crate::backend::PresentClockSample>,
+) -> crate::backend::PresentClockSample {
+    let cached = cached_present_crtc_clock(state, crtc_id, crtc_epoch);
+    if cached.completion.msc > 0 {
+        cached.completion
+    } else if let Some(exact) = exact {
+        exact
+    } else {
+        crate::backend::PresentClockSample {
+            msc: cached.msc,
+            ust: cached.ust,
+            source: crate::backend::PresentClockSource::Immediate,
+        }
+    }
+}
+
 /// Refresh one current physical clock epoch. A valid-but-Off CRTC and the
 /// headless domain stay at zero; they are accepted but deliberately unpaced.
 pub(crate) fn refresh_present_crtc_general_clock(
@@ -713,8 +749,8 @@ pub(super) fn effective_present_target_raw(
 
 /// Execute a batch of specific `present_pending_exec` entries by id —
 /// shared by every msc-due execution site (the due-pass's normal
-/// execute-due step, the idle-display fallback, the absolute-arm
-/// Ok(0)/Err fallback, and the blackout flush). Missing ids (already
+/// execute-due step, the idle-display fallback, the shared-wake
+/// false/error fallback, and the blackout flush). Missing ids (already
 /// resolved by a concurrent path) are silently skipped. Mirrors
 /// `drain_ready_present_pixmaps`'s execute/release/mark_dirty sequence:
 /// the entry pin is released after `execute_present_pixmap_copy`
@@ -750,8 +786,7 @@ pub(crate) fn execute_parked_present_ids(
 /// msc-due-pass (spec §msc-due; Task 7): re-classify every msc-parked
 /// source-ready entry against the fresh general clock and execute
 /// whatever just became due, then run the two fallback-ladder rungs that
-/// are execution decisions rather than arming (the third rung, the
-/// absolute-vblank arm, is an arming call site and lives in
+/// are execution decisions rather than arming (the shared-wake arm lives in
 /// `run::arm_present_idle_vblanks`, post-compose, alongside the other two
 /// arms). Called at the top of `drain_present_completions`, which Task 4
 /// hoisted above `maybe_composite`, so an entry executed here is visible
@@ -822,7 +857,7 @@ pub(crate) fn drain_due_present_pending_exec(state: &mut ServerState, backend: &
     // so waiting would deadlock forever; execute immediately instead.
     // Gated to `!present_absolute_vblank_arm_supported()` drivers only —
     // on sequence-capable drivers an idle display still ticks via the
-    // absolute arm, and applying this fallback there would reintroduce
+    // tagged shared wake, and applying this fallback there would reintroduce
     // the early-frame bug for mpv (spec §msc-due).
     let idle_fallback: Vec<u64> = state
         .present_pending_exec
@@ -3092,18 +3127,7 @@ fn fire_present_completions_sweep(state: &mut ServerState, backend: &mut dyn Bac
         let mut iter = entries.into_iter();
         for p in iter.by_ref() {
             let blocked = ext_min.is_some_and(|m| m < p.event.present_id);
-            let cached = cached_present_crtc_clock(state, p.event.crtc_id, p.event.crtc_epoch);
-            let due_clock = if cached.completion.msc > 0 {
-                cached.completion
-            } else if let Some(exact) = p.event.completion_clock {
-                exact
-            } else {
-                crate::backend::PresentClockSample {
-                    msc: cached.msc,
-                    ust: cached.ust,
-                    source: crate::backend::PresentClockSource::Immediate,
-                }
-            };
+            let due_clock = present_completion_due_clock(state, &p.event);
             // The domain cache decides when a paced event is due. An exact
             // grouped-direct reference sample only stamps that event; using an
             // older exact retirement as the due clock would park it forever

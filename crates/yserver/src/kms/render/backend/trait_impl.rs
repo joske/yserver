@@ -286,12 +286,8 @@ impl<P: Platform> Backend for XBackend<P> {
         P::present_absolute_vblank_arm_supported(self, crtc_id)
     }
 
-    fn arm_present_absolute_vblank(
-        &mut self,
-        randr_crtc_id: u32,
-        targets: &[u64],
-    ) -> io::Result<usize> {
-        P::arm_present_absolute_vblank(self, randr_crtc_id, targets)
+    fn arm_present_shared_wake(&mut self, randr_crtc_id: u32) -> io::Result<bool> {
+        P::arm_present_shared_wake(self, randr_crtc_id)
     }
 
     fn present_scanout_blackout(&self) -> bool {

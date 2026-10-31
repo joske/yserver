@@ -22,7 +22,7 @@ use crate::{
     platform::drm::Output,
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     io,
     os::fd::{AsFd as _, AsRawFd as _, RawFd},
     rc::Rc,
@@ -58,6 +58,27 @@ impl OutputPowerExecutor for PowerLog {
 
     fn disable_device(&self, _device: &crate::drm::Device) -> io::Result<()> {
         self.0.borrow_mut().push(("device", 0));
+        Ok(())
+    }
+}
+
+struct RejectModeset;
+
+impl OutputPowerExecutor for RejectModeset {
+    fn disable(&self, _device: &crate::drm::Device, _output: &Output) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn enable(
+        &self,
+        _device: &crate::drm::Device,
+        _output: &Output,
+        _framebuffer: ::drm::control::framebuffer::Handle,
+    ) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::EIO))
+    }
+
+    fn disable_device(&self, _device: &crate::drm::Device) -> io::Result<()> {
         Ok(())
     }
 }
@@ -187,6 +208,20 @@ fn output_removal_keeps_owner_state_with_its_output_per_crtc_off() {
     }
     let removed_crtc = crtc(&backend, 0);
     let survivor_crtc = crtc(&backend, 1);
+    let removed_key =
+        crate::kms::render::platform::CrtcKey::for_output(&backend.platform.outputs[0]);
+    let survivor_key =
+        crate::kms::render::platform::CrtcKey::for_output(&backend.platform.outputs[1]);
+    super::seed_vblank_arm_watch(
+        &mut backend,
+        removed_key,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT,
+    );
+    super::seed_vblank_arm_watch(
+        &mut backend,
+        survivor_key,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT,
+    );
     let name = connector(&backend, 0);
     let id = output_id(&mut backend, &name);
 
@@ -202,6 +237,16 @@ fn output_removal_keeps_owner_state_with_its_output_per_crtc_off() {
     );
     assert_eq!(backend.platform.outputs.len(), 1);
     assert_eq!(crtc(&backend, 0), survivor_crtc);
+    assert!(!super::vblank_arm_is_watched(
+        &backend,
+        removed_key,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT
+    ));
+    assert!(super::vblank_arm_is_watched(
+        &backend,
+        survivor_key,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT
+    ));
     assert_eq!(backend.pstate.direct.outputs.len(), 1);
     assert_eq!(backend.pstate.direct.outputs[0].eligible_streak, 3);
     assert!(backend.pstate.direct.outputs[0].reentry_blocked_until_composed);
@@ -494,6 +539,56 @@ fn live_two_heads() -> Option<(RecordingSceneFixture, Rc<PowerLog>, ScanoutRoute
     Some((fixture, log, route))
 }
 
+fn install_fake_clock(backend: &mut KmsBackend) -> Rc<Cell<std::time::Instant>> {
+    let now = Rc::new(Cell::new(std::time::Instant::now()));
+    let clock = Rc::clone(&now);
+    backend.for_tests_set_monotonic_clock(Rc::new(move || clock.get()));
+    now
+}
+
+fn freeze_output_for_test(
+    backend: &mut KmsBackend,
+    output_idx: usize,
+    now: &Cell<std::time::Instant>,
+) -> (
+    crate::kms::render::platform::CrtcKey,
+    u32,
+    Rc<crate::kms::render::platform::flip_events::RecordingPageFlipEventSource>,
+) {
+    use yserver_core::{backend::Backend, server::ServerState};
+
+    let key =
+        crate::kms::render::platform::CrtcKey::for_output(&backend.platform.outputs[output_idx]);
+    let projected = Backend::randr_outputs_and_modes(backend).0;
+    let crtc_id = projected
+        .get(output_idx)
+        .expect("live output has a RandR projection")
+        .crtc_id;
+    let source = backend.platform.devices[0]
+        .test_page_flip_event_source
+        .clone()
+        .expect("recording fixture has a page-flip source");
+    source.set_legacy_vblank(Ok(5));
+    backend
+        .pstate
+        .crtc_queue_sequence_unsupported_devices
+        .insert(key.device_key);
+    backend
+        .platform
+        .vblank_fallback
+        .pipes
+        .insert(key, output_idx as u32);
+    assert!(
+        Backend::arm_present_shared_wake(backend, crtc_id)
+            .expect("arm the selected CRTC's kernel wake")
+    );
+    let armed_at = now.get();
+    now.set(armed_at + KmsBackend::FROZEN_VBLANK_WINDOW);
+    backend.poll_deferred_input(&mut ServerState::new());
+    assert!(backend.platform.vblank_fallback.frozen.contains_key(&key));
+    (key, crtc_id, source)
+}
+
 fn device_fd(fixture: &RecordingSceneFixture) -> RawFd {
     fixture.events.backend.platform.devices[0]
         .device
@@ -629,8 +724,8 @@ fn advertised(width: u16, height: u16) -> crate::platform::drm::Mode {
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutations: take the global quiesce for a mode change (both CRTCs are turned
-// off), or drain every scene output instead of the changed one (output 0's
-// in-flight frame is lost).
+// off), drain every scene output instead of the changed one (output 0's
+// in-flight frame is lost), or retain the changed CRTC's shared wake slot.
 fn mode_change_modesets_only_its_crtc_while_the_other_keeps_presenting() {
     let Some((mut fixture, log, route)) = live_two_heads() else {
         return;
@@ -640,6 +735,22 @@ fn mode_change_modesets_only_its_crtc_while_the_other_keeps_presenting() {
     let (crtc0, crtc1) = (
         crtc(&fixture.events.backend, 0),
         crtc(&fixture.events.backend, 1),
+    );
+    let crtc_key0 = crate::kms::render::platform::CrtcKey::for_output(
+        &fixture.events.backend.platform.outputs[0],
+    );
+    let crtc_key1 = crate::kms::render::platform::CrtcKey::for_output(
+        &fixture.events.backend.platform.outputs[1],
+    );
+    super::seed_vblank_arm_watch(
+        &mut fixture.events.backend,
+        crtc_key0,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT,
+    );
+    super::seed_vblank_arm_watch(
+        &mut fixture.events.backend,
+        crtc_key1,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT,
     );
     let in_flight = submit_frame(&mut fixture);
     let (flip0, flip1) = (flip_for(&in_flight, crtc0), flip_for(&in_flight, crtc1));
@@ -671,6 +782,38 @@ fn mode_change_modesets_only_its_crtc_while_the_other_keeps_presenting() {
     );
 
     assert_eq!(log.entries(), vec![("on", crtc1)]);
+    assert!(!super::vblank_arm_is_watched(
+        backend,
+        crtc_key1,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT
+    ));
+    assert!(super::vblank_arm_is_watched(
+        backend,
+        crtc_key0,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT
+    ));
+    let changed_crtc_randr_id = backend
+        .pstate
+        .randr_id_alloc
+        .entry(&backend.platform.outputs[1].key)
+        .expect("changed CRTC keeps its RandR resource")
+        .ids
+        .crtc_id;
+    let wake_source = backend.platform.devices[0]
+        .test_page_flip_event_source
+        .clone()
+        .expect("fixture records vblank requests");
+    backend
+        .pstate
+        .crtc_queue_sequence_unsupported_devices
+        .insert(crtc_key1.device_key);
+    backend.platform.vblank_fallback.pipes.insert(crtc_key1, 1);
+    wake_source.set_legacy_vblank(Ok(5));
+    assert!(
+        Backend::arm_present_shared_wake(backend, changed_crtc_randr_id)
+            .expect("changed CRTC can arm a fresh wake")
+    );
+    assert_eq!(wake_source.legacy_vblank_arms().len(), 1);
     assert_ne!(backend.pstate.crtc_config_topology_epoch, epoch);
     assert_eq!(
         undelivered(&fixture),
@@ -697,6 +840,80 @@ fn mode_change_modesets_only_its_crtc_while_the_other_keeps_presenting() {
     flip_for(&next, crtc1);
     retire_all(&mut fixture, &next, 3, None);
     fixture.adopt_drawables(0x6b00..0x6b03);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: clear the arm slots before a modeset that is rejected.
+fn rejected_mode_change_preserves_arm_slots_and_watch_deadlines() {
+    let Some((mut fixture, _log, _route)) = live_two_heads() else {
+        return;
+    };
+    let backend = &mut fixture.events.backend;
+    let key = crate::kms::render::platform::CrtcKey::for_output(&backend.platform.outputs[1]);
+    let crtc_id = Backend::randr_outputs_and_modes(backend).0[1].crtc_id;
+    let source = backend.platform.devices[0]
+        .test_page_flip_event_source
+        .clone()
+        .expect("fixture records vblank requests");
+    source.set_legacy_vblank(Ok(5));
+    backend
+        .pstate
+        .crtc_queue_sequence_unsupported_devices
+        .insert(key.device_key);
+    backend.platform.vblank_fallback.pipes.insert(key, 1);
+    let now = install_fake_clock(backend);
+
+    assert!(Backend::arm_present_shared_wake(backend, crtc_id).expect("arm shared wake"));
+    assert_eq!(
+        Backend::arm_idle_vblanks(backend, crtc_id, &[9]).expect("arm idle slot"),
+        1
+    );
+    let watches_before = backend.platform.vblank_fallback.kernel_arm_watch.clone();
+    let arms_before = source.legacy_vblank_arms().len();
+    assert_eq!(watches_before.len(), 2, "both independent slots are armed");
+
+    let output_key = backend.platform.outputs[1].key.clone();
+    let mut discovered = clone_test_drm_output(&backend.platform.outputs[1].output);
+    discovered.picked.vrefresh = 75;
+    let mut alternate = advertised(800, 600);
+    alternate.vrefresh = 75;
+    discovered.modes.push(alternate);
+    backend.pstate.crtc_config_discovery_override = Some(discovered);
+    backend
+        .platform
+        .for_tests_set_output_power_executor(Rc::new(RejectModeset));
+    let connector_name = connector(backend, 1);
+    let output_id = output_id(backend, &connector_name);
+    let error = Backend::apply_crtc_config(
+        backend,
+        output_id,
+        &connector_name,
+        Some(ModeSpec {
+            width: 800,
+            height: 600,
+            vrefresh: 75,
+        }),
+        800,
+        0,
+    )
+    .expect_err("recording power executor rejects the modeset");
+    assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    assert_eq!(backend.platform.outputs[1].key, output_key);
+    assert_eq!(backend.platform.outputs[1].output.picked.vrefresh, 60);
+
+    now.set(now.get() + Duration::from_secs(2));
+    assert!(Backend::arm_present_shared_wake(backend, crtc_id).expect("existing wake covers"));
+    assert_eq!(
+        Backend::arm_idle_vblanks(backend, crtc_id, &[9]).expect("existing idle slot covers"),
+        0
+    );
+    assert_eq!(source.legacy_vblank_arms().len(), arms_before);
+    assert_eq!(
+        backend.platform.vblank_fallback.kernel_arm_watch, watches_before,
+        "a refused modeset preserves each outstanding slot's original deadline"
+    );
     fixture.finish_after_normal_drain();
 }
 
@@ -802,6 +1019,134 @@ fn enabling_an_off_output_modesets_only_its_crtc() {
     flip_for(&next, crtc0);
     flip_for(&next, crtc1);
     retire_all(&mut fixture, &next, 2, None);
+    fixture.adopt_drawables(0x6b00..0x6b03);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: clear the mark on a same-route modeset, or keep the old interval.
+fn same_route_modeset_keeps_the_mark_and_never_rewinds() {
+    let Some((mut fixture, _log, _route)) = live_two_heads() else {
+        println!(
+            "SKIP same_route_modeset_keeps_the_mark_and_never_rewinds: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let now = install_fake_clock(&mut fixture.events.backend);
+    let (key, crtc_id, _source) = freeze_output_for_test(&mut fixture.events.backend, 1, &now);
+    now.set(now.get() + Duration::from_secs(1));
+    let before = Backend::present_get_ust_msc(&fixture.events.backend, crtc_id);
+
+    let backend = &mut fixture.events.backend;
+    let mut discovered = clone_test_drm_output(&backend.platform.outputs[1].output);
+    let mut timing = advertised(800, 600);
+    timing.vrefresh = 240;
+    timing.clock_khz = 0;
+    timing.htotal = 0;
+    timing.vtotal = 0;
+    discovered.picked = timing.clone();
+    discovered.modes.push(timing);
+    backend.pstate.crtc_config_discovery_override = Some(discovered);
+    let connector_name = connector(backend, 1);
+    let output_id = output_id(backend, &connector_name);
+    assert!(
+        Backend::apply_crtc_config(
+            backend,
+            output_id,
+            &connector_name,
+            Some(ModeSpec {
+                width: 800,
+                height: 600,
+                vrefresh: 240,
+            }),
+            800,
+            0,
+        )
+        .expect("same-route 240 Hz mode change")
+    );
+
+    let frozen = backend.platform.vblank_fallback.frozen[&key];
+    assert_eq!(
+        frozen.anchor_msc, before.0,
+        "modeset anchors at the current MSC"
+    );
+    assert_eq!(
+        frozen.anchor_ust, before.1,
+        "modeset anchors at the current UST"
+    );
+    assert_eq!(frozen.anchor_at, now.get());
+    assert_eq!(frozen.interval, Duration::from_nanos(1_000_000_000 / 240));
+    now.set(now.get() + frozen.interval * 2);
+    assert_eq!(
+        Backend::present_get_ust_msc(backend, crtc_id).0,
+        before.0 + 2,
+        "the re-anchored clock advances at the new mode's rate"
+    );
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: retain a frozen mark after disable, preventing the kernel arm on enable.
+fn disable_and_enable_returns_to_the_kernel_clock() {
+    let Some((mut fixture, _log, route)) = live_two_heads() else {
+        println!("SKIP disable_and_enable_returns_to_the_kernel_clock: Vulkan fixture unavailable");
+        return;
+    };
+    let now = install_fake_clock(&mut fixture.events.backend);
+    let (key, crtc_id, source) = freeze_output_for_test(&mut fixture.events.backend, 1, &now);
+    let backend = &mut fixture.events.backend;
+    let output_key = backend.platform.outputs[1].key.clone();
+    let saved = clone_test_drm_output(&backend.platform.outputs[1].output);
+    let connector_name = connector(backend, 1);
+    let output_id = output_id(backend, &connector_name);
+    assert!(
+        Backend::apply_crtc_config(backend, output_id, &connector_name, None, 0, 0,)
+            .expect("disable frozen CRTC")
+    );
+    assert!(!backend.platform.vblank_fallback.frozen.contains_key(&key));
+    assert!(
+        !backend
+            .platform
+            .vblank_fallback
+            .kernel_arm_watch
+            .keys()
+            .any(|(watched, _)| *watched == key)
+    );
+
+    backend.pstate.crtc_config_discovery_override = Some(saved);
+    let pool = recording_scanout_pool(backend, &output_key, route, (800, 600), 0x6b00, 0x5300)
+        .expect("replacement pool for re-enable");
+    backend.pstate.crtc_config_discovery_pool = Some((route, pool));
+    assert!(
+        Backend::apply_crtc_config(backend, output_id, &connector_name, Some(MODE_800), 800, 0,)
+            .expect("re-enable CRTC")
+    );
+    assert!(!backend.platform.vblank_fallback.frozen.contains_key(&key));
+    backend
+        .pstate
+        .crtc_queue_sequence_unsupported_devices
+        .insert(key.device_key);
+    backend.platform.vblank_fallback.pipes.insert(key, 1);
+    source.set_legacy_vblank(Ok(5));
+    assert!(
+        Backend::arm_present_shared_wake(backend, crtc_id)
+            .expect("re-enabled CRTC arms the kernel wake")
+    );
+    assert!(super::vblank_arm_is_watched(
+        backend,
+        key,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT
+    ));
+    assert!(
+        backend
+            .platform
+            .vblank_fallback
+            .kernel_arm_watch
+            .contains_key(&(key, super::SHARED_WAKE_VBLANK_ARM_SLOT,))
+    );
+    assert!(!backend.platform.vblank_fallback.software.contains_key(&key));
     fixture.adopt_drawables(0x6b00..0x6b03);
     fixture.finish_after_normal_drain();
 }

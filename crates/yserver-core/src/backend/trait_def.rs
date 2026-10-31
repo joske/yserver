@@ -1263,28 +1263,20 @@ pub trait Backend {
     fn present_crtc_clock_epoch(&self, _crtc_id: u32) -> u64 {
         0
     }
-    /// Kernel accepts absolute CRTC_QUEUE_SEQUENCE arming. Gates the
-    /// idle-display fallback to flip-driven-clock drivers. Default false.
+    /// Kernel accepts CRTC_QUEUE_SEQUENCE arming. Gates the idle-display
+    /// fallback to flip-driven-clock drivers. Default false.
     fn present_absolute_vblank_arm_supported(&self, _crtc_id: u32) -> bool {
         false
     }
-    /// Arm absolute vblank sequences for parked future-target presents.
-    /// Own per-CRTC target set; must not consume or suppress the
-    /// relative-1 idle arm.
+    /// Keep one tagged next-vblank wake outstanding for Present work on a
+    /// CRTC. The wake covers every Present target on that CRTC and is
+    /// independent of the untagged idle-vblank arm.
     ///
-    /// Returns the number of targets now **covered** by an in-flight arm
-    /// — newly issued or already armed from a prior call — not just
-    /// newly issued arms: the caller re-arms every iteration, and a
-    /// still-parked already-armed target must not read as failure. `0`
-    /// or `Err` means the caller must not park on this mechanism (no
-    /// targets, no outputs, arming unsupported/failed) and should fall
-    /// through to another due-execution trigger. Default `Ok(0)`.
-    fn arm_present_absolute_vblank(
-        &mut self,
-        _crtc_id: u32,
-        _targets: &[u64],
-    ) -> std::io::Result<usize> {
-        Ok(0)
+    /// Returns `true` when the tagged wake is already outstanding or was
+    /// newly armed. `false` means no wake is available; `Err` reports an
+    /// arming failure. Default `Ok(false)`.
+    fn arm_present_shared_wake(&mut self, _crtc_id: u32) -> std::io::Result<bool> {
+        Ok(false)
     }
     /// Display cannot scan out at all (VT-away OR DPMS-off). Gates the
     /// blackout flush. Default false.

@@ -257,6 +257,7 @@ fn accepted_framebuffer(
 fn single_buffer_rotation_promotes_on_its_second_present() {
     let (mut b, _) = backend();
     let a = root_pixmap(&mut b, 0x0061_0001);
+    b.pstate.scanout_m0.interval_start = Instant::now();
 
     observe(&mut b, 0x0061_0001, STAGE);
     assert_eq!(b.pstate.scanout_m0.server.candidates, 1);
