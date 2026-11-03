@@ -39,7 +39,7 @@ serde_json = "1"
 signal-hook = "0.4"
 thiserror = "2"
 udev = "0.9"
-xkbcommon = "0.9"
+xkbcommon = { version = "0.9", default-features = false }
 yserver-core = { path = "crates/yserver-core", default-features = false }
 yserver-protocol = { path = "crates/yserver-protocol", default-features = false }
 yserver-render = { path = "crates/yserver-render", default-features = false }
