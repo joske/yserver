@@ -5,7 +5,7 @@
 //! [`PresentCompletionEntry`]; the concrete payload (core's event and wake
 //! handles) lives in `present_completion`, which recovers it by downcast.
 
-use std::os::fd::OwnedFd;
+use yserver_protocol::fd::OwnedFd;
 
 use ash::vk;
 
@@ -36,9 +36,14 @@ impl PresentBatchWait {
     /// sync_file, `Ready`, or `Poll` (which defers to the batch ticket).
     #[must_use]
     pub fn signaled(&self) -> bool {
-        use std::os::fd::AsRawFd as _;
+        #[cfg(unix)]
+        use yserver_protocol::fd::AsRawFd as _;
         match self {
             Self::Ready | Self::Poll => true,
+            // No sync file exists on Windows.
+            #[cfg(windows)]
+            Self::Fd(fd) => match *fd {},
+            #[cfg(unix)]
             Self::Fd(fd) => {
                 let mut pfd = libc::pollfd {
                     fd: fd.as_raw_fd(),

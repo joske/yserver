@@ -206,7 +206,7 @@ pub enum ImageBacking {
     /// constructor can drop into the existing enum without the
     /// invasive refactor of a sealed type.
     Imported {
-        dma_buf_fd: std::os::fd::OwnedFd,
+        dma_buf_fd: yserver_protocol::fd::OwnedFd,
         vk_memory: vk::DeviceMemory,
     },
 }
@@ -337,7 +337,7 @@ impl DrawableImage {
     /// retained original.
     pub fn from_dmabuf(
         vk: Arc<VkContext>,
-        dma_buf_fd: std::os::fd::OwnedFd,
+        dma_buf_fd: yserver_protocol::fd::OwnedFd,
         width: u32,
         height: u32,
         format: vk::Format,
@@ -375,7 +375,7 @@ impl DrawableImage {
     #[allow(clippy::too_many_arguments)]
     pub fn from_dmabuf_with_usage(
         vk: Arc<VkContext>,
-        dma_buf_fd: std::os::fd::OwnedFd,
+        dma_buf_fd: yserver_protocol::fd::OwnedFd,
         width: u32,
         height: u32,
         format: vk::Format,
@@ -385,7 +385,7 @@ impl DrawableImage {
         usage: vk::ImageUsageFlags,
         linear_layout_policy: NonExplicitLinearLayoutPolicy,
     ) -> Result<Self, DrawableImageError> {
-        use std::os::fd::IntoRawFd as _;
+        use yserver_protocol::fd::IntoRawFd as _;
         if plane_offsets.len() != plane_pitches.len() {
             return Err(DrawableImageError::Vk(
                 vk::Result::ERROR_INITIALIZATION_FAILED,
@@ -752,8 +752,8 @@ impl DrawableImage {
     /// outstanding GPU writes via the buffer's implicit fence —
     /// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`. Server-owned images are
     /// ordered by yserver's own queue barriers and need no such wait.
-    pub fn imported_dma_buf_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
-        use std::os::fd::AsFd;
+    pub fn imported_dma_buf_fd(&self) -> Option<yserver_protocol::fd::BorrowedFd<'_>> {
+        use yserver_protocol::fd::AsFd;
         match &self.backing {
             ImageBacking::Imported { dma_buf_fd, .. } => Some(dma_buf_fd.as_fd()),
             ImageBacking::ServerOwned { .. } => None,
@@ -1133,6 +1133,8 @@ impl DrawableImage {
     /// don't go through the pool; caller must check).
     #[allow(dead_code)] // wired by pixmap-pool T2 (free_pixmap).
     pub fn into_pool_entry(mut self) -> crate::kms::vk::pixmap_pool::PooledPixmapImage {
+        // Windows has no dma-buf import, so no `Imported` backing.
+        #[cfg_attr(windows, allow(irrefutable_let_patterns))]
         let ImageBacking::ServerOwned { vk_memory } = self.backing else {
             panic!("DrawableImage::into_pool_entry: Imported backing cannot be pooled");
         };
@@ -1884,7 +1886,7 @@ fn pick_memory_type(
 #[allow(dead_code)]
 fn _compile_check_from_dmabuf(
     vk: Arc<VkContext>,
-    dma_buf_fd: std::os::fd::OwnedFd,
+    dma_buf_fd: yserver_protocol::fd::OwnedFd,
     modifier: u64,
     plane_offsets: &[u64],
     plane_pitches: &[u32],

@@ -22,6 +22,8 @@ use std::{
     path::PathBuf,
 };
 
+use crate::fd::RawSocket;
+#[cfg(unix)]
 use crate::fd::{AsRawFd, RawFd};
 
 use super::{pad4, padded_len, read_i16, read_u16, read_u32, write_u16};
@@ -77,20 +79,30 @@ impl Write for HostStream {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for HostStream {
     fn as_raw_fd(&self) -> RawFd {
         match self {
-            #[cfg(unix)]
             HostStream::Unix(s) => s.as_raw_fd(),
-            #[cfg(unix)]
             HostStream::Tcp(s) => s.as_raw_fd(),
-            #[cfg(windows)]
-            HostStream::Tcp(s) => std::os::windows::io::AsRawSocket::as_raw_socket(s),
         }
     }
 }
 
 impl HostStream {
+    /// The socket [`wait_readable`](crate::core_loop::client_reader::wait_readable)
+    /// waits on.
+    #[cfg(unix)]
+    pub(super) fn raw_socket(&self) -> RawSocket {
+        self.as_raw_fd()
+    }
+
+    #[cfg(windows)]
+    pub(super) fn raw_socket(&self) -> RawSocket {
+        let HostStream::Tcp(s) = self;
+        std::os::windows::io::AsRawSocket::as_raw_socket(s)
+    }
+
     /// Read what is available without blocking, whatever the stream's own
     /// blocking mode.
     #[cfg(unix)]

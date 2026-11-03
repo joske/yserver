@@ -452,8 +452,8 @@ impl RenderEngine {
         } else {
             (Vec::new(), Vec::new())
         };
-        let exported_borrows: Vec<(std::os::fd::BorrowedFd<'_>, bool)> = {
-            use std::os::fd::AsFd as _;
+        let exported_borrows: Vec<(yserver_protocol::fd::BorrowedFd<'_>, bool)> = {
+            use yserver_protocol::fd::AsFd as _;
             exported
                 .iter()
                 .map(|(f, prewaited)| (f.as_fd(), *prewaited))

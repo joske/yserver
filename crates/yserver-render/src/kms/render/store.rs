@@ -27,9 +27,10 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    os::fd::OwnedFd,
     sync::Arc,
 };
+
+use yserver_protocol::fd::OwnedFd;
 
 use ash::vk;
 

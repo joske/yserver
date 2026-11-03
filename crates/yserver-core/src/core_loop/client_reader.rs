@@ -40,7 +40,7 @@ use yserver_protocol::x11::{self, ClientByteOrder, ClientId, SequenceNumber};
 use crate::unix_fd::FdReader;
 use crate::{
     core_loop::{message::Message, sender::BoundSender},
-    fd::RawFd,
+    fd::RawSocket,
     server::ReaderControl,
     transport::Transport,
 };
@@ -278,7 +278,7 @@ impl BlockingFdReader {
     fn take_attached_fd(&mut self, fd_count: usize) -> Option<std::os::fd::OwnedFd> {
         use std::os::fd::FromRawFd;
 
-        let mut attached_fd: Option<RawFd> = None;
+        let mut attached_fd: Option<std::os::fd::RawFd> = None;
         for _ in 0..fd_count {
             // First fd → attached_fd; any extras (PixmapFromBuffers
             // num_buffers > 1) are closed because Phase 4.2 only
@@ -307,7 +307,7 @@ impl BlockingFdReader {
         None
     }
 
-    fn fd(&self) -> RawFd {
+    fn fd(&self) -> RawSocket {
         self.inner.fd()
     }
 }
@@ -341,7 +341,7 @@ impl FdReader {
         }
     }
 
-    fn fd(&self) -> RawFd {
+    fn fd(&self) -> RawSocket {
         std::os::windows::io::AsRawSocket::as_raw_socket(&self.0)
     }
 }
@@ -357,7 +357,7 @@ impl io::Read for FdReader {
 /// also surfaced as readable so the caller observes EOF on the next
 /// `read`.
 #[cfg(unix)]
-pub(crate) fn wait_readable(fd: RawFd) -> io::Result<()> {
+pub(crate) fn wait_readable(fd: RawSocket) -> io::Result<()> {
     use std::time::Duration;
     let mut pfd = libc::pollfd {
         fd,
@@ -385,7 +385,7 @@ pub(crate) fn wait_readable(fd: RawFd) -> io::Result<()> {
 /// error are reported readable, so the caller observes them on the next
 /// `read`.
 #[cfg(windows)]
-pub(crate) fn wait_readable(socket: RawFd) -> io::Result<()> {
+pub(crate) fn wait_readable(socket: RawSocket) -> io::Result<()> {
     use windows_sys::Win32::Networking::WinSock::{POLLRDNORM, SOCKET, WSAPOLLFD, WSAPoll};
 
     let mut pfd = WSAPOLLFD {

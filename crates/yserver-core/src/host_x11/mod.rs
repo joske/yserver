@@ -16,10 +16,9 @@ use std::{
 use log::debug;
 use yserver_protocol::x11::ResourceId;
 
-use crate::{
-    backend::{OriginContext, PixmapHandle, WindowHandle},
-    fd::{AsRawFd, RawFd},
-};
+use crate::backend::{OriginContext, PixmapHandle, WindowHandle};
+#[cfg(unix)]
+use crate::fd::{AsRawFd, RawFd};
 
 use crate::core_loop::client_reader::wait_readable;
 
@@ -434,6 +433,7 @@ impl HostX11Backend {
     /// Raw fd of the host X11 connection. The core registers this with
     /// its mio poller (using a unique backend poll-source token) so readiness wakes the core
     /// to call `drain_host_socket`.
+    #[cfg(unix)]
     pub(super) fn host_fd(&self) -> RawFd {
         self.stream.as_raw_fd()
     }
@@ -773,7 +773,7 @@ impl HostX11Backend {
             if let Some(response) = self.take_buffered_reply(target_full) {
                 return Ok(decode_reply_or_error(response));
             }
-            wait_readable(self.stream.as_raw_fd())?;
+            wait_readable(self.stream.raw_socket())?;
         }
     }
 

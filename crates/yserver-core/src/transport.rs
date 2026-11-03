@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
 use crate::fd::{AsRawFd, RawFd};
 
 #[cfg(test)]
@@ -174,15 +175,12 @@ impl Write for Transport {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for Transport {
     fn as_raw_fd(&self) -> RawFd {
         match self {
-            #[cfg(unix)]
             Self::Unix(stream) => stream.as_raw_fd(),
-            #[cfg(unix)]
             Self::Tcp(stream) => stream.as_raw_fd(),
-            #[cfg(windows)]
-            Self::Tcp(stream) => std::os::windows::io::AsRawSocket::as_raw_socket(stream),
             #[cfg(test)]
             Self::Capture(_) => -1,
         }

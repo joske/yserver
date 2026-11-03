@@ -10,10 +10,10 @@ use ash::vk;
 use std::rc::Weak;
 use std::{
     cell::{Cell, RefCell},
-    os::fd::OwnedFd,
     rc::Rc,
     sync::Arc,
 };
+use yserver_protocol::fd::OwnedFd;
 
 /// `FenceTicket::wait` calls on this thread (spec §10 "the engine's wait
 /// counter"); per thread, so parallel tests each see their own.

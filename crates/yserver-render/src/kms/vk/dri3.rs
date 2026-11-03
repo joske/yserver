@@ -388,7 +388,7 @@ pub fn export_dmabuf(
 
 #[derive(Debug)]
 pub struct DmabufExport {
-    pub fd: std::os::fd::OwnedFd,
+    pub fd: yserver_protocol::fd::OwnedFd,
     pub size: u32,
     pub stride: u32,
     /// Byte offset of plane 0 in the dma-buf, as the driver laid it out;
@@ -479,7 +479,7 @@ pub fn export_promoted(
 /// give a client asking about that pixmap is `DRM_FORMAT_MOD_INVALID`.
 pub fn import_dmabuf_reporting(
     vk: Arc<VkContext>,
-    dma_buf_fd: std::os::fd::OwnedFd,
+    dma_buf_fd: yserver_protocol::fd::OwnedFd,
     width: u32,
     height: u32,
     format: vk::Format,
@@ -496,7 +496,7 @@ pub fn import_dmabuf_reporting(
 
 pub fn import_dmabuf(
     vk: Arc<VkContext>,
-    dma_buf_fd: std::os::fd::OwnedFd,
+    dma_buf_fd: yserver_protocol::fd::OwnedFd,
     width: u32,
     height: u32,
     format: vk::Format,
@@ -538,6 +538,7 @@ pub enum DmabufWait {
 pub type DmabufReadWait = DmabufWait;
 
 // `struct dma_buf_export_sync_file { __u32 flags; __s32 fd; }`
+#[cfg(unix)]
 #[repr(C)]
 struct DmaBufExportSyncFile {
     flags: u32,
@@ -551,7 +552,7 @@ struct DmaBufExportSyncFile {
 // 32-bit `Ioctl`; cast from the unsigned literal to preserve the bit pattern.
 #[cfg(target_os = "linux")]
 const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: libc::Ioctl = 0xc008_6202_u32 as libc::Ioctl;
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: libc::c_ulong = 0xc008_6202;
 const DMA_BUF_SYNC_READ: u32 = 1 << 0;
 const DMA_BUF_SYNC_WRITE: u32 = 1 << 1;
@@ -565,13 +566,17 @@ pub enum ExportedSyncFile {
     /// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` unsupported / errored.
     Unsupported,
     /// The exported sync_file fd; caller owns it.
-    Fd(std::os::fd::OwnedFd),
+    Fd(yserver_protocol::fd::OwnedFd),
 }
 
 /// Shared `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` ioctl. `flags` selects the
 /// reservation scope (see [`sync_file_export_and_poll`] doc). Returns the
 /// owned sync_file fd, or `Idle`/`Unsupported`.
-fn export_sync_file_fd(dma_buf_fd: std::os::fd::BorrowedFd<'_>, flags: u32) -> ExportedSyncFile {
+#[cfg(unix)]
+fn export_sync_file_fd(
+    dma_buf_fd: yserver_protocol::fd::BorrowedFd<'_>,
+    flags: u32,
+) -> ExportedSyncFile {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     let mut export = DmaBufExportSyncFile { flags, fd: -1 };
@@ -596,18 +601,28 @@ fn export_sync_file_fd(dma_buf_fd: std::os::fd::BorrowedFd<'_>, flags: u32) -> E
     ExportedSyncFile::Fd(unsafe { OwnedFd::from_raw_fd(export.fd) })
 }
 
+/// Windows has no dma-bufs.
+#[cfg(windows)]
+fn export_sync_file_fd(
+    _dma_buf_fd: yserver_protocol::fd::BorrowedFd<'_>,
+    _flags: u32,
+) -> ExportedSyncFile {
+    ExportedSyncFile::Unsupported
+}
+
 /// Shared implementation of `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` + `poll`.
 ///
 /// `flags` selects the reservation scope:
 /// - [`DMA_BUF_SYNC_READ`]  — snapshot the write fence a reader must wait on.
 /// - [`DMA_BUF_SYNC_WRITE`] — snapshot ALL fences (readers + writers) a writer
 ///   must wait on before overwriting the buffer.
+#[cfg(unix)]
 fn sync_file_export_and_poll(
-    dma_buf_fd: std::os::fd::BorrowedFd<'_>,
+    dma_buf_fd: yserver_protocol::fd::BorrowedFd<'_>,
     flags: u32,
     timeout_ms: i32,
 ) -> DmabufWait {
-    use std::os::fd::AsRawFd;
+    use yserver_protocol::fd::AsRawFd;
 
     let sync_fd = match export_sync_file_fd(dma_buf_fd, flags) {
         ExportedSyncFile::Unsupported => return DmabufWait::Unsupported,
@@ -629,6 +644,16 @@ fn sync_file_export_and_poll(
     }
 }
 
+/// Windows has no dma-bufs.
+#[cfg(windows)]
+fn sync_file_export_and_poll(
+    _dma_buf_fd: yserver_protocol::fd::BorrowedFd<'_>,
+    _flags: u32,
+    _timeout_ms: i32,
+) -> DmabufWait {
+    DmabufWait::Unsupported
+}
+
 /// CPU-wait for a DRI3-imported dma-buf's outstanding producer writes
 /// to complete before yserver reads it (e.g. a `PresentPixmap` copy).
 ///
@@ -647,7 +672,7 @@ fn sync_file_export_and_poll(
 /// [`export_dmabuf_read_access_sync_file`] and resumes asynchronously from
 /// the main loop instead of blocking here.
 pub fn wait_dmabuf_read_ready(
-    dma_buf_fd: std::os::fd::BorrowedFd<'_>,
+    dma_buf_fd: yserver_protocol::fd::BorrowedFd<'_>,
     timeout_ms: i32,
 ) -> DmabufWait {
     sync_file_export_and_poll(dma_buf_fd, DMA_BUF_SYNC_READ, timeout_ms)
@@ -658,7 +683,7 @@ pub fn wait_dmabuf_read_ready(
 /// overtake. Callers may register the fd in an event loop and submit the copy
 /// only after it becomes readable.
 pub fn export_dmabuf_read_access_sync_file(
-    dma_buf_fd: std::os::fd::BorrowedFd<'_>,
+    dma_buf_fd: yserver_protocol::fd::BorrowedFd<'_>,
 ) -> ExportedSyncFile {
     export_sync_file_fd(dma_buf_fd, DMA_BUF_SYNC_READ)
 }
@@ -668,7 +693,7 @@ pub fn export_dmabuf_read_access_sync_file(
 /// that a subsequent yserver write must not overtake. Callers should import
 /// it as a Vulkan wait semaphore on the submission that performs the write.
 pub fn export_dmabuf_write_access_sync_file(
-    dma_buf_fd: std::os::fd::BorrowedFd<'_>,
+    dma_buf_fd: yserver_protocol::fd::BorrowedFd<'_>,
 ) -> ExportedSyncFile {
     export_sync_file_fd(dma_buf_fd, DMA_BUF_SYNC_WRITE)
 }
@@ -684,13 +709,14 @@ pub fn export_dmabuf_write_access_sync_file(
 /// **Bounded / deadlock-safe:** on `timeout_ms` elapse it returns
 /// [`DmabufWait::TimedOut`] and the caller proceeds.
 pub fn wait_dmabuf_write_ready(
-    dma_buf_fd: std::os::fd::BorrowedFd<'_>,
+    dma_buf_fd: yserver_protocol::fd::BorrowedFd<'_>,
     timeout_ms: i32,
 ) -> DmabufWait {
     sync_file_export_and_poll(dma_buf_fd, DMA_BUF_SYNC_WRITE, timeout_ms)
 }
 
 // `struct dma_buf_import_sync_file { __u32 flags; __s32 fd; }` — 8 bytes.
+#[cfg(unix)]
 #[repr(C)]
 struct DmaBufImportSyncFile {
     flags: u32,
@@ -702,7 +728,7 @@ struct DmaBufImportSyncFile {
 //   (1<<30) | (8<<16) | (0x62<<8) | 3 = 0x4008_6203
 #[cfg(target_os = "linux")]
 const DMA_BUF_IOCTL_IMPORT_SYNC_FILE: libc::Ioctl = 0x4008_6203_u32 as libc::Ioctl;
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 const DMA_BUF_IOCTL_IMPORT_SYNC_FILE: libc::c_ulong = 0x4008_6203;
 
 /// Attach `sync_fd` (a sync_file representing yserver's completed Vulkan write)
@@ -719,11 +745,12 @@ const DMA_BUF_IOCTL_IMPORT_SYNC_FILE: libc::c_ulong = 0x4008_6203;
 /// does not support `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` (`ENOTTY` or
 /// `EINVAL`).  Any other non-zero ioctl return is propagated as
 /// `io::Error::last_os_error()`.
+#[cfg(unix)]
 pub fn import_dmabuf_write_fence(
-    dmabuf: std::os::fd::BorrowedFd<'_>,
-    sync_fd: std::os::fd::BorrowedFd<'_>,
+    dmabuf: yserver_protocol::fd::BorrowedFd<'_>,
+    sync_fd: yserver_protocol::fd::BorrowedFd<'_>,
 ) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
+    use yserver_protocol::fd::AsRawFd;
 
     let mut arg = DmaBufImportSyncFile {
         flags: DMA_BUF_SYNC_WRITE,
@@ -747,6 +774,15 @@ pub fn import_dmabuf_write_fence(
         return Err(err);
     }
     Ok(())
+}
+
+/// Windows has no dma-bufs.
+#[cfg(windows)]
+pub fn import_dmabuf_write_fence(
+    _dmabuf: yserver_protocol::fd::BorrowedFd<'_>,
+    _sync_fd: yserver_protocol::fd::BorrowedFd<'_>,
+) -> std::io::Result<()> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
 #[cfg(test)]
