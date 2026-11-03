@@ -34,7 +34,7 @@ nix = { version = "0.31", features = [
   "socket",
   "term",
 ] }
-roxmltree = "0.20"
+roxmltree = "0.21"
 serde_json = "1"
 signal-hook = "0.4"
 thiserror = "2"
