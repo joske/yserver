@@ -24,23 +24,28 @@ use yserver_core::rootless::ToplevelId;
 
 use super::{
     shell::{self, WM_RUN},
-    window,
+    tray, window,
 };
 use crate::windows::input::{self, RawKeyMessage, ShellInput};
 
 /// `WM_MOUSELEAVE` (`winuser.h`), from the `Win32_UI_Controls` feature.
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
-/// The message window's procedure: the shell's queued work, the end.
+/// The message window's procedure: the shell's queued work, the tray
+/// icon, the end.
 pub(super) unsafe extern "system" fn message(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if tray::message(message, lparam) {
+        return 0;
+    }
     match message {
         WM_RUN => shell::run_jobs(),
         WM_DESTROY => {
+            tray::remove();
             // SAFETY: ends this thread's message loop.
             unsafe { PostQuitMessage(0) };
         }

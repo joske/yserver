@@ -115,6 +115,30 @@ impl ShellUi for UiQueue {
     }
 }
 
+/// Ask whether to quit while `clients` X clients are connected; `true`
+/// without asking when none is.
+pub(super) fn confirm_quit(owner: HWND, clients: usize) -> bool {
+    if clients == 0 {
+        return true;
+    }
+    let noun = if clients == 1 { "client" } else { "clients" };
+    let text: Vec<u16> =
+        format!("{clients} X {noun} connected\n\nQuitting yserver disconnects them.")
+            .encode_utf16()
+            .chain([0])
+            .collect();
+    // SAFETY: a live window (or none) and NUL-terminated strings.
+    let answer = unsafe {
+        MessageBoxW(
+            owner,
+            text.as_ptr(),
+            windows_sys::core::w!("yserver"),
+            MB_OKCANCEL | MB_ICONWARNING,
+        )
+    };
+    answer == IDOK
+}
+
 /// Post `message` to the window `hwnd` from any thread.
 fn post(hwnd: usize, message: u32) {
     // SAFETY: posting to a window handle is thread-safe; a destroyed
@@ -167,27 +191,10 @@ impl Shell {
     /// The close button: ask while X clients are connected, then shut down.
     fn close(&self) {
         let clients = self.clients.load(Ordering::Acquire);
-        if !self.close_confirmed.get() && clients > 0 {
-            let noun = if clients == 1 { "client" } else { "clients" };
-            let text: Vec<u16> =
-                format!("{clients} X {noun} connected\n\nQuitting yserver disconnects them.")
-                    .encode_utf16()
-                    .chain([0])
-                    .collect();
-            // SAFETY: a live window and NUL-terminated strings; the box runs
-            // a modal loop that may re-enter the window procedure, with no
-            // borrow held.
-            let answer = unsafe {
-                MessageBoxW(
-                    self.hwnd,
-                    text.as_ptr(),
-                    windows_sys::core::w!("yserver"),
-                    MB_OKCANCEL | MB_ICONWARNING,
-                )
-            };
-            if answer != IDOK {
-                return;
-            }
+        // The box runs a modal loop that may re-enter the window procedure,
+        // with no borrow held.
+        if !self.close_confirmed.get() && !confirm_quit(self.hwnd, clients) {
+            return;
         }
         self.close_confirmed.set(true);
         self.link.request_shutdown();

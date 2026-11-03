@@ -3,11 +3,13 @@
 //! ([`shell`]) and runs the message loop; the `DwmFlush` thread ticks the
 //! frame pacer.
 //!
-//! Shutdown: the core loop returns, drops every Vulkan object and asks the
-//! UI thread to quit (`ShellUi::quit`), which destroys the message window
+//! Shutdown: the tray icon's Exit asks the core to shut down (`tray`); the
+//! core loop returns, drops every Vulkan object and asks the UI thread to
+//! quit (`ShellUi::quit`), which destroys the message window
 //! and ends the message loop; `run` then returns the core's result.
 
 mod shell;
+mod tray;
 mod window;
 mod wndproc;
 
@@ -15,7 +17,7 @@ use std::{
     collections::{HashMap, HashSet},
     io, ptr,
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicUsize},
     thread,
 };
 
@@ -147,6 +149,7 @@ struct RootlessUi {
 impl ShellUi for RootlessUi {
     fn set_display(&self, display: u16) {
         log::info!("windows: rootless, DISPLAY=:{display}");
+        shell::on_ui(move |_| tray::set_display(display));
     }
 
     fn quit(&self, _failed: bool) {
@@ -207,6 +210,8 @@ pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
         input,
         message_window,
     );
+    let clients = Arc::new(AtomicUsize::new(0));
+    tray::install(message_window, Arc::clone(&link), Arc::clone(&clients));
     let ticker = DwmTicker::start(Arc::clone(&clock))?;
     let spec = RootlessSpec {
         surface_extension: ash::khr::win32_surface::NAME,
@@ -216,7 +221,7 @@ pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
         ui: Arc::new(RootlessUi {
             message_window: message_window as usize,
         }),
-        clients: Arc::default(),
+        clients,
     };
     let host = WinRootlessHost {
         pacer,

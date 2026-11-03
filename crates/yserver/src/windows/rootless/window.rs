@@ -21,12 +21,12 @@ use windows_sys::{
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::{
             AdjustWindowRectEx, CW_USEDEFAULT, CreateWindowExW, GA_ROOT, GWL_EXSTYLE, GWL_STYLE,
-            GWLP_USERDATA, GetAncestor, GetClientRect, GetWindowLongPtrW, HWND_MESSAGE,
-            IDI_APPLICATION, LoadIconW, MONITORINFOF_PRIMARY, RegisterClassExW, SetWindowLongPtrW,
-            WINDOW_EX_STYLE, WINDOW_STYLE, WMSZ_BOTTOMLEFT, WMSZ_LEFT, WMSZ_TOP, WMSZ_TOPLEFT,
-            WMSZ_TOPRIGHT, WNDCLASSEXW, WNDPROC, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-            WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_POPUP, WS_SYSMENU,
-            WS_THICKFRAME, WindowFromPoint,
+            GWLP_USERDATA, GetAncestor, GetClientRect, GetWindowLongPtrW, IDI_APPLICATION,
+            LoadIconW, MONITORINFOF_PRIMARY, RegisterClassExW, SetWindowLongPtrW, WINDOW_EX_STYLE,
+            WINDOW_STYLE, WMSZ_BOTTOMLEFT, WMSZ_LEFT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT,
+            WNDCLASSEXW, WNDPROC, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+            WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+            WindowFromPoint,
         },
     },
     core::w,
@@ -188,24 +188,26 @@ pub(super) fn register(toplevel: WNDPROC, message: WNDPROC) -> io::Result<()> {
     Ok(())
 }
 
-/// The message-only window the core's commands are posted to.
+/// The window the core's commands are posted to and the tray icon talks
+/// to: a top-level never shown, as the tray menu needs a window that can be
+/// the foreground one (a message-only window cannot).
 ///
 /// # Errors
 ///
 /// The window could not be created.
 pub(super) fn create_message_window() -> io::Result<HWND> {
-    // SAFETY: a registered class; a message-only window.
+    // SAFETY: a registered class; no parent.
     let hwnd = unsafe {
         CreateWindowExW(
-            0,
+            WS_EX_TOOLWINDOW,
             MESSAGE_CLASS,
             w!("yserver"),
+            WS_POPUP,
             0,
             0,
             0,
             0,
-            0,
-            HWND_MESSAGE,
+            ptr::null_mut(),
             ptr::null_mut(),
             GetModuleHandleW(ptr::null()),
             ptr::null(),
