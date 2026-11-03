@@ -20,9 +20,9 @@ pub const GIT_COMMIT: &str = env!("YSERVER_GIT_COMMIT");
 /// the `#[cfg]` — not by hoping the source order happens to sort correctly.
 #[must_use]
 fn feature_list() -> String {
-    #[cfg(feature = "tcp-transport")]
+    #[cfg(tcp_transport)]
     let tcp_transport = Some("tcp-transport");
-    #[cfg(not(feature = "tcp-transport"))]
+    #[cfg(not(tcp_transport))]
     let tcp_transport: Option<&'static str> = None;
 
     #[cfg(feature = "xdmcp")]
@@ -60,21 +60,21 @@ mod tests {
     // only holds under the matching `--features` invocation; run all three to
     // see all three strings. Names describe what is built, not which one is
     // the default — the default set is a policy that can change.
-    #[cfg(all(feature = "tcp-transport", feature = "xdmcp"))]
+    #[cfg(all(tcp_transport, feature = "xdmcp"))]
     #[test]
     fn feature_suffix_full_build() {
         assert_eq!(feature_list(), "tcp-transport,xdmcp");
         assert!(line().ends_with(" features=[tcp-transport,xdmcp]"));
     }
 
-    #[cfg(all(feature = "tcp-transport", not(feature = "xdmcp")))]
+    #[cfg(all(tcp_transport, not(feature = "xdmcp")))]
     #[test]
     fn feature_suffix_tcp_transport_only() {
         assert_eq!(feature_list(), "tcp-transport");
         assert!(line().ends_with(" features=[tcp-transport]"));
     }
 
-    #[cfg(not(feature = "tcp-transport"))]
+    #[cfg(not(tcp_transport))]
     #[test]
     fn feature_suffix_minimal_build() {
         assert_eq!(feature_list(), "");

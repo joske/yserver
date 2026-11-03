@@ -122,7 +122,8 @@ pub struct LaunchOptions {
     /// `-auth FILE` — stashed for item 4, unused now.
     pub auth_file: Option<PathBuf>,
     /// Whether `-listen tcp` is the last TCP transport option in argv.
-    /// TCP remains disabled by default, matching Xorg's no-listen list.
+    /// Off by default, matching Xorg's no-listen list, except on Windows,
+    /// where TCP is the only transport.
     pub tcp_listen: bool,
     /// `--version` / `-version` — print version + git commit and exit
     /// (handled by the binary before `run()`).
@@ -188,7 +189,17 @@ pub enum VrrMode {
 /// without arguments; flags that change nothing do not count.
 #[must_use]
 pub fn has_argv_overrides(parsed: &LaunchOptions) -> bool {
-    *parsed != LaunchOptions::default()
+    *parsed != LaunchOptions::without_args()
+}
+
+impl LaunchOptions {
+    /// The options of a launch without arguments.
+    fn without_args() -> Self {
+        Self {
+            tcp_listen: cfg!(windows),
+            ..Self::default()
+        }
+    }
 }
 
 /// Rooted (one window is the root) or rootless (one native window per
@@ -285,7 +296,7 @@ fn next_value(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
 /// hard-errors only on malformed *explicit* requests and missing values
 /// for known value-taking flags.
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOptions, String> {
-    let mut o = LaunchOptions::default();
+    let mut o = LaunchOptions::without_args();
     let mut it = args.into_iter().peekable();
     // XDMCP fields build up alongside `o` as local state, and are only
     // assembled into `o.xdmcp` at the end of the loop: `XdmcpOptions`

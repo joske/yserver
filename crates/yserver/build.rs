@@ -21,6 +21,12 @@ fn main() {
     emit_cfg("kqueue", matches!(os, "freebsd" | "openbsd" | "macos"));
     // `eventfd(2)`, which DRM syncobj notification needs.
     emit_cfg("eventfd", matches!(os, "linux" | "freebsd"));
+    // `cfg(tcp_transport)`: TCP can be listened on. The feature everywhere,
+    // and always on Windows, where TCP is the only transport.
+    emit_cfg(
+        "tcp_transport",
+        env::var_os("CARGO_FEATURE_TCP_TRANSPORT").is_some() || os == "windows",
+    );
     // The `xkbcommon` crate links `-lxkbcommon` without a search path, and
     // neither Homebrew's lib dir (macOS) nor vcpkg's (Windows) is on the
     // linker's default path.

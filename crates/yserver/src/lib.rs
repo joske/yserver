@@ -150,7 +150,7 @@ fn validate_tcp_startup(
     // silently unix-only. `-nolisten tcp` (`opts.tcp_listen == false`) stays
     // accepted in this build — asking not to listen is satisfiable when the
     // binary cannot listen at all.
-    #[cfg(not(feature = "tcp-transport"))]
+    #[cfg(not(tcp_transport))]
     if opts.tcp_listen {
         return Err(io::Error::other(
             "this yserver was built without TCP support: -listen tcp needs the \
@@ -284,7 +284,7 @@ fn bind_client_listeners(
 /// the type is `std` and costs nothing, and forking every `match` on
 /// `Transport` would buy no meaningful size win — so only the ABILITY to
 /// create the listener is gated here.
-#[cfg(feature = "tcp-transport")]
+#[cfg(tcp_transport)]
 fn bind_tcp_listener(port: u16) -> io::Result<std::net::TcpListener> {
     let tcp =
         std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).map_err(|err| {
@@ -301,7 +301,7 @@ fn bind_tcp_listener(port: u16) -> io::Result<std::net::TcpListener> {
 /// `-listen tcp` long before this point, before any hardware or sockets are
 /// touched. This is a second line of defence only, mirroring
 /// `build_xdmcp_service`'s feature-off twin above.
-#[cfg(not(feature = "tcp-transport"))]
+#[cfg(not(tcp_transport))]
 fn bind_tcp_listener(_port: u16) -> io::Result<std::net::TcpListener> {
     Err(io::Error::other(
         "this yserver was built without TCP support: -listen tcp needs the \
@@ -1351,7 +1351,7 @@ fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
     Ok(kq)
 }
 
-#[cfg(all(test, feature = "tcp-transport"))]
+#[cfg(all(test, tcp_transport))]
 mod tcp_tests;
 
 #[cfg(test)]
@@ -1485,7 +1485,7 @@ mod tests {
     /// test asserting only that it errored would pass just as well if
     /// `-listen` had degraded to "unknown option", which is the failure this
     /// step exists to prevent.
-    #[cfg(not(feature = "tcp-transport"))]
+    #[cfg(not(tcp_transport))]
     #[test]
     fn a_build_without_tcp_transport_refuses_listen_tcp_at_startup_validation() {
         let opts = launch::parse_args([":7", "-listen", "tcp"].into_iter().map(String::from))
@@ -1516,7 +1516,7 @@ mod tests {
     /// `-nolisten tcp` asks not to listen, which a build lacking
     /// `tcp-transport` can always satisfy — it must not be swept up in the
     /// refusal above.
-    #[cfg(not(feature = "tcp-transport"))]
+    #[cfg(not(tcp_transport))]
     #[test]
     fn a_build_without_tcp_transport_still_accepts_nolisten_tcp() {
         let opts = launch::parse_args([":7", "-nolisten", "tcp"].into_iter().map(String::from))
@@ -1620,7 +1620,7 @@ mod tests {
     // built-without-TCP refusal fires first. Per the design's test-gating
     // rule, a test is gated by the narrowest feature whose behaviour it
     // asserts.
-    #[cfg(feature = "tcp-transport")]
+    #[cfg(tcp_transport)]
     #[test]
     fn listen_tcp_without_auth_is_rejected_before_startup() {
         let opts = crate::launch::parse_args(["-listen".into(), "tcp".into()]).unwrap();
@@ -1667,7 +1667,7 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "tcp-transport")]
+    #[cfg(tcp_transport)]
     #[test]
     fn tcp_startup_port_validation_accepts_65535_and_rejects_overflow() {
         let path = std::env::temp_dir().join(format!(
