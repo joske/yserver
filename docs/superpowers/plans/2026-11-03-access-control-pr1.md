@@ -64,9 +64,11 @@ is empty. `AuthState` gains `admit`, which returns how a client was admitted; th
   disconnect (`run.rs:2532-2554`), so a policy always hears `client_connected` before `connection_gone`. RECORD's
   `client_started` and the reset trigger's establishment arming stay where they are: the reset design arms only
   once setup reached Running (`2026-09-09-server-reset-design.md:297-305`), which is a different boundary.
-- `CredentialId` is a keyed 64-bit hash of the cookie bytes, keyed per `AuthState` with `std::hash::RandomState`:
-  stable for the process's life for the same cookie (a reload that keeps a cookie keeps its id), distinct cookies
-  get distinct ids with overwhelming probability, and the key never leaves the process.
+- `CredentialId` is allocated, not derived (maintainer, #320): `AuthState` holds a counter that only goes up,
+  and each credential gets the next id when it is loaded, stored beside its bytes (file cookies and the session
+  credential alike). A reload that still holds a cookie keeps that cookie's id; a cookie that leaves the file, a
+  replaced or cleared session credential and the cookies a reset drops (#324) take their ids with them, and an id
+  is never handed out again. The id says nothing about the cookie's bytes.
 
 ## Review Focus
 
@@ -98,8 +100,9 @@ is empty. `AuthState` gains `admit`, which returns how a client was admitted; th
   - `pub struct DenyError { pub code: u8, pub value: u32 }` with `pub const ACCESS: DenyError` (`BAD_ACCESS`, 0)
   - `pub struct AccessMode(u32)` with `pub const READ`, `pub const MANAGE`, `contains`, `|`
   - `pub struct RequestOpcodes { pub major: u8, pub minor: u8 }`
-  - `pub struct AccessContext<'a>` (fields private) with `pub fn peer(&self, client: ClientId) -> Option<&PeerIdentity>`,
-    `pub fn admission(&self, client: ClientId) -> Option<&Admission>`, `pub fn request(&self) -> Option<RequestOpcodes>`
+  - `pub struct AccessContext<'a>` (fields private) with `pub fn peer(&self, client: ClientId) -> Option<&PeerIdentity>`
+    and `pub fn request(&self) -> Option<RequestOpcodes>`. `admission` is added by Task 2, with the field it reads;
+    Task 1 has no placeholder.
   - `pub trait AccessPolicy: Send + Sync` with, all defaulting to allow / no-op:
     `fn server(&self, ctx: &AccessContext<'_>, client: ClientId, mode: AccessMode) -> Decision`,
     `fn client_connected(&self, ctx: &AccessContext<'_>, client: ClientId, peer: &PeerIdentity, admission: &Admission)`,
@@ -142,6 +145,7 @@ is empty. `AuthState` gains `admit`, which returns how a client was admitted; th
 
 **Interfaces:**
 - Consumes: `Admission`, `CredentialId`, `CredentialSource` (Task 1).
+- Produces: `AccessContext::admission(&self, client: ClientId) -> Option<&Admission>`, reading `ClientState.admission`.
 - Produces: `pub fn admit(&self, peer: &PeerIdentity, setup_generation: Generation, proto_name: &[u8], proto_data: &[u8]) -> Result<Admission, &'static str>`
   on `AuthState`. `check` keeps its signature and becomes `admit(..)` mapped to `AuthVerdict`; its callers and tests
   do not change.
@@ -159,11 +163,17 @@ is empty. `AuthState` gains `admit`, which returns how a client was admitted; th
   - `failed_cookie_then_host_list_admits_as_host_access`: Unix peer, wrong cookie, local access open → `HostAccess`.
     Mutation: record the presented cookie → fails.
   - `internal_client_admits_as_internal`: through `Message::InternalClient` → `Internal`.
+  - `credential_ids_are_kept_while_loaded_and_never_reused` (auth.rs, through `admit` and the file reload): a reload
+    that keeps C1 keeps its id; C1 removed from the file, then put back → a new id; a reset (#324 drops the cookies)
+    and the reload after it → a new id for the same bytes; a session credential replaced by another → a new id; no id
+    seen in the test repeats. Mutation: derive the id from the cookie bytes → fails.
+  - `access_context_returns_the_clients_admission`: a connected client's admission is what the context reports.
+    Mutation: return `None` → fails.
   - `admission_debug_never_shows_the_cookie` (auth.rs): `format!("{:?}", admission)` for a known cookie does not
     contain its bytes in hex or decimal.
 - [ ] **Step 2: Run, expect FAIL.** Run: `cargo test -p yserver-core --lib admit`
-- [ ] **Step 3: Implement** `admit`, the per-`AuthState` `RandomState` key, the message field and the `ClientState`
-  field.
+- [ ] **Step 3: Implement** `admit`, the id counter and the id stored beside each credential, the message field, the
+  `ClientState` field and `AccessContext::admission`.
 - [ ] **Step 4: Run, expect PASS**, plus the whole `auth`, `xdmcp` and `setup_thread` test modules unchanged, 5 runs
   under load.
 - [ ] **Step 5: Commit** `feat(core): record how each client was admitted`
@@ -254,7 +264,8 @@ is empty. `AuthState` gains `admit`, which returns how a client was admitted; th
 - [ ] `cargo +nightly fmt` first, then `cargo +nightly fmt -- --check` (AGENTS.md).
 - [ ] `cargo clippy --all-targets -- -D warnings`, exactly as CI (AGENTS.md), and the FreeBSD cross-check:
   `source ~/Projects/claude-scratch/freebsd-sysroot/env.sh && cargo clippy -p yserver-core --target x86_64-unknown-freebsd`.
-- [ ] `cargo test --workspace`, each `crates/*/tests/*.rs`, and `cargo test --workspace --features xdmcp -- --ignored`
+- [ ] `cargo test --workspace`, `cargo test --workspace --features xdmcp` (the ordinary XDMCP tests, which the
+  `--ignored` run skips), each `crates/*/tests/*.rs`, and `cargo test --workspace --features xdmcp -- --ignored`
   (lavapipe suite, as CI).
 - [ ] The setup-thread, `run_core` and lifecycle tests 5 times under `nproc` busy loops, zero failures.
 - [ ] `just man`.
