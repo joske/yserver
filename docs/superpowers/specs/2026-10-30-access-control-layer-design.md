@@ -1,7 +1,7 @@
 # Access control layer
 
-Status: draft, revised after the maintainer's answer on #320. Nothing is
-implemented.
+Status: draft, revised after the maintainer's second answer on #320: go ahead
+with the implementation plan. Nothing is implemented.
 
 ## Why
 
@@ -48,8 +48,10 @@ SECURITY policy's rules get their own spec; this one fixes what they rest on.
   unfinished after this series:** an untrusted client is not protected from, or
   prevented from, selection transfers by anything specified here. Mediating them
   will need an interface other than plain checks.
-- Rewriting operations: property filters, virtual roots, renamed selections,
-  image censoring, `forcedBG`. Each needs its own interface later.
+- Rewriting operations in PRs 1 to 5: property filters, virtual roots, renamed
+  selections, image censoring, `forcedBG`. Each needs its own interface later.
+  This does not leave untrusted clients unprotected: no untrusted credential
+  exists before PR 6, and PR 6 has a gate on these protections, below.
 - Who may connect: #321 owns that.
 
 ## Reference model
@@ -103,6 +105,11 @@ same null-list shortcut XLibre has, so the hot paths pay a branch.
 
 Lifecycle notifications go to every policy in order, including policies that
 denied something.
+
+Privileges for the WM, the compositor and session services are recognized by
+each policy they matter to, inside that policy. A policy that grants the WM
+something only stops objecting itself; it never overrides another policy's
+denial.
 
 ### Surviving a reset
 
@@ -214,6 +221,7 @@ Xnamespace tells apart requests that share a mode:
 | Receive | no delivery and no error |
 | Extension access | the extension is reported as absent |
 | `QueryKeymap` and similar reads | the zeroed reply XLibre gives |
+| A derived target in `DestroySubwindows` | the loop stops, the remaining children stay unmapped, and the request succeeds (Xorg `dix/dispatch.c:852`) |
 
 A check authorizes either a whole request or one entry of a list, and the plan
 records which for each site. Rewriting is out of scope, but because sites own
@@ -249,19 +257,32 @@ does for every child. Traversing to find them stays unchecked server work.
 ### Denial with several targets
 
 Whether earlier work survives a later denial is client-visible, so it follows
-the reference, per request. XLibre's `DestroySubwindows` checks each child immediately before
-destroying it and stops at the first denial, so children already destroyed stay
-destroyed, their notifications were sent, and the error is reported. A policy
-denial therefore does not imply "state unchanged". The plan lists every request
-with several targets and records its Xorg ordering.
+Xorg, per request. The plan lists every request with several targets and
+records its Xorg ordering.
 
-yserver's `DestroySubwindows` differs in structure: it prepares every child,
-unmaps them in bulk, then destroys them, so a check in its last loop would come
-after denied children were unmapped. Moving everyone to one-by-one destruction
-would change notification order with no policy installed. So with an empty list
-the bulk path stays byte-identical, and with any policy installed the request
-destroys child by child through the path `DestroyWindow` uses, checking each. A request that checks all its
-operands before acting, or that has one target, does leave the state unchanged.
+**`DestroySubwindows` keeps the Xorg ordering, policy or not.** Xorg
+(`dix/window.c:1104-1124`) unmaps all children first, then checks and destroys
+each one in a loop, and a denial stops the loop: the children already destroyed
+stay destroyed, the remaining ones stay unmapped but not destroyed.
+`ProcDestroySubwindows` ignores that result and returns `Success`
+(`dix/dispatch.c:841-853`), so the client gets no error. yserver follows both:
+
+- yserver already has the same shape: it prepares each child, unmaps them in
+  bulk, then destroys them in a second loop. The check goes in that loop,
+  immediately before each child's destroy, in the order yserver already
+  destroys in. With an empty list nothing changes.
+- A denial stops the loop. Children not reached keep their window and stay
+  unmapped; their prepared destroy is released with no client-visible effect.
+- The request succeeds with no error, as in Xorg. XLibre returns the denial as
+  an error; yserver does not follow it here.
+
+XLibre also destroys child by child for everyone, so each child's UnmapNotify
+comes right before its DestroyNotify, as the protocol describes; Xorg's own
+comment admits the bulk unmap departs from it. That is a defensible change on
+its own, discussed separately, and nothing in this series depends on it.
+
+A request that checks all its operands before acting, or that has one target,
+does leave the state unchanged on denial.
 
 **Receive.** No single function has the client, the event and the window: the
 common writer only has bytes. The set that covers delivery is the two fanout
@@ -340,7 +361,7 @@ until the last one.
 | 3 | Resource and property checks, including creation and several-target requests | Same |
 | 4 | Send and receive checks, with `EventSubject` | Same |
 | 5 | Device and client checks, remaining server sites | Same |
-| 6 | SECURITY in one step: protocol, generated credentials, rules, dispatch and discovery | First denying policy |
+| 6 | SECURITY in one step: protocol, generated credentials, rules, protections for untrusted pixels, dispatch and discovery | First denying policy |
 
 Nothing of SECURITY is wired before PR 6: hiding it from discovery alone would not
 be enough, since dispatch selects handlers by opcode. Until then its requests
@@ -348,6 +369,49 @@ behave as they do today and no generated credential can be issued or admitted, s
 no client can hold an untrusted cookie while only part of its isolation is
 enforced. The deny branches run only in tests until then. PR 6 can split further
 if its size calls for it, as long as dispatch and credential issue land last.
+
+### Gate before untrusted credentials
+
+The hooks alone do not establish SECURITY's boundary. Two Xorg behaviours that
+are not checks keep other clients' pixels away from an untrusted client:
+
+- An untrusted client's windows cannot have background None
+  (`Xext/security.c:749`, `forcedBG`): on Xorg a None background shows
+  whatever was on screen, which may belong to another client.
+- `GetImage` on a window is censored (`XaceCensorImage`, `Xext/xace.c:183`,
+  called from `dix/dispatch.c` and `Xext/shm.c`): the parts of the image outside
+  the window's `borderClip` are overwritten, so windows that cover it do not
+  show. This is not part of SECURITY: Xorg does it for every client, trusted or
+  not, and the protocol leaves obscured contents undefined anyway.
+
+Read checks deny `GetImage` on the root window and on other clients' windows,
+as SECURITY's access masks do (`Xext/security.c:81-86`). What they cannot cover
+is another client's pixels reached through a drawable the untrusted client is
+allowed to read.
+
+So the SECURITY policy spec, before the PR that issues untrusted credentials,
+must state for each of the two either how yserver provides it or which
+operations are denied to untrusted clients instead. For censoring, providing it
+can mean doing it for every client, as Xorg does, with no policy hook. The spec
+includes a test that an untrusted client cannot read a trusted client's pixels.
+
+It covers every path that returns pixels from a window and that SECURITY's
+extension rules leave open to untrusted clients. Xorg's SECURITY shows them only
+XC-MISC and BIG-REQUESTS (`Xext/security.c:72-76`), so by default the paths
+are core `GetImage`, `CopyArea` and `CopyPlane`; each extension the SECURITY
+spec chooses to expose adds its own.
+
+yserver differs from Xorg in ways that spec must measure rather than assume:
+each window has its own storage, filled with a default colour when its
+background is None (`resources/pixmap_props.rs`,
+`core_loop/process_request/windows.rs`), so the screen does not show through
+as on Xorg; and `GetImage` reads the backend's copy of the window or of its
+redirected ancestor (`core_loop/process_request/drawing.rs`), whose content
+from overlapping windows owned by other clients must be established. Inferiors
+owned by another client are a yserver question only: Xorg's `borderClip`
+includes them, so Xorg does not censor them either.
+
+Selections stay deferred, as in Non-goals.
 
 ## Testing
 
@@ -361,14 +425,16 @@ Per PR, for the sites that PR adds:
   the backend and the state is unchanged.
 - **Every site asks:** a recording policy asserts each request presents the
   expected client, object, mode and context.
-- **Several policies:** with allow then deny and deny then allow, the operation is
-  denied both ways, the first denier's error is reported, and a policy after a
-  denier is not asked. Lifecycle notifications reach all of them.
-- **Several targets:** with an empty list `DestroySubwindows` emits today's bytes.
-  With a policy, `DestroySubwindows` with a denied child destroys the children
-  below it in stacking order, as Xorg walks from the bottom, keeps the denied
-  child and those above it, and emits the same notifications in the same order. A propagated send stops at the denied window; a denied list entry is left
-  out of the reply.
+- **Several policies:** on a single-target request, with allow then deny and
+  deny then allow, the operation is denied both ways, the first denier's error
+  is reported, and a policy after a denier is not asked. Lifecycle notifications
+  reach all of them.
+- **Several targets:** with an empty list, and with an allow-all policy,
+  `DestroySubwindows` emits today's bytes. With a policy that denies one child,
+  every child is unmapped, the children destroyed before the denied one stay
+  destroyed, the denied child and the rest keep their windows unmapped, and the
+  request returns no error. A propagated send stops at the denied window; a
+  denied list entry is left out of the reply.
 - **Revocation:** a recording policy allows, then denies, on the same client and
   object; the second request and the next delivery see the denial.
 - **Reset:** policies installed before `run_core` and before a reset are present
@@ -400,18 +466,22 @@ since behaviour must not change before PR 6.
   production lines across the series, plus tests. SECURITY's rules are additional.
 - Clipboard isolation remains unfinished, as stated in Non-goals.
 
-## Questions for the maintainer
+## Answered by the maintainer
 
-1. Is one list with "any policy can deny" right for the WM and compositor
-   privileges you describe? Under this design a privilege is the absence of a
-   denial, granted by each policy for itself, never an override.
-2. `DestroySubwindows` keeps today's bulk path with no policy and goes child by
-   child with one. XLibre has moved to child by child for everyone, for ordering.
-   Should that correction be a separate PR, ahead of this series?
+1. One list where any policy can deny is right; WM and compositor privileges
+   are recognized by each policy they matter to, and a grant never overrides
+   another policy's denial.
+2. `DestroySubwindows` follows Xorg's ordering with or without a policy;
+   child-by-child destruction is a separate discussion.
+3. Untrusted credentials wait for a policy spec that says how background None
+   and `GetImage` censoring are provided, or which operations are denied
+   instead, over the pixel paths open to untrusted clients.
 
 ## Provenance
 
-Read for behaviour and scope, with no code copied: XLibre `Xext/xace.c`,
+Read for behaviour and scope, with no code copied: Xorg xserver master
+(`dix/window.c`, `dix/dispatch.c`, `Xext/security.c`, `Xext/xace.c`, MIT
+licensed) and XLibre `Xext/xace.c`,
 `Xext/xace.h`, `include/dixaccess.h`, `dix/`, `Xext/security/security.c` and
 `Xext/namespace/` (X11/MIT licensed; the namespace files are offered under
 `X11 OR MIT OR AGPL-3.0-or-later`, used here under MIT). No copyleft source was
