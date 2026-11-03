@@ -23,7 +23,6 @@ ash.workspace = true
 crossbeam-channel.workspace = true
 env_logger.workspace = true
 flate2 = "1.1"
-fontconfig = "0.11"
 freetype-rs.workspace = true
 libc.workspace = true
 log.workspace = true
@@ -40,6 +39,10 @@ yserver-render.workspace = true
 
 [dev-dependencies]
 yserver-render = { workspace = true, features = ["test-support"] }
+
+# Windows finds its fonts by scanning the font directories (`kms/font_scan.rs`).
+[target.'cfg(not(windows))'.dependencies]
+fontconfig = "0.11"
 
 # The DRM/KMS platform; build.rs emits `cfg(kms)` for the same targets.
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]

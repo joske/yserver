@@ -635,7 +635,10 @@ pub(crate) fn embedded_font(name: &str) -> Option<&'static EmbeddedFont> {
 
 pub(crate) struct FontLoader {
     pub(crate) library: freetype::Library,
+    #[cfg(not(windows))]
     pub(crate) fc: fontconfig::Fontconfig,
+    #[cfg(windows)]
+    pub(crate) fc: super::font_scan::FontScan,
     pub(crate) catalog: FontTable<()>,
     /// `XORG_BUILTIN_NAMES`, lowered for matching.
     builtin_keys: Vec<LoweredName>,
@@ -722,8 +725,12 @@ pub(crate) const BUILTIN_ALIASES: &[&str] = &["fixed", "cursor", "nil2"];
 
 impl FontLoader {
     pub(crate) fn new() -> io::Result<Self> {
+        #[cfg(not(windows))]
         let fc = fontconfig::Fontconfig::new()
             .ok_or_else(|| io::Error::other("fontconfig init failed"))?;
+        #[cfg(windows)]
+        let fc = super::font_scan::FontScan::new()
+            .ok_or_else(|| io::Error::other("font scan init failed"))?;
         let catalog = build_font_catalog(&fc);
         log::info!("font catalog: {} XLFDs from fontconfig", catalog.len());
         let mut loader = Self {
@@ -1352,7 +1359,30 @@ impl FontLoader {
             (Some(name.to_string()), None, None)
         };
         let query_family = family.as_deref().unwrap_or("monospace");
+        let (path, face_index) = self.match_builtin_file(name, query_family, style.as_deref())?;
+        let face = self
+            .library
+            .new_face(&path, face_index)
+            .map_err(|e| io::Error::other(format!("freetype new_face({path}) failed: {e:?}")))?;
 
+        // Honour XLFD PIXEL_SIZE if specified; otherwise default to 12pt @ 96dpi.
+        if let Some(px) = xlfd_px {
+            let _ = face.set_pixel_sizes(0, px);
+        } else {
+            let _ = face.set_char_size(12 << 6, 12 << 6, 96, 96);
+        }
+        Ok(face)
+    }
+
+    /// The file and face index fontconfig matches for `query_family`
+    /// (chained with `monospace`) in `style`.
+    #[cfg(not(windows))]
+    fn match_builtin_file(
+        &self,
+        name: &str,
+        query_family: &str,
+        style: Option<&str>,
+    ) -> io::Result<(String, isize)> {
         let cfamily = std::ffi::CString::new(query_family)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "font name has nul"))?;
 
@@ -1369,7 +1399,7 @@ impl FontLoader {
                 .map_err(fc_err)?;
         }
         let cstyle_storage;
-        if let Some(style) = style.as_deref() {
+        if let Some(style) = style {
             cstyle_storage = std::ffi::CString::new(style)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "font style has nul"))?;
             pat.add_string(fontconfig::FC_STYLE, &cstyle_storage)
@@ -1380,18 +1410,20 @@ impl FontLoader {
             io::Error::new(io::ErrorKind::NotFound, format!("font not found: {name}"))
         })?;
         let face_index: isize = matched.face_index().unwrap_or(0) as isize;
-        let face = self
-            .library
-            .new_face(path, face_index)
-            .map_err(|e| io::Error::other(format!("freetype new_face({path}) failed: {e:?}")))?;
+        Ok((path.to_string(), face_index))
+    }
 
-        // Honour XLFD PIXEL_SIZE if specified; otherwise default to 12pt @ 96dpi.
-        if let Some(px) = xlfd_px {
-            let _ = face.set_pixel_sizes(0, px);
-        } else {
-            let _ = face.set_char_size(12 << 6, 12 << 6, 96, 96);
-        }
-        Ok(face)
+    #[cfg(windows)]
+    fn match_builtin_file(
+        &self,
+        name: &str,
+        query_family: &str,
+        style: Option<&str>,
+    ) -> io::Result<(String, isize)> {
+        let face = self.fc.find(query_family, style).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("font not found: {name}"))
+        })?;
+        Ok((face.path.to_string_lossy().into_owned(), face.index))
     }
 }
 
@@ -2055,22 +2087,19 @@ pub(crate) fn sanitize_xlfd_field(s: &str) -> String {
 /// gb2312*, ksc*) need real fonts on disk to satisfy properly; rather
 /// than stub them, we let libXt warn "Missing charset X" and proceed
 /// with the iso* coverage that's guaranteed real.
+#[cfg(not(windows))]
 pub(crate) fn build_font_catalog(fc: &fontconfig::Fontconfig) -> Vec<String> {
-    const PIXEL_SIZES: &[u32] = &[8, 10, 12, 14, 16, 18, 24];
-    const CHARSETS: &[&str] = &["iso8859-1", "iso10646-1"];
-
     // `fixed`, `cursor` and the rest of Xorg's own built-ins are listed
     // from `XORG_BUILTIN_NAMES`, ahead of these.
-    let mut entries: Vec<String> = Vec::new();
 
     // fontconfig 0.11 wraps construction/queries in `Result`; this fn
     // is infallible, so on any setup failure fall back to just the
     // alias entries rather than panicking at boot.
     let Ok(pat) = fontconfig::Pattern::new(fc) else {
-        return entries;
+        return Vec::new();
     };
     let Ok(mut objs) = fontconfig::ObjectSet::new(fc) else {
-        return entries;
+        return Vec::new();
     };
     for obj in [
         fontconfig::FC_FAMILY,
@@ -2082,11 +2111,10 @@ pub(crate) fn build_font_catalog(fc: &fontconfig::Fontconfig) -> Vec<String> {
         let _ = objs.add(obj);
     }
     let Ok(set) = fontconfig::list_fonts(&pat, Some(&objs)) else {
-        return entries;
+        return Vec::new();
     };
 
-    let mut seen: HashSet<(String, String, i32, i32, i32)> = HashSet::new();
-
+    let mut catalog = CatalogBuilder::default();
     for font in set.iter() {
         let Ok(family) = font.get_string(fontconfig::FC_FAMILY) else {
             continue;
@@ -2095,6 +2123,33 @@ pub(crate) fn build_font_catalog(fc: &fontconfig::Fontconfig) -> Vec<String> {
         let weight = font.get_int(fontconfig::FC_WEIGHT).unwrap_or(80);
         let slant = font.get_int(fontconfig::FC_SLANT).unwrap_or(0);
         let spacing = font.get_int(fontconfig::FC_SPACING).unwrap_or(0);
+        catalog.add(family, foundry, weight, slant, spacing);
+    }
+    catalog.entries
+}
+
+/// [`build_font_catalog`] over the faces a directory scan found.
+#[cfg(windows)]
+pub(crate) fn build_font_catalog(fc: &super::font_scan::FontScan) -> Vec<String> {
+    let mut catalog = CatalogBuilder::default();
+    for f in fc.faces() {
+        catalog.add(&f.family, "misc", f.weight, f.slant, f.spacing);
+    }
+    catalog.entries
+}
+
+/// Catalog XLFDs, one set per distinct face.
+#[derive(Default)]
+struct CatalogBuilder {
+    entries: Vec<String>,
+    seen: HashSet<(String, String, i32, i32, i32)>,
+}
+
+impl CatalogBuilder {
+    /// Add a face, its properties in fontconfig's values.
+    fn add(&mut self, family: &str, foundry: &str, weight: i32, slant: i32, spacing: i32) {
+        const PIXEL_SIZES: &[u32] = &[8, 10, 12, 14, 16, 18, 24];
+        const CHARSETS: &[&str] = &["iso8859-1", "iso10646-1"];
 
         let key = (
             family.to_lowercase(),
@@ -2103,8 +2158,8 @@ pub(crate) fn build_font_catalog(fc: &fontconfig::Fontconfig) -> Vec<String> {
             slant,
             spacing,
         );
-        if !seen.insert(key) {
-            continue;
+        if !self.seen.insert(key) {
+            return;
         }
 
         let foundry_x = sanitize_xlfd_field(foundry);
@@ -2119,15 +2174,13 @@ pub(crate) fn build_font_catalog(fc: &fontconfig::Fontconfig) -> Vec<String> {
             // by this field, and QueryFont returns the real widths.
             let avg_width = (px * 6).clamp(1, 999);
             for &charset in CHARSETS {
-                entries.push(format!(
+                self.entries.push(format!(
                     "-{foundry_x}-{family_x}-{weight_x}-{slant_x}-normal--{px}-{}-75-75-{spacing_x}-{avg_width}-{charset}",
                     px * 10,
                 ));
             }
         }
     }
-
-    entries
 }
 
 // ───────────────────────────────────────────────────────────────

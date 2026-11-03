@@ -10,6 +10,8 @@ pub(crate) type ConsoleGuardOpt = Option<console::ConsoleGuard>;
 #[cfg(kms)]
 pub(crate) mod cursor_plane;
 pub(crate) mod font_index;
+#[cfg(windows)]
+pub(crate) mod font_scan;
 #[cfg(kms)]
 pub(crate) mod hotplug;
 #[cfg(kms)]
