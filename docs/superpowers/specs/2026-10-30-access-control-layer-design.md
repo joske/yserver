@@ -337,7 +337,11 @@ life:
    and its admission record.
 2. Connection gone, before its `ClientState` is removed. Its retained resources
    keep their original owner, so the owner id can still appear in later checks.
-3. Owner gone, when its last retained resources have been destroyed.
+3. Owner gone, when the retained client is finally closed down: `KillClient` on
+   one of its resources, `KillClient(AllTemporary)`, or a reset. This is Xorg's
+   `ClientStateGone` for a retained client (`dix/dispatch.c:3478-3560`); freeing
+   its resources one by one does not end it, as in Xorg. A client that retains
+   nothing hears it right after connection gone.
 
 A reset keeps the same policy objects and tells them the generation ended, so
 they drop what they hold per client.
