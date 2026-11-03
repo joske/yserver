@@ -361,11 +361,68 @@ fn every_policy_hears_lifecycle() {
     assert!(!state.zombie_clients.contains_key(&id.0));
 }
 
+#[cfg(target_os = "linux")]
+fn reader_spawn_skip_reason(
+    euid: libc::uid_t,
+    effective_capabilities: u64,
+) -> Option<&'static str> {
+    const CAP_SYS_ADMIN: u64 = 1 << 21;
+    const CAP_SYS_RESOURCE: u64 = 1 << 24;
+
+    if euid == 0 {
+        Some("euid 0 is exempt from RLIMIT_NPROC")
+    } else if effective_capabilities & CAP_SYS_RESOURCE != 0 {
+        Some("CAP_SYS_RESOURCE is effective")
+    } else if effective_capabilities & CAP_SYS_ADMIN != 0 {
+        Some("CAP_SYS_ADMIN is effective")
+    } else {
+        None
+    }
+}
+
+// Mutation: ignore CAP_SYS_RESOURCE or CAP_SYS_ADMIN in CapEff; its matching row fails.
+#[cfg(target_os = "linux")]
+#[test]
+fn reader_spawn_skip_reason_names_rlimit_nproc_exemptions() {
+    let cases: [(libc::uid_t, u64, Option<&str>); 4] = [
+        (0, 0, Some("euid 0 is exempt from RLIMIT_NPROC")),
+        (1000, 1 << 24, Some("CAP_SYS_RESOURCE is effective")),
+        (1000, 1 << 21, Some("CAP_SYS_ADMIN is effective")),
+        (1000, 0, None),
+    ];
+
+    for (euid, effective_capabilities, expected) in cases {
+        assert_eq!(
+            reader_spawn_skip_reason(euid, effective_capabilities),
+            expected,
+            "euid {euid}, CapEff {effective_capabilities:#x}"
+        );
+    }
+}
+
 // Mutation: move client_connected until after reader spawn; the constrained spawn error must still leave it first.
 #[cfg(target_os = "linux")]
 #[test]
 fn failed_reader_spawn_still_connects_before_departing() {
     use std::process::Command;
+
+    // SAFETY: `geteuid` has no preconditions or pointer arguments.
+    let euid = unsafe { libc::geteuid() };
+    if let Some(reason) = reader_spawn_skip_reason(euid, 0) {
+        eprintln!("Skipping reader-spawn failure test: {reason}");
+        return;
+    }
+
+    let status = std::fs::read_to_string("/proc/self/status").expect("read process status");
+    let cap_eff = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .expect("CapEff in /proc/self/status");
+    let effective_capabilities = u64::from_str_radix(cap_eff.trim(), 16).expect("hex CapEff");
+    if let Some(reason) = reader_spawn_skip_reason(euid, effective_capabilities) {
+        eprintln!("Skipping reader-spawn failure test: {reason}");
+        return;
+    }
 
     const CHILD_MARKER: &str = "YTEST_LIFECYCLE_RLIMIT_CHILD";
     let output = Command::new(std::env::current_exe().expect("test executable"))
@@ -398,13 +455,6 @@ fn lifecycle_reader_spawn_failure_child() {
     if std::env::var_os(CHILD_MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
         return;
     }
-
-    assert_ne!(
-        // SAFETY: `geteuid` has no preconditions or pointer arguments.
-        unsafe { libc::geteuid() },
-        0,
-        "RLIMIT_NPROC spawn-failure test needs an unprivileged user; euid 0 is exempt",
-    );
 
     let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut state = ServerState::new();
