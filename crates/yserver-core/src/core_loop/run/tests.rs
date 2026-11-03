@@ -367,6 +367,7 @@ fn every_policy_hears_lifecycle() {
 fn failed_reader_spawn_still_connects_before_departing() {
     use std::process::Command;
 
+    const CHILD_MARKER: &str = "YTEST_LIFECYCLE_RLIMIT_CHILD";
     let output = Command::new(std::env::current_exe().expect("test executable"))
         .args([
             "--ignored",
@@ -375,6 +376,7 @@ fn failed_reader_spawn_still_connects_before_departing() {
             "--nocapture",
             "--test-threads=1",
         ])
+        .env(CHILD_MARKER, "1")
         .output()
         .expect("run the constrained child test");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -391,6 +393,18 @@ fn failed_reader_spawn_still_connects_before_departing() {
 #[ignore = "invoked in a subprocess with RLIMIT_NPROC lowered to force the real thread spawn to fail"]
 fn lifecycle_reader_spawn_failure_child() {
     use crate::backend::recording::RecordingBackend;
+
+    const CHILD_MARKER: &str = "YTEST_LIFECYCLE_RLIMIT_CHILD";
+    if std::env::var_os(CHILD_MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
+
+    assert_ne!(
+        // SAFETY: `geteuid` has no preconditions or pointer arguments.
+        unsafe { libc::geteuid() },
+        0,
+        "RLIMIT_NPROC spawn-failure test needs an unprivileged user; euid 0 is exempt",
+    );
 
     let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut state = ServerState::new();
