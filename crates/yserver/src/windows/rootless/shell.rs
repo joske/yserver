@@ -18,13 +18,14 @@ use windows_sys::Win32::{
     UI::{
         Input::KeyboardAndMouse::SetActiveWindow,
         WindowsAndMessaging::{
-            DestroyWindow, GW_HWNDNEXT, GW_HWNDPREV, GWLP_HWNDPARENT, GetForegroundWindow,
-            GetTopWindow, GetWindow, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDYES,
-            IsIconic, IsZoomed, MB_ICONWARNING, MB_YESNO, MessageBoxW, PostMessageW, SC_MOVE,
-            SC_SIZE, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNA, SWP_FRAMECHANGED,
-            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
-            SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE,
-            WINDOW_STYLE, WM_SYSCOMMAND, WS_EX_TOPMOST, WS_POPUP,
+            DestroyWindow, GW_HWNDNEXT, GW_HWNDPREV, GWL_STYLE, GWLP_HWNDPARENT,
+            GetForegroundWindow, GetTopWindow, GetWindow, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOP,
+            HWND_TOPMOST, IDYES, IsIconic, IsZoomed, MB_ICONWARNING, MB_YESNO, MessageBoxW,
+            PostMessageW, SC_MOVE, SC_SIZE, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE,
+            SW_SHOWNA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+            SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
+            WINDOW_EX_STYLE, WINDOW_STYLE, WM_SYSCOMMAND, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
+            WS_POPUP,
         },
     },
 };
@@ -735,10 +736,11 @@ impl RootlessShell {
                     if IsZoomed(hwnd) != 0 {
                         ShowWindow(hwnd, SW_RESTORE);
                     }
+                    // Without the frame; `WS_VISIBLE` stays.
                     SetWindowLongPtrW(
                         hwnd,
-                        windows_sys::Win32::UI::WindowsAndMessaging::GWL_STYLE,
-                        WS_POPUP as isize,
+                        GWL_STYLE,
+                        ((style & !WS_OVERLAPPEDWINDOW) | WS_POPUP) as isize,
                     );
                     SetWindowPos(
                         hwnd,
@@ -756,11 +758,7 @@ impl RootlessShell {
                 let frame = windowed.frame;
                 // SAFETY: our window.
                 unsafe {
-                    SetWindowLongPtrW(
-                        hwnd,
-                        windows_sys::Win32::UI::WindowsAndMessaging::GWL_STYLE,
-                        windowed.style as isize,
-                    );
+                    SetWindowLongPtrW(hwnd, GWL_STYLE, windowed.style as isize);
                     SetWindowPos(
                         hwnd,
                         ptr::null_mut(),
