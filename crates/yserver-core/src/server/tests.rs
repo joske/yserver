@@ -165,6 +165,7 @@ fn subscribers_returns_clients_with_bit_set() {
     state.clients.insert(
         1,
         ClientState {
+            admission: crate::access::Admission::Internal,
             writer: make_test_writer(),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
@@ -191,6 +192,7 @@ fn subscribers_returns_clients_with_bit_set() {
     state.clients.insert(
         2,
         ClientState {
+            admission: crate::access::Admission::Internal,
             writer: make_test_writer(),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
@@ -225,6 +227,7 @@ fn subscribers_omits_other_windows() {
     state.clients.insert(
         1,
         ClientState {
+            admission: crate::access::Admission::Internal,
             writer: make_test_writer(),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
@@ -256,6 +259,7 @@ fn subscribers_omits_other_windows() {
 fn xi2_pointer_mask_matches_exact_and_wildcard_devices() {
     for deviceid in [2u16, 1, 0] {
         let client = ClientState {
+            admission: crate::access::Admission::Internal,
             writer: make_test_writer(),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
@@ -296,6 +300,7 @@ fn xi2_pointer_mask_matches_exact_and_wildcard_devices() {
 fn xi2_mask_ors_masks_split_across_device_wildcards() {
     let win = ResourceId(0x0080_0037);
     let client = ClientState {
+        admission: crate::access::Admission::Internal,
         writer: make_test_writer(),
         byte_order: ClientByteOrder::LittleEndian,
         last_sequence: Arc::new(AtomicU16::new(0)),
@@ -342,6 +347,7 @@ fn xi2_mask_ors_masks_split_across_device_wildcards() {
 fn xi2_keyboard_mask_matches_exact_and_wildcard_devices() {
     for deviceid in [3u16, 1, 0] {
         let client = ClientState {
+            admission: crate::access::Admission::Internal,
             writer: make_test_writer(),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
@@ -378,6 +384,7 @@ fn subscribers_omits_disconnected_client() {
     state.clients.insert(
         1,
         ClientState {
+            admission: crate::access::Admission::Internal,
             writer: make_test_writer(),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
@@ -412,6 +419,7 @@ fn subscribers_intersecting_matches_any_selected_bit() {
     state.clients.insert(
         1,
         ClientState {
+            admission: crate::access::Admission::Internal,
             writer: make_test_writer(),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
@@ -438,6 +446,7 @@ fn subscribers_intersecting_matches_any_selected_bit() {
     state.clients.insert(
         2,
         ClientState {
+            admission: crate::access::Admission::Internal,
             writer: make_test_writer(),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
@@ -487,6 +496,7 @@ fn client_target_returns_connected_client() {
     state.clients.insert(
         7,
         ClientState {
+            admission: crate::access::Admission::Internal,
             writer: make_test_writer(),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0x1234)),
@@ -532,6 +542,7 @@ fn xi_dynamic_reset_nested_host_pointer_uses_master_xi_ids() {
         state.clients.insert(
             client_id,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(writer)),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -684,6 +695,7 @@ fn unmap_notify_fanout_reaches_only_subscribed_clients() {
     state.clients.insert(
         1,
         ClientState {
+            admission: crate::access::Admission::Internal,
             writer: Arc::new(Mutex::new(Transport::Unix(a_writer_local))),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
@@ -710,6 +722,7 @@ fn unmap_notify_fanout_reaches_only_subscribed_clients() {
     state.clients.insert(
         2,
         ClientState {
+            admission: crate::access::Admission::Internal,
             writer: Arc::new(Mutex::new(Transport::Unix(b_writer_local))),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
@@ -764,6 +777,7 @@ fn drop_window_subscriptions_removes_entries_for_destroyed_windows() {
     state.clients.insert(
         1,
         ClientState {
+            admission: crate::access::Admission::Internal,
             writer: make_test_writer(),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
@@ -891,6 +905,7 @@ fn replay_pointer_delivers_to_button_press_window_not_grab_owner() {
         s.clients.insert(
             1,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(Transport::Unix(grab_writer_local))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -917,6 +932,7 @@ fn replay_pointer_delivers_to_button_press_window_not_grab_owner() {
         s.clients.insert(
             2,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(Transport::Unix(target_writer_local))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1064,6 +1080,7 @@ fn passive_grab_owner_events_keeps_child_delivery_on_owned_windows() {
         s.clients.insert(
             1,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(Transport::Unix(grab_writer_local))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1090,6 +1107,7 @@ fn passive_grab_owner_events_keeps_child_delivery_on_owned_windows() {
         s.clients.insert(
             2,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(Transport::Unix(child_writer_local))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1239,6 +1257,7 @@ fn passive_grab_owner_events_keeps_descendant_delivery_even_when_child_owned_els
         s.clients.insert(
             1,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(Transport::Unix(grab_writer_local))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1265,6 +1284,7 @@ fn passive_grab_owner_events_keeps_descendant_delivery_even_when_child_owned_els
         s.clients.insert(
             2,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(Transport::Unix(child_writer_local))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1373,6 +1393,7 @@ fn pointer_event_fanout_filters_by_mask() {
         s.clients.insert(
             1,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(Transport::Unix(a_writer_local))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1399,6 +1420,7 @@ fn pointer_event_fanout_filters_by_mask() {
         s.clients.insert(
             2,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(Transport::Unix(b_writer_local))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1425,6 +1447,7 @@ fn pointer_event_fanout_filters_by_mask() {
         s.clients.insert(
             3,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(Transport::Unix(c_writer_local))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1532,6 +1555,7 @@ fn pointer_event_fanout_delivers_motion_under_button_motion_mask() {
         s.clients.insert(
             1,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(Transport::Unix(a_writer_local))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1558,6 +1582,7 @@ fn pointer_event_fanout_delivers_motion_under_button_motion_mask() {
         s.clients.insert(
             2,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(Transport::Unix(b_writer_local))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1667,6 +1692,7 @@ fn pointer_event_fanout_drops_unknown_host_xid() {
         s.clients.insert(
             1,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(Transport::Unix(a_writer_local))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1864,6 +1890,7 @@ fn add_test_client(state: &mut ServerState, client_id: u32, base: u32) {
     state.clients.insert(
         client_id,
         ClientState {
+            admission: crate::access::Admission::Internal,
             writer: make_test_writer(),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
@@ -2332,6 +2359,7 @@ fn propagation_walk_up_undoes_the_border_term() {
     state.clients.insert(
         7,
         ClientState {
+            admission: crate::access::Admission::Internal,
             writer: make_test_writer(),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),

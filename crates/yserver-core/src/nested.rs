@@ -1491,6 +1491,7 @@ mod tests {
             state.clients.insert(
                 1,
                 ClientState {
+                    admission: crate::access::Admission::Internal,
                     writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer_local))),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),

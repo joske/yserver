@@ -77,6 +77,12 @@ pub enum CredentialSource {
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct CredentialId(u64);
 
+impl CredentialId {
+    pub(crate) const fn from_counter(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 impl std::fmt::Debug for CredentialId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
@@ -101,12 +107,21 @@ impl<'a> AccessContext<'a> {
     }
 
     #[must_use]
+    pub fn admission(&self, client: ClientId) -> Option<&Admission> {
+        self.state
+            .clients
+            .get(&client.0)
+            .map(|state| &state.admission)
+    }
+
+    #[must_use]
     pub const fn request(&self) -> Option<RequestOpcodes> {
         self.request
     }
 }
 
-/// An ordered, synchronous access policy.
+/// An ordered, synchronous access policy. Methods run inline on the core loop
+/// and must do no I/O or blocking wait.
 pub trait AccessPolicy: Send + Sync {
     fn server(&self, _ctx: &AccessContext<'_>, _client: ClientId, _mode: AccessMode) -> Decision {
         Decision::Allow

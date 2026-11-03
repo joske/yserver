@@ -1093,6 +1093,7 @@ pub(super) fn install_client_for_render(state: &mut yserver_core::server::Server
     state.clients.insert(
         id,
         ClientState {
+            admission: yserver_core::access::Admission::Internal,
             writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(a))),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1331,6 +1332,7 @@ fn kbd_map_client_id(
     state.clients.insert(
         id,
         yserver_core::server::ClientState {
+            admission: yserver_core::access::Admission::Internal,
             writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(writer))),
             byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),

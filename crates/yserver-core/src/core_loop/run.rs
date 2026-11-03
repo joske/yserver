@@ -2537,6 +2537,7 @@ fn run_core_with_inventory(
                                 fd_passing,
                                 internal,
                                 peer,
+                                admission,
                                 setup_reply,
                             } => {
                                 if let Err(err) = handle_client_setup_complete(
@@ -2551,6 +2552,7 @@ fn run_core_with_inventory(
                                     byte_order,
                                     (is_local, fd_passing, internal),
                                     peer,
+                                    admission,
                                     &setup_reply,
                                 ) {
                                     error!("ClientSetupComplete for client {} failed: {err}", id.0);
@@ -4683,6 +4685,7 @@ fn handle_client_setup_complete(
     byte_order: yserver_protocol::x11::ClientByteOrder,
     (is_local, fd_passing, internal): (bool, bool, bool),
     peer: crate::peer::PeerIdentity,
+    admission: crate::access::Admission,
     setup_reply: &[u8],
 ) -> io::Result<()> {
     use std::sync::{Arc, Mutex, atomic::AtomicU16};
@@ -4717,6 +4720,7 @@ fn handle_client_setup_complete(
             fd_passing,
             internal,
             peer,
+            admission,
         },
     );
     setup_registry

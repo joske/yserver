@@ -34,7 +34,7 @@ use yserver_protocol::x11::{self, ClientId};
 
 use crate::{
     core_loop::{
-        auth::{AuthState, AuthVerdict},
+        auth::AuthState,
         message::{Message, SetupAllocateResponse},
         sender::BoundSender,
     },
@@ -172,23 +172,28 @@ fn run_setup(
     // new session has by then installed a credential of its own. The
     // server's own client is not authorized: it never came through a
     // listener.
-    if !internal
-        && let AuthVerdict::Reject(reason) = auth.check(
+    let admission = if internal {
+        crate::access::Admission::Internal
+    } else {
+        match auth.admit(
             &peer,
             sender.generation(),
             &setup.auth_protocol_name,
             &setup.auth_protocol_data,
-        )
-    {
-        warn!(
-            "client {} auth rejected ({:?}); presented proto {:?}",
-            id.0,
-            reason.trim_end(),
-            String::from_utf8_lossy(&setup.auth_protocol_name)
-        );
-        x11::write_setup_failed(&mut stream, setup.byte_order, reason)?;
-        return Ok(()); // drop stream → connection closes
-    }
+        ) {
+            Ok(admission) => admission,
+            Err(reason) => {
+                warn!(
+                    "client {} auth rejected ({:?}); presented proto {:?}",
+                    id.0,
+                    reason.trim_end(),
+                    String::from_utf8_lossy(&setup.auth_protocol_name)
+                );
+                x11::write_setup_failed(&mut stream, setup.byte_order, reason)?;
+                return Ok(()); // drop stream → connection closes
+            }
+        }
+    };
 
     // Sync rendezvous with the core: allocate ids + snapshot geometry.
     let (response_tx, response_rx) = bounded::<SetupAllocateResponse>(1);
@@ -278,6 +283,7 @@ fn run_setup(
         fd_passing,
         internal,
         peer,
+        admission,
         setup_reply,
     })?;
     Ok(())
@@ -296,6 +302,7 @@ fn vendor_release() -> u32 {
 mod tests {
     use super::*;
     use crate::{
+        access::{Admission, CredentialSource},
         core_loop::{auth::AuthTransport, sender::channel},
         xauth::MIT_MAGIC_COOKIE,
     };
@@ -417,6 +424,198 @@ mod tests {
         buf[2] = 0; // protocol_major hi
         buf[3] = 11; // lo (big-endian)
         s.write_all(&buf)
+    }
+
+    fn write_setup_request_with_auth(
+        s: &mut UnixStream,
+        auth_name: &[u8],
+        auth_data: &[u8],
+    ) -> io::Result<()> {
+        let mut header = [0u8; 12];
+        header[0] = b'l';
+        header[2] = 11;
+        header[6..8].copy_from_slice(&(auth_name.len() as u16).to_le_bytes());
+        header[8..10].copy_from_slice(&(auth_data.len() as u16).to_le_bytes());
+        s.write_all(&header)?;
+        s.write_all(auth_name)?;
+        if !auth_name.len().is_multiple_of(4) {
+            s.write_all(&[0; 4][..4 - auth_name.len() % 4])?;
+        }
+        s.write_all(auth_data)?;
+        if !auth_data.len().is_multiple_of(4) {
+            s.write_all(&[0; 4][..4 - auth_data.len() % 4])?;
+        }
+        Ok(())
+    }
+
+    fn setup_admission_on_stream(
+        auth: Arc<AuthState>,
+        id: ClientId,
+        server_side: UnixStream,
+        mut client_side: UnixStream,
+        auth_name: &[u8],
+        auth_data: &[u8],
+        internal: bool,
+    ) -> Admission {
+        let (_poll, sender, rx) = channel().unwrap();
+        let registry = make_registry();
+        spawn(
+            id,
+            server_side,
+            sender.bind(),
+            registry.clone(),
+            auth,
+            true,
+            true,
+            internal,
+        )
+        .unwrap();
+        write_setup_request_with_auth(&mut client_side, auth_name, auth_data).unwrap();
+
+        let alloc_msg = wait_for_message(&rx, Duration::from_secs(2)).unwrap();
+        let response_tx = match alloc_msg {
+            Message::SetupAllocate { response_tx, .. } => response_tx,
+            other => panic!("expected SetupAllocate, got {other:?}"),
+        };
+        response_tx
+            .send(SetupAllocateResponse {
+                resource_id_base: 0x0010_0000,
+                resource_id_mask: 0x000F_FFFF,
+                screen_width_px: 800,
+                screen_height_px: 600,
+                screen_width_mm: 212,
+                screen_height_mm: 159,
+                current_input_masks: 0,
+            })
+            .unwrap();
+
+        let head = read_n_with_timeout(&mut client_side, 8, Duration::from_secs(2)).unwrap();
+        assert_eq!(head[0], 1, "setup should succeed");
+        let extra_words = u16::from_le_bytes([head[6], head[7]]);
+        let extra_bytes = usize::from(extra_words) * 4;
+        if extra_bytes > 0 {
+            read_n_with_timeout(&mut client_side, extra_bytes, Duration::from_secs(2)).unwrap();
+        }
+
+        match wait_for_message(&rx, Duration::from_secs(2)).unwrap() {
+            Message::ClientSetupComplete { admission, .. } => admission,
+            other => panic!("expected ClientSetupComplete, got {other:?}"),
+        }
+    }
+
+    fn xauth_record(number: &[u8], cookie: &[u8]) -> Vec<u8> {
+        let mut record = Vec::new();
+        record.extend_from_slice(&256u16.to_be_bytes()); // FamilyLocal
+        for field in [
+            b"host".as_slice(),
+            number,
+            MIT_MAGIC_COOKIE.as_bytes(),
+            cookie,
+        ] {
+            record.extend_from_slice(&(field.len() as u16).to_be_bytes());
+            record.extend_from_slice(field);
+        }
+        record
+    }
+
+    fn auth_file(tag: &str, cookies: &[(&[u8], &[u8])]) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("yserver-setup-auth-{}-{tag}", std::process::id()));
+        let mut data = Vec::new();
+        for (number, cookie) in cookies {
+            data.extend_from_slice(&xauth_record(number, cookie));
+        }
+        std::fs::write(&path, data).unwrap();
+        path
+    }
+
+    // Mutation: returning one constant CredentialId makes C1 and C2 compare equal.
+    #[test]
+    fn two_file_cookies_admit_with_distinct_stable_credentials() {
+        let c1 = [0x11u8; 16];
+        let c2 = [0x22u8; 16];
+        let path = auth_file("two-cookies", &[(b"1", &c1), (b"2", &c2)]);
+        let auth = AuthState::new(Some(path.clone()));
+        // Use distinct socket pairs for each complete setup handshake.
+        let first = setup_file_cookie(auth.clone(), ClientId(701), &c1);
+        let second = setup_file_cookie(auth.clone(), ClientId(702), &c2);
+        let first_again = setup_file_cookie(auth, ClientId(703), &c1);
+
+        let credential = |admission| match admission {
+            Admission::Cookie {
+                credential, source, ..
+            } => {
+                assert_eq!(source, CredentialSource::File);
+                credential
+            }
+            other => panic!("expected file-cookie admission, got {other:?}"),
+        };
+        assert_eq!(credential(first), credential(first_again));
+        assert_ne!(credential(first), credential(second));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn setup_file_cookie(auth: Arc<AuthState>, id: ClientId, cookie: &[u8]) -> Admission {
+        let (server_side, client_side) = crate::peer::connected_unix_pair();
+        setup_admission_on_stream(
+            auth,
+            id,
+            server_side,
+            client_side,
+            MIT_MAGIC_COOKIE.as_bytes(),
+            cookie,
+            false,
+        )
+    }
+
+    // Mutation: labelling a session-cookie match as File makes this assertion fail.
+    #[test]
+    fn session_cookie_admits_as_session() {
+        let cookie = [0x31u8; 16];
+        let auth = AuthState::new_with_xdmcp(None, true);
+        assert!(auth.install_session_cookie(
+            crate::core_loop::generation::Generation::default(),
+            MIT_MAGIC_COOKIE.as_bytes(),
+            &cookie,
+        ));
+        let admission = setup_file_cookie(auth, ClientId(704), &cookie);
+        assert!(matches!(
+            admission,
+            Admission::Cookie {
+                source: CredentialSource::Session,
+                ..
+            }
+        ));
+    }
+
+    // Mutation: recording the presented cookie instead of the host-list fallback makes this fail.
+    #[test]
+    fn failed_cookie_then_host_list_admits_as_host_access() {
+        let auth = AuthState::new(None);
+        let wrong_cookie = [0x41u8; 16];
+        let admission = setup_file_cookie(auth, ClientId(705), &wrong_cookie);
+        assert_eq!(admission, Admission::HostAccess);
+    }
+
+    // Mutation: treating an InternalClient as a normal open-host admission makes this fail.
+    #[test]
+    fn internal_client_admits_as_internal() {
+        let auth = AuthState::new_with_xdmcp(None, true);
+        let (server_stream, client_stream) = crate::peer::connected_unix_pair();
+        let internal_message = Message::InternalClient(server_stream);
+        let Message::InternalClient(server_stream) = internal_message else {
+            unreachable!();
+        };
+        let admission = setup_admission_on_stream(
+            auth,
+            ClientId(706),
+            server_stream,
+            client_stream,
+            b"invalid-protocol",
+            &[0x51; 16],
+            true,
+        );
+        assert_eq!(admission, Admission::Internal);
     }
 
     /// Drain `n` bytes from `s` with a deadline; returns the bytes.

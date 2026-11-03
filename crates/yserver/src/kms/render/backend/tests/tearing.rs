@@ -4534,6 +4534,7 @@ fn install_test_core_client_as(
     state.clients.insert(
         client_id.0,
         ClientState {
+            admission: yserver_core::access::Admission::Internal,
             writer: Arc::new(Mutex::new(transport)),
             is_local: true,
             fd_passing: true,
@@ -4730,6 +4731,7 @@ fn query_capabilities_in_core(
     state.clients.insert(
         client_id.0,
         ClientState {
+            admission: yserver_core::access::Admission::Internal,
             writer: Arc::new(Mutex::new(transport)),
             is_local: true,
             fd_passing: true,

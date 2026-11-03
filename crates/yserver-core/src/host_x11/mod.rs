@@ -1443,6 +1443,7 @@ mod tests {
         state.clients.insert(
             id,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(writer)),
                 is_local: true,
                 fd_passing: true,
@@ -2559,6 +2560,7 @@ mod tests {
         state.clients.insert(
             1,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(writer)),
                 is_local: true,
                 fd_passing: true,

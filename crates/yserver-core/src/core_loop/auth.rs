@@ -38,6 +38,7 @@ use super::{
     },
 };
 use crate::{
+    access::{Admission, CredentialId, CredentialSource},
     peer::{PeerCred, PeerIdentity, own_interface_addrs},
     xauth::{self, MIT_MAGIC_COOKIE},
 };
@@ -136,6 +137,7 @@ struct SessionCredential {
     /// MIT-MAGIC-COOKIE-1 data. Never empty — see
     /// [`AuthState::install_session_cookie`].
     cookie: Vec<u8>,
+    credential: CredentialId,
 }
 
 struct Inner {
@@ -156,11 +158,20 @@ struct Inner {
     generation: Generation,
     /// MIT-MAGIC-COOKIE-1 data blobs. Additive within a generation; a reset
     /// clears them (`MitResetCookie`, os/mitauth.c:87-97).
-    cookies: Vec<Vec<u8>>,
+    cookies: Vec<(CredentialId, Vec<u8>)>,
+    /// Next process-lifetime id. It is preserved across generation resets.
+    next_credential_id: u64,
     /// The XDMCP session credential. ONE slot: a new `Accept` replaces it,
     /// an abandoned offer clears it. Deliberately not merged into `cookies`,
     /// which is additive and only cleared by a reset.
     session: Option<SessionCredential>,
+}
+
+fn reject_reason(name: &[u8]) -> &'static str {
+    match Inner::reject(name) {
+        AuthVerdict::Reject(reason) => reason,
+        AuthVerdict::Allow => unreachable!("reject always returns Reject"),
+    }
 }
 
 /// Reproduce X.Org's reload trigger (os/auth.c:166-175), updating
@@ -222,8 +233,9 @@ impl Inner {
                 // cookies already held, so a reload of an unchanged file
                 // does not grow the list.
                 for cookie in cookies {
-                    if !self.cookies.contains(&cookie) {
-                        self.cookies.push(cookie);
+                    if !self.cookies.iter().any(|(_, loaded)| loaded == &cookie) {
+                        let credential = self.allocate_credential_id();
+                        self.cookies.push((credential, cookie));
                     }
                 }
                 self.local_open = false; // DisableLocalAccess
@@ -267,6 +279,14 @@ impl Inner {
             self.generation = generation;
         }
         Access::Current
+    }
+
+    fn allocate_credential_id(&mut self) -> CredentialId {
+        let value = self.next_credential_id;
+        self.next_credential_id = value
+            .checked_add(1)
+            .expect("credential id counter exhausted");
+        CredentialId::from_counter(value)
     }
 }
 
@@ -335,7 +355,7 @@ impl Inner {
     /// (os/access.c:1529-1555) that need no lookup: access control disabled
     /// (`xhost +`) or local access open. Both only for Unix: the host list
     /// never admits a TCP client. The selfhost and SI rules run in
-    /// [`AuthState::check`] with the lock released.
+    /// [`AuthState::admit`] with the lock released.
     fn verdict(
         &self,
         transport: AuthTransport,
@@ -363,23 +383,49 @@ impl Inner {
         name: &[u8],
         data: &[u8],
     ) -> AuthVerdict {
-        if self.session_authorizes(setup_generation, name, data) {
+        if self
+            .cookie_match(transport, xdmcp, setup_generation, name, data)
+            .is_some()
+        {
             return AuthVerdict::Allow;
+        }
+        Self::reject(name)
+    }
+
+    /// Return the credential that matched, preserving session-before-file
+    /// ordering and XDMCP's TCP-only-session rule.
+    fn cookie_match(
+        &self,
+        transport: AuthTransport,
+        xdmcp: bool,
+        setup_generation: Generation,
+        name: &[u8],
+        data: &[u8],
+    ) -> Option<(CredentialId, CredentialSource)> {
+        if self.session_authorizes(setup_generation, name, data) {
+            return self
+                .session
+                .as_ref()
+                .map(|session| (session.credential, CredentialSource::Session));
         }
         // In XDMCP mode the session credential is the ONLY thing that
         // authorizes TCP: stop before the file cookies and before the
         // local-open fallback. Before the first `Accept` there is no
         // credential at all, so this is also where TCP fails closed.
         if xdmcp && transport == AuthTransport::Tcp {
-            return Self::reject(name);
+            return None;
         }
         // Cookie match; `verdict` adds the local-open fallback (mirrors
         // CheckAuthorization + host-ACL fallthrough,
         // os/connection.c:536-560).
-        if name == MIT_MAGIC_COOKIE.as_bytes() && self.cookies.iter().any(|c| ct_eq(c, data)) {
-            return AuthVerdict::Allow;
+        if name == MIT_MAGIC_COOKIE.as_bytes() {
+            return self
+                .cookies
+                .iter()
+                .find(|(_, cookie)| ct_eq(cookie, data))
+                .map(|(credential, _)| (*credential, CredentialSource::File));
         }
-        Self::reject(name)
+        None
     }
 }
 
@@ -423,6 +469,7 @@ impl AuthState {
                 hosts: HostList::default(),
                 generation: Generation::default(),
                 cookies: Vec::new(),
+                next_credential_id: 1,
                 session: None,
             }),
         }
@@ -453,9 +500,11 @@ impl AuthState {
             inner.session = None;
             return false;
         }
+        let credential = inner.allocate_credential_id();
         inner.session = Some(SessionCredential {
             generation,
             cookie: data.to_vec(),
+            credential,
         });
         true
     }
@@ -522,7 +571,20 @@ impl AuthState {
         proto_name: &[u8],
         proto_data: &[u8],
     ) -> AuthVerdict {
-        self.check_with(
+        self.admit(peer, setup_generation, proto_name, proto_data)
+            .map_or_else(AuthVerdict::Reject, |_| AuthVerdict::Allow)
+    }
+
+    /// Authorize a client and record the credential or fallback that admitted
+    /// it. Credential ids are allocated independently of cookie bytes.
+    pub fn admit(
+        &self,
+        peer: &PeerIdentity,
+        setup_generation: Generation,
+        proto_name: &[u8],
+        proto_data: &[u8],
+    ) -> Result<Admission, &'static str> {
+        self.admit_with(
             peer,
             setup_generation,
             proto_name,
@@ -531,6 +593,7 @@ impl AuthState {
         )
     }
 
+    #[cfg(test)]
     fn check_with(
         &self,
         peer: &PeerIdentity,
@@ -539,7 +602,19 @@ impl AuthState {
         proto_data: &[u8],
         resolver: &dyn NameResolver,
     ) -> AuthVerdict {
-        let (verdict, hosts) = {
+        self.admit_with(peer, setup_generation, proto_name, proto_data, resolver)
+            .map_or_else(AuthVerdict::Reject, |_| AuthVerdict::Allow)
+    }
+
+    fn admit_with(
+        &self,
+        peer: &PeerIdentity,
+        setup_generation: Generation,
+        proto_name: &[u8],
+        proto_data: &[u8],
+        resolver: &dyn NameResolver,
+    ) -> Result<Admission, &'static str> {
+        let hosts = {
             // Poisoning recovery — same pattern as setup_thread.rs:66.
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             // A newer generation first gets Xorg's reset state; a stale
@@ -547,13 +622,16 @@ impl AuthState {
             // nor the host list applies to it.
             let access = inner.enter(setup_generation, self.file.as_deref(), self.xdmcp);
             if access == Access::Stale {
-                return inner.cookie_verdict(
+                return match inner.cookie_match(
                     peer.transport,
                     self.xdmcp,
                     setup_generation,
                     proto_name,
                     proto_data,
-                );
+                ) {
+                    Some((credential, source)) => Ok(Admission::Cookie { credential, source }),
+                    None => Err(reject_reason(proto_name)),
+                };
             }
             // With no `-auth` file there is nothing to reload: `local_open`
             // then changes only through `enter` and `FamilyLocalHost`. The
@@ -561,24 +639,36 @@ impl AuthState {
             if let Some(path) = self.file.as_deref() {
                 Self::reload_if_needed(&mut inner, path, false, self.xdmcp);
             }
-            let verdict = inner.verdict(
+            if let Some((credential, source)) = inner.cookie_match(
                 peer.transport,
                 self.xdmcp,
                 setup_generation,
                 proto_name,
                 proto_data,
-            );
-            if verdict == AuthVerdict::Allow || peer.transport != AuthTransport::Unix {
-                return verdict;
+            ) {
+                return Ok(Admission::Cookie { credential, source });
             }
-            (verdict, inner.hosts.hosts.clone())
+            if inner.verdict(
+                peer.transport,
+                self.xdmcp,
+                setup_generation,
+                proto_name,
+                proto_data,
+            ) == AuthVerdict::Allow
+            {
+                return Ok(Admission::HostAccess);
+            }
+            if peer.transport != AuthTransport::Unix {
+                return Err(reject_reason(proto_name));
+            }
+            inner.hosts.hosts.clone()
         };
         // The lock is released: the interface query and the NSS lookups run
         // on this snapshot of the list.
         if self.list_admits_unix(&hosts, peer.cred.as_ref(), resolver) {
-            return AuthVerdict::Allow;
+            return Ok(Admission::HostAccess);
         }
-        verdict
+        Err(reject_reason(proto_name))
     }
 
     /// The rest of `InvalidHost` for a Unix peer (os/access.c:1540-1566):
@@ -769,16 +859,20 @@ mod tests {
     }
 
     fn enforcing_with(cookies: Vec<Vec<u8>>) -> Inner {
-        Inner {
-            last_mtime: Some(t(1)),
-            ever_loaded: true,
-            local_open: false,
-            hosts: HostList::default(),
-            generation: Generation::default(),
-            cookies,
-            session: None,
-        }
+        let mut inner = fresh_open();
+        inner.last_mtime = Some(t(1));
+        inner.apply_load_outcome(LoadOutcome::Loaded(cookies), false);
+        inner
     }
+
+    fn cookie_bytes(inner: &Inner) -> Vec<Vec<u8>> {
+        inner
+            .cookies
+            .iter()
+            .map(|(_, cookie)| cookie.clone())
+            .collect()
+    }
+
     fn fresh_open() -> Inner {
         Inner {
             last_mtime: None,
@@ -787,6 +881,7 @@ mod tests {
             hosts: HostList::default(),
             generation: Generation::default(),
             cookies: Vec::new(),
+            next_credential_id: 1,
             session: None,
         }
     }
@@ -797,10 +892,10 @@ mod tests {
         i.apply_load_outcome(LoadOutcome::Loaded(vec![vec![1u8; 16]]), false);
         assert!(!i.local_open);
         assert!(i.ever_loaded);
-        assert_eq!(i.cookies, vec![vec![1u8; 16]]);
+        assert_eq!(cookie_bytes(&i), vec![vec![1u8; 16]]);
         // A second load APPENDS (additive — Xorg never clears on reload).
         i.apply_load_outcome(LoadOutcome::Loaded(vec![vec![2u8; 16]]), false);
-        assert_eq!(i.cookies, vec![vec![1u8; 16], vec![2u8; 16]]);
+        assert_eq!(cookie_bytes(&i), vec![vec![1u8; 16], vec![2u8; 16]]);
     }
 
     #[test]
@@ -809,7 +904,7 @@ mod tests {
         i.apply_load_outcome(LoadOutcome::OpenedEmpty, false);
         assert!(i.local_open, "empty file reopens local access (Xorg quirk)");
         assert_eq!(
-            i.cookies,
+            cookie_bytes(&i),
             vec![vec![1u8; 16]],
             "cookies retained (additive)"
         );
@@ -820,7 +915,7 @@ mod tests {
         let mut i = enforcing_with(vec![vec![1u8; 16]]);
         i.apply_load_outcome(LoadOutcome::OpenFailed, false);
         assert!(!i.local_open, "stays enforcing — does NOT reopen");
-        assert_eq!(i.cookies, vec![vec![1u8; 16]]);
+        assert_eq!(cookie_bytes(&i), vec![vec![1u8; 16]]);
     }
 
     #[test]
@@ -834,6 +929,7 @@ mod tests {
             hosts: HostList::default(),
             generation: Generation::default(),
             cookies: Vec::new(),
+            next_credential_id: 1,
             session: None,
         };
         i.apply_load_outcome(LoadOutcome::OpenFailed, false);
@@ -934,6 +1030,140 @@ mod tests {
 
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("yserver-auth-test-{}-{tag}", std::process::id()))
+    }
+
+    // Mutation: exposing the cookie bytes from `Admission`'s Debug output makes this assertion fail.
+    #[test]
+    fn admission_debug_never_shows_the_cookie() {
+        let cookie = [0xABu8; 16];
+        let path = temp_path("admission-debug");
+        fs::write(&path, xauth_bytes(b"7", &cookie)).unwrap();
+        let auth = AuthState::new(Some(path.clone()));
+
+        let admission = auth
+            .admit(
+                &UNIX,
+                Generation::default(),
+                MIT_MAGIC_COOKIE.as_bytes(),
+                &cookie,
+            )
+            .unwrap();
+        let debug = format!("{admission:?}");
+        let hex = cookie
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let decimal = cookie
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(!debug.contains(&hex));
+        assert!(!debug.contains(&decimal));
+        fs::remove_file(path).unwrap();
+    }
+
+    // Mutation: derive CredentialId from cookie bytes; reloading C1 after a
+    // reset makes `assert_ne!(c1_reloaded_id, c1_id)` fail.
+    #[test]
+    fn credential_ids_are_kept_while_loaded_and_never_reused() {
+        fn file_id(auth: &AuthState, generation: Generation, cookie: &[u8]) -> CredentialId {
+            match auth
+                .admit(&UNIX, generation, MIT, cookie)
+                .expect("file cookie must be admitted")
+            {
+                Admission::Cookie {
+                    credential,
+                    source: CredentialSource::File,
+                } => credential,
+                other => panic!("expected file-cookie admission, got {other:?}"),
+            }
+        }
+
+        fn session_id(auth: &AuthState, generation: Generation, cookie: &[u8]) -> CredentialId {
+            match auth
+                .admit(&TCP, generation, MIT, cookie)
+                .expect("session cookie must be admitted")
+            {
+                Admission::Cookie {
+                    credential,
+                    source: CredentialSource::Session,
+                } => credential,
+                other => panic!("expected session-cookie admission, got {other:?}"),
+            }
+        }
+
+        let path = temp_path("allocated-credential-ids");
+        let c1 = [0xD1u8; 16];
+        fs::write(&path, xauth_bytes(b"1", &c1)).unwrap();
+        let auth = AuthState::new(Some(path.clone()));
+        let counter = GenerationCounter::new();
+        let mut generation = counter.current();
+        let mut seen = std::collections::HashSet::new();
+
+        let c1_id = file_id(&auth, generation, &c1);
+        assert!(seen.insert(c1_id), "first credential id must be new");
+
+        // A real mtime-triggered reload that retains C1 must keep its id.
+        touch_later(&path);
+        assert_eq!(file_id(&auth, generation, &c1), c1_id);
+
+        // Reset clears the loaded cookie list; the changed file is empty, so
+        // this generation no longer has C1. Empty-file local access is closed
+        // only after exercising the real reset/reload path.
+        rewrite_keeping_mtime(&path, b"");
+        generation = counter.bump();
+        assert_eq!(
+            auth.admit(&UNIX, generation, MIT, &c1).unwrap(),
+            Admission::HostAccess
+        );
+        set_local_open(&auth, false);
+        assert_eq!(
+            auth.admit(&UNIX, generation, MIT, &c1),
+            Err(REASON_BAD_COOKIE)
+        );
+
+        // Reintroducing C1 after reset creates a new credential lifetime.
+        rewrite_keeping_mtime(&path, &xauth_bytes(b"1", &c1));
+        generation = counter.bump();
+        let c1_reloaded_id = file_id(&auth, generation, &c1);
+        assert_ne!(c1_reloaded_id, c1_id);
+        assert!(seen.insert(c1_reloaded_id), "reloaded C1 id must be new");
+
+        // A reset drops even a still-present cookie, and the forced reload
+        // allocates a fresh id for that same byte sequence.
+        generation = counter.bump();
+        let c1_after_reset_id = file_id(&auth, generation, &c1);
+        assert_ne!(c1_after_reset_id, c1_reloaded_id);
+        assert!(
+            seen.insert(c1_after_reset_id),
+            "post-reset C1 id must be new"
+        );
+
+        let session1 = [0xE1u8; 16];
+        let session2 = [0xE2u8; 16];
+        assert!(auth.install_session_cookie(generation, MIT, &session1));
+        let session1_id = session_id(&auth, generation, &session1);
+        assert!(seen.insert(session1_id), "session id must be new");
+
+        assert!(auth.install_session_cookie(generation, MIT, &session2));
+        let session2_id = session_id(&auth, generation, &session2);
+        assert_ne!(session2_id, session1_id);
+        assert!(
+            seen.insert(session2_id),
+            "replacement session id must be new"
+        );
+
+        auth.clear_session_cookie();
+        assert!(auth.install_session_cookie(generation, MIT, &session2));
+        let session2_reinstalled_id = session_id(&auth, generation, &session2);
+        assert_ne!(session2_reinstalled_id, session2_id);
+        assert!(
+            seen.insert(session2_reinstalled_id),
+            "cleared session id must never be reused"
+        );
+
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1093,7 +1323,7 @@ mod tests {
         );
         let inner = auth.inner.lock().unwrap();
         assert_eq!(
-            inner.cookies,
+            cookie_bytes(&inner),
             vec![cookie.to_vec()],
             "runtime must see the startup load rather than append a second load"
         );

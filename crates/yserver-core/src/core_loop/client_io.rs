@@ -210,6 +210,7 @@ mod tests {
 
     fn make_client(writer: UnixStream) -> ClientState {
         ClientState {
+            admission: crate::access::Admission::Internal,
             writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer))),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),

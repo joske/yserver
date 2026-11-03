@@ -142,6 +142,7 @@ impl ProtoFixture {
         };
         use yserver_core::{resources::ROOT_WINDOW, server::ClientState};
         ClientState {
+            admission: yserver_core::access::Admission::Internal,
             writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(a))),
             byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),

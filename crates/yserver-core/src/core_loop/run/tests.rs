@@ -12,6 +12,7 @@ fn install_xi_config_test_client(
     state.clients.insert(
         client_id,
         ClientState {
+            admission: crate::access::Admission::Internal,
             writer: Arc::new(Mutex::new(transport)),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
@@ -46,6 +47,7 @@ fn unix_client(
 ) -> crate::server::ClientState {
     use std::sync::{Arc, Mutex, atomic::AtomicU16};
     crate::server::ClientState {
+        admission: crate::access::Admission::Internal,
         writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer))),
         byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
         last_sequence: Arc::new(AtomicU16::new(0)),
@@ -72,6 +74,22 @@ fn unix_client(
         internal: false,
         peer: crate::peer::PeerIdentity::unknown_unix(),
     }
+}
+
+// Mutation: returning None from AccessContext::admission makes this assertion fail.
+#[test]
+fn access_context_returns_the_clients_admission() {
+    let (writer, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut state = ServerState::new();
+    let mut client = unix_client(writer, 7, 0);
+    client.admission = crate::access::Admission::HostAccess;
+    state.clients.insert(7, client);
+
+    let context = crate::access::AccessContext::new(&state, None);
+    assert_eq!(
+        context.admission(yserver_protocol::x11::ClientId(7)),
+        Some(&crate::access::Admission::HostAccess),
+    );
 }
 
 /// Client `owner`'s 10x10 child of the root.
@@ -1470,6 +1488,7 @@ fn randr_change_fanout_orders_screen_then_all_crtcs_then_all_outputs() {
     state.clients.insert(
         7,
         ClientState {
+            admission: crate::access::Admission::Internal,
             writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer))),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(9)),
@@ -1880,6 +1899,7 @@ fn ready_crtc_completion_replies_unblocks_and_returns_reader_credit() {
     state.clients.insert(
         client_id.0,
         ClientState {
+            admission: crate::access::Admission::Internal,
             writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer))),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
@@ -2230,6 +2250,7 @@ fn reconcile_writable_interest_tracks_outbound_state() {
     state.clients.insert(
         7,
         ClientState {
+            admission: crate::access::Admission::Internal,
             writer: writer_arc,
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
@@ -2384,6 +2405,7 @@ fn reconcile_registers_an_unregistered_writer_only_while_output_waits() {
     state.clients.insert(
         7,
         ClientState {
+            admission: crate::access::Admission::Internal,
             writer: writer_arc,
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
@@ -2912,6 +2934,7 @@ fn an_orphaned_xdmcp_client_does_not_reset_the_generation() {
             fd_passing: false,
             internal: false,
             peer: crate::peer::PeerIdentity::unknown_unix(),
+            admission: crate::access::Admission::Internal,
             setup_reply: Vec::new(),
         })
         .expect("send the racing completion");

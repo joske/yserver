@@ -647,6 +647,7 @@ fn an_old_setup_completion_cannot_create_a_client_in_the_new_generation() {
             fd_passing: true,
             internal: false,
             peer: crate::peer::PeerIdentity::unknown_unix(),
+            admission: crate::access::Admission::Internal,
             setup_reply: Vec::new(),
         })
         .expect("send the stale completion");

@@ -570,6 +570,7 @@ fn add_client(state: &mut ServerState) -> UnixStream {
     state.clients.insert(
         CLIENT,
         ClientState {
+            admission: yserver_core::access::Admission::Internal,
             writer: Arc::new(Mutex::new(Transport::Unix(writer))),
             byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),

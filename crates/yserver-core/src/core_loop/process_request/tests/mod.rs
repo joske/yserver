@@ -115,6 +115,7 @@ fn install_client_with_transport(
     state.clients.insert(
         id,
         ClientState {
+            admission: crate::access::Admission::Internal,
             writer: Arc::new(Mutex::new(transport)),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),

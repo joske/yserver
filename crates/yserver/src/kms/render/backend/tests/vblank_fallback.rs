@@ -248,6 +248,7 @@ fn frozen_clock_reads_are_current_after_inactivity() {
     state.clients.insert(
         1,
         ClientState {
+            admission: yserver_core::access::Admission::Internal,
             writer: Arc::new(Mutex::new(transport)),
             is_local: true,
             fd_passing: true,
@@ -824,6 +825,7 @@ fn run_frozen_core_present_requests(
     peer.set_read_timeout(Some(Duration::from_secs(10)))
         .expect("set test client read timeout");
     let make_client_state = |transport| ClientState {
+        admission: yserver_core::access::Admission::Internal,
         writer: Arc::new(Mutex::new(transport)),
         is_local: true,
         fd_passing: true,
