@@ -307,9 +307,9 @@ pub(super) fn handle_ungrab_server(
     Ok(RequestOutcome::Handled)
 }
 
-/// Who may change the host list or the access mode: Xorg's
-/// `AuthorizedClient` without `-ac` (`os/access.c:1293-1307`). The hook point
-/// for SECURITY's `DixManageAccess`.
+/// The existing locality rule for changing the host list or access mode:
+/// Xorg's `AuthorizedClient` without `-ac` (`os/access.c:1293-1307`). Callers
+/// ask the `DixManageAccess` policy hook before applying this rule.
 fn may_manage_access(client: &ClientState) -> bool {
     client.is_local
 }
@@ -382,12 +382,6 @@ pub(super) fn handle_change_hosts(
             109,
         );
     }
-    let Some(client) = state.clients.get(&client_id.0) else {
-        return Ok(RequestOutcome::Handled);
-    };
-    if !may_manage_access(client) {
-        return emit_x11_error(state, client_id, sequence, x11::error::BAD_ACCESS, 0, 109);
-    }
     if let Decision::Deny(error) = state.check_server(
         client_id,
         AccessMode::MANAGE,
@@ -397,6 +391,12 @@ pub(super) fn handle_change_hosts(
         }),
     ) {
         return emit_x11_error(state, client_id, sequence, error.code, error.value, 109);
+    }
+    let Some(client) = state.clients.get(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    if !may_manage_access(client) {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_ACCESS, 0, 109);
     }
     // The generic length check already matched the request length to the
     // address length; the body is little-endian here.
@@ -449,12 +449,6 @@ pub(super) fn handle_set_access_control(
             111,
         );
     }
-    let Some(client) = state.clients.get(&client_id.0) else {
-        return Ok(RequestOutcome::Handled);
-    };
-    if !may_manage_access(client) {
-        return emit_x11_error(state, client_id, sequence, x11::error::BAD_ACCESS, 0, 111);
-    }
     if let Decision::Deny(error) = state.check_server(
         client_id,
         AccessMode::MANAGE,
@@ -464,6 +458,12 @@ pub(super) fn handle_set_access_control(
         }),
     ) {
         return emit_x11_error(state, client_id, sequence, error.code, error.value, 111);
+    }
+    let Some(client) = state.clients.get(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    if !may_manage_access(client) {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_ACCESS, 0, 111);
     }
     let handle = state.host_access.clone();
     match handle.auth.set_access_enabled(handle.generation, mode == 1) {

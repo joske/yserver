@@ -1305,33 +1305,62 @@ fn server_hook_asks_with_client_mode_and_context() {
 }
 
 #[test]
-fn existing_rules_answer_before_the_hook() {
-    // Mutation: ask policies before mode or locality checks; expected errors and zero calls must fail.
-    let mut state = ServerState::new();
-    let mut peer = install_client(&mut state, 1);
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    state.install_access_policy(Arc::new(RecordingServerPolicy {
-        decision: crate::access::Decision::Deny(crate::access::DenyError {
-            code: x11::error::BAD_VALUE,
-            value: 0x55,
-        }),
-        calls: Arc::clone(&calls),
-    }));
+fn invalid_mode_answers_before_the_hook_and_the_hook_before_locality() {
+    // Mutation: move the hook before mode validation or after the locality check; both boundaries fail.
+    let deny = crate::access::Decision::Deny(crate::access::DenyError {
+        code: x11::error::BAD_VALUE,
+        value: 0x55,
+    });
+    let requests = [(109, change_hosts_body(252, &[])), (111, Vec::new())];
 
-    let invalid_mode = change_hosts(&mut state, &mut peer, 2, 252, &[]);
-    assert_eq!(
-        invalid_mode,
-        expected_host_error(20, x11::error::BAD_VALUE, 2, 109)
-    );
-    assert!(calls.lock().unwrap().is_empty());
+    for (opcode, body) in requests {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        state.install_access_policy(Arc::new(RecordingServerPolicy {
+            decision: deny,
+            calls: Arc::clone(&calls),
+        }));
 
-    state.clients.get_mut(&1).unwrap().is_local = false;
-    let non_local = change_hosts(&mut state, &mut peer, 0, 252, &[]);
-    assert_eq!(
-        non_local,
-        expected_host_error(20, x11::error::BAD_ACCESS, 0, 109)
-    );
-    assert!(calls.lock().unwrap().is_empty());
+        let invalid_mode = host_request(&mut state, 1, &mut peer, 20, opcode, 2, &body);
+        assert_eq!(
+            invalid_mode,
+            expected_host_error(20, x11::error::BAD_VALUE, 2, opcode)
+        );
+        assert!(calls.lock().unwrap().is_empty());
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.clients.get_mut(&1).unwrap().is_local = false;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        state.install_access_policy(Arc::new(RecordingServerPolicy {
+            decision: crate::access::Decision::Allow,
+            calls: Arc::clone(&calls),
+        }));
+
+        let allowed_non_local = host_request(&mut state, 1, &mut peer, 20, opcode, 0, &body);
+        assert_eq!(
+            allowed_non_local,
+            expected_host_error(20, x11::error::BAD_ACCESS, 0, opcode)
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1);
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.clients.get_mut(&1).unwrap().is_local = false;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        state.install_access_policy(Arc::new(RecordingServerPolicy {
+            decision: deny,
+            calls: Arc::clone(&calls),
+        }));
+
+        let denied_non_local = host_request(&mut state, 1, &mut peer, 20, opcode, 0, &body);
+        assert_eq!(
+            denied_non_local,
+            expected_host_error(20, x11::error::BAD_VALUE, 0x55, opcode)
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
 }
 
 #[test]
