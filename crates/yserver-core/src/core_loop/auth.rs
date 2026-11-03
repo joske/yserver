@@ -152,11 +152,12 @@ struct Inner {
     /// outlives a reset, so the reset is applied by the first access from a
     /// newer generation ([`Inner::enter`]), never by a call at the boundary.
     generation: Generation,
-    /// MIT-MAGIC-COOKIE-1 data blobs. ADDITIVE — never cleared.
+    /// MIT-MAGIC-COOKIE-1 data blobs. Additive within a generation; a reset
+    /// clears them (`MitResetCookie`, os/mitauth.c:87-97).
     cookies: Vec<Vec<u8>>,
     /// The XDMCP session credential. ONE slot: a new `Accept` replaces it,
     /// an abandoned offer clears it. Deliberately not merged into `cookies`,
-    /// which is additive and process-lifetime — the opposite lifetime.
+    /// which is additive and only cleared by a reset.
     session: Option<SessionCredential>,
 }
 
@@ -215,9 +216,9 @@ impl Inner {
     fn apply_load_outcome(&mut self, outcome: LoadOutcome, xdmcp: bool) {
         match outcome {
             LoadOutcome::Loaded(cookies) => {
-                // Additive — os/auth.c never clears. Skip cookies already
-                // held, so the forced reload on every reset does not grow
-                // the list.
+                // Additive — a reload never clears (os/auth.c). Skip
+                // cookies already held, so a reload of an unchanged file
+                // does not grow the list.
                 for cookie in cookies {
                     if !self.cookies.contains(&cookie) {
                         self.cookies.push(cookie);
@@ -243,8 +244,9 @@ impl Inner {
 
     /// Bring the state into `generation`. The first access from a newer
     /// generation applies Xorg's reset: `ResetHosts` closes local access
-    /// and empties the enabled host list (os/access.c:956-962), and `ResetAuthorization` forces the next auth load
-    /// (os/auth.c:225-233), whose outcome may open it again. With no auth
+    /// and empties the enabled host list (os/access.c:956-962), and
+    /// `ResetAuthorization` drops every cookie and forces the next auth load
+    /// (os/auth.c:225-233, os/mitauth.c:87-97), whose outcome may open it again. With no auth
     /// file that load finds zero cookies (`LoadAuthorization` returns 0,
     /// os/auth.c:117-119), so the reset value is `!xdmcp`. An access from an
     /// older generation changes nothing.
@@ -255,6 +257,7 @@ impl Inner {
         if generation > self.generation {
             self.local_open = false;
             self.hosts = HostList::default();
+            self.cookies.clear();
             match file {
                 Some(path) => AuthState::reload_if_needed(self, path, true, xdmcp),
                 None => self.apply_load_outcome(LoadOutcome::OpenedEmpty, xdmcp),
@@ -1627,6 +1630,11 @@ mod tests {
             "the reset forced the reload"
         );
         assert_eq!(
+            auth.check(&UNIX, g1, MIT, &first),
+            AuthVerdict::Reject(REASON_BAD_COOKIE),
+            "the reset dropped the cookie the file no longer holds"
+        );
+        assert_eq!(
             cookieless_unix(&auth, g1),
             AuthVerdict::Reject(REASON_NO_PROTO),
             "a loaded cookie leaves local access closed"
@@ -1669,9 +1677,15 @@ mod tests {
         );
         set_local_open(&auth, true);
         fs::remove_file(&path).unwrap();
+        let g1 = counter.bump();
         assert_eq!(
-            cookieless_unix(&auth, counter.bump()),
+            cookieless_unix(&auth, g1),
             AuthVerdict::Reject(REASON_NO_PROTO)
+        );
+        assert_eq!(
+            auth.check(&UNIX, g1, MIT, &[0x34u8; 16]),
+            AuthVerdict::Reject(REASON_BAD_COOKIE),
+            "no file to reload, and the reset dropped the old cookie"
         );
     }
 
