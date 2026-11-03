@@ -13,16 +13,16 @@
 //! `pub(super)` re-exports so it doesn't have to duplicate the wire
 //! decoding.
 
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::{
     env, fs,
     io::{self, ErrorKind, Read, Write},
     net::TcpStream,
-    os::{
-        fd::{AsRawFd, RawFd},
-        unix::net::UnixStream,
-    },
     path::PathBuf,
 };
+
+use crate::fd::{AsRawFd, RawFd};
 
 use super::{pad4, padded_len, read_i16, read_u16, read_u32, write_u16};
 
@@ -38,6 +38,7 @@ use super::{pad4, padded_len, read_i16, read_u16, read_u32, write_u16};
 /// forward fd-mode shm to the host server; that path stays
 /// fd-passing-disabled when the host connection is TCP.
 pub enum HostStream {
+    #[cfg(unix)]
     Unix(UnixStream),
     Tcp(TcpStream),
 }
@@ -45,6 +46,7 @@ pub enum HostStream {
 impl Read for HostStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
+            #[cfg(unix)]
             HostStream::Unix(s) => s.read(buf),
             HostStream::Tcp(s) => s.read(buf),
         }
@@ -54,18 +56,21 @@ impl Read for HostStream {
 impl Write for HostStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
+            #[cfg(unix)]
             HostStream::Unix(s) => s.write(buf),
             HostStream::Tcp(s) => s.write(buf),
         }
     }
     fn flush(&mut self) -> io::Result<()> {
         match self {
+            #[cfg(unix)]
             HostStream::Unix(s) => s.flush(),
             HostStream::Tcp(s) => s.flush(),
         }
     }
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         match self {
+            #[cfg(unix)]
             HostStream::Unix(s) => s.write_all(buf),
             HostStream::Tcp(s) => s.write_all(buf),
         }
@@ -75,9 +80,47 @@ impl Write for HostStream {
 impl AsRawFd for HostStream {
     fn as_raw_fd(&self) -> RawFd {
         match self {
+            #[cfg(unix)]
             HostStream::Unix(s) => s.as_raw_fd(),
+            #[cfg(unix)]
             HostStream::Tcp(s) => s.as_raw_fd(),
+            #[cfg(windows)]
+            HostStream::Tcp(s) => std::os::windows::io::AsRawSocket::as_raw_socket(s),
         }
+    }
+}
+
+impl HostStream {
+    /// Read what is available without blocking, whatever the stream's own
+    /// blocking mode.
+    #[cfg(unix)]
+    pub(super) fn recv_dontwait(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // SAFETY: `recv(2)` with MSG_DONTWAIT on a connected socket; `buf`
+        // is a valid mutable slice.
+        let n = unsafe {
+            libc::recv(
+                self.as_raw_fd(),
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        #[allow(clippy::cast_sign_loss)]
+        Ok(n as usize)
+    }
+
+    /// Read what is available without blocking, whatever the stream's own
+    /// blocking mode.
+    #[cfg(windows)]
+    pub(super) fn recv_dontwait(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let HostStream::Tcp(s) = self;
+        s.set_nonblocking(true)?;
+        let read = s.read(buf);
+        s.set_nonblocking(false)?;
+        read
     }
 }
 
@@ -93,9 +136,17 @@ pub(super) fn connect_to_host() -> io::Result<HostStream> {
     let auth = XAuthority::load(display_number).unwrap_or_default();
     let mut stream = match host.as_deref() {
         // Empty host or "unix" → AF_UNIX at /tmp/.X11-unix/Xn.
+        #[cfg(unix)]
         None | Some("") | Some("unix") => {
             let socket_path = format!("/tmp/.X11-unix/X{display_number}");
             HostStream::Unix(UnixStream::connect(socket_path)?)
+        }
+        #[cfg(windows)]
+        None | Some("" | "unix") => {
+            return Err(io::Error::new(
+                ErrorKind::Unsupported,
+                "Windows has no Unix-domain host display",
+            ));
         }
         // Otherwise TCP at host:(6000+display_number). Most commonly
         // localhost:6010 for SSH X11 forwarding (DISPLAY=localhost:10.0).

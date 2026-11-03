@@ -2,11 +2,13 @@
 //!
 //! See `docs/superpowers/plans/2026-05-06-single-threaded-core.md` Phase B.
 
-use std::{os::fd::OwnedFd, path::PathBuf, time::Instant};
+use std::{path::PathBuf, time::Instant};
 
 use yserver_protocol::x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber};
 
-use crate::{core_loop::generation::Generation, host_x11::HostKeyEvent, transport::Transport};
+use crate::{
+    core_loop::generation::Generation, fd::OwnedFd, host_x11::HostKeyEvent, transport::Transport,
+};
 
 /// Snapshot of a libinput device's identity and touchpad configuration at
 /// device-add time.  Plain data — no libinput handles, safe to send across
@@ -237,6 +239,7 @@ pub enum Message {
     /// The server's own X client (a window shell's clipboard bridge): the
     /// core runs the setup on `stream` as for an accepted connection, with
     /// no authorization, and marks the client internal.
+    #[cfg(unix)]
     InternalClient(std::os::unix::net::UnixStream),
     /// One framed X11 request from a client reader thread.
     Request {

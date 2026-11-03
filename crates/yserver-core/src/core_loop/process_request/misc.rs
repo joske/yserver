@@ -244,6 +244,7 @@ pub(super) fn extension_query_reply(name: &str, backend: &mut dyn Backend) -> Op
         ExtensionAvailability::HostXkb => backend.xkb_opcode().is_some(),
         ExtensionAvailability::Dri3 => backend.dri3_capabilities().version != (0, 0),
         ExtensionAvailability::Glx => backend.glx_available(),
+        ExtensionAvailability::Unix => cfg!(unix),
     };
     if !available {
         return None;
@@ -269,6 +270,7 @@ pub(super) fn advertised_extension_names(backend: &mut dyn Backend) -> Vec<&'sta
             ExtensionAvailability::HostXkb => xkb_available,
             ExtensionAvailability::Dri3 => dri3_available,
             ExtensionAvailability::Glx => glx_available,
+            ExtensionAvailability::Unix => cfg!(unix),
         })
         .map(|ext| ext.name)
         .collect()

@@ -4,6 +4,7 @@
 // glue, region/shape ops). The legacy `handle_client`/`handle_request`
 // path was deleted in H1.
 
+#[cfg(unix)]
 use std::{
     fs,
     io::{self, ErrorKind},
@@ -11,10 +12,13 @@ use std::{
     path::PathBuf,
 };
 
+#[cfg(unix)]
 use log::{error, info};
 use yserver_protocol::x11::{ResourceId, shape as x11shape, xfixes as x11xfixes};
 
-use crate::{host_x11::HostX11Backend, region::Region, server::ServerState};
+#[cfg(unix)]
+use crate::host_x11::HostX11Backend;
+use crate::{region::Region, server::ServerState};
 
 // Extension error-code bases. INVARIANT: each extension's reserved range
 // `[first_error, first_error + error_count)` must NOT overlap any other
@@ -124,6 +128,8 @@ pub(crate) enum ExtensionAvailability {
     Dri3,
     /// GLX — gated on `Backend::glx_available()`.
     Glx,
+    /// MIT-SHM — its segments are SysV shm or passed fds, so Unix only.
+    Unix,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -287,7 +293,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         first_event: MIT_SHM_FIRST_EVENT,
         event_count: 1, // ShmCompletion=0
         first_error: MIT_SHM_FIRST_ERROR,
-        availability: ExtensionAvailability::Always,
+        availability: ExtensionAvailability::Unix,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
     },
     ExtensionMetadata {
@@ -355,6 +361,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
     },
 ];
 
+#[cfg(unix)]
 pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
     let socket_dir = PathBuf::from("/tmp/.X11-unix");
     fs::create_dir_all(&socket_dir)?;

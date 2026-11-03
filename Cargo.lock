@@ -1445,6 +1445,7 @@ dependencies = [
  "log",
  "mio",
  "proptest",
+ "windows-sys 0.61.2",
  "yserver-protocol",
 ]
 

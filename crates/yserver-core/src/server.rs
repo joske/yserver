@@ -2855,7 +2855,7 @@ pub struct PresentEventSelection {
 /// `<sys/shm.h>`'s `SHM_RDONLY`, which the libc crate omits for OpenBSD.
 #[cfg(target_os = "openbsd")]
 const SHM_RDONLY: libc::c_int = 0o10000;
-#[cfg(not(target_os = "openbsd"))]
+#[cfg(all(unix, not(target_os = "openbsd")))]
 const SHM_RDONLY: libc::c_int = libc::SHM_RDONLY;
 
 /// A shared memory segment attached via MIT-SHM. Owns the lifetime of both
@@ -2875,9 +2875,11 @@ pub struct MitShmSegment {
     addr: *mut libc::c_void,
     /// Backing source — either an FD we close on Drop, or a SysV shmat
     /// mapping we shmdt on Drop.
+    #[cfg(unix)]
     backing: MitShmBacking,
 }
 
+#[cfg(unix)]
 #[derive(Debug)]
 enum MitShmBacking {
     /// `AttachFd`: file descriptor that backs `addr` via `mmap`.
@@ -2891,6 +2893,8 @@ enum MitShmBacking {
 unsafe impl Send for MitShmSegment {}
 unsafe impl Sync for MitShmSegment {}
 
+/// Windows has no MIT-SHM, so no segment is ever made there.
+#[cfg(unix)]
 impl MitShmSegment {
     /// Map an attached file descriptor. Caller must have verified the FD
     /// references a regular file or memfd; we `fstat` to learn the size.
@@ -2971,7 +2975,9 @@ impl MitShmSegment {
             backing: MitShmBacking::Sysv,
         })
     }
+}
 
+impl MitShmSegment {
     /// View into the mapped memory. Lifetime is tied to `&self`, so callers
     /// may only borrow within their own request handler.
     #[must_use]
@@ -2995,6 +3001,7 @@ impl MitShmSegment {
     }
 }
 
+#[cfg(unix)]
 impl Drop for MitShmSegment {
     fn drop(&mut self) {
         unsafe {
@@ -3140,6 +3147,10 @@ pub struct ClientState {
     /// Whether the core's mio poller currently watches this client's
     /// writer fd for WRITABLE.  Used in I2.
     pub watching_writable: bool,
+    /// The duplicate of the writer socket the poller watches: mio cannot
+    /// watch a borrowed socket on Windows.
+    #[cfg(windows)]
+    pub writable_source: Option<mio::net::TcpStream>,
     /// A write to this client failed (peer gone, or `OUTBOUND_CAP`
     /// reached), so its stream can no longer be whole. Set by
     /// `client_io`, never cleared; the core loop disconnects every

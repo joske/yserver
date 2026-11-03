@@ -12,6 +12,9 @@ libc.workspace = true
 crossbeam-channel.workspace = true
 mio.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
+
 [dev-dependencies]
 proptest = "1"
 

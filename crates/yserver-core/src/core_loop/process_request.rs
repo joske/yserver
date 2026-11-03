@@ -53,9 +53,12 @@ pub(crate) use window_destroy::{destroy_window_subtree, execute_destroy};
 mod windows;
 mod xi;
 mod xkb;
+#[cfg(unix)]
 mod xshm;
 mod xtest;
 
+#[cfg(unix)]
+use crate::core_loop::process_request::xshm::handle_mit_shm_request;
 use crate::core_loop::process_request::{
     colormaps::{
         handle_alloc_color, handle_alloc_color_cells, handle_alloc_color_planes,
@@ -100,7 +103,6 @@ use crate::core_loop::process_request::{
     render::handle_render_request,
     vidmode::handle_xf86vidmode_request,
     xkb::handle_xkb_request,
-    xshm::handle_mit_shm_request,
     xtest::handle_xtest_request,
 };
 pub(crate) use dri3::complete_dri3_export;
@@ -126,7 +128,7 @@ mod largest_free_xid_gap_tests;
 #[cfg(test)]
 mod tests;
 
-use std::{io, os::fd::OwnedFd};
+use std::io;
 
 use log::debug;
 use yserver_protocol::{
@@ -139,6 +141,7 @@ use crate::core_loop::pointer_fanout::pointer_event_fanout_to_state;
 use crate::{
     backend::{Backend, OriginContext},
     core_loop::{client_io, client_io::WriteOutcome},
+    fd::OwnedFd,
     server::ServerState,
 };
 
@@ -517,6 +520,7 @@ pub fn process_request(
         // ── DAMAGE extension dispatcher ──
         143 => handle_damage_request(state, backend, client_id, sequence, header, body),
         // ── MIT-SHM extension dispatcher ──
+        #[cfg(unix)]
         130 => handle_mit_shm_request(
             state,
             backend,
@@ -742,7 +746,7 @@ fn reject_non_local_extension_request(
 fn send_reply_with_fd(
     client: &mut crate::server::ClientState,
     bytes: &[u8],
-    fd: std::os::fd::RawFd,
+    fd: crate::fd::RawFd,
 ) -> io::Result<()> {
     if client.gone {
         return Ok(());
@@ -768,6 +772,15 @@ fn send_reply_with_fd(
             }
         }
     }
+    send_with_fd(client, bytes, fd)
+}
+
+#[cfg(unix)]
+fn send_with_fd(
+    client: &crate::server::ClientState,
+    bytes: &[u8],
+    fd: crate::fd::RawFd,
+) -> io::Result<()> {
     let writer_arc = client.writer.clone();
     let mut w = writer_arc
         .lock()
@@ -779,6 +792,19 @@ fn send_reply_with_fd(
         ));
     };
     crate::unix_fd::send_with_fd(stream, bytes, fd)
+}
+
+/// No Windows transport passes descriptors, so `fd_passing` is never set.
+#[cfg(windows)]
+fn send_with_fd(
+    _client: &crate::server::ClientState,
+    _bytes: &[u8],
+    _fd: crate::fd::RawFd,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "file descriptor passing is unavailable on this transport",
+    ))
 }
 
 /// A window or pixmap of that id.
