@@ -5,4 +5,5 @@
 pub(crate) mod devices;
 pub(crate) mod keymap;
 pub(crate) mod pointer;
+pub(crate) mod scancode;
 pub(crate) mod translate;
