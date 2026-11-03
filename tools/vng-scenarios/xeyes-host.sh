@@ -18,9 +18,10 @@ if not files:
     sys.exit("no scanout dump")
 p = Image.open(files[0]).convert("RGB").load()
 root, white = (0x4F, 0x4F, 0x4F), (255, 255, 255)
-# Window outer rect 100,100 302x202 (bw 1).
-outside = [(101, 101), (400, 101), (101, 300), (400, 300), (251, 101), (251, 300)]
-inside = [(172, 140), (330, 140)]
+# Window outer rect 100,100 1002x602 (bw 1). The eyes are sampled high and
+# low, away from the pupils.
+outside = [(101, 101), (1100, 101), (101, 700), (1100, 700), (601, 101), (601, 700)]
+inside = [(351, 200), (851, 200), (351, 620), (851, 620)]
 bad = [f"{xy} {p[xy]} not root" for xy in outside if p[xy] != root]
 bad += [f"{xy} {p[xy]} not an eye" for xy in inside if p[xy] != white]
 print("\n".join(bad) or "ok")

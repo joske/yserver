@@ -10,11 +10,12 @@ use crate::kms::{
         },
     },
     vk::{
-        compositor::{CompositeScene, PresentError},
+        compositor::{CompositeDraw, CompositeScene, PresentError},
         pipeline::{CompositePushConsts, CompositorPipeline},
     },
 };
 use ash::vk;
+use std::collections::HashMap;
 
 pub(super) fn present_error_is_device_lost(error: &PresentError) -> bool {
     matches!(error, PresentError::Vk(vk::Result::ERROR_DEVICE_LOST))
@@ -95,26 +96,17 @@ pub(super) fn record_and_submit_render<T: ComposeRenderTarget + ?Sized>(
     };
     target.set_last_gpu_render_ns(last_gpu_render_ns);
 
-    // Allocate descriptor sets — same shape as v1.
-    let mut descriptors: Vec<vk::DescriptorSet> = Vec::with_capacity(scene.draws.len());
-    for draw in &scene.draws {
+    // One descriptor set per distinct image view, shared by every draw that
+    // samples it: a shaped window emits a draw per visible rect, and one set
+    // per draw ran the pool dry and dropped the topmost draws.
+    let descriptors = share_descriptor_sets(&scene.draws, |view| {
         let layouts = [pipeline.descriptor_set_layout];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(descriptor_pool)
             .set_layouts(&layouts);
-        let set = match unsafe { vk.device.allocate_descriptor_sets(&alloc_info) } {
-            Ok(sets) => sets[0],
-            Err(e) => {
-                log::warn!(
-                    "render compose: descriptor allocation failed ({e:?}) at draw {} of {}",
-                    descriptors.len(),
-                    scene.draws.len(),
-                );
-                break;
-            }
-        };
+        let set = unsafe { vk.device.allocate_descriptor_sets(&alloc_info) }?[0];
         let image_info = [vk::DescriptorImageInfo::default()
-            .image_view(draw.image_view)
+            .image_view(view)
             .sampler(pipeline.sampler)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let writes = [vk::WriteDescriptorSet::default()
@@ -123,8 +115,8 @@ pub(super) fn record_and_submit_render<T: ComposeRenderTarget + ?Sized>(
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&image_info)];
         unsafe { vk.device.update_descriptor_sets(&writes, &[]) };
-        descriptors.push(set);
-    }
+        Ok(set)
+    });
 
     // Record.
     record_command_buffer(
@@ -185,6 +177,41 @@ pub(super) fn record_and_submit_render<T: ComposeRenderTarget + ?Sized>(
         descriptor_count: descriptors.len(),
         draw_count: scene.draws.len(),
     })
+}
+
+/// The descriptor set of each draw, allocating one per distinct image view.
+///
+/// Stops at the first failed allocation, so the result is the prefix of draws
+/// that can be recorded; a shorter result marks the submit incomplete.
+pub(super) fn share_descriptor_sets(
+    draws: &[CompositeDraw],
+    mut allocate: impl FnMut(vk::ImageView) -> Result<vk::DescriptorSet, vk::Result>,
+) -> Vec<vk::DescriptorSet> {
+    let mut by_view: HashMap<vk::ImageView, vk::DescriptorSet> = HashMap::new();
+    let mut sets = Vec::with_capacity(draws.len());
+    for (i, draw) in draws.iter().enumerate() {
+        let set = if let Some(&set) = by_view.get(&draw.image_view) {
+            set
+        } else {
+            match allocate(draw.image_view) {
+                Ok(set) => {
+                    by_view.insert(draw.image_view, set);
+                    set
+                }
+                Err(e) => {
+                    log::warn!(
+                        "render compose: descriptor allocation failed ({e:?}) at draw {i} of {} \
+                         ({} distinct views)",
+                        draws.len(),
+                        by_view.len(),
+                    );
+                    break;
+                }
+            }
+        };
+        sets.push(set);
+    }
+    sets
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -513,4 +540,65 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
     }
     let _ = render_area;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::share_descriptor_sets;
+    use crate::kms::vk::{compositor::CompositeDraw, pipeline::MAX_DESCRIPTOR_SETS_PER_FRAME};
+    use ash::vk::{self, Handle};
+
+    fn draw(view: u64) -> CompositeDraw {
+        CompositeDraw {
+            image_view: vk::ImageView::from_raw(view),
+            dst_origin: [0.0, 0.0],
+            dst_size: [1.0, 1.0],
+            src_origin: [0.0, 0.0],
+            src_size: [1.0, 1.0],
+            alpha_passthrough: false,
+        }
+    }
+
+    /// xeyes resized large: a draw per visible row of each eye, from the shell
+    /// and from the child it presents into, is more draws than the pool holds
+    /// sets. Every draw is still recorded, each with its own view's set.
+    #[test]
+    fn draws_past_the_pool_size_that_share_views_are_all_recorded() {
+        let pool = usize::try_from(MAX_DESCRIPTOR_SETS_PER_FRAME).unwrap();
+        let draws: Vec<CompositeDraw> = [1u64]
+            .into_iter()
+            .chain(std::iter::repeat_n(2, pool))
+            .chain(std::iter::repeat_n(3, pool))
+            .chain([4])
+            .map(draw)
+            .collect();
+        let mut allocated = 0;
+        let sets = share_descriptor_sets(&draws, |view| {
+            if allocated == pool {
+                return Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY);
+            }
+            allocated += 1;
+            Ok(vk::DescriptorSet::from_raw(view.as_raw() << 8))
+        });
+        assert_eq!(sets.len(), draws.len(), "every draw recorded");
+        assert_eq!(allocated, 4, "one set per distinct view");
+        for (d, s) in draws.iter().zip(&sets) {
+            assert_eq!(s.as_raw(), d.image_view.as_raw() << 8);
+        }
+    }
+
+    /// Distinct views past the pool still truncate to the allocated prefix.
+    #[test]
+    fn distinct_views_past_the_pool_truncate_to_the_prefix() {
+        let draws: Vec<CompositeDraw> = (1..=5).map(draw).collect();
+        let mut allocated = 0;
+        let sets = share_descriptor_sets(&draws, |view| {
+            if allocated == 3 {
+                return Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY);
+            }
+            allocated += 1;
+            Ok(vk::DescriptorSet::from_raw(view.as_raw()))
+        });
+        assert_eq!(sets.len(), 3);
+    }
 }
