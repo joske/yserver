@@ -345,11 +345,12 @@ pub fn stored_settings() -> settings::Settings {
     macos::stored_settings()
 }
 
-/// Run the server on Windows: in a window, or headless with `--headless`.
+/// Run the server on Windows: in a window, in a window per top-level with
+/// `--rootless`, or headless with `--headless`.
 #[cfg(windows)]
 pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
-    launch::shell_mode(&opts, false).map_err(io::Error::other)?;
-    windows::run(opts)
+    let mode = launch::shell_mode(&opts, true).map_err(io::Error::other)?;
+    windows::run(opts, mode)
 }
 
 /// Run the server on a platform with neither KMS nor a window shell.

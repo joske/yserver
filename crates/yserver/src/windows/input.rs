@@ -23,14 +23,19 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::surface::{
-    input::{
-        keymap::ev,
-        pointer::{self, RawPointer, RawScroll, ScrollPhase, Scroller},
-        scancode::{self, EXTENDED},
-        translate::Translator,
+use yserver_core::{core_loop::HostInputEvent, rootless::ToplevelId};
+
+use crate::{
+    rootless::native::seat::PointerTracker,
+    surface::{
+        input::{
+            keymap::ev,
+            pointer::{self, RawPointer, RawScroll, ScrollPhase, Scroller},
+            scancode::{self, EXTENDED},
+            translate::Translator,
+        },
+        link::{ShellEvent, ShellLink},
     },
-    link::{ShellEvent, ShellLink},
 };
 
 /// `WHEEL_DELTA`: one wheel notch.
@@ -93,6 +98,8 @@ pub(super) struct ShellInput {
     scroller: RefCell<Scroller>,
     /// The last client position, for motion deltas.
     last: Cell<Option<(i32, i32)>>,
+    /// Rootless: which top-level the pointer is in.
+    pointer: RefCell<PointerTracker>,
 }
 
 impl ShellInput {
@@ -103,6 +110,7 @@ impl ShellInput {
             translator: RefCell::new(Translator::default()),
             scroller: RefCell::new(Scroller::default()),
             last: Cell::new(None),
+            pointer: RefCell::new(PointerTracker::default()),
         }
     }
 
@@ -156,21 +164,94 @@ impl ShellInput {
         let raw = self.raw_pointer(at);
         let fb = self.fb.get();
         log::debug!("windows button {number} pressed={pressed}: {raw:?}");
-        let any_held =
-            held & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2) as usize != 0;
-        // SAFETY: a live window of this thread.
-        unsafe {
-            if pressed {
-                SetCapture(hwnd);
-            } else if !any_held {
-                ReleaseCapture();
-            }
-        }
+        capture(hwnd, pressed, held);
         let mut translator = self.translator.borrow_mut();
         self.link.send_input(|time, out| {
             out.push(pointer::motion(&raw, fb, time));
             translator.button(number, pressed, 0, false, time, out);
         });
+    }
+
+    /// Rootless: the pointer moved over top-level `id`, at X pixel `local`
+    /// of it.
+    pub(super) fn motion_local(&self, id: ToplevelId, local: (f64, f64)) {
+        log::trace!("windows motion {id:?}: {local:?}");
+        let mut pointer = self.pointer.borrow_mut();
+        self.link.send_input(|time, out| {
+            out.push(HostInputEvent::Rootless(pointer.moved(id, local, time)));
+        });
+    }
+
+    /// Rootless: a button changed over `hwnd`, top-level `id`, at `local`;
+    /// the position goes first, a leave deferred while it was held goes
+    /// last. `under`: during a drag, the top-level under the pointer and the
+    /// position in it (see [`Self::dragged_local`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn button_local(
+        &self,
+        hwnd: HWND,
+        id: ToplevelId,
+        number: i64,
+        pressed: bool,
+        local: (f64, f64),
+        held: usize,
+        under: Option<(Option<ToplevelId>, (f64, f64))>,
+    ) {
+        log::debug!("windows button {number} pressed={pressed} {id:?}: {local:?}");
+        capture(hwnd, pressed, held);
+        let mut pointer = self.pointer.borrow_mut();
+        let mut translator = self.translator.borrow_mut();
+        self.link.send_input(|time, out| {
+            let at = match under {
+                Some((under, local)) => pointer.dragged(under, local, time),
+                None => Some(pointer.moved(id, local, time)),
+            };
+            out.extend(at.map(HostInputEvent::Rootless));
+            translator.button(number, pressed, 0, false, time, out);
+            if let Some(leave) = pointer.button(pressed, time) {
+                out.push(HostInputEvent::Rootless(leave));
+            }
+        });
+    }
+
+    /// Rootless: drag motion at the top-level under the pointer (`under`,
+    /// `local` in it), or relative to the current one over none of ours.
+    pub(super) fn dragged_local(&self, under: Option<ToplevelId>, local: (f64, f64)) {
+        let mut pointer = self.pointer.borrow_mut();
+        self.link.send_input(|time, out| {
+            out.extend(
+                pointer
+                    .dragged(under, local, time)
+                    .map(HostInputEvent::Rootless),
+            );
+        });
+    }
+
+    /// Rootless: a button is held, and the top-level the pointer is in.
+    pub(super) fn drag_state(&self) -> (bool, Option<ToplevelId>) {
+        let pointer = self.pointer.borrow();
+        (pointer.dragging(), pointer.inside())
+    }
+
+    /// Rootless: the pointer is in one of our top-levels.
+    pub(super) fn pointer_inside(&self) -> bool {
+        self.pointer.borrow().inside().is_some()
+    }
+
+    /// Rootless: the pointer left `id`'s client area.
+    pub(super) fn exited_local(&self, id: ToplevelId) {
+        let mut pointer = self.pointer.borrow_mut();
+        self.link.send_input(|time, out| {
+            if let Some(leave) = pointer.exited(id, time) {
+                out.push(HostInputEvent::Rootless(leave));
+            }
+        });
+    }
+
+    /// Rootless: a move or size loop takes the mouse.
+    pub(super) fn release_capture(&self) {
+        // SAFETY: a plain call on this thread.
+        unsafe { ReleaseCapture() };
     }
 
     /// A wheel turned by `delta` (`WHEEL_DELTA` per notch), `horizontal`
@@ -228,6 +309,21 @@ impl ShellInput {
             scale: 1.0,
             dx_pt: f64::from(dx),
             dy_pt: f64::from(dy),
+        }
+    }
+}
+
+/// Keep the mouse in `hwnd` while any button is held (`held`: the `MK_*`
+/// flags after a button message).
+fn capture(hwnd: HWND, pressed: bool, held: usize) {
+    let any_held =
+        held & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2) as usize != 0;
+    // SAFETY: a live window of this thread.
+    unsafe {
+        if pressed {
+            SetCapture(hwnd);
+        } else if !any_held {
+            ReleaseCapture();
         }
     }
 }

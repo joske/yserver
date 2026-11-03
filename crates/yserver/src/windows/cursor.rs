@@ -35,7 +35,27 @@ thread_local! {
 
 /// Show `image` over `hwnd`'s client area from now on, or no cursor.
 pub(super) fn set(hwnd: HWND, image: Option<&CursorImage>) {
-    let cursor = CURSORS.with_borrow_mut(|cursors| {
+    let cursor = select(image);
+    if pointer_inside(hwnd) {
+        // SAFETY: a live cursor of this cache, or null (none).
+        unsafe { SetCursor(cursor) };
+    }
+}
+
+/// Rootless: show `image` (`None`: no cursor) over every top-level's
+/// client area; at once when the pointer is `inside` one of them, else at
+/// its next `WM_SETCURSOR`.
+pub(super) fn set_global(image: Option<&CursorImage>, inside: bool) {
+    let cursor = select(image);
+    if inside {
+        // SAFETY: as in `set`.
+        unsafe { SetCursor(cursor) };
+    }
+}
+
+/// Make `image`'s cursor the current one.
+fn select(image: Option<&CursorImage>) -> HCURSOR {
+    CURSORS.with_borrow_mut(|cursors| {
         let cursor = match image {
             Some(image) => {
                 let key = (image.version, image.hot);
@@ -64,11 +84,7 @@ pub(super) fn set(hwnd: HWND, image: Option<&CursorImage>) {
         };
         cursors.current = cursor;
         cursor
-    });
-    if pointer_inside(hwnd) {
-        // SAFETY: a live cursor of this cache, or null (none).
-        unsafe { SetCursor(cursor) };
-    }
+    })
 }
 
 /// `WM_SETCURSOR` over the client area: show the X cursor.
@@ -91,6 +107,13 @@ pub(super) fn warp(hwnd: HWND, x: i32, y: i32) {
         ClientToScreen(hwnd, &raw mut at);
         SetCursorPos(at.x, at.y);
     }
+}
+
+/// Rootless: move the host pointer to screen pixel `(x, y)`; no "inside"
+/// guard (spec §5 Global).
+pub(super) fn warp_screen(x: i32, y: i32) {
+    // SAFETY: a plain call.
+    unsafe { SetCursorPos(x, y) };
 }
 
 /// Whether the host pointer is over `hwnd`'s client area, nothing above it.

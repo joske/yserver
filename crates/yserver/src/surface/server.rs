@@ -61,7 +61,10 @@ pub(crate) struct WindowSpec {
 
 /// A rootless window shell's half of the server: one native window per
 /// top-level, no output.
-#[allow(dead_code, reason = "a window shell's; only macOS has one")]
+#[allow(
+    dead_code,
+    reason = "a window shell's; only macOS and Windows have one"
+)]
 pub(crate) struct RootlessSpec {
     /// The shell's Vulkan surface extension.
     pub(crate) surface_extension: &'static CStr,
@@ -79,7 +82,10 @@ pub(crate) struct RootlessSpec {
 /// # Errors
 ///
 /// See [`super::headless_backend`].
-#[allow(dead_code, reason = "a window shell's; only macOS has one")]
+#[allow(
+    dead_code,
+    reason = "a window shell's; only macOS and Windows have one"
+)]
 pub(crate) fn rootless_backend(
     vk: Arc<VkContext>,
     spec: &RootlessSpec,
@@ -109,12 +115,15 @@ pub(crate) fn rootless_backend(
 /// # Errors
 ///
 /// Vulkan, rootless mode, the sockets or the core loop failed.
-#[allow(dead_code, reason = "a window shell's; only macOS has one")]
+#[allow(
+    dead_code,
+    reason = "a window shell's; only macOS and Windows have one"
+)]
 pub(crate) fn run_rootless(
     opts: launch::LaunchOptions,
     spec: RootlessSpec,
     host: Box<dyn RootlessHost + Send>,
-    clipboard: HostClipboard,
+    clipboard: Option<HostClipboard>,
 ) -> io::Result<()> {
     let result = serve(
         &opts,
@@ -137,7 +146,7 @@ pub(crate) fn run_rootless(
             .map_err(|e| io::Error::other(format!("rootless: {e}")))
         },
         Some(&spec.link),
-        Some(clipboard),
+        clipboard,
         |display| spec.ui.set_display(display),
     );
     spec.link.disconnect();
