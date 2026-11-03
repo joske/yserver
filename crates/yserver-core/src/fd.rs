@@ -25,6 +25,12 @@ mod stand_in {
         fn as_raw_fd(&self) -> RawFd;
     }
 
+    impl Drop for OwnedFd {
+        fn drop(&mut self) {
+            match *self {}
+        }
+    }
+
     impl AsRawFd for OwnedFd {
         fn as_raw_fd(&self) -> RawFd {
             match *self {}

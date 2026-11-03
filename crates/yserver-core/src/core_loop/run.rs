@@ -42,8 +42,8 @@ use super::{
     input_inventory::InputInventory,
     message::{HostInputEvent, Message, SetupAllocateResponse, XiConfigRequest},
     poll_tokens::{
-        ClientIdAllocator, NOTIFY_TOKEN, backend_token, client_token, listener_token,
-        token_to_backend_index, token_to_client, token_to_listener_index,
+        ClientIdAllocator, NOTIFY_TOKEN, client_token, listener_token, token_to_backend_index,
+        token_to_client, token_to_listener_index,
     },
     process_request::{
         PendingCrtcConfig, PendingDri3Export, PropertyDispatchError, RequestOutcome,
@@ -2174,24 +2174,23 @@ fn run_core_with_inventory(
         .into_iter()
         .map(|(fd, kind)| BackendPollSource { fd, kind })
         .collect();
+    // TODO(windows): no backend has a poll source there yet.
+    #[cfg(windows)]
+    if !backend_poll_sources.is_empty() {
+        return Err(io::Error::other(
+            "backend poll fds are unsupported on Windows",
+        ));
+    }
+    #[cfg(unix)]
     for (index, source) in backend_poll_sources.iter().enumerate() {
-        let token = backend_token(index).ok_or_else(|| {
+        let token = super::poll_tokens::backend_token(index).ok_or_else(|| {
             io::Error::other(format!(
                 "backend exposes too many poll fds: {}",
                 backend_poll_sources.len()
             ))
         })?;
-        #[cfg(unix)]
         poll.registry()
             .register(&mut SourceFd(&source.fd), token, Interest::READABLE)?;
-        // TODO(windows): no backend has a poll source there yet.
-        #[cfg(windows)]
-        {
-            let _ = (source, token);
-            return Err(io::Error::other(
-                "backend poll fds are unsupported on Windows",
-            ));
-        }
     }
 
     // Probe input devices at startup, Xorg-style: drain libinput's
