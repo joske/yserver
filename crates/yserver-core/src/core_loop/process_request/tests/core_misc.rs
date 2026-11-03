@@ -1145,12 +1145,264 @@ fn host_error(wire: &[u8]) -> HostError {
     )
 }
 
+fn expected_host_error(sequence: u16, code: u8, value: u32, major: u8) -> [u8; 32] {
+    let mut expected = [0; 32];
+    expected[1] = code;
+    expected[2..4].copy_from_slice(&sequence.to_le_bytes());
+    expected[4..8].copy_from_slice(&value.to_le_bytes());
+    expected[10] = major;
+    expected
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecordedServerCheck {
+    client: ClientId,
+    mode: crate::access::AccessMode,
+    request: Option<crate::access::RequestOpcodes>,
+    peer: Option<crate::peer::PeerIdentity>,
+    admission: Option<crate::access::Admission>,
+}
+
+struct RecordingServerPolicy {
+    decision: crate::access::Decision,
+    calls: Arc<Mutex<Vec<RecordedServerCheck>>>,
+}
+
+impl crate::access::AccessPolicy for RecordingServerPolicy {
+    fn server(
+        &self,
+        ctx: &crate::access::AccessContext<'_>,
+        client: ClientId,
+        mode: crate::access::AccessMode,
+    ) -> crate::access::Decision {
+        self.calls.lock().unwrap().push(RecordedServerCheck {
+            client,
+            mode,
+            request: ctx.request(),
+            peer: ctx.peer(client).copied(),
+            admission: ctx.admission(client).cloned(),
+        });
+        self.decision
+    }
+}
+
+struct RevocableServerPolicy(Arc<std::sync::atomic::AtomicBool>);
+
+impl crate::access::AccessPolicy for RevocableServerPolicy {
+    fn server(
+        &self,
+        _ctx: &crate::access::AccessContext<'_>,
+        _client: ClientId,
+        _mode: crate::access::AccessMode,
+    ) -> crate::access::Decision {
+        if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            crate::access::Decision::Deny(crate::access::DenyError {
+                code: x11::error::BAD_VALUE,
+                value: 0x55,
+            })
+        } else {
+            crate::access::Decision::Allow
+        }
+    }
+}
+
 /// `enabled = 1`, no hosts: what a fresh Xorg reports without `-ac`
 /// (`dix/dispatch.c:3270-3304`, `os/access.c:956-962`).
 const EMPTY_LIST_HOSTS_LE: [u8; 32] = [
     1, 1, 0x0b, 0x0a, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0,
 ];
+
+#[test]
+fn server_hook_denies_each_host_access_request() {
+    // Mutation: ignore a handler's policy denial; the exact error packet and unchanged state must fail.
+    let requests: [(u8, u8, Vec<u8>); 3] = [
+        (110, 0, Vec::new()),
+        (109, 0, change_hosts_body(252, &[])),
+        (111, 0, Vec::new()),
+    ];
+
+    for (opcode, data, body) in requests {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.install_access_policy(Arc::new(RecordingServerPolicy {
+            decision: crate::access::Decision::Deny(crate::access::DenyError {
+                code: x11::error::BAD_VALUE,
+                value: 0x55,
+            }),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }));
+
+        let sequence = 0x4567;
+        let wire = host_request(&mut state, 1, &mut peer, sequence, opcode, data, &body);
+        assert_eq!(
+            wire,
+            expected_host_error(sequence, x11::error::BAD_VALUE, 0x55, opcode),
+            "opcode {opcode} must report the policy's complete error packet"
+        );
+
+        state.host_access.policies.clear();
+        assert_eq!(
+            list_hosts(&mut state, 1, &mut peer),
+            EMPTY_LIST_HOSTS_LE,
+            "opcode {opcode} must leave hosts and access mode unchanged"
+        );
+    }
+}
+
+#[test]
+fn server_hook_asks_with_client_mode_and_context() {
+    // Mutation: pass READ for ChangeHosts; its recorded MANAGE mode must fail.
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let expected_peer = state.clients[&1].peer;
+    let expected_admission = state.clients[&1].admission;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.install_access_policy(Arc::new(RecordingServerPolicy {
+        decision: crate::access::Decision::Allow,
+        calls: Arc::clone(&calls),
+    }));
+
+    assert_eq!(list_hosts(&mut state, 1, &mut peer), EMPTY_LIST_HOSTS_LE);
+    assert!(change_hosts(&mut state, &mut peer, 0, 252, &[]).is_empty());
+    assert!(host_request(&mut state, 1, &mut peer, 21, 111, 0, &[]).is_empty());
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [
+            RecordedServerCheck {
+                client: ClientId(1),
+                mode: crate::access::AccessMode::READ,
+                request: Some(crate::access::RequestOpcodes {
+                    major: 110,
+                    minor: 0,
+                }),
+                peer: Some(expected_peer),
+                admission: Some(expected_admission),
+            },
+            RecordedServerCheck {
+                client: ClientId(1),
+                mode: crate::access::AccessMode::MANAGE,
+                request: Some(crate::access::RequestOpcodes {
+                    major: 109,
+                    minor: 0,
+                }),
+                peer: Some(expected_peer),
+                admission: Some(expected_admission),
+            },
+            RecordedServerCheck {
+                client: ClientId(1),
+                mode: crate::access::AccessMode::MANAGE,
+                request: Some(crate::access::RequestOpcodes {
+                    major: 111,
+                    minor: 0,
+                }),
+                peer: Some(expected_peer),
+                admission: Some(expected_admission),
+            },
+        ]
+    );
+}
+
+#[test]
+fn existing_rules_answer_before_the_hook() {
+    // Mutation: ask policies before mode or locality checks; expected errors and zero calls must fail.
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.install_access_policy(Arc::new(RecordingServerPolicy {
+        decision: crate::access::Decision::Deny(crate::access::DenyError {
+            code: x11::error::BAD_VALUE,
+            value: 0x55,
+        }),
+        calls: Arc::clone(&calls),
+    }));
+
+    let invalid_mode = change_hosts(&mut state, &mut peer, 2, 252, &[]);
+    assert_eq!(
+        invalid_mode,
+        expected_host_error(20, x11::error::BAD_VALUE, 2, 109)
+    );
+    assert!(calls.lock().unwrap().is_empty());
+
+    state.clients.get_mut(&1).unwrap().is_local = false;
+    let non_local = change_hosts(&mut state, &mut peer, 0, 252, &[]);
+    assert_eq!(
+        non_local,
+        expected_host_error(20, x11::error::BAD_ACCESS, 0, 109)
+    );
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn several_policies_on_one_request() {
+    // Mutation: continue after a denial and accept a later Allow; deny-then-allow must stay denied.
+    let deny = crate::access::Decision::Deny(crate::access::DenyError {
+        code: x11::error::BAD_VALUE,
+        value: 0x55,
+    });
+    let later_deny = crate::access::Decision::Deny(crate::access::DenyError {
+        code: x11::error::BAD_ACCESS,
+        value: 0x66,
+    });
+
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let allow_calls = Arc::new(Mutex::new(Vec::new()));
+    let deny_calls = Arc::new(Mutex::new(Vec::new()));
+    let after_deny_calls = Arc::new(Mutex::new(Vec::new()));
+    for (decision, calls) in [
+        (crate::access::Decision::Allow, Arc::clone(&allow_calls)),
+        (deny, Arc::clone(&deny_calls)),
+        (later_deny, Arc::clone(&after_deny_calls)),
+    ] {
+        state.install_access_policy(Arc::new(RecordingServerPolicy { decision, calls }));
+    }
+    let wire = list_hosts(&mut state, 1, &mut peer);
+    assert_eq!(
+        wire,
+        expected_host_error(0x0a0b, x11::error::BAD_VALUE, 0x55, 110)
+    );
+    assert_eq!(allow_calls.lock().unwrap().len(), 1);
+    assert_eq!(deny_calls.lock().unwrap().len(), 1);
+    assert!(after_deny_calls.lock().unwrap().is_empty());
+
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let deny_calls = Arc::new(Mutex::new(Vec::new()));
+    let allow_calls = Arc::new(Mutex::new(Vec::new()));
+    state.install_access_policy(Arc::new(RecordingServerPolicy {
+        decision: deny,
+        calls: Arc::clone(&deny_calls),
+    }));
+    state.install_access_policy(Arc::new(RecordingServerPolicy {
+        decision: crate::access::Decision::Allow,
+        calls: Arc::clone(&allow_calls),
+    }));
+    let wire = list_hosts(&mut state, 1, &mut peer);
+    assert_eq!(
+        wire,
+        expected_host_error(0x0a0b, x11::error::BAD_VALUE, 0x55, 110)
+    );
+    assert_eq!(deny_calls.lock().unwrap().len(), 1);
+    assert!(allow_calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn revocation_applies_from_the_next_check() {
+    // Mutation: skip the next ListHosts check after an Allow; revocation must make the second request fail.
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    state.install_access_policy(Arc::new(RevocableServerPolicy(Arc::clone(&revoked))));
+
+    assert_eq!(list_hosts(&mut state, 1, &mut peer), EMPTY_LIST_HOSTS_LE);
+    revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        list_hosts(&mut state, 1, &mut peer),
+        expected_host_error(0x0a0b, x11::error::BAD_VALUE, 0x55, 110)
+    );
+}
 
 #[test]
 fn list_hosts_on_a_fresh_server_is_enabled_and_empty() {

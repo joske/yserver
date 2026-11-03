@@ -1,4 +1,5 @@
 use crate::{
+    access::{AccessMode, Decision, RequestOpcodes},
     backend::Backend,
     core_loop::{
         auth::HostChangeError,
@@ -328,12 +329,25 @@ pub(super) fn handle_list_hosts(
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} ListHosts", client_id.0, sequence.0);
     let handle = state.host_access.clone();
-    let Some(client) = state.clients.get_mut(&client_id.0) else {
+    let Some(client) = state.clients.get(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
     if !may_read_access(client) {
         return emit_x11_error(state, client_id, sequence, x11::error::BAD_ACCESS, 0, 110);
     }
+    if let Decision::Deny(error) = state.check_server(
+        client_id,
+        AccessMode::READ,
+        Some(RequestOpcodes {
+            major: 110,
+            minor: 0,
+        }),
+    ) {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 110);
+    }
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
     let byte_order = client.byte_order;
     let (enabled, hosts) = handle.auth.list_hosts(handle.generation);
     let (n_hosts, entries) = encode_entries(&hosts, byte_order);
@@ -373,6 +387,16 @@ pub(super) fn handle_change_hosts(
     };
     if !may_manage_access(client) {
         return emit_x11_error(state, client_id, sequence, x11::error::BAD_ACCESS, 0, 109);
+    }
+    if let Decision::Deny(error) = state.check_server(
+        client_id,
+        AccessMode::MANAGE,
+        Some(RequestOpcodes {
+            major: 109,
+            minor: 0,
+        }),
+    ) {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 109);
     }
     // The generic length check already matched the request length to the
     // address length; the body is little-endian here.
@@ -430,6 +454,16 @@ pub(super) fn handle_set_access_control(
     };
     if !may_manage_access(client) {
         return emit_x11_error(state, client_id, sequence, x11::error::BAD_ACCESS, 0, 111);
+    }
+    if let Decision::Deny(error) = state.check_server(
+        client_id,
+        AccessMode::MANAGE,
+        Some(RequestOpcodes {
+            major: 111,
+            minor: 0,
+        }),
+    ) {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 111);
     }
     let handle = state.host_access.clone();
     match handle.auth.set_access_enabled(handle.generation, mode == 1) {
