@@ -430,25 +430,26 @@ fn handle_shape_request_ops(
                             Some(rects)
                         }
                         Ok(None) => {
-                            log::debug!(
-                                "shape diag: MASK src=0x{:x} read_depth1_pixmap returned None \
-                                 (no pixmap mirror)",
+                            log::warn!(
+                                "SHAPE Mask src=0x{:x}: no readback of the mask; shaping to its \
+                                 bounding rect",
                                 req.src
                             );
                             None
                         }
                         Err(e) => {
-                            log::debug!(
-                                "shape diag: MASK src=0x{:x} read_depth1_pixmap err: {e}",
+                            log::warn!(
+                                "SHAPE Mask src=0x{:x}: mask readback failed ({e}); shaping to \
+                                 its bounding rect",
                                 req.src
                             );
                             None
                         }
                     }
                 } else {
-                    log::debug!(
-                        "shape diag: MASK src=0x{:x} no host_xid for source pixmap (fallback to \
-                         bounding-box rect)",
+                    log::warn!(
+                        "SHAPE Mask src=0x{:x}: source pixmap has no storage; shaping to its \
+                         bounding rect",
                         req.src
                     );
                     None

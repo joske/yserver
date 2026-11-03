@@ -587,6 +587,7 @@ fn a_borderless_node_needs_no_separate_child_region() {
             i32::MIN / 2,
             i32::MAX / 2,
             i32::MAX / 2,
+            None,
         )
     };
     let plain = decide(0x100, &store, &windows, &empty);
@@ -805,6 +806,7 @@ fn the_child_clip_bound_is_absolute_not_storage_local() {
         i32::MIN / 2,
         i32::MAX / 2,
         i32::MAX / 2,
+        None,
     );
     assert_eq!((node.abs_x, node.abs_y), (0, 17), "outer absolute");
     assert_eq!(

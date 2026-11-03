@@ -447,6 +447,7 @@ pub(super) fn build_scene_with(
             i32::MIN / 2,
             i32::MAX / 2,
             i32::MAX / 2,
+            None,
         );
     }
     // The root is the last node in computation order — the bottom of the

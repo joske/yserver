@@ -1181,6 +1181,9 @@ struct NodeDecision {
     opaque: bool,
     /// Whether this node's children are under a redirected ancestor.
     child_under_redirected_ancestor: bool,
+    /// Under `On`: the children must be cut to `child_place` (or `place`)
+    /// exactly, because it comes from this node's shapes or an ancestor's.
+    shapes_children: bool,
 }
 
 // ────────────────────────────────────────────────────────────────

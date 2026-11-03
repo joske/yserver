@@ -159,6 +159,7 @@ pub(super) fn decide_node(
     clip_y0: i32,
     clip_x1: i32,
     clip_y1: i32,
+    ancestor_shape: Option<&[vk::Rect2D]>,
 ) -> NodeDecision {
     // #133 step 5 (P6) — the CONTENT OFFSET of the storage this node samples.
     //
@@ -254,6 +255,7 @@ pub(super) fn decide_node(
     } else {
         (clip_x0, clip_y0, clip_x1, clip_y1)
     };
+    let ancestor_shape = ancestor_shape.filter(|_| !self_owns_redirected_target);
 
     // X11 parent-clipping. This window's visible box in its OWN
     // STORAGE-local coords = its OUTER rect [0,outer_w)×[0,outer_h)
@@ -366,6 +368,11 @@ pub(super) fn decide_node(
             .into_iter()
             .filter_map(|r| clip_rect_to_output_extent(r, output))
             .collect();
+        // A shaped ancestor's exact region: `mine` alone cannot carry it,
+        // since it collapses to its bounding box past `Region::MAX_RECTS`.
+        if let Some(shape) = ancestor_shape {
+            place = intersect_rect_lists(&place, shape);
+        }
     }
 
     // #133 step 5 (5.2 / 5.3) — the INNER region (`winSize`) descendants are
@@ -397,7 +404,17 @@ pub(super) fn decide_node(
             layout_w,
             layout_h,
         ))
+        .map(|inner| match (mode, ancestor_shape) {
+            (Visibility::On, Some(shape)) => intersect_rect_lists(&inner, shape),
+            _ => inner,
+        })
     };
+    // Whether the region this node's children are confined to is narrower
+    // than a rect: its own shapes, or a shaped ancestor's.
+    let shapes_children = mode == Visibility::On
+        && (ancestor_shape.is_some()
+            || shape_bounding.contains_key(&host_xid)
+            || clip_shape.is_some());
 
     let store_info = lookup_id.and_then(|id| {
         let d = store.get(id)?;
@@ -508,7 +525,36 @@ pub(super) fn decide_node(
         emits,
         opaque: emits && !under_cow_subtree,
         child_under_redirected_ancestor: under_redirected_ancestor || self_owns_redirected_target,
+        shapes_children,
     }
+}
+
+/// `a ∩ b` for two lists of pairwise-disjoint rects; the result is disjoint
+/// too, so it needs no union.
+fn intersect_rect_lists(a: &[vk::Rect2D], b: &[vk::Rect2D]) -> Vec<vk::Rect2D> {
+    let mut out = Vec::new();
+    for ra in a {
+        let (ax1, ay1) = (
+            ra.offset.x.saturating_add_unsigned(ra.extent.width),
+            ra.offset.y.saturating_add_unsigned(ra.extent.height),
+        );
+        for rb in b {
+            let x0 = ra.offset.x.max(rb.offset.x);
+            let y0 = ra.offset.y.max(rb.offset.y);
+            let x1 = ax1.min(rb.offset.x.saturating_add_unsigned(rb.extent.width));
+            let y1 = ay1.min(rb.offset.y.saturating_add_unsigned(rb.extent.height));
+            if x1 > x0 && y1 > y0 {
+                out.push(vk::Rect2D {
+                    offset: vk::Offset2D { x: x0, y: y0 },
+                    extent: vk::Extent2D {
+                        width: u32::try_from(x1 - x0).unwrap_or(0),
+                        height: u32::try_from(y1 - y0).unwrap_or(0),
+                    },
+                });
+            }
+        }
+    }
+    out
 }
 
 /// One node of the scene walk, mirroring Xorg's `miComputeClips`
@@ -609,6 +655,9 @@ pub(super) fn visit_window_subtree(
     clip_y0: i32,
     clip_x1: i32,
     clip_y1: i32,
+    // A shaped ancestor's exact region (output-local, `Visibility::On`
+    // only): this node's place is cut to it. `None` without one.
+    ancestor_shape: Option<&[vk::Rect2D]>,
 ) {
     let debug_focus = scene_walk_debug_enabled_for(host_xid);
     // Stage 4 diagnostic: trace-level scene-walk decision per window.
@@ -670,6 +719,7 @@ pub(super) fn visit_window_subtree(
         clip_y0,
         clip_x1,
         clip_y1,
+        ancestor_shape,
     );
     sink.stats.nodes_visited += 1;
     // OUTER absolute — what the node samples and occludes with.
@@ -940,6 +990,7 @@ pub(super) fn visit_window_subtree(
                 node.child_clip_y0,
                 node.child_clip_x1,
                 node.child_clip_y1,
+                node.shapes_children.then_some(child_region_rects),
             );
         }
     }

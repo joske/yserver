@@ -430,6 +430,85 @@ fn a_partial_parent_shape_clips_its_children() {
     assert_eq!(root, 800 * 600 - 100 * 200);
 }
 
+/// A parent shape with more boxes than `Region::MAX_RECTS` (xeyes' two
+/// ovals: 226) still clips its children exactly. The children's universe
+/// is built from the parent's place and collapses to its bounding box past
+/// the cap; clipping them to that box painted an unshaped child over the
+/// whole rectangle the shape cuts away (`mi/mivaltree.c:390`).
+#[test]
+fn a_parent_shape_past_the_region_cap_clips_its_children() {
+    let mut core = TestCore::for_tests();
+    let mut store = DrawableStore::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
+    alloc_root(&core, &mut store, 800, 600);
+    alloc_stub_window(
+        &mut store,
+        &mut windows,
+        0x100,
+        100,
+        100,
+        200,
+        200,
+        None,
+        true,
+    );
+    alloc_stub_window(
+        &mut store,
+        &mut windows,
+        0x101,
+        0,
+        0,
+        200,
+        200,
+        Some(0x100),
+        true,
+    );
+    core.top_level_order = vec![0x100];
+    // A staircase: one band per row, every band a different width.
+    let rows: u16 = 2 * u16::try_from(crate::kms::render::region::Region::MAX_RECTS).unwrap();
+    let shape: Vec<xfixes::RegionRect> = (0..rows)
+        .map(|i| xfixes::RegionRect {
+            x: 0,
+            y: i16::try_from(i).unwrap(),
+            width: 10 + i,
+            height: 1,
+        })
+        .collect();
+    let shape_area: u64 = shape
+        .iter()
+        .map(|r| u64::from(r.width) * u64::from(r.height))
+        .sum();
+    core.shape_bounding.insert(0x100, shape);
+    let on = build_with(
+        Visibility::On,
+        &core,
+        &mut store,
+        &windows,
+        (0, 0, 800, 600),
+        None,
+    );
+    let child = draws_of(&on, win_view(0x101));
+    let child_area: u64 = child.iter().map(|r| area_of(*r)).sum();
+    assert_eq!(
+        child_area, shape_area,
+        "child clipped to the parent's shape"
+    );
+    // Nothing above the root paints outside the shape. (The root's own
+    // universe may collapse to a superset; it is painted first, so that is
+    // the safe direction.)
+    for r in child.iter().chain(&draws_of(&on, win_view(0x100))) {
+        let row = r.offset.y - 100;
+        let right = r.offset.x + i32::try_from(r.extent.width).unwrap();
+        assert!(
+            r.offset.x >= 100
+                && r.extent.height == 1
+                && (0..i32::from(rows)).contains(&row)
+                && right <= 110 + row,
+            "pixel outside the parent's shape: {r:?}"
+        );
+    }
+}
+
 /// COW subtree above opaque windows: the COW claims nothing, so the windows
 /// below still emit in full, and the COW blends over them.
 #[test]
