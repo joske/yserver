@@ -96,7 +96,6 @@ pub struct AccessContext<'a> {
 }
 
 impl<'a> AccessContext<'a> {
-    #[allow(dead_code)] // Called by ServerState's staged policy helpers.
     pub(crate) const fn new(state: &'a ServerState, request: Option<RequestOpcodes>) -> Self {
         Self { state, request }
     }

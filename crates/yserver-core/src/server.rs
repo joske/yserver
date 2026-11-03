@@ -1641,7 +1641,6 @@ impl ServerState {
     }
 
     /// Ask installed policies about a server operation, stopping at the first denial.
-    #[allow(dead_code)] // Server access checks are wired in a later task.
     pub(crate) fn check_server(
         &self,
         client: ClientId,
