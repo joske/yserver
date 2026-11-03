@@ -38,7 +38,7 @@ fn main() {
             // build deps zero — this is a one-shot lookup.
             env::var_os("PATH").and_then(|paths| {
                 env::split_paths(&paths)
-                    .map(|d| d.join("glslc"))
+                    .map(|d| d.join(format!("glslc{}", env::consts::EXE_SUFFIX)))
                     .find(|p| p.is_file())
             })
         })
