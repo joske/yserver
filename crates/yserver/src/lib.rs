@@ -21,12 +21,15 @@ pub mod present;
 pub(crate) mod rootless;
 pub(crate) mod scroll_v120;
 pub mod settings;
-// Only the macOS shell opens windows; elsewhere the window half is unused.
+// Only the macOS shell uses all of it (Windows: a rooted window without the
+// clipboard); elsewhere the window half is unused.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 pub(crate) mod surface;
 pub mod version;
 #[cfg(kms)]
 mod vt;
+#[cfg(windows)]
+mod windows;
 
 #[cfg(kms)]
 pub mod vrr_exclusions;
@@ -342,8 +345,15 @@ pub fn stored_settings() -> settings::Settings {
     macos::stored_settings()
 }
 
+/// Run the server on Windows: in a window, or headless with `--headless`.
+#[cfg(windows)]
+pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
+    launch::shell_mode(&opts, false).map_err(io::Error::other)?;
+    windows::run(opts)
+}
+
 /// Run the server on a platform with neither KMS nor a window shell.
-#[cfg(all(not(kms), not(target_os = "macos")))]
+#[cfg(all(not(kms), not(target_os = "macos"), not(windows)))]
 pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     launch::shell_mode(&opts, false).map_err(io::Error::other)?;
     surface::server::run_headless(opts)

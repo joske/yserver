@@ -65,6 +65,18 @@ objc2-foundation = "=0.3.2"
 objc2-quartz-core = "=0.3.2"
 objc2-service-management = { version = "=0.3.2", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
 
+# The Win32 window shell (`src/windows/`).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemServices",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [features]
 # Both features are OFF by default, for two different reasons: enabling a TCP
 # listener lowers the server's security posture, so it must be an affirmative

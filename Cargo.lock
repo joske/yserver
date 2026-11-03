@@ -1418,6 +1418,7 @@ dependencies = [
  "signal-hook",
  "thiserror",
  "udev",
+ "windows-sys 0.61.2",
  "xkbcommon",
  "yserver-core",
  "yserver-protocol",

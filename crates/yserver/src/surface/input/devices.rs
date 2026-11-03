@@ -52,13 +52,19 @@ fn device(source_id: InputSourceId, name: &str, keyboard: bool) -> DeviceInfo {
     }
 }
 
+/// The window system the devices are named after.
+#[cfg(not(windows))]
+const SYSTEM: &str = "macOS";
+#[cfg(windows)]
+const SYSTEM: &str = "Windows";
+
 /// What a shell sends before any input: both devices, then a Num Lock
 /// press+release so the keypad types digits, as on the Mac.
 pub(crate) fn announcements(time: u32) -> Vec<HostInputEvent> {
     let num_lock = x_keycode_of_evdev(ev::KEY_NUMLOCK);
     vec![
-        HostInputEvent::DeviceAdded(device(KEYBOARD, "macOS keyboard", true)),
-        HostInputEvent::DeviceAdded(device(POINTER, "macOS pointer", false)),
+        HostInputEvent::DeviceAdded(device(KEYBOARD, &format!("{SYSTEM} keyboard"), true)),
+        HostInputEvent::DeviceAdded(device(POINTER, &format!("{SYSTEM} pointer"), false)),
         key_event(num_lock, true, time),
         key_event(num_lock, false, time),
     ]

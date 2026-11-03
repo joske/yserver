@@ -39,7 +39,10 @@ pub(crate) const DEFAULT_SIZE: (u16, u16) = (1280, 800);
 /// A window shell's half of the server: its surface, the surface's frame
 /// clock (ticked by the shell), its link, its UI commands, the count of
 /// established X clients the core keeps for it and the host pasteboard.
-#[allow(dead_code, reason = "a window shell's; only macOS has one")]
+#[allow(
+    dead_code,
+    reason = "a window shell's; only macOS and Windows have one"
+)]
 pub(crate) struct WindowSpec {
     pub(crate) surface: NativeSurface,
     pub(crate) clock: Arc<FrameClock>,
@@ -52,8 +55,8 @@ pub(crate) struct WindowSpec {
     pub(crate) output_mm: (u32, u32),
     /// Swapchain pixels per X pixel; later changes come as `Resized`.
     pub(crate) copy_scale: u32,
-    /// Bridged with CLIPBOARD.
-    pub(crate) clipboard: HostClipboard,
+    /// Bridged with CLIPBOARD; none: not bridged.
+    pub(crate) clipboard: Option<HostClipboard>,
 }
 
 /// A rootless window shell's half of the server: one native window per
@@ -198,7 +201,10 @@ pub(crate) fn run_headless(opts: launch::LaunchOptions) -> io::Result<()> {
 /// # Errors
 ///
 /// Vulkan, the sockets or the core loop failed.
-#[allow(dead_code, reason = "a window shell's; only macOS has one")]
+#[allow(
+    dead_code,
+    reason = "a window shell's; only macOS and Windows have one"
+)]
 pub(crate) fn run_windowed(opts: launch::LaunchOptions, spec: WindowSpec) -> io::Result<()> {
     let size = opts.geometry.unwrap_or(DEFAULT_SIZE);
     let WindowSpec {
@@ -235,7 +241,7 @@ pub(crate) fn run_windowed(opts: launch::LaunchOptions, spec: WindowSpec) -> io:
         },
         |_, _| Ok(()),
         Some(&link),
-        Some(clipboard),
+        clipboard,
         |display| ui.set_display(display),
     );
     link.disconnect();
