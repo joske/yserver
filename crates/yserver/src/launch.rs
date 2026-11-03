@@ -3,6 +3,9 @@
 //! readiness handshake. See
 //! `docs/superpowers/specs/2026-06-12-lightdm-launch-design.md`.
 
+#[cfg(windows)]
+use std::path::PathBuf;
+#[cfg(unix)]
 use std::{
     fs::{self, OpenOptions},
     io::{self, ErrorKind, Read, Write},
@@ -15,6 +18,10 @@ use std::{
     },
     path::{Path, PathBuf},
 };
+
+/// `-displayfd`'s descriptor; Windows has none to name, but parses it alike.
+#[cfg(windows)]
+type RawFd = i32;
 
 use yserver_core::core_loop::ResetPolicy;
 
@@ -115,7 +122,8 @@ pub struct LaunchOptions {
     /// `-auth FILE` — stashed for item 4, unused now.
     pub auth_file: Option<PathBuf>,
     /// Whether `-listen tcp` is the last TCP transport option in argv.
-    /// TCP remains disabled by default, matching Xorg's no-listen list.
+    /// Off by default, matching Xorg's no-listen list, except on Windows,
+    /// where TCP is the only transport.
     pub tcp_listen: bool,
     /// `--version` / `-version` — print version + git commit and exit
     /// (handled by the binary before `run()`).
@@ -181,7 +189,17 @@ pub enum VrrMode {
 /// without arguments; flags that change nothing do not count.
 #[must_use]
 pub fn has_argv_overrides(parsed: &LaunchOptions) -> bool {
-    *parsed != LaunchOptions::default()
+    *parsed != LaunchOptions::without_args()
+}
+
+impl LaunchOptions {
+    /// The options of a launch without arguments.
+    fn without_args() -> Self {
+        Self {
+            tcp_listen: cfg!(windows),
+            ..Self::default()
+        }
+    }
 }
 
 /// Rooted (one window is the root) or rootless (one native window per
@@ -278,7 +296,7 @@ fn next_value(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
 /// hard-errors only on malformed *explicit* requests and missing values
 /// for known value-taking flags.
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOptions, String> {
-    let mut o = LaunchOptions::default();
+    let mut o = LaunchOptions::without_args();
     let mut it = args.into_iter().peekable();
     // XDMCP fields build up alongside `o` as local state, and are only
     // assembled into `o.xdmcp` at the end of the loop: `XdmcpOptions`
@@ -527,6 +545,7 @@ pub fn resolve(opts: &LaunchOptions) -> Resolution {
     }
 }
 
+#[cfg(unix)]
 /// RAII handle for an acquired display lock. Dropping removes the lock
 /// file. `run()` holds this for the server's lifetime and lets it drop
 /// *after* the socket is removed at shutdown (the lock is the
@@ -536,12 +555,14 @@ pub struct LockGuard {
     path: PathBuf,
 }
 
+#[cfg(unix)]
 impl Drop for LockGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
 }
 
+#[cfg(unix)]
 /// Removes the temp lock file when `acquire_lock` exits by ANY path —
 /// including `?` error propagation. The success path's hard link
 /// survives the temp's unlink, so unconditional cleanup is safe.
@@ -549,24 +570,28 @@ struct TmpGuard {
     path: PathBuf,
 }
 
+#[cfg(unix)]
 impl Drop for TmpGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
 }
 
+#[cfg(unix)]
 /// `/tmp/.X<N>-lock` path for a display.
 #[must_use]
 pub fn lock_path(lock_dir: &Path, display: u16) -> PathBuf {
     lock_dir.join(format!(".X{display}-lock"))
 }
 
+#[cfg(unix)]
 enum LockState {
     Alive,
     Stale,
     Bogus,
 }
 
+#[cfg(unix)]
 fn inspect_lock(path: &Path) -> io::Result<LockState> {
     let f = match OpenOptions::new()
         .read(true)
@@ -607,6 +632,7 @@ fn inspect_lock(path: &Path) -> io::Result<LockState> {
     }
 }
 
+#[cfg(unix)]
 /// Acquire the `/tmp/.X<N>-lock` display lock using Xorg's temp-file +
 /// atomic `link()` protocol (`os/utils.c`), reclaiming stale/bogus locks.
 /// Errors with `AddrInUse` if a live server owns the display.
@@ -701,6 +727,7 @@ pub fn acquire_lock(lock_dir: &Path, display: u16) -> io::Result<LockGuard> {
     ))
 }
 
+#[cfg(unix)]
 /// Occupancy classification for a path in the socket directory.
 enum Occupancy {
     /// Nothing there — free to bind.
@@ -715,6 +742,7 @@ enum Occupancy {
     Opaque,
 }
 
+#[cfg(unix)]
 /// Probe a socket-dir path. The connect is NONBLOCKING: a blocking
 /// connect to a live-but-backlogged AF_UNIX listener waits for accept —
 /// potentially forever (a wedged server, or a hostile local user's
@@ -764,12 +792,14 @@ fn probe(path: &Path) -> Occupancy {
     // fd is an OwnedFd — closed on drop.
 }
 
+#[cfg(unix)]
 fn chmod_socket(path: &Path) -> io::Result<()> {
     // X clients connect as the invoking user; the socket needs world
     // write (connect() on AF_UNIX requires `w`). Xorg sets 0777.
     fs::set_permissions(path, fs::Permissions::from_mode(0o777))
 }
 
+#[cfg(unix)]
 /// Bind `<socket_dir>/X<display>` for the explicit-`:N` and
 /// back-compat-default cases. Probes an existing socket before removing
 /// it: a live server's socket is NEVER stolen (old yservers take no
@@ -813,6 +843,7 @@ pub fn bind_explicit(socket_dir: &Path, display: u16) -> io::Result<(UnixListene
     Ok((listener, path))
 }
 
+#[cfg(unix)]
 /// Scan `0..256` for the lowest free display and bind it. Disambiguates an
 /// existing socket file via `connect()`: refused ⇒ stale ⇒ reclaim;
 /// connected ⇒ live ⇒ skip; other error ⇒ occupied ⇒ skip. Moves on to the
@@ -853,6 +884,7 @@ pub fn autopick(socket_dir: &Path) -> io::Result<(u16, UnixListener, PathBuf)> {
     ))
 }
 
+#[cfg(unix)]
 /// Lock and bind the lowest display in `first..256` whose lock is not held
 /// by a live server and whose socket is not live, skipping any display
 /// lost to a concurrent starter.
@@ -880,6 +912,7 @@ pub fn autopick_locked(
     ))
 }
 
+#[cfg(unix)]
 /// Write `"<display>\n"` (Xorg's `-displayfd` format) to `fd`, then close
 /// it. Takes ownership of the fd (closed on every exit path via drop).
 /// Close errors are ignored: the fd is single-use and there is nothing
@@ -892,6 +925,7 @@ pub fn write_displayfd(fd: RawFd, display: u16) -> io::Result<()> {
     f.write_all(format!("{display}\n").as_bytes())
 }
 
+#[cfg(unix)]
 /// True if SIGUSR1's *inherited disposition* is `SIG_IGN` — the signal
 /// the DM (lightdm/Xorg convention) uses to request "signal me when
 /// ready". Querying via `sigaction(…, NULL, &old)` does not mutate the
@@ -906,6 +940,7 @@ pub fn sigusr1_is_ignored() -> bool {
     rc == 0 && old.sa_sigaction == libc::SIG_IGN
 }
 
+#[cfg(unix)]
 /// Capture the parent PID once at startup — Xorg's `InitParentProcess`
 /// (`os/connection.c`). Returns `None` if already orphaned (`ppid <= 1`,
 /// no DM to signal). MUST be called early, before long init during which
@@ -916,6 +951,7 @@ pub fn startup_parent_pid() -> Option<i32> {
     if ppid > 1 { Some(ppid) } else { None }
 }
 
+#[cfg(unix)]
 /// Send SIGUSR1 to the parent (the DM) captured at startup, matching
 /// Xorg's `NotifyParentProcess` (`ParentProcess` set in
 /// `InitParentProcess`). `parent_pid` comes from [`startup_parent_pid`].
@@ -924,6 +960,7 @@ pub fn signal_ready_to_parent(parent_pid: i32) {
     unsafe { libc::kill(parent_pid, libc::SIGUSR1) };
 }
 
+#[cfg(unix)]
 /// Perform the readiness handshake: report the chosen display on
 /// `-displayfd` (if given) and signal the startup-captured parent (if
 /// SIGUSR1 was inherited ignored). Call once, just before the core loop.
@@ -949,6 +986,32 @@ pub fn signal_ready(
                 "yserver: SIGUSR1 inherited-ignored but orphaned at startup — no parent to signal"
             ),
         }
+    }
+}
+
+/// Windows has no inherited signal disposition to hand readiness over.
+#[cfg(windows)]
+#[must_use]
+pub fn sigusr1_is_ignored() -> bool {
+    false
+}
+
+#[cfg(windows)]
+#[must_use]
+pub fn startup_parent_pid() -> Option<i32> {
+    None
+}
+
+/// TODO(windows): `-displayfd` names a descriptor, which Windows lacks.
+#[cfg(windows)]
+pub fn signal_ready(
+    opts: &LaunchOptions,
+    _display: u16,
+    _sigusr1_was_ignored: bool,
+    _parent_pid: Option<i32>,
+) {
+    if opts.displayfd.is_some() {
+        log::warn!("yserver: -displayfd is unsupported on Windows");
     }
 }
 

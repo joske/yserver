@@ -410,7 +410,7 @@ impl SceneCompositor {
 /// What the sink did with a finished frame, as the tick consumes it.
 enum Handoff {
     Flipped(Option<u64>),
-    Render(Option<std::os::fd::OwnedFd>),
+    Render(Option<yserver_protocol::fd::OwnedFd>),
 }
 
 pub(super) fn output_is_ready_for_submit(

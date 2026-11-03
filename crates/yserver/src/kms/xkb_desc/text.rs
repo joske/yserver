@@ -36,7 +36,12 @@ pub(crate) fn keymap_text(keymap: &xkbcommon::xkb::Keymap) -> String {
         // SAFETY: dlsym with RTLD_DEFAULT and a NUL-terminated name only
         // looks the symbol up; a non-null result is libxkbcommon's
         // `xkb_keymap_get_as_string2`, whose C signature `GetAsString2` is.
+        #[cfg(unix)]
         let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"xkb_keymap_get_as_string2".as_ptr()) };
+        // TODO(windows): look it up in the xkbcommon DLL; until then the
+        // text drops the unused entries.
+        #[cfg(windows)]
+        let sym = std::ptr::null_mut::<std::ffi::c_void>();
         (!sym.is_null()).then(|| {
             // SAFETY: see above; same size, it's a function pointer.
             unsafe { std::mem::transmute::<*mut std::ffi::c_void, GetAsString2>(sym) }

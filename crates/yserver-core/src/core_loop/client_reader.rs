@@ -29,21 +29,20 @@
 //! dropping its `reader_control`, so a reader parked on a barrier
 //! also exits.
 
-use std::{
-    io::{self, ErrorKind},
-    os::fd::{FromRawFd, RawFd},
-};
+use std::io::{self, ErrorKind};
 
 use crossbeam_channel::{Receiver, TryRecvError};
 use log::warn;
 
 use yserver_protocol::x11::{self, ClientByteOrder, ClientId, SequenceNumber};
 
+#[cfg(unix)]
+use crate::unix_fd::FdReader;
 use crate::{
     core_loop::{message::Message, sender::BoundSender},
+    fd::RawSocket,
     server::ReaderControl,
     transport::Transport,
-    unix_fd::FdReader,
 };
 
 /// X11 BigRequests `Enable` minor opcode (always 0 — see X.Org spec).
@@ -193,21 +192,7 @@ fn run(
         // xcb-dri3 hits this every time. Now we peek at the (major,
         // minor[, body]) and pop exactly the right count.
         let fd_count = expected_fd_count(header.opcode, header.data, &body);
-        let mut attached_fd: Option<RawFd> = None;
-        for _ in 0..fd_count {
-            // First fd → attached_fd; any extras (PixmapFromBuffers
-            // num_buffers > 1) are closed because Phase 4.2 only
-            // accepts num_buffers == 1 — the dispatcher rejects
-            // larger requests with BadAlloc anyway.
-            match reader.pop_fd() {
-                Some(raw) if attached_fd.is_none() => attached_fd = Some(raw),
-                Some(raw) => {
-                    // SAFETY: own the raw fd; close to avoid leak.
-                    unsafe { libc::close(raw) };
-                }
-                None => break,
-            }
-        }
+        let attached_fd = reader.take_attached_fd(fd_count);
 
         let is_enable =
             header.opcode == big_requests_major && header.data == BIG_REQUESTS_ENABLE_MINOR;
@@ -219,11 +204,7 @@ fn run(
             accepted_at: telemetry_enabled.then(std::time::Instant::now),
             header,
             body,
-            attached_fd: attached_fd.map(|raw| {
-                // SAFETY: FdReader hands us an fd it received via SCM_RIGHTS;
-                // there's no other owner.
-                unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) }
-            }),
+            attached_fd,
         })?;
 
         if is_enable {
@@ -292,11 +273,41 @@ impl BlockingFdReader {
         Self { inner }
     }
 
-    fn pop_fd(&mut self) -> Option<RawFd> {
-        self.inner.pop_fd()
+    /// The descriptor of a request expecting `fd_count`.
+    #[cfg(unix)]
+    fn take_attached_fd(&mut self, fd_count: usize) -> Option<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd;
+
+        let mut attached_fd: Option<std::os::fd::RawFd> = None;
+        for _ in 0..fd_count {
+            // First fd → attached_fd; any extras (PixmapFromBuffers
+            // num_buffers > 1) are closed because Phase 4.2 only
+            // accepts num_buffers == 1 — the dispatcher rejects
+            // larger requests with BadAlloc anyway.
+            match self.inner.pop_fd() {
+                Some(raw) if attached_fd.is_none() => attached_fd = Some(raw),
+                Some(raw) => {
+                    // SAFETY: own the raw fd; close to avoid leak.
+                    unsafe { libc::close(raw) };
+                }
+                None => break,
+            }
+        }
+        attached_fd.map(|raw| {
+            // SAFETY: FdReader hands us an fd it received via SCM_RIGHTS;
+            // there's no other owner.
+            unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) }
+        })
     }
 
-    fn fd(&self) -> RawFd {
+    /// No descriptors arrive over a Windows socket.
+    #[cfg(windows)]
+    #[allow(clippy::unused_self)]
+    fn take_attached_fd(&mut self, _fd_count: usize) -> Option<crate::fd::OwnedFd> {
+        None
+    }
+
+    fn fd(&self) -> RawSocket {
         self.inner.fd()
     }
 }
@@ -315,10 +326,38 @@ impl io::Read for BlockingFdReader {
     }
 }
 
+/// Client ingress on Windows: a plain TCP stream, which carries no
+/// descriptors.
+#[cfg(windows)]
+struct FdReader(std::net::TcpStream);
+
+#[cfg(windows)]
+impl FdReader {
+    fn new(stream: Transport) -> Self {
+        match stream {
+            Transport::Tcp(stream) => Self(stream),
+            #[cfg(test)]
+            Transport::Capture(_) => panic!("test capture transport cannot read client requests"),
+        }
+    }
+
+    fn fd(&self) -> RawSocket {
+        std::os::windows::io::AsRawSocket::as_raw_socket(&self.0)
+    }
+}
+
+#[cfg(windows)]
+impl io::Read for FdReader {
+    fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+        self.0.read(dst)
+    }
+}
+
 /// Block until `fd` is readable (or `poll(2)` errors).  POLLHUP is
 /// also surfaced as readable so the caller observes EOF on the next
 /// `read`.
-pub(crate) fn wait_readable(fd: RawFd) -> io::Result<()> {
+#[cfg(unix)]
+pub(crate) fn wait_readable(fd: RawSocket) -> io::Result<()> {
     use std::time::Duration;
     let mut pfd = libc::pollfd {
         fd,
@@ -339,6 +378,30 @@ pub(crate) fn wait_readable(fd: RawFd) -> io::Result<()> {
         }
         // Spurious wake — extremely rare with timeout=-1, but defend.
         std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Block until `socket` is readable (or `WSAPoll` errors). Hangup and
+/// error are reported readable, so the caller observes them on the next
+/// `read`.
+#[cfg(windows)]
+pub(crate) fn wait_readable(socket: RawSocket) -> io::Result<()> {
+    use windows_sys::Win32::Networking::WinSock::{POLLRDNORM, SOCKET, WSAPOLLFD, WSAPoll};
+
+    let mut pfd = WSAPOLLFD {
+        fd: socket as SOCKET,
+        events: POLLRDNORM,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: one valid WSAPOLLFD, for the duration of the call.
+        let n = unsafe { WSAPoll(&raw mut pfd, 1, -1) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if pfd.revents != 0 {
+            return Ok(());
+        }
     }
 }
 

@@ -463,7 +463,7 @@ pub struct Dri3PixmapExport {
     pub depth: u8,
     pub bpp: u8,
     pub modifier: u64,
-    pub fd: std::os::fd::OwnedFd,
+    pub fd: crate::fd::OwnedFd,
 }
 
 /// Opaque identity of a DRI3 export the backend deferred.
@@ -514,11 +514,7 @@ pub trait SyncobjHandle: std::fmt::Debug + Send + Sync {
     /// completes. This is the PresentPixmapSynced Copy-path operation used
     /// by Xorg/Xwayland: clients may queue dependent work without reusing the
     /// pixmap before the server's GPU read has retired.
-    fn import_sync_file(
-        &self,
-        _value: u64,
-        _fd: std::os::fd::BorrowedFd<'_>,
-    ) -> std::io::Result<()> {
+    fn import_sync_file(&self, _value: u64, _fd: crate::fd::BorrowedFd<'_>) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "sync_file import unsupported",
@@ -757,7 +753,7 @@ pub trait Backend {
     /// `drm_fd` is readable. The backend should drain completion events from
     /// that exact DRM device and submit the next composite/flip. The fd is one
     /// returned by [`Backend::poll_fds`] with [`BackendFdKind::Drm`].
-    fn on_page_flip_ready(&mut self, state: &mut ServerState, drm_fd: std::os::fd::RawFd);
+    fn on_page_flip_ready(&mut self, state: &mut ServerState, drm_fd: crate::fd::RawFd);
 
     /// The DRM hotplug monitor is readable. Default: no-op.
     fn on_display_hotplug(&mut self, _state: &mut ServerState) {}
@@ -1296,7 +1292,7 @@ pub trait Backend {
     /// Raw fds the core's poller should watch on this backend's behalf. The
     /// core gives every entry a unique token and retains both the fd and its
     /// `BackendFdKind` for readiness dispatch.
-    fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)>;
+    fn poll_fds(&self) -> Vec<(crate::fd::RawFd, BackendFdKind)>;
 
     /// Downcast to `Any` for backend-specific operations (e.g. KMS composite).
     fn as_any(&self) -> &dyn Any;
@@ -2521,7 +2517,7 @@ pub trait Backend {
     ///
     /// `_drawable` is currently unused (single-GPU only — the fd is
     /// the same regardless of which drawable triggered the request).
-    fn dri3_open(&mut self, _drawable: u32) -> io::Result<std::os::fd::OwnedFd> {
+    fn dri3_open(&mut self, _drawable: u32) -> io::Result<crate::fd::OwnedFd> {
         Err(io::Error::other("DRI3 unsupported on this backend"))
     }
 
@@ -2558,7 +2554,7 @@ pub trait Backend {
     #[allow(clippy::too_many_arguments)]
     fn dri3_import_pixmap(
         &mut self,
-        _fd: std::os::fd::OwnedFd,
+        _fd: crate::fd::OwnedFd,
         _width: u16,
         _height: u16,
         _stride: u32,
@@ -2593,7 +2589,7 @@ pub trait Backend {
     fn dri3_export_pixmap(
         &mut self,
         _host_xid: u32,
-    ) -> io::Result<(u32, u16, u16, u16, u8, u8, std::os::fd::OwnedFd)> {
+    ) -> io::Result<(u32, u16, u16, u16, u8, u8, crate::fd::OwnedFd)> {
         Err(io::Error::other("DRI3 export unsupported on this backend"))
     }
 
@@ -2637,7 +2633,7 @@ pub trait Backend {
     /// success the backend owns a `VkSemaphore` keyed by `fence_xid`.
     ///
     /// Default impl is unsupported.
-    fn dri3_fence_from_fd(&mut self, _fence_xid: u32, _fd: std::os::fd::OwnedFd) -> io::Result<()> {
+    fn dri3_fence_from_fd(&mut self, _fence_xid: u32, _fd: crate::fd::OwnedFd) -> io::Result<()> {
         Err(io::Error::other("DRI3 FenceFromFD unsupported"))
     }
 
@@ -2646,7 +2642,7 @@ pub trait Backend {
     /// caller.
     ///
     /// Default impl is unsupported.
-    fn dri3_fd_from_fence(&mut self, _fence_xid: u32) -> io::Result<std::os::fd::OwnedFd> {
+    fn dri3_fd_from_fence(&mut self, _fence_xid: u32) -> io::Result<crate::fd::OwnedFd> {
         Err(io::Error::other("DRI3 FDFromFence unsupported"))
     }
 
@@ -2659,7 +2655,7 @@ pub trait Backend {
         &mut self,
         _client_id: yserver_protocol::x11::ClientId,
         _syncobj_xid: u32,
-        _fd: std::os::fd::OwnedFd,
+        _fd: crate::fd::OwnedFd,
     ) -> io::Result<()> {
         Err(io::Error::other("DRI3 ImportSyncobj unsupported"))
     }

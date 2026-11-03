@@ -4,7 +4,9 @@
 //! docs/superpowers/specs/2026-10-30-xhost-access-control-design.md, "Peer
 //! identity, captured once".
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
+#[cfg(unix)]
+use std::net::{Ipv4Addr, Ipv6Addr};
 #[cfg(any(
     target_os = "linux",
     target_os = "openbsd",
@@ -52,6 +54,7 @@ impl PeerIdentity {
     #[must_use]
     pub fn of(stream: &Transport) -> Self {
         match stream {
+            #[cfg(unix)]
             Transport::Unix(stream) => Self {
                 transport: AuthTransport::Unix,
                 addr: None,
@@ -158,12 +161,15 @@ fn peer_pid(_fd: RawFd) -> Option<u32> {
     None
 }
 
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "openbsd",
-    target_os = "macos",
-    target_os = "freebsd"
-)))]
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "openbsd",
+        target_os = "macos",
+        target_os = "freebsd"
+    ))
+))]
 fn unix_peer_cred(_stream: &std::os::unix::net::UnixStream) -> Option<PeerCred> {
     None
 }
@@ -196,6 +202,7 @@ pub fn own_interface_addrs() -> Vec<HostEntry> {
 }
 
 /// IPv4 and IPv6 addresses of every interface. Empty if `getifaddrs` fails.
+#[cfg(unix)]
 fn interface_ips() -> Vec<IpAddr> {
     let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: `getifaddrs` fills `ifap` with an owned list on success; we
@@ -228,6 +235,13 @@ fn interface_ips() -> Vec<IpAddr> {
     // SAFETY: `ifap` is exactly what `getifaddrs` returned and is freed once.
     unsafe { libc::freeifaddrs(ifap) };
     ips
+}
+
+/// TODO(windows): enumerate the interfaces (`GetAdaptersAddresses`); until
+/// then only a loopback peer is local.
+#[cfg(windows)]
+fn interface_ips() -> Vec<IpAddr> {
+    Vec::new()
 }
 
 /// Is `peer` one of this machine's own addresses?

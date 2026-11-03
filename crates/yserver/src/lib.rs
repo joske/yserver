@@ -21,12 +21,15 @@ pub mod present;
 pub(crate) mod rootless;
 pub(crate) mod scroll_v120;
 pub mod settings;
-// Only the macOS shell opens windows; elsewhere the window half is unused.
+// Only the macOS shell uses all of it (Windows: a rooted window without the
+// clipboard); elsewhere the window half is unused.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 pub(crate) mod surface;
 pub mod version;
 #[cfg(kms)]
 mod vt;
+#[cfg(windows)]
+mod windows;
 
 #[cfg(kms)]
 pub mod vrr_exclusions;
@@ -34,17 +37,22 @@ pub mod vrr_exclusions;
 // `crate::vk_count!` call sites outside the render crate resolve through this.
 pub use yserver_render::vk_count;
 
+use std::io;
+#[cfg(unix)]
+use std::thread;
 #[cfg(kms)]
 use std::{fs, path::PathBuf};
-use std::{io, thread};
 
+#[cfg(unix)]
 use nix::sys::signal::{SigSet, Signal};
 #[cfg(target_os = "linux")]
 use nix::sys::signal::{SigmaskHow, sigprocmask};
 #[cfg(target_os = "linux")]
 use nix::sys::signalfd::SignalFd;
 
-use yserver_core::core_loop::{self, Message, ResetPolicy};
+#[cfg(unix)]
+use yserver_core::core_loop::Message;
+use yserver_core::core_loop::{self, ResetPolicy};
 // Moved into core (`backend::install_backend_root_bindings`) so the
 // server-reset generation boundary can re-run the identical binding step
 // against a freshly constructed `ServerState`. Imported under its own name
@@ -145,7 +153,7 @@ fn validate_tcp_startup(
     // silently unix-only. `-nolisten tcp` (`opts.tcp_listen == false`) stays
     // accepted in this build — asking not to listen is satisfiable when the
     // binary cannot listen at all.
-    #[cfg(not(feature = "tcp-transport"))]
+    #[cfg(not(tcp_transport))]
     if opts.tcp_listen {
         return Err(io::Error::other(
             "this yserver was built without TCP support: -listen tcp needs the \
@@ -232,6 +240,7 @@ fn build_xdmcp_service(
     Ok(None)
 }
 
+#[cfg(unix)]
 fn bind_client_listeners(
     unix: std::os::unix::net::UnixListener,
     display: u16,
@@ -253,12 +262,32 @@ fn bind_client_listeners(
     Ok(listeners)
 }
 
+/// Windows has no Unix-domain listener, so TCP is its only transport.
+#[cfg(windows)]
+fn bind_client_listeners(
+    display: u16,
+    opts: &launch::LaunchOptions,
+    auth: &core_loop::auth::AuthState,
+) -> io::Result<Vec<yserver_core::transport::Listener>> {
+    if !opts.tcp_listen {
+        return Err(io::Error::other(
+            "Windows has no Unix-domain sockets: start with -listen tcp",
+        ));
+    }
+    auth.require_tcp_auth_at_startup()
+        .map_err(io::Error::other)?;
+    let port = launch::tcp_port(display).map_err(io::Error::other)?;
+    Ok(vec![yserver_core::transport::Listener::tcp(
+        bind_tcp_listener(port)?,
+    )?])
+}
+
 /// The one place a `tcp-transport` build actually opens a TCP socket.
 /// `Transport::Tcp` / `Listener::Tcp` stay compiled in every configuration —
 /// the type is `std` and costs nothing, and forking every `match` on
 /// `Transport` would buy no meaningful size win — so only the ABILITY to
 /// create the listener is gated here.
-#[cfg(feature = "tcp-transport")]
+#[cfg(tcp_transport)]
 fn bind_tcp_listener(port: u16) -> io::Result<std::net::TcpListener> {
     let tcp =
         std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).map_err(|err| {
@@ -275,7 +304,7 @@ fn bind_tcp_listener(port: u16) -> io::Result<std::net::TcpListener> {
 /// `-listen tcp` long before this point, before any hardware or sockets are
 /// touched. This is a second line of defence only, mirroring
 /// `build_xdmcp_service`'s feature-off twin above.
-#[cfg(not(feature = "tcp-transport"))]
+#[cfg(not(tcp_transport))]
 fn bind_tcp_listener(_port: u16) -> io::Result<std::net::TcpListener> {
     Err(io::Error::other(
         "this yserver was built without TCP support: -listen tcp needs the \
@@ -316,8 +345,16 @@ pub fn stored_settings() -> settings::Settings {
     macos::stored_settings()
 }
 
+/// Run the server on Windows: in a window, in a window per top-level with
+/// `--rootless`, or headless with `--headless`.
+#[cfg(windows)]
+pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
+    let mode = launch::shell_mode(&opts, true).map_err(io::Error::other)?;
+    windows::run(opts, mode)
+}
+
 /// Run the server on a platform with neither KMS nor a window shell.
-#[cfg(all(not(kms), not(target_os = "macos")))]
+#[cfg(all(not(kms), not(target_os = "macos"), not(windows)))]
 pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     launch::shell_mode(&opts, false).map_err(io::Error::other)?;
     surface::server::run_headless(opts)
@@ -1004,6 +1041,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
 /// acquire handshake; (3) we *send* SIGUSR1 outward to the parent
 /// at readiness. Disposition-in, delivery-to-self, and signal-out
 /// are separate.
+#[cfg(unix)]
 fn spawn_signal_thread(
     signal_fd: SignalSource,
     signal_sender: core_loop::CoreSender,
@@ -1179,6 +1217,27 @@ fn raise_open_files_limit() {
     }
 }
 
+/// TODO(windows): Ctrl+C and console close should request `Shutdown`
+/// (`SetConsoleCtrlHandler`); until then nothing watches for them.
+#[cfg(windows)]
+struct SignalSource;
+
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)]
+fn block_termination_signals() -> io::Result<SignalSource> {
+    Ok(SignalSource)
+}
+
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)]
+fn spawn_signal_thread(
+    _signal_source: SignalSource,
+    _signal_sender: core_loop::CoreSender,
+    _signal_reset_policy: ResetPolicy,
+) -> io::Result<()> {
+    Ok(())
+}
+
 /// What the signal thread reads signals from.
 #[cfg(target_os = "linux")]
 type SignalSource = SignalFd;
@@ -1303,7 +1362,7 @@ fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
     Ok(kq)
 }
 
-#[cfg(all(test, feature = "tcp-transport"))]
+#[cfg(all(test, tcp_transport))]
 mod tcp_tests;
 
 #[cfg(test)]
@@ -1437,7 +1496,7 @@ mod tests {
     /// test asserting only that it errored would pass just as well if
     /// `-listen` had degraded to "unknown option", which is the failure this
     /// step exists to prevent.
-    #[cfg(not(feature = "tcp-transport"))]
+    #[cfg(not(tcp_transport))]
     #[test]
     fn a_build_without_tcp_transport_refuses_listen_tcp_at_startup_validation() {
         let opts = launch::parse_args([":7", "-listen", "tcp"].into_iter().map(String::from))
@@ -1468,7 +1527,7 @@ mod tests {
     /// `-nolisten tcp` asks not to listen, which a build lacking
     /// `tcp-transport` can always satisfy — it must not be swept up in the
     /// refusal above.
-    #[cfg(not(feature = "tcp-transport"))]
+    #[cfg(not(tcp_transport))]
     #[test]
     fn a_build_without_tcp_transport_still_accepts_nolisten_tcp() {
         let opts = launch::parse_args([":7", "-nolisten", "tcp"].into_iter().map(String::from))
@@ -1572,7 +1631,7 @@ mod tests {
     // built-without-TCP refusal fires first. Per the design's test-gating
     // rule, a test is gated by the narrowest feature whose behaviour it
     // asserts.
-    #[cfg(feature = "tcp-transport")]
+    #[cfg(tcp_transport)]
     #[test]
     fn listen_tcp_without_auth_is_rejected_before_startup() {
         let opts = crate::launch::parse_args(["-listen".into(), "tcp".into()]).unwrap();
@@ -1619,7 +1678,7 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "tcp-transport")]
+    #[cfg(tcp_transport)]
     #[test]
     fn tcp_startup_port_validation_accepts_65535_and_rejects_overflow() {
         let path = std::env::temp_dir().join(format!(

@@ -115,6 +115,27 @@ impl Translator {
         }
     }
 
+    /// Translate a key that comes as an evdev code with its own press and
+    /// release (Windows): a press of a key already down is the window
+    /// system's autorepeat and dropped.
+    #[cfg(any(windows, test))]
+    pub(crate) fn evdev_key(
+        &mut self,
+        evdev: u16,
+        pressed: bool,
+        time: u32,
+        out: &mut Vec<HostInputEvent>,
+    ) {
+        let Ok(keycode) = u8::try_from(evdev + 8) else {
+            return;
+        };
+        if pressed {
+            self.press(keycode, time, out);
+        } else {
+            self.release(keycode, time, out);
+        }
+    }
+
     fn flags_changed(&mut self, raw: RawKey, time: u32, out: &mut Vec<HostInputEvent>) {
         if raw.kvk == kvk::kVK_CapsLock {
             // One event per lock change, none on release: each toggles X once.
@@ -410,6 +431,17 @@ mod tests {
             ],
         );
         assert_eq!(events, [(38, true), (38, false)]);
+    }
+
+    #[test]
+    fn evdev_keys_press_once_and_drop_unmatched_releases() {
+        let mut t = Translator::default();
+        let mut out = Vec::new();
+        t.evdev_key(30, true, 0, &mut out);
+        t.evdev_key(30, true, 0, &mut out);
+        t.evdev_key(29, false, 0, &mut out);
+        t.evdev_key(30, false, 0, &mut out);
+        assert_eq!(summary(&out), [(38, true), (38, false)]);
     }
 
     #[test]

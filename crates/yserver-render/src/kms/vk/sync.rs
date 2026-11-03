@@ -15,7 +15,7 @@
 //! raw fd and close it before returning `Err`.
 
 use ash::vk;
-use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
+use yserver_protocol::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 
 use super::device::VkContext;
 

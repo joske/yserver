@@ -10,7 +10,7 @@ use std::sync::Arc;
 /// [`RenderEngine::promote_drawable_for_scanout`] before any storage swap.
 #[derive(Debug)]
 pub struct ScanoutCandidate<'a> {
-    pub fd: std::os::fd::BorrowedFd<'a>,
+    pub fd: yserver_protocol::fd::BorrowedFd<'a>,
     pub width: u32,
     pub height: u32,
     pub format: vk::Format,
@@ -128,7 +128,7 @@ impl RenderEngine {
         let export = crate::kms::vk::dri3::export_backing(&vk, &candidate)
             .map_err(ScanoutPromoteError::Export)?;
         let accepted = {
-            use std::os::fd::AsFd as _;
+            use yserver_protocol::fd::AsFd as _;
             probe(&ScanoutCandidate {
                 fd: export.fd.as_fd(),
                 width: extent.width,

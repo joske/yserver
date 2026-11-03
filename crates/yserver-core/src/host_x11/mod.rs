@@ -11,13 +11,14 @@ pub use pump::{
 use std::{
     collections::{HashMap, VecDeque},
     io::{self, ErrorKind, Read, Write},
-    os::fd::{AsRawFd, RawFd},
 };
 
 use log::debug;
 use yserver_protocol::x11::ResourceId;
 
 use crate::backend::{OriginContext, PixmapHandle, WindowHandle};
+#[cfg(unix)]
+use crate::fd::{AsRawFd, RawFd};
 
 use crate::core_loop::client_reader::wait_readable;
 
@@ -432,6 +433,7 @@ impl HostX11Backend {
     /// Raw fd of the host X11 connection. The core registers this with
     /// its mio poller (using a unique backend poll-source token) so readiness wakes the core
     /// to call `drain_host_socket`.
+    #[cfg(unix)]
     pub(super) fn host_fd(&self) -> RawFd {
         self.stream.as_raw_fd()
     }
@@ -771,7 +773,7 @@ impl HostX11Backend {
             if let Some(response) = self.take_buffered_reply(target_full) {
                 return Ok(decode_reply_or_error(response));
             }
-            wait_readable(self.stream.as_raw_fd())?;
+            wait_readable(self.stream.raw_socket())?;
         }
     }
 
@@ -808,37 +810,24 @@ impl HostX11Backend {
         if self.socket_eof {
             return Ok(HostSocketStatus::Eof);
         }
-        let fd = self.stream.as_raw_fd();
         let mut tmp = [0u8; 4096];
         loop {
-            // SAFETY: `recv(2)` with MSG_DONTWAIT on a connected
-            // Unix socket; `tmp` is a valid mutable slice.
-            let n = unsafe {
-                libc::recv(
-                    fd,
-                    tmp.as_mut_ptr().cast::<libc::c_void>(),
-                    tmp.len(),
-                    libc::MSG_DONTWAIT,
-                )
-            };
-            if n == 0 {
-                self.socket_eof = true;
-                self.classify_buffered_frames();
-                return Ok(HostSocketStatus::Eof);
-            }
-            if n < 0 {
-                let err = io::Error::last_os_error();
-                match err.kind() {
+            let n = match self.stream.recv_dontwait(&mut tmp) {
+                Ok(0) => {
+                    self.socket_eof = true;
+                    self.classify_buffered_frames();
+                    return Ok(HostSocketStatus::Eof);
+                }
+                Ok(n) => n,
+                Err(err) => match err.kind() {
                     ErrorKind::WouldBlock => {
                         self.classify_buffered_frames();
                         return Ok(HostSocketStatus::WouldBlock);
                     }
                     ErrorKind::Interrupted => continue,
                     _ => return Err(err),
-                }
-            }
-            #[allow(clippy::cast_sign_loss)]
-            let n = n as usize;
+                },
+            };
             self.read_buffer.extend_from_slice(&tmp[..n]);
         }
     }

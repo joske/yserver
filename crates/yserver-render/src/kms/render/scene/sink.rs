@@ -7,9 +7,10 @@
 //! that crosses is plain data, a Vulkan handle, or a [`ComposeRenderTarget`]
 //! lent to the record closure of [`OutputSink::finish_frame`].
 
-use std::{io, os::fd::OwnedFd};
+use std::io;
 
 use ash::vk;
+use yserver_protocol::fd::OwnedFd;
 
 use crate::kms::{
     render::{

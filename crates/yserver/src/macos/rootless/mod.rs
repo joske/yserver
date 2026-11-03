@@ -287,10 +287,10 @@ pub(super) fn start(
                 opts,
                 spec,
                 Box::new(host),
-                HostClipboard {
+                Some(HostClipboard {
                     pasteboard: Box::new(super::pasteboard::GeneralPasteboard),
                     sync: sync_clipboard,
-                },
+                }),
             )
         })?;
     Ok((ticker, input))

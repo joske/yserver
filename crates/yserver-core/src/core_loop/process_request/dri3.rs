@@ -4,10 +4,11 @@ use crate::{
         RequestOutcome, emit_x11_error_with_minor, send_reply_with_fd, write_to_client,
         xid_out_of_client_range,
     },
+    fd::OwnedFd,
     server::ServerState,
 };
 use log::debug;
-use std::{io, os::fd::OwnedFd};
+use std::io;
 use yserver_protocol::{
     x11,
     x11::{ClientId, RequestHeader, ResourceId, SequenceNumber},
@@ -60,13 +61,13 @@ pub(super) fn handle_dri3_request(
                         "client {} #{} DRI3::Open drawable=0x{drawable:x} -> fd={}",
                         client_id.0,
                         sequence.0,
-                        std::os::fd::AsRawFd::as_raw_fd(&fd)
+                        crate::fd::AsRawFd::as_raw_fd(&fd)
                     );
                     let reply = x11dri3::encode_open_reply(byte_order, sequence);
                     let Some(client) = state.clients.get_mut(&client_id.0) else {
                         return Ok(RequestOutcome::Handled);
                     };
-                    let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
+                    let raw = crate::fd::AsRawFd::as_raw_fd(&fd);
                     if let Err(e) = send_reply_with_fd(client, &reply, raw) {
                         log::warn!("DRI3::Open SCM_RIGHTS dispatch failed: {e}");
                         return Ok(RequestOutcome::Disconnect(client_id));
@@ -501,7 +502,7 @@ pub(super) fn handle_dri3_request(
                     let Some(client) = state.clients.get_mut(&client_id.0) else {
                         return Ok(RequestOutcome::Handled);
                     };
-                    let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
+                    let raw = crate::fd::AsRawFd::as_raw_fd(&fd);
                     if let Err(e) = send_reply_with_fd(client, &reply, raw) {
                         log::warn!("DRI3::FDFromFence SCM_RIGHTS dispatch failed: {e}");
                         return Ok(RequestOutcome::Disconnect(client_id));
@@ -814,7 +815,7 @@ pub(crate) fn complete_dri3_export(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
-    let raw = std::os::fd::AsRawFd::as_raw_fd(&export.fd);
+    let raw = crate::fd::AsRawFd::as_raw_fd(&export.fd);
     if let Err(e) = send_reply_with_fd(client, &reply, raw) {
         log::warn!("DRI3::{op:?} SCM_RIGHTS dispatch failed: {e}");
         return Ok(RequestOutcome::Disconnect(client_id));

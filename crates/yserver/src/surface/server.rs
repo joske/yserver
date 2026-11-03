@@ -3,10 +3,11 @@
 
 use std::{
     ffi::CStr,
-    fs, io,
-    path::PathBuf,
+    io,
     sync::{Arc, atomic::AtomicUsize},
 };
+#[cfg(unix)]
+use std::{fs, path::PathBuf};
 
 use yserver_core::{
     backend::{Backend as _, BackendTopology, install_backend_root_bindings},
@@ -38,7 +39,10 @@ pub(crate) const DEFAULT_SIZE: (u16, u16) = (1280, 800);
 /// A window shell's half of the server: its surface, the surface's frame
 /// clock (ticked by the shell), its link, its UI commands, the count of
 /// established X clients the core keeps for it and the host pasteboard.
-#[allow(dead_code, reason = "a window shell's; only macOS has one")]
+#[allow(
+    dead_code,
+    reason = "a window shell's; only macOS and Windows have one"
+)]
 pub(crate) struct WindowSpec {
     pub(crate) surface: NativeSurface,
     pub(crate) clock: Arc<FrameClock>,
@@ -51,13 +55,16 @@ pub(crate) struct WindowSpec {
     pub(crate) output_mm: (u32, u32),
     /// Swapchain pixels per X pixel; later changes come as `Resized`.
     pub(crate) copy_scale: u32,
-    /// Bridged with CLIPBOARD.
-    pub(crate) clipboard: HostClipboard,
+    /// Bridged with CLIPBOARD; none: not bridged.
+    pub(crate) clipboard: Option<HostClipboard>,
 }
 
 /// A rootless window shell's half of the server: one native window per
 /// top-level, no output.
-#[allow(dead_code, reason = "a window shell's; only macOS has one")]
+#[allow(
+    dead_code,
+    reason = "a window shell's; only macOS and Windows have one"
+)]
 pub(crate) struct RootlessSpec {
     /// The shell's Vulkan surface extension.
     pub(crate) surface_extension: &'static CStr,
@@ -75,7 +82,10 @@ pub(crate) struct RootlessSpec {
 /// # Errors
 ///
 /// See [`super::headless_backend`].
-#[allow(dead_code, reason = "a window shell's; only macOS has one")]
+#[allow(
+    dead_code,
+    reason = "a window shell's; only macOS and Windows have one"
+)]
 pub(crate) fn rootless_backend(
     vk: Arc<VkContext>,
     spec: &RootlessSpec,
@@ -105,12 +115,15 @@ pub(crate) fn rootless_backend(
 /// # Errors
 ///
 /// Vulkan, rootless mode, the sockets or the core loop failed.
-#[allow(dead_code, reason = "a window shell's; only macOS has one")]
+#[allow(
+    dead_code,
+    reason = "a window shell's; only macOS and Windows have one"
+)]
 pub(crate) fn run_rootless(
     opts: launch::LaunchOptions,
     spec: RootlessSpec,
     host: Box<dyn RootlessHost + Send>,
-    clipboard: HostClipboard,
+    clipboard: Option<HostClipboard>,
 ) -> io::Result<()> {
     let result = serve(
         &opts,
@@ -133,7 +146,7 @@ pub(crate) fn run_rootless(
             .map_err(|e| io::Error::other(format!("rootless: {e}")))
         },
         Some(&spec.link),
-        Some(clipboard),
+        clipboard,
         |display| spec.ui.set_display(display),
     );
     spec.link.disconnect();
@@ -197,7 +210,10 @@ pub(crate) fn run_headless(opts: launch::LaunchOptions) -> io::Result<()> {
 /// # Errors
 ///
 /// Vulkan, the sockets or the core loop failed.
-#[allow(dead_code, reason = "a window shell's; only macOS has one")]
+#[allow(
+    dead_code,
+    reason = "a window shell's; only macOS and Windows have one"
+)]
 pub(crate) fn run_windowed(opts: launch::LaunchOptions, spec: WindowSpec) -> io::Result<()> {
     let size = opts.geometry.unwrap_or(DEFAULT_SIZE);
     let WindowSpec {
@@ -234,7 +250,7 @@ pub(crate) fn run_windowed(opts: launch::LaunchOptions, spec: WindowSpec) -> io:
         },
         |_, _| Ok(()),
         Some(&link),
-        Some(clipboard),
+        clipboard,
         |display| ui.set_display(display),
     );
     link.disconnect();
@@ -277,36 +293,16 @@ fn serve(
     yserver_core::core_loop::process_request::install_default_font(&mut state, &mut backend)?;
     setup(&mut state, &mut backend)?;
 
-    let socket_dir = PathBuf::from("/tmp/.X11-unix");
-    fs::create_dir_all(&socket_dir).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("create_dir_all({}): {e}", socket_dir.display()),
-        )
-    })?;
-    let (display, listener, _lock_guard, socket_path) = match launch::resolve(opts) {
-        launch::Resolution::Explicit { display, lock } => {
-            let guard = if lock {
-                Some(launch::acquire_lock(&PathBuf::from("/tmp"), display)?)
-            } else {
-                None
-            };
-            let (listener, socket_path) = launch::bind_explicit(&socket_dir, display)?;
-            (display, listener, guard, socket_path)
-        }
-        launch::Resolution::AutoPick => {
-            let (display, listener, socket_path) = launch::autopick(&socket_dir)?;
-            (display, listener, None, socket_path)
-        }
-        launch::Resolution::FirstFree { first } => {
-            let (display, guard, listener, socket_path) =
-                launch::autopick_locked(&PathBuf::from("/tmp"), &socket_dir, first)?;
-            (display, listener, Some(guard), socket_path)
-        }
-    };
-    log::info!("yserver: listening on unix socket DISPLAY=:{display}");
+    #[cfg(unix)]
+    let (display, listener, _lock_guard, socket_path) = bind_display(opts)?;
+    // TODO(windows): no display lock or free-display scan yet.
+    #[cfg(windows)]
+    let display = opts.display.unwrap_or(launch::DEFAULT_DISPLAY);
     on_display(display);
+    #[cfg(unix)]
     let listeners = crate::bind_client_listeners(listener, display, opts, &auth)?;
+    #[cfg(windows)]
+    let listeners = crate::bind_client_listeners(display, opts, &auth)?;
     let xdmcp = crate::build_xdmcp_service(opts, display)?;
 
     let (poll, sender, rx) = core_loop::channel()?;
@@ -354,7 +350,49 @@ fn serve(
         &mut backend,
     );
     backend.shutdown_destroy_drawables();
+    #[cfg(unix)]
     let _ = fs::remove_file(&socket_path);
     log::info!("yserver: exiting");
     result
+}
+
+/// Resolve the display, take its lock and bind its Unix socket.
+#[cfg(unix)]
+fn bind_display(
+    opts: &launch::LaunchOptions,
+) -> io::Result<(
+    u16,
+    std::os::unix::net::UnixListener,
+    Option<launch::LockGuard>,
+    PathBuf,
+)> {
+    let socket_dir = PathBuf::from("/tmp/.X11-unix");
+    fs::create_dir_all(&socket_dir).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("create_dir_all({}): {e}", socket_dir.display()),
+        )
+    })?;
+    let (display, listener, lock_guard, socket_path) = match launch::resolve(opts) {
+        launch::Resolution::Explicit { display, lock } => {
+            let guard = if lock {
+                Some(launch::acquire_lock(&PathBuf::from("/tmp"), display)?)
+            } else {
+                None
+            };
+            let (listener, socket_path) = launch::bind_explicit(&socket_dir, display)?;
+            (display, listener, guard, socket_path)
+        }
+        launch::Resolution::AutoPick => {
+            let (display, listener, socket_path) = launch::autopick(&socket_dir)?;
+            (display, listener, None, socket_path)
+        }
+        launch::Resolution::FirstFree { first } => {
+            let (display, guard, listener, socket_path) =
+                launch::autopick_locked(&PathBuf::from("/tmp"), &socket_dir, first)?;
+            (display, listener, Some(guard), socket_path)
+        }
+    };
+    log::info!("yserver: listening on unix socket DISPLAY=:{display}");
+    Ok((display, listener, lock_guard, socket_path))
 }

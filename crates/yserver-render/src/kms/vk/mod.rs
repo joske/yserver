@@ -40,8 +40,12 @@ pub mod vram;
 // gone with the rest of the pixman canonical-store machinery.
 
 use ash::vk as ash_vk;
-use std::os::fd::{FromRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
 
+use yserver_protocol::fd::OwnedFd;
+
+#[cfg(unix)]
 pub fn owned_fd_from_vk(raw_fd: i32, call: &str) -> Result<OwnedFd, ash_vk::Result> {
     if raw_fd < 0 {
         log::warn!("vk: {call} returned invalid fd {raw_fd}");
@@ -51,6 +55,14 @@ pub fn owned_fd_from_vk(raw_fd: i32, call: &str) -> Result<OwnedFd, ash_vk::Resu
     // SAFETY: Vulkan fd-export calls return a fresh fd owned by the
     // caller. The negative-fd case is handled above.
     Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+}
+
+/// No Vulkan fd export exists on Windows, whose external handles are
+/// `HANDLE`s.
+#[cfg(windows)]
+pub fn owned_fd_from_vk(raw_fd: i32, call: &str) -> Result<OwnedFd, ash_vk::Result> {
+    log::warn!("vk: {call} returned fd {raw_fd}, which Windows cannot own");
+    Err(ash_vk::Result::ERROR_FEATURE_NOT_PRESENT)
 }
 
 pub fn optional_sync_fd_from_vk(

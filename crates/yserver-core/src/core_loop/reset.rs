@@ -15,8 +15,11 @@
 //!   with the generation counter, the setup registry, the loop-local
 //!   per-client collections and a freshly seeded `ServerState`.
 
-use std::{collections::VecDeque, os::fd::AsRawFd};
+use std::collections::VecDeque;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
+#[cfg(unix)]
 use mio::unix::SourceFd;
 use yserver_protocol::x11::ClientId;
 
@@ -361,14 +364,10 @@ pub(crate) fn reset_generation(
     let mut live: Vec<u32> = state.clients.keys().copied().collect();
     live.sort_unstable();
     for id in &live {
-        let Some(client) = state.clients.get(id) else {
+        let Some(client) = state.clients.get_mut(id) else {
             continue;
         };
-        let raw = match client.writer.lock() {
-            Ok(writer) => writer.as_raw_fd(),
-            Err(poisoned) => poisoned.into_inner().as_raw_fd(),
-        };
-        if let Err(err) = registry.deregister(&mut SourceFd(&raw))
+        if let Err(err) = deregister_writer(registry, client)
             && err.kind() != std::io::ErrorKind::NotFound
         {
             log::warn!("reset: deregister client {id} from the poller: {err}");
@@ -491,6 +490,31 @@ pub(crate) fn reset_generation(
 /// Deliberately the same call the protocol's `ClearArea` makes, against
 /// the same resolved background, so KMS records the damage its
 /// composite path needs rather than relying on `mark_dirty` alone.
+/// Take a client's writer out of the poller.
+#[cfg(unix)]
+fn deregister_writer(
+    registry: &mio::Registry,
+    client: &mut crate::server::ClientState,
+) -> std::io::Result<()> {
+    let raw = match client.writer.lock() {
+        Ok(writer) => writer.as_raw_fd(),
+        Err(poisoned) => poisoned.into_inner().as_raw_fd(),
+    };
+    registry.deregister(&mut SourceFd(&raw))
+}
+
+/// Take a client's writer out of the poller.
+#[cfg(windows)]
+fn deregister_writer(
+    registry: &mio::Registry,
+    client: &mut crate::server::ClientState,
+) -> std::io::Result<()> {
+    match client.writable_source.take() {
+        Some(mut source) => registry.deregister(&mut source),
+        None => Err(std::io::ErrorKind::NotFound.into()),
+    }
+}
+
 fn clear_root(state: &mut ServerState, backend: &mut dyn Backend) {
     let Some((width, height)) = state
         .resources

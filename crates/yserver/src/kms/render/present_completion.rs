@@ -7,12 +7,12 @@
 //!
 //! Spec: `docs/superpowers/specs/2026-05-23-deferred-present-completion-design.md`.
 
-use std::{
-    os::fd::{AsFd, OwnedFd},
-    sync::{Arc, Once},
-};
+use std::sync::{Arc, Once};
 
-use yserver_core::backend::{CompletedPresentEvent, SyncobjHandle, XshmfenceHandle};
+use yserver_core::{
+    backend::{CompletedPresentEvent, SyncobjHandle, XshmfenceHandle},
+    fd::{AsFd, OwnedFd},
+};
 
 use crate::kms::render::present_batch::PresentCompletionEntry;
 
@@ -115,7 +115,7 @@ mod tests {
         fn import_sync_file(
             &self,
             value: u64,
-            _fd: std::os::fd::BorrowedFd<'_>,
+            _fd: yserver_core::fd::BorrowedFd<'_>,
         ) -> std::io::Result<()> {
             if self.fail_import {
                 return Err(std::io::Error::other("injected import failure"));

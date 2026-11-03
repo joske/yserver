@@ -26,13 +26,14 @@ use dri3_export::{ParkedDri3Export, drain_ready_dri3_exports};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
-    os::fd::{AsRawFd, OwnedFd, RawFd},
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use log::{error, warn};
-use mio::{Events, Interest, Poll, unix::SourceFd};
+#[cfg(unix)]
+use mio::unix::SourceFd;
+use mio::{Events, Interest, Poll};
 
 use super::{
     auth::AuthState,
@@ -41,8 +42,8 @@ use super::{
     input_inventory::InputInventory,
     message::{HostInputEvent, Message, SetupAllocateResponse, XiConfigRequest},
     poll_tokens::{
-        ClientIdAllocator, NOTIFY_TOKEN, backend_token, client_token, listener_token,
-        token_to_backend_index, token_to_client, token_to_listener_index,
+        ClientIdAllocator, NOTIFY_TOKEN, client_token, listener_token, token_to_backend_index,
+        token_to_client, token_to_listener_index,
     },
     process_request::{
         PendingCrtcConfig, PendingDri3Export, PropertyDispatchError, RequestOutcome,
@@ -56,6 +57,7 @@ use super::{
 };
 use crate::{
     backend::{Backend, BackendFdKind, CrtcConfigToken, Dri3ExportToken, HostSocketStatus},
+    fd::{OwnedFd, RawFd},
     host_x11::HostEvent,
     peer::address_is_ours,
     server::{KeyRepeatState, ServerState},
@@ -2139,13 +2141,11 @@ fn run_core_with_inventory(
     let listeners: Vec<_> = listeners
         .into_iter()
         .enumerate()
-        .map(|(index, listener)| {
+        .map(|(index, mut listener)| {
             listener.set_nonblocking(true)?;
-            let raw = listener.as_raw_fd();
             let token = listener_token(index)
                 .ok_or_else(|| io::Error::other("too many client listeners"))?;
-            poll.registry()
-                .register(&mut SourceFd(&raw), token, Interest::READABLE)?;
+            listener.register(poll.registry(), token)?;
             Ok(listener)
         })
         .collect::<io::Result<_>>()?;
@@ -2174,8 +2174,16 @@ fn run_core_with_inventory(
         .into_iter()
         .map(|(fd, kind)| BackendPollSource { fd, kind })
         .collect();
+    // TODO(windows): no backend has a poll source there yet.
+    #[cfg(windows)]
+    if !backend_poll_sources.is_empty() {
+        return Err(io::Error::other(
+            "backend poll fds are unsupported on Windows",
+        ));
+    }
+    #[cfg(unix)]
     for (index, source) in backend_poll_sources.iter().enumerate() {
-        let token = backend_token(index).ok_or_else(|| {
+        let token = super::poll_tokens::backend_token(index).ok_or_else(|| {
             io::Error::other(format!(
                 "backend exposes too many poll fds: {}",
                 backend_poll_sources.len()
@@ -2495,6 +2503,7 @@ fn run_core_with_inventory(
                                 telemetry.record_deferred_push(req.id);
                                 deferred_requests.push_back(req);
                             }
+                            #[cfg(unix)]
                             Message::InternalClient(stream) => {
                                 let id = client_id_allocator.allocate();
                                 if let Err(err) = setup_thread::spawn(
@@ -4279,27 +4288,19 @@ fn reconcile_client_writable_interest(
             }
         }
         let needs_writable = !client.outbound.is_empty();
-        if needs_writable == client.watching_writable {
+        // mio's Windows readiness is one-shot until I/O through the source
+        // would block, and the writes go through the writer: re-arm on
+        // every pass.
+        if needs_writable == client.watching_writable && !(cfg!(windows) && needs_writable) {
             continue;
         }
-        let raw = std::os::fd::AsRawFd::as_raw_fd(&*client.writer.lock().unwrap());
         // The writer fd is in the poller only while output waits for room:
         // the reader thread owns reads, so a READABLE registration would
         // only wake this loop for every byte the client sends -- and on a
         // kernel whose edge-triggered readiness also counts the other
         // direction's traffic, for every byte the server sends too.
-        let changed = if needs_writable {
-            let token = client_token(yserver_protocol::x11::ClientId(*id));
-            match registry.register(&mut SourceFd(&raw), token, Interest::WRITABLE) {
-                // Registered by somebody else meanwhile: take it over.
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                    registry.reregister(&mut SourceFd(&raw), token, Interest::WRITABLE)
-                }
-                other => other,
-            }
-        } else {
-            registry.deregister(&mut SourceFd(&raw))
-        };
+        let token = client_token(yserver_protocol::x11::ClientId(*id));
+        let changed = watch_writable(registry, client, token, needs_writable);
         match changed {
             Ok(()) => client.watching_writable = needs_writable,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -4312,6 +4313,57 @@ fn reconcile_client_writable_interest(
         }
     }
     to_disconnect
+}
+
+/// Add the client's writer to the poller for WRITABLE, or take it out.
+#[cfg(unix)]
+fn watch_writable(
+    registry: &mio::Registry,
+    client: &mut crate::server::ClientState,
+    token: mio::Token,
+    watch: bool,
+) -> io::Result<()> {
+    let raw = crate::fd::AsRawFd::as_raw_fd(&*client.writer.lock().unwrap());
+    if watch {
+        match registry.register(&mut SourceFd(&raw), token, Interest::WRITABLE) {
+            // Registered by somebody else meanwhile: take it over.
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                registry.reregister(&mut SourceFd(&raw), token, Interest::WRITABLE)
+            }
+            other => other,
+        }
+    } else {
+        registry.deregister(&mut SourceFd(&raw))
+    }
+}
+
+/// Add the client's writer to the poller for WRITABLE, or take it out.
+/// mio cannot watch a borrowed socket on Windows, so it watches a
+/// duplicate of the writer's.
+// TODO(windows): unverified at runtime.
+#[cfg(windows)]
+fn watch_writable(
+    registry: &mio::Registry,
+    client: &mut crate::server::ClientState,
+    token: mio::Token,
+    watch: bool,
+) -> io::Result<()> {
+    if !watch {
+        return match client.writable_source.take() {
+            Some(mut source) => registry.deregister(&mut source),
+            None => Err(io::ErrorKind::NotFound.into()),
+        };
+    }
+    if let Some(source) = client.writable_source.as_mut() {
+        return registry.reregister(source, token, Interest::WRITABLE);
+    }
+    let duplicate = match &*client.writer.lock().unwrap() {
+        Transport::Tcp(stream) => stream.try_clone()?,
+    };
+    let mut source = mio::net::TcpStream::from_std(duplicate);
+    registry.register(&mut source, token, Interest::WRITABLE)?;
+    client.writable_source = Some(source);
+    Ok(())
 }
 
 fn handle_setup_allocate(
@@ -4654,6 +4706,8 @@ fn handle_client_setup_complete(
             xi1_window_event_classes: std::collections::HashMap::new(),
             outbound: std::collections::VecDeque::new(),
             watching_writable: false,
+            #[cfg(windows)]
+            writable_source: None,
             write_failed: false,
             gone: false,
             focused_window: crate::resources::ROOT_WINDOW,
@@ -4678,6 +4732,7 @@ fn handle_client_setup_complete(
     // being debugged. The branch already had to learn this distinction
     // once, for authorization.
     let transport_label = match &stream {
+        #[cfg(unix)]
         Transport::Unix(_) => "unix",
         Transport::Tcp(_) => "TCP",
         #[cfg(test)]
@@ -4804,31 +4859,31 @@ fn accept_pending(
     auth: &Arc<AuthState>,
 ) -> bool {
     for _ in 0..ACCEPT_BUDGET {
-        let accepted = match listener {
-            Listener::Unix(listener) => listener
-                .accept()
-                .map(|(stream, _)| (Transport::Unix(stream), true, true)),
-            Listener::Tcp(listener) => listener.accept().map(|(stream, peer)| {
-                // `is_local` is an ADDRESS property, `fd_passing` is a
-                // TRANSPORT one, and this is the site that must not
-                // conflate them. `SCM_RIGHTS` is impossible over TCP
-                // whoever the peer is, so fd passing is always off here.
-                // Locality is not: Xorg's `xtransLocalClient`
-                // (`os/access.c`) answers TRUE for a TCP peer whose
-                // address is one of the server's own, which is why a
-                // same-machine client keeps MIT-SHM — its `Attach` passes
-                // a SysV shmid, an integer on the wire, so shared memory
-                // works fine without a descriptor.
-                //
-                // Nagle off, as xtrans `SocketINETAccept` does: a small
-                // reply held back behind an unacked write costs the
-                // client a delayed-ACK round trip.
-                if let Err(err) = stream.set_nodelay(true) {
-                    warn!("TCP_NODELAY on {peer}: {err}");
+        let accepted = listener
+            .accept()
+            .map(|(stream, peer)| match (stream, peer) {
+                (Transport::Tcp(stream), Some(peer)) => {
+                    // `is_local` is an ADDRESS property, `fd_passing` is a
+                    // TRANSPORT one, and this is the site that must not
+                    // conflate them. `SCM_RIGHTS` is impossible over TCP
+                    // whoever the peer is, so fd passing is always off here.
+                    // Locality is not: Xorg's `xtransLocalClient`
+                    // (`os/access.c`) answers TRUE for a TCP peer whose
+                    // address is one of the server's own, which is why a
+                    // same-machine client keeps MIT-SHM — its `Attach` passes
+                    // a SysV shmid, an integer on the wire, so shared memory
+                    // works fine without a descriptor.
+                    //
+                    // Nagle off, as xtrans `SocketINETAccept` does: a small
+                    // reply held back behind an unacked write costs the
+                    // client a delayed-ACK round trip.
+                    if let Err(err) = stream.set_nodelay(true) {
+                        warn!("TCP_NODELAY on {peer}: {err}");
+                    }
+                    (Transport::Tcp(stream), address_is_ours(peer.ip()), false)
                 }
-                (Transport::Tcp(stream), address_is_ours(peer.ip()), false)
-            }),
-        };
+                (stream, _) => (stream, true, true),
+            });
         match accepted {
             Ok((stream, is_local, fd_passing)) => {
                 let id = client_id_allocator.allocate();

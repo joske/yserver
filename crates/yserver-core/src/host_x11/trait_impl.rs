@@ -201,14 +201,22 @@ impl Backend for HostX11Backend {
     fn on_page_flip_ready(
         &mut self,
         _state: &mut crate::server::ServerState,
-        _drm_fd: std::os::fd::RawFd,
+        _drm_fd: crate::fd::RawFd,
     ) {
     }
 
     /// F2: host fd registered with the core's poller. Readiness drives
     /// `drain_host_socket`.
-    fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, crate::backend::BackendFdKind)> {
+    #[cfg(unix)]
+    fn poll_fds(&self) -> Vec<(crate::fd::RawFd, crate::backend::BackendFdKind)> {
         vec![(self.host_fd(), crate::backend::BackendFdKind::HostX11)]
+    }
+
+    /// TODO(windows): a poll source is a socket there; no core poller
+    /// registers one yet.
+    #[cfg(windows)]
+    fn poll_fds(&self) -> Vec<(crate::fd::RawFd, crate::backend::BackendFdKind)> {
+        Vec::new()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

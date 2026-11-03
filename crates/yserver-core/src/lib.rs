@@ -1,9 +1,11 @@
+#[cfg(unix)]
 pub mod anon_shm;
 pub mod backend;
 pub mod composite_redirects;
 pub mod core_loop;
 pub mod crossings;
 pub(crate) mod dri3;
+pub use yserver_protocol::fd;
 pub mod host_x11;
 pub mod nested;
 pub mod peer;
@@ -15,6 +17,7 @@ pub mod resources;
 pub mod rootless;
 pub mod server;
 pub mod transport;
+#[cfg(unix)]
 mod unix_fd;
 pub mod xauth;
 pub mod xinput;

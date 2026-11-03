@@ -23,11 +23,9 @@ ash.workspace = true
 crossbeam-channel.workspace = true
 env_logger.workspace = true
 flate2 = "1.1"
-fontconfig = "0.11"
 freetype-rs.workspace = true
 libc.workspace = true
 log.workspace = true
-nix.workspace = true
 regex = "1.13.1"
 roxmltree.workspace = true
 serde_json.workspace = true
@@ -40,6 +38,13 @@ yserver-render.workspace = true
 
 [dev-dependencies]
 yserver-render = { workspace = true, features = ["test-support"] }
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+# Windows finds its fonts by scanning the font directories (`kms/font_scan.rs`).
+[target.'cfg(not(windows))'.dependencies]
+fontconfig = "0.11"
 
 # The DRM/KMS platform; build.rs emits `cfg(kms)` for the same targets.
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]
@@ -59,6 +64,19 @@ objc2-app-kit = "=0.3.2"
 objc2-foundation = "=0.3.2"
 objc2-quartz-core = "=0.3.2"
 objc2-service-management = { version = "=0.3.2", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
+
+# The Win32 window shell (`src/windows/`).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemServices",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [features]
 # Both features are OFF by default, for two different reasons: enabling a TCP

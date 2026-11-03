@@ -210,6 +210,7 @@ impl SubmitStats {
 
 /// CPU time consumed by the calling thread, in nanoseconds; 0 if the
 /// clock is unavailable.
+#[cfg(unix)]
 #[must_use]
 pub fn thread_cpu_ns() -> u64 {
     let mut ts = libc::timespec {
@@ -224,6 +225,13 @@ pub fn thread_cpu_ns() -> u64 {
         .unwrap_or(0)
         .saturating_mul(1_000_000_000)
         .saturating_add(u64::try_from(ts.tv_nsec).unwrap_or(0))
+}
+
+/// TODO(windows): `GetThreadTimes`; until then the clock is unavailable.
+#[cfg(windows)]
+#[must_use]
+pub fn thread_cpu_ns() -> u64 {
+    0
 }
 
 /// Run `submit` (one `vkQueueSubmit2` of `cbs` command buffers) and count

@@ -371,8 +371,10 @@ pub struct SystemResolver;
 
 /// Upper bound for the `*_r` scratch buffer; a lookup that still reports
 /// `ERANGE` at this size is treated as unresolved.
+#[cfg(unix)]
 const NSS_BUF_MAX: usize = 1 << 20;
 
+#[cfg(unix)]
 impl NameResolver for SystemResolver {
     fn uid(&self, name: &CStr) -> Option<u32> {
         let mut buf = vec![0 as libc::c_char; 1024];
@@ -421,6 +423,19 @@ impl NameResolver for SystemResolver {
             }
             return (rc == 0 && !result.is_null()).then_some(grp.gr_gid);
         }
+    }
+}
+
+/// Windows has no uids or gids, so no `localuser`/`localgroup` name
+/// resolves.
+#[cfg(windows)]
+impl NameResolver for SystemResolver {
+    fn uid(&self, _name: &CStr) -> Option<u32> {
+        None
+    }
+
+    fn gid(&self, _name: &CStr) -> Option<u32> {
+        None
     }
 }
 

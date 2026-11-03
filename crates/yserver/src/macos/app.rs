@@ -381,10 +381,10 @@ impl YserverAppDelegate {
             max_output: super::window::max_content_size(mtm),
             output_mm: metrics.mm(size),
             copy_scale: metrics.factor,
-            clipboard: HostClipboard {
+            clipboard: Some(HostClipboard {
                 pasteboard: Box::new(super::pasteboard::GeneralPasteboard),
                 sync: Arc::clone(&ivars.sync_clipboard),
-            },
+            }),
         };
         let spawned = thread::Builder::new()
             .name("yserver-core".into())

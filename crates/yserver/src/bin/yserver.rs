@@ -29,6 +29,8 @@ fn main() -> ExitCode {
             );
             #[cfg(target_os = "macos")]
             eprintln!("       macOS: [--rootless | --rooted] [--geometry WxH] [--scale auto|1|2]");
+            #[cfg(windows)]
+            eprintln!("       Windows: [--rootless] [--geometry WxH]");
             return ExitCode::FAILURE;
         }
     };

@@ -157,7 +157,7 @@ impl<P: Platform> Backend for XBackend<P> {
         P::on_scanout_render_completion(self, state)
     }
 
-    fn on_page_flip_ready(&mut self, state: &mut ServerState, drm_fd: std::os::fd::RawFd) {
+    fn on_page_flip_ready(&mut self, state: &mut ServerState, drm_fd: yserver_core::fd::RawFd) {
         P::on_page_flip_ready(self, state, drm_fd)
     }
 
@@ -302,7 +302,7 @@ impl<P: Platform> Backend for XBackend<P> {
         Self::backend_present_release_present_source(self, pin_id)
     }
 
-    fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)> {
+    fn poll_fds(&self) -> Vec<(yserver_core::fd::RawFd, BackendFdKind)> {
         P::poll_fds(self)
     }
 
@@ -1647,7 +1647,7 @@ impl<P: Platform> Backend for XBackend<P> {
         Ok((0, 11))
     }
 
-    fn dri3_open(&mut self, drawable: u32) -> io::Result<std::os::fd::OwnedFd> {
+    fn dri3_open(&mut self, drawable: u32) -> io::Result<yserver_core::fd::OwnedFd> {
         P::dri3_open(self, drawable)
     }
 
@@ -1661,7 +1661,7 @@ impl<P: Platform> Backend for XBackend<P> {
 
     fn dri3_import_pixmap(
         &mut self,
-        fd: std::os::fd::OwnedFd,
+        fd: yserver_core::fd::OwnedFd,
         width: u16,
         height: u16,
         stride: u32,
@@ -1682,7 +1682,7 @@ impl<P: Platform> Backend for XBackend<P> {
     fn dri3_export_pixmap(
         &mut self,
         host_xid: u32,
-    ) -> io::Result<(u32, u16, u16, u16, u8, u8, std::os::fd::OwnedFd)> {
+    ) -> io::Result<(u32, u16, u16, u16, u8, u8, yserver_core::fd::OwnedFd)> {
         P::dri3_export_pixmap(self, host_xid)
     }
 
@@ -1712,7 +1712,11 @@ impl<P: Platform> Backend for XBackend<P> {
         P::release_dri3_export(self, token);
     }
 
-    fn dri3_fence_from_fd(&mut self, fence_xid: u32, fd: std::os::fd::OwnedFd) -> io::Result<()> {
+    fn dri3_fence_from_fd(
+        &mut self,
+        fence_xid: u32,
+        fd: yserver_core::fd::OwnedFd,
+    ) -> io::Result<()> {
         P::dri3_fence_from_fd(self, fence_xid, fd)
     }
 
@@ -1754,7 +1758,7 @@ impl<P: Platform> Backend for XBackend<P> {
         P::dri3_syncobj_owned(self, client_id, syncobj_xid)
     }
 
-    fn dri3_fd_from_fence(&mut self, fence_xid: u32) -> io::Result<std::os::fd::OwnedFd> {
+    fn dri3_fd_from_fence(&mut self, fence_xid: u32) -> io::Result<yserver_core::fd::OwnedFd> {
         P::dri3_fd_from_fence(self, fence_xid)
     }
 
@@ -1762,7 +1766,7 @@ impl<P: Platform> Backend for XBackend<P> {
         &mut self,
         client_id: yserver_protocol::x11::ClientId,
         syncobj_xid: u32,
-        fd: std::os::fd::OwnedFd,
+        fd: yserver_core::fd::OwnedFd,
     ) -> io::Result<()> {
         P::dri3_import_syncobj(self, client_id, syncobj_xid, fd)
     }

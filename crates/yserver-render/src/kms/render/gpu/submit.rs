@@ -12,11 +12,8 @@ use crate::kms::{
     },
 };
 use ash::vk;
-use std::{
-    io,
-    os::fd::{AsFd as _, AsRawFd as _},
-    sync::Arc,
-};
+use std::{io, sync::Arc};
+use yserver_protocol::fd::{AsFd as _, AsRawFd as _};
 
 impl GpuCore {
     /// VkContext accessor for the engine. Returns `None` on the
@@ -212,9 +209,9 @@ impl GpuCore {
     pub(crate) fn flush_submit_group_with_exports(
         &mut self,
         reason: FlushReason,
-        exported_writes: &[(std::os::fd::BorrowedFd<'_>, bool)],
+        exported_writes: &[(yserver_protocol::fd::BorrowedFd<'_>, bool)],
         scanout_signal: bool,
-    ) -> Result<(FlushOutcome, Option<std::os::fd::OwnedFd>), vk::Result> {
+    ) -> Result<(FlushOutcome, Option<yserver_protocol::fd::OwnedFd>), vk::Result> {
         // Empty-group fast path: do NOT consume the ticket.  An open
         // cow/render_batch may still be mid-recording (ticket Some,
         // entries empty).  Dropping the ticket here would force the
@@ -397,7 +394,9 @@ impl GpuCore {
     }
 
     /// The completion sync_file of a submitted signal semaphore.
-    fn export_signal_sync_file(signal: &PresentCompletionSignal) -> Option<std::os::fd::OwnedFd> {
+    fn export_signal_sync_file(
+        signal: &PresentCompletionSignal,
+    ) -> Option<yserver_protocol::fd::OwnedFd> {
         match signal.export_sync_file_fd() {
             Ok(fd) => fd,
             Err(e) => {
@@ -413,8 +412,8 @@ impl GpuCore {
     /// on yserver's write before sampling. `Unsupported` (old
     /// kernel/driver) is silently tolerated; other errors warn.
     fn publish_export_write_fences(
-        sync_fd: &std::os::fd::OwnedFd,
-        exported_writes: &[(std::os::fd::BorrowedFd<'_>, bool)],
+        sync_fd: &yserver_protocol::fd::OwnedFd,
+        exported_writes: &[(yserver_protocol::fd::BorrowedFd<'_>, bool)],
     ) {
         for &(fd, _) in exported_writes {
             match crate::kms::vk::dri3::import_dmabuf_write_fence(fd, sync_fd.as_fd()) {

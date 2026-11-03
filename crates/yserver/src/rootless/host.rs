@@ -1,9 +1,12 @@
 //! What a native host implements and receives (spec §4.5).
 
-use std::{io, os::fd::OwnedFd};
+use std::io;
 
 use ash::vk;
-use yserver_core::rootless::{Rect, RootlessEvent, ToplevelId};
+use yserver_core::{
+    fd::OwnedFd,
+    rootless::{Rect, RootlessEvent, ToplevelId},
+};
 
 use crate::kms::vk::device::VkContext;
 
