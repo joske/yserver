@@ -4612,3 +4612,86 @@ fn run_core_keeps_policies_installed_before_it() {
     assert_eq!(state.host_access.policies.len(), 1);
     assert!(Arc::ptr_eq(&state.host_access.policies[0], &policy));
 }
+
+// Mutation: assigning HostAccess to an InternalClient makes the stored-state
+// assertion fail after the production Message::InternalClient dispatch.
+#[test]
+fn internal_client_admits_as_internal() {
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+    };
+
+    let (server_stream, mut peer) = UnixStream::pair().expect("internal socket pair");
+    peer.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("peer read timeout");
+    let (poll, sender, receiver) = crate::core_loop::channel().expect("core channel");
+    let sender_for_core = sender.clone_handle();
+    let handle = std::thread::spawn(move || {
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        let result = run_core(
+            poll,
+            receiver,
+            sender_for_core,
+            &mut state,
+            &mut backend,
+            [],
+            &ClientIdAllocator::new(),
+            AuthState::new_with_xdmcp(None, true),
+            ResetPolicy::NoReset,
+            None,
+        );
+        (result, state)
+    });
+
+    let interaction = (|| -> io::Result<(u8, u8)> {
+        sender.send(Message::InternalClient(server_stream))?;
+
+        // The internal path bypasses authorization even with a protocol name
+        // the configured auth state would reject.
+        let auth_name = b"invalid-protocol";
+        let auth_data = [0x51u8; 16];
+        let mut setup = [0u8; 12];
+        setup[0] = b'l';
+        setup[2] = 11;
+        setup[6..8].copy_from_slice(&(auth_name.len() as u16).to_le_bytes());
+        setup[8..10].copy_from_slice(&(auth_data.len() as u16).to_le_bytes());
+        peer.write_all(&setup)?;
+        peer.write_all(auth_name)?;
+        let padding = (4 - auth_name.len() % 4) % 4;
+        peer.write_all(&[0; 3][..padding])?;
+        peer.write_all(&auth_data)?;
+
+        let mut setup_reply = [0u8; 8];
+        peer.read_exact(&mut setup_reply)?;
+        if setup_reply[0] != 1 {
+            return Ok((setup_reply[0], 0));
+        }
+        let body_len = usize::from(u16::from_le_bytes([setup_reply[6], setup_reply[7]])) * 4;
+        let mut setup_body = vec![0; body_len];
+        peer.read_exact(&mut setup_body)?;
+
+        // A request round trip proves the core processed ClientSetupComplete
+        // and installed the client before the assertion reads ServerState.
+        peer.write_all(&[43, 0, 1, 0])?;
+        let mut focus_reply = [0u8; 32];
+        peer.read_exact(&mut focus_reply)?;
+        Ok((setup_reply[0], focus_reply[0]))
+    })();
+
+    let shutdown = sender.send(Message::Shutdown);
+    let (core_result, state) = handle.join().expect("core thread");
+    shutdown.expect("send shutdown");
+    core_result.expect("run core");
+    let (setup_status, focus_status) = interaction.expect("internal handshake and round trip");
+    assert_eq!(setup_status, 1, "internal setup must bypass auth");
+    assert_eq!(
+        focus_status, 1,
+        "core must process the internal client's request"
+    );
+    assert_eq!(state.clients.len(), 1);
+    let client = state.clients.values().next().expect("installed client");
+    assert!(client.internal);
+    assert_eq!(client.admission, crate::access::Admission::Internal);
+}

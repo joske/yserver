@@ -1064,7 +1064,7 @@ mod tests {
     }
 
     // Mutation: derive CredentialId from cookie bytes; reloading C1 after a
-    // reset makes `assert_ne!(c1_reloaded_id, c1_id)` fail.
+    // reset makes `assert_ne!(c1_after_reset_id, c1_id)` fail.
     #[test]
     fn credential_ids_are_kept_while_loaded_and_never_reused() {
         fn file_id(auth: &AuthState, generation: Generation, cookie: &[u8]) -> CredentialId {
@@ -1104,37 +1104,25 @@ mod tests {
         let c1_id = file_id(&auth, generation, &c1);
         assert!(seen.insert(c1_id), "first credential id must be new");
 
-        // A real mtime-triggered reload that retains C1 must keep its id.
+        // The file reload is additive. Removing C1 from the file does not
+        // remove the already-loaded credential or change its id.
+        fs::write(&path, b"").unwrap();
+        touch_later(&path);
+        // Mutation: reallocating IDs for retained credentials on every reload
+        // makes this keep-after-removal assertion fail.
+        assert_eq!(file_id(&auth, generation, &c1), c1_id);
+
+        // Putting C1 back and reloading still refers to the same loaded
+        // lifetime. The file contents do not remove/recreate loaded cookies.
+        fs::write(&path, xauth_bytes(b"1", &c1)).unwrap();
         touch_later(&path);
         assert_eq!(file_id(&auth, generation, &c1), c1_id);
 
-        // Reset clears the loaded cookie list; the changed file is empty, so
-        // this generation no longer has C1. Empty-file local access is closed
-        // only after exercising the real reset/reload path.
-        rewrite_keeping_mtime(&path, b"");
-        generation = counter.bump();
-        assert_eq!(
-            auth.admit(&UNIX, generation, MIT, &c1).unwrap(),
-            Admission::HostAccess
-        );
-        set_local_open(&auth, false);
-        assert_eq!(
-            auth.admit(&UNIX, generation, MIT, &c1),
-            Err(REASON_BAD_COOKIE)
-        );
-
-        // Reintroducing C1 after reset creates a new credential lifetime.
-        rewrite_keeping_mtime(&path, &xauth_bytes(b"1", &c1));
-        generation = counter.bump();
-        let c1_reloaded_id = file_id(&auth, generation, &c1);
-        assert_ne!(c1_reloaded_id, c1_id);
-        assert!(seen.insert(c1_reloaded_id), "reloaded C1 id must be new");
-
-        // A reset drops even a still-present cookie, and the forced reload
-        // allocates a fresh id for that same byte sequence.
+        // A reset drops the loaded cookie list, then the forced reload
+        // allocates a fresh id for the same bytes.
         generation = counter.bump();
         let c1_after_reset_id = file_id(&auth, generation, &c1);
-        assert_ne!(c1_after_reset_id, c1_reloaded_id);
+        assert_ne!(c1_after_reset_id, c1_id);
         assert!(
             seen.insert(c1_after_reset_id),
             "post-reset C1 id must be new"

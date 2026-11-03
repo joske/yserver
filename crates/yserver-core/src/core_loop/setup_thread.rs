@@ -597,27 +597,6 @@ mod tests {
         assert_eq!(admission, Admission::HostAccess);
     }
 
-    // Mutation: treating an InternalClient as a normal open-host admission makes this fail.
-    #[test]
-    fn internal_client_admits_as_internal() {
-        let auth = AuthState::new_with_xdmcp(None, true);
-        let (server_stream, client_stream) = crate::peer::connected_unix_pair();
-        let internal_message = Message::InternalClient(server_stream);
-        let Message::InternalClient(server_stream) = internal_message else {
-            unreachable!();
-        };
-        let admission = setup_admission_on_stream(
-            auth,
-            ClientId(706),
-            server_stream,
-            client_stream,
-            b"invalid-protocol",
-            &[0x51; 16],
-            true,
-        );
-        assert_eq!(admission, Admission::Internal);
-    }
-
     /// Drain `n` bytes from `s` with a deadline; returns the bytes.
     fn read_n_with_timeout(s: &mut UnixStream, n: usize, timeout: Duration) -> io::Result<Vec<u8>> {
         // macOS fails SO_RCVTIMEO with EINVAL once the peer has closed; the
