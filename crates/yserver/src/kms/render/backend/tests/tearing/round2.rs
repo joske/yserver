@@ -184,6 +184,31 @@ fn run_task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_loa
             }
             self.drain_events(device).map(Some)
         }
+
+        fn events_ready(&self, device: &crate::drm::Device) -> io::Result<bool> {
+            let mut poll_fd = libc::pollfd {
+                fd: device.as_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `poll_fd` is initialized for this zero-time readiness check.
+            let ready = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    return Ok(true);
+                }
+                return Err(error);
+            }
+            let error_events = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+            if poll_fd.revents & error_events != 0 {
+                return Err(io::Error::other(format!(
+                    "test DRM fd {} reported poll error flags 0x{:x}",
+                    poll_fd.fd, poll_fd.revents
+                )));
+            }
+            Ok(ready > 0 && poll_fd.revents & libc::POLLIN != 0)
+        }
     }
 
     struct RunCoreCommitExecutor(Arc<SharedCommitRecorder>);

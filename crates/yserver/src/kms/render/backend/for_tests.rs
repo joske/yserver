@@ -46,6 +46,22 @@ impl KmsBackend {
         &mut self,
         clock: Rc<dyn Fn() -> std::time::Instant>,
     ) {
+        let origin_instant = clock();
+        let origin_ust = crate::drm::atomic::monotonic_timestamp();
+        self.pstate.monotonic_clock = Rc::new(move || {
+            let instant = clock();
+            let ust = origin_ust.map(|origin| {
+                origin.saturating_add(instant.saturating_duration_since(origin_instant))
+            });
+            (instant, ust)
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_set_monotonic_clock_sample(
+        &mut self,
+        clock: Rc<dyn Fn() -> crate::kms::render::backend::kms::state::MonotonicClockSample>,
+    ) {
         self.pstate.monotonic_clock = clock;
     }
 
@@ -674,9 +690,9 @@ impl KmsBackend {
             vt_resume_executor: std::rc::Rc::new(
                 crate::kms::render::backend::kms::session::DrmVtResumeExecutor,
             ),
-            monotonic_clock: Rc::new(std::time::Instant::now),
-            armed_vblank_targets: std::collections::HashMap::new(),
-            absolute_vblank_targets: std::collections::HashMap::new(),
+            monotonic_clock: Rc::new(
+                crate::kms::render::backend::kms::state::system_monotonic_clock_sample,
+            ),
             crtc_queue_sequence_unsupported_devices: HashSet::new(),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),

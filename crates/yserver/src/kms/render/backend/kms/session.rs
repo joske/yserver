@@ -230,9 +230,9 @@ impl KmsBackend {
                 crate::kms::render::backend::DeferredServerScanoutExports::default(),
             dri3_drawable_exporter: KmsBackend::dri3_export_drawable,
             vt_resume_executor: std::rc::Rc::new(DrmVtResumeExecutor),
-            monotonic_clock: std::rc::Rc::new(std::time::Instant::now),
-            armed_vblank_targets: std::collections::HashMap::new(),
-            absolute_vblank_targets: std::collections::HashMap::new(),
+            monotonic_clock: std::rc::Rc::new(
+                crate::kms::render::backend::kms::state::system_monotonic_clock_sample,
+            ),
             crtc_queue_sequence_unsupported_devices: HashSet::new(),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),

@@ -62,7 +62,37 @@ use std::{
     collections::{HashMap, VecDeque},
     io,
     rc::Rc,
+    time::Instant,
 };
+
+const IDLE_VBLANK_ARM_SLOT: crate::kms::render::platform::vblank_fallback::VblankArmSlot =
+    crate::kms::render::platform::vblank_fallback::VblankArmSlot::Idle;
+const SHARED_WAKE_VBLANK_ARM_SLOT: crate::kms::render::platform::vblank_fallback::VblankArmSlot =
+    crate::kms::render::platform::vblank_fallback::VblankArmSlot::SharedWake;
+
+fn seed_vblank_arm_watch(
+    backend: &mut KmsBackend,
+    crtc: CrtcKey,
+    slot: crate::kms::render::platform::vblank_fallback::VblankArmSlot,
+) {
+    backend
+        .platform
+        .vblank_fallback
+        .kernel_arm_watch
+        .insert((crtc, slot), Instant::now());
+}
+
+fn vblank_arm_is_watched(
+    backend: &KmsBackend,
+    crtc: CrtcKey,
+    slot: crate::kms::render::platform::vblank_fallback::VblankArmSlot,
+) -> bool {
+    backend
+        .platform
+        .vblank_fallback
+        .kernel_arm_watch
+        .contains_key(&(crtc, slot))
+}
 
 pub(crate) fn vulkan_absence_is_expected(error: &io::Error) -> bool {
     use crate::kms::vk::device::VkInitError;

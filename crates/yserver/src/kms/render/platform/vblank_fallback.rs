@@ -21,6 +21,20 @@ pub(crate) struct SoftwareVblank {
     pub(crate) armed_msc: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum VblankArmSlot {
+    Idle,
+    SharedWake,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrozenClock {
+    pub(crate) anchor_msc: u64,
+    pub(crate) anchor_ust: u64,
+    pub(crate) anchor_at: Instant,
+    pub(crate) interval: Duration,
+}
+
 #[derive(Default)]
 pub(crate) struct VblankFallback {
     /// Devices whose legacy `DRM_IOCTL_WAIT_VBLANK` is unavailable; latched
@@ -30,12 +44,19 @@ pub(crate) struct VblankFallback {
     pub(crate) pipes: HashMap<CrtcKey, u32>,
     /// Armed software vblanks for devices with no kernel vblank source.
     pub(crate) software: HashMap<CrtcKey, SoftwareVblank>,
+    /// Time each unfired kernel arm slot was successfully issued.
+    pub(crate) kernel_arm_watch: HashMap<(CrtcKey, VblankArmSlot), Instant>,
+    /// CRTC clocks whose accepted kernel vblank arm did not fire in time.
+    pub(crate) frozen: HashMap<CrtcKey, FrozenClock>,
 }
 
 impl VblankFallback {
     pub(super) fn retain_live(&mut self, live: &HashSet<CrtcKey>) {
         self.pipes.retain(|key, _| live.contains(key));
         self.software.retain(|key, _| live.contains(key));
+        self.kernel_arm_watch
+            .retain(|(key, _), _| live.contains(key));
+        self.frozen.retain(|key, _| live.contains(key));
     }
 }
 
@@ -147,10 +168,22 @@ impl PlatformBackend {
             return false;
         };
         let armed_msc = self.present_get_ust_msc(crtc_key).0;
+        let deadline =
+            self.vblank_fallback
+                .frozen
+                .get(&crtc_key)
+                .map_or(now + interval, |frozen| {
+                    let elapsed = now.saturating_duration_since(frozen.anchor_at);
+                    let interval_ns = frozen.interval.as_nanos().max(1);
+                    let frames = elapsed.as_nanos() / interval_ns;
+                    let next_ns = (frames + 1).saturating_mul(interval_ns);
+                    frozen.anchor_at
+                        + Duration::from_nanos(u64::try_from(next_ns).unwrap_or(u64::MAX))
+                });
         self.vblank_fallback.software.insert(
             crtc_key,
             SoftwareVblank {
-                deadline: now + interval,
+                deadline,
                 armed_msc,
             },
         );
@@ -162,6 +195,31 @@ impl PlatformBackend {
             .software
             .values()
             .map(|vblank| vblank.deadline)
+            .min()
+    }
+
+    pub(crate) fn frozen_clock_now(&self, crtc_key: CrtcKey, now: Instant) -> Option<(u64, u64)> {
+        let frozen = self.vblank_fallback.frozen.get(&crtc_key)?;
+        let elapsed = now.saturating_duration_since(frozen.anchor_at);
+        let interval_ns = frozen.interval.as_nanos().max(1);
+        let frames = elapsed.as_nanos() / interval_ns;
+        let frames_u64 = u64::try_from(frames).unwrap_or(u64::MAX);
+        let elapsed_us =
+            u64::try_from(frames.saturating_mul(interval_ns) / 1_000).unwrap_or(u64::MAX);
+        Some((
+            frozen.anchor_msc.saturating_add(frames_u64),
+            frozen.anchor_ust.saturating_add(elapsed_us),
+        ))
+    }
+
+    pub(crate) fn next_frozen_watch_deadline(&self) -> Option<Instant> {
+        self.vblank_fallback
+            .kernel_arm_watch
+            .iter()
+            .filter(|((key, _), _)| !self.vblank_fallback.frozen.contains_key(key))
+            .map(|(_, armed_at)| {
+                *armed_at + crate::kms::render::backend::KmsBackend::FROZEN_VBLANK_WINDOW
+            })
             .min()
     }
 

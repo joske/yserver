@@ -1340,7 +1340,7 @@ fn retire_registered_cursor_in_dead_zone(
     );
 }
 
-fn materialize_test_cow_stage(
+pub(super) fn materialize_test_cow_stage(
     backend: &mut KmsBackend,
     state: &mut yserver_core::server::ServerState,
     client_id: yserver_protocol::x11::ClientId,
@@ -3173,7 +3173,7 @@ fn live_scene_backend() -> Option<KmsBackend> {
     live_scene_backend_with_outputs(1)
 }
 
-fn live_scene_backend_with_outputs(output_count: usize) -> Option<KmsBackend> {
+pub(super) fn live_scene_backend_with_outputs(output_count: usize) -> Option<KmsBackend> {
     scene_backend_with_recording_pools(output_count)
         .unwrap_or_else(|error| panic!("recording scene fixture unavailable: {error}"))
 }

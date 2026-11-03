@@ -257,6 +257,7 @@ fn accepted_framebuffer(
 fn single_buffer_rotation_promotes_on_its_second_present() {
     let (mut b, _) = backend();
     let a = root_pixmap(&mut b, 0x0061_0001);
+    b.pstate.scanout_m0.interval_start = Instant::now();
 
     observe(&mut b, 0x0061_0001, STAGE);
     assert_eq!(b.pstate.scanout_m0.server.candidates, 1);
@@ -1064,7 +1065,7 @@ fn the_export_deadline_tears_direct_scanout_down_first() {
     let token = pending_token(begin_export(&mut b, a_xid));
     let deadline = b.pstate.server_scanout_exports.parked[&token].deadline;
     assert_eq!(
-        deadline - (b.pstate.monotonic_clock)(),
+        deadline - (b.pstate.monotonic_clock)().0,
         crate::kms::render::backend::SERVER_SCANOUT_EXPORT_WAIT
     );
     assert!(Backend::next_wakeup(&b).is_some_and(|wake| wake <= deadline));
@@ -1126,7 +1127,7 @@ fn a_failed_deadline_teardown_fails_the_export_and_keeps_the_frame() {
         Some(fake_framebuffer_handle(a))
     );
     assert!(
-        Backend::next_wakeup(&b).is_none_or(|wake| wake > (b.pstate.monotonic_clock)()),
+        Backend::next_wakeup(&b).is_none_or(|wake| wake > (b.pstate.monotonic_clock)().0),
         "a failed export does not keep the loop spinning"
     );
 }

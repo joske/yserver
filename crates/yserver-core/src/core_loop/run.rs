@@ -3180,7 +3180,7 @@ pub(crate) fn run_iteration_tail(state: &mut ServerState, backend: &mut dyn Back
 /// starve with no fd left to wake `poll`. Running here, once per iteration,
 /// also covers parks made by the epfd-driven drain (`run.rs:1027`, itself
 /// pre-compose) in the same iteration — the backend dedups against its
-/// per-CRTC armed-target map so a second call per iteration is safe.
+/// per-CRTC slots so a second call per iteration is safe.
 pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dyn Backend) {
     // Idle vblank arming: if NotifyMSC requests remain parked, ask the
     // backend to schedule a kernel vblank so the clock keeps advancing even
@@ -3222,6 +3222,18 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
         let mut by_domain: std::collections::BTreeMap<(u32, u64), Vec<u64>> =
             std::collections::BTreeMap::new();
         for pending in &state.present_pending_complete {
+            let due_clock = crate::core_loop::process_request::present_completion_due_clock(
+                state,
+                &pending.event,
+            );
+            if due_clock.msc != 0
+                && !crate::present_scheduler::msc_is_after(
+                    pending.effective_target_msc,
+                    due_clock.msc,
+                )
+            {
+                continue;
+            }
             by_domain
                 .entry((pending.event.crtc_id, pending.event.crtc_epoch))
                 .or_default()
@@ -3232,17 +3244,19 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
                 continue;
             }
             // A page flip in flight is not sufficient as the only wake
-            // source: arm the selected CRTC independently.
+            // source: keep one tagged next-vblank wake for future targets.
             let result = if backend.present_absolute_vblank_arm_supported(crtc_id) {
-                backend.arm_present_absolute_vblank(crtc_id, &targets)
+                backend.arm_present_shared_wake(crtc_id)
             } else {
-                backend.arm_present_completion_idle_vblanks(crtc_id, &targets)
+                backend
+                    .arm_present_completion_idle_vblanks(crtc_id, &targets)
+                    .map(|armed| armed > 0)
             };
             match result {
                 Ok(armed) => {
-                    if armed > 0 {
+                    if armed {
                         log::debug!(
-                            "PRESENT-DBG: arm_present_completion_vblanks crtc=0x{crtc_id:x} pending={} -> armed={armed}",
+                            "PRESENT-DBG: arm_present_completion_vblanks crtc=0x{crtc_id:x} pending={} -> armed",
                             targets.len()
                         );
                     }
@@ -3255,28 +3269,19 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
         }
     }
 
-    // Third arming call site (spec §msc-due, future-target fallback rung
-    // 1): parked msc-due entries whose target is more than one vblank out
-    // get an absolute per-target sequence arm here, alongside the other
-    // two idle arms above — placement matches the spec's own wording
-    // ("a third arming call site in run.rs, alongside present_pending_msc
-    // ... and present_pending_complete ...", spec §msc-due future-target
-    // bullet), not folded into the pre-compose due-pass
+    // Parked, source-ready presents also use the shared tagged wake. This
+    // call stays alongside the other arms, after compose, rather than in the
+    // pre-compose due pass. A next-MSC entry behind an in-flight flip needs
+    // the tagged wake too: flips may not advance a frozen CRTC clock.
     // (`drain_due_present_pending_exec`): this call arms a kernel event,
     // it doesn't decide an execution, and every other arming call site in
     // this codebase already lives in this post-compose function. Must
     // NOT route through `arm_present_completion_idle_vblanks` — its
     // idle-only gate would suppress the arm during any activity.
     {
-        // `(present_id, eff - 1)` for every still-parked, source-ready,
-        // genuinely future-target entry. The `-1` is CORE-SIDE: `eff` is
-        // the vblank at which the compose carrying this copy must already
-        // have been submitted, so the copy itself is due one vblank
-        // earlier, at `eff - 1`. `arm_present_absolute_vblank` arms
-        // exactly the values it receives (Task 3) — it does not itself
-        // subtract. `wrapping_sub`: `eff` is a wrapped MSC value (u64
-        // wraparound is a documented, tested case throughout this
-        // module), so a plain `eff - 1` would debug-panic when `eff == 0`.
+        // Group every still-future target by clock domain. `msc == 0`
+        // means no usable clock, so it counts as ahead, matching the
+        // completion sweep's due rule.
         let mut by_domain: std::collections::BTreeMap<(u32, u64), Vec<(u64, u64)>> =
             std::collections::BTreeMap::new();
         for (&pid, entry) in &state.present_pending_exec {
@@ -3285,77 +3290,75 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
             }
             let crtc_id = entry.pending.crtc_id;
             let crtc_epoch = entry.pending.crtc_epoch;
-            if backend.present_crtc_clock_epoch(crtc_id) != crtc_epoch
-                || !backend.present_absolute_vblank_arm_supported(crtc_id)
-            {
+            if backend.present_crtc_clock_epoch(crtc_id) != crtc_epoch {
                 continue;
             }
-            let clock_msc = crate::core_loop::process_request::cached_present_crtc_clock(
-                state, crtc_id, crtc_epoch,
-            )
-            .msc;
+            let due_clock =
+                crate::core_loop::process_request::present_completion_due_clock_for_domain(
+                    state, crtc_id, crtc_epoch, None,
+                );
             if let Some(eff) = entry.pending.effective_target_msc
-                && crate::present_scheduler::msc_is_after(eff, clock_msc.wrapping_add(1))
+                && (due_clock.msc == 0
+                    || crate::present_scheduler::msc_is_after(eff, due_clock.msc))
             {
                 by_domain
                     .entry((crtc_id, crtc_epoch))
                     .or_default()
-                    .push((pid, eff.wrapping_sub(1)));
+                    .push((pid, eff));
             }
         }
-        for ((crtc_id, _crtc_epoch), future_parked) in by_domain {
-            let targets: Vec<u64> = future_parked.iter().map(|&(_, t)| t).collect();
-            // Full coverage required, not just `> 0`: the trait contract
-            // (`arm_present_absolute_vblank`'s doc comment) allows a
-            // partial `Ok(n)` — some targets newly armed or already
-            // covered, others not (e.g. a CRTC set change mid-call).
-            // Treating any partial result as success would leave the
-            // uncovered subset parked with no wake source at all.
-            // Unreachable against today's KMS impl (Task 3): it arms
-            // every target on every connected CRTC or trips the
-            // EOPNOTSUPP latch and returns `Err`, so it's all-or-`Err`
-            // in practice — this guard is a contract-level guarantee,
-            // not a dead branch removal candidate.
-            match backend.arm_present_absolute_vblank(crtc_id, &targets) {
-                Ok(covered) if covered == targets.len() => {
+        for ((crtc_id, crtc_epoch), future_parked) in by_domain {
+            if !backend.present_absolute_vblank_arm_supported(crtc_id) {
+                // Unsupported clocks keep the due-pass's flip pacing; its
+                // separate idle-display rung handles an actually idle CRTC.
+                continue;
+            }
+            let result = backend.arm_present_shared_wake(crtc_id);
+            let covered = match result {
+                Ok(true) => {
                     log::debug!(
-                        "PRESENT-DBG: arm_present_absolute_vblank crtc=0x{crtc_id:x} pending={} -> armed={covered}",
-                        targets.len()
+                        "PRESENT-DBG: arm_present_shared_wake crtc=0x{crtc_id:x} pending={} -> armed",
+                        future_parked.len()
                     );
+                    true
                 }
-                other => {
-                    // `Ok(0)` (nothing covered — including the iteration
-                    // where an EOPNOTSUPP latch first trips), a partial
-                    // `Ok(n < targets.len())`, or `Err`: the caller must
-                    // not park the uncovered entries on this mechanism.
-                    // Execute ALL of them immediately in this same pass
-                    // (trigger=idle_fallback) rather than leave any
-                    // subset parked with no wake source. This runs
-                    // post-compose (this function, per the call-site
-                    // placement above), so a latch-trip execution here
-                    // misses THIS iteration's compose and lands in the
-                    // next one instead — `mark_dirty` still guarantees
-                    // the wake for it; accepted as a rare, one-iteration-
-                    // latency path.
-                    match other {
-                        Ok(covered) => log::debug!(
-                            "PRESENT-DBG: arm_present_absolute_vblank crtc=0x{crtc_id:x} pending={} -> covered={covered}, \
-                             executing immediately",
-                            targets.len()
-                        ),
-                        Err(e) => log::warn!(
-                            "PRESENT-DBG: arm_present_absolute_vblank crtc=0x{crtc_id:x} pending={} -> ERR {e}",
-                            targets.len()
-                        ),
-                    }
-                    let ids: Vec<u64> = future_parked.iter().map(|&(pid, _)| pid).collect();
-                    crate::core_loop::process_request::execute_parked_present_ids(
-                        state,
-                        backend,
-                        &ids,
-                        "idle_fallback",
+                Ok(false) => {
+                    log::debug!(
+                        "PRESENT-DBG: arm_present_shared_wake crtc=0x{crtc_id:x} pending={} -> unavailable",
+                        future_parked.len()
                     );
+                    false
                 }
+                Err(error) => {
+                    log::warn!(
+                        "PRESENT-DBG: arm_present_shared_wake crtc=0x{crtc_id:x} pending={} -> ERR {error}",
+                        future_parked.len()
+                    );
+                    false
+                }
+            };
+            if !covered {
+                // Preserve the old fallback's general-clock eligibility.
+                // The completion clock above decides whether a wake is
+                // needed; it must not make an in-flight-flip next-MSC entry
+                // look distant (or hide a distant entry) when arming fails.
+                let general_msc = crate::core_loop::process_request::cached_present_crtc_clock(
+                    state, crtc_id, crtc_epoch,
+                )
+                .msc;
+                let ids: Vec<u64> = future_parked
+                    .iter()
+                    .filter_map(|&(pid, target)| {
+                        crate::present_scheduler::msc_is_after(target, general_msc.wrapping_add(1))
+                            .then_some(pid)
+                    })
+                    .collect();
+                crate::core_loop::process_request::execute_parked_present_ids(
+                    state,
+                    backend,
+                    &ids,
+                    "idle_fallback",
+                );
             }
         }
     }
@@ -3370,7 +3373,7 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
     // msc-due-pass (spec §msc-due; Task 7): re-classify every msc-parked
     // source-ready entry against the fresh general clock and execute
     // whatever is now due, plus the idle-display and blackout fallback
-    // rungs (the absolute-vblank-arm rung is a call-site match for the
+    // rungs (the shared-wake arm is a call-site match for the
     // other two arms below and lives in `arm_present_idle_vblanks`,
     // post-compose). Runs here, at the top of this pre-compose drain
     // (Task 4), so an entry executed here is visible to THIS iteration's

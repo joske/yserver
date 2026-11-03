@@ -483,6 +483,7 @@ impl Platform for PlatformBackend {
         KmsBackend::backend_scanout_next_wakeup(b)
             .into_iter()
             .chain(b.platform.next_software_vblank_deadline())
+            .chain(b.platform.next_frozen_watch_deadline())
             .min()
     }
 
@@ -573,12 +574,8 @@ impl Platform for PlatformBackend {
         KmsBackend::backend_present_present_absolute_vblank_arm_supported(b, crtc_id)
     }
 
-    fn arm_present_absolute_vblank(
-        b: &mut KmsBackend,
-        randr_crtc_id: u32,
-        targets: &[u64],
-    ) -> io::Result<usize> {
-        KmsBackend::backend_present_arm_present_absolute_vblank(b, randr_crtc_id, targets)
+    fn arm_present_shared_wake(b: &mut KmsBackend, randr_crtc_id: u32) -> io::Result<bool> {
+        KmsBackend::backend_present_arm_present_shared_wake(b, randr_crtc_id)
     }
 
     fn present_scanout_blackout(b: &KmsBackend) -> bool {
@@ -694,6 +691,7 @@ impl Platform for PlatformBackend {
 
     fn poll_deferred_input(b: &mut KmsBackend, state: &mut ServerState) {
         b.service_software_vblanks();
+        b.mark_frozen_crtcs();
         KmsBackend::backend_session_poll_deferred_input(b, state)
     }
 
