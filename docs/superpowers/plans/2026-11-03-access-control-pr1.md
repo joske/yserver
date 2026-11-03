@@ -50,10 +50,10 @@ is empty. `AuthState` gains `admit`, which returns how a client was admitted; th
 - Policies are `Arc<dyn AccessPolicy>` with `AccessPolicy: Send + Sync`, so `ServerState` keeps its auto traits. A
   policy that keeps state uses its own interior mutability; methods take `&self`, which lets a check lend `&ServerState`
   to the context while the list is borrowed from the same state.
-- The server hook runs after the existing rule at the #321 sites (spec, "Server"): `may_manage_access` still answers
-  `BadAccess` for a non-local client before any policy is asked. XLibre asks the hook first
-  (`os/access.c:1247`); the two orders differ only in which error a doubly denied request reports, and the spec keeps
-  yserver's existing error precedence.
+- The server hook runs before the locality rule at the #321 sites (spec, "Server"), as Xorg's `AuthorizedClient`
+  (`os/access.c:1302`, 21.1.24) and XLibre do (maintainer, #328). The invalid-mode `BadValue` stays first. With no
+  policy, `may_manage_access` answers `BadAccess` for a non-local client exactly as before; with a policy, a remote
+  attempt reaches it.
 - A reset's teardown already runs every client through `process_disconnect` and every zombie through
   `destroy_zombie_resources_reporting` (`reset.rs:215-248`), so policies hear `connection_gone` and `owner_gone` for
   each of them, then `generation_ended` at the successful return of `reset_generation`, after its last refusal
@@ -234,8 +234,8 @@ is empty. `AuthState` gains `admit`, which returns how a client was admitted; th
 
 **Interfaces:**
 - Consumes: `check_server`, `AccessMode::{READ, MANAGE}`, `RequestOpcodes`, `DenyError` (Task 1).
-- Order per request, all existing steps unchanged: `ChangeHosts` and `SetAccessControl`: mode `BadValue` → existing
-  `may_manage_access` `BadAccess` → `check_server(MANAGE)` → the rest. `ListHosts`: existing `may_read_access` →
+- Order per request, all existing steps unchanged: `ChangeHosts` and `SetAccessControl`: mode `BadValue` →
+  `check_server(MANAGE)` → existing `may_manage_access` `BadAccess` → the rest. `ListHosts`: existing `may_read_access` →
   `check_server(READ)` → reply. The `ListHosts` check runs before `state.clients.get_mut`. A `Deny(e)` emits
   `e.code` with `e.value` and the request's major opcode (109, 110, 111), minor 0.
 
@@ -247,8 +247,9 @@ is empty. `AuthState` gains `admit`, which returns how a client was admitted; th
   - `server_hook_asks_with_client_mode_and_context`: a recording policy sees client 1, `MANAGE` for 109 and 111,
     `READ` for 110, `request() == Some(RequestOpcodes { major, minor: 0 })`, and the client's peer and admission
     through the context. Mutation: pass `READ` for `ChangeHosts` → fails.
-  - `existing_rules_answer_before_the_hook`: mode 2 → `BadValue` and a non-local client → `BadAccess`, and the
-    recording policy was not asked in either case.
+  - `invalid_mode_answers_before_the_hook_and_the_hook_before_locality`: for `ChangeHosts` and `SetAccessControl`,
+    mode 2 → `BadValue` and the recording policy was not asked; a non-local client with an allowing policy →
+    `BadAccess` after the policy was asked once; a non-local client with a denying policy → the policy's error.
   - `several_policies_on_one_request`: allow-then-deny and deny-then-allow on `ListHosts` are both denied with the
     first denier's error, and a policy after a denier is not asked.
   - `revocation_applies_from_the_next_check`: a policy holding an `AtomicBool`, allow then flip, two `ListHosts` →

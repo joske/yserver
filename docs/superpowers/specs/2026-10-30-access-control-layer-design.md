@@ -323,9 +323,12 @@ are not checked.
 and access is in `QueryExtension` and `ListExtensions`.
 
 **Server.** `may_manage_access` and `may_read_access` in `process_request/misc.rs`
-(#321) ask the server hook after their existing rule, so the error stays
-`BadAccess` where they already answer it and `is_local` still applies with no
-policy. Other server sites follow XLibre's call sites.
+(#321) ask the server hook before their existing rule, as Xorg's
+`AuthorizedClient` does (`os/access.c:1302`, 21.1.24): the hook first, then
+`client->local`. Request validation that comes earlier (the invalid-mode
+`BadValue`) stays first. With no policy `is_local` still answers `BadAccess`
+exactly as before; with a policy installed, a remote attempt reaches it. Other
+server sites follow XLibre's call sites.
 
 **Client, device.** Follow XLibre's call sites, mapped to yserver's handlers in
 the plan.
@@ -340,8 +343,10 @@ life:
 3. Owner gone, when the retained client is finally closed down: `KillClient` on
    one of its resources, `KillClient(AllTemporary)`, or a reset. This is Xorg's
    `ClientStateGone` for a retained client (`dix/dispatch.c:3478-3560`); freeing
-   its resources one by one does not end it, as in Xorg. A client that retains
-   nothing hears it right after connection gone.
+   its resources one by one does not end it, as in Xorg. Every client whose
+   close-down mode is `RetainPermanent` or `RetainTemporary` becomes a zombie at
+   disconnect, whether or not it holds resources, and hears owner gone only then;
+   a client in `DestroyAll` mode hears it right after connection gone.
 
 A reset keeps the same policy objects and tells them the generation ended, so
 they drop what they hold per client.
