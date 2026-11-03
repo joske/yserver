@@ -5,5 +5,6 @@
 pub(crate) mod devices;
 pub(crate) mod keymap;
 pub(crate) mod pointer;
+#[cfg(any(windows, test))]
 pub(crate) mod scancode;
 pub(crate) mod translate;

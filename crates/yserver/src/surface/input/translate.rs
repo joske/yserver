@@ -118,6 +118,7 @@ impl Translator {
     /// Translate a key that comes as an evdev code with its own press and
     /// release (Windows): a press of a key already down is the window
     /// system's autorepeat and dropped.
+    #[cfg(any(windows, test))]
     pub(crate) fn evdev_key(
         &mut self,
         evdev: u16,
