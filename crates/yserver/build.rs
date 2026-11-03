@@ -22,10 +22,14 @@ fn main() {
     // `eventfd(2)`, which DRM syncobj notification needs.
     emit_cfg("eventfd", matches!(os, "linux" | "freebsd"));
     // The `xkbcommon` crate links `-lxkbcommon` without a search path, and
-    // Homebrew's lib dir is not on the macOS linker's default path.
+    // neither Homebrew's lib dir (macOS) nor vcpkg's (Windows) is on the
+    // linker's default path.
     if target_os == "macos" {
         emit_pkg_config_link_search("xkbcommon");
         emit_homebrew_prefix();
+    }
+    if target_os == "windows" {
+        emit_pkg_config_link_search("xkbcommon");
     }
 
     // Stamp the build with the git commit for `--version`. Best-effort:
@@ -45,7 +49,11 @@ fn emit_cfg(name: &str, enabled: bool) {
 /// rather than `--libs-only-L`: pkgconf drops `-L` for its system dirs.
 fn emit_pkg_config_link_search(lib: &str) {
     println!("cargo::rerun-if-env-changed=PKG_CONFIG_PATH");
-    let Ok(output) = Command::new("pkg-config")
+    println!("cargo::rerun-if-env-changed=PKG_CONFIG");
+    // `PKG_CONFIG` names the binary, as for the `pkg-config` crate: vcpkg's
+    // is `pkgconf.exe`, off PATH.
+    let pkg_config = env::var_os("PKG_CONFIG").unwrap_or_else(|| "pkg-config".into());
+    let Ok(output) = Command::new(pkg_config)
         .args(["--variable=libdir", lib])
         .output()
     else {

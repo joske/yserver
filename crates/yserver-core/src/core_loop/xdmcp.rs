@@ -28,13 +28,15 @@
 //!    comes from the machine's `SessionClientEstablished` event — see
 //!    [`XdmcpService::note_client_established`].
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::{
     io::{self, ErrorKind},
     net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket},
-    os::fd::AsRawFd,
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
 use mio::{Interest, unix::SourceFd};
 use yserver_protocol::{
     x11::ClientId,
@@ -255,9 +257,21 @@ impl XdmcpService {
     }
 
     /// Register the socket with the core poller.
+    #[cfg(unix)]
     pub fn register(&self, registry: &mio::Registry) -> io::Result<()> {
         let fd = self.socket.as_raw_fd();
         registry.register(&mut SourceFd(&fd), XDMCP_TOKEN, Interest::READABLE)
+    }
+
+    /// TODO(windows): mio cannot watch a borrowed socket there; the UDP
+    /// socket has to become mio's own first.
+    #[cfg(windows)]
+    #[allow(clippy::unused_self)]
+    pub fn register(&self, _registry: &mio::Registry) -> io::Result<()> {
+        Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "XDMCP is unsupported on Windows",
+        ))
     }
 
     /// `XdmcpInit` (`xdmcp.c:600`): send the first query.

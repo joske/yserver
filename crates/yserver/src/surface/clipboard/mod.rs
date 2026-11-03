@@ -3,26 +3,32 @@
 //! CLIPBOARD and the host pasteboard in step, as text, while the sync
 //! setting is on. PRIMARY is not bridged.
 
+#[cfg(unix)]
 mod bridge;
+#[cfg(unix)]
 pub(crate) mod conn;
 #[cfg(all(test, kms))]
 mod tests;
 
 use std::{
     io,
+    sync::{Arc, atomic::AtomicBool},
+};
+#[cfg(unix)]
+use std::{
     os::unix::net::UnixStream,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Mutex, atomic::Ordering},
     thread::{self, JoinHandle},
     time::Duration,
 };
 
-use yserver_core::core_loop::{CoreSender, Message};
+use yserver_core::core_loop::CoreSender;
+#[cfg(unix)]
+use yserver_core::core_loop::Message;
 
 /// After the connection is lost (KillClient, a server reset), reconnect
 /// after this.
+#[cfg(unix)]
 const RECONNECT: Duration = Duration::from_secs(1);
 
 /// The host's clipboard, as text.
@@ -44,6 +50,7 @@ pub(crate) struct HostClipboard {
 }
 
 /// The bridge's thread; reconnects until stopped.
+#[cfg(unix)]
 pub(crate) struct ClipboardBridge {
     stop: Arc<AtomicBool>,
     /// The live connection's socket, shut down to stop.
@@ -51,6 +58,7 @@ pub(crate) struct ClipboardBridge {
     thread: Option<JoinHandle<()>>,
 }
 
+#[cfg(unix)]
 impl ClipboardBridge {
     /// Start the bridge as an internal client of the core behind `sender`.
     ///
@@ -104,6 +112,7 @@ impl ClipboardBridge {
     }
 }
 
+#[cfg(unix)]
 impl Drop for ClipboardBridge {
     fn drop(&mut self) {
         self.shut_down();
@@ -111,6 +120,7 @@ impl Drop for ClipboardBridge {
 }
 
 /// One connection: hand the core its end, set up, bridge until it ends.
+#[cfg(unix)]
 fn serve(
     sender: &CoreSender,
     pasteboard: &mut dyn Pasteboard,
@@ -129,4 +139,21 @@ fn serve(
     sender.send(Message::InternalClient(core_side))?;
     let conn = conn::Conn::setup(ours)?;
     bridge::Bridge::new(conn, pasteboard, sync)?.run()
+}
+
+/// TODO(windows): the bridge's internal connection is a Unix socket pair,
+/// and Windows has no host pasteboard behind it yet.
+#[cfg(windows)]
+pub(crate) struct ClipboardBridge;
+
+#[cfg(windows)]
+impl ClipboardBridge {
+    pub(crate) fn start(_sender: CoreSender, _host: HostClipboard) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no clipboard bridge on Windows",
+        ))
+    }
+
+    pub(crate) fn stop(self) {}
 }

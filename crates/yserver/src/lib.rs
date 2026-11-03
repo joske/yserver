@@ -34,17 +34,22 @@ pub mod vrr_exclusions;
 // `crate::vk_count!` call sites outside the render crate resolve through this.
 pub use yserver_render::vk_count;
 
+use std::io;
+#[cfg(unix)]
+use std::thread;
 #[cfg(kms)]
 use std::{fs, path::PathBuf};
-use std::{io, thread};
 
+#[cfg(unix)]
 use nix::sys::signal::{SigSet, Signal};
 #[cfg(target_os = "linux")]
 use nix::sys::signal::{SigmaskHow, sigprocmask};
 #[cfg(target_os = "linux")]
 use nix::sys::signalfd::SignalFd;
 
-use yserver_core::core_loop::{self, Message, ResetPolicy};
+#[cfg(unix)]
+use yserver_core::core_loop::Message;
+use yserver_core::core_loop::{self, ResetPolicy};
 // Moved into core (`backend::install_backend_root_bindings`) so the
 // server-reset generation boundary can re-run the identical binding step
 // against a freshly constructed `ServerState`. Imported under its own name
@@ -232,6 +237,7 @@ fn build_xdmcp_service(
     Ok(None)
 }
 
+#[cfg(unix)]
 fn bind_client_listeners(
     unix: std::os::unix::net::UnixListener,
     display: u16,
@@ -251,6 +257,26 @@ fn bind_client_listeners(
         listeners.push(Listener::Tcp(bind_tcp_listener(port)?));
     }
     Ok(listeners)
+}
+
+/// Windows has no Unix-domain listener, so TCP is its only transport.
+#[cfg(windows)]
+fn bind_client_listeners(
+    display: u16,
+    opts: &launch::LaunchOptions,
+    auth: &core_loop::auth::AuthState,
+) -> io::Result<Vec<yserver_core::transport::Listener>> {
+    if !opts.tcp_listen {
+        return Err(io::Error::other(
+            "Windows has no Unix-domain sockets: start with -listen tcp",
+        ));
+    }
+    auth.require_tcp_auth_at_startup()
+        .map_err(io::Error::other)?;
+    let port = launch::tcp_port(display).map_err(io::Error::other)?;
+    Ok(vec![yserver_core::transport::Listener::tcp(
+        bind_tcp_listener(port)?,
+    )?])
 }
 
 /// The one place a `tcp-transport` build actually opens a TCP socket.
@@ -1004,6 +1030,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
 /// acquire handshake; (3) we *send* SIGUSR1 outward to the parent
 /// at readiness. Disposition-in, delivery-to-self, and signal-out
 /// are separate.
+#[cfg(unix)]
 fn spawn_signal_thread(
     signal_fd: SignalSource,
     signal_sender: core_loop::CoreSender,
@@ -1177,6 +1204,27 @@ fn raise_open_files_limit() {
             io::Error::last_os_error()
         );
     }
+}
+
+/// TODO(windows): Ctrl+C and console close should request `Shutdown`
+/// (`SetConsoleCtrlHandler`); until then nothing watches for them.
+#[cfg(windows)]
+struct SignalSource;
+
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)]
+fn block_termination_signals() -> io::Result<SignalSource> {
+    Ok(SignalSource)
+}
+
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)]
+fn spawn_signal_thread(
+    _signal_source: SignalSource,
+    _signal_sender: core_loop::CoreSender,
+    _signal_reset_policy: ResetPolicy,
+) -> io::Result<()> {
+    Ok(())
 }
 
 /// What the signal thread reads signals from.

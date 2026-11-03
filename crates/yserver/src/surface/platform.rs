@@ -4,7 +4,6 @@
 
 use std::{
     io,
-    os::fd::OwnedFd,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -15,6 +14,7 @@ use ash::vk;
 use yserver_core::{
     backend::Backend as _,
     core_loop::{CoreSender, Message, host_screen_resized, run::emit_randr_change_notifications},
+    fd::OwnedFd,
     randr::{RR_ROTATE_0, RandrLimits},
     server::ServerState,
 };

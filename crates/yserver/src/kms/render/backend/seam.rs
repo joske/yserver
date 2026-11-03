@@ -241,7 +241,7 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn on_page_flip_ready(
         _b: &mut XBackend<Self>,
         _state: &mut ServerState,
-        _drm_fd: std::os::fd::RawFd,
+        _drm_fd: yserver_core::fd::RawFd,
     ) {
     }
 
@@ -343,7 +343,7 @@ pub trait Platform: OutputSink + Sized + 'static {
         false
     }
 
-    fn poll_fds(_b: &XBackend<Self>) -> Vec<(std::os::fd::RawFd, BackendFdKind)> {
+    fn poll_fds(_b: &XBackend<Self>) -> Vec<(yserver_core::fd::RawFd, BackendFdKind)> {
         Vec::new()
     }
 
@@ -472,7 +472,7 @@ pub trait Platform: OutputSink + Sized + 'static {
         false
     }
 
-    fn dri3_open(_b: &mut XBackend<Self>, _drawable: u32) -> io::Result<std::os::fd::OwnedFd> {
+    fn dri3_open(_b: &mut XBackend<Self>, _drawable: u32) -> io::Result<yserver_core::fd::OwnedFd> {
         Err(io::Error::other("DRI3 unsupported on this backend"))
     }
 
@@ -487,7 +487,7 @@ pub trait Platform: OutputSink + Sized + 'static {
 
     fn dri3_import_pixmap(
         _b: &mut XBackend<Self>,
-        _fd: std::os::fd::OwnedFd,
+        _fd: yserver_core::fd::OwnedFd,
         _width: u16,
         _height: u16,
         _stride: u32,
@@ -512,7 +512,7 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn dri3_export_pixmap(
         _b: &mut XBackend<Self>,
         _host_xid: u32,
-    ) -> io::Result<(u32, u16, u16, u16, u8, u8, std::os::fd::OwnedFd)> {
+    ) -> io::Result<(u32, u16, u16, u16, u8, u8, yserver_core::fd::OwnedFd)> {
         Err(io::Error::other("DRI3 export unsupported on this backend"))
     }
 
@@ -555,7 +555,7 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn dri3_fence_from_fd(
         _b: &mut XBackend<Self>,
         _fence_xid: u32,
-        _fd: std::os::fd::OwnedFd,
+        _fd: yserver_core::fd::OwnedFd,
     ) -> io::Result<()> {
         Err(io::Error::other("DRI3 FenceFromFD unsupported"))
     }
@@ -597,7 +597,7 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn dri3_fd_from_fence(
         _b: &mut XBackend<Self>,
         _fence_xid: u32,
-    ) -> io::Result<std::os::fd::OwnedFd> {
+    ) -> io::Result<yserver_core::fd::OwnedFd> {
         Err(io::Error::other("DRI3 FDFromFence unsupported"))
     }
 
@@ -605,7 +605,7 @@ pub trait Platform: OutputSink + Sized + 'static {
         _b: &mut XBackend<Self>,
         _client_id: yserver_protocol::x11::ClientId,
         _syncobj_xid: u32,
-        _fd: std::os::fd::OwnedFd,
+        _fd: yserver_core::fd::OwnedFd,
     ) -> io::Result<()> {
         Err(io::Error::other("DRI3 ImportSyncobj unsupported"))
     }

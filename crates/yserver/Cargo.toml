@@ -26,7 +26,6 @@ flate2 = "1.1"
 freetype-rs.workspace = true
 libc.workspace = true
 log.workspace = true
-nix.workspace = true
 regex = "1.13.1"
 roxmltree.workspace = true
 serde_json.workspace = true
@@ -39,6 +38,9 @@ yserver-render.workspace = true
 
 [dev-dependencies]
 yserver-render = { workspace = true, features = ["test-support"] }
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
 
 # Windows finds its fonts by scanning the font directories (`kms/font_scan.rs`).
 [target.'cfg(not(windows))'.dependencies]

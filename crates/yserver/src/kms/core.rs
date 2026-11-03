@@ -1846,10 +1846,12 @@ fn read_bdf_properties(face: &freetype::Face) -> Vec<(String, FontPropValue)> {
                 };
                 FontPropValue::Str(s)
             }
-            // SAFETY: tag-checked union reads.
+            // SAFETY: tag-checked union reads. `c_long` is `i32` on Windows.
+            #[cfg_attr(windows, allow(clippy::unnecessary_cast))]
             ft_bdf::BDF_PROPERTY_TYPE_INTEGER => {
                 FontPropValue::Int(unsafe { prop.u.integer } as i32)
             }
+            #[cfg_attr(windows, allow(clippy::unnecessary_cast))]
             ft_bdf::BDF_PROPERTY_TYPE_CARDINAL => {
                 FontPropValue::Card(unsafe { prop.u.cardinal } as u32)
             }
