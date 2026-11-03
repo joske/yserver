@@ -2129,6 +2129,7 @@ fn run_core_with_inventory(
     state.host_access = super::auth::HostAccessHandle {
         auth: Arc::clone(&auth),
         generation: rx.current_generation(),
+        policies: std::mem::take(&mut state.host_access.policies),
     };
     // The generation counter is shared with every `CoreSender`; the
     // receiver is the loop's sole handle to it, and the reset boundary

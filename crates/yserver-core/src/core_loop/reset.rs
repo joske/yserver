@@ -446,6 +446,7 @@ pub(crate) fn reset_generation(
     fresh.host_access = crate::core_loop::auth::HostAccessHandle {
         auth: std::sync::Arc::clone(&state.host_access.auth),
         generation,
+        policies: state.host_access.policies.clone(),
     };
     // Rebuild physical facets from the process-lifetime inventory. Disabled
     // continuation facts remain registered but disabled, matching their live
@@ -1154,6 +1155,43 @@ mod tests {
 
         assert_eq!(state.host_access.generation, generation);
         assert!(std::sync::Arc::ptr_eq(&state.host_access.auth, &auth));
+    }
+
+    /// Mutation: omit `policies` from the reset carry-over; these pointer/order assertions must fail.
+    #[test]
+    fn reset_generation_carries_installed_policies_in_order() {
+        use crate::access::AccessPolicy;
+
+        struct Policy;
+        impl AccessPolicy for Policy {}
+
+        let mut state = ServerState::new();
+        let first: Arc<dyn AccessPolicy> = Arc::new(Policy);
+        let second: Arc<dyn AccessPolicy> = Arc::new(Policy);
+        state.install_access_policy(Arc::clone(&first));
+        state.install_access_policy(Arc::clone(&second));
+
+        let mut backend = backend_with_topology();
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        )
+        .expect("the reset must proceed: this test holds no overlay claim");
+
+        assert_eq!(state.host_access.policies.len(), 2);
+        assert!(Arc::ptr_eq(&state.host_access.policies[0], &first));
+        assert!(Arc::ptr_eq(&state.host_access.policies[1], &second));
     }
 
     /// Rootless (plan RL0 Task 3): a reset tells the host every mapped

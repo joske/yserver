@@ -97,6 +97,7 @@ pub struct AuthState {
 pub struct HostAccessHandle {
     pub auth: Arc<AuthState>,
     pub generation: Generation,
+    pub policies: Vec<Arc<dyn crate::access::AccessPolicy>>,
 }
 
 impl Default for HostAccessHandle {
@@ -106,6 +107,7 @@ impl Default for HostAccessHandle {
         Self {
             auth: AuthState::new(None),
             generation: Generation::default(),
+            policies: Vec::new(),
         }
     }
 }

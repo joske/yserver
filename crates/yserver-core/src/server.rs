@@ -1635,6 +1635,51 @@ pub struct GlxDrawable {
 }
 
 impl ServerState {
+    /// Append an access policy. Policies run in installation order.
+    pub fn install_access_policy(&mut self, policy: Arc<dyn crate::access::AccessPolicy>) {
+        self.host_access.policies.push(policy);
+    }
+
+    /// Ask installed policies about a server operation, stopping at the first denial.
+    #[allow(dead_code)] // Server access checks are wired in a later task.
+    pub(crate) fn check_server(
+        &self,
+        client: ClientId,
+        mode: crate::access::AccessMode,
+        request: Option<crate::access::RequestOpcodes>,
+    ) -> crate::access::Decision {
+        let policies = &self.host_access.policies;
+        if policies.is_empty() {
+            return crate::access::Decision::Allow;
+        }
+
+        let context = crate::access::AccessContext::new(self, request);
+        for policy in policies {
+            match policy.server(&context, client, mode) {
+                crate::access::Decision::Allow => {}
+                denial @ crate::access::Decision::Deny(_) => return denial,
+            }
+        }
+        crate::access::Decision::Allow
+    }
+
+    /// Notify every installed policy in installation order.
+    #[allow(dead_code)] // Lifecycle notification sites are wired in a later task.
+    pub(crate) fn notify_policies(
+        &self,
+        f: impl Fn(&dyn crate::access::AccessPolicy, &crate::access::AccessContext<'_>),
+    ) {
+        let policies = &self.host_access.policies;
+        if policies.is_empty() {
+            return;
+        }
+
+        let context = crate::access::AccessContext::new(self, None);
+        for policy in policies {
+            f(policy.as_ref(), &context);
+        }
+    }
+
     /// Install the complete active pointer-grab snapshot.
     pub fn set_pointer_grab(&mut self, grab: ActivePointerGrab) {
         self.active_pointer_grab = Some(grab);

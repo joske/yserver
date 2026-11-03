@@ -4555,3 +4555,37 @@ fn run_core_installs_its_auth_state_as_the_host_access_handle() {
     assert!(Arc::ptr_eq(&state.host_access.auth, &auth));
     assert_eq!(state.host_access.generation, generation);
 }
+
+/// Mutation: initialize the run-core handle with an empty policy list; this pointer assertion must fail.
+#[test]
+fn run_core_keeps_policies_installed_before_it() {
+    use crate::access::AccessPolicy;
+    use std::sync::Arc;
+
+    struct Policy;
+    impl AccessPolicy for Policy {}
+
+    let mut state = ServerState::new();
+    let policy: Arc<dyn AccessPolicy> = Arc::new(Policy);
+    state.install_access_policy(Arc::clone(&policy));
+
+    let mut backend = crate::backend::recording::RecordingBackend::new();
+    let (poll, sender, receiver) = crate::core_loop::channel().expect("core channel");
+    sender.send(Message::Shutdown).unwrap();
+    run_core(
+        poll,
+        receiver,
+        sender.clone_handle(),
+        &mut state,
+        &mut backend,
+        [],
+        &ClientIdAllocator::new(),
+        AuthState::new(None),
+        ResetPolicy::NoReset,
+        None,
+    )
+    .expect("run core to shutdown");
+
+    assert_eq!(state.host_access.policies.len(), 1);
+    assert!(Arc::ptr_eq(&state.host_access.policies[0], &policy));
+}
