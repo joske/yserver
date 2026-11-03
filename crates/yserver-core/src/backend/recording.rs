@@ -550,6 +550,9 @@ pub struct RecordingBackend {
     pub fail_copy_area: bool,
     /// When `true`, `fill_rectangle` records the call but returns `Err`.
     pub fail_fill_rectangle: bool,
+    /// The next `open_font` records its call and returns this error kind.
+    /// Used to drive reset's fatal default-font reinstall boundary.
+    pub fail_open_font: Option<io::ErrorKind>,
     /// Canned direct-Present result plus observed candidates. A successful
     /// result lets request-layer tests prove M2b bypasses Copy entirely.
     pub present_direct_result: bool,
@@ -711,6 +714,7 @@ impl RecordingBackend {
             arm_idle_vblanks_result: None,
             fail_copy_area: false,
             fail_fill_rectangle: false,
+            fail_open_font: None,
             present_direct_result: false,
             reallocate_fails: false,
             present_direct_candidates: Vec::new(),
@@ -1923,8 +1927,11 @@ impl Backend for RecordingBackend {
         _origin: Option<OriginContext>,
         name: &str,
     ) -> io::Result<(FontHandle, FontMetrics)> {
-        let xid = self.allocate_handle();
         self.record(RecordedCall::OpenFont(name.to_string()));
+        if let Some(kind) = self.fail_open_font.take() {
+            return Err(io::Error::from(kind));
+        }
+        let xid = self.allocate_handle();
         // FontMetrics is private to the protocol crate; return a Default-ish
         // value via Default::default(). If FontMetrics has no Default we fall
         // back to a zero-initialised one in the unimplemented branch below.

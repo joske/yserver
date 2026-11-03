@@ -1,5 +1,482 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LifecycleEvent {
+    Connected(
+        yserver_protocol::x11::ClientId,
+        crate::peer::PeerIdentity,
+        crate::access::Admission,
+    ),
+    ConnectionGone(yserver_protocol::x11::ClientId),
+    OwnerGone(yserver_protocol::x11::ClientId),
+    GenerationEnded,
+}
+
+struct LifecycleRecordingPolicy {
+    events: std::sync::Arc<std::sync::Mutex<Vec<LifecycleEvent>>>,
+    deny_server_checks: bool,
+}
+
+impl crate::access::AccessPolicy for LifecycleRecordingPolicy {
+    fn server(
+        &self,
+        _ctx: &crate::access::AccessContext<'_>,
+        _client: yserver_protocol::x11::ClientId,
+        _mode: crate::access::AccessMode,
+    ) -> crate::access::Decision {
+        if self.deny_server_checks {
+            crate::access::Decision::Deny(crate::access::ACCESS)
+        } else {
+            crate::access::Decision::Allow
+        }
+    }
+
+    fn client_connected(
+        &self,
+        _ctx: &crate::access::AccessContext<'_>,
+        client: yserver_protocol::x11::ClientId,
+        peer: &crate::peer::PeerIdentity,
+        admission: &crate::access::Admission,
+    ) {
+        self.events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(LifecycleEvent::Connected(client, *peer, *admission));
+    }
+
+    fn connection_gone(
+        &self,
+        _ctx: &crate::access::AccessContext<'_>,
+        client: yserver_protocol::x11::ClientId,
+    ) {
+        self.events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(LifecycleEvent::ConnectionGone(client));
+    }
+
+    fn owner_gone(&self, client: yserver_protocol::x11::ClientId) {
+        self.events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(LifecycleEvent::OwnerGone(client));
+    }
+
+    fn generation_ended(&self) {
+        self.events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(LifecycleEvent::GenerationEnded);
+    }
+}
+
+fn install_lifecycle_recording_policy(
+    state: &mut ServerState,
+    events: std::sync::Arc<std::sync::Mutex<Vec<LifecycleEvent>>>,
+    deny_server_checks: bool,
+) -> std::sync::Arc<LifecycleRecordingPolicy> {
+    let policy = std::sync::Arc::new(LifecycleRecordingPolicy {
+        events,
+        deny_server_checks,
+    });
+    state.install_access_policy(policy.clone());
+    policy
+}
+
+fn lifecycle_setup_client(
+    state: &mut ServerState,
+    sender: &CoreSender,
+    setup_registry: &crate::core_loop::setup_thread::SetupRegistry,
+    id: u32,
+) -> std::os::unix::net::UnixStream {
+    let (server_stream, peer_stream) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    super::handle_client_setup_complete(
+        sender,
+        setup_registry,
+        state,
+        yserver_protocol::x11::ClientId(id),
+        crate::core_loop::generation::Generation::default(),
+        crate::transport::Transport::Unix(server_stream),
+        id << 20,
+        0x000F_FFFF,
+        yserver_protocol::x11::ClientByteOrder::LittleEndian,
+        (true, true, false),
+        crate::peer::PeerIdentity::unknown_unix(),
+        crate::access::Admission::Internal,
+        &[],
+    )
+    .expect("client setup completes");
+    peer_stream
+}
+
+fn lifecycle_request(
+    state: &mut ServerState,
+    backend: &mut crate::backend::recording::RecordingBackend,
+    client: u32,
+    opcode: u8,
+    data: u8,
+    length_units: u32,
+    body: &[u8],
+) {
+    let _outcome = crate::core_loop::process_request::process_request(
+        state,
+        backend,
+        yserver_protocol::x11::ClientId(client),
+        yserver_protocol::x11::SequenceNumber(1),
+        yserver_protocol::x11::RequestHeader {
+            opcode,
+            data,
+            length_units,
+        },
+        body,
+        None,
+    )
+    .expect("request processes");
+}
+
+fn create_lifecycle_pixmap(
+    state: &mut ServerState,
+    backend: &mut crate::backend::recording::RecordingBackend,
+    client: u32,
+    pixmap: u32,
+) {
+    let mut body = Vec::with_capacity(12);
+    body.extend_from_slice(&pixmap.to_le_bytes());
+    body.extend_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+    body.extend_from_slice(&16_u16.to_le_bytes());
+    body.extend_from_slice(&16_u16.to_le_bytes());
+    lifecycle_request(state, backend, client, 53, 24, 4, &body);
+}
+
+fn lifecycle_events_for(
+    events: &[LifecycleEvent],
+    id: yserver_protocol::x11::ClientId,
+) -> Vec<LifecycleEvent> {
+    events
+        .iter()
+        .copied()
+        .filter(|event| match event {
+            LifecycleEvent::Connected(client, _, _)
+            | LifecycleEvent::ConnectionGone(client)
+            | LifecycleEvent::OwnerGone(client) => *client == id,
+            LifecycleEvent::GenerationEnded => false,
+        })
+        .collect()
+}
+
+// Mutation: drop the client_connected call after ClientState insertion; this sequence assertion fails.
+#[test]
+fn lifecycle_of_a_destroying_client() {
+    use crate::backend::recording::RecordingBackend;
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut state = ServerState::new();
+    install_lifecycle_recording_policy(&mut state, events.clone(), false);
+    let (_poll, sender, _receiver) = crate::core_loop::sender::channel().expect("core channel");
+    let setup_registry = crate::core_loop::setup_thread::make_registry();
+    let id = yserver_protocol::x11::ClientId(7);
+    let peer_identity = crate::peer::PeerIdentity::unknown_unix();
+    let _peer = lifecycle_setup_client(&mut state, &sender, &setup_registry, id.0);
+
+    crate::core_loop::process_disconnect::process_disconnect(
+        &mut state,
+        &mut RecordingBackend::new(),
+        id,
+    );
+
+    assert_eq!(
+        lifecycle_events_for(&events.lock().unwrap(), id),
+        vec![
+            LifecycleEvent::Connected(id, peer_identity, crate::access::Admission::Internal),
+            LifecycleEvent::ConnectionGone(id),
+            LifecycleEvent::OwnerGone(id),
+        ],
+    );
+    assert!(!state.clients.contains_key(&id.0));
+    assert!(!state.zombie_clients.contains_key(&id.0));
+}
+
+// Mutation: emit owner_gone at disconnect even when the client is retained; the post-disconnect assertion fails.
+#[test]
+fn lifecycle_of_a_retained_owner() {
+    use crate::backend::recording::RecordingBackend;
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut state = ServerState::new();
+    install_lifecycle_recording_policy(&mut state, events.clone(), false);
+    let (_poll, sender, _receiver) = crate::core_loop::sender::channel().expect("core channel");
+    let setup_registry = crate::core_loop::setup_thread::make_registry();
+    let _owner_peer = lifecycle_setup_client(&mut state, &sender, &setup_registry, 7);
+    let _killer_peer = lifecycle_setup_client(&mut state, &sender, &setup_registry, 8);
+    let mut backend = RecordingBackend::new();
+    let owner = yserver_protocol::x11::ClientId(7);
+    let pixmap = 0x0070_0100;
+
+    lifecycle_request(&mut state, &mut backend, owner.0, 112, 1, 1, &[]);
+    create_lifecycle_pixmap(&mut state, &mut backend, owner.0, pixmap);
+    crate::core_loop::process_disconnect::process_disconnect(&mut state, &mut backend, owner);
+
+    assert_eq!(
+        lifecycle_events_for(&events.lock().unwrap(), owner),
+        vec![
+            LifecycleEvent::Connected(
+                owner,
+                crate::peer::PeerIdentity::unknown_unix(),
+                crate::access::Admission::Internal,
+            ),
+            LifecycleEvent::ConnectionGone(owner),
+        ],
+    );
+    assert_eq!(state.zombie_clients.get(&owner.0), Some(&1));
+    assert_eq!(
+        state
+            .resources
+            .resource_owner(yserver_protocol::x11::ResourceId(pixmap)),
+        Some(owner),
+    );
+
+    lifecycle_request(
+        &mut state,
+        &mut backend,
+        8,
+        113,
+        0,
+        2,
+        &pixmap.to_le_bytes(),
+    );
+
+    assert_eq!(
+        lifecycle_events_for(&events.lock().unwrap(), owner),
+        vec![
+            LifecycleEvent::Connected(
+                owner,
+                crate::peer::PeerIdentity::unknown_unix(),
+                crate::access::Admission::Internal,
+            ),
+            LifecycleEvent::ConnectionGone(owner),
+            LifecycleEvent::OwnerGone(owner),
+        ],
+    );
+    assert!(!state.clients.contains_key(&owner.0));
+    assert!(!state.zombie_clients.contains_key(&owner.0));
+    assert!(
+        !state
+            .resources
+            .xid_in_use(yserver_protocol::x11::ResourceId(pixmap))
+    );
+}
+
+// Mutation: omit owner_gone for RetainTemporary zombies; AllTemporary must still notify their teardown.
+#[test]
+fn retain_temporary_owner_gone_through_all_temporary() {
+    use crate::backend::recording::RecordingBackend;
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut state = ServerState::new();
+    install_lifecycle_recording_policy(&mut state, events.clone(), false);
+    let (_poll, sender, _receiver) = crate::core_loop::sender::channel().expect("core channel");
+    let setup_registry = crate::core_loop::setup_thread::make_registry();
+    let _owner_peer = lifecycle_setup_client(&mut state, &sender, &setup_registry, 7);
+    let _killer_peer = lifecycle_setup_client(&mut state, &sender, &setup_registry, 8);
+    let mut backend = RecordingBackend::new();
+    let owner = yserver_protocol::x11::ClientId(7);
+    let pixmap = 0x0070_0101;
+
+    lifecycle_request(&mut state, &mut backend, owner.0, 112, 2, 1, &[]);
+    create_lifecycle_pixmap(&mut state, &mut backend, owner.0, pixmap);
+    crate::core_loop::process_disconnect::process_disconnect(&mut state, &mut backend, owner);
+    assert_eq!(state.zombie_clients.get(&owner.0), Some(&2));
+    assert_eq!(
+        lifecycle_events_for(&events.lock().unwrap(), owner),
+        vec![
+            LifecycleEvent::Connected(
+                owner,
+                crate::peer::PeerIdentity::unknown_unix(),
+                crate::access::Admission::Internal,
+            ),
+            LifecycleEvent::ConnectionGone(owner),
+        ],
+    );
+
+    lifecycle_request(&mut state, &mut backend, 8, 113, 0, 2, &0_u32.to_le_bytes());
+
+    assert_eq!(
+        lifecycle_events_for(&events.lock().unwrap(), owner),
+        vec![
+            LifecycleEvent::Connected(
+                owner,
+                crate::peer::PeerIdentity::unknown_unix(),
+                crate::access::Admission::Internal,
+            ),
+            LifecycleEvent::ConnectionGone(owner),
+            LifecycleEvent::OwnerGone(owner),
+        ],
+    );
+    assert!(!state.clients.contains_key(&owner.0));
+    assert!(!state.zombie_clients.contains_key(&owner.0));
+    assert!(
+        !state
+            .resources
+            .xid_in_use(yserver_protocol::x11::ResourceId(pixmap))
+    );
+}
+
+// Mutation: have notify_policies stop after the first installed policy; the second recorder misses this sequence.
+#[test]
+fn every_policy_hears_lifecycle() {
+    use crate::backend::recording::RecordingBackend;
+
+    let first_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let second_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut state = ServerState::new();
+    install_lifecycle_recording_policy(&mut state, first_events.clone(), true);
+    install_lifecycle_recording_policy(&mut state, second_events.clone(), false);
+    let (_poll, sender, _receiver) = crate::core_loop::sender::channel().expect("core channel");
+    let setup_registry = crate::core_loop::setup_thread::make_registry();
+    let id = yserver_protocol::x11::ClientId(7);
+    let _peer = lifecycle_setup_client(&mut state, &sender, &setup_registry, id.0);
+
+    assert_eq!(
+        state.check_server(id, crate::access::AccessMode::MANAGE, None),
+        crate::access::Decision::Deny(crate::access::ACCESS),
+    );
+    crate::core_loop::process_disconnect::process_disconnect(
+        &mut state,
+        &mut RecordingBackend::new(),
+        id,
+    );
+
+    let expected = vec![
+        LifecycleEvent::Connected(
+            id,
+            crate::peer::PeerIdentity::unknown_unix(),
+            crate::access::Admission::Internal,
+        ),
+        LifecycleEvent::ConnectionGone(id),
+        LifecycleEvent::OwnerGone(id),
+    ];
+    assert_eq!(*first_events.lock().unwrap(), expected);
+    assert_eq!(*second_events.lock().unwrap(), expected);
+    assert!(!state.clients.contains_key(&id.0));
+    assert!(!state.zombie_clients.contains_key(&id.0));
+}
+
+// Mutation: move client_connected until after reader spawn; the constrained spawn error must still leave it first.
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_reader_spawn_still_connects_before_departing() {
+    use std::process::Command;
+
+    let output = Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--ignored",
+            "--exact",
+            "core_loop::run::tests::lifecycle_reader_spawn_failure_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .output()
+        .expect("run the constrained child test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("1 passed; 0 failed"),
+        "constrained reader-spawn test failed:\n{stdout}\n{stderr}",
+    );
+}
+
+// Mutation: move client_connected after reader spawn; the child test's first event assertion fails.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "invoked in a subprocess with RLIMIT_NPROC lowered to force the real thread spawn to fail"]
+fn lifecycle_reader_spawn_failure_child() {
+    use crate::backend::recording::RecordingBackend;
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut state = ServerState::new();
+    install_lifecycle_recording_policy(&mut state, events.clone(), false);
+    let (_poll, sender, _receiver) = crate::core_loop::sender::channel().expect("core channel");
+    let setup_registry = crate::core_loop::setup_thread::make_registry();
+    let (server_stream, _peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    let id = yserver_protocol::x11::ClientId(7);
+
+    // The child process has already started its test worker. Limiting its
+    // own per-UID task allowance below the current task count forces the
+    // same OS thread creation failure the production spawn can encounter.
+    // SAFETY: zero is valid for an output `rlimit` before `getrlimit` fills it.
+    let mut original = unsafe { std::mem::zeroed::<libc::rlimit>() };
+    // SAFETY: `original` is a valid writable output pointer.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut original) },
+        0
+    );
+    let constrained = libc::rlimit {
+        rlim_cur: 1,
+        rlim_max: original.rlim_max,
+    };
+    // SAFETY: `constrained` is valid and only lowers this child process's soft limit.
+    assert_eq!(
+        unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &constrained) },
+        0
+    );
+
+    let setup_result = super::handle_client_setup_complete(
+        &sender,
+        &setup_registry,
+        &mut state,
+        id,
+        crate::core_loop::generation::Generation::default(),
+        crate::transport::Transport::Unix(server_stream),
+        id.0 << 20,
+        0x000F_FFFF,
+        yserver_protocol::x11::ClientByteOrder::LittleEndian,
+        (true, true, false),
+        crate::peer::PeerIdentity::unknown_unix(),
+        crate::access::Admission::Internal,
+        &[],
+    );
+    // SAFETY: restore the exact process limit saved above before assertions or teardown.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &original) }, 0);
+    assert_eq!(
+        setup_result
+            .expect_err("reader thread creation must fail")
+            .kind(),
+        std::io::ErrorKind::WouldBlock,
+    );
+    assert!(state.clients.contains_key(&id.0));
+    assert_eq!(
+        lifecycle_events_for(&events.lock().unwrap(), id),
+        vec![LifecycleEvent::Connected(
+            id,
+            crate::peer::PeerIdentity::unknown_unix(),
+            crate::access::Admission::Internal,
+        )],
+    );
+
+    super::disconnect_with_pending_cleanup(
+        &mut state,
+        &mut RecordingBackend::new(),
+        &mut PendingBackendRequests::default(),
+        &mut XiConfigLane::default(),
+        &mut ResetTrigger::new(ResetPolicy::NoReset),
+        id,
+    );
+    assert_eq!(
+        lifecycle_events_for(&events.lock().unwrap(), id),
+        vec![
+            LifecycleEvent::Connected(
+                id,
+                crate::peer::PeerIdentity::unknown_unix(),
+                crate::access::Admission::Internal,
+            ),
+            LifecycleEvent::ConnectionGone(id),
+            LifecycleEvent::OwnerGone(id),
+        ],
+    );
+    assert!(!state.clients.contains_key(&id.0));
+    assert!(!state.zombie_clients.contains_key(&id.0));
+}
+
 fn install_xi_config_test_client(
     state: &mut ServerState,
     client_id: u32,

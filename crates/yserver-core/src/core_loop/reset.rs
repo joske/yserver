@@ -483,6 +483,7 @@ pub(crate) fn reset_generation(
     backend.mark_dirty();
 
     // -- 9. Listeners are left bound and untouched. -----------------
+    state.notify_policies(|policy, _context| policy.generation_ended());
     Some(generation)
 }
 
@@ -588,6 +589,38 @@ mod tests {
         server::{ClientState, GlxContext, GlxDrawable, GlxDrawableKind, ServerState},
     };
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum LifecycleEvent {
+        ConnectionGone(ClientId),
+        OwnerGone(ClientId),
+        GenerationEnded,
+    }
+
+    struct LifecycleRecordingPolicy(Arc<Mutex<Vec<LifecycleEvent>>>);
+
+    impl crate::access::AccessPolicy for LifecycleRecordingPolicy {
+        fn connection_gone(&self, _ctx: &crate::access::AccessContext<'_>, client: ClientId) {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(LifecycleEvent::ConnectionGone(client));
+        }
+
+        fn owner_gone(&self, client: ClientId) {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(LifecycleEvent::OwnerGone(client));
+        }
+
+        fn generation_ended(&self) {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(LifecycleEvent::GenerationEnded);
+        }
+    }
+
     fn install_client(state: &mut ServerState, id: u32) {
         let (a, _b) = UnixStream::pair().expect("socketpair");
         state.clients.insert(
@@ -617,6 +650,16 @@ mod tests {
                 peer: crate::peer::PeerIdentity::unknown_unix(),
             },
         );
+    }
+
+    fn lifecycle_recording_policy(
+        state: &mut ServerState,
+        events: Arc<Mutex<Vec<LifecycleEvent>>>,
+    ) -> Arc<dyn crate::access::AccessPolicy> {
+        let policy: Arc<dyn crate::access::AccessPolicy> =
+            Arc::new(LifecycleRecordingPolicy(events));
+        state.install_access_policy(Arc::clone(&policy));
+        policy
     }
 
     /// Everything one client of a session holds that costs the BACKEND
@@ -1193,6 +1236,186 @@ mod tests {
         assert_eq!(state.host_access.policies.len(), 2);
         assert!(Arc::ptr_eq(&state.host_access.policies[0], &first));
         assert!(Arc::ptr_eq(&state.host_access.policies[1], &second));
+    }
+
+    // Mutation: call generation_ended at reset entry before client teardown; it must be last.
+    #[test]
+    fn reset_tells_policies_after_every_client() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut state = ServerState::new();
+        let policy = lifecycle_recording_policy(&mut state, events.clone());
+        install_client(&mut state, 7);
+        install_client(&mut state, 8);
+        state.close_down_modes.insert(7, 1);
+        state.resources.create_pixmap(
+            ClientId(7),
+            CreatePixmapRequest {
+                pixmap: ResourceId(0x0070_0001),
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+                depth: 24,
+            },
+        );
+        let mut backend = backend_with_topology();
+
+        crate::core_loop::process_disconnect::process_disconnect_reporting(
+            &mut state,
+            &mut backend,
+            ClientId(7),
+            None,
+        );
+        assert_eq!(state.zombie_clients.get(&7), Some(&1));
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        )
+        .expect("reset succeeds");
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                LifecycleEvent::ConnectionGone(ClientId(7)),
+                LifecycleEvent::ConnectionGone(ClientId(8)),
+                LifecycleEvent::OwnerGone(ClientId(8)),
+                LifecycleEvent::OwnerGone(ClientId(7)),
+                LifecycleEvent::GenerationEnded,
+            ],
+        );
+        assert_eq!(state.host_access.policies.len(), 1);
+        assert!(Arc::ptr_eq(&state.host_access.policies[0], &policy));
+        assert!(state.clients.is_empty());
+        assert!(state.zombie_clients.is_empty());
+        assert!(!state.resources.xid_in_use(ResourceId(0x0070_0001)));
+    }
+
+    // Mutation: notify owner_gone when FreePixmap frees one zombie resource; it must wait until reset closes the owner.
+    #[test]
+    fn freeing_a_zombie_resource_does_not_end_its_owner() {
+        use crate::core_loop::process_request::process_request;
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut state = ServerState::new();
+        lifecycle_recording_policy(&mut state, events.clone());
+        install_client(&mut state, 7);
+        install_client(&mut state, 8);
+        state.close_down_modes.insert(7, 1);
+        let pixmap = ResourceId(0x0070_0051);
+        state.resources.create_pixmap(
+            ClientId(7),
+            CreatePixmapRequest {
+                pixmap,
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+                depth: 24,
+            },
+        );
+        let mut backend = backend_with_topology();
+
+        crate::core_loop::process_disconnect::process_disconnect_reporting(
+            &mut state,
+            &mut backend,
+            ClientId(7),
+            None,
+        );
+        let _outcome = process_request(
+            &mut state,
+            &mut backend,
+            ClientId(8),
+            yserver_protocol::x11::SequenceNumber(1),
+            yserver_protocol::x11::RequestHeader {
+                opcode: 54,
+                data: 0,
+                length_units: 2,
+            },
+            &pixmap.0.to_le_bytes(),
+            None,
+        )
+        .expect("FreePixmap processes");
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![LifecycleEvent::ConnectionGone(ClientId(7))],
+        );
+        assert!(!state.resources.xid_in_use(pixmap));
+        assert_eq!(state.zombie_clients.get(&7), Some(&1));
+
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        )
+        .expect("reset succeeds");
+
+        let recorded = events.lock().unwrap();
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|event| **event == LifecycleEvent::OwnerGone(ClientId(7)))
+                .count(),
+            1,
+        );
+        assert_eq!(recorded.last(), Some(&LifecycleEvent::GenerationEnded));
+        assert!(state.clients.is_empty());
+        assert!(state.zombie_clients.is_empty());
+    }
+
+    // Mutation: emit generation_ended immediately after installing the fresh state; a later font refusal must not announce success.
+    #[test]
+    fn refused_reset_sends_no_generation_end() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut state = ServerState::new();
+        lifecycle_recording_policy(&mut state, events.clone());
+        install_client(&mut state, 7);
+        let mut backend = backend_with_topology();
+        backend.fail_open_font = Some(std::io::ErrorKind::NotFound);
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+
+        assert!(
+            reset_generation(
+                &mut state,
+                &mut backend,
+                p.registry(),
+                &generations,
+                &registry,
+                &inventory,
+                locals.borrow(),
+            )
+            .is_none(),
+            "the failed default-font reinstall refuses the boundary"
+        );
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .contains(&LifecycleEvent::GenerationEnded)
+        );
+        assert!(state.clients.is_empty());
+        assert!(state.zombie_clients.is_empty());
     }
 
     /// Rootless (plan RL0 Task 3): a reset tells the host every mapped

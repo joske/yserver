@@ -1664,7 +1664,6 @@ impl ServerState {
     }
 
     /// Notify every installed policy in installation order.
-    #[allow(dead_code)] // Lifecycle notification sites are wired in a later task.
     pub(crate) fn notify_policies(
         &self,
         f: impl Fn(&dyn crate::access::AccessPolicy, &crate::access::AccessContext<'_>),

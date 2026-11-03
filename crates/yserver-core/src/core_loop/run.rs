@@ -4723,6 +4723,11 @@ fn handle_client_setup_complete(
             admission,
         },
     );
+    state.notify_policies(|policy, context| {
+        if let (Some(peer), Some(admission)) = (context.peer(id), context.admission(id)) {
+            policy.client_connected(context, id, peer, admission);
+        }
+    });
     setup_registry
         .lock()
         .unwrap_or_else(|e| e.into_inner())
