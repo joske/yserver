@@ -240,9 +240,9 @@ pub enum Message {
     },
     /// The server's own X client (a window shell's clipboard bridge): the
     /// core runs the setup on `stream` as for an accepted connection, with
-    /// no authorization, and marks the client internal.
-    #[cfg(unix)]
-    InternalClient(std::os::unix::net::UnixStream),
+    /// no authorization, and marks the client internal. A Unix socket pair
+    /// where there is one, else a loopback TCP pair (Windows).
+    InternalClient(Transport),
     /// One framed X11 request from a client reader thread.
     Request {
         id: ClientId,

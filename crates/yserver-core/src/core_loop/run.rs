@@ -2504,9 +2504,10 @@ fn run_core_with_inventory(
                                 telemetry.record_deferred_push(req.id);
                                 deferred_requests.push_back(req);
                             }
-                            #[cfg(unix)]
                             Message::InternalClient(stream) => {
                                 let id = client_id_allocator.allocate();
+                                // No `SCM_RIGHTS` over the loopback TCP pair.
+                                let fd_passing = !matches!(stream, Transport::Tcp(_));
                                 if let Err(err) = setup_thread::spawn(
                                     id,
                                     stream,
@@ -2514,7 +2515,7 @@ fn run_core_with_inventory(
                                     setup_registry.clone(),
                                     auth.clone(),
                                     true,
-                                    true,
+                                    fd_passing,
                                     true,
                                 ) {
                                     error!(

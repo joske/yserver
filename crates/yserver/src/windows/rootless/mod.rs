@@ -17,7 +17,10 @@ use std::{
     collections::{HashMap, HashSet},
     io, ptr,
     rc::Rc,
-    sync::{Arc, Mutex, atomic::AtomicUsize},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize},
+    },
     thread,
 };
 
@@ -29,7 +32,7 @@ use windows_sys::Win32::{
 };
 use yserver_core::rootless::{RootlessEvent, ToplevelId};
 
-use super::{frame_clock::DwmTicker, input::ShellInput};
+use super::{clipboard::WindowsClipboard, frame_clock::DwmTicker, input::ShellInput};
 use crate::{
     kms::vk::device::VkContext,
     launch::LaunchOptions,
@@ -38,6 +41,7 @@ use crate::{
         native::{pacing::FramePacer, space::GlobalSpace},
     },
     surface::{
+        clipboard::HostClipboard,
         clock::FrameClock,
         link::ShellLink,
         server::{self, RootlessSpec},
@@ -228,10 +232,13 @@ pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
         surfaced: HashSet::new(),
         hwnds,
     };
-    // TODO(windows): bridge CLIPBOARD with the Windows clipboard.
+    let clipboard = HostClipboard {
+        pasteboard: Box::new(WindowsClipboard::new(message_window)),
+        sync: Arc::new(AtomicBool::new(opts.live.sync_clipboard)),
+    };
     let core = thread::Builder::new()
         .name("yserver-core".into())
-        .spawn(move || server::run_rootless(opts, spec, Box::new(host), None))?;
+        .spawn(move || server::run_rootless(opts, spec, Box::new(host), Some(clipboard)))?;
 
     // No `TranslateMessage`: keys go to X by scan code, not as characters.
     // SAFETY: zeroed is a valid MSG.

@@ -1,10 +1,10 @@
 //! A minimal little-endian X client connection: requests out, replies,
 //! errors and events in. Enough for the clipboard bridge (and its tests).
 
+use super::Stream;
 use std::{
     collections::VecDeque,
     io::{self, Read, Write},
-    os::unix::net::UnixStream,
     time::{Duration, Instant},
 };
 
@@ -92,7 +92,7 @@ impl Req {
 }
 
 pub(crate) struct Conn {
-    stream: UnixStream,
+    stream: Stream,
     /// Bytes read but not yet parsed into packets.
     input: Vec<u8>,
     /// The last request's sequence number.
@@ -108,7 +108,7 @@ pub(crate) struct Conn {
 
 impl Conn {
     /// Run the connection setup on `stream` (no authorization).
-    pub(crate) fn setup(mut stream: UnixStream) -> io::Result<Self> {
+    pub(crate) fn setup(mut stream: Stream) -> io::Result<Self> {
         stream.set_read_timeout(Some(REPLY_TIMEOUT))?;
         stream.write_all(&[b'l', 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0])?;
         let mut header = [0; 8];
