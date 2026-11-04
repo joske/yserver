@@ -1,10 +1,10 @@
 //! The Settings dialog (the tray icon's Settings…, and the rooted window's
 //! system menu), built in code: one instance, brought to front on reopen.
 //! As on macOS, every change is written to the settings file at once; the
-//! live settings also apply at once, the mode at the next start. No Scale:
-//! the process is not DPI-aware yet, so it would change nothing. A
-//! setting a command-line flag fixed for this run is shown disabled and
-//! never written. Start at sign-in is the `Run` registry value, never
+//! live settings also apply at once, the mode and the scale at the next
+//! start. A setting a command-line flag fixed for this run is shown
+//! disabled and never written. Laid out at the dialog's DPI, and again
+//! when that changes. Start at sign-in is the `Run` registry value, never
 //! stored; Restart quits as Exit does and starts yserver again with the
 //! same arguments (`super::run`). UI thread only.
 
@@ -40,18 +40,19 @@ use windows_sys::{
             },
         },
         UI::{
+            HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow, SystemParametersInfoForDpi},
             Input::KeyboardAndMouse::EnableWindow,
             WindowsAndMessaging::{
-                AdjustWindowRectEx, BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX,
-                BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CW_USEDEFAULT,
-                CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowRect, IDC_ARROW, IDCANCEL,
-                IsDialogMessageW, LoadCursorW, MB_ICONWARNING, MB_OK, MSG, MessageBoxW,
-                NONCLIENTMETRICSW, RegisterClassExW, SPI_GETNONCLIENTMETRICS, SW_SHOW,
-                SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowPos, SetWindowTextW,
-                ShowWindow, SystemParametersInfoW, WA_INACTIVE, WINDOW_STYLE, WM_ACTIVATE,
-                WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WM_SETFONT, WNDCLASSEXW,
-                WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_GROUP,
-                WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+                BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON,
+                BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL,
+                CBN_SELCHANGE, CBS_DROPDOWNLIST, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
+                DestroyWindow, GetWindowRect, IDC_ARROW, IDCANCEL, IsDialogMessageW, LoadCursorW,
+                MB_ICONWARNING, MB_OK, MSG, MessageBoxW, NONCLIENTMETRICSW, RegisterClassExW,
+                SPI_GETNONCLIENTMETRICS, SW_SHOW, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
+                SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, WA_INACTIVE,
+                WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY,
+                WM_DPICHANGED, WM_SETFONT, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT,
+                WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
             },
         },
     },
@@ -59,9 +60,10 @@ use windows_sys::{
 };
 
 use crate::{
+    launch::ScaleOption,
     settings::{
-        KEY_MODE, KEY_SYNC_CLIPBOARD, LoginItem, Mode, SetByArgv, Store, file::FileStore, login,
-        restart_view,
+        KEY_MODE, KEY_SCALE, KEY_SYNC_CLIPBOARD, LoginItem, Mode, SetByArgv, Store,
+        file::FileStore, login, restart_view, scale_str,
     },
     surface::link::ShellLink,
 };
@@ -79,6 +81,18 @@ const ID_WINDOW: u16 = 103;
 const ID_RESTART: u16 = 105;
 const ID_CLIPBOARD: u16 = 106;
 const ID_LOGIN: u16 = 107;
+const ID_SCALE: u16 = 108;
+
+/// The scale list's items, in order: macOS's choices, in device pixels
+/// (`--scale` is how many device pixels an X pixel covers per axis).
+const SCALES: [(ScaleOption, &str); 3] = [
+    (ScaleOption::Auto, "Automatic"),
+    (ScaleOption::Factor(1), "1 (one X pixel per screen pixel)"),
+    (
+        ScaleOption::Factor(2),
+        "2 (one X pixel per 2\u{d7}2 screen pixels)",
+    ),
+];
 
 /// `BST_CHECKED`, in `Win32_UI_Controls`.
 const CHECKED: usize = 1;
@@ -107,8 +121,9 @@ pub(super) struct Context {
     /// The clipboard bridge's switch.
     pub(super) sync_clipboard: Arc<AtomicBool>,
     pub(super) set_by_argv: SetByArgv,
-    /// This run's mode, shown when argv fixed it.
+    /// This run's mode and scale, shown when argv fixed them.
     pub(super) mode: Mode,
+    pub(super) scale: ScaleOption,
     /// The rooted window, which the dialog stays above; none when rootless.
     pub(super) owner: HWND,
 }
@@ -178,7 +193,7 @@ pub(super) fn show() {
         }
         return;
     }
-    if let Err(e) = create() {
+    if let Err(e) = create(None) {
         log::error!("windows: cannot open the settings: {e}");
     }
 }
@@ -335,6 +350,16 @@ fn command(hwnd: HWND, id: u16, notification: u16) {
             log::info!("windows: settings: mode = {}", mode.as_str());
         }
         (ID_RESTART, BN_CLICKED) => restart(hwnd),
+        (ID_SCALE, notification) if notification == CBN_SELCHANGE => {
+            // SAFETY: the list of this dialog.
+            let at = unsafe { SendMessageW(item(hwnd, ID_SCALE), CB_GETCURSEL, 0, 0) };
+            let scale = usize::try_from(at)
+                .ok()
+                .and_then(|at| SCALES.get(at))
+                .map_or(ScaleOption::Auto, |&(scale, _)| scale);
+            store.set_string(KEY_SCALE, &scale_str(scale));
+            log::info!("windows: settings: scale = {}", scale_str(scale));
+        }
         (ID_CLIPBOARD, BN_CLICKED) => {
             let on = checked(item(hwnd, ID_CLIPBOARD));
             store.set_bool(KEY_SYNC_CLIPBOARD, on);
@@ -422,6 +447,16 @@ unsafe extern "system" fn wndproc(
             close();
             0
         }
+        WM_DPICHANGED => {
+            // SAFETY: `lparam` is the suggested outer rect for this message.
+            let at = unsafe { *(lparam as *const RECT) };
+            // Built again at the new DPI, where Windows suggests.
+            close();
+            if let Err(e) = create(Some((at.left, at.top))) {
+                log::error!("windows: cannot open the settings again: {e}");
+            }
+            0
+        }
         WM_DESTROY => {
             if let Some(dialog) = DIALOG.take() {
                 // SAFETY: the font is ours and its controls are gone.
@@ -434,17 +469,18 @@ unsafe extern "system" fn wndproc(
     }
 }
 
-/// The message font, as the system's own dialogs use.
-fn message_font() -> HFONT {
+/// The message font at `dpi`, as the system's own dialogs use.
+fn message_font(dpi: u32) -> HFONT {
     // SAFETY: zeroed is a valid NONCLIENTMETRICSW; the call fills it.
     unsafe {
         let mut metrics: NONCLIENTMETRICSW = std::mem::zeroed();
         metrics.cbSize = u32::try_from(size_of::<NONCLIENTMETRICSW>()).unwrap_or(0);
-        if SystemParametersInfoW(
+        if SystemParametersInfoForDpi(
             SPI_GETNONCLIENTMETRICS,
             metrics.cbSize,
             (&raw mut metrics).cast::<c_void>(),
             0,
+            dpi,
         ) == 0
         {
             return ptr::null_mut();
@@ -463,12 +499,21 @@ struct Builder {
     notes: Vec<HWND>,
     /// The right edge of the widest row.
     right: i32,
+    /// The dialog's DPI.
+    dpi: u32,
 }
 
+/// At 96 DPI (100%); [`Builder::px`] scales them.
 const MARGIN: i32 = 12;
 const GAP: i32 = 8;
 
 impl Builder {
+    /// `v` pixels at 96 DPI in this dialog's pixels.
+    fn px(&self, v: i32) -> i32 {
+        let dpi = i32::try_from(self.dpi).unwrap_or(96);
+        (v * dpi + 48) / 96
+    }
+
     fn text_width(&self, text: &str) -> i32 {
         let text: Vec<u16> = text.encode_utf16().collect();
         let mut size = SIZE { cx: 0, cy: 0 };
@@ -530,30 +575,53 @@ impl Builder {
     }
 
     fn button(&mut self, text: &str, id: u16, style: WINDOW_STYLE, at: (i32, i32)) -> HWND {
-        let width = (self.text_width(text) + 24).max(75);
+        let width = (self.text_width(text) + self.px(24)).max(self.px(75));
+        let height = self.line + self.px(9);
         self.control(
             w!("BUTTON"),
             text,
             style | WS_TABSTOP,
             id,
             at,
-            (width, self.line + 9),
+            (width, height),
         )
     }
 
     /// A check box or radio button: the box, a gap and the text.
     fn check(&mut self, text: &str, id: u16, style: WINDOW_STYLE, at: (i32, i32)) -> HWND {
-        let width = self.text_width(text) + 24;
-        self.control(w!("BUTTON"), text, style, id, at, (width, self.line + 4))
+        let width = self.text_width(text) + self.px(24);
+        let height = self.line + self.px(4);
+        self.control(w!("BUTTON"), text, style, id, at, (width, height))
+    }
+
+    /// A drop-down list of `items`, `selected` shown.
+    fn list(&mut self, items: &[&str], selected: usize, id: u16, at: (i32, i32)) -> HWND {
+        let width = items.iter().map(|t| self.text_width(t)).max().unwrap_or(0) + self.px(32);
+        // The height includes the open list.
+        let height = (self.line + self.px(4)) * (i32::try_from(items.len()).unwrap_or(1) + 2);
+        let style = CBS_DROPDOWNLIST as WINDOW_STYLE | WS_VSCROLL | WS_TABSTOP | WS_GROUP;
+        let list = self.control(w!("COMBOBOX"), "", style, id, at, (width, height));
+        for text in items {
+            let text = wide(text);
+            // SAFETY: a list of this thread and a NUL-terminated string.
+            unsafe { SendMessageW(list, CB_ADDSTRING, 0, text.as_ptr() as LPARAM) };
+        }
+        // SAFETY: as above.
+        unsafe { SendMessageW(list, CB_SETCURSEL, selected, 0) };
+        list
     }
 }
 
-fn create() -> std::io::Result<()> {
-    let Some((set_by_argv, run_mode, owner, sync)) = CONTEXT.with_borrow(|context| {
+/// Build and show the dialog, centred (over the owner) or with its top-left
+/// corner `at`.
+#[allow(clippy::too_many_lines)]
+fn create(at: Option<(i32, i32)>) -> std::io::Result<()> {
+    let Some((set_by_argv, run_mode, run_scale, owner, sync)) = CONTEXT.with_borrow(|context| {
         context.as_ref().map(|c| {
             (
                 c.set_by_argv,
                 c.mode,
+                c.scale,
                 c.owner,
                 c.sync_clipboard.load(Ordering::Acquire),
             )
@@ -566,6 +634,11 @@ fn create() -> std::io::Result<()> {
         run_mode
     } else {
         stored.mode
+    };
+    let scale = if set_by_argv.scale {
+        run_scale
+    } else {
+        stored.scale
     };
 
     // SAFETY: the module handle of this executable.
@@ -598,8 +671,8 @@ fn create() -> std::io::Result<()> {
             CLASS_NAME,
             w!("yserver Settings"),
             style,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            at.map_or(CW_USEDEFAULT, |at| at.0),
+            at.map_or(CW_USEDEFAULT, |at| at.1),
             0,
             0,
             owner,
@@ -611,7 +684,12 @@ fn create() -> std::io::Result<()> {
     if hwnd.is_null() {
         return Err(std::io::Error::last_os_error());
     }
-    let font = message_font();
+    // SAFETY: a plain query of the new window (on the monitor it opened on).
+    let dpi = match unsafe { GetDpiForWindow(hwnd) } {
+        0 => 96,
+        dpi => dpi,
+    };
+    let font = message_font(dpi);
     // SAFETY: the dialog's DC, released below.
     let hdc = unsafe { GetDC(hwnd) };
     // SAFETY: a live DC and font.
@@ -623,24 +701,26 @@ fn create() -> std::io::Result<()> {
         line: 0,
         notes: Vec::new(),
         right: 0,
+        dpi,
     };
+    let (margin, gap) = (b.px(MARGIN), b.px(GAP));
     let mut size = SIZE { cx: 0, cy: 0 };
     // SAFETY: as in `text_width`.
     unsafe { GetTextExtentPoint32W(hdc, w!("Xg"), 2, &raw mut size) };
     b.line = size.cy;
-    let row = b.line + 12;
-    let indent = MARGIN
-        + ["X display:", "Mode:"]
+    let row = b.line + b.px(12);
+    let indent = margin
+        + ["X display:", "Mode:", "Scale:"]
             .iter()
             .map(|t| b.text_width(t))
             .max()
             .unwrap_or(0)
-        + GAP;
-    let check_lift = 2;
-    let button_lift = 4;
+        + gap;
+    let check_lift = b.px(2);
+    let button_lift = b.px(4);
 
-    let mut y = MARGIN + button_lift;
-    b.label("X display:", (MARGIN, y));
+    let mut y = margin + button_lift;
+    b.label("X display:", (margin, y));
     let display_width = b
         .text_width("localhost:65535")
         .max(b.text_width("starting"));
@@ -656,18 +736,18 @@ fn create() -> std::io::Result<()> {
         "Copy",
         ID_COPY,
         BS_PUSHBUTTON as WINDOW_STYLE,
-        (indent + display_width + GAP, y - button_lift),
+        (indent + display_width + gap, y - button_lift),
     );
-    y += row + GAP;
+    y += row + gap;
 
-    b.label("Mode:", (MARGIN, y));
+    b.label("Mode:", (margin, y));
     let rootless = b.check(
         "Rootless (a Windows window per X window)",
         ID_ROOTLESS,
         BS_AUTORADIOBUTTON as WINDOW_STYLE | WS_GROUP | WS_TABSTOP,
         (indent, y - check_lift),
     );
-    y += row - 4;
+    y += row - b.px(4);
     let window = b.check(
         "One window for the X screen",
         ID_WINDOW,
@@ -687,30 +767,42 @@ fn create() -> std::io::Result<()> {
             // SAFETY: a control of this thread.
             unsafe { EnableWindow(radio, 0) };
         }
-        y += row - 4;
+        y += row - b.px(4);
+        b.note("set by command line", (indent, y));
+    }
+    y += row + gap;
+
+    b.label("Scale:", (margin, y));
+    let titles: Vec<&str> = SCALES.iter().map(|&(_, title)| title).collect();
+    let selected = SCALES.iter().position(|&(s, _)| s == scale).unwrap_or(0);
+    let list = b.list(&titles, selected, ID_SCALE, (indent, y - button_lift));
+    if set_by_argv.scale {
+        // SAFETY: a control of this thread.
+        unsafe { EnableWindow(list, 0) };
+        y += row;
         b.note("set by command line", (indent, y));
     }
     y += row;
 
-    y += GAP;
+    y += gap;
 
     let (can_restart, restart_note) = restart_view(true, false);
-    b.note(restart_note, (MARGIN, y));
+    b.note(restart_note, (margin, y));
     let restart = b.button(
         "Restart yserver",
         ID_RESTART,
         BS_PUSHBUTTON as WINDOW_STYLE,
-        (MARGIN + b.text_width(restart_note) + GAP, y - button_lift),
+        (margin + b.text_width(restart_note) + gap, y - button_lift),
     );
     // SAFETY: a control of this thread.
     unsafe { EnableWindow(restart, i32::from(can_restart)) };
-    y += row + 2 * GAP;
+    y += row + 2 * gap;
 
     let clipboard = b.check(
         "Sync the clipboard with the Windows clipboard",
         ID_CLIPBOARD,
         BS_AUTOCHECKBOX as WINDOW_STYLE | WS_TABSTOP | WS_GROUP,
-        (MARGIN, y),
+        (margin, y),
     );
     set_checked(clipboard, sync);
     y += row;
@@ -718,20 +810,20 @@ fn create() -> std::io::Result<()> {
         "Start yserver when you sign in",
         ID_LOGIN,
         BS_AUTOCHECKBOX as WINDOW_STYLE | WS_TABSTOP,
-        (MARGIN, y),
+        (margin, y),
     );
     set_checked(login, login_item().view().checked);
-    y += row + 2 * GAP;
+    y += row + 2 * gap;
 
-    let close_width = (b.text_width("Close") + 24).max(75);
-    let width = b.right.max(close_width) + MARGIN;
+    let close_width = (b.text_width("Close") + b.px(24)).max(b.px(75));
+    let width = b.right.max(close_width) + margin;
     b.button(
         "Close",
         IDCANCEL as u16,
         BS_DEFPUSHBUTTON as WINDOW_STYLE,
-        (width - MARGIN - close_width, y),
+        (width - margin - close_width, y),
     );
-    let height = y + b.line + 9 + MARGIN;
+    let height = y + b.line + b.px(9) + margin;
 
     // SAFETY: restores the DC's font and releases it.
     unsafe {
@@ -754,7 +846,7 @@ fn create() -> std::io::Result<()> {
         bottom: height,
     };
     // SAFETY: writes the rectangle; no menu.
-    unsafe { AdjustWindowRectEx(&raw mut frame, style, 0, ex_style) };
+    unsafe { AdjustWindowRectExForDpi(&raw mut frame, style, 0, ex_style, dpi) };
     let (frame_width, frame_height) = (frame.right - frame.left, frame.bottom - frame.top);
     // Centred over the owner, else on the primary screen's work area.
     let mut over = RECT {
@@ -776,7 +868,9 @@ fn create() -> std::io::Result<()> {
             GetWindowRect(owner, &raw mut over)
         }
     } != 0;
-    let (x, y) = if found {
+    let (x, y) = if let Some(at) = at {
+        at
+    } else if found {
         (
             over.left + (over.right - over.left - frame_width) / 2,
             over.top + (over.bottom - over.top - frame_height) / 2,

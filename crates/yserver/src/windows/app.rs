@@ -493,6 +493,7 @@ pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
         sync_clipboard: Arc::clone(&sync_clipboard),
         set_by_argv: opts.set_by_argv,
         mode: Mode::Window,
+        scale: opts.scale,
         owner: hwnd,
     });
     // SAFETY: the window's own menu copy; the strings are NUL-terminated.
