@@ -317,9 +317,10 @@ jobs:
           "VCPKG_ROOT=$root" >> $env:GITHUB_ENV
           "VCPKG_COMMIT=$(git -C $root rev-parse HEAD)" >> $env:GITHUB_ENV
           New-Item -ItemType Directory -Force vcpkg-cache | Out-Null
-      - name: Cache vcpkg packages
+      - name: Restore vcpkg packages
         # Keyed on the vcpkg commit, which pins every port's version.
-        uses: actions/cache@v6
+        id: vcpkg-cache
+        uses: actions/cache/restore@v6
         with:
           path: vcpkg-cache
           key: vcpkg-${{ matrix.target }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('tools/windows/vcpkg-triplets/*', 'tools/windows/vcpkg-env.ps1') }}
@@ -334,6 +335,13 @@ jobs:
       - name: Install the C libraries (vcpkg)
         shell: pwsh
         run: tools/windows/vcpkg-env.ps1 -Target ${{ matrix.target }}
+      - name: Save vcpkg packages
+        # Here rather than at job end, so a later failing step keeps them.
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: vcpkg-cache
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
       - name: Clippy
         # Not --all-targets: the test code does not build on Windows yet.
         run: cargo clippy --workspace -- -D warnings
