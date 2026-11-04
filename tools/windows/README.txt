@@ -17,8 +17,8 @@ first run it creates a cookie file in %LOCALAPPDATA%\yserver\Xauthority
 need to connect. Quit yserver from its icon in the notification area.
 
 Windows Firewall asks whether yserver may accept connections the first time
-it runs. Allow it on the networks your clients come from; WSL2 counts as a
-public network.
+it runs. Allow it on the networks your clients come from; if WSL2 cannot
+connect, allow it on public networks too.
 
 Rootless (start-yserver.cmd, or `yserver.exe :0 -auth FILE --rootless`):
 each X window is a window of its own on the Windows desktop.

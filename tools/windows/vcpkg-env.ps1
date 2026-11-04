@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
 Install the C libraries yserver links with vcpkg, and set the build
-environment for them: PKG_CONFIG, PKG_CONFIG_PATH, PKG_CONFIG_ALL_STATIC and
-GLSLC. Also into $env:GITHUB_ENV on GitHub Actions.
+environment for them: PKG_CONFIG, PKG_CONFIG_PATH, PKG_CONFIG_ALL_STATIC,
+GLSLC and RUSTFLAGS. Also into $env:GITHUB_ENV on GitHub Actions.
 
 .PARAMETER Target
 x86_64-pc-windows-msvc or aarch64-pc-windows-msvc. Default: the host's.
@@ -47,6 +47,11 @@ $vars = [ordered]@{
     # freetype's own dependencies (zlib, libpng, ...) are in its Libs.private.
     PKG_CONFIG_ALL_STATIC = '1'
     GLSLC                 = "$installed\tools\shaderc\glslc.exe"
+    # The xkbcommon crate's `#[link]` is dylib-kind, so it calls through
+    # __imp_ pointers that a static library lacks; a static `-l` overrides
+    # that kind in every crate.
+    RUSTFLAGS             = (@($env:RUSTFLAGS, "-L native=$installed\lib -l static=xkbcommon") |
+            Where-Object { $_ }) -join ' '
 }
 foreach ($kv in $vars.GetEnumerator()) {
     Set-Item "env:$($kv.Key)" $kv.Value
