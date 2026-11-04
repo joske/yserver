@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
 Set up what building yserver on Windows needs: the C libraries from vcpkg
-(static, on the DLL CRT, release only), glslc from the Vulkan SDK, and the
+(static, on the static CRT, release only), glslc from the Vulkan SDK, and the
 environment for them: PKG_CONFIG, PKG_CONFIG_PATH, PKG_CONFIG_ALL_STATIC,
-GLSLC and RUSTFLAGS. Also into $env:GITHUB_ENV on GitHub Actions.
+GLSLC and RUSTFLAGS, with +crt-static so the exe needs no Visual C++ runtime. Also into $env:GITHUB_ENV on GitHub Actions.
 
 .PARAMETER Target
 x86_64-pc-windows-msvc or aarch64-pc-windows-msvc. Default: the host's.
@@ -12,7 +12,7 @@ x86_64-pc-windows-msvc or aarch64-pc-windows-msvc. Default: the host's.
 Default: $env:VCPKG_ROOT, else $env:VCPKG_INSTALLATION_ROOT, else C:\vcpkg.
 
 .PARAMETER Triplet
-Default: <arch>-windows-static-md-release, from tools/windows/vcpkg-triplets;
+Default: <arch>-windows-static-release, from tools/windows/vcpkg-triplets;
 also the host triplet, so vcpkg's host tools are release-only too.
 #>
 param(
@@ -31,7 +31,7 @@ if (-not $Target) {
     $Target = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
 }
 $vcpkgArch = @{ 'x86_64' = 'x64'; 'aarch64' = 'arm64' }[$Target.Split('-')[0]]
-if (-not $Triplet) { $Triplet = "$vcpkgArch-windows-static-md-release" }
+if (-not $Triplet) { $Triplet = "$vcpkgArch-windows-static-release" }
 if (-not $VcpkgRoot) {
     $VcpkgRoot = @($env:VCPKG_ROOT, $env:VCPKG_INSTALLATION_ROOT, 'C:\vcpkg') |
         Where-Object { $_ -and (Test-Path "$_\vcpkg.exe") } | Select-Object -First 1
@@ -85,10 +85,14 @@ $vars = [ordered]@{
     # freetype's own dependencies (zlib, libpng, ...) are in its Libs.private.
     PKG_CONFIG_ALL_STATIC = '1'
     GLSLC                 = "$glslcDir\glslc.exe"
+    # The static CRT, as the vcpkg libraries are built against: mixing the
+    # two is LNK4098 at best. Here rather than in .cargo/config.toml, which
+    # RUSTFLAGS would override and which would break DLL-CRT vcpkg builds.
     # The xkbcommon crate's `#[link]` is dylib-kind, so it calls through
     # __imp_ pointers that a static library lacks; a static `-l` overrides
     # that kind in every crate.
-    RUSTFLAGS             = (@($env:RUSTFLAGS, "-L native=$installed\lib -l static=xkbcommon") |
+    RUSTFLAGS             = (@($env:RUSTFLAGS,
+            "-C target-feature=+crt-static -L native=$installed\lib -l static=xkbcommon") |
             Where-Object { $_ }) -join ' '
 }
 foreach ($kv in $vars.GetEnumerator()) {

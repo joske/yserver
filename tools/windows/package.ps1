@@ -63,7 +63,8 @@ Invoke-Native cargo @('build', '--release', '--locked', '--manifest-path', "$rep
     '--target', $Target, '-p', 'yserver', '--bin', 'yserver')
 $exe = "$repo\target\$Target\release\yserver.exe"
 
-# Only system DLLs: the libraries above must be linked in, not imported.
+# Only system DLLs: the libraries above must be linked in, not imported,
+# and so must the CRT (no vcruntime140.dll, no api-ms-win-crt-*).
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $hostDir = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'Hostarm64' } else { 'Hostx64' }
 $dumpbin = & $vswhere -latest -products * -find 'VC\Tools\MSVC\**\bin\**\dumpbin.exe' |
@@ -71,10 +72,9 @@ $dumpbin = & $vswhere -latest -products * -find 'VC\Tools\MSVC\**\bin\**\dumpbin
 if (-not $dumpbin) { throw 'dumpbin not found' }
 $dependents = & $dumpbin /nologo /dependents $exe |
     ForEach-Object { $_.Trim() } | Where-Object { $_ -match '\.dll$' }
-$system = '^(api-ms-win-.*|kernel32|ntdll|user32|gdi32|advapi32|ws2_32|bcrypt|bcryptprimitives|' +
+$system = '^(api-ms-win-(?!crt-).*|kernel32|ntdll|user32|gdi32|advapi32|ws2_32|bcrypt|bcryptprimitives|' +
     'shell32|ole32|oleaut32|dwmapi|imm32|comctl32|shcore|uxtheme|userenv|secur32|crypt32|' +
-    'winmm|version|ucrtbase|shlwapi|combase|powrprof|setupapi|dbghelp|' +
-    'vcruntime140|vcruntime140_1|vulkan-1)\.dll$'
+    'winmm|version|shlwapi|combase|powrprof|setupapi|dbghelp|vulkan-1)\.dll$'
 Write-Host "yserver.exe imports: $($dependents -join ', ')"
 $foreign = @($dependents | Where-Object { $_ -notmatch $system })
 if ($foreign) { throw "yserver.exe imports non-system DLLs: $($foreign -join ', ')" }

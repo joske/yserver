@@ -90,8 +90,7 @@ Files
   LICENSE.txt          yserver's license
   licenses\            the licenses of the libraries and data in this build
 
-yserver.exe needs the Microsoft Visual C++ runtime (vcruntime140.dll),
-which most systems have; if it is missing, install the "Microsoft Visual
-C++ Redistributable" for your CPU from Microsoft.
+yserver.exe needs no Visual C++ Redistributable: the C runtime is linked
+in.
 
 For more output, set RUST_LOG=debug before starting it.
