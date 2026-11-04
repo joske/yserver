@@ -25,6 +25,9 @@ See [`docs/extensions.txt`](docs/extensions.txt) for a list of all supported/imp
 
 ### Recent work
 
+- Windows (x86_64 and aarch64): X clients from WSL or other machines show up
+  on the Windows desktop, each in its own window or in one rooted window, with
+  a shared clipboard, a Settings dialog and DPI awareness
 - macOS: yserver runs in a window on Apple Silicon (Mesa KosmicKrisp), with a
   Dock icon and a Settings window; rootless mode gives every X window its own
   Mac window
@@ -263,6 +266,40 @@ Clients connect with the display number, e.g. with XQuartz's clients:
 ```sh
 DISPLAY=:1 /opt/X11/bin/xterm
 ```
+
+### Windows
+
+yserver runs on Windows 11 (x86_64 and aarch64) and needs a GPU driver
+with Vulkan 1.3. Portable zips (`yserver-<version>-windows-<arch>.zip`) are
+built by CI; nothing needs installing, the C runtime and libraries are linked
+in. The zip's `README.txt` covers it in full.
+
+Run `start-yserver.cmd`: it starts display `:0`, creates a cookie in
+`%LOCALAPPDATA%\yserver\Xauthority` on first use and prints it. Clients
+connect over TCP only. yserver's icon in the notification area opens Settings
+and quits it.
+
+- rootless (the default): every X top-level window is its own Windows window;
+  `--rooted` puts the whole X screen in one window instead
+- text copied in X clients (CLIPBOARD) can be pasted in Windows apps, and the
+  other way round
+- Scale works as on macOS: `auto` uses 1 X pixel per screen pixel up to 125%
+  and 2 from 150%
+
+From WSL2 (default NAT networking):
+
+```sh
+export DISPLAY=$(ip route show default | awk '{print $3}'):0
+export XAUTHORITY=/mnt/c/Users/<you>/AppData/Local/yserver/Xauthority
+xterm &
+```
+
+`ssh -X` from Windows' own ssh client does not work yet (it has no `xauth`);
+use `ssh -R 6010:127.0.0.1:6000 host` and add the cookie for `localhost:10`
+on the remote host.
+
+To build it yourself, `tools/windows/package.ps1` installs the C libraries
+with vcpkg, builds yserver and makes the zip.
 
 ## Regression coverage with xts5 and rendercheck
 
