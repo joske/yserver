@@ -5,6 +5,7 @@ on:
   pull_request:
     branches: [master]
   workflow_call:
+  workflow_dispatch:
 env:
   CARGO_TERM_COLOR: always
 jobs:
@@ -81,7 +82,7 @@ jobs:
         # beyond bash. No cargo involved, so feature-independent; run once.
         if: matrix.name == 'unix-only'
         run: |
-          shellcheck -s sh starty tools/install-smoke.sh tools/check-layout.sh
+          shellcheck -s sh starty tools/install-smoke.sh tools/check-layout.sh tools/windows/build-xkb-data.sh
           dash ./starty --help > /dev/null
       - name: Render man pages
         # scdoc only — feature-independent. Kept on the same leg as the two
@@ -265,3 +266,88 @@ jobs:
         env:
           YSERVER_ALLOW_SOFTWARE_VULKAN: "1"
         run: cargo test --workspace --locked --no-fail-fast -- --ignored
+  xkb-data:
+    # The XKB data the Windows zip ships, from a pinned xkeyboard-config
+    # release: its rules files are generated at build time (meson, python,
+    # perl), so build it once here and hand it to both Windows legs.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure apt (mirror, retries)
+        run: |
+          printf 'http://mirrors.edge.kernel.org/ubuntu/\tpriority:1\nhttp://archive.ubuntu.com/ubuntu/\tpriority:2\n' | sudo tee /etc/apt/apt-mirrors.txt
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "20";\n' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
+      - name: Install meson
+        timeout-minutes: 5
+        run: sudo apt-get update && sudo apt-get install -y meson ninja-build
+      - name: Build the XKB data
+        run: sh tools/windows/build-xkb-data.sh target/xkb-data
+      - uses: actions/upload-artifact@v7
+        with:
+          name: xkb-data
+          path: target/xkb-data
+          if-no-files-found: error
+  windows:
+    needs: xkb-data
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    env:
+      # vcpkg builds shaderc (glslang, SPIRV-Tools) from source, so keep its
+      # binary packages between runs: a files cache, saved by actions/cache.
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}\vcpkg-cache,readwrite
+    steps:
+      - uses: actions/checkout@v7
+      - name: Locate vcpkg
+        # The x64 image ships vcpkg; clone it where an image does not.
+        shell: pwsh
+        run: |
+          $root = $env:VCPKG_INSTALLATION_ROOT
+          if (-not ($root -and (Test-Path "$root\vcpkg.exe"))) {
+            $root = "$env:RUNNER_TEMP\vcpkg"
+            git clone --quiet https://github.com/microsoft/vcpkg $root
+            & "$root\bootstrap-vcpkg.bat" -disableMetrics
+          }
+          "VCPKG_ROOT=$root" >> $env:GITHUB_ENV
+          "VCPKG_COMMIT=$(git -C $root rev-parse HEAD)" >> $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force vcpkg-cache | Out-Null
+      - name: Cache vcpkg packages
+        # Keyed on the vcpkg commit, which pins every port's version.
+        uses: actions/cache@v6
+        with:
+          path: vcpkg-cache
+          key: vcpkg-${{ matrix.target }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('tools/windows/vcpkg-triplets/*', 'tools/windows/vcpkg-env.ps1') }}
+          restore-keys: vcpkg-${{ matrix.target }}-
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          components: clippy
+          toolchain: stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install the C libraries (vcpkg)
+        shell: pwsh
+        run: tools/windows/vcpkg-env.ps1 -Target ${{ matrix.target }}
+      - name: Clippy
+        # Not --all-targets: the test code does not build on Windows yet.
+        run: cargo clippy --workspace -- -D warnings
+      - uses: actions/download-artifact@v8
+        with:
+          name: xkb-data
+          path: target/xkb-data
+      - name: Build the zip
+        id: package
+        shell: pwsh
+        run: tools/windows/package.ps1 -Target ${{ matrix.target }} -XkbData target/xkb-data
+      - uses: actions/upload-artifact@v7
+        with:
+          # The zip itself, not zipped again; the artifact takes its name.
+          path: ${{ steps.package.outputs.zip }}
+          archive: false
+          if-no-files-found: error
