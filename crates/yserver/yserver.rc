@@ -1,0 +1,2 @@
+// The icon of yserver.exe, its windows and its tray icon (src/windows/icon.rs).
+1 ICON "../../assets/yserver.ico"

@@ -44,8 +44,8 @@ use windows_sys::{
                 AdjustWindowRectEx, BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX,
                 BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL,
                 CB_SETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST, CW_USEDEFAULT, CreateWindowExW,
-                DefWindowProcW, DestroyWindow, GetWindowRect, IDC_ARROW, IDCANCEL, IDI_APPLICATION,
-                IsDialogMessageW, LoadCursorW, LoadIconW, MB_ICONWARNING, MB_OK, MSG, MessageBoxW,
+                DefWindowProcW, DestroyWindow, GetWindowRect, IDC_ARROW, IDCANCEL,
+                IsDialogMessageW, LoadCursorW, MB_ICONWARNING, MB_OK, MSG, MessageBoxW,
                 NONCLIENTMETRICSW, RegisterClassExW, SPI_GETNONCLIENTMETRICS, SW_SHOW,
                 SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowPos, SetWindowTextW,
                 ShowWindow, SystemParametersInfoW, WA_INACTIVE, WINDOW_STYLE, WM_ACTIVATE,
@@ -607,15 +607,14 @@ fn create() -> std::io::Result<()> {
         cbClsExtra: 0,
         cbWndExtra: 0,
         hInstance: instance,
-        // SAFETY: system resources by predefined id.
-        hIcon: unsafe { LoadIconW(ptr::null_mut(), IDI_APPLICATION) },
-        // SAFETY: as above.
+        hIcon: super::icon::large(),
+        // SAFETY: a system resource by predefined id.
         hCursor: unsafe { LoadCursorW(ptr::null_mut(), IDC_ARROW) },
         // SAFETY: a system brush, never freed.
         hbrBackground: unsafe { GetSysColorBrush(COLOR_BTNFACE) },
         lpszMenuName: ptr::null(),
         lpszClassName: CLASS_NAME,
-        hIconSm: ptr::null_mut(),
+        hIconSm: super::icon::small(),
     };
     // SAFETY: a fully initialised class description; registering twice
     // fails harmlessly.

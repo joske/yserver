@@ -21,10 +21,9 @@ use windows_sys::{
                 Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
-                AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, IDI_APPLICATION,
-                LoadIconW, MF_STRING, PostMessageW, RegisterWindowMessageW, SetForegroundWindow,
-                TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP, WM_CONTEXTMENU, WM_NULL,
-                WM_RBUTTONUP,
+                AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, MF_STRING, PostMessageW,
+                RegisterWindowMessageW, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+                TrackPopupMenu, WM_APP, WM_CONTEXTMENU, WM_NULL, WM_RBUTTONUP,
             },
         },
     },
@@ -65,8 +64,7 @@ impl Tray {
         data.uID = 1;
         data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         data.uCallbackMessage = WM_TRAY;
-        // SAFETY: a system resource by predefined id.
-        data.hIcon = unsafe { LoadIconW(ptr::null_mut(), IDI_APPLICATION) };
+        data.hIcon = super::icon::small();
         let tip = match self.display {
             Some(display) => format!("yserver DISPLAY=:{display}"),
             None => "yserver".to_owned(),

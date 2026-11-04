@@ -6,6 +6,7 @@ mod app;
 mod clipboard;
 mod cursor;
 mod frame_clock;
+mod icon;
 mod input;
 mod resize;
 mod rootless;
