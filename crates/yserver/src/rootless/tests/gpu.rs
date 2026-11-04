@@ -133,6 +133,53 @@ fn presented_image_holds_the_backing() {
     f.assert_validation_clean();
 }
 
+/// A host copy scale of 2 (Windows at 200%) shows each backing pixel as
+/// 2x2 swapchain pixels: the headless surface takes the extent asked for,
+/// so the image is twice the backing and holds it blown up. Oracle:
+/// `get_image` of the backing, each pixel repeated.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_copy_scale_of_two_shows_each_backing_pixel_as_two_by_two() {
+    let Some(mut f) = Fixture::gpu_or_skip(|log| log.copy_scale = 2) else {
+        return;
+    };
+    mapped(&mut f);
+    f.fill(W, 0x00ff_0000, (3, 3, 10, 7));
+    shown_until(&mut f, 1);
+    let id = f.id(W);
+    let vk = f.b.platform.gpu().vk().expect("vk").clone();
+    if !with_swapchain(&mut f, id, WindowSwapchain::capture_next) {
+        eprintln!("skipping: the surface makes no TRANSFER_SRC images");
+        return;
+    }
+    f.fill(W, 0x0000_ff00, (20, 10, 9, 9));
+    shown_until(&mut f, 2);
+    let captured = with_swapchain(&mut f, id, |sc| {
+        sc.last_copy
+            .as_ref()
+            .expect("a copy")
+            .wait(&vk)
+            .expect("copy done");
+        sc.capture.as_ref().and_then(Capture::bytes)
+    })
+    .expect("captured the presented image");
+    // The 40x30 window has a 2-pixel border: a 44x34 backing.
+    let backing = f.full_readback(W);
+    let (w, h) = (44, 34);
+    assert_eq!(backing.len(), w * h * 4);
+    let mut expected = Vec::with_capacity(backing.len() * 4);
+    for row in backing.chunks_exact(w * 4) {
+        let wide: Vec<u8> = row
+            .chunks_exact(4)
+            .flat_map(|px| px.iter().chain(px).copied().collect::<Vec<u8>>())
+            .collect();
+        expected.extend_from_slice(&wide);
+        expected.extend_from_slice(&wide);
+    }
+    assert_eq!(captured, expected);
+    f.assert_validation_clean();
+}
+
 /// §4.5: the GPU path acks after a successful present only; a failed one
 /// leaves the damage in the store.
 #[test]

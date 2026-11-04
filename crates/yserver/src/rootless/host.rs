@@ -93,6 +93,12 @@ pub(crate) trait RootlessHost {
     fn first_frame(&mut self, id: ToplevelId);
     /// Lifecycle, after the presenter applied the batch.
     fn on_events(&mut self, events: &[RootlessEvent]);
+    /// `VulkanSurface`: swapchain pixels per X pixel per axis, for a window
+    /// system whose surfaces are in device pixels (Windows); 1 shows the
+    /// backing 1:1.
+    fn copy_scale(&self) -> u32 {
+        1
+    }
     /// `id` has a frame waiting for `Ready`: arm the pacing signal (D7).
     #[allow(dead_code, reason = "readiness gating (RL1 Task 5)")]
     fn frame_wanted(&mut self, _id: ToplevelId) {}

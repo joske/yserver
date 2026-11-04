@@ -150,6 +150,7 @@ impl GpuState {
             .peek_presentation_damage(backing)
             .filter(|s| !s.region.is_empty());
         let extent = t.store.get(backing).map(|d| d.storage.extent);
+        sc.set_copy_scale(host.copy_scale());
         if let Some(e) = extent.filter(|&e| sc.rebuild_due(e, frames.backing_gen())) {
             host.surface_resizing(id, (e.width, e.height));
         }

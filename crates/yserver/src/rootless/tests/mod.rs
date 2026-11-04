@@ -83,6 +83,8 @@ pub(super) struct HostLog {
     pub deliver: Deliver,
     pub release: Release,
     pub handoff: HandoffKind,
+    /// `RootlessHost::copy_scale`.
+    pub copy_scale: u32,
     pub calls: Vec<Call>,
     /// Every submitted frame's metadata and a copy of its bytes.
     pub frames: Vec<FrameCopy>,
@@ -115,6 +117,10 @@ pub(super) struct RecordingHost {
 impl RootlessHost for RecordingHost {
     fn handoff(&self, _id: ToplevelId, _depth: u8) -> HandoffKind {
         lock(&self.log).handoff
+    }
+
+    fn copy_scale(&self) -> u32 {
+        lock(&self.log).copy_scale
     }
 
     /// A `VK_EXT_headless_surface` (the context must enable it).
@@ -271,6 +277,7 @@ impl Fixture {
             deliver: Deliver::Immediate,
             release: Release::Immediate,
             handoff: HandoffKind::Cpu,
+            copy_scale: 1,
             calls: Vec::new(),
             frames: Vec::new(),
             held: Vec::new(),

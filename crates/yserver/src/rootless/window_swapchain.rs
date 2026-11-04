@@ -17,7 +17,10 @@ use crate::{
         },
         vk::device::VkContext,
     },
-    surface::swapchain::chain::{Acquire, AlphaMode, Chain, Present, Swapchain},
+    surface::swapchain::{
+        chain::{Acquire, AlphaMode, Chain, Present, Swapchain},
+        copy_region,
+    },
 };
 
 /// Acquire semaphores (and copy command buffers) in rotation, as
@@ -67,6 +70,11 @@ pub(crate) struct WindowSwapchain {
     /// The backing generation and extent the swapchain was built for.
     backing_gen: u64,
     extent: vk::Extent2D,
+    /// Swapchain pixels per backing pixel per axis, as the host asked.
+    copy_scale: u32,
+    /// The device blits backing → swapchain image; without it the copy
+    /// stays 1:1 whatever the scale.
+    blit: bool,
     pool: vk::CommandPool,
     syncs: Vec<FrameSync>,
     next_sync: usize,
@@ -125,6 +133,8 @@ impl WindowSwapchain {
             maintenance1,
             backing_gen: 0,
             extent: vk::Extent2D::default(),
+            copy_scale: 1,
+            blit: false,
             pool,
             syncs: Vec::new(),
             next_sync: 0,
@@ -181,9 +191,41 @@ impl WindowSwapchain {
         if readable {
             self.chain.extra_usage = vk::ImageUsageFlags::TRANSFER_SRC;
             self.needs_rebuild = true;
-            self.capture = Some(Capture::new(&self.vk, self.extent));
+            let scale = self.effective_scale();
+            let image = vk::Extent2D {
+                width: self.extent.width * scale,
+                height: self.extent.height * scale,
+            };
+            self.capture = Some(Capture::new(&self.vk, image));
         }
         readable
+    }
+
+    /// Show each backing pixel as `scale`x`scale` swapchain pixels (nearest)
+    /// from the next present on.
+    pub(crate) fn set_copy_scale(&mut self, scale: u32) {
+        let scale = scale.max(1);
+        if scale != self.copy_scale {
+            self.copy_scale = scale;
+            self.needs_rebuild = true;
+        }
+    }
+
+    /// The copy scale the device can do.
+    fn effective_scale(&self) -> u32 {
+        if self.blit { self.copy_scale } else { 1 }
+    }
+
+    /// Whether `format` blits from and to itself (optimal tiling).
+    fn blits(&self, format: vk::Format) -> bool {
+        // SAFETY: a physical device of this instance.
+        let features = unsafe {
+            self.vk
+                .instance
+                .get_physical_device_format_properties(self.vk.physical_device, format)
+        }
+        .optimal_tiling_features;
+        features.contains(vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST)
     }
 
     /// Whether `present` at this backing `extent` and generation (re)builds
@@ -234,13 +276,23 @@ impl WindowSwapchain {
         {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
+        self.blit = self.copy_scale == 1 || self.blits(format.format);
+        if !self.blit {
+            log::warn!(
+                "rootless: no backing → swapchain blit on this device; scale {} shown 1:1",
+                self.copy_scale
+            );
+        }
+        let scale = self.effective_scale();
         let image_extent = if caps.current_extent.width == u32::MAX {
             vk::Extent2D {
                 width: extent
                     .width
+                    .saturating_mul(scale)
                     .clamp(caps.min_image_extent.width, caps.max_image_extent.width),
                 height: extent
                     .height
+                    .saturating_mul(scale)
                     .clamp(caps.min_image_extent.height, caps.max_image_extent.height),
             }
         } else {
@@ -530,6 +582,7 @@ impl WindowSwapchain {
                 src_extent,
                 image,
                 image_extent,
+                self.effective_scale(),
                 if capture.is_some() {
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL
                 } else {
@@ -840,7 +893,9 @@ thread_local! {
 ///
 /// # Safety
 ///
-/// `cb` is recording; both images belong to `device`.
+/// `cb` is recording; both images belong to `device`; a `scale` above 1
+/// needs both formats to blit.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn record_backing_copy(
     device: &ash::Device,
     cb: vk::CommandBuffer,
@@ -848,6 +903,7 @@ pub(crate) unsafe fn record_backing_copy(
     src_extent: vk::Extent2D,
     image: vk::Image,
     image_extent: vk::Extent2D,
+    scale: u32,
     final_layout: vk::ImageLayout,
 ) {
     let range = vk::ImageSubresourceRange::default()
@@ -862,10 +918,7 @@ pub(crate) unsafe fn record_backing_copy(
         .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
         .image(image)
         .subresource_range(range)];
-    let copy = vk::Extent2D {
-        width: src_extent.width.min(image_extent.width),
-        height: src_extent.height.min(image_extent.height),
-    };
+    let region = copy_region(src_extent, image_extent, scale);
     let layers = vk::ImageSubresourceLayers::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .layer_count(1);
@@ -874,7 +927,7 @@ pub(crate) unsafe fn record_backing_copy(
             cb,
             &vk::DependencyInfo::default().image_memory_barriers(&to_dst),
         );
-        if copy != image_extent {
+        if region.clear {
             device.cmd_clear_color_image(
                 cb,
                 image,
@@ -898,13 +951,15 @@ pub(crate) unsafe fn record_backing_copy(
                 &vk::DependencyInfo::default().image_memory_barriers(&cleared),
             );
         }
-        if copy.width > 0 && copy.height > 0 {
-            let region = [vk::ImageCopy::default()
+        if region.src.width == 0 || region.src.height == 0 {
+            // Nothing of the backing fits.
+        } else if region.scale == 1 {
+            let copy = [vk::ImageCopy::default()
                 .src_subresource(layers)
                 .dst_subresource(layers)
                 .extent(vk::Extent3D {
-                    width: copy.width,
-                    height: copy.height,
+                    width: region.src.width,
+                    height: region.src.height,
                     depth: 1,
                 })];
             device.cmd_copy_image(
@@ -913,7 +968,27 @@ pub(crate) unsafe fn record_backing_copy(
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &region,
+                &copy,
+            );
+        } else {
+            let corner = |extent: vk::Extent2D| vk::Offset3D {
+                x: i32::try_from(extent.width).unwrap_or(i32::MAX),
+                y: i32::try_from(extent.height).unwrap_or(i32::MAX),
+                z: 1,
+            };
+            let blit = [vk::ImageBlit::default()
+                .src_subresource(layers)
+                .src_offsets([vk::Offset3D::default(), corner(region.src)])
+                .dst_subresource(layers)
+                .dst_offsets([vk::Offset3D::default(), corner(region.dst)])];
+            device.cmd_blit_image(
+                cb,
+                src,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &blit,
+                vk::Filter::NEAREST,
             );
         }
         let after = [vk::ImageMemoryBarrier2::default()
