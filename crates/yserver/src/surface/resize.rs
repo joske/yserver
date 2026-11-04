@@ -76,6 +76,80 @@ pub(crate) fn to_px(points: f64, scale: f64) -> u16 {
     px.clamp(1.0, f64::from(u16::MAX)) as u16
 }
 
+/// Logical pixels per inch on Windows: 100% display scaling.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(crate) const BASE_DPI: u32 = 96;
+
+/// `--scale` on a window system whose window coordinates are device
+/// pixels (Windows, per-monitor DPI aware): a logical pixel (`BASE_DPI`)
+/// is the point, the monitor's DPI over `BASE_DPI` the backing scale.
+/// Every window size, position and pointer coordinate is in device
+/// pixels, and one X pixel covers `factor`x`factor` of them, so the
+/// mapping is whole device pixels over the copy factor; the X pixels per
+/// point follow from the backing scale exactly as on macOS.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PixelScale {
+    /// Device pixels per logical pixel.
+    pub(crate) backing: f64,
+    /// X pixels per logical pixel.
+    pub(crate) xpp: f64,
+    /// Device pixels per X pixel per axis.
+    pub(crate) factor: u32,
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+impl PixelScale {
+    /// `option` on a monitor of `dpi` (0: unknown, as `BASE_DPI`).
+    pub(crate) fn new(option: ScaleOption, dpi: u32) -> Self {
+        let backing = if dpi == 0 {
+            1.0
+        } else {
+            f64::from(dpi) / f64::from(BASE_DPI)
+        };
+        Self {
+            backing,
+            xpp: x_per_point(option, backing),
+            factor: copy_factor(option, backing),
+        }
+    }
+
+    /// A device-pixel coordinate in X pixels, unfloored (the pointer).
+    pub(crate) fn to_x_coord(self, device: f64) -> f64 {
+        device / f64::from(self.factor)
+    }
+
+    /// `device` pixels (a window's client area) in whole X pixels, within
+    /// `1..=u16::MAX`; a remainder below one X pixel is not shown.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Clamped.
+    pub(crate) fn to_x(self, device: (i32, i32)) -> Size {
+        let px = |v: i32| (v / self.factor as i32).clamp(1, i32::from(u16::MAX)) as u16;
+        (px(device.0), px(device.1))
+    }
+
+    /// `size` X pixels in device pixels.
+    pub(crate) fn to_device(self, size: Size) -> (i32, i32) {
+        let px = |v: u16| i32::from(v).saturating_mul(self.factor as i32);
+        (px(size.0), px(size.1))
+    }
+
+    /// `size` X pixels in millimetres on a monitor of `display_mm` over
+    /// `display_device` device pixels; `(0, 0)` when it does not say.
+    pub(crate) fn mm(
+        &self,
+        size: Size,
+        display_mm: (f64, f64),
+        display_device: (f64, f64),
+    ) -> (u32, u32) {
+        output_mm(
+            size,
+            1.0 / f64::from(self.factor),
+            display_mm,
+            display_device,
+        )
+    }
+}
+
 /// The window's content size changes in, the sizes to post out.
 #[derive(Debug)]
 pub(crate) struct ResizeCoalescer {
@@ -156,7 +230,7 @@ impl ResizeCoalescer {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResizeCoalescer, copy_factor, output_mm, to_px, x_per_point};
+    use super::{PixelScale, ResizeCoalescer, copy_factor, output_mm, to_px, x_per_point};
     use crate::launch::ScaleOption;
 
     #[test]
@@ -209,6 +283,98 @@ mod tests {
         assert_eq!(output_mm((1280, 800), 1.0, (0.0, 0.0), pt), (0, 0));
         assert_eq!(output_mm((1280, 800), 1.0, mm, (0.0, 956.0)), (0, 0));
         assert_eq!(output_mm((1280, 800), f64::NAN, mm, pt), (0, 0));
+    }
+
+    /// Windows display scaling 100/125/150/200% is 96/120/144/192 DPI,
+    /// backing 1, 1.25, 1.5, 2 device pixels per logical pixel. Auto rounds
+    /// the backing (half away from zero, as macOS's Auto): 1, 1, 2, 2; a
+    /// fixed scale keeps its factor. X pixels per logical pixel are the
+    /// backing over the factor.
+    #[test]
+    fn pixel_scale_factor_and_x_per_logical_pixel() {
+        let cases = [
+            // (dpi, option, factor, xpp)
+            (96, ScaleOption::Auto, 1, 1.0),
+            (96, ScaleOption::Factor(1), 1, 1.0),
+            (96, ScaleOption::Factor(2), 2, 0.5),
+            (120, ScaleOption::Auto, 1, 1.25),
+            (120, ScaleOption::Factor(1), 1, 1.25),
+            (120, ScaleOption::Factor(2), 2, 0.625),
+            (144, ScaleOption::Auto, 2, 0.75),
+            (144, ScaleOption::Factor(1), 1, 1.5),
+            (144, ScaleOption::Factor(2), 2, 0.75),
+            (192, ScaleOption::Auto, 2, 1.0),
+            (192, ScaleOption::Factor(1), 1, 2.0),
+            (192, ScaleOption::Factor(2), 2, 1.0),
+            // 175%: 1.75 rounds to 2.
+            (168, ScaleOption::Auto, 2, 0.875),
+        ];
+        for (dpi, option, factor, xpp) in cases {
+            let s = PixelScale::new(option, dpi);
+            assert_eq!(s.factor, factor, "{dpi} dpi {option:?}");
+            assert_eq!(s.xpp, xpp, "{dpi} dpi {option:?}");
+        }
+        assert_eq!(PixelScale::new(ScaleOption::Auto, 0).factor, 1, "unknown");
+        assert_eq!(PixelScale::new(ScaleOption::Auto, 0).xpp, 1.0, "unknown");
+    }
+
+    /// A window of 1024x768 logical pixels is 1024x768 device pixels at
+    /// 100%, 1280x960 at 125%, 1536x1152 at 150%, 2048x1536 at 200%; the X
+    /// screen is that over the factor.
+    #[test]
+    fn pixel_scale_window_sizes() {
+        let cases = [
+            // (dpi, device client area, option, X size)
+            (96, (1024, 768), ScaleOption::Auto, (1024, 768)),
+            (96, (1024, 768), ScaleOption::Factor(1), (1024, 768)),
+            (96, (1024, 768), ScaleOption::Factor(2), (512, 384)),
+            (120, (1280, 960), ScaleOption::Auto, (1280, 960)),
+            (120, (1280, 960), ScaleOption::Factor(1), (1280, 960)),
+            (120, (1280, 960), ScaleOption::Factor(2), (640, 480)),
+            (144, (1536, 1152), ScaleOption::Auto, (768, 576)),
+            (144, (1536, 1152), ScaleOption::Factor(1), (1536, 1152)),
+            (144, (1536, 1152), ScaleOption::Factor(2), (768, 576)),
+            (192, (2048, 1536), ScaleOption::Auto, (1024, 768)),
+            (192, (2048, 1536), ScaleOption::Factor(1), (2048, 1536)),
+            (192, (2048, 1536), ScaleOption::Factor(2), (1024, 768)),
+        ];
+        for (dpi, device, option, x) in cases {
+            let s = PixelScale::new(option, dpi);
+            assert_eq!(s.to_x(device), x, "{dpi} dpi {option:?}");
+            assert_eq!(s.to_device(x), device, "{dpi} dpi {option:?}");
+        }
+        let two = PixelScale::new(ScaleOption::Auto, 144);
+        // 1537 / 2 = 768.5: the last device column shows nothing.
+        assert_eq!(two.to_x((1537, 1153)), (768, 576));
+        assert_eq!(two.to_x((1, 0)), (1, 1), "at least one X pixel");
+        assert_eq!(two.to_x((-4, 200_000)), (1, u16::MAX));
+        // `--geometry 1024x768` at 150% Auto: 2048x1536 device pixels,
+        // 1365.33 logical pixels wide, as 1024 / 0.75 points on macOS.
+        assert_eq!(two.to_device((1024, 768)), (2048, 1536));
+    }
+
+    #[test]
+    fn pixel_scale_pointer_coordinates() {
+        let two = PixelScale::new(ScaleOption::Factor(2), 192);
+        // Device pixels 300 and 301 are both X pixel 150.
+        assert_eq!(two.to_x_coord(300.0), 150.0);
+        assert_eq!(two.to_x_coord(301.0), 150.5);
+        assert_eq!(two.to_x_coord(-3.0), -1.5, "captured, left of the window");
+        let one = PixelScale::new(ScaleOption::Auto, 120);
+        assert_eq!(one.to_x_coord(301.0), 301.0);
+    }
+
+    #[test]
+    fn pixel_scale_millimetres() {
+        // A 2000x1000 device-pixel monitor of 500x250 mm: 0.25 mm per
+        // device pixel. 1024x768 X pixels at factor 2 cover 2048x1536
+        // device pixels: 512x384 mm; at factor 1, 256x192 mm.
+        let (mm, device) = ((500.0, 250.0), (2000.0, 1000.0));
+        let two = PixelScale::new(ScaleOption::Auto, 192);
+        assert_eq!(two.mm((1024, 768), mm, device), (512, 384));
+        let one = PixelScale::new(ScaleOption::Factor(1), 192);
+        assert_eq!(one.mm((1024, 768), mm, device), (256, 192));
+        assert_eq!(one.mm((1024, 768), (0.0, 0.0), device), (0, 0), "unknown");
     }
 
     #[test]
