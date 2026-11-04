@@ -5,14 +5,15 @@
 use std::ptr;
 
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
     Graphics::Gdi::{ClientToScreen, ValidateRect},
     UI::{
         Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent},
         WindowsAndMessaging::{
             CREATESTRUCTW, DefWindowProcW, GetMessageTime, HTCLIENT, HTTRANSPARENT, MA_NOACTIVATE,
-            MINMAXINFO, PostQuitMessage, WA_INACTIVE, WM_ACTIVATE, WM_ACTIVATEAPP, WM_CLOSE,
-            WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+            MINMAXINFO, PostQuitMessage, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, WA_INACTIVE,
+            WM_ACTIVATE, WM_ACTIVATEAPP, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
+            WM_GETDPISCALEDSIZE, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
             WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEHWHEEL,
             WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT,
             WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZING, WM_SYSKEYDOWN, WM_SYSKEYUP,
@@ -108,6 +109,51 @@ pub(super) unsafe extern "system" fn toplevel(
             }
             return default();
         }
+        // One scale for every monitor: the client area keeps its device
+        // pixels, so X keeps the geometry; only the frame takes the new DPI.
+        WM_GETDPISCALEDSIZE => {
+            let dpi = u32::try_from(wparam).unwrap_or(crate::surface::resize::BASE_DPI);
+            // SAFETY: `lparam` is the outer size to fill for this message.
+            let size = unsafe { &mut *(lparam as *mut SIZE) };
+            let (ws, ex) = window::styles(hwnd);
+            let content = window::content_rect(hwnd);
+            let client = RECT {
+                left: 0,
+                top: 0,
+                right: content.right - content.left,
+                bottom: content.bottom - content.top,
+            };
+            let frame = window::frame_rect(client, ws, ex, dpi);
+            size.cx = frame.right - frame.left;
+            size.cy = frame.bottom - frame.top;
+            return 1;
+        }
+        WM_DPICHANGED => {
+            // SAFETY: `lparam` is the suggested outer rect for this message.
+            let r = unsafe { *(lparam as *const RECT) };
+            log::debug!(
+                "windows: {id:?} at DPI {}: {},{} {}x{}",
+                wparam & 0xFFFF,
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top
+            );
+            // SAFETY: our window; `WM_WINDOWPOSCHANGED` only queues work.
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    ptr::null_mut(),
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            // The outer limits are at the old DPI's frame.
+            shell::on_ui(move |shell| shell.dpi_changed(id));
+        }
         // Not under the pointer until its first frame shows.
         WM_NCHITTEST if !data.shown.get() => return HTTRANSPARENT as LRESULT,
         // A popup takes the click without taking the focus (§6.2).
@@ -198,7 +244,7 @@ fn input_message(
             track_leave(hwnd);
             match drag_target(&input, hwnd, lparam) {
                 Some((under, local)) => input.dragged_local(under, local),
-                None => input.motion_local(id, local(lparam)),
+                None => input.motion_local(id, local(&input, lparam)),
             }
         }
         WM_MOUSELEAVE => {
@@ -255,13 +301,13 @@ fn button(
     } else {
         drag_target(input, hwnd, lparam)
     };
-    input.button_local(hwnd, id, number, pressed, local(lparam), wparam, under);
+    let at = local(input, lparam);
+    input.button_local(hwnd, id, number, pressed, at, wparam, under);
 }
 
 /// The X pixel of a mouse message's client position.
-fn local(lparam: LPARAM) -> (f64, f64) {
-    let (x, y) = input::client_position(lparam);
-    (f64::from(x), f64::from(y))
+fn local(input: &ShellInput, lparam: LPARAM) -> (f64, f64) {
+    input.to_x(input::client_position(lparam))
 }
 
 /// Ask for `WM_MOUSELEAVE` once per stay in `hwnd`.
@@ -302,11 +348,5 @@ fn drag_target(
     let under = window::toplevel_at(at);
     let target = window::hwnd_of(under.or(current)?)?;
     let content = window::content_rect(target);
-    Some((
-        under,
-        (
-            f64::from(at.x - content.left),
-            f64::from(at.y - content.top),
-        ),
-    ))
+    Some((under, input.to_x((at.x - content.left, at.y - content.top))))
 }

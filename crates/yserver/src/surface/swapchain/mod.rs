@@ -791,19 +791,19 @@ struct RetiredSwapchain {
 
 /// Where a slot lands in a swapchain image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct CopyRegion {
+pub(crate) struct CopyRegion {
     /// The slot's top-left part that is shown.
-    pub(super) src: vk::Extent2D,
+    pub(crate) src: vk::Extent2D,
     /// The image's top-left part it covers, `src` times the scale.
-    pub(super) dst: vk::Extent2D,
-    pub(super) scale: u32,
+    pub(crate) dst: vk::Extent2D,
+    pub(crate) scale: u32,
     /// The rest of the image is cleared.
-    pub(super) clear: bool,
+    pub(crate) clear: bool,
 }
 
 /// A `slot`-sized slot in an `image`-sized image at `scale` image pixels
 /// per slot pixel: as much of the slot as fits whole.
-pub(super) fn copy_region(slot: vk::Extent2D, image: vk::Extent2D, scale: u32) -> CopyRegion {
+pub(crate) fn copy_region(slot: vk::Extent2D, image: vk::Extent2D, scale: u32) -> CopyRegion {
     let scale = scale.max(1);
     let src = vk::Extent2D {
         width: slot.width.min(image.width / scale),

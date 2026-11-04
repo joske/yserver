@@ -5,11 +5,13 @@
 mod app;
 mod clipboard;
 mod cursor;
+mod edid;
 mod frame_clock;
 mod icon;
 mod input;
 mod resize;
 mod rootless;
+mod scale;
 mod settings_dialog;
 mod tray;
 mod vulkan;
@@ -45,6 +47,8 @@ pub(crate) fn run(opts: LaunchOptions, mode: ShellMode) -> io::Result<()> {
     let result = if opts.headless {
         crate::surface::server::run_headless(opts)
     } else {
+        scale::declare_dpi_awareness();
+        scale::set_option(opts.scale);
         match mode {
             ShellMode::Rooted => app::run(opts),
             ShellMode::Rootless => rootless::run(opts),

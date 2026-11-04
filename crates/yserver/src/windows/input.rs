@@ -94,6 +94,8 @@ pub(super) struct ShellInput {
     /// The output in X pixels, as last posted to the core; pointer
     /// positions clamp to it.
     fb: Cell<(u16, u16)>,
+    /// Device pixels per X pixel per axis.
+    factor: Cell<u32>,
     translator: RefCell<Translator>,
     scroller: RefCell<Scroller>,
     /// The last client position, for motion deltas.
@@ -107,6 +109,7 @@ impl ShellInput {
         Self {
             link,
             fb: Cell::new(fb),
+            factor: Cell::new(1),
             translator: RefCell::new(Translator::default()),
             scroller: RefCell::new(Scroller::default()),
             last: Cell::new(None),
@@ -117,6 +120,18 @@ impl ShellInput {
     /// The window now shows a `fb`-sized output.
     pub(super) fn set_fb(&self, fb: (u16, u16)) {
         self.fb.set(fb);
+    }
+
+    /// One X pixel covers `factor`x`factor` device pixels from now on.
+    pub(super) fn set_factor(&self, factor: u32) {
+        self.factor.set(factor.max(1));
+    }
+
+    /// A position in device pixels (a client or screen position, or an
+    /// offset) in X pixels, unfloored.
+    pub(super) fn to_x(&self, device: (i32, i32)) -> (f64, f64) {
+        let factor = f64::from(self.factor.get());
+        (f64::from(device.0) / factor, f64::from(device.1) / factor)
     }
 
     /// A key message for `hwnd`.
@@ -140,7 +155,7 @@ impl ShellInput {
             .send_input(|time, out| translator.evdev_key(evdev, raw.pressed, time, out));
     }
 
-    /// The pointer moved to client pixel `at`.
+    /// The pointer moved to client device pixel `at`.
     pub(super) fn motion(&self, at: (i32, i32)) {
         let raw = self.raw_pointer(at);
         log::trace!("windows motion: {raw:?}");
@@ -150,7 +165,7 @@ impl ShellInput {
     }
 
     /// Mouse button `number` (0 left, 1 right, 2 middle, 3 back, 4 forward)
-    /// changed at client pixel `at`; the position goes first. The window
+    /// changed at client device pixel `at`; the position goes first. The window
     /// keeps the mouse while any button is held (`held`: the `MK_*` flags
     /// after the message).
     pub(super) fn button(
@@ -294,21 +309,23 @@ impl ShellInput {
         self.link.post(ShellEvent::LockState { caps });
     }
 
-    /// `at` as the translator's view points: one point per X pixel, the
-    /// origin flipped to the bottom of the output.
+    /// Client device pixel `at` as the translator's view points: one point
+    /// per X pixel, the origin flipped to the bottom of the output.
     fn raw_pointer(&self, at: (i32, i32)) -> RawPointer {
         let (dx, dy) = self
             .last
             .replace(Some(at))
             .map_or((0, 0), |(x, y)| (at.0 - x, at.1 - y));
         let height = f64::from(self.fb.get().1);
+        let (x, y) = self.to_x(at);
+        let (dx, dy) = self.to_x((dx, dy));
         RawPointer {
-            x_pt: f64::from(at.0),
-            y_pt: height - f64::from(at.1),
+            x_pt: x,
+            y_pt: height - y,
             view_h_pt: height,
             scale: 1.0,
-            dx_pt: f64::from(dx),
-            dy_pt: f64::from(dy),
+            dx_pt: dx,
+            dy_pt: dy,
         }
     }
 }

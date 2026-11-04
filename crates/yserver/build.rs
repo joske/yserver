@@ -169,6 +169,7 @@ fn embed_windows_icon() {
     if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         println!("cargo::rerun-if-changed=yserver.rc");
         println!("cargo::rerun-if-changed=../../assets/yserver.ico");
+        println!("cargo::rerun-if-changed=yserver.exe.manifest");
         embed_resource::compile_for("yserver.rc", ["yserver"], embed_resource::NONE)
             .manifest_required()
             .expect("the icon resource");

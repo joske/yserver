@@ -4,6 +4,8 @@
 
 pub(crate) mod clipboard;
 pub(crate) mod clock;
+#[cfg(any(windows, test))]
+pub(crate) mod edid;
 pub(crate) mod input;
 pub(crate) mod link;
 mod platform;
