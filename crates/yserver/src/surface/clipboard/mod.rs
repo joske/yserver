@@ -3,32 +3,65 @@
 //! CLIPBOARD and the host pasteboard in step, as text, while the sync
 //! setting is on. PRIMARY is not bridged.
 
-#[cfg(unix)]
 mod bridge;
-#[cfg(unix)]
 pub(crate) mod conn;
 #[cfg(all(test, kms))]
 mod tests;
+mod text;
 
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::{
     io,
-    sync::{Arc, atomic::AtomicBool},
-};
-#[cfg(unix)]
-use std::{
-    os::unix::net::UnixStream,
-    sync::{Mutex, atomic::Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
 
-use yserver_core::core_loop::CoreSender;
+use yserver_core::core_loop::{CoreSender, Message};
+
+#[cfg(windows)]
+pub(crate) use text::{from_windows_units, to_windows_units};
+
+/// The bridge's end of its internal connection.
 #[cfg(unix)]
-use yserver_core::core_loop::Message;
+pub(crate) type Stream = UnixStream;
+/// The bridge's end of its internal connection: Windows has no
+/// `socketpair`, so a loopback TCP pair.
+#[cfg(windows)]
+pub(crate) type Stream = std::net::TcpStream;
+
+/// A connected pair: the core's end, as the core takes it, and ours.
+#[cfg(unix)]
+fn pair() -> io::Result<(yserver_core::transport::Transport, Stream)> {
+    let (core_side, ours) = UnixStream::pair()?;
+    Ok((core_side.into(), ours))
+}
+
+/// A connected loopback pair from a one-shot listener; the accepted end
+/// must be the peer we connected, not another local process that raced in.
+#[cfg(windows)]
+fn pair() -> io::Result<(yserver_core::transport::Transport, Stream)> {
+    use std::net::{Ipv4Addr, TcpListener, TcpStream};
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let ours = TcpStream::connect(listener.local_addr()?)?;
+    let (core_side, peer) = listener.accept()?;
+    if peer != ours.local_addr()? {
+        return Err(io::Error::other(
+            "clipboard: a stranger took the loopback pair",
+        ));
+    }
+    ours.set_nodelay(true)?;
+    core_side.set_nodelay(true)?;
+    Ok((yserver_core::transport::Transport::Tcp(core_side), ours))
+}
 
 /// After the connection is lost (KillClient, a server reset), reconnect
 /// after this.
-#[cfg(unix)]
 const RECONNECT: Duration = Duration::from_secs(1);
 
 /// The host's clipboard, as text.
@@ -50,15 +83,13 @@ pub(crate) struct HostClipboard {
 }
 
 /// The bridge's thread; reconnects until stopped.
-#[cfg(unix)]
 pub(crate) struct ClipboardBridge {
     stop: Arc<AtomicBool>,
     /// The live connection's socket, shut down to stop.
-    socket: Arc<Mutex<Option<UnixStream>>>,
+    socket: Arc<Mutex<Option<Stream>>>,
     thread: Option<JoinHandle<()>>,
 }
 
-#[cfg(unix)]
 impl ClipboardBridge {
     /// Start the bridge as an internal client of the core behind `sender`.
     ///
@@ -112,7 +143,6 @@ impl ClipboardBridge {
     }
 }
 
-#[cfg(unix)]
 impl Drop for ClipboardBridge {
     fn drop(&mut self) {
         self.shut_down();
@@ -120,15 +150,14 @@ impl Drop for ClipboardBridge {
 }
 
 /// One connection: hand the core its end, set up, bridge until it ends.
-#[cfg(unix)]
 fn serve(
     sender: &CoreSender,
     pasteboard: &mut dyn Pasteboard,
     sync: &AtomicBool,
     stop: &AtomicBool,
-    socket: &Mutex<Option<UnixStream>>,
+    socket: &Mutex<Option<Stream>>,
 ) -> io::Result<()> {
-    let (core_side, ours) = UnixStream::pair()?;
+    let (core_side, ours) = pair()?;
     {
         let mut slot = socket.lock().unwrap_or_else(|e| e.into_inner());
         if stop.load(Ordering::Acquire) {
@@ -139,21 +168,4 @@ fn serve(
     sender.send(Message::InternalClient(core_side))?;
     let conn = conn::Conn::setup(ours)?;
     bridge::Bridge::new(conn, pasteboard, sync)?.run()
-}
-
-/// TODO(windows): the bridge's internal connection is a Unix socket pair,
-/// and Windows has no host pasteboard behind it yet.
-#[cfg(windows)]
-pub(crate) struct ClipboardBridge;
-
-#[cfg(windows)]
-impl ClipboardBridge {
-    pub(crate) fn start(_sender: CoreSender, _host: HostClipboard) -> io::Result<Self> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "no clipboard bridge on Windows",
-        ))
-    }
-
-    pub(crate) fn stop(self) {}
 }

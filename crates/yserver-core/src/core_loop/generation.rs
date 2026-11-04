@@ -82,7 +82,6 @@ pub(crate) fn is_session_scoped(message: &Message) -> bool {
         | Message::DumpDrawables
         | Message::PlatformEvent
         | Message::Rootless(_) => false,
-        #[cfg(unix)]
         Message::InternalClient(_) => false,
     }
 }

@@ -35,6 +35,7 @@ use windows_sys::Win32::{
 };
 
 use super::{
+    clipboard::WindowsClipboard,
     frame_clock::DwmTicker,
     input::{self, RawKeyMessage, ShellInput},
     resize::Sizer,
@@ -43,6 +44,7 @@ use super::{
 use crate::{
     launch::LaunchOptions,
     surface::{
+        clipboard::HostClipboard,
         clock::FrameClock,
         link::{ShellEvent, ShellLink},
         resize::{MIN_SCREEN, Size, to_px},
@@ -389,8 +391,10 @@ pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
         max_output: window::max_content_size(),
         output_mm,
         copy_scale: 1,
-        // TODO(windows): bridge CLIPBOARD with the Windows clipboard.
-        clipboard: None,
+        clipboard: Some(HostClipboard {
+            pasteboard: Box::new(WindowsClipboard::new(hwnd)),
+            sync: Arc::new(AtomicBool::new(opts.live.sync_clipboard)),
+        }),
     };
     let core = thread::Builder::new()
         .name("yserver-core".into())

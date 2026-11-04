@@ -5187,7 +5187,7 @@ fn internal_client_admits_as_internal() {
     });
 
     let interaction = (|| -> io::Result<(u8, u8)> {
-        sender.send(Message::InternalClient(server_stream))?;
+        sender.send(Message::InternalClient(server_stream.into()))?;
 
         // The internal path bypasses authorization even with a protocol name
         // the configured auth state would reject.

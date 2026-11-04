@@ -143,7 +143,7 @@ impl Server {
         let (core_side, peer) = UnixStream::pair().expect("socketpair");
         peer.set_read_timeout(Some(TIMEOUT)).expect("read timeout");
         self.sender
-            .send(Message::InternalClient(core_side))
+            .send(Message::InternalClient(core_side.into()))
             .expect("send the internal connection");
         Self::finish_setup(peer).0
     }

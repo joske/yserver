@@ -3,6 +3,7 @@
 //! core loop on its own thread. `--headless` runs without it.
 
 mod app;
+mod clipboard;
 mod cursor;
 mod frame_clock;
 mod input;
