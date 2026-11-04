@@ -1,7 +1,8 @@
 //! The Settings dialog (the tray icon's Settings…, and the rooted window's
 //! system menu), built in code: one instance, brought to front on reopen.
 //! As on macOS, every change is written to the settings file at once; the
-//! live settings also apply at once, mode and scale at the next start. A
+//! live settings also apply at once, the mode at the next start. No Scale:
+//! the process is not DPI-aware yet, so it would change nothing. A
 //! setting a command-line flag fixed for this run is shown disabled and
 //! never written. Start at sign-in is the `Run` registry value, never
 //! stored; Restart quits as Exit does and starts yserver again with the
@@ -42,16 +43,15 @@ use windows_sys::{
             Input::KeyboardAndMouse::EnableWindow,
             WindowsAndMessaging::{
                 AdjustWindowRectEx, BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX,
-                BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL,
-                CB_SETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST, CW_USEDEFAULT, CreateWindowExW,
-                DefWindowProcW, DestroyWindow, GetWindowRect, IDC_ARROW, IDCANCEL,
+                BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CW_USEDEFAULT,
+                CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowRect, IDC_ARROW, IDCANCEL,
                 IsDialogMessageW, LoadCursorW, MB_ICONWARNING, MB_OK, MSG, MessageBoxW,
                 NONCLIENTMETRICSW, RegisterClassExW, SPI_GETNONCLIENTMETRICS, SW_SHOW,
                 SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowPos, SetWindowTextW,
                 ShowWindow, SystemParametersInfoW, WA_INACTIVE, WINDOW_STYLE, WM_ACTIVATE,
                 WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WM_SETFONT, WNDCLASSEXW,
                 WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_GROUP,
-                WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+                WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
             },
         },
     },
@@ -59,23 +59,12 @@ use windows_sys::{
 };
 
 use crate::{
-    launch::ScaleOption,
     settings::{
-        KEY_MODE, KEY_SCALE, KEY_SYNC_CLIPBOARD, LoginItem, Mode, SetByArgv, Store,
-        file::FileStore, login, restart_view, scale_str,
+        KEY_MODE, KEY_SYNC_CLIPBOARD, LoginItem, Mode, SetByArgv, Store, file::FileStore, login,
+        restart_view,
     },
     surface::link::ShellLink,
 };
-
-/// The scale list's items, in order.
-const SCALES: [(ScaleOption, &str); 3] = [
-    (ScaleOption::Auto, "Automatic"),
-    (ScaleOption::Factor(1), "1 (one X pixel per pixel at 100%)"),
-    (
-        ScaleOption::Factor(2),
-        "2 (one X pixel per screen pixel at 200%)",
-    ),
-];
 
 /// The `Run` key and yserver's value in it.
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -87,7 +76,6 @@ const CLASS_NAME: PCWSTR = w!("yserver settings");
 const ID_COPY: u16 = 101;
 const ID_ROOTLESS: u16 = 102;
 const ID_WINDOW: u16 = 103;
-const ID_SCALE: u16 = 104;
 const ID_RESTART: u16 = 105;
 const ID_CLIPBOARD: u16 = 106;
 const ID_LOGIN: u16 = 107;
@@ -119,9 +107,8 @@ pub(super) struct Context {
     /// The clipboard bridge's switch.
     pub(super) sync_clipboard: Arc<AtomicBool>,
     pub(super) set_by_argv: SetByArgv,
-    /// This run's mode and scale, shown for what argv fixed.
+    /// This run's mode, shown when argv fixed it.
     pub(super) mode: Mode,
-    pub(super) scale: ScaleOption,
     /// The rooted window, which the dialog stays above; none when rootless.
     pub(super) owner: HWND,
 }
@@ -347,17 +334,6 @@ fn command(hwnd: HWND, id: u16, notification: u16) {
             store.set_string(KEY_MODE, mode.as_str());
             log::info!("windows: settings: mode = {}", mode.as_str());
         }
-        (ID_SCALE, CBN_SELCHANGE) => {
-            let control = item(hwnd, ID_SCALE);
-            // SAFETY: the dialog's combo box.
-            let at = unsafe { SendMessageW(control, CB_GETCURSEL, 0, 0) };
-            let scale = usize::try_from(at)
-                .ok()
-                .and_then(|at| SCALES.get(at))
-                .map_or(ScaleOption::Auto, |&(scale, _)| scale);
-            store.set_string(KEY_SCALE, &scale_str(scale));
-            log::info!("windows: settings: scale = {}", scale_str(scale));
-        }
         (ID_RESTART, BN_CLICKED) => restart(hwnd),
         (ID_CLIPBOARD, BN_CLICKED) => {
             let on = checked(item(hwnd, ID_CLIPBOARD));
@@ -573,12 +549,11 @@ impl Builder {
 }
 
 fn create() -> std::io::Result<()> {
-    let Some((set_by_argv, run_mode, run_scale, owner, sync)) = CONTEXT.with_borrow(|context| {
+    let Some((set_by_argv, run_mode, owner, sync)) = CONTEXT.with_borrow(|context| {
         context.as_ref().map(|c| {
             (
                 c.set_by_argv,
                 c.mode,
-                c.scale,
                 c.owner,
                 c.sync_clipboard.load(Ordering::Acquire),
             )
@@ -591,11 +566,6 @@ fn create() -> std::io::Result<()> {
         run_mode
     } else {
         stored.mode
-    };
-    let scale = if set_by_argv.scale {
-        run_scale
-    } else {
-        stored.scale
     };
 
     // SAFETY: the module handle of this executable.
@@ -660,7 +630,7 @@ fn create() -> std::io::Result<()> {
     b.line = size.cy;
     let row = b.line + 12;
     let indent = MARGIN
-        + ["X display:", "Mode:", "Scale:"]
+        + ["X display:", "Mode:"]
             .iter()
             .map(|t| b.text_width(t))
             .max()
@@ -722,35 +692,7 @@ fn create() -> std::io::Result<()> {
     }
     y += row;
 
-    b.label("Scale:", (MARGIN, y));
-    let combo_width = SCALES
-        .iter()
-        .map(|&(_, title)| b.text_width(title))
-        .max()
-        .unwrap_or(0)
-        + 40;
-    let combo = b.control(
-        w!("COMBOBOX"),
-        "",
-        CBS_DROPDOWNLIST as WINDOW_STYLE | WS_VSCROLL | WS_TABSTOP | WS_GROUP,
-        ID_SCALE,
-        (indent, y - button_lift),
-        (combo_width, b.line * 8),
-    );
-    for (_, title) in SCALES {
-        let title = wide(title);
-        // SAFETY: the combo box copies the string.
-        unsafe { SendMessageW(combo, CB_ADDSTRING, 0, title.as_ptr() as LPARAM) };
-    }
-    let at = SCALES.iter().position(|&(s, _)| s == scale).unwrap_or(0);
-    // SAFETY: a control of this thread.
-    unsafe { SendMessageW(combo, CB_SETCURSEL, at, 0) };
-    if set_by_argv.scale {
-        // SAFETY: a control of this thread.
-        unsafe { EnableWindow(combo, 0) };
-        b.note("set by command line", (indent + combo_width + GAP, y));
-    }
-    y += row + GAP;
+    y += GAP;
 
     let (can_restart, restart_note) = restart_view(true, false);
     b.note(restart_note, (MARGIN, y));

@@ -2,7 +2,7 @@
 //! thread and the core loop on its own thread. The UI thread never touches
 //! Vulkan; the core's `ShellUi` commands reach it as a posted message.
 //!
-//! The system menu (title bar, Alt+Space) and the tray icon open the
+//! The system menu (a right click on the title bar) and the tray icon open the
 //! Settings.
 //!
 //! Shutdown: the close button asks first while X clients are connected,
@@ -26,20 +26,17 @@ use windows_sys::{
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, WPARAM},
         Graphics::Gdi::ValidateRect,
-        UI::{
-            Input::KeyboardAndMouse::VK_SPACE,
-            WindowsAndMessaging::{
-                AppendMenuW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageTime,
-                GetMessageW, GetSystemMenu, HTCLIENT, IDOK, MB_ICONWARNING, MB_OKCANCEL,
-                MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, MessageBoxW, PostMessageW,
-                PostQuitMessage, SC_KEYMENU, SIZE_MINIMIZED, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
-                SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WM_APP, WM_CLOSE,
-                WM_DESTROY, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO,
-                WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-                WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
-                WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCOMMAND,
-                WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
-            },
+        UI::WindowsAndMessaging::{
+            AppendMenuW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageTime,
+            GetMessageW, GetSystemMenu, HTCLIENT, IDOK, MB_ICONWARNING, MB_OKCANCEL, MF_SEPARATOR,
+            MF_STRING, MINMAXINFO, MSG, MessageBoxW, PostMessageW, PostQuitMessage, SC_KEYMENU,
+            SIZE_MINIMIZED, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetForegroundWindow,
+            SetWindowPos, ShowWindow, WM_APP, WM_CLOSE, WM_DESTROY, WM_ENTERSIZEMOVE,
+            WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+            WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
+            WM_SETFOCUS, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
+            WM_XBUTTONUP,
         },
     },
     core::w,
@@ -71,8 +68,6 @@ const WM_UI_COMMANDS: u32 = WM_APP + 1;
 const WM_RESIZE_TICK: u32 = WM_APP + 2;
 /// The system menu's Settings item (the low four bits are the system's).
 const SETTINGS_COMMAND: usize = 0x0100;
-/// A key message's context code: Alt is down.
-const ALT_DOWN: LPARAM = 1 << 29;
 
 /// What the core thread asks of the UI thread.
 enum UiCommand {
@@ -179,8 +174,6 @@ struct Shell {
     minimized: Cell<bool>,
     /// The user already confirmed closing.
     close_confirmed: Cell<bool>,
-    /// Alt+Space opened the system menu: its Space release is not X's.
-    menu_space: Cell<bool>,
 }
 
 thread_local! {
@@ -316,22 +309,9 @@ unsafe extern "system" fn wndproc(
         // Not to `DefWindowProcW`: Alt and F10 would open the (absent)
         // window menu, Alt+F4 would close; X gets them all.
         WM_SYSCOMMAND if wparam & 0xFFF0 == SETTINGS_COMMAND => settings_dialog::show(),
-        // Alt+Space: the system menu, which X does not see.
-        WM_SYSKEYDOWN if wparam == usize::from(VK_SPACE) && lparam & ALT_DOWN != 0 => {
-            shell.input.focus_lost();
-            shell.menu_space.set(true);
-            // SAFETY: the default handling of the window menu key; the
-            // menu's modal loop runs with no borrow held.
-            unsafe {
-                DefWindowProcW(
-                    hwnd,
-                    WM_SYSCOMMAND,
-                    SC_KEYMENU as WPARAM,
-                    LPARAM::from(b' '),
-                )
-            };
-        }
-        WM_KEYUP | WM_SYSKEYUP if wparam == usize::from(VK_SPACE) && shell.menu_space.take() => {}
+        // The keyboard's way into the window menu (Alt, F10, Alt+Space):
+        // X gets those keys, so the menu opens only from the title bar.
+        WM_SYSCOMMAND if wparam & 0xFFF0 == SC_KEYMENU as WPARAM => {}
         WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
             let pressed = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
             // SAFETY: a plain query of the message being handled.
@@ -414,7 +394,6 @@ pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
         sizer: RefCell::new(sizer),
         minimized: Cell::new(false),
         close_confirmed: Cell::new(false),
-        menu_space: Cell::new(false),
     });
     SHELL.set(Some(Rc::clone(&shell)));
     let sync_clipboard = Arc::new(AtomicBool::new(opts.live.sync_clipboard));
@@ -425,7 +404,6 @@ pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
         sync_clipboard: Arc::clone(&sync_clipboard),
         set_by_argv: opts.set_by_argv,
         mode: Mode::Window,
-        scale: opts.scale,
         owner: hwnd,
     });
     // SAFETY: the window's own menu copy; the strings are NUL-terminated.

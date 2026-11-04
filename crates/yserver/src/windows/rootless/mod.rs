@@ -229,7 +229,6 @@ pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
         sync_clipboard: Arc::clone(&sync_clipboard),
         set_by_argv: opts.set_by_argv,
         mode: Mode::Rootless,
-        scale: opts.scale,
         owner: ptr::null_mut(),
     });
     let ticker = DwmTicker::start(Arc::clone(&clock))?;
