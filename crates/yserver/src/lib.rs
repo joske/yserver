@@ -345,6 +345,13 @@ pub fn stored_settings() -> settings::Settings {
     macos::stored_settings()
 }
 
+/// The settings stored in `%APPDATA%\yserver\settings.conf`.
+#[cfg(windows)]
+#[must_use]
+pub fn stored_settings() -> settings::Settings {
+    windows::stored_settings()
+}
+
 /// Run the server on Windows: in a window, in a window per top-level with
 /// `--rootless`, or headless with `--headless`.
 #[cfg(windows)]

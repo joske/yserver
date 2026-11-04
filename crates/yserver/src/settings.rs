@@ -1,6 +1,10 @@
 //! The app's settings (`docs/superpowers/specs/2026-10-23-macos-settings-design.md`):
 //! values under string keys in a [`Store`] (`NSUserDefaults` on macOS),
-//! merged under argv at launch by [`crate::launch::apply_settings`].
+//! merged under argv at launch by [`crate::launch::apply_settings`]. On
+//! Windows the store is a file ([`file`]).
+
+pub mod file;
+pub mod login;
 
 use crate::launch::ScaleOption;
 
@@ -10,7 +14,8 @@ pub const KEY_KEY_EQUIVALENTS: &str = "key_equivalents";
 pub const KEY_SYNC_CLIPBOARD: &str = "sync_clipboard";
 pub const KEY_SCALE: &str = "scale";
 
-/// Where the settings live; a missing or malformed value reads as `None`.
+/// Where the settings live (`NSUserDefaults` on macOS, [`file::FileStore`]
+/// on Windows); a missing or malformed value reads as `None`.
 pub trait Store {
     fn string(&self, key: &str) -> Option<String>;
     fn bool(&self, key: &str) -> Option<bool>;

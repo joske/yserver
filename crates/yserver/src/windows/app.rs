@@ -2,6 +2,9 @@
 //! thread and the core loop on its own thread. The UI thread never touches
 //! Vulkan; the core's `ShellUi` commands reach it as a posted message.
 //!
+//! The system menu (title bar, Alt+Space) and the tray icon open the
+//! Settings.
+//!
 //! Shutdown: the close button asks first while X clients are connected,
 //! then asks the core to shut down; the core loop returns, drops every
 //! Vulkan object and asks the UI thread to quit (`ShellUi::quit`), which
@@ -19,19 +22,27 @@ use std::{
     thread,
 };
 
-use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-    Graphics::Gdi::ValidateRect,
-    UI::WindowsAndMessaging::{
-        DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageTime, GetMessageW, HTCLIENT,
-        IDOK, MB_ICONWARNING, MB_OKCANCEL, MINMAXINFO, MSG, MessageBoxW, PostMessageW,
-        PostQuitMessage, SIZE_MINIMIZED, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
-        SetForegroundWindow, SetWindowPos, ShowWindow, WM_APP, WM_CLOSE, WM_DESTROY,
-        WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP,
-        WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
-        WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
-        WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+use windows_sys::{
+    Win32::{
+        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+        Graphics::Gdi::ValidateRect,
+        UI::{
+            Input::KeyboardAndMouse::VK_SPACE,
+            WindowsAndMessaging::{
+                AppendMenuW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageTime,
+                GetMessageW, GetSystemMenu, HTCLIENT, IDOK, MB_ICONWARNING, MB_OKCANCEL,
+                MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, MessageBoxW, PostMessageW,
+                PostQuitMessage, SC_KEYMENU, SIZE_MINIMIZED, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
+                SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WM_APP, WM_CLOSE,
+                WM_DESTROY, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO,
+                WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+                WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
+                WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCOMMAND,
+                WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+            },
+        },
     },
+    core::w,
 };
 
 use super::{
@@ -39,10 +50,11 @@ use super::{
     frame_clock::DwmTicker,
     input::{self, RawKeyMessage, ShellInput},
     resize::Sizer,
-    window,
+    settings_dialog, tray, window,
 };
 use crate::{
     launch::LaunchOptions,
+    settings::Mode,
     surface::{
         clipboard::HostClipboard,
         clock::FrameClock,
@@ -57,6 +69,10 @@ use crate::{
 const WM_UI_COMMANDS: u32 = WM_APP + 1;
 /// A frame-clock tick a waiting size asked for.
 const WM_RESIZE_TICK: u32 = WM_APP + 2;
+/// The system menu's Settings item (the low four bits are the system's).
+const SETTINGS_COMMAND: usize = 0x0100;
+/// A key message's context code: Alt is down.
+const ALT_DOWN: LPARAM = 1 << 29;
 
 /// What the core thread asks of the UI thread.
 enum UiCommand {
@@ -117,15 +133,16 @@ impl ShellUi for UiQueue {
     }
 }
 
-/// Ask whether to quit while `clients` X clients are connected; `true`
-/// without asking when none is.
-pub(super) fn confirm_quit(owner: HWND, clients: usize) -> bool {
+/// Ask whether to quit, or to `restart`, while `clients` X clients are
+/// connected; `true` without asking when none is.
+pub(super) fn confirm_quit(owner: HWND, clients: usize, restart: bool) -> bool {
     if clients == 0 {
         return true;
     }
     let noun = if clients == 1 { "client" } else { "clients" };
+    let verb = if restart { "Restarting" } else { "Quitting" };
     let text: Vec<u16> =
-        format!("{clients} X {noun} connected\n\nQuitting yserver disconnects them.")
+        format!("{clients} X {noun} connected\n\n{verb} yserver disconnects them.")
             .encode_utf16()
             .chain([0])
             .collect();
@@ -162,6 +179,8 @@ struct Shell {
     minimized: Cell<bool>,
     /// The user already confirmed closing.
     close_confirmed: Cell<bool>,
+    /// Alt+Space opened the system menu: its Space release is not X's.
+    menu_space: Cell<bool>,
 }
 
 thread_local! {
@@ -195,7 +214,7 @@ impl Shell {
         let clients = self.clients.load(Ordering::Acquire);
         // The box runs a modal loop that may re-enter the window procedure,
         // with no borrow held.
-        if !self.close_confirmed.get() && !confirm_quit(self.hwnd, clients) {
+        if !self.close_confirmed.get() && !confirm_quit(self.hwnd, clients, false) {
             return;
         }
         self.close_confirmed.set(true);
@@ -206,7 +225,11 @@ impl Shell {
     fn run_commands(&self) {
         for command in self.ui.take() {
             match command {
-                UiCommand::SetDisplay(display) => window::set_title(self.hwnd, display),
+                UiCommand::SetDisplay(display) => {
+                    window::set_title(self.hwnd, display);
+                    tray::set_display(display);
+                    settings_dialog::set_display(display);
+                }
                 UiCommand::Quit => {
                     // SAFETY: the window of this thread; `WM_DESTROY` ends
                     // the message loop.
@@ -263,11 +286,15 @@ unsafe extern "system" fn wndproc(
         // SAFETY: the default handling of a message for this window.
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     };
+    if tray::message(message, lparam) {
+        return 0;
+    }
     match message {
         WM_UI_COMMANDS => shell.run_commands(),
         WM_RESIZE_TICK => shell.sizer.borrow_mut().tick(&shell.input),
         WM_CLOSE => shell.close(),
         WM_DESTROY => {
+            tray::remove();
             // SAFETY: ends this thread's message loop.
             unsafe { PostQuitMessage(0) };
         }
@@ -288,6 +315,23 @@ unsafe extern "system" fn wndproc(
         WM_KILLFOCUS => shell.input.focus_lost(),
         // Not to `DefWindowProcW`: Alt and F10 would open the (absent)
         // window menu, Alt+F4 would close; X gets them all.
+        WM_SYSCOMMAND if wparam & 0xFFF0 == SETTINGS_COMMAND => settings_dialog::show(),
+        // Alt+Space: the system menu, which X does not see.
+        WM_SYSKEYDOWN if wparam == usize::from(VK_SPACE) && lparam & ALT_DOWN != 0 => {
+            shell.input.focus_lost();
+            shell.menu_space.set(true);
+            // SAFETY: the default handling of the window menu key; the
+            // menu's modal loop runs with no borrow held.
+            unsafe {
+                DefWindowProcW(
+                    hwnd,
+                    WM_SYSCOMMAND,
+                    SC_KEYMENU as WPARAM,
+                    LPARAM::from(b' '),
+                )
+            };
+        }
+        WM_KEYUP | WM_SYSKEYUP if wparam == usize::from(VK_SPACE) && shell.menu_space.take() => {}
         WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
             let pressed = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
             // SAFETY: a plain query of the message being handled.
@@ -370,8 +414,28 @@ pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
         sizer: RefCell::new(sizer),
         minimized: Cell::new(false),
         close_confirmed: Cell::new(false),
+        menu_space: Cell::new(false),
     });
     SHELL.set(Some(Rc::clone(&shell)));
+    let sync_clipboard = Arc::new(AtomicBool::new(opts.live.sync_clipboard));
+    tray::install(hwnd, Arc::clone(&link), Arc::clone(&shell.clients));
+    settings_dialog::install(settings_dialog::Context {
+        link: Arc::clone(&link),
+        clients: Arc::clone(&shell.clients),
+        sync_clipboard: Arc::clone(&sync_clipboard),
+        set_by_argv: opts.set_by_argv,
+        mode: Mode::Window,
+        scale: opts.scale,
+        owner: hwnd,
+    });
+    // SAFETY: the window's own menu copy; the strings are NUL-terminated.
+    unsafe {
+        let menu = GetSystemMenu(hwnd, 0);
+        if !menu.is_null() {
+            AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+            AppendMenuW(menu, MF_STRING, SETTINGS_COMMAND, w!("Settings…"));
+        }
+    }
     // The window may have come out smaller than asked (a small screen).
     let client = window::client_size(hwnd);
     shell.sizer.borrow_mut().resized(&shell.input, client);
@@ -393,7 +457,7 @@ pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
         copy_scale: 1,
         clipboard: Some(HostClipboard {
             pasteboard: Box::new(WindowsClipboard::new(hwnd)),
-            sync: Arc::new(AtomicBool::new(opts.live.sync_clipboard)),
+            sync: sync_clipboard,
         }),
     };
     let core = thread::Builder::new()
@@ -405,10 +469,14 @@ pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
     let mut msg: MSG = unsafe { std::mem::zeroed() };
     // SAFETY: this thread's queue; writes `msg`.
     while unsafe { GetMessageW(&raw mut msg, ptr::null_mut(), 0, 0) } > 0 {
+        if super::settings_dialog::is_dialog_message(&msg) {
+            continue;
+        }
         // SAFETY: a message `GetMessageW` returned.
         unsafe { DispatchMessageW(&raw const msg) };
     }
     drop(ticker);
+    settings_dialog::uninstall();
     SHELL.set(None);
     core.join()
         .map_err(|_| io::Error::other("the core thread panicked"))?

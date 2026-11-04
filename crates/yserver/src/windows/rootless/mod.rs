@@ -3,13 +3,13 @@
 //! ([`shell`]) and runs the message loop; the `DwmFlush` thread ticks the
 //! frame pacer.
 //!
-//! Shutdown: the tray icon's Exit asks the core to shut down (`tray`); the
+//! Shutdown: the tray icon's Exit asks the core to shut down
+//! (`super::tray`); the
 //! core loop returns, drops every Vulkan object and asks the UI thread to
 //! quit (`ShellUi::quit`), which destroys the message window
 //! and ends the message loop; `run` then returns the core's result.
 
 mod shell;
-mod tray;
 mod window;
 mod wndproc;
 
@@ -32,7 +32,9 @@ use windows_sys::Win32::{
 };
 use yserver_core::rootless::{RootlessEvent, ToplevelId};
 
-use super::{clipboard::WindowsClipboard, frame_clock::DwmTicker, input::ShellInput};
+use super::{
+    clipboard::WindowsClipboard, frame_clock::DwmTicker, input::ShellInput, settings_dialog, tray,
+};
 use crate::{
     kms::vk::device::VkContext,
     launch::LaunchOptions,
@@ -40,6 +42,7 @@ use crate::{
         host::{CpuFrame, HandoffKind, RootlessHost},
         native::{pacing::FramePacer, space::GlobalSpace},
     },
+    settings::Mode,
     surface::{
         clipboard::HostClipboard,
         clock::FrameClock,
@@ -153,7 +156,10 @@ struct RootlessUi {
 impl ShellUi for RootlessUi {
     fn set_display(&self, display: u16) {
         log::info!("windows: rootless, DISPLAY=:{display}");
-        shell::on_ui(move |_| tray::set_display(display));
+        shell::on_ui(move |_| {
+            tray::set_display(display);
+            settings_dialog::set_display(display);
+        });
     }
 
     fn quit(&self, _failed: bool) {
@@ -215,7 +221,17 @@ pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
         message_window,
     );
     let clients = Arc::new(AtomicUsize::new(0));
+    let sync_clipboard = Arc::new(AtomicBool::new(opts.live.sync_clipboard));
     tray::install(message_window, Arc::clone(&link), Arc::clone(&clients));
+    settings_dialog::install(settings_dialog::Context {
+        link: Arc::clone(&link),
+        clients: Arc::clone(&clients),
+        sync_clipboard: Arc::clone(&sync_clipboard),
+        set_by_argv: opts.set_by_argv,
+        mode: Mode::Rootless,
+        scale: opts.scale,
+        owner: ptr::null_mut(),
+    });
     let ticker = DwmTicker::start(Arc::clone(&clock))?;
     let spec = RootlessSpec {
         surface_extension: ash::khr::win32_surface::NAME,
@@ -234,7 +250,7 @@ pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
     };
     let clipboard = HostClipboard {
         pasteboard: Box::new(WindowsClipboard::new(message_window)),
-        sync: Arc::new(AtomicBool::new(opts.live.sync_clipboard)),
+        sync: sync_clipboard,
     };
     let core = thread::Builder::new()
         .name("yserver-core".into())
@@ -245,10 +261,14 @@ pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
     let mut msg: MSG = unsafe { std::mem::zeroed() };
     // SAFETY: this thread's queue; writes `msg`.
     while unsafe { GetMessageW(&raw mut msg, ptr::null_mut(), 0, 0) } > 0 {
+        if settings_dialog::is_dialog_message(&msg) {
+            continue;
+        }
         // SAFETY: a message `GetMessageW` returned.
         unsafe { DispatchMessageW(&raw const msg) };
     }
     drop(ticker);
+    settings_dialog::uninstall();
     shell::uninstall();
     core.join()
         .map_err(|_| io::Error::other("the core thread panicked"))?

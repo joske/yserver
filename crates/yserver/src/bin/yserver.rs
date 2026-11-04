@@ -30,7 +30,9 @@ fn main() -> ExitCode {
             #[cfg(target_os = "macos")]
             eprintln!("       macOS: [--rootless | --rooted] [--geometry WxH] [--scale auto|1|2]");
             #[cfg(windows)]
-            eprintln!("       Windows: [--rootless] [--geometry WxH]");
+            eprintln!(
+                "       Windows: [--rootless | --rooted] [--geometry WxH] [--scale auto|1|2]"
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -42,6 +44,18 @@ fn main() -> ExitCode {
         yserver::launch::LaunchOptions {
             pick_free_display: startup.bundle.is_some(),
             from_bundle: startup.bundle.is_some(),
+            argv_overrides: yserver::launch::has_argv_overrides(&opts),
+            ..opts
+        },
+        &yserver::stored_settings(),
+    );
+
+    // Every Windows launch is the app's: the saved settings apply under
+    // argv, so a launch without `--rooted` is rootless by default.
+    #[cfg(windows)]
+    let opts = yserver::launch::apply_settings(
+        yserver::launch::LaunchOptions {
+            from_bundle: true,
             argv_overrides: yserver::launch::has_argv_overrides(&opts),
             ..opts
         },
