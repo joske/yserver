@@ -302,20 +302,22 @@ jobs:
       # Keep vcpkg's binary packages between runs: a files cache, saved by
       # actions/cache.
       VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}\vcpkg-cache,readwrite
+      # vcpkg 2026.10.16. Pinned rather than the image's checkout, which
+      # moves with the image and would invalidate the cache.
+      VCPKG_COMMIT: 9eec002df1cd109f8f104cd966a763daf9751489
     steps:
       - uses: actions/checkout@v7
-      - name: Locate vcpkg
-        # The x64 image ships vcpkg; clone it where an image does not.
+      - name: Fetch vcpkg
         shell: pwsh
         run: |
-          $root = $env:VCPKG_INSTALLATION_ROOT
-          if (-not ($root -and (Test-Path "$root\vcpkg.exe"))) {
-            $root = "$env:RUNNER_TEMP\vcpkg"
-            git clone --quiet https://github.com/microsoft/vcpkg $root
-            & "$root\bootstrap-vcpkg.bat" -disableMetrics
-          }
+          $root = "$env:RUNNER_TEMP\vcpkg"
+          git init --quiet $root
+          git -C $root fetch --quiet --depth 1 https://github.com/microsoft/vcpkg $env:VCPKG_COMMIT
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg fetch failed' }
+          git -C $root checkout --quiet FETCH_HEAD
+          & "$root\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg bootstrap failed' }
           "VCPKG_ROOT=$root" >> $env:GITHUB_ENV
-          "VCPKG_COMMIT=$(git -C $root rev-parse HEAD)" >> $env:GITHUB_ENV
           New-Item -ItemType Directory -Force vcpkg-cache | Out-Null
       - name: Restore vcpkg packages
         # Keyed on the vcpkg commit, which pins every port's version.
@@ -323,8 +325,8 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: vcpkg-cache
-          key: vcpkg-v2-${{ matrix.target }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('tools/windows/vcpkg-*/**', 'tools/windows/build-env.ps1') }}
-          restore-keys: vcpkg-v2-${{ matrix.target }}-
+          key: vcpkg-v3-${{ matrix.target }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('tools/windows/vcpkg-*/**', 'tools/windows/build-env.ps1') }}
+          restore-keys: vcpkg-v3-${{ matrix.target }}-
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
