@@ -3,7 +3,7 @@
 Build the portable Windows zip: yserver-<version>-windows-<arch>.zip.
 
 .DESCRIPTION
-Installs the C libraries (vcpkg-env.ps1), builds yserver --release for
+Installs the C libraries (build-env.ps1), builds yserver --release for
 -Target, checks that yserver.exe needs no DLL beyond the system's, and zips it
 with the XKB data, the launcher, README.txt and the licenses. Works on the
 checkout it is part of, from any directory.
@@ -17,7 +17,7 @@ tools/windows/build-xkb-data.sh makes it.
 
 .PARAMETER VcpkgRoot
 .PARAMETER Triplet
-See vcpkg-env.ps1.
+See build-env.ps1.
 
 .PARAMETER OutDir
 Where the zip goes. Default: target\dist.
@@ -52,7 +52,7 @@ foreach ($need in 'xkb\rules\evdev', 'COPYING.xkeyboard-config') {
 }
 
 # Sets $installed, the vcpkg prefix.
-. "$PSScriptRoot\vcpkg-env.ps1" -Target $Target -VcpkgRoot $VcpkgRoot -Triplet $Triplet
+. "$PSScriptRoot\build-env.ps1" -Target $Target -VcpkgRoot $VcpkgRoot -Triplet $Triplet
 
 $meta = cargo metadata --format-version 1 --locked --manifest-path "$repo\Cargo.toml" --filter-platform $Target |
     ConvertFrom-Json
