@@ -7,7 +7,7 @@ in `process_request`), with no change any client can observe while no policy is 
 
 **Architecture:** `AccessPolicy` gains two default-allow methods. `ServerState` gains two check helpers that share
 the existing first-denial loop with `check_server`. Discovery asks the access check per extension; dispatch asks the
-dispatch check once per request whose major opcode belongs to an available extension. Both sites interpret a denial
+dispatch check once per request whose major opcode belongs to a registered extension, advertised or not. Both sites interpret a denial
 as Xorg does: the extension looks absent.
 
 **Tech Stack:** Rust, crate `yserver-core`; std only (no new dependencies).
@@ -40,10 +40,21 @@ table ("Extension access and dispatch checks"). PR 1 (#328, merged as 4ccb1d2a) 
 - **Hook signatures.** Both hooks receive the extension's registered name, as XLibre's hooks receive the
   `ExtensionEntry`. The dispatch hook's minor opcode comes from `ctx.request()`, as the spec says ("the opcodes are
   the question"). Neither hook takes an `AccessMode`; the spec's hook table gives them none.
-- **Which requests the dispatch check covers.** Only requests whose major opcode is the `major_opcode` of an entry
-  in `nested::EXTENSIONS` that is available on this backend. Core requests (1-127), unassigned majors and
-  extensions the backend does not offer are not asked, as in Xorg, where `GetExtensionEntry` returns nothing for
-  them and the hook does not run (`Xext/xace.c:41-44`; XLibre `dix/dispatch.c:553-560`).
+- **Which requests the dispatch check covers.** Every request whose major opcode is the `major_opcode` of an entry
+  in `nested::EXTENSIONS`, whether or not the backend advertises it. yserver's dispatcher is a fixed opcode `match`
+  that runs RENDER, XKEYBOARD, GLX and DRI3 handlers even when discovery hides them (GLX and DRI3 requests sent
+  without `QueryExtension` are not refused, macOS plan 8b8b1364 `2026-10-14-macos-m0-m1.md:763-765`; RENDER
+  `QueryVersion` reaches the backend, `render.rs:108-119`), so in yserver "registered" means "has a handler", not
+  "is advertised". Discovery availability stays a discovery filter only (Task 1). Core requests (1-127) and majors
+  with no entry are not asked, as in Xorg, where `GetExtensionEntry` returns nothing and the hook does not run
+  (`Xext/xace.c:41-44`; XLibre `dix/dispatch.c:553-560`). The `Unix` availability rule (MIT-SHM) therefore only
+  affects discovery, as today.
+- **BIG-REQUESTS `Enable` releases the reader on denial.** The client's reader parks after forwarding an `Enable`
+  until the core sends `ReaderControl::ApplyBigRequests` or `IgnoreBigRequests` (`client_reader.rs:197-224`;
+  contract of b3f35834, `2026-05-06-single-threaded-core.md:408`: no path leaves the reader parked). A denied
+  `Enable` sends `IgnoreBigRequests`, like the existing malformed-minor path (`misc.rs:690-700`), through one
+  helper both paths share. The reader detects `Enable` as major `BIG_REQUESTS_MAJOR_OPCODE`, minor 0
+  (`client_reader.rs:197-198`); the denial path releases exactly that pair.
 - **A dispatch denial is `BadRequest`**, whatever `DenyError` the policy gave: Xorg maps every hook failure to
   `BadRequest` ("pretend extension doesn't exist", `Xext/xace.c:45-46`). XLibre reports the policy's status
   instead; we follow Xorg (client-observable = Xorg parity). The error carries value 0, the request's minor opcode
@@ -82,10 +93,10 @@ table ("Extension access and dispatch checks"). PR 1 (#328, merged as 4ccb1d2a) 
 2. `ListExtensions` with every entry denied answers a well-formed empty list (`nExtensions = 0`, length 0), not an
    error. Task 1 test.
 3. An extension whose availability depends on the backend (RENDER, XKEYBOARD, DRI3, GLX under
-   `RecordingBackend`) is never asked about at discovery or dispatch when unavailable, and its existing answer is
-   unchanged. Tasks 1 and 2 tests.
-4. A denied BIG-REQUESTS `Enable` must not switch the reader to big framing: the client state and the reader
-   control channel are untouched. Task 2 test.
+   `RecordingBackend`) is never asked about at discovery when unavailable, but a request addressed to it directly
+   is still asked at dispatch, and a denial stops it before its handler. Tasks 1 and 2 tests.
+4. A denied BIG-REQUESTS `Enable` keeps normal framing and does not park the reader: the next ordinary request on
+   the same connection completes. Task 2 test through the real reader and `run_core`.
 5. Name matching is exact and case-sensitive, as Xorg's (`strcmp`): a policy denying `"XFIXES"` does not affect
    `"xfixes"` (unknown anyway) nor any other entry. Task 1 test.
 
@@ -181,24 +192,32 @@ git commit -S -m "feat(core): access control PR 2: extension access check at dis
   gate": add the dispatch row and the position after the maximum-length check)
 
 **Interfaces:**
-- Consumes (Task 1): `check_extension_dispatch`, `policies_installed`, `extension_available`,
-  `AccessPolicy::extension_dispatch`.
-- Produces: `misc::available_extension_by_opcode(major: u8, backend: &mut dyn Backend) -> Option<&'static ExtensionMetadata>`
-  (`pub(super)`).
+- Consumes (Task 1): `check_extension_dispatch`, `policies_installed`, `AccessPolicy::extension_dispatch`.
+- Produces: `misc::extension_by_opcode(major: u8) -> Option<&'static ExtensionMetadata>` (`pub(super)`, no
+  availability test); `misc::release_big_requests_reader(state: &ServerState, client_id: ClientId)` (`pub(super)`,
+  sends `IgnoreBigRequests` on the client's reader-control channel if it has one), used by the existing
+  malformed-minor path and the new denial path.
+- Modify also: `crates/yserver-core/src/core_loop/run/tests.rs` (the real reader test).
 
 - [ ] **Step 1: Write the failing tests** in `tests/extensions.rs`.
-  - `every_extension_dispatch_denial_answers_bad_request` — table over every `EXTENSIONS` entry available under
-    `RecordingBackend`: a fresh state, a policy whose `extension_dispatch` denies with
+  - `every_extension_dispatch_denial_answers_bad_request` — table over EVERY `EXTENSIONS` entry, advertised under
+    `RecordingBackend` or not (RENDER, XKEYBOARD, DRI3 and GLX included): a fresh state, a policy whose `extension_dispatch` denies with
     `DenyError { code: BAD_VALUE, value: 0x55 }`, one request with the entry's major opcode, minor 0 and an 8-byte
     body. The client receives exactly one 32-byte error: code `BAD_REQUEST`, the sequence, value 0, minor 0, the
     major opcode; no reply; `backend.calls()` is empty. Mutation: report the policy's error, or skip the check.
-  - `denied_big_requests_enable_changes_nothing` — denied BIG-REQUESTS `Enable`: `BadRequest`,
-    `big_requests_enabled` stays false, and the client's reader-control channel receives nothing.
+  - `denied_big_requests_enable_releases_the_reader` (dispatcher level) — denied BIG-REQUESTS `Enable`:
+    `BadRequest`, `big_requests_enabled` stays false, and the client's reader-control channel receives exactly one
+    `IgnoreBigRequests`. Mutation: return the error without releasing.
+  - `denied_big_requests_enable_keeps_the_connection_working` (in `run/tests.rs`, real reader thread and `run_core`,
+    policy installed before `run_core` as in PR 1's `run/tests.rs:340` test) — the client sends `Enable` then
+    `GetInputFocus` with normal framing; it reads `BadRequest` for the first and the `GetInputFocus` reply for the
+    second within the harness timeout. Mutation: drop the release; the second reply never arrives.
   - `extension_dispatch_asks_with_client_name_and_opcodes` — recording policy that allows. An XFIXES `QueryVersion`
     records `{client 1, "XFIXES", Some(RequestOpcodes { major: XFIXES_MAJOR_OPCODE, minor: 0 })}` and gets its
-    normal reply. `GetInputFocus` (43), an unassigned major (200) and RENDER's major (unavailable under
-    `RecordingBackend`) record nothing, and their bytes equal the no-policy bytes. Mutation: ask for core opcodes,
-    or for unavailable extensions.
+    normal reply. RENDER `QueryVersion` (not advertised under `RecordingBackend`) records
+    `{client 1, "RENDER", Some(RequestOpcodes { major: RENDER_MAJOR_OPCODE, minor: 0 })}` and keeps its no-policy
+    bytes. `GetInputFocus` (43) and an unassigned major (200) record nothing, and their bytes equal the no-policy
+    bytes. Mutation: ask for core opcodes or unassigned majors, or skip unadvertised extensions.
   - `transport_gate_and_max_length_answer_before_the_dispatch_check` — denying recording policy. A non-local
     client's DRI3 request answers the gate's `BadMatch` (same bytes as without a policy); a request whose
     `length_units` exceeds the maximum answers `BadLength`; neither records a call. Mutation: move the check above
@@ -213,13 +232,14 @@ Run: `cargo test -p yserver-core --lib core_loop::process_request::tests::extens
 Expected: the dispatch tests fail with normal replies instead of `BadRequest`.
 
 - [ ] **Step 3: Implement**
-  - `available_extension_by_opcode` in `misc.rs`: the entry whose `major_opcode` matches and that
-    `extension_available` accepts.
+  - `extension_by_opcode` in `misc.rs`: the `EXTENSIONS` entry whose `major_opcode` matches.
+  - `release_big_requests_reader` in `misc.rs`, replacing the inline send in `handle_big_requests_request`.
   - In `process_request`, after the maximum-length `BadLength` and before the core-length validation: only when
     `header.opcode >= 128` and `state.policies_installed()`, look the extension up; if found, ask
     `check_extension_dispatch(client_id, ext.name, Some(RequestOpcodes { major: header.opcode, minor: header.data }))`
-    and on `Deny(_)` return `emit_x11_error_with_minor(state, client_id, sequence, BAD_REQUEST, 0,
-    u16::from(header.data), header.opcode)`.
+    and on `Deny(_)` first call `release_big_requests_reader` when the request is
+    `(BIG_REQUESTS_MAJOR_OPCODE, 0)`, then return `emit_x11_error_with_minor(state, client_id, sequence,
+    BAD_REQUEST, 0, u16::from(header.data), header.opcode)`.
   - Spec: in "A denial is interpreted by its site", add the row "Extension dispatch | `BadRequest` with value 0, as
     Xorg (`Xext/xace.c:45-46`), whatever the policy's error"; in "The existing transport gate", say the dispatch
     check runs after the gate and after the maximum-length `BadLength`, as in Xorg (`dix/dispatch.c:546-549`).
@@ -235,6 +255,7 @@ Expected: all pass, the existing suite unmodified.
 git add crates/yserver-core/src/core_loop/process_request.rs \
   crates/yserver-core/src/core_loop/process_request/misc.rs \
   crates/yserver-core/src/core_loop/process_request/tests/extensions.rs \
+  crates/yserver-core/src/core_loop/run/tests.rs \
   docs/superpowers/specs/2026-10-30-access-control-layer-design.md
 git commit -S -m "feat(core): access control PR 2: extension dispatch check"
 ```
@@ -244,8 +265,8 @@ git commit -S -m "feat(core): access control PR 2: extension dispatch check"
 - [ ] **Step 1:** Run the PR 1 gate script adapted to this worktree (`gate.sh`: `cargo +nightly fmt -- --check`;
   clippy plain, `--features tcp-transport`, `--features xdmcp`, FreeBSD; `cargo test --workspace` and
   `--features xdmcp`; each `crates/*/tests` target; `--features xdmcp -- --ignored` on lavapipe; `just man`).
-  The loaded runs are `cargo test -p yserver-core --lib core_loop::process_request::tests::extensions` 5 times
-  under `nproc` busy loops.
+  The loaded runs are `cargo test -p yserver-core --lib -- core_loop::process_request::tests::extensions
+  denied_big_requests_enable_keeps_the_connection_working` 5 times under `nproc` busy loops.
   Expected: every step rc=0, zero failures in the loaded runs.
 - [ ] **Step 2:** Hardware regression pass on AMD and NVIDIA with the PR 1 harness (`hw-ac.sh amd|nvidia`), plus
   `xdpyinfo` extension list compared with the PR 1 run's list.
