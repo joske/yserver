@@ -42,8 +42,8 @@ use crate::{
 /// The scale popup's items, in order.
 const SCALES: [(ScaleOption, &str); 3] = [
     (ScaleOption::Auto, "Automatic"),
-    (ScaleOption::Factor(1), "1 (one X pixel per point)"),
-    (ScaleOption::Factor(2), "2 (one X pixel per Retina pixel)"),
+    (ScaleOption::Factor(1), "1 (one X pixel per Retina pixel)"),
+    (ScaleOption::Factor(2), "2 (one X pixel per point)"),
 ];
 
 /// What the window shows and changes besides the stored settings.
