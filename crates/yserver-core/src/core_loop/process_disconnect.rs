@@ -174,6 +174,7 @@ pub fn process_disconnect_reporting(
     // RECORD: Xorg's ClientStateGone callback runs before any resource is
     // freed, and needs the client's base and sequence.
     crate::core_loop::record::client_disconnected(state, client_id);
+    state.notify_policies(|policy, context| policy.connection_gone(context, client_id));
 
     // Xorg `DeleteClientFromAnySelections` (`dix/dispatch.c:3495`), before
     // any of the client's resources go: the selections this client set
@@ -502,6 +503,9 @@ pub fn process_disconnect_reporting(
     // Drop any per-client transient backend state (e.g. the root-overlay
     // contribution) so a crashed/killed client can't strand it.
     backend.client_disconnected(client_id);
+    if !retain {
+        state.notify_policies(|policy, _context| policy.owner_gone(client_id));
+    }
 }
 
 /// L2 plan B.6c — release the redirect's reason-1 hold on a
@@ -725,6 +729,7 @@ pub fn destroy_zombie_resources_reporting(
             );
         }
     }
+    state.notify_policies(|policy, _context| policy.owner_gone(zombie));
     Ok(())
 }
 
@@ -741,7 +746,7 @@ mod tests {
         ClientByteOrder, ClientId, CreatePixmapRequest, CreateWindowRequest, ResourceId,
     };
 
-    use super::{destroy_zombie_resources, process_disconnect};
+    use super::{destroy_zombie_resources, destroy_zombie_resources_reporting, process_disconnect};
     use crate::{
         backend::recording::{RecordedCall, RecordingBackend},
         resources::ROOT_WINDOW,
@@ -753,6 +758,7 @@ mod tests {
         state.clients.insert(
             id,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(a))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -782,6 +788,7 @@ mod tests {
         state.clients.insert(
             id,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1516,6 +1523,63 @@ mod tests {
         destroy_zombie_resources(&mut state, &mut backend, ClientId(7)).expect("zombie cleanup");
         assert!(!state.resources.xid_in_use(ResourceId(XID)));
         assert!(!backend.dri3_syncobj_owners.contains_key(&XID));
+    }
+
+    // Mutation: omit owner_gone from the successful zombie-destruction path; the second event assertion fails.
+    #[test]
+    fn zombie_owner_notification_follows_successful_resource_destruction() {
+        use crate::access::{AccessContext, AccessPolicy};
+
+        struct Recorder(Arc<Mutex<Vec<(&'static str, ClientId)>>>);
+        impl AccessPolicy for Recorder {
+            fn connection_gone(&self, _ctx: &AccessContext<'_>, client: ClientId) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(("connection_gone", client));
+            }
+
+            fn owner_gone(&self, client: ClientId) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(("owner_gone", client));
+            }
+        }
+
+        let id = ClientId(7);
+        let pixmap = ResourceId(0x0070_0051);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut state = ServerState::new();
+        state.install_access_policy(Arc::new(Recorder(events.clone())));
+        install_client(&mut state, id.0);
+        state.close_down_modes.insert(id.0, 1);
+        state.resources.create_pixmap(
+            id,
+            CreatePixmapRequest {
+                pixmap,
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+                depth: 24,
+            },
+        );
+        let mut backend = RecordingBackend::new();
+
+        process_disconnect(&mut state, &mut backend, id);
+
+        assert_eq!(*events.lock().unwrap(), vec![("connection_gone", id)]);
+        assert_eq!(state.zombie_clients.get(&id.0), Some(&1));
+        destroy_zombie_resources_reporting(&mut state, &mut backend, id, None)
+            .expect("zombie resources are destroyed");
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![("connection_gone", id), ("owner_gone", id)],
+        );
+        state.zombie_clients.remove(&id.0);
+        assert!(!state.clients.contains_key(&id.0));
+        assert!(!state.zombie_clients.contains_key(&id.0));
+        assert!(!state.resources.xid_in_use(pixmap));
     }
 
     #[test]

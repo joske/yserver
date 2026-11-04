@@ -628,6 +628,7 @@ fn xi2_dynamic_hotplug_publishes_atomic_hierarchy_steps() {
         state.clients.insert(
             id,
             ClientState {
+                admission: yserver_core::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(writer))),
                 is_local: true,
                 fd_passing: true,
@@ -1162,6 +1163,7 @@ fn xi_dynamic_session_disable_floats_query_and_resume_reattaches_home_master() {
         state.clients.insert(
             id,
             ClientState {
+                admission: yserver_core::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(Transport::Unix(writer))),
                 is_local: true,
                 fd_passing: true,
@@ -1423,6 +1425,7 @@ fn xi_dynamic_session_disable_clears_grab_detach_before_ungrab() {
         state.clients.insert(
             id,
             ClientState {
+                admission: yserver_core::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(Transport::Unix(writer))),
                 is_local: true,
                 fd_passing: true,
@@ -1673,6 +1676,7 @@ fn xi1_xi2_dynamic_hotplug_presence_precedes_hierarchy_for_each_transition() {
         state.clients.insert(
             id,
             ClientState {
+                admission: yserver_core::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(Transport::Unix(writer))),
                 is_local: true,
                 fd_passing: true,
@@ -2187,6 +2191,7 @@ fn xi1_dynamic_hotplug_notifies_selected_client_at_each_facet_transition() {
         state.clients.insert(
             id,
             ClientState {
+                admission: yserver_core::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(writer))),
                 is_local: true,
                 fd_passing: true,

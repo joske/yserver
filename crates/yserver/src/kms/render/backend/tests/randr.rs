@@ -2522,6 +2522,7 @@ fn lightweight_active_disconnect_retains_crtc_then_heavy_detach_publishes_off() 
     state.clients.insert(
         7,
         ClientState {
+            admission: yserver_core::access::Admission::Internal,
             writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(writer))),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(9)),
@@ -3062,6 +3063,7 @@ fn subscribe_randr_client(state: &mut ServerState) -> std::os::unix::net::UnixSt
     state.clients.insert(
         7,
         ClientState {
+            admission: yserver_core::access::Admission::Internal,
             writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(writer))),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(9)),

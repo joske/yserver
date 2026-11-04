@@ -2129,6 +2129,7 @@ fn run_core_with_inventory(
     state.host_access = super::auth::HostAccessHandle {
         auth: Arc::clone(&auth),
         generation: rx.current_generation(),
+        policies: std::mem::take(&mut state.host_access.policies),
     };
     // The generation counter is shared with every `CoreSender`; the
     // receiver is the loop's sole handle to it, and the reset boundary
@@ -2536,6 +2537,7 @@ fn run_core_with_inventory(
                                 fd_passing,
                                 internal,
                                 peer,
+                                admission,
                                 setup_reply,
                             } => {
                                 if let Err(err) = handle_client_setup_complete(
@@ -2550,6 +2552,7 @@ fn run_core_with_inventory(
                                     byte_order,
                                     (is_local, fd_passing, internal),
                                     peer,
+                                    admission,
                                     &setup_reply,
                                 ) {
                                     error!("ClientSetupComplete for client {} failed: {err}", id.0);
@@ -4682,6 +4685,7 @@ fn handle_client_setup_complete(
     byte_order: yserver_protocol::x11::ClientByteOrder,
     (is_local, fd_passing, internal): (bool, bool, bool),
     peer: crate::peer::PeerIdentity,
+    admission: crate::access::Admission,
     setup_reply: &[u8],
 ) -> io::Result<()> {
     use std::sync::{Arc, Mutex, atomic::AtomicU16};
@@ -4716,8 +4720,14 @@ fn handle_client_setup_complete(
             fd_passing,
             internal,
             peer,
+            admission,
         },
     );
+    state.notify_policies(|policy, context| {
+        if let (Some(peer), Some(admission)) = (context.peer(id), context.admission(id)) {
+            policy.client_connected(context, id, peer, admission);
+        }
+    });
     setup_registry
         .lock()
         .unwrap_or_else(|e| e.into_inner())

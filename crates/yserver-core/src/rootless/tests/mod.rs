@@ -78,6 +78,7 @@ impl RecordingHost {
         self.state.clients.insert(
             id,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(transport)),
                 byte_order,
                 last_sequence: Arc::new(AtomicU16::new(0)),

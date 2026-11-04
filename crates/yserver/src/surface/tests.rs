@@ -673,6 +673,7 @@ fn add_client(state: &mut ServerState, id: u32, mask: u32) -> std::os::unix::net
     state.clients.insert(
         id,
         ClientState {
+            admission: yserver_core::access::Admission::Internal,
             writer: Arc::new(Mutex::new(Transport::Unix(writer))),
             byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),

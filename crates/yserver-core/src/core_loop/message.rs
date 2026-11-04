@@ -232,6 +232,8 @@ pub enum Message {
         internal: bool,
         /// Read from the socket once, before the setup request.
         peer: crate::peer::PeerIdentity,
+        /// How authorization admitted this client, without retaining its cookie.
+        admission: crate::access::Admission,
         /// The setup reply bytes the client received, for RECORD's
         /// ClientStarted.
         setup_reply: Vec<u8>,

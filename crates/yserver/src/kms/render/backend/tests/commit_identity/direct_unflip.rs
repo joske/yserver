@@ -851,6 +851,7 @@ fn submit_next_msc_present_and_assert_parked(
     state.clients.insert(
         CLIENT_ID,
         ClientState {
+            admission: yserver_core::access::Admission::Internal,
             writer: Arc::new(Mutex::new(writer)),
             is_local: true,
             fd_passing: true,

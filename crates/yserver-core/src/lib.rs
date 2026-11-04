@@ -1,3 +1,4 @@
+pub mod access;
 #[cfg(unix)]
 pub mod anon_shm;
 pub mod backend;

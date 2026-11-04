@@ -24,6 +24,7 @@ fn xkb_use_extension_from_a_big_endian_client_is_refused_in_its_byte_order() {
     state.clients.insert(
         7,
         ClientState {
+            admission: yserver_core::access::Admission::Internal,
             writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(writer))),
             byte_order: ClientByteOrder::BigEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
