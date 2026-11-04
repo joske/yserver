@@ -13,6 +13,7 @@ mod rootless;
 mod settings_dialog;
 mod tray;
 mod window;
+pub(crate) mod xkb;
 
 use std::{
     io,
