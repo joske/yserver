@@ -11,20 +11,27 @@ https://github.com/joske/yserver
 Starting it
 -----------
 
-Run start-yserver.cmd. It starts yserver rootless on display :0, and on the
-first run it creates a cookie file in %LOCALAPPDATA%\yserver\Xauthority
-(set YSERVER_AUTH to use another file). It prints the cookie, which clients
-need to connect. Quit yserver from its icon in the notification area.
+Run start-yserver.cmd. It starts yserver on display :0, and on the first
+run it creates a cookie file in %LOCALAPPDATA%\yserver\Xauthority (set
+YSERVER_AUTH to use another file). It prints the cookie, which clients
+need to connect. yserver's icon in the notification area opens its
+Settings and quits it (Exit).
 
 Windows Firewall asks whether yserver may accept connections the first time
 it runs. Allow it on the networks your clients come from; if WSL2 cannot
 connect, allow it on public networks too.
 
-Rootless (start-yserver.cmd, or `yserver.exe :0 -auth FILE --rootless`):
-each X window is a window of its own on the Windows desktop.
+The mode is chosen in Settings and applies when yserver restarts (its
+Restart button does that); --rootless or --rooted overrides it for one run.
 
-Rooted (`yserver.exe :0 -auth FILE`): one window holds the whole X screen,
-for a desktop session or a window manager. --geometry WxH sets its size.
+Rootless (the default): each X window is a window of its own on the
+Windows desktop.
+
+Rooted: one window holds the whole X screen, for a desktop session or a
+window manager; its title bar menu also opens Settings. --geometry WxH
+sets its size.
+
+Settings are kept in %APPDATA%\yserver\settings.conf.
 
 The keyboard layout is US unless you pass one, e.g. `-layout de` (any
 other argument to start-yserver.cmd is passed on too), or set
@@ -84,7 +91,7 @@ Files
 -----
 
   yserver.exe          the server
-  start-yserver.cmd    starts it rootless with a cookie
+  start-yserver.cmd    starts it with a cookie
   xkb\                 keyboard data (xkeyboard-config); XKB_CONFIG_ROOT
                        overrides it
   LICENSE.txt          yserver's license

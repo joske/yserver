@@ -1,5 +1,6 @@
 @echo off
-rem Start yserver rootless on display :0, with the MIT cookie in the file
+rem Start yserver on display :0, in the mode chosen in its Settings
+rem (rootless by default), with the MIT cookie in the file
 rem YSERVER_AUTH names, made on first use. Extra arguments go to yserver.
 setlocal
 if not defined YSERVER_AUTH set "YSERVER_AUTH=%LOCALAPPDATA%\yserver\Xauthority"
@@ -27,6 +28,6 @@ for /f %%c in ('powershell -NoProfile -Command "$b = [IO.File]::ReadAllBytes($en
 echo yserver on display :0
 echo   cookie file  %YSERVER_AUTH%
 echo   cookie       MIT-MAGIC-COOKIE-1 %COOKIE%
-echo Quit it from its icon in the notification area.
-"%~dp0yserver.exe" :0 -auth "%YSERVER_AUTH%" --rootless %*
+echo Settings and Exit are on its icon in the notification area.
+"%~dp0yserver.exe" :0 -auth "%YSERVER_AUTH%" %*
 if errorlevel 1 pause
