@@ -299,8 +299,8 @@ jobs:
             target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     env:
-      # vcpkg builds shaderc (glslang, SPIRV-Tools) from source, so keep its
-      # binary packages between runs: a files cache, saved by actions/cache.
+      # Keep vcpkg's binary packages between runs: a files cache, saved by
+      # actions/cache.
       VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}\vcpkg-cache,readwrite
     steps:
       - uses: actions/checkout@v7
@@ -323,8 +323,8 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: vcpkg-cache
-          key: vcpkg-${{ matrix.target }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('tools/windows/vcpkg-triplets/*', 'tools/windows/vcpkg-env.ps1') }}
-          restore-keys: vcpkg-${{ matrix.target }}-
+          key: vcpkg-v2-${{ matrix.target }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('tools/windows/vcpkg-*/**', 'tools/windows/build-env.ps1') }}
+          restore-keys: vcpkg-v2-${{ matrix.target }}-
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
@@ -332,9 +332,15 @@ jobs:
           toolchain: stable
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-      - name: Install the C libraries (vcpkg)
+      - name: Cache glslc
+        # From the Vulkan SDK installer (tools/windows/build-env.ps1).
+        uses: actions/cache@v6
+        with:
+          path: target/tools
+          key: glslc-${{ matrix.os }}-${{ hashFiles('tools/windows/build-env.ps1') }}
+      - name: Install the C libraries (vcpkg) and glslc
         shell: pwsh
-        run: tools/windows/vcpkg-env.ps1 -Target ${{ matrix.target }}
+        run: tools/windows/build-env.ps1 -Target ${{ matrix.target }}
       - name: Save vcpkg packages
         # Here rather than at job end, so a later failing step keeps them.
         if: steps.vcpkg-cache.outputs.cache-hit != 'true'
