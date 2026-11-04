@@ -11,6 +11,7 @@ use std::{
 fn main() {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    embed_windows_icon();
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let os = target_os.as_str();
@@ -159,4 +160,17 @@ fn git_status(dir: &Path, args: &[&str]) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// yserver.exe's icon resource (`yserver.rc`), on windows-msvc; rc.exe
+/// comes with the MSVC Build Tools.
+fn embed_windows_icon() {
+    #[cfg(windows)]
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo::rerun-if-changed=yserver.rc");
+        println!("cargo::rerun-if-changed=../../assets/yserver.ico");
+        embed_resource::compile_for("yserver.rc", ["yserver"], embed_resource::NONE)
+            .manifest_required()
+            .expect("the icon resource");
+    }
 }

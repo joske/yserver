@@ -21,12 +21,11 @@ use windows_sys::{
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::{
             AdjustWindowRectEx, CW_USEDEFAULT, CreateWindowExW, GA_ROOT, GWL_EXSTYLE, GWL_STYLE,
-            GWLP_USERDATA, GetAncestor, GetClientRect, GetWindowLongPtrW, IDI_APPLICATION,
-            LoadIconW, MONITORINFOF_PRIMARY, RegisterClassExW, SetWindowLongPtrW, WINDOW_EX_STYLE,
-            WINDOW_STYLE, WMSZ_BOTTOMLEFT, WMSZ_LEFT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT,
-            WNDCLASSEXW, WNDPROC, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-            WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
-            WindowFromPoint,
+            GWLP_USERDATA, GetAncestor, GetClientRect, GetWindowLongPtrW, MONITORINFOF_PRIMARY,
+            RegisterClassExW, SetWindowLongPtrW, WINDOW_EX_STYLE, WINDOW_STYLE, WMSZ_BOTTOMLEFT,
+            WMSZ_LEFT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT, WNDCLASSEXW, WNDPROC, WS_CAPTION,
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
+            WS_OVERLAPPED, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WindowFromPoint,
         },
     },
     core::w,
@@ -170,15 +169,15 @@ pub(super) fn register(toplevel: WNDPROC, message: WNDPROC) -> io::Result<()> {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: instance,
-            // SAFETY: a system resource by predefined id.
-            hIcon: unsafe { LoadIconW(ptr::null_mut(), IDI_APPLICATION) },
+            // The client's `_NET_WM_ICON` could show here; yserver's for now.
+            hIcon: crate::windows::icon::large(),
             // None: `WM_SETCURSOR` shows the X cursor over the client area.
             hCursor: ptr::null_mut(),
             // No background brush: Vulkan paints every pixel.
             hbrBackground: ptr::null_mut(),
             lpszMenuName: ptr::null(),
             lpszClassName: name,
-            hIconSm: ptr::null_mut(),
+            hIconSm: crate::windows::icon::small(),
         };
         // SAFETY: a fully initialised class description.
         if unsafe { RegisterClassExW(&raw const class) } == 0 {

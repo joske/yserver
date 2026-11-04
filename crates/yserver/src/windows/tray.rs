@@ -1,6 +1,7 @@
-//! The notification-area icon: rootless has no root window to close, so
-//! its menu's Exit stops the server (as XWin's tray icon does), asking first
-//! while X clients are connected. Its tip names the display. UI thread only.
+//! The notification-area icon, in both modes: its menu opens the Settings
+//! and Exit stops the server (as XWin's tray icon does; rootless has no root
+//! window to close), asking first while X clients are connected. Its tip
+//! names the display. UI thread only.
 
 use std::{
     cell::RefCell,
@@ -20,10 +21,9 @@ use windows_sys::{
                 Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
-                AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, IDI_APPLICATION,
-                LoadIconW, MF_STRING, PostMessageW, RegisterWindowMessageW, SetForegroundWindow,
-                TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP, WM_CONTEXTMENU, WM_NULL,
-                WM_RBUTTONUP,
+                AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, MF_STRING, PostMessageW,
+                RegisterWindowMessageW, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+                TrackPopupMenu, WM_APP, WM_CONTEXTMENU, WM_NULL, WM_RBUTTONUP,
             },
         },
     },
@@ -32,11 +32,12 @@ use windows_sys::{
 
 use crate::surface::link::ShellLink;
 
-/// The icon's callback message.
-pub(super) const WM_TRAY: u32 = WM_APP + 2;
+/// The icon's callback message (the rooted window's own are below it).
+const WM_TRAY: u32 = WM_APP + 3;
 
-/// The menu's Exit item.
-const EXIT: usize = 1;
+/// The menu's items.
+const SETTINGS: usize = 1;
+const EXIT: usize = 2;
 
 struct Tray {
     hwnd: HWND,
@@ -63,8 +64,7 @@ impl Tray {
         data.uID = 1;
         data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         data.uCallbackMessage = WM_TRAY;
-        // SAFETY: a system resource by predefined id.
-        data.hIcon = unsafe { LoadIconW(ptr::null_mut(), IDI_APPLICATION) };
+        data.hIcon = super::icon::small();
         let tip = match self.display {
             Some(display) => format!("yserver DISPLAY=:{display}"),
             None => "yserver".to_owned(),
@@ -82,7 +82,8 @@ impl Tray {
     }
 }
 
-/// Show the icon, owned by `hwnd` (the message window).
+/// Show the icon, owned by `hwnd` (the rooted window or the rootless
+/// message window).
 pub(super) fn install(hwnd: HWND, link: Arc<ShellLink>, clients: Arc<AtomicUsize>) {
     // SAFETY: a NUL-terminated string.
     let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
@@ -135,8 +136,12 @@ pub(super) fn message(message: u32, lparam: LPARAM) -> bool {
         return false;
     }
     let event = u32::try_from(lparam & 0xFFFF).unwrap_or(0);
-    if matches!(event, WM_RBUTTONUP | WM_CONTEXTMENU) && menu(hwnd) == EXIT {
-        exit(hwnd);
+    if matches!(event, WM_RBUTTONUP | WM_CONTEXTMENU) {
+        match menu(hwnd) {
+            SETTINGS => super::settings_dialog::show(),
+            EXIT => exit(hwnd),
+            _ => {}
+        }
     }
     true
 }
@@ -152,6 +157,7 @@ fn menu(hwnd: HWND) -> usize {
         if menu.is_null() {
             return 0;
         }
+        AppendMenuW(menu, MF_STRING, SETTINGS, w!("Settings…"));
         AppendMenuW(menu, MF_STRING, EXIT, w!("Exit yserver"));
         GetCursorPos(&raw mut at);
         SetForegroundWindow(hwnd);
@@ -179,7 +185,7 @@ fn exit(hwnd: HWND) {
         return;
     };
     // The box's modal loop runs with no borrow held.
-    if !quitting && !crate::windows::app::confirm_quit(hwnd, clients) {
+    if !quitting && !super::app::confirm_quit(hwnd, clients, false) {
         return;
     }
     TRAY.with_borrow_mut(|tray| {

@@ -11,9 +11,9 @@ use windows_sys::{
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::{
             AdjustWindowRectEx, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
-            GetClientRect, IDC_ARROW, IDI_APPLICATION, LoadCursorW, LoadIconW, RegisterClassExW,
-            SPI_GETWORKAREA, SetWindowTextW, SystemParametersInfoW, WINDOW_EX_STYLE, WNDCLASSEXW,
-            WNDPROC, WS_OVERLAPPEDWINDOW,
+            GetClientRect, IDC_ARROW, LoadCursorW, RegisterClassExW, SPI_GETWORKAREA,
+            SetWindowTextW, SystemParametersInfoW, WINDOW_EX_STYLE, WNDCLASSEXW, WNDPROC,
+            WS_OVERLAPPEDWINDOW,
         },
     },
     core::w,
@@ -44,15 +44,14 @@ pub(super) fn create(size: Size, wndproc: WNDPROC) -> io::Result<HWND> {
         cbClsExtra: 0,
         cbWndExtra: 0,
         hInstance: instance,
-        // SAFETY: system resources by predefined id.
-        hIcon: unsafe { LoadIconW(ptr::null_mut(), IDI_APPLICATION) },
-        // SAFETY: as above.
+        hIcon: super::icon::large(),
+        // SAFETY: a system resource by predefined id.
         hCursor: unsafe { LoadCursorW(ptr::null_mut(), IDC_ARROW) },
         // No background brush: Vulkan paints every pixel.
         hbrBackground: ptr::null_mut(),
         lpszMenuName: ptr::null(),
         lpszClassName: CLASS_NAME,
-        hIconSm: ptr::null_mut(),
+        hIconSm: super::icon::small(),
     };
     // SAFETY: a fully initialised class description.
     if unsafe { RegisterClassExW(&raw const class) } == 0 {

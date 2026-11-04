@@ -159,8 +159,8 @@ pub struct LaunchOptions {
     /// macOS app bundle). Without `:N` and `-displayfd`, the lowest free
     /// display from [`FIRST_FREE_DISPLAY`] is locked and used.
     pub pick_free_display: bool,
-    /// Not from argv: started as the macOS app bundle, which defaults to
-    /// rootless.
+    /// Not from argv: started as the macOS app bundle, or on Windows (every
+    /// launch there): rootless by default, and the saved settings apply.
     pub from_bundle: bool,
     /// The settings that apply immediately: the stored ones from the
     /// bundle ([`apply_settings`]), else the defaults.

@@ -24,9 +24,12 @@ use yserver_core::rootless::ToplevelId;
 
 use super::{
     shell::{self, WM_RUN},
-    tray, window,
+    window,
 };
-use crate::windows::input::{self, RawKeyMessage, ShellInput};
+use crate::windows::{
+    input::{self, RawKeyMessage, ShellInput},
+    tray,
+};
 
 /// `WM_MOUSELEAVE` (`winuser.h`), from the `Win32_UI_Controls` feature.
 const WM_MOUSELEAVE: u32 = 0x02A3;

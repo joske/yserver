@@ -65,6 +65,11 @@ objc2-foundation = "=0.3.2"
 objc2-quartz-core = "=0.3.2"
 objc2-service-management = { version = "=0.3.2", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
 
+# The icon resource in yserver.exe (`build.rs`, `yserver.rc`); rc.exe
+# comes with the MSVC Build Tools.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0.12"
+
 # The Win32 window shell (`src/windows/`).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -74,6 +79,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
+    "Win32_System_Registry",
     "Win32_System_SystemServices",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",

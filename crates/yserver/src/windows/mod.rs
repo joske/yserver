@@ -6,14 +6,31 @@ mod app;
 mod clipboard;
 mod cursor;
 mod frame_clock;
+mod icon;
 mod input;
 mod resize;
 mod rootless;
+mod settings_dialog;
+mod tray;
 mod window;
 
-use std::io;
+use std::{
+    io,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
-use crate::launch::{LaunchOptions, ShellMode};
+use crate::{
+    launch::{LaunchOptions, ShellMode},
+    settings::Settings,
+};
+
+/// The Settings dialog's Restart shut the server down: start it again.
+static RESTART: AtomicBool = AtomicBool::new(false);
+
+/// The settings in `%APPDATA%\yserver\settings.conf`.
+pub(crate) fn stored_settings() -> Settings {
+    Settings::load(&settings_dialog::store())
+}
 
 /// Run the server in a window, in a window per top-level (rootless), or
 /// headless with `--headless`.
@@ -26,8 +43,26 @@ pub(crate) fn run(opts: LaunchOptions, mode: ShellMode) -> io::Result<()> {
     if opts.headless {
         return crate::surface::server::run_headless(opts);
     }
-    match mode {
+    let result = match mode {
         ShellMode::Rooted => app::run(opts),
         ShellMode::Rootless => rootless::run(opts),
+    };
+    if RESTART.load(Ordering::Acquire) {
+        relaunch();
+    }
+    result
+}
+
+/// Start this program again with this run's arguments: the server has shut
+/// down and closed its listener, so the new one can take the display.
+fn relaunch() {
+    let spawned = std::env::current_exe().and_then(|exe| {
+        std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .spawn()
+    });
+    match spawned {
+        Ok(child) => log::info!("windows: restart: started process {}", child.id()),
+        Err(e) => log::error!("windows: restart: cannot start yserver again: {e}"),
     }
 }
