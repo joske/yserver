@@ -73,6 +73,8 @@ embed-resource = "3.0.12"
 # The Win32 window shell (`src/windows/`).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Display",
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
@@ -82,6 +84,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Registry",
     "Win32_System_SystemServices",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }

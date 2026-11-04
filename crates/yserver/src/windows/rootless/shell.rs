@@ -51,7 +51,7 @@ use crate::{
         },
     },
     surface::{link::ShellLink, ui::CursorImage},
-    windows::input::ShellInput,
+    windows::{input::ShellInput, scale},
 };
 
 /// The shell's queued work is waiting (`on_ui`).
@@ -73,6 +73,7 @@ static MESSAGE_WINDOW: AtomicUsize = AtomicUsize::new(0);
 /// Set up the shell on the UI thread.
 pub(super) fn install(
     space: GlobalSpace,
+    factor: u32,
     link: Arc<ShellLink>,
     hwnds: Arc<HwndTable>,
     input: Rc<ShellInput>,
@@ -82,6 +83,7 @@ pub(super) fn install(
     INPUT.set(Some(Rc::clone(&input)));
     SHELL.set(Some(RootlessShell {
         space,
+        factor,
         windows: HashMap::new(),
         link,
         hwnds,
@@ -184,6 +186,8 @@ struct NativeWindow {
 
 pub(super) struct RootlessShell {
     space: GlobalSpace,
+    /// Device pixels per X pixel per axis, everywhere (one global scale).
+    factor: u32,
     windows: HashMap<ToplevelId, NativeWindow>,
     link: Arc<ShellLink>,
     hwnds: Arc<HwndTable>,
@@ -250,32 +254,37 @@ fn top_left(rect: RECT) -> POINT {
     }
 }
 
-/// `WM_NORMAL_HINTS` as the outer size limits of `hwnd`.
-fn apply_limits(hwnd: HWND, info: &WindowInfo, border: u16) {
+/// `WM_NORMAL_HINTS` as the outer size limits of `hwnd`, whose X pixels
+/// are `factor`x`factor` device pixels; its client size snaps to whole X
+/// pixels.
+fn apply_limits(hwnd: HWND, info: &WindowInfo, border: u16, factor: u32) {
     let Some(data) = window::data(hwnd) else {
         return;
     };
     let (ws, ex) = window::styles(hwnd);
+    let dpi = scale::window_dpi(hwnd);
     let limits = content_limits(&info.size_hints, border);
+    let factor = i32::try_from(factor.max(1)).unwrap_or(1);
     let outer = |(w, h): (u16, u16)| {
         let frame = window::frame_rect(
             RECT {
                 left: 0,
                 top: 0,
-                right: i32::from(w),
-                bottom: i32::from(h),
+                right: i32::from(w).saturating_mul(factor),
+                bottom: i32::from(h).saturating_mul(factor),
             },
             ws,
             ex,
+            dpi,
         );
         (frame.right - frame.left, frame.bottom - frame.top)
     };
     data.min.set(limits.min.map(outer));
     data.max.set(limits.max.map(outer));
     let hints = &info.size_hints;
-    let side = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
-    let bw = 2 * i32::from(border);
-    data.increments.set(hints.inc.map(|(w, h)| {
+    let side = |v: u32| i32::try_from(v).unwrap_or(i32::MAX).saturating_mul(factor);
+    let bw = 2 * i32::from(border) * factor;
+    let increments = hints.inc.map(|(w, h)| {
         let (base_w, base_h) = hints.base.or(hints.min).unwrap_or((0, 0));
         window::Increments {
             base: (
@@ -284,13 +293,19 @@ fn apply_limits(hwnd: HWND, info: &WindowInfo, border: u16) {
             ),
             inc: (side(w), side(h)),
         }
-    }));
+    });
+    data.increments
+        .set(increments.or((factor > 1).then_some(window::Increments {
+            base: (0, 0),
+            inc: (factor, factor),
+        })));
 }
 
 /// `content` moved down so a title bar of `ws`/`ex` stays below the top of
 /// the work area of its monitor (XQuartz, spec §4.0).
 fn below_title(content: RECT, ws: WINDOW_STYLE, ex: WINDOW_EX_STYLE) -> RECT {
-    let title_bar = content.top - window::frame_rect(content, ws, ex).top;
+    let dpi = scale::dpi_at(content);
+    let title_bar = content.top - window::frame_rect(content, ws, ex, dpi).top;
     let Some((_, work)) = window::monitor_at(top_left(content)) else {
         return content;
     };
@@ -304,7 +319,7 @@ fn below_title(content: RECT, ws: WINDOW_STYLE, ex: WINDOW_EX_STYLE) -> RECT {
 /// Set `hwnd`'s client area to `content`, keeping its place in the order.
 fn set_content(hwnd: HWND, content: RECT) {
     let (ws, ex) = window::styles(hwnd);
-    let frame = window::frame_rect(content, ws, ex);
+    let frame = window::frame_rect(content, ws, ex, scale::window_dpi(hwnd));
     // SAFETY: our window; `WM_WINDOWPOSCHANGED` only queues work.
     unsafe {
         SetWindowPos(
@@ -438,7 +453,7 @@ impl RootlessShell {
             }
         };
         if style.titled {
-            apply_limits(hwnd, info, g.border);
+            apply_limits(hwnd, info, g.border, self.factor);
         }
         if style.level == NativeLevel::Below {
             // SAFETY: our window.
@@ -604,7 +619,7 @@ impl RootlessShell {
             set_title(w.hwnd, &info.title);
         }
         if changed.contains(InfoFields::SIZE_HINTS) && native_style(w.kind, info).titled {
-            apply_limits(w.hwnd, info, w.border);
+            apply_limits(w.hwnd, info, w.border, self.factor);
         }
         if changed.contains(InfoFields::STATE) {
             w.net.client_state(info.state);
@@ -729,7 +744,7 @@ impl RootlessShell {
                 };
                 w.fullscreen = Some(Windowed {
                     style,
-                    frame: window::frame_rect(content, style, ex),
+                    frame: window::frame_rect(content, style, ex, scale::window_dpi(hwnd)),
                 });
                 // SAFETY: our window.
                 unsafe {
@@ -878,6 +893,17 @@ impl RootlessShell {
                 self.input.release_capture();
                 post_command(SC_SIZE as usize + if button == 0 { 0 } else { size_edge(edge) });
             }
+        }
+    }
+
+    /// `id`'s window is at another DPI: its outer limits take the new
+    /// frame.
+    pub(super) fn dpi_changed(&mut self, id: ToplevelId) {
+        let Some(w) = self.windows.get(&id) else {
+            return;
+        };
+        if native_style(w.kind, &w.info).titled {
+            apply_limits(w.hwnd, &w.info, w.border, self.factor);
         }
     }
 

@@ -20,21 +20,24 @@ use windows_sys::{
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::{
-            AdjustWindowRectEx, CW_USEDEFAULT, CreateWindowExW, GA_ROOT, GWL_EXSTYLE, GWL_STYLE,
-            GWLP_USERDATA, GetAncestor, GetClientRect, GetWindowLongPtrW, MONITORINFOF_PRIMARY,
-            RegisterClassExW, SetWindowLongPtrW, WINDOW_EX_STYLE, WINDOW_STYLE, WMSZ_BOTTOMLEFT,
-            WMSZ_LEFT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT, WNDCLASSEXW, WNDPROC, WS_CAPTION,
-            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
-            WS_OVERLAPPED, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WindowFromPoint,
+            CW_USEDEFAULT, CreateWindowExW, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, GWLP_USERDATA,
+            GetAncestor, GetClientRect, GetWindowLongPtrW, MONITORINFOF_PRIMARY, RegisterClassExW,
+            SetWindowLongPtrW, WINDOW_EX_STYLE, WINDOW_STYLE, WMSZ_BOTTOMLEFT, WMSZ_LEFT, WMSZ_TOP,
+            WMSZ_TOPLEFT, WMSZ_TOPRIGHT, WNDCLASSEXW, WNDPROC, WS_CAPTION, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPED,
+            WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WindowFromPoint,
         },
     },
     core::w,
 };
 use yserver_core::rootless::ToplevelId;
 
-use crate::rootless::native::{
-    space::NativeRect,
-    style::{NativeLevel, NativeStyle},
+use crate::{
+    rootless::native::{
+        space::NativeRect,
+        style::{NativeLevel, NativeStyle},
+    },
+    windows::scale,
 };
 
 const TOPLEVEL_CLASS: windows_sys::core::PCWSTR = w!("yserver-toplevel");
@@ -56,7 +59,8 @@ pub(super) struct WindowData {
     pub(super) increments: Cell<Option<Increments>>,
 }
 
-/// `WM_NORMAL_HINTS` resize increments, in client pixels.
+/// `WM_NORMAL_HINTS` resize increments (at least the copy factor), in
+/// client device pixels.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Increments {
     pub(super) base: (i32, i32),
@@ -76,6 +80,7 @@ pub(super) fn snap(hwnd: HWND, frame: &mut RECT, edge: u32, increments: Incremen
         },
         ws,
         ex,
+        scale::window_dpi(hwnd),
     );
     let snap = |outer: i32, extra: i32, base: i32, inc: i32| {
         let content = outer - extra;
@@ -250,7 +255,7 @@ pub(super) fn window_style(style: &NativeStyle) -> (WINDOW_STYLE, WINDOW_EX_STYL
 }
 
 /// A cloaked window of `style` whose client area is `content` (screen
-/// pixels), owned by `owner`; at the system's default position when
+/// device pixels), owned by `owner`; at the system's default position when
 /// `place`. Shown but cloaked: a present to it acquires, nothing is seen
 /// until [`uncloak`].
 ///
@@ -266,7 +271,7 @@ pub(super) fn create(
     place: bool,
 ) -> io::Result<HWND> {
     let (ws, ex) = window_style(style);
-    let frame = frame_rect(content, ws, ex);
+    let frame = frame_rect(content, ws, ex, scale::dpi_at(content));
     let title: Vec<u16> = title.encode_utf16().chain([0]).collect();
     let data = Box::into_raw(Box::new(data));
     let (x, y) = if place {
@@ -327,16 +332,9 @@ pub(super) fn styles(hwnd: HWND) -> (WINDOW_STYLE, WINDOW_EX_STYLE) {
     }
 }
 
-/// The outer rect of a window of these styles whose client area is
-/// `content`.
-pub(super) fn frame_rect(content: RECT, ws: WINDOW_STYLE, ex: WINDOW_EX_STYLE) -> RECT {
-    let mut rect = content;
-    // SAFETY: writes the rectangle; no menu.
-    unsafe { AdjustWindowRectEx(&raw mut rect, ws, 0, ex) };
-    rect
-}
+pub(super) use crate::windows::scale::frame_rect;
 
-/// `hwnd`'s client area in screen pixels.
+/// `hwnd`'s client area in screen device pixels.
 pub(super) fn content_rect(hwnd: HWND) -> RECT {
     let mut rect = RECT {
         left: 0,

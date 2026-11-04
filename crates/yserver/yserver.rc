@@ -1,2 +1,4 @@
 // The icon of yserver.exe, its windows and its tray icon (src/windows/icon.rs).
 1 ICON "../../assets/yserver.ico"
+// Per-monitor DPI awareness v2 and common controls v6 (RT_MANIFEST, id 1).
+1 24 "yserver.exe.manifest"

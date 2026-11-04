@@ -24,19 +24,19 @@ use std::{
 
 use windows_sys::{
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::Gdi::ValidateRect,
         UI::WindowsAndMessaging::{
             AppendMenuW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageTime,
             GetMessageW, GetSystemMenu, HTCLIENT, IDOK, MB_ICONWARNING, MB_OKCANCEL, MF_SEPARATOR,
             MF_STRING, MINMAXINFO, MSG, MessageBoxW, PostMessageW, PostQuitMessage, SC_KEYMENU,
             SIZE_MINIMIZED, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetForegroundWindow,
-            SetWindowPos, ShowWindow, WM_APP, WM_CLOSE, WM_DESTROY, WM_ENTERSIZEMOVE,
-            WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
-            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
-            WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
-            WM_SETFOCUS, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
-            WM_XBUTTONUP,
+            SetWindowPos, ShowWindow, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE,
+            WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO,
+            WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+            WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN,
+            WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN,
+            WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
         },
     },
     core::w,
@@ -47,6 +47,7 @@ use super::{
     frame_clock::DwmTicker,
     input::{self, RawKeyMessage, ShellInput},
     resize::Sizer,
+    scale::{self, Metrics},
     settings_dialog, tray, window,
 };
 use crate::{
@@ -56,7 +57,7 @@ use crate::{
         clipboard::HostClipboard,
         clock::FrameClock,
         link::{ShellEvent, ShellLink},
-        resize::{MIN_SCREEN, Size, to_px},
+        resize::{MIN_SCREEN, Size},
         server::{self, WindowSpec},
         ui::{CursorImage, ShellUi},
     },
@@ -172,6 +173,8 @@ struct Shell {
     input: ShellInput,
     sizer: RefCell<Sizer>,
     minimized: Cell<bool>,
+    /// The display configuration changed since the metrics were read.
+    display_changed: Cell<bool>,
     /// The user already confirmed closing.
     close_confirmed: Cell<bool>,
 }
@@ -196,10 +199,66 @@ impl Shell {
         if self.minimized.replace(false) {
             self.link.post(ShellEvent::Visible(true));
         }
-        let width = f64::from(u16::try_from(lparam & 0xFFFF).unwrap_or(0));
-        let height = f64::from(u16::try_from((lparam >> 16) & 0xFFFF).unwrap_or(0));
-        let size: Size = (to_px(width, 1.0), to_px(height, 1.0));
-        self.sizer.borrow_mut().resized(&self.input, size);
+        let width = i32::from(u16::try_from(lparam & 0xFFFF).unwrap_or(0));
+        let height = i32::from(u16::try_from((lparam >> 16) & 0xFFFF).unwrap_or(0));
+        self.sizer
+            .borrow_mut()
+            .resized(&self.input, (width, height));
+    }
+
+    /// `WM_DPICHANGED`: the window moved to a monitor of another DPI, or
+    /// the scaling changed. The window takes the suggested rect (the same
+    /// logical size, as macOS keeps a window's points), the cursor and the
+    /// core the new scale.
+    fn dpi_changed(&self, wparam: WPARAM, suggested: RECT) {
+        let dpi = u32::try_from(wparam & 0xFFFF).unwrap_or(0);
+        let metrics = Metrics::at_rect(dpi, suggested);
+        log::debug!(
+            "windows: DPI {dpi}, factor {}, {:?}",
+            metrics.factor(),
+            metrics.scale
+        );
+        // Before the resize: `WM_SIZE` converts with them.
+        self.sizer.borrow_mut().set_metrics(metrics);
+        // SAFETY: the window of this thread; `WM_SIZE` arrives before this
+        // returns, with no borrow held.
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                ptr::null_mut(),
+                suggested.left,
+                suggested.top,
+                suggested.right - suggested.left,
+                suggested.bottom - suggested.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+        self.scale_changed(metrics);
+    }
+
+    /// The window may be on another monitor, or the monitor changed: new
+    /// millimetres.
+    fn monitor_changed(&self) {
+        let old = self.sizer.borrow().metrics();
+        if scale::monitor_of(self.hwnd) == old.monitor
+            && scale::window_dpi(self.hwnd) == old.dpi
+            && !self.display_changed.get()
+        {
+            return;
+        }
+        self.display_changed.set(false);
+        // Reads the EDID: only on a change.
+        let metrics = Metrics::of_window(self.hwnd);
+        self.sizer.borrow_mut().set_metrics(metrics);
+        self.scale_changed(metrics);
+    }
+
+    /// The cursor and the core follow `metrics`.
+    fn scale_changed(&self, metrics: Metrics) {
+        self.input.set_factor(metrics.factor());
+        super::cursor::set_factor(metrics.factor(), super::cursor::pointer_inside(self.hwnd));
+        let client = window::client_size(self.hwnd);
+        self.sizer.borrow_mut().metrics_changed(&self.input, client);
     }
 
     /// The close button: ask while X clients are connected, then shut down.
@@ -241,7 +300,8 @@ impl Shell {
     fn set_content_size(&self, size: Size, token: u64) {
         // Before the resize: `WM_SIZE` holds back its own report.
         self.resize_request.store(token, Ordering::Release);
-        let (width, height) = window::frame_size(size);
+        let metrics = self.sizer.borrow().metrics();
+        let (width, height) = window::frame_size(metrics.scale.to_device(size), metrics.dpi);
         // SAFETY: the window of this thread; `WM_SIZE` arrives before this
         // returns, with no borrow held.
         unsafe {
@@ -268,7 +328,8 @@ unsafe extern "system" fn wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     if message == WM_GETMINMAXINFO {
-        let (width, height) = window::frame_size(MIN_SCREEN);
+        let dpi = scale::window_dpi(hwnd);
+        let (width, height) = window::frame_size(scale::at_dpi(dpi).to_device(MIN_SCREEN), dpi);
         // SAFETY: `lparam` is the system's MINMAXINFO for this message.
         let info = unsafe { &mut *(lparam as *mut MINMAXINFO) };
         info.ptMinTrackSize.x = width;
@@ -293,7 +354,19 @@ unsafe extern "system" fn wndproc(
         }
         WM_SIZE => shell.sized(wparam, lparam),
         WM_ENTERSIZEMOVE => shell.sizer.borrow_mut().live_started(),
-        WM_EXITSIZEMOVE => shell.sizer.borrow_mut().live_ended(&shell.input),
+        WM_EXITSIZEMOVE => {
+            shell.sizer.borrow_mut().live_ended(&shell.input);
+            shell.monitor_changed();
+        }
+        WM_DPICHANGED => {
+            // SAFETY: `lparam` is the suggested outer rect for this message.
+            let suggested = unsafe { *(lparam as *const RECT) };
+            shell.dpi_changed(wparam, suggested);
+        }
+        WM_DISPLAYCHANGE => {
+            shell.display_changed.set(true);
+            shell.monitor_changed();
+        }
         // Vulkan paints the client area.
         WM_ERASEBKGND => return 1,
         WM_PAINT => {
@@ -359,7 +432,19 @@ unsafe extern "system" fn wndproc(
 /// [`server::run_windowed`]).
 pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
     let size = opts.geometry.unwrap_or(server::DEFAULT_SIZE);
-    let hwnd = window::create(size, Some(wndproc))?;
+    // At most the work area: a 2x factor doubles the window.
+    let primary = Metrics::of_primary();
+    let start = window::max_content_size(&primary)
+        .map_or(size, |max| (size.0.min(max.0), size.1.min(max.1)));
+    let hwnd = window::create(start, &primary, Some(wndproc))?;
+    // The monitor the window landed on.
+    let metrics = Metrics::of_window(hwnd);
+    log::info!(
+        "windows: {} DPI, {} device pixels per X pixel, {} X pixels per logical pixel",
+        metrics.dpi,
+        metrics.factor(),
+        metrics.scale.xpp
+    );
     let link = Arc::new(ShellLink::default());
     let resize_request = Arc::new(AtomicU64::new(0));
     let tick_wanted = Arc::new(AtomicBool::new(false));
@@ -379,11 +464,12 @@ pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
     });
     let sizer = Sizer::new(
         size,
+        metrics,
         Arc::clone(&link),
         Arc::clone(&resize_request),
         tick_wanted,
     );
-    let output_mm = sizer.mm(size);
+    let output_mm = metrics.mm(size);
     let shell = Rc::new(Shell {
         hwnd,
         link: Arc::clone(&link),
@@ -393,8 +479,11 @@ pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
         input: ShellInput::new(Arc::clone(&link), size),
         sizer: RefCell::new(sizer),
         minimized: Cell::new(false),
+        display_changed: Cell::new(false),
         close_confirmed: Cell::new(false),
     });
+    shell.input.set_factor(metrics.factor());
+    super::cursor::set_factor(metrics.factor(), false);
     SHELL.set(Some(Rc::clone(&shell)));
     let sync_clipboard = Arc::new(AtomicBool::new(opts.live.sync_clipboard));
     tray::install(hwnd, Arc::clone(&link), Arc::clone(&shell.clients));
@@ -430,9 +519,9 @@ pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
         link,
         ui,
         clients: Arc::clone(&shell.clients),
-        max_output: window::max_content_size(),
+        max_output: window::max_content_size(&metrics),
         output_mm,
-        copy_scale: 1,
+        copy_scale: metrics.factor(),
         clipboard: Some(HostClipboard {
             pasteboard: Box::new(WindowsClipboard::new(hwnd)),
             sync: sync_clipboard,

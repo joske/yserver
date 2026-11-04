@@ -33,7 +33,8 @@ use windows_sys::Win32::{
 use yserver_core::rootless::{RootlessEvent, ToplevelId};
 
 use super::{
-    clipboard::WindowsClipboard, frame_clock::DwmTicker, input::ShellInput, settings_dialog, tray,
+    clipboard::WindowsClipboard, frame_clock::DwmTicker, input::ShellInput, scale, settings_dialog,
+    tray,
 };
 use crate::{
     kms::vk::device::VkContext,
@@ -75,6 +76,8 @@ impl HwndTable {
 /// The host on the core thread; every window change goes to the UI thread.
 struct WinRootlessHost {
     pacer: Arc<FramePacer>,
+    /// Device pixels per X pixel per axis.
+    factor: u32,
     /// Windows with a Vulkan surface: freed at `surface_released`.
     surfaced: HashSet<ToplevelId>,
     hwnds: Arc<HwndTable>,
@@ -83,6 +86,10 @@ struct WinRootlessHost {
 impl RootlessHost for WinRootlessHost {
     fn handoff(&self, _id: ToplevelId, _depth: u8) -> HandoffKind {
         HandoffKind::VulkanSurface
+    }
+
+    fn copy_scale(&self) -> u32 {
+        self.factor
     }
 
     fn create_surface(&mut self, id: ToplevelId, vk: &VkContext) -> io::Result<vk::SurfaceKHR> {
@@ -195,14 +202,20 @@ impl ShellUi for RootlessUi {
 pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
     window::register(Some(wndproc::toplevel), Some(wndproc::message))?;
     let message_window = window::create_message_window()?;
-    // One X pixel per pixel of a DPI-unaware process.
+    // One scale for every monitor (as macOS, D2): the primary's. Monitors
+    // are in device pixels; one X pixel covers `factor`x`factor` of them.
+    let primary = scale::at_dpi(scale::primary_dpi());
+    let factor = primary.factor;
     let displays: Vec<_> = window::monitors().into_iter().map(window::native).collect();
-    let space = GlobalSpace::new(&displays, 1.0, MAX_ROOT_SIDE);
+    let space = GlobalSpace::new(&displays, 1.0 / f64::from(factor), MAX_ROOT_SIDE);
     log::info!(
-        "windows: rootless over {} display(s), root {}x{}",
+        "windows: rootless over {} display(s), root {}x{}, {} device pixels per X pixel, \
+         {} X pixels per logical pixel",
         displays.len(),
         space.root().0,
-        space.root().1
+        space.root().1,
+        factor,
+        primary.xpp
     );
     let link = Arc::new(ShellLink::default());
     let clock = Arc::new(FrameClock::new(Arc::clone(&link)));
@@ -212,9 +225,12 @@ pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
         clock.set_tick_hook(move || pacer.tick());
     }
     let input = Rc::new(ShellInput::new(Arc::clone(&link), space.root()));
+    input.set_factor(factor);
+    super::cursor::set_factor(factor, false);
     let hwnds = Arc::new(HwndTable::default());
     shell::install(
         space,
+        factor,
         Arc::clone(&link),
         Arc::clone(&hwnds),
         input,
@@ -244,6 +260,7 @@ pub(super) fn run(opts: LaunchOptions) -> io::Result<()> {
     };
     let host = WinRootlessHost {
         pacer,
+        factor,
         surfaced: HashSet::new(),
         hwnds,
     };
