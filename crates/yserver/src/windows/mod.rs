@@ -12,7 +12,9 @@ mod resize;
 mod rootless;
 mod settings_dialog;
 mod tray;
+mod vulkan;
 mod window;
+pub(crate) mod xkb;
 
 use std::{
     io,
@@ -40,17 +42,18 @@ pub(crate) fn stored_settings() -> Settings {
 /// See [`crate::surface::server::run_headless`], [`app::run`] and
 /// [`rootless::run`].
 pub(crate) fn run(opts: LaunchOptions, mode: ShellMode) -> io::Result<()> {
-    if opts.headless {
-        return crate::surface::server::run_headless(opts);
-    }
-    let result = match mode {
-        ShellMode::Rooted => app::run(opts),
-        ShellMode::Rootless => rootless::run(opts),
+    let result = if opts.headless {
+        crate::surface::server::run_headless(opts)
+    } else {
+        match mode {
+            ShellMode::Rooted => app::run(opts),
+            ShellMode::Rootless => rootless::run(opts),
+        }
     };
     if RESTART.load(Ordering::Acquire) {
         relaunch();
     }
-    result
+    result.map_err(vulkan::explain)
 }
 
 /// Start this program again with this run's arguments: the server has shut

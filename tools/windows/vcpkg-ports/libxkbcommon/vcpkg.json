@@ -1,0 +1,14 @@
+{
+  "name": "libxkbcommon",
+  "version": "1.13.2",
+  "description": "keymap handling library for toolkits and window systems; yserver's overlay, without xkbcommon-x11",
+  "homepage": "https://xkbcommon.org/",
+  "license": "MIT",
+  "supports": "windows",
+  "dependencies": [
+    {
+      "name": "vcpkg-tool-meson",
+      "host": true
+    }
+  ]
+}

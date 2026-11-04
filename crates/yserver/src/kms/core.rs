@@ -2673,6 +2673,9 @@ impl KmsCore {
     /// Returns `io::Error` on FontLoader init failure or XKB
     /// keymap construction failure.
     pub(crate) fn new(fb_w: u16, fb_h: u16, layout_arg: Option<String>) -> io::Result<Self> {
+        #[cfg(windows)]
+        let xkb_context = XkbContext(crate::windows::xkb::context());
+        #[cfg(not(windows))]
         let xkb_context = XkbContext(xkbcommon::xkb::Context::new(
             xkbcommon::xkb::CONTEXT_NO_FLAGS,
         ));
