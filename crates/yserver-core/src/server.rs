@@ -1693,10 +1693,6 @@ impl ServerState {
     }
 
     /// Ask installed policies whether a request may be dispatched to an extension.
-    #[allow(
-        dead_code,
-        reason = "Consumed by Task 2's extension-dispatch integration"
-    )]
     pub(crate) fn check_extension_dispatch(
         &self,
         client: ClientId,

@@ -139,6 +139,7 @@ use yserver_protocol::{
 #[cfg(test)]
 use crate::core_loop::pointer_fanout::pointer_event_fanout_to_state;
 use crate::{
+    access::{Decision, RequestOpcodes},
     backend::{Backend, OriginContext},
     core_loop::{client_io, client_io::WriteOutcome},
     fd::OwnedFd,
@@ -280,6 +281,31 @@ pub fn process_request(
             sequence,
             x11::error::BAD_LENGTH,
             0,
+            header.opcode,
+        );
+    }
+    if header.opcode >= 128
+        && state.policies_installed()
+        && let Some(extension) = misc::extension_by_opcode(header.opcode)
+        && let Decision::Deny(_) = state.check_extension_dispatch(
+            client_id,
+            extension.name,
+            Some(RequestOpcodes {
+                major: header.opcode,
+                minor: header.data,
+            }),
+        )
+    {
+        if extension.name == "BIG-REQUESTS" && header.data == 0 {
+            misc::release_big_requests_reader(state, client_id);
+        }
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_REQUEST,
+            0,
+            u16::from(header.data),
             header.opcode,
         );
     }

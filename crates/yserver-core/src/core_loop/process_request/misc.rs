@@ -264,6 +264,24 @@ pub(super) fn extension_available(
     }
 }
 
+/// Find the registered extension handler for a major opcode. Discovery
+/// availability is deliberately not part of this lookup: dispatch is fixed
+/// by the server's opcode table even when a backend hides the extension.
+pub(super) fn extension_by_opcode(major: u8) -> Option<&'static crate::nested::ExtensionMetadata> {
+    crate::nested::EXTENSIONS
+        .iter()
+        .find(|extension| extension.major_opcode == major)
+}
+
+/// Release a reader waiting for the result of BIG-REQUESTS Enable.
+pub(super) fn release_big_requests_reader(state: &ServerState, client_id: ClientId) {
+    if let Some(client) = state.clients.get(&client_id.0)
+        && let Some(tx) = client.reader_control.as_ref()
+    {
+        let _ = tx.send(crate::server::ReaderControl::IgnoreBigRequests);
+    }
+}
+
 pub(super) fn advertised_extension_names(backend: &mut dyn Backend) -> Vec<&'static str> {
     use crate::nested::EXTENSIONS;
     EXTENSIONS
@@ -689,11 +707,7 @@ pub(super) fn handle_big_requests_request(
         // Apply / Ignore signal after sending the Enable through the
         // channel; unblock it with `IgnoreBigRequests` so it doesn't
         // deadlock.
-        if let Some(client) = state.clients.get(&client_id.0)
-            && let Some(tx) = client.reader_control.as_ref()
-        {
-            let _ = tx.send(crate::server::ReaderControl::IgnoreBigRequests);
-        }
+        release_big_requests_reader(state, client_id);
         return emit_x11_error_with_minor(
             state,
             client_id,
