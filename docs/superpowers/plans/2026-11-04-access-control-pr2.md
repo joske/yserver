@@ -89,7 +89,9 @@ table ("Extension access and dispatch checks"). PR 1 (#328, merged as 4ccb1d2a) 
 
 1. A request replayed through `process_request` later (held during a server grab, `reset.rs:1333`,
    `record.rs:1080`, `process_disconnect.rs:1939`, `host_x11/mod.rs`) is checked when it is actually dispatched,
-   with the opcodes it carries; nothing caches an earlier answer. Covered by the revocation test in Task 2.
+   with the opcodes it carries; nothing caches an earlier answer. Covered by
+   `held_extension_request_is_checked_when_the_grab_releases` in Task 2 (the scheduler's real
+   `server_grab_waiters` path, `run.rs:1872-1894`).
 2. `ListExtensions` with every entry denied answers a well-formed empty list (`nExtensions = 0`, length 0), not an
    error. Task 1 test.
 3. An extension whose availability depends on the backend (RENDER, XKEYBOARD, DRI3, GLX under
@@ -212,6 +214,12 @@ git commit -S -m "feat(core): access control PR 2: extension access check at dis
     policy installed before `run_core` as in PR 1's `run/tests.rs:340` test) — the client sends `Enable` then
     `GetInputFocus` with normal framing; it reads `BadRequest` for the first and the `GetInputFocus` reply for the
     second within the harness timeout. Mutation: drop the release; the second reply never arrives.
+  - `held_extension_request_is_checked_when_the_grab_releases` (in `run/tests.rs`, real `run_core` with two
+    clients, revocable policy installed before `run_core`) — client A grabs the server; client B sends an XFIXES
+    `QueryVersion`, which the scheduler parks in `server_grab_waiters`; the policy is revoked while it is held;
+    A ungrabs; B reads `BadRequest` (value 0, minor 0, XFIXES major) and no `QueryVersion` reply. Mutation: decide
+    at intake (when the request is queued) and carry the cached decision to dispatch; the held request is then
+    answered normally.
   - `extension_dispatch_asks_with_client_name_and_opcodes` — recording policy that allows. An XFIXES `QueryVersion`
     records `{client 1, "XFIXES", Some(RequestOpcodes { major: XFIXES_MAJOR_OPCODE, minor: 0 })}` and gets its
     normal reply. RENDER `QueryVersion` (not advertised under `RecordingBackend`) records
@@ -266,7 +274,8 @@ git commit -S -m "feat(core): access control PR 2: extension dispatch check"
   clippy plain, `--features tcp-transport`, `--features xdmcp`, FreeBSD; `cargo test --workspace` and
   `--features xdmcp`; each `crates/*/tests` target; `--features xdmcp -- --ignored` on lavapipe; `just man`).
   The loaded runs are `cargo test -p yserver-core --lib -- core_loop::process_request::tests::extensions
-  denied_big_requests_enable_keeps_the_connection_working` 5 times under `nproc` busy loops.
+  denied_big_requests_enable_keeps_the_connection_working held_extension_request_is_checked_when_the_grab_releases`
+  5 times under `nproc` busy loops.
   Expected: every step rc=0, zero failures in the loaded runs.
 - [ ] **Step 2:** Hardware regression pass on AMD and NVIDIA with the PR 1 harness (`hw-ac.sh amd|nvidia`), plus
   `xdpyinfo` extension list compared with the PR 1 run's list.
