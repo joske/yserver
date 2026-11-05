@@ -2041,6 +2041,47 @@ mod tests {
         assert_eq!(get_context_clients(LittleEndian, &reply), enabled_clients);
     }
 
+    /// `record-probe recdie l` after the previous probe's clients left: the
+    /// recorder takes the lowest free base, so FutureClients fills its slot
+    /// between xprop and ctl (Xvfb, record.c RecordDeleteClientFromRCAP).
+    #[test]
+    fn recorder_reusing_the_lowest_base_keeps_xorg_client_order() {
+        for release_rec_first in [true, false] {
+            let mut state = ServerState::new();
+            let base = |s: &mut ServerState| s.id_allocator.allocate().unwrap().0;
+            let (xprop, old_rec, old_ctl) = (base(&mut state), base(&mut state), base(&mut state));
+            let freed = if release_rec_first {
+                [old_rec, old_ctl]
+            } else {
+                [old_ctl, old_rec]
+            };
+            for b in freed {
+                state.id_allocator.release(b);
+            }
+            let (rec_base, ctl_base) = (base(&mut state), base(&mut state));
+            let mut streams = [(C3, xprop), (REC, rec_base), (CTL, ctl_base)].map(|(id, b)| {
+                let stream = install(&mut state, id, b, LittleEndian);
+                state.clients.get_mut(&id).unwrap().resource_id_mask = 0x000F_FFFF;
+                stream
+            });
+            let ctx = ctl_base + 1;
+            let died = Range {
+                device_events: (2, 6),
+                client_died: 1,
+                ..Range::default()
+            };
+            create(&mut state, CTL, 2, ctx, 0, &[x11rec::ALL_CLIENTS], &[died]);
+            ctx_request(&mut state, REC, 2, x11rec::ENABLE_CONTEXT, ctx);
+            ctx_request(&mut state, CTL, 5, x11rec::GET_CONTEXT, ctx);
+            let reply = read_all(&mut streams[2]);
+            assert_eq!(
+                get_context_clients(LittleEndian, &reply),
+                [xprop, x11rec::FUTURE_CLIENTS, ctl_base],
+                "release_rec_first={release_rec_first}"
+            );
+        }
+    }
+
     /// `record-probe ownerdie l`: the creator leaving records its ClientDied
     /// (with the FromClientSequence header), then frees the context, which
     /// ends the stream.
