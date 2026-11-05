@@ -1,15 +1,21 @@
 //! Rootless presentation: each top-level's backing reaches its native window
 //! (spec `docs/superpowers/specs/2026-10-19-rootless-core-design.md` §4.5).
-//! A feature of the surface platform; KMS is never rootless (§7).
+//! The surface platform's (macOS, Windows), and the card-less KMS platform's
+//! for a host served on the core thread ([`display`], a Wayland
+//! compositor): the presenter itself runs on any [`Platform`].
 
 // Nothing outside tests starts the presenter until RL2 (macOS).
 #![cfg_attr(not(test), allow(dead_code))]
 
 mod cpu;
+#[cfg(kms)]
+pub(crate) mod display;
 pub(crate) mod frames;
 mod gpu;
 pub(crate) mod host;
 pub(crate) mod native;
+#[cfg(kms)]
+pub(crate) mod present_clock;
 pub(crate) mod record;
 pub(crate) mod window_swapchain;
 
@@ -31,7 +37,7 @@ use self::{
     window_swapchain::Retiring,
 };
 use crate::{
-    kms::render::{XBackend, scene::OutputSink as _, store::DrawableStore},
+    kms::render::{Platform, XBackend, store::DrawableStore},
     surface::SurfacePlatform,
 };
 
@@ -221,7 +227,7 @@ impl Presenter {
     /// Per window: follow the backing's generation; CPU: finish a completed
     /// readback into a frame and start the next; GPU: present; else ask a
     /// Busy host for a frame. Never waits on the CPU path.
-    fn tick(&mut self, b: &mut XBackend<SurfacePlatform>) {
+    pub(crate) fn tick<P: Platform>(&mut self, b: &mut XBackend<P>) {
         let Some(vk) = b.platform.gpu().vk().cloned() else {
             return;
         };

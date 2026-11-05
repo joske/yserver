@@ -485,6 +485,12 @@ impl Platform for PlatformBackend {
     }
 
     fn before_block(b: &mut KmsBackend) {
+        if let Some(rootless) = b.pstate.rootless.as_mut() {
+            rootless.host.borrow_mut().flush();
+            if let Some(presenter) = rootless.presenter.as_mut() {
+                presenter.poll_retiring();
+            }
+        }
         b.reclaim_retired_gpu_work();
         b.platform
             .emit_tearing_summary_if_due(b.pstate.tearing.is_on(), b.telemetry.avg_gpu_render_ns());
@@ -499,11 +505,26 @@ impl Platform for PlatformBackend {
             .into_iter()
             .chain(b.platform.next_software_vblank_deadline())
             .chain(b.platform.next_frozen_watch_deadline())
+            .chain(b.rootless_next_wakeup())
             .min()
     }
 
     fn maybe_composite(b: &mut KmsBackend) -> io::Result<()> {
-        KmsBackend::backend_scanout_maybe_composite(b)
+        let composed = KmsBackend::backend_scanout_maybe_composite(b);
+        b.rootless_tick();
+        composed
+    }
+
+    fn on_rootless_events(
+        b: &mut KmsBackend,
+        state: &ServerState,
+        events: &[yserver_core::rootless::RootlessEvent],
+    ) {
+        b.rootless_events(state, events);
+    }
+
+    fn on_host_display_ready(b: &mut KmsBackend, state: &mut ServerState) -> bool {
+        b.rootless_on_display_ready(state)
     }
 
     fn dump_scanout(b: &mut KmsBackend) {
@@ -586,21 +607,40 @@ impl Platform for PlatformBackend {
     }
 
     fn present_absolute_vblank_arm_supported(b: &KmsBackend, crtc_id: u32) -> bool {
+        // The rootless Present clock wakes the loop at any MSC asked of it.
+        if b.is_rootless_present_crtc(crtc_id) {
+            return true;
+        }
         KmsBackend::backend_present_present_absolute_vblank_arm_supported(b, crtc_id)
     }
 
     fn arm_present_shared_wake(b: &mut KmsBackend, randr_crtc_id: u32) -> io::Result<bool> {
+        // The rootless Present clock comes round at each MSC while armed.
+        if b.arm_rootless_present_clock(randr_crtc_id).is_some() {
+            return Ok(true);
+        }
         KmsBackend::backend_present_arm_present_shared_wake(b, randr_crtc_id)
     }
 
     fn present_scanout_blackout(b: &KmsBackend) -> bool {
+        // A rootless server has no KMS output to be dark, and its Present
+        // clock runs regardless: parked completions wait for their MSC
+        // rather than being flushed at the one the clock is in.
+        if b.rootless_active() {
+            return false;
+        }
         !(b.scanout_allowed() && b.kms_outputs_active)
     }
 
     fn poll_fds(b: &KmsBackend) -> Vec<(std::os::fd::RawFd, BackendFdKind)> {
         // Direct mode only: DRM fd + present-completion epfd. libinput runs
-        // on its own thread, not the core poll.
-        b.platform.poll_fds()
+        // on its own thread, not the core poll. A rootless host's display
+        // connection is served on the core thread.
+        let mut fds = b.platform.poll_fds();
+        if let Some(fd) = b.rootless_host_fd() {
+            fds.push((fd, BackendFdKind::HostDisplay));
+        }
+        fds
     }
 
     fn vt_switching_armed(b: &KmsBackend) -> bool {
@@ -707,7 +747,8 @@ impl Platform for PlatformBackend {
     fn poll_deferred_input(b: &mut KmsBackend, state: &mut ServerState) {
         b.service_software_vblanks();
         b.mark_frozen_crtcs();
-        KmsBackend::backend_session_poll_deferred_input(b, state)
+        KmsBackend::backend_session_poll_deferred_input(b, state);
+        b.rootless_service(state);
     }
 
     fn start_device_config(
@@ -907,6 +948,9 @@ impl Platform for PlatformBackend {
     }
 
     fn present_get_ust_msc(b: &KmsBackend, crtc_id: u32) -> (u64, u64) {
+        if let Some(sample) = b.rootless_present_clock(crtc_id) {
+            return sample;
+        }
         KmsBackend::backend_present_present_get_ust_msc(b, crtc_id)
     }
 
@@ -914,6 +958,13 @@ impl Platform for PlatformBackend {
         b: &KmsBackend,
         crtc_id: u32,
     ) -> yserver_core::backend::PresentClockSample {
+        if let Some((msc, ust)) = b.rootless_present_clock(crtc_id) {
+            return yserver_core::backend::PresentClockSample {
+                msc,
+                ust,
+                source: yserver_core::backend::PresentClockSource::BackendVblank,
+            };
+        }
         KmsBackend::backend_present_present_get_completion_clock(b, crtc_id)
     }
 
@@ -922,6 +973,9 @@ impl Platform for PlatformBackend {
         crtc_id: u32,
         target_mscs: &[u64],
     ) -> std::io::Result<usize> {
+        if let Some(armed) = b.arm_rootless_present_clock(crtc_id) {
+            return Ok(usize::from(!target_mscs.is_empty() && armed));
+        }
         b.arm_idle_vblanks_ioctl(crtc_id, target_mscs)
     }
 
@@ -930,6 +984,9 @@ impl Platform for PlatformBackend {
         crtc_id: u32,
         target_mscs: &[u64],
     ) -> std::io::Result<usize> {
+        if let Some(armed) = b.arm_rootless_present_clock(crtc_id) {
+            return Ok(usize::from(!target_mscs.is_empty() && armed));
+        }
         KmsBackend::backend_present_arm_present_completion_idle_vblanks(b, crtc_id, target_mscs)
     }
 
