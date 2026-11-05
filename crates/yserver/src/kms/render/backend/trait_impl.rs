@@ -1928,6 +1928,10 @@ impl<P: Platform> Backend for XBackend<P> {
         self.apply_cursor_hidden(hidden);
     }
 
+    fn displayed_cursor_hidden(&self) -> bool {
+        self.effective_cursor_hidden()
+    }
+
     fn take_displayed_cursor_change(&mut self) -> Option<yserver_core::backend::DisplayedCursor> {
         self.displayed_cursor_pending.take()
     }

@@ -7,6 +7,7 @@
 mod acks;
 mod host;
 mod info;
+mod lock;
 mod seat;
 mod topology;
 mod types;
@@ -33,6 +34,7 @@ use yserver_protocol::x11::ResourceId;
 
 pub use acks::ConfigureSource;
 pub(crate) use acks::note_configure;
+pub(crate) use lock::note_warp;
 pub use seat::PointerScope;
 pub(crate) use seat::map_input;
 pub(crate) use wm::{note_root_client_message, refuse_root_redirect};
@@ -99,6 +101,10 @@ pub struct Rootless {
     written_stacking: Vec<u32>,
     /// Pointer scope for the hit test (spec §4.4).
     scope: PointerScope,
+    /// The Managed top-level the host last activated: where its keyboard is.
+    active: Option<ResourceId>,
+    /// The pointer lock (`lock.rs`).
+    lock: lock::LockState,
 }
 
 impl Rootless {
@@ -117,6 +123,8 @@ impl Rootless {
             written_client_list: Vec::new(),
             written_stacking: Vec::new(),
             scope: PointerScope::Anywhere,
+            active: None,
+            lock: lock::LockState::default(),
         }
     }
 
@@ -257,7 +265,10 @@ pub fn reconcile_and_dispatch(state: &mut ServerState, backend: &mut dyn Backend
     let Some(mut rootless) = state.rootless.take() else {
         return;
     };
-    let events = rootless.reconcile(state);
+    let mut events = rootless.reconcile(state);
+    if let Some(event) = lock::reconcile(&mut rootless, state, backend.displayed_cursor_hidden()) {
+        events.push(event);
+    }
     wm::apply_policy(state, backend, &mut rootless, &events);
     state.rootless = Some(rootless);
     if !events.is_empty() {
