@@ -2,7 +2,7 @@
 
 use std::ops::BitOr;
 
-use yserver_protocol::x11::ClientId;
+use yserver_protocol::x11::{AtomId, ClientId, ResourceId};
 
 use crate::{peer::PeerIdentity, server::ServerState};
 
@@ -33,6 +33,24 @@ pub struct AccessMode(u32);
 impl AccessMode {
     pub const READ: Self = Self(1 << 0);
     pub const MANAGE: Self = Self(1 << 1);
+    pub const WRITE: Self = Self(1 << 2);
+    pub const DESTROY: Self = Self(1 << 3);
+    pub const CREATE: Self = Self(1 << 4);
+    pub const GET_ATTR: Self = Self(1 << 5);
+    pub const SET_ATTR: Self = Self(1 << 6);
+    pub const LIST_PROP: Self = Self(1 << 7);
+    pub const GET_PROP: Self = Self(1 << 8);
+    pub const SET_PROP: Self = Self(1 << 9);
+    pub const LIST: Self = Self(1 << 10);
+    pub const ADD: Self = Self(1 << 11);
+    pub const REMOVE: Self = Self(1 << 12);
+    pub const HIDE: Self = Self(1 << 13);
+    pub const SHOW: Self = Self(1 << 14);
+    pub const BLEND: Self = Self(1 << 15);
+    pub const USE: Self = Self(1 << 16);
+    pub const RECEIVE: Self = Self(1 << 17);
+    pub const INSTALL: Self = Self(1 << 18);
+    pub const UNINSTALL: Self = Self(1 << 19);
 
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {
@@ -46,6 +64,50 @@ impl BitOr for AccessMode {
     fn bitor(self, rhs: Self) -> Self::Output {
         Self(self.0 | rhs.0)
     }
+}
+
+/// X resource classes exposed to resource access policies.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ResourceKind {
+    Window,
+    Pixmap,
+    Gc,
+    Font,
+    Cursor,
+    Colormap,
+    Picture,
+    GlyphSet,
+    Region,
+    PointerBarrier,
+    SyncCounter,
+    SyncAlarm,
+    SyncFence,
+    Damage,
+    PresentEventSelection,
+    ShmSegment,
+    GlxContext,
+    GlxDrawable,
+    Dri3Syncobj,
+    RecordContext,
+    RandrOutput,
+    RandrCrtc,
+    RandrMode,
+    RandrProvider,
+}
+
+/// Resource ownership metadata supplied when a policy checks a creation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Creation {
+    pub parent: Option<ResourceId>,
+    pub owner: ClientId,
+}
+
+/// The typed X resource a policy is asked about.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResourceTarget {
+    pub id: ResourceId,
+    pub kind: ResourceKind,
+    pub creation: Option<Creation>,
 }
 
 /// The request opcodes active at an access check.
@@ -113,6 +175,24 @@ impl<'a> AccessContext<'a> {
             .map(|state| &state.admission)
     }
 
+    /// Resolve the owner of an object of exactly this resource kind.
+    #[must_use]
+    pub fn owner(&self, id: ResourceId, kind: ResourceKind) -> Option<ClientId> {
+        self.state.access_resource_owner(id, kind)
+    }
+
+    /// Whether `window` is this screen's root window.
+    #[must_use]
+    pub fn is_root(&self, window: ResourceId) -> bool {
+        window == crate::resources::ROOT_WINDOW
+    }
+
+    /// Resolve an atom's current name without interning it.
+    #[must_use]
+    pub fn atom_name(&self, atom: AtomId) -> Option<&str> {
+        self.state.atoms.name(atom)
+    }
+
     #[must_use]
     pub const fn request(&self) -> Option<RequestOpcodes> {
         self.request
@@ -144,6 +224,29 @@ pub trait AccessPolicy: Send + Sync {
         _ctx: &AccessContext<'_>,
         _client: ClientId,
         _extension: &str,
+    ) -> Decision {
+        Decision::Allow
+    }
+
+    /// Decide whether a client may perform `mode` on a typed resource.
+    fn resource(
+        &self,
+        _ctx: &AccessContext<'_>,
+        _client: ClientId,
+        _target: &ResourceTarget,
+        _mode: AccessMode,
+    ) -> Decision {
+        Decision::Allow
+    }
+
+    /// Decide whether a client may perform `mode` on a window property.
+    fn property(
+        &self,
+        _ctx: &AccessContext<'_>,
+        _client: ClientId,
+        _window: ResourceId,
+        _property: AtomId,
+        _mode: AccessMode,
     ) -> Decision {
         Decision::Allow
     }

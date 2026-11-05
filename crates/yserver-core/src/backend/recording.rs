@@ -599,6 +599,8 @@ pub struct RecordingBackend {
     pub client_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Returned by `glx_available`.
     pub glx_available: bool,
+    /// Let request-path tests create a glyphset without a host renderer.
+    pub render_create_glyphset_returns_handle: bool,
     /// Whether the test backend simulates queueing the input pause barrier.
     pub vt_release_pause_queued: bool,
     /// Set when the release has crossed the test backend's yield boundary.
@@ -731,6 +733,7 @@ impl RecordingBackend {
             platform_events: 0,
             client_count: std::sync::Arc::default(),
             glx_available: true,
+            render_create_glyphset_returns_handle: false,
             vt_release_pause_queued: false,
             vt_release_finished: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
@@ -2405,7 +2408,9 @@ impl Backend for RecordingBackend {
         _origin: Option<OriginContext>,
         _ynest_format: u32,
     ) -> io::Result<Option<GlyphSetHandle>> {
-        Ok(None)
+        Ok(self
+            .render_create_glyphset_returns_handle
+            .then(|| GlyphSetHandle::from_raw_panicking(self.allocate_handle())))
     }
 
     fn render_free_glyphset(
