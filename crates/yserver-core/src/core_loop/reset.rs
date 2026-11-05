@@ -2213,7 +2213,7 @@ mod tests {
     #[test]
     fn a_client_refused_for_a_bad_cookie_arms_nothing() {
         // Same shape, and the one a stranger can reach: the TCP
-        // listener binds 0.0.0.0, so a port scan or a wrong cookie must
+        // listener binds every interface, so a port scan or a wrong cookie must
         // not be able to make the server erase its session.
         let mut trigger = ResetTrigger::new(ResetPolicy::Reset);
         for _ in 0..10 {

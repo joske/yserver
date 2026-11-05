@@ -257,15 +257,14 @@ fn interface_ips() -> Vec<IpAddr> {
 /// hotplug or a DHCP renewal. Xorg snapshots and then patches with
 /// `AugmentSelf`; asking each time is simpler and cannot drift.
 ///
-/// Any loopback address counts; otherwise only IPv4 interface addresses
-/// are compared, since the TCP listener is IPv4-only.
+/// Any loopback address counts, and any interface address of either family.
 ///
 /// Not implemented: Xorg additionally treats a client whose command name
 /// is `ssh` as non-local, to catch a forwarded connection. That is a
 /// heuristic on `/proc`, and `ssh -X` reaches us over a UNIX socket
 /// anyway.
 pub(crate) fn address_is_ours(peer: IpAddr) -> bool {
-    peer.is_loopback() || (peer.is_ipv4() && interface_ips().contains(&peer))
+    peer.is_loopback() || interface_ips().contains(&peer)
 }
 
 /// A Unix connection made through a bound listener and `accept`, the
@@ -350,5 +349,38 @@ mod tests {
         assert_eq!(peer.transport, AuthTransport::Tcp);
         assert_eq!(peer.addr, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
         assert_eq!(peer.cred, None);
+    }
+
+    /// Xorg's `DefineSelf` puts every `getifaddrs` address of both families
+    /// in `selfhosts`, and `xtransLocalClient` matches a peer against it.
+    #[test]
+    fn every_interface_address_of_either_family_is_ours() {
+        for ip in interface_ips() {
+            assert!(address_is_ours(ip), "{ip} is an interface address");
+        }
+    }
+
+    #[test]
+    fn tcp_peer_over_ipv6_loopback_is_internet6_and_ours() {
+        let Ok(listener) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) else {
+            eprintln!("no IPv6 loopback on this host: skipping");
+            return;
+        };
+        let _client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let (accepted, from) = listener.accept().expect("accept");
+        let peer = PeerIdentity::of(&Transport::Tcp(accepted));
+        assert_eq!(peer.transport, AuthTransport::Tcp);
+        assert_eq!(peer.addr, Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert_eq!(peer.cred, None);
+        let mut loopback = vec![0; 15];
+        loopback.push(1);
+        assert_eq!(
+            host_entry_of(&from),
+            HostEntry {
+                family: FAMILY_INTERNET6,
+                addr: loopback,
+            }
+        );
+        assert!(address_is_ours(Ipv6Addr::LOCALHOST.into()));
     }
 }
