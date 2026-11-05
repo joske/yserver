@@ -1267,6 +1267,21 @@ pub trait Backend {
     /// the destination disappeared).
     fn finish_present_source_wait(&mut self, _wait_id: u64) {}
 
+    /// Whether a Present that is not yet executed is scrapped (completed as
+    /// Skip) by a later one for the same window and target MSC, as Xorg's
+    /// `present_scmd.c` does ("don't bother doing the previous one if this
+    /// one will overwrite it in the same frame"). Default true. A backend
+    /// whose windows are another window system's says false: Xwayland's
+    /// `xwl_present_pixmap` scraps nothing for a shared target but executes
+    /// each in turn, and queues a flip behind a pending one, since the
+    /// window system -- not the X server -- decides which frame a refresh
+    /// shows. Two presents a game sends a millisecond apart (FSR3 frame
+    /// generation's generated and real frame) then are two frames on the
+    /// screen rather than one.
+    fn present_supersedes_same_msc(&self) -> bool {
+        true
+    }
+
     /// A scanout pageflip is submitted and not yet retired. Used ONLY by
     /// the immediate-target arrival rule (spec §msc-due). Default false:
     /// non-KMS backends execute everything at arrival.

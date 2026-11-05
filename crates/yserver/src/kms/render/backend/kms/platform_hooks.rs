@@ -622,6 +622,12 @@ impl Platform for PlatformBackend {
         KmsBackend::backend_present_arm_present_shared_wake(b, randr_crtc_id)
     }
 
+    fn present_supersedes_same_msc(b: &KmsBackend) -> bool {
+        // A rootless host's window system shows the frames it gets: every
+        // present is executed in turn, as Xwayland does.
+        !b.rootless_active()
+    }
+
     fn present_scanout_blackout(b: &KmsBackend) -> bool {
         // A rootless server has no KMS output to be dark, and its Present
         // clock runs regardless: parked completions wait for their MSC

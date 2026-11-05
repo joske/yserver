@@ -277,6 +277,10 @@ impl<P: Platform> Backend for XBackend<P> {
         P::begin_ready_present_destination_write(self, wait_id)
     }
 
+    fn present_supersedes_same_msc(&self) -> bool {
+        P::present_supersedes_same_msc(self)
+    }
+
     fn finish_present_source_wait(&mut self, wait_id: u64) {
         P::finish_present_source_wait(self, wait_id)
     }

@@ -330,6 +330,11 @@ pub trait Platform: OutputSink + Sized + 'static {
 
     fn finish_present_source_wait(_b: &mut XBackend<Self>, _wait_id: u64) {}
 
+    /// `Backend::present_supersedes_same_msc`.
+    fn present_supersedes_same_msc(_b: &XBackend<Self>) -> bool {
+        true
+    }
+
     fn present_flip_in_flight(_b: &XBackend<Self>, _crtc_id: u32) -> bool {
         false
     }
