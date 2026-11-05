@@ -1,0 +1,7 @@
+# Used by the OpenBSD CI job only. OpenBSD 8.0 can lose the wakeup of a
+# blocking loopback connect() or accept() after the handshake completes, so a
+# test can hang forever there: kill it after two minutes and retry it.
+[profile.openbsd]
+slow-timeout = { period = "60s", terminate-after = 2 }
+retries = 2
+fail-fast = false
