@@ -1769,7 +1769,6 @@ impl ServerState {
     }
 
     /// Ask installed policies whether a client may perform `mode` on a property.
-    #[allow(dead_code)] // Added before the core request-site migration.
     pub(crate) fn check_property(
         &self,
         client: ClientId,

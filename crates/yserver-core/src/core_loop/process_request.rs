@@ -438,7 +438,7 @@ pub fn process_request(
         14 => handle_get_geometry(state, client_id, sequence, access_request, body),
         15 => handle_query_tree(state, client_id, sequence, access_request, body),
         16 => handle_intern_atom(state, client_id, sequence, header, body),
-        21 => handle_list_properties(state, client_id, sequence, body),
+        21 => handle_list_properties(state, client_id, sequence, header, body),
         23 => handle_get_selection_owner(state, client_id, sequence, body),
         40 => handle_translate_coordinates(state, client_id, sequence, access_request, body),
         // ── grabs (pure state mutation on ServerState.{pointer,key}_grabs) ──
@@ -457,8 +457,8 @@ pub fn process_request(
         97 => handle_query_best_size(state, client_id, sequence, access_request, body),
         // ── properties (state mutation + PropertyNotify fanout) ──
         18 => handle_change_property(state, backend, client_id, sequence, header, body),
-        19 => handle_delete_property(state, backend, client_id, sequence, body),
-        114 => handle_rotate_properties(state, backend, client_id, sequence, body),
+        19 => handle_delete_property(state, backend, client_id, sequence, header, body),
+        114 => handle_rotate_properties(state, backend, client_id, sequence, header, body),
         20 => handle_get_property(state, backend, client_id, sequence, header, body),
         // ── backend-proxy replies (state-light, host-RPC) ──
         17 => handle_get_atom_name(state, backend, origin, client_id, sequence, body),
