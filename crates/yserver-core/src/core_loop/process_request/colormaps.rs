@@ -1,4 +1,7 @@
 use crate::{
+    access::{
+        AccessMode, Creation, Decision, DenyError, RequestOpcodes, ResourceKind, ResourceTarget,
+    },
     core_loop::process_request::{
         RequestOutcome, emit_x11_error, write_to_client, xid_out_of_client_range,
     },
@@ -11,13 +14,50 @@ use yserver_protocol::{
     x11::{ClientId, ResourceId, SequenceNumber},
 };
 
+fn check_colormap_access(
+    state: &ServerState,
+    client_id: ClientId,
+    cmap: ResourceId,
+    mode: AccessMode,
+    access_request: RequestOpcodes,
+) -> Option<DenyError> {
+    if !state.policies_installed() || client_id == crate::resources::SERVER_OWNER {
+        return None;
+    }
+    state.resources.colormap(cmap)?;
+    match state.check_resource(
+        client_id,
+        &ResourceTarget {
+            id: cmap,
+            kind: ResourceKind::Colormap,
+            creation: None,
+        },
+        mode,
+        Some(access_request),
+    ) {
+        Decision::Allow => None,
+        Decision::Deny(error) => Some(error),
+    }
+}
+
 /// StoreColors (89): always BadAccess on TrueColor (read-only) colormaps.
 pub(super) fn handle_store_colors(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
+    body: &[u8],
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} StoreColors", client_id.0, sequence.0);
+    if let Some(cmap) = body.get(..4).map(|bytes| {
+        ResourceId(u32::from_le_bytes(
+            bytes.try_into().expect("four-byte colormap id"),
+        ))
+    }) && let Some(error) =
+        check_colormap_access(state, client_id, cmap, AccessMode::WRITE, access_request)
+    {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 89);
+    }
     emit_x11_error(state, client_id, sequence, x11::error::BAD_ACCESS, 0, 89)
 }
 
@@ -26,8 +66,19 @@ pub(super) fn handle_store_named_color(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
+    body: &[u8],
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} StoreNamedColor", client_id.0, sequence.0);
+    if let Some(cmap) = body.get(..4).map(|bytes| {
+        ResourceId(u32::from_le_bytes(
+            bytes.try_into().expect("four-byte colormap id"),
+        ))
+    }) && let Some(error) =
+        check_colormap_access(state, client_id, cmap, AccessMode::WRITE, access_request)
+    {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 90);
+    }
     emit_x11_error(state, client_id, sequence, x11::error::BAD_ACCESS, 0, 90)
 }
 
@@ -39,9 +90,20 @@ pub(super) fn handle_alloc_color_cells(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
-    _body: &[u8],
+    access_request: RequestOpcodes,
+    body: &[u8],
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} AllocColorCells", client_id.0, sequence.0);
+    let cmap = ResourceId(u32::from_le_bytes(
+        body[..4]
+            .try_into()
+            .expect("fixed-length AllocColorCells colormap id"),
+    ));
+    if let Some(error) =
+        check_colormap_access(state, client_id, cmap, AccessMode::ADD, access_request)
+    {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 86);
+    }
     emit_x11_error(state, client_id, sequence, x11::error::BAD_ALLOC, 0, 86)
 }
 
@@ -50,9 +112,20 @@ pub(super) fn handle_alloc_color_planes(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
-    _body: &[u8],
+    access_request: RequestOpcodes,
+    body: &[u8],
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} AllocColorPlanes", client_id.0, sequence.0);
+    let cmap = ResourceId(u32::from_le_bytes(
+        body[..4]
+            .try_into()
+            .expect("fixed-length AllocColorPlanes colormap id"),
+    ));
+    if let Some(error) =
+        check_colormap_access(state, client_id, cmap, AccessMode::ADD, access_request)
+    {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 87);
+    }
     emit_x11_error(state, client_id, sequence, x11::error::BAD_ALLOC, 0, 87)
 }
 
@@ -60,6 +133,7 @@ pub(super) fn handle_create_colormap(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() < 12 {
@@ -76,6 +150,36 @@ pub(super) fn handle_create_colormap(
             78,
         );
     }
+    let window = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+    if state.resources.window(window).is_some()
+        && let Decision::Deny(error) = state.check_resource(
+            client_id,
+            &ResourceTarget {
+                id: window,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            AccessMode::GET_ATTR,
+            Some(access_request),
+        )
+    {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 78);
+    }
+    if let Decision::Deny(error) = state.check_resource(
+        client_id,
+        &ResourceTarget {
+            id: mid,
+            kind: ResourceKind::Colormap,
+            creation: Some(Creation {
+                parent: Some(window),
+                owner: client_id,
+            }),
+        },
+        AccessMode::CREATE,
+        Some(access_request),
+    ) {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 78);
+    }
     let visual = ResourceId(u32::from_le_bytes([body[8], body[9], body[10], body[11]]));
     state.resources.create_colormap(client_id, mid, visual);
     debug!(
@@ -90,6 +194,7 @@ pub(super) fn handle_copy_colormap_and_free(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() < 8 {
@@ -108,6 +213,30 @@ pub(super) fn handle_copy_colormap_and_free(
     }
     // Source colormap's visual; default to ROOT_VISUAL if unknown.
     let src_id = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+    if let Some(error) = check_colormap_access(
+        state,
+        client_id,
+        src_id,
+        AccessMode::READ | AccessMode::REMOVE,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 80);
+    }
+    if let Decision::Deny(error) = state.check_resource(
+        client_id,
+        &ResourceTarget {
+            id: mid,
+            kind: ResourceKind::Colormap,
+            creation: Some(Creation {
+                parent: None,
+                owner: client_id,
+            }),
+        },
+        AccessMode::CREATE,
+        Some(access_request),
+    ) {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 80);
+    }
     let visual = state
         .resources
         .colormap(src_id)
@@ -162,6 +291,7 @@ pub(super) fn handle_install_colormap(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() < 4 {
@@ -181,6 +311,11 @@ pub(super) fn handle_install_colormap(
             cmap.0,
             81,
         );
+    }
+    if let Some(error) =
+        check_colormap_access(state, client_id, cmap, AccessMode::INSTALL, access_request)
+    {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 81);
     }
     if state.installed_colormaps.contains(&cmap) {
         return Ok(RequestOutcome::Handled);
@@ -204,6 +339,7 @@ pub(super) fn handle_free_colormap(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() < 4 {
@@ -224,6 +360,11 @@ pub(super) fn handle_free_colormap(
             79,
         );
     }
+    if let Some(error) =
+        check_colormap_access(state, client_id, cmap, AccessMode::DESTROY, access_request)
+    {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 79);
+    }
     let was_installed = state.installed_colormaps.contains(&cmap);
     state.installed_colormaps.retain(|c| *c != cmap);
     if was_installed {
@@ -241,6 +382,7 @@ pub(super) fn handle_uninstall_colormap(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() < 4 {
@@ -261,6 +403,15 @@ pub(super) fn handle_uninstall_colormap(
             82,
         );
     }
+    if let Some(error) = check_colormap_access(
+        state,
+        client_id,
+        cmap,
+        AccessMode::UNINSTALL,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 82);
+    }
     let before = state.installed_colormaps.len();
     state.installed_colormaps.retain(|c| *c != cmap);
     if state.installed_colormaps.len() == before {
@@ -275,6 +426,7 @@ pub(super) fn handle_list_installed_colormaps(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     // Body's window xid scopes the reply to the window's screen.
@@ -298,6 +450,18 @@ pub(super) fn handle_list_installed_colormaps(
             window.0,
             83,
         );
+    }
+    if let Decision::Deny(error) = state.check_resource(
+        client_id,
+        &ResourceTarget {
+            id: window,
+            kind: ResourceKind::Window,
+            creation: None,
+        },
+        AccessMode::GET_ATTR,
+        Some(access_request),
+    ) {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 83);
     }
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
@@ -332,10 +496,20 @@ pub(super) fn handle_alloc_color(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} AllocColor", client_id.0, sequence.0);
     let color = x11::alloc_color_request(body).unwrap_or_default();
+    if let Some(cmap) = body.get(..4).map(|bytes| {
+        ResourceId(u32::from_le_bytes(
+            bytes.try_into().expect("four-byte colormap id"),
+        ))
+    }) && let Some(error) =
+        check_colormap_access(state, client_id, cmap, AccessMode::ADD, access_request)
+    {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 84);
+    }
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
@@ -357,6 +531,7 @@ pub(super) fn handle_free_colors(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let Some(prefix) = body.get(..8) else {
@@ -384,6 +559,11 @@ pub(super) fn handle_free_colors(
             88,
         );
     };
+    if let Some(error) =
+        check_colormap_access(state, client_id, cmap, AccessMode::REMOVE, access_request)
+    {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 88);
+    }
     let Some(visual) = state.resources.visual(colormap.visual) else {
         return emit_x11_error(
             state,
@@ -423,6 +603,7 @@ pub(super) fn handle_alloc_named_color(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let name = x11::alloc_named_color_name(body);
@@ -435,6 +616,15 @@ pub(super) fn handle_alloc_named_color(
         );
         return emit_x11_error(state, client_id, sequence, x11::error::BAD_NAME, 0, 85);
     };
+    if let Some(cmap) = body.get(..4).map(|bytes| {
+        ResourceId(u32::from_le_bytes(
+            bytes.try_into().expect("four-byte colormap id"),
+        ))
+    }) && let Some(error) =
+        check_colormap_access(state, client_id, cmap, AccessMode::ADD, access_request)
+    {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 85);
+    }
     debug!(
         "client {} #{} AllocNamedColor {:?}",
         client_id.0, sequence.0, name
@@ -452,6 +642,7 @@ pub(super) fn handle_query_colors(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let pixels = x11::query_colors_pixels(body);
@@ -461,6 +652,15 @@ pub(super) fn handle_query_colors(
         sequence.0,
         pixels.len()
     );
+    if let Some(cmap) = body.get(..4).map(|bytes| {
+        ResourceId(u32::from_le_bytes(
+            bytes.try_into().expect("four-byte colormap id"),
+        ))
+    }) && let Some(error) =
+        check_colormap_access(state, client_id, cmap, AccessMode::READ, access_request)
+    {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 91);
+    }
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
@@ -474,6 +674,7 @@ pub(super) fn handle_lookup_color(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let name = x11::alloc_named_color_name(body);
@@ -485,6 +686,15 @@ pub(super) fn handle_lookup_color(
         );
         return emit_x11_error(state, client_id, sequence, x11::error::BAD_NAME, 0, 92);
     };
+    if let Some(cmap) = body.get(..4).map(|bytes| {
+        ResourceId(u32::from_le_bytes(
+            bytes.try_into().expect("four-byte colormap id"),
+        ))
+    }) && let Some(error) =
+        check_colormap_access(state, client_id, cmap, AccessMode::READ, access_request)
+    {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 92);
+    }
     debug!(
         "client {} #{} LookupColor {:?}",
         client_id.0, sequence.0, name
