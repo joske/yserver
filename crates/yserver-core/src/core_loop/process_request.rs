@@ -118,6 +118,7 @@ pub(crate) use saver_dpms::*;
 pub(crate) use selection::*;
 pub(crate) use shape_xfixes::*;
 pub(crate) use sync_ext::*;
+pub(crate) use vidmode::reinstall_vidmode_gamma;
 pub(crate) use windows::*;
 pub(crate) use xi::*;
 

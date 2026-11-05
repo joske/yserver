@@ -1585,6 +1585,14 @@ impl KmsBackend {
             return Ok(());
         }
         let lut = self.cached_gamma_for_current_size(output_key, gamma_size);
+        // The VidMode table goes under the RANDR ramp, as modesetting's
+        // xf86RandR12CrtcComputeGamma loads every CRTC.
+        let (red, green, blue) = match &self.pstate.vidmode_gamma {
+            Some(table) => {
+                table.crtc_lut((&lut.red, &lut.green, &lut.blue), usize::from(gamma_size))
+            }
+            None => (lut.red, lut.green, lut.blue),
+        };
         let Some(device) = self.platform.device_for_key(device_key) else {
             return Ok(());
         };
@@ -1615,8 +1623,7 @@ impl KmsBackend {
                     .pending_gamma_deadline
                     .set(active.then(|| now + refresh_period));
             }
-            *output.pending_gamma_lut.borrow_mut() =
-                Some((lut.red.clone(), lut.green.clone(), lut.blue.clone()));
+            *output.pending_gamma_lut.borrow_mut() = Some((red, green, blue));
             let deadline_elapsed = output
                 .pending_gamma_deadline
                 .get()
@@ -1670,7 +1677,17 @@ impl KmsBackend {
             || direct_work
     }
 
-    pub(super) fn reapply_gamma_for_output(&self, output_key: &OutputKey) {
+    /// Keep the VidMode gamma table and reload every live output's LUT.
+    pub(in crate::kms::render::backend) fn backend_set_vidmode_gamma(
+        &mut self,
+        table: Option<&yserver_core::backend::gamma::VidModeGammaTable>,
+    ) -> io::Result<()> {
+        self.pstate.vidmode_gamma = table.cloned();
+        self.reapply_gamma_for_live_outputs();
+        Ok(())
+    }
+
+    pub(in crate::kms::render::backend) fn reapply_gamma_for_output(&self, output_key: &OutputKey) {
         if let Err(e) = self.apply_gamma_to_live_output(output_key) {
             log::warn!("kms gamma: reapply for {output_key:?} failed: {e}");
         }

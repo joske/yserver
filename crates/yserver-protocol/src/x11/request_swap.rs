@@ -286,8 +286,8 @@ const fn extension_request_swap_table(major: u8, minor: u8) -> Option<&'static [
 }
 
 const fn xf86vidmode_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
-    use FieldEntry::Fixed;
-    use FieldKind::U16;
+    use FieldEntry::{ElementArrayTail, Fixed};
+    use FieldKind::{U16, U32};
 
     // `screen(u16) + pad(u16)`, shared by the ordinary screen-scoped reads.
     const SCREEN: &[FieldEntry] = &[Fixed {
@@ -297,9 +297,43 @@ const fn xf86vidmode_request_swap_table(minor: u8) -> Option<&'static [FieldEntr
 
     Some(match minor {
         // QueryVersion (0) has an empty body. ValidateModeLine (9) stays
-        // unswapped for its version-aware parser. Rejected write requests are
-        // not inspected.
+        // unswapped for its version-aware parser. The mode-setting writes,
+        // always rejected, are not inspected.
         1 | 4 | 6 | 11 | 13 | 16 | 19 | 20 => SCREEN,
+        // LockModeSwitch: screen(u16), lock(u16) (`SProcVidModeLockModeSwitch`).
+        5 => &[
+            Fixed {
+                offset: 0,
+                kind: U16,
+            },
+            Fixed {
+                offset: 2,
+                kind: U16,
+            },
+        ],
+        // SetGamma: screen(u16), pad(u16), red, green, blue (u32)
+        // (`SProcVidModeSetGamma`).
+        15 => &[
+            Fixed {
+                offset: 0,
+                kind: U16,
+            },
+            Fixed {
+                offset: 4,
+                kind: U32,
+            },
+            Fixed {
+                offset: 8,
+                kind: U32,
+            },
+            Fixed {
+                offset: 12,
+                kind: U32,
+            },
+        ],
+        // SetGammaRamp: screen(u16), size(u16), then the three channels,
+        // every CARD16 swapped (`SProcVidModeSetGammaRamp`'s `SwapRestS`).
+        18 => &[ElementArrayTail { from: 0, kind: U16 }],
         // GetGammaRamp: screen(u16), size(u16).
         17 => &[
             Fixed {
@@ -1215,6 +1249,41 @@ mod tests {
         swap_request_body(153, 17, ClientByteOrder::BigEndian, &mut ramp);
         assert_eq!(u16::from_le_bytes(ramp[0..2].try_into().unwrap()), 0x1234);
         assert_eq!(u16::from_le_bytes(ramp[2..4].try_into().unwrap()), 0x0100);
+    }
+
+    #[test]
+    fn xf86vidmode_gamma_writes_and_lock_are_swapped() {
+        let mut lock = [0, 1, 0, 1];
+        swap_request_body(153, 5, ClientByteOrder::BigEndian, &mut lock);
+        assert_eq!(lock, [1, 0, 1, 0]);
+
+        let mut gamma = vec![0u8; 28];
+        gamma[0..2].copy_from_slice(&1u16.to_be_bytes());
+        for (at, value) in [(4, 15_000u32), (8, 10_000), (12, 5_000)] {
+            gamma[at..at + 4].copy_from_slice(&value.to_be_bytes());
+        }
+        swap_request_body(153, 15, ClientByteOrder::BigEndian, &mut gamma);
+        assert_eq!(u16::from_le_bytes([gamma[0], gamma[1]]), 1);
+        for (at, value) in [(4, 15_000u32), (8, 10_000), (12, 5_000)] {
+            assert_eq!(
+                u32::from_le_bytes(gamma[at..at + 4].try_into().unwrap()),
+                value
+            );
+        }
+
+        let mut ramp = Vec::new();
+        for word in [0u16, 2, 0x0102, 0x0304, 0x0506, 0x0708, 0x090a, 0x0b0c] {
+            ramp.extend_from_slice(&word.to_be_bytes());
+        }
+        swap_request_body(153, 18, ClientByteOrder::BigEndian, &mut ramp);
+        let words: Vec<u16> = ramp
+            .chunks_exact(2)
+            .map(|w| u16::from_le_bytes([w[0], w[1]]))
+            .collect();
+        assert_eq!(
+            words,
+            [0, 2, 0x0102, 0x0304, 0x0506, 0x0708, 0x090a, 0x0b0c]
+        );
     }
 
     #[test]

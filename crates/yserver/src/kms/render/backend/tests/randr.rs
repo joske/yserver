@@ -795,6 +795,129 @@ fn kms_gamma_off_connector_set_roundtrips_cached_values() {
     assert_eq!(b.get_crtc_gamma(crtc), (red, green, blue));
 }
 
+/// GetCrtcGamma keeps reporting the RANDR ramp under a VidMode table.
+#[test]
+fn kms_gamma_vidmode_table_leaves_the_randr_ramp() {
+    use yserver_core::backend::gamma::VidModeGammaTable;
+
+    let mut b = KmsBackend::for_tests();
+    let crtc = 0x4000;
+    b.pstate
+        .crtc_key_by_id
+        .insert(crtc, test_output_key(0, "DP-1"));
+    let before = b.get_crtc_gamma(crtc);
+    let table = VidModeGammaTable::from_gamma([2.0, 1.0, 0.5]);
+    b.set_vidmode_gamma(Some(&table))
+        .expect("set VidMode table");
+    assert_eq!(b.pstate.vidmode_gamma.as_ref(), Some(&table));
+    assert_eq!(b.get_crtc_gamma(crtc), before);
+
+    let ramp = vec![7u16; 256];
+    b.set_crtc_gamma(crtc, &ramp, &ramp, &ramp)
+        .expect("set gamma cache");
+    assert_eq!(b.get_crtc_gamma(crtc), (ramp.clone(), ramp.clone(), ramp));
+    assert_eq!(
+        b.pstate.vidmode_gamma.as_ref(),
+        Some(&table),
+        "a RANDR set keeps the VidMode table"
+    );
+}
+
+#[test]
+// Mutations: load the RANDR ramp alone under a VidMode table, or skip the table on a per-CRTC
+// reapply (#285's mode/enable path).
+fn kms_gamma_hardware_lut_stacks_the_randr_ramp_on_the_vidmode_table() {
+    use crate::drm::atomic::{AtomicCommitSink, tests_support::RecordingAtomicCommitExecutor};
+    use std::rc::Rc;
+    use yserver_core::backend::{Backend, gamma::VidModeGammaTable};
+
+    let mut backend = KmsBackend::for_tests();
+    let gamma_size = 256;
+    let crtc_xid = 0x4000;
+    let output_key = {
+        let output = &mut backend.platform.outputs[0];
+        output.output.crtc_gamma_lut_prop = Some(::drm::control::from_u32(70).unwrap());
+        output.output.crtc_gamma_lut_size = Some(4096);
+        output.key.clone()
+    };
+    backend
+        .pstate
+        .crtc_key_by_id
+        .insert(crtc_xid, output_key.clone());
+    let recorder = Rc::new(RecordingAtomicCommitExecutor::default());
+    recorder.set_gamma_size_for_tests(gamma_size);
+    backend.platform.devices[0].atomic_commit_sink =
+        Rc::new(AtomicCommitSink::new(recorder.clone()));
+    let blob_entry = |blob: &[u8], i: usize| -> (u16, u16, u16) {
+        let e = &blob[i * 8..i * 8 + 6];
+        (
+            u16::from_le_bytes([e[0], e[1]]),
+            u16::from_le_bytes([e[2], e[3]]),
+            u16::from_le_bytes([e[4], e[5]]),
+        )
+    };
+    let loaded = |recorder: &RecordingAtomicCommitExecutor, backend: &KmsBackend| {
+        let pending = backend.platform.outputs[0]
+            .output
+            .pending_gamma_lut
+            .borrow()
+            .clone();
+        pending.unwrap_or_else(|| {
+            let blobs = recorder.created_property_blobs();
+            let (_, blob) = blobs.last().expect("a gamma blob");
+            let entries: Vec<_> = (0..blob.len() / 8).map(|i| blob_entry(blob, i)).collect();
+            (
+                entries.iter().map(|e| e.0).collect(),
+                entries.iter().map(|e| e.1).collect(),
+                entries.iter().map(|e| e.2).collect(),
+            )
+        })
+    };
+
+    let randr: Vec<u16> = (0..256u32).map(|i| (i * 200) as u16).collect();
+    Backend::set_crtc_gamma(&mut backend, crtc_xid, &randr, &randr, &randr)
+        .expect("set the RANDR ramp");
+    let table = VidModeGammaTable::from_gamma([2.0, 1.0, 0.5]);
+    backend
+        .set_vidmode_gamma(Some(&table))
+        .expect("set the VidMode table");
+    let expected = table.crtc_lut((&randr, &randr, &randr), usize::from(gamma_size));
+    assert_ne!(expected.0, randr, "the table must change the LUT");
+    assert_eq!(loaded(&recorder, &backend), expected);
+    assert_eq!(
+        backend.get_crtc_gamma(crtc_xid),
+        (randr.clone(), randr.clone(), randr.clone())
+    );
+
+    // A per-CRTC mode or enable reloads the same stacked LUT.
+    backend.platform.outputs[0]
+        .output
+        .pending_gamma_lut
+        .borrow_mut()
+        .take();
+    let before = recorder.created_property_blobs().len();
+    backend.reapply_gamma_for_output(&output_key);
+    assert!(
+        recorder.created_property_blobs().len() > before
+            || backend.platform.outputs[0]
+                .output
+                .pending_gamma_lut
+                .borrow()
+                .is_some(),
+        "the reapply must load the LUT"
+    );
+    assert_eq!(loaded(&recorder, &backend), expected);
+
+    // Clearing the table loads the RANDR ramp alone.
+    backend
+        .set_vidmode_gamma(None)
+        .expect("clear the VidMode table");
+    assert_eq!(
+        loaded(&recorder, &backend),
+        (randr.clone(), randr.clone(), randr)
+    );
+}
+
 #[test]
 // Mutations: route a supported ramp through the legacy ioctl, always defer idle gamma, or prefer
 // GAMMA_LUT_SIZE over a nonzero legacy size.
