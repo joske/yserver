@@ -736,6 +736,7 @@ impl KmsBackend {
             vidmode_gamma: None,
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported: false,
+            rootless: None,
             export_holders: Default::default(),
         };
         let mut backend = Self::assemble(

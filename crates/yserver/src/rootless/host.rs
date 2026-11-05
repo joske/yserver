@@ -4,6 +4,7 @@ use std::io;
 
 use ash::vk;
 use yserver_core::{
+    backend::ActiveCursorImage,
     fd::OwnedFd,
     rootless::{Rect, RootlessEvent, ToplevelId},
 };
@@ -110,4 +111,9 @@ pub(crate) trait RootlessHost {
     /// The presenter destroyed the last swapchain and the surface of `id`:
     /// the native window may be freed now.
     fn surface_released(&mut self, _id: ToplevelId) {}
+    /// The cursor to show over the host's windows, when it changed; `None`
+    /// shows none (the `None` cursor, or one hidden). Its pixels are
+    /// straight-alpha BGRA. For a host with no shell of its own to tell.
+    #[cfg_attr(not(kms), allow(dead_code))]
+    fn set_cursor(&mut self, _cursor: Option<&ActiveCursorImage>) {}
 }

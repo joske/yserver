@@ -430,7 +430,6 @@ impl<P: Platform> XBackend<P> {
 
     /// The shown sprite's `(version, hotspot)`, `None` while hidden; no
     /// bytes copied.
-    #[cfg_attr(kms, allow(dead_code))] // The surface platform's.
     pub(crate) fn sprite_key(&self) -> Option<(u64, (u16, u16))> {
         if self.effective_cursor_hidden() {
             return None;
