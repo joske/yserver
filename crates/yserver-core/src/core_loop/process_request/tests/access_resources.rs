@@ -5737,9 +5737,26 @@ fn copy_gc_denial_preserves_destination_for_source_and_destination_denial() {
 #[ignore]
 fn bench_poly_point_with_and_without_policy() {
     const REQUESTS: u32 = 100_000;
+
+    /// An allow-all policy that only counts its calls, so the timing is the
+    /// layer's own cost rather than the recording policy's bookkeeping.
+    struct CountingAllow(std::sync::atomic::AtomicUsize);
+
+    impl crate::access::AccessPolicy for CountingAllow {
+        fn resource(
+            &self,
+            _ctx: &crate::access::AccessContext<'_>,
+            _client: ClientId,
+            _target: &ResourceTarget,
+            _mode: AccessMode,
+        ) -> Decision {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Decision::Allow
+        }
+    }
     const GC_ID: ResourceId = ResourceId(0x0055_0090);
 
-    let run = |with_policy: bool| {
+    let run = |with_policy: bool, counting: Option<Arc<CountingAllow>>| {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, CLIENT.0);
         state.resources.create_gc(
@@ -5778,7 +5795,9 @@ fn bench_poly_point_with_and_without_policy() {
             .expect("root window")
             .host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(0x100));
         let calls = Arc::new(Mutex::new(Vec::new()));
-        if with_policy {
+        if let Some(counting) = counting {
+            state.install_access_policy(counting);
+        } else if with_policy {
             state.install_access_policy(Arc::new(DrawingResourcePolicy {
                 label: "PolyPoint benchmark allow-all",
                 calls: Arc::clone(&calls),
@@ -5860,8 +5879,20 @@ fn bench_poly_point_with_and_without_policy() {
         (elapsed, wire_bytes, point_draws, access_counts)
     };
 
-    let without_policy = run(false);
-    let with_policy = run(true);
+    let without_policy = run(false, None);
+    let with_policy = run(true, None);
+    let counter = Arc::new(CountingAllow(std::sync::atomic::AtomicUsize::new(0)));
+    let counting = run(true, Some(Arc::clone(&counter)));
+    assert!(
+        counting.1.is_empty(),
+        "counting-policy PolyPoint requests wrote an error or reply"
+    );
+    assert_eq!(counting.2, REQUESTS as usize, "counting-policy point draws");
+    assert_eq!(
+        counter.0.load(Ordering::Relaxed),
+        REQUESTS as usize * 2,
+        "counting policy asked once for drawable and once for GC per request"
+    );
     assert!(
         without_policy.1.is_empty(),
         "no-policy PolyPoint requests wrote an error or reply"
@@ -5880,8 +5911,9 @@ fn bench_poly_point_with_and_without_policy() {
         "allow-all policy asks once for drawable and once for GC per request"
     );
     println!(
-        "PolyPoint ({REQUESTS} requests): no policy = {:.1} ns/request; allow-all policy = {:.1} ns/request",
+        "PolyPoint ({REQUESTS} requests): no policy = {:.1} ns/request; counting allow-all = {:.1} ns/request; recording allow-all = {:.1} ns/request",
         without_policy.0.as_nanos() as f64 / f64::from(REQUESTS),
+        counting.0.as_nanos() as f64 / f64::from(REQUESTS),
         with_policy.0.as_nanos() as f64 / f64::from(REQUESTS),
     );
 }
