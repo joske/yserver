@@ -509,6 +509,288 @@ fn a_parent_shape_past_the_region_cap_clips_its_children() {
     }
 }
 
+/// Every output pixel a window's draws cover, asserting its draws never
+/// overlap (one draw per pixel, so an area sum would also be exact).
+fn pixels_of(built: &SceneBuild, xid: u32) -> std::collections::BTreeSet<(i32, i32)> {
+    let mut px = std::collections::BTreeSet::new();
+    for r in draws_of(built, win_view(xid)) {
+        for y in r.offset.y..r.offset.y + i32::try_from(r.extent.height).unwrap() {
+            for x in r.offset.x..r.offset.x + i32::try_from(r.extent.width).unwrap() {
+                assert!(px.insert((x, y)), "0x{xid:x} drew ({x},{y}) twice");
+            }
+        }
+    }
+    px
+}
+
+/// The pixels of `w`×`h` at (`x0`, `y0`) for which `keep(x, y)` holds, with
+/// `x` / `y` relative to the origin.
+fn pixels_where(
+    (x0, y0, w, h): (i32, i32, i32, i32),
+    keep: impl Fn(i32, i32) -> bool,
+) -> std::collections::BTreeSet<(i32, i32)> {
+    (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .filter(|&(x, y)| keep(x, y))
+        .map(|(x, y)| (x0 + x, y0 + y))
+        .collect()
+}
+
+fn stripes(n: u16, len: u16, vertical: bool) -> Vec<xfixes::RegionRect> {
+    (0..n)
+        .map(|i| {
+            let at = i16::try_from(2 * i).unwrap();
+            if vertical {
+                xfixes::RegionRect {
+                    x: at,
+                    y: 0,
+                    width: 1,
+                    height: len,
+                }
+            } else {
+                xfixes::RegionRect {
+                    x: 0,
+                    y: at,
+                    width: len,
+                    height: 1,
+                }
+            }
+        })
+        .collect()
+}
+
+/// A shaped child of a shaped parent shows only where BOTH shapes hold: the
+/// child's `borderSize` is built by `ClippedRegionFromBox(pParent, …)`, i.e.
+/// already inside the parent's `winSize` (content ∩ bounding), and then cut
+/// to its own bounding shape (`dix/window.c` `SetBorderSize`); the child
+/// universe is `∩ pParent->winSize` (`mi/mivaltree.c:390`). Vertical
+/// parent stripes × horizontal child stripes, each well past
+/// `Region::MAX_RECTS`, leave a grid of single pixels.
+#[test]
+fn intersecting_parent_and_child_shapes_keep_the_gaps() {
+    let mut core = TestCore::for_tests();
+    let mut store = DrawableStore::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
+    alloc_root(&core, &mut store, 800, 600);
+    alloc_stub_window(
+        &mut store,
+        &mut windows,
+        0x100,
+        100,
+        100,
+        129,
+        129,
+        None,
+        true,
+    );
+    alloc_stub_window(
+        &mut store,
+        &mut windows,
+        0x101,
+        0,
+        0,
+        129,
+        129,
+        Some(0x100),
+        true,
+    );
+    core.top_level_order = vec![0x100];
+    core.shape_bounding.insert(0x100, stripes(65, 129, true));
+    core.shape_bounding.insert(0x101, stripes(65, 129, false));
+    let on = build_with(
+        Visibility::On,
+        &core,
+        &mut store,
+        &windows,
+        (0, 0, 800, 600),
+        None,
+    );
+    let area = (100, 100, 129, 129);
+    assert_eq!(
+        pixels_of(&on, 0x101),
+        pixels_where(area, |x, y| x % 2 == 0 && y % 2 == 0),
+        "child = parent shape ∩ child shape"
+    );
+    // The parent may paint under its child (the claim is a superset past
+    // the region cap, the safe direction), but never outside its shape, and
+    // what is SHOWN is exact: child on the grid, parent on the rest of its
+    // stripes, root everywhere else.
+    assert!(
+        pixels_of(&on, 0x100).is_subset(&pixels_where(area, |x, _| x % 2 == 0)),
+        "parent painted outside its shape"
+    );
+    let shown = rasterise(&on.scene.draws, 800, 600);
+    for (i, stack) in shown.iter().enumerate() {
+        let (x, y) = (i % 800, i / 800);
+        let (lx, ly) = (x as i32 - 100, y as i32 - 100);
+        let inside = (0..129).contains(&lx) && (0..129).contains(&ly);
+        let want = match (inside, lx % 2 == 0, ly % 2 == 0) {
+            (true, true, true) => win_view(0x101),
+            (true, true, false) => win_view(0x100),
+            _ => 0x00A0_7000,
+        };
+        assert_eq!(
+            stack.last().map(|s| s.0),
+            Some(want),
+            "pixel ({x},{y}) shows the wrong window"
+        );
+    }
+}
+
+/// The rule is transitive: a grandchild is cut to every ancestor's shape,
+/// each one's `winSize` being built inside its parent's.
+#[test]
+fn a_grandchild_is_clipped_to_every_shaped_ancestor() {
+    let mut core = TestCore::for_tests();
+    let mut store = DrawableStore::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
+    alloc_root(&core, &mut store, 800, 600);
+    alloc_stub_window(
+        &mut store,
+        &mut windows,
+        0x100,
+        100,
+        100,
+        129,
+        129,
+        None,
+        true,
+    );
+    alloc_stub_window(
+        &mut store,
+        &mut windows,
+        0x101,
+        0,
+        0,
+        129,
+        129,
+        Some(0x100),
+        true,
+    );
+    // Unshaped grandchild, offset inside its parent.
+    alloc_stub_window(
+        &mut store,
+        &mut windows,
+        0x102,
+        10,
+        20,
+        100,
+        100,
+        Some(0x101),
+        true,
+    );
+    core.top_level_order = vec![0x100];
+    core.shape_bounding.insert(0x100, stripes(65, 129, true));
+    core.shape_bounding.insert(0x101, stripes(65, 129, false));
+    let on = build_with(
+        Visibility::On,
+        &core,
+        &mut store,
+        &windows,
+        (0, 0, 800, 600),
+        None,
+    );
+    assert_eq!(
+        pixels_of(&on, 0x102),
+        pixels_where((110, 120, 100, 100), |x, y| (10 + x) % 2 == 0
+            && (20 + y) % 2 == 0),
+        "grandchild = own rect ∩ parent shape ∩ grandparent shape"
+    );
+}
+
+/// Shapes that do not meet leave nothing: neither the shaped child nor its
+/// unshaped descendant may paint, and an explicitly EMPTY bounding shape
+/// hides the whole subtree (`RegionIntersect` with an empty region).
+#[test]
+fn disjoint_or_empty_ancestor_shapes_hide_the_subtree() {
+    let mut core = TestCore::for_tests();
+    let mut store = DrawableStore::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
+    alloc_root(&core, &mut store, 800, 600);
+    alloc_stub_window(
+        &mut store,
+        &mut windows,
+        0x100,
+        100,
+        100,
+        200,
+        200,
+        None,
+        true,
+    );
+    alloc_stub_window(
+        &mut store,
+        &mut windows,
+        0x101,
+        0,
+        0,
+        200,
+        200,
+        Some(0x100),
+        true,
+    );
+    alloc_stub_window(
+        &mut store,
+        &mut windows,
+        0x102,
+        0,
+        0,
+        200,
+        200,
+        Some(0x101),
+        true,
+    );
+    alloc_stub_window(
+        &mut store,
+        &mut windows,
+        0x200,
+        400,
+        100,
+        100,
+        100,
+        None,
+        true,
+    );
+    alloc_stub_window(
+        &mut store,
+        &mut windows,
+        0x201,
+        0,
+        0,
+        100,
+        100,
+        Some(0x200),
+        true,
+    );
+    core.top_level_order = vec![0x100, 0x200];
+    let half = |x| {
+        vec![xfixes::RegionRect {
+            x,
+            y: 0,
+            width: 100,
+            height: 200,
+        }]
+    };
+    core.shape_bounding.insert(0x100, half(0));
+    core.shape_bounding.insert(0x101, half(100));
+    core.shape_bounding.insert(0x200, Vec::new());
+    let on = build_with(
+        Visibility::On,
+        &core,
+        &mut store,
+        &windows,
+        (0, 0, 800, 600),
+        None,
+    );
+    for xid in [0x101, 0x102, 0x200, 0x201] {
+        assert!(pixels_of(&on, xid).is_empty(), "0x{xid:x} painted");
+    }
+    assert_eq!(
+        pixels_of(&on, 0x100),
+        pixels_where((100, 100, 100, 200), |_, _| true)
+    );
+}
+
 /// COW subtree above opaque windows: the COW claims nothing, so the windows
 /// below still emit in full, and the COW blends over them.
 #[test]
