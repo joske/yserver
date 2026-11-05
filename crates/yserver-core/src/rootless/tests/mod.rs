@@ -5,6 +5,7 @@ mod acks;
 mod info;
 mod lock;
 mod seat;
+mod selection;
 mod topology;
 mod wm;
 
