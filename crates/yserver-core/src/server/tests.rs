@@ -47,6 +47,30 @@ fn release_recycles_base_for_next_allocate() {
     );
 }
 
+/// Xorg `NextAvailableClient` takes the lowest free client index
+/// (dix/dispatch.c `nextFreeClientID`), whatever order clients left in.
+#[test]
+fn allocate_reuses_the_lowest_released_base() {
+    for release_low_first in [true, false] {
+        let mut a = IdAllocator::new();
+        let (_, b1, b2) = (
+            a.allocate().unwrap().0,
+            a.allocate().unwrap().0,
+            a.allocate().unwrap().0,
+        );
+        let order = if release_low_first {
+            [b1, b2]
+        } else {
+            [b2, b1]
+        };
+        for b in order {
+            a.release(b);
+        }
+        assert_eq!(a.allocate().unwrap().0, b1);
+        assert_eq!(a.allocate().unwrap().0, b2);
+    }
+}
+
 #[test]
 fn release_ignores_unaligned_or_below_first_base() {
     let mut a = IdAllocator::new();

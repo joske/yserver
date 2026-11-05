@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     io::Write,
     sync::{
         Arc, Mutex,
@@ -53,13 +53,13 @@ pub struct IdAllocator {
     /// `next_base` so XID-heavy workloads (xts5 XIproto opens a fresh
     /// connection per protocol-validation TP and burned through bases
     /// after ~4096 reconnects, hitting the u32 ceiling) keep going.
-    /// `Vec` rather than `VecDeque` because allocate/release strict
-    /// LIFO order is fine — Xorg's `clientPrivates` reuses MRU bases
-    /// similarly. Released bases of *retained* clients (CloseDownMode
+    /// The lowest is reused first, as Xorg's `NextAvailableClient` takes
+    /// the lowest free client index (dix/dispatch.c `nextFreeClientID`).
+    /// Released bases of *retained* clients (CloseDownMode
     /// `RetainPermanent`/`RetainTemporary`) are NOT pushed here — the
     /// resources owned by those bases stay live in the resource table
     /// and a fresh client reusing the base would collide with them.
-    free_bases: Vec<u32>,
+    free_bases: BTreeSet<u32>,
 }
 
 impl IdAllocator {
@@ -67,18 +67,18 @@ impl IdAllocator {
     pub fn new() -> Self {
         Self {
             next_base: FIRST_CLIENT_BASE,
-            free_bases: Vec::new(),
+            free_bases: BTreeSet::new(),
         }
     }
 
     /// Returns `(resource_id_base, resource_id_mask)` for a new client.
-    /// Reuses a previously-released base if one is available; otherwise
+    /// Reuses the lowest previously-released base if one is available; otherwise
     /// bumps the monotonic counter. Returns `None` only when the free
     /// list is empty AND the next monotonic base would overflow `u32`
     /// — in practice unreachable for any realistic workload now that
     /// disconnect recycles bases.
     pub fn allocate(&mut self) -> Option<(u32, u32)> {
-        if let Some(base) = self.free_bases.pop() {
+        if let Some(base) = self.free_bases.pop_first() {
             return Some((base, PER_CLIENT_MASK));
         }
         let base = self.next_base;
@@ -100,7 +100,7 @@ impl IdAllocator {
             log::warn!("IdAllocator::release: ignoring invalid base 0x{base:x}");
             return;
         }
-        self.free_bases.push(base);
+        self.free_bases.insert(base);
     }
 
     /// `id` is owned by the holder of `(base, mask)` iff `(id & !mask) == base`.
