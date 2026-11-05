@@ -499,7 +499,7 @@ fn a_connection_dropped_before_setup_completes_arms_nothing() {
 #[test]
 fn a_client_refused_for_a_bad_cookie_arms_nothing() {
     // The case a stranger can reach: stage 1's TCP listener binds
-    // 0.0.0.0, so a wrong cookie must not be able to erase a
+    // every interface, so a wrong cookie must not be able to erase a
     // session. Refused inside the setup thread — the core never
     // hears about it.
     let cookie = [0x5A_u8; 16];

@@ -257,7 +257,7 @@ fn bind_client_listeners(
         auth.require_tcp_auth_at_startup()
             .map_err(io::Error::other)?;
         let port = launch::tcp_port(display).map_err(io::Error::other)?;
-        listeners.push(Listener::Tcp(bind_tcp_listener(port)?));
+        listeners.extend(bind_tcp_listeners(port)?.into_iter().map(Listener::Tcp));
     }
     Ok(listeners)
 }
@@ -277,27 +277,64 @@ fn bind_client_listeners(
     auth.require_tcp_auth_at_startup()
         .map_err(io::Error::other)?;
     let port = launch::tcp_port(display).map_err(io::Error::other)?;
-    Ok(vec![yserver_core::transport::Listener::tcp(
-        bind_tcp_listener(port)?,
-    )?])
+    bind_tcp_listeners(port)?
+        .into_iter()
+        .map(yserver_core::transport::Listener::tcp)
+        .collect()
 }
 
-/// The one place a `tcp-transport` build actually opens a TCP socket.
+/// The one place a `tcp-transport` build actually opens TCP sockets.
 /// `Transport::Tcp` / `Listener::Tcp` stay compiled in every configuration —
 /// the type is `std` and costs nothing, and forking every `match` on
 /// `Transport` would buy no meaningful size win — so only the ABILITY to
-/// create the listener is gated here.
+/// create the listeners is gated here.
+///
+/// `0.0.0.0:port`, then `[::]:port` with `IPV6_V6ONLY` as xtrans sets it
+/// (`Xtranssock.c` `SocketOpen`), so IPv4 peers keep plain IPv4 addresses.
+/// Like xtrans `MakeAllCOTSServerListeners`, `EADDRINUSE` on either is
+/// "server already running" and fatal; any other IPv6 failure (no IPv6 in
+/// the kernel) leaves an IPv4-only server, Xorg's default `PartialNetwork`.
 #[cfg(tcp_transport)]
-fn bind_tcp_listener(port: u16) -> io::Result<std::net::TcpListener> {
-    let tcp =
-        std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!("cannot listen on TCP port {port}: {err}"),
-            )
-        })?;
-    log::info!("yserver: listening on TCP 0.0.0.0:{port}");
-    Ok(tcp)
+fn bind_tcp_listeners(port: u16) -> io::Result<Vec<std::net::TcpListener>> {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    let v4 = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+    let v6 = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
+    let cannot = |addr: SocketAddr, err: io::Error| {
+        io::Error::new(err.kind(), format!("cannot listen on TCP {addr}: {err}"))
+    };
+    let mut listeners = vec![bind_tcp_listener(v4).map_err(|err| cannot(v4, err))?];
+    match bind_tcp_listener(v6) {
+        Ok(listener) => {
+            listeners.push(listener);
+            log::info!("yserver: listening on TCP {v4} and {v6}");
+        }
+        Err(err) if err.kind() == io::ErrorKind::AddrInUse => return Err(cannot(v6, err)),
+        Err(err) => {
+            log::warn!("yserver: no IPv6 TCP listener on {v6} ({err}); IPv4 only");
+            log::info!("yserver: listening on TCP {v4}");
+        }
+    }
+    Ok(listeners)
+}
+
+/// One listening socket; an IPv6 one accepts IPv6 only.
+#[cfg(tcp_transport)]
+fn bind_tcp_listener(addr: std::net::SocketAddr) -> io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    // As std's `TcpListener::bind` and xtrans do; on Windows it would let
+    // another process bind the same port.
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    // std's `TcpListener::bind` backlog.
+    socket.listen(128)?;
+    Ok(socket.into())
 }
 
 /// The feature-off twin: `validate_tcp_startup` has already refused
@@ -305,7 +342,7 @@ fn bind_tcp_listener(port: u16) -> io::Result<std::net::TcpListener> {
 /// touched. This is a second line of defence only, mirroring
 /// `build_xdmcp_service`'s feature-off twin above.
 #[cfg(not(tcp_transport))]
-fn bind_tcp_listener(_port: u16) -> io::Result<std::net::TcpListener> {
+fn bind_tcp_listeners(_port: u16) -> io::Result<Vec<std::net::TcpListener>> {
     Err(io::Error::other(
         "this yserver was built without TCP support: -listen tcp needs the \
          `tcp-transport` build feature",

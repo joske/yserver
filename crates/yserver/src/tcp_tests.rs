@@ -5,7 +5,7 @@
 use std::{
     fs,
     io::{self, Read, Write},
-    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream},
     os::unix::net::{UnixListener, UnixStream},
     path::PathBuf,
     time::Duration,
@@ -61,6 +61,10 @@ impl Fixture {
         (Ipv4Addr::LOCALHOST, self.port).into()
     }
 
+    fn address_v6(&self) -> SocketAddr {
+        (Ipv6Addr::LOCALHOST, self.port).into()
+    }
+
     fn options(&self, args: &[&str]) -> crate::launch::LaunchOptions {
         crate::launch::parse_args(
             [format!(":{}", self.port - 6000)]
@@ -112,6 +116,15 @@ impl Drop for Fixture {
     }
 }
 
+/// CI runners and some VMs have no IPv6 loopback; the v6 checks skip there.
+fn has_ipv6_loopback() -> bool {
+    let available = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_ok();
+    if !available {
+        eprintln!("no IPv6 loopback on this host: skipping the IPv6 checks");
+    }
+    available
+}
+
 #[test]
 fn no_listen_tcp_has_no_bound_tcp_socket() {
     for args in [
@@ -143,7 +156,7 @@ fn listen_tcp_binds_ipv4_display_port_after_loading_shared_auth() {
     ]);
     let auth = AuthState::new(opts.auth_file.clone());
     let listeners = fixture.bind(&opts, &auth).unwrap();
-    assert_eq!(listeners.len(), 2, "opt-in must bind the TCP listener");
+    assert!(listeners.len() >= 2, "opt-in must bind the TCP listener");
     let Listener::Tcp(tcp) = &listeners[1] else {
         panic!("missing TCP listener")
     };
@@ -151,7 +164,25 @@ fn listen_tcp_binds_ipv4_display_port_after_loading_shared_auth() {
         tcp.local_addr().unwrap(),
         (Ipv4Addr::UNSPECIFIED, fixture.port).into()
     );
-    TcpStream::connect(fixture.address()).unwrap();
+    let client = TcpStream::connect(fixture.address()).unwrap();
+    let (_, peer) = listeners[1].accept().unwrap();
+    assert_eq!(peer, Some(client.local_addr().unwrap()));
+    if has_ipv6_loopback() {
+        assert_eq!(listeners.len(), 3, "IPv6 is available, so [::] is bound");
+        let Listener::Tcp(tcp6) = &listeners[2] else {
+            panic!("missing IPv6 TCP listener")
+        };
+        assert_eq!(
+            tcp6.local_addr().unwrap(),
+            (Ipv6Addr::UNSPECIFIED, fixture.port).into()
+        );
+        // xtrans sets IPV6_V6ONLY, so IPv4 peers never arrive as ::ffff:a.b.c.d.
+        assert!(socket2::SockRef::from(tcp6).only_v6().unwrap());
+        let client = TcpStream::connect(fixture.address_v6()).unwrap();
+        let (_, peer) = listeners[2].accept().unwrap();
+        assert_eq!(peer, Some(client.local_addr().unwrap()));
+        assert_eq!(peer.unwrap().ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+    }
     assert_eq!(
         auth.check(
             &yserver_core::peer::PeerIdentity {
@@ -165,6 +196,45 @@ fn listen_tcp_binds_ipv4_display_port_after_loading_shared_auth() {
         ),
         core_loop::auth::AuthVerdict::Allow,
         "the same loaded AuthState must authorize runtime clients"
+    );
+}
+
+/// xtrans `MakeAllCOTSServerListeners`: `EADDRINUSE` on any TCP listener is
+/// "server already running" and fails the whole bind, IPv6 included.
+#[test]
+fn ipv6_port_in_use_is_fatal_and_releases_ipv4() {
+    if !has_ipv6_loopback() {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    fixture.write_authority();
+    let opts = fixture.options(&[
+        "-listen",
+        "tcp",
+        "-auth",
+        fixture.auth_path().to_str().unwrap(),
+    ]);
+    let auth = AuthState::new(opts.auth_file.clone());
+    let squatter =
+        socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None).unwrap();
+    squatter.set_only_v6(true).unwrap();
+    squatter
+        .bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, fixture.port)).into())
+        .unwrap();
+    squatter.listen(1).unwrap();
+    let err = fixture
+        .bind(&opts, &auth)
+        .err()
+        .expect("an IPv6 port in use must fail the bind");
+    assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+    assert!(
+        err.to_string().contains(&format!("[::]:{}", fixture.port)),
+        "{err}"
+    );
+    assert_eq!(
+        TcpStream::connect(fixture.address()).unwrap_err().kind(),
+        io::ErrorKind::ConnectionRefused,
+        "the IPv4 listener must not outlive the failed bind"
     );
 }
 
@@ -294,12 +364,19 @@ fn tcp_loopback_cookie_setup_and_listener_capabilities() {
     // Keep successful peers alive until after inspecting installed clients.
     let mut peers = Vec::new();
     let mut unix_peer = None;
+    let ipv6 = has_ipv6_loopback();
     let result: io::Result<()> = (|| {
-        let mut peer = TcpStream::connect_timeout(&fixture.address(), Duration::from_secs(2))?;
-        peer.set_read_timeout(Some(Duration::from_secs(5)))?;
-        assert_eq!(setup(&mut peer, MIT_MAGIC_COOKIE.as_bytes(), &cookie)?.0, 1);
-        request_barrier(&mut peer)?;
-        peers.push(peer);
+        let mut addresses = vec![fixture.address()];
+        if ipv6 {
+            addresses.push(fixture.address_v6());
+        }
+        for address in addresses {
+            let mut peer = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
+            peer.set_read_timeout(Some(Duration::from_secs(5)))?;
+            assert_eq!(setup(&mut peer, MIT_MAGIC_COOKIE.as_bytes(), &cookie)?.0, 1);
+            request_barrier(&mut peer)?;
+            peers.push(peer);
+        }
 
         let mut unix = UnixStream::connect(fixture.unix_path())?;
         unix.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -333,9 +410,9 @@ fn tcp_loopback_cookie_setup_and_listener_capabilities() {
     let (core_result, capabilities) = handle.join().unwrap();
     core_result.unwrap();
     result.unwrap();
-    // (is_local, fd_passing) for the TCP client then the unix one.
+    // (is_local, fd_passing) for the TCP clients then the unix one.
     //
-    // The TCP peer is 127.0.0.1, so it is LOCAL: `is_local` is an address
+    // The TCP peers are 127.0.0.1 and ::1, so they are LOCAL: `is_local` is an address
     // property, and Xorg's `xtransLocalClient` (os/access.c) answers TRUE
     // for a TCP peer whose address is the server's own. It keeps MIT-SHM,
     // whose legacy `Attach` passes a SysV shmid rather than a descriptor.
@@ -344,7 +421,9 @@ fn tcp_loopback_cookie_setup_and_listener_capabilities() {
     // local the peer is. Until 2026-09-10 both were derived from the
     // transport and this asserted `(false, false)`, which cost a
     // same-machine XDMCP session its shared memory.
-    assert_eq!(capabilities, [(true, false), (true, true)]);
+    let mut expected = vec![(true, false); 1 + usize::from(ipv6)];
+    expected.push((true, true));
+    assert_eq!(capabilities, expected);
 }
 
 /// Raised in review on #148. XDMCP over UDP negotiates a session and then the

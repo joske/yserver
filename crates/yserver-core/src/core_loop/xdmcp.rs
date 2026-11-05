@@ -581,9 +581,8 @@ fn describe(message: &XdmcpMessage) -> &'static str {
 
 /// Resolve a host (or literal address) to one IPv4 socket address.
 ///
-/// IPv6 is out of scope for the whole XDMCP stage, consistent with the
-/// IPv4-only listener from stage 1, so an AAAA-only host is a startup
-/// error rather than a silent no-op.
+/// IPv6 is out of scope for the whole XDMCP stage, so an AAAA-only host is
+/// a startup error rather than a silent no-op.
 fn resolve_ipv4(host: &str, port: u16) -> io::Result<SocketAddr> {
     let mut last_err = None;
     // `to_socket_addrs` needs a port; a bare literal address gets one here.

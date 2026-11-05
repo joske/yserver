@@ -3338,7 +3338,7 @@ fn an_xdmcp_terminate_ends_the_core_loop() {
 /// (`DISPLAY=127.0.0.1:1`) and pushed every image over the wire.
 #[test]
 fn a_tcp_peer_on_this_machine_is_a_local_client() {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     assert!(
         address_is_ours(IpAddr::V4(Ipv4Addr::LOCALHOST)),
@@ -3353,6 +3353,15 @@ fn a_tcp_peer_on_this_machine_is_a_local_client() {
     assert!(
         !address_is_ours(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
         "a documentation-range address is not ours"
+    );
+    assert!(
+        address_is_ours(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        "::1 is ours"
+    );
+    // 2001:db8::/32 (RFC 3849) is the IPv6 documentation prefix.
+    assert!(
+        !address_is_ours(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
+        "a documentation-range IPv6 address is not ours"
     );
 }
 

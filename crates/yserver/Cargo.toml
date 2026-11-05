@@ -30,6 +30,8 @@ regex = "1.13.1"
 roxmltree.workspace = true
 serde_json.workspace = true
 signal-hook.workspace = true
+# IPV6_V6ONLY before bind, which std cannot set.
+socket2 = "0.6"
 thiserror.workspace = true
 xkbcommon.workspace = true
 yserver-core.workspace = true
