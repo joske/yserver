@@ -130,7 +130,7 @@ joined with `+`.
 | 11 UnmapSubwindows | parent `LIST`; each child `HIDE` in the unmap loop | derived-target ruling |
 | 12 ConfigureWindow | window `MANAGE+SET_ATTR`; sibling `GET_ATTR` | |
 | 13 CirculateWindow | container `MANAGE`; chosen child `MANAGE+SET_ATTR` | derived-target ruling |
-| 14 GetGeometry | drawable `GET_ATTR` (window or pixmap, whichever resolved) | |
+| 14 GetGeometry | drawable `GET_ATTR` on whichever target resolved, in the existing precedence: window, pixmap, then the GLX drawable record (`glx_pbuffer_geometry`, kind `GlxDrawable`) | the GLX fallback succeeds today for a pbuffer whose backing pixmap allocation failed (`glx.rs:628-672`); its zero-size guard (`247b7a42`) is kept |
 | 15 QueryTree | window `LIST` | |
 | 18 ChangeProperty | window `SET_PROP`; property hook: existing property `WRITE` (Replace) or `BLEND` (Append/Prepend), absent property `CREATE+WRITE` | property check after the type atom's validation |
 | 19 DeleteProperty | window `SET_PROP`; existing property `DESTROY` | absent property: no property check, as XLibre |
@@ -186,6 +186,30 @@ joined with `+`.
 Not in 3a: `GetAtomName` (atom only), `GetSelectionOwner` (selection hook, deferred), `SendEvent` (PR 4), the
 screen hooks of Install/Uninstall/ListInstalledColormaps (the spec lists no screen hook; noted for PR 5's
 "remaining server sites").
+
+## Shared unmapping: checked requests versus consequences
+
+`DestroySubwindows` and `UnmapSubwindows` share the child loop in `unmap_subwindows_with_delta`
+(`windows.rs:2127`, `:2667`). The per-child checks belong to the requests, never to that helper:
+`UnmapSubwindows` and `MapSubwindows` decide which children are allowed (asking `HIDE` / `SHOW` per child, in the
+loop's order) and the helper acts on that set; `DestroySubwindows` passes every child, unchecked, because the spec
+makes its bulk unmap unconditional and checks only `DESTROY`. The helper itself never calls a check.
+
+## Denial test contract
+
+Every "deny" test row, in every task, asserts all of:
+- the client reads exactly the site's denial result (the policy's error with the request's major and minor, or
+  the row's success outcome);
+- the `RecordingBackend` call log is unchanged by the request (no draw, configure, map, property, cursor or
+  colormap call), except calls the row's permitted partial outcome names;
+- a snapshot of the state the request would change is unchanged: for windows their attributes, geometry,
+  stacking, mapping and properties; for GCs their values; for colormaps their entries and install state; for
+  properties their type, format and data; the existence of an object a creation or destruction would add or
+  remove.
+
+The derived-target rows (DestroySubwindows, Map/UnmapSubwindows, CirculateWindow) and the ReparentWindow remap
+assert their permitted partial outcomes exactly instead. A denied remap leaves the window in the state a client
+`UnmapWindow` would leave it in.
 
 ## Review Focus
 
@@ -301,6 +325,9 @@ and the request returns no error.
     (UnmapNotify for each), c1 is destroyed (DestroyNotify), c2 and c3 still exist unmapped, and the request returns
     no error. With an empty list and with an allow-all policy, the bytes equal today's. Mutation: check before the
     bulk unmap; continue after a denial.
+  - `destroy_subwindows_bulk_unmap_ignores_hide`: a policy denying every child's `HIDE` and c2's `DESTROY`: every
+    child is still unmapped, c1 destroyed, c2 and c3 exist unmapped, no error. Mutation: put the `HIDE` check in
+    the shared helper.
   - `destroy_window_checks_parent_remove`: denying the parent's `REMOVE` denies DestroyWindow with the policy's
     error and the window still exists.
 - [ ] **Steps 2–5.** Commit `… Task 4: window creation, attributes and destruction`.
@@ -311,6 +338,9 @@ and the request returns no error.
 
 - [ ] **Step 1: Failing tests:**
   - table-driven deny and ask tests for the whole-request rows.
+  - `get_geometry_checks_glx_drawable_without_backing_pixmap`: a pbuffer whose backing allocation fails (the
+    `RecordingBackend` refuses it), another client's GetGeometry on it with a policy denying `GlxDrawable`: the
+    policy's error, no reply. Mutation: check only windows and pixmaps.
   - `map_window_denied_show_returns_success_and_maps_nothing`: no error, no MapNotify, the window stays unmapped.
     Mutation: report the policy's error.
   - `map_subwindows_skips_denied_child`: three unmapped children, the middle one denied; the other two get
