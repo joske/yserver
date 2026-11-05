@@ -4394,3 +4394,784 @@ fn circulate_core_policy_context_uses_zero_minor() {
         )]
     );
 }
+
+struct GcFontAccessFixture {
+    state: ServerState,
+    backend: RecordingBackend,
+    peer: UnixStream,
+    font: ResourceId,
+    second_font: ResourceId,
+    source: ResourceId,
+    destination: ResourceId,
+    tile: ResourceId,
+    stipple: ResourceId,
+    clip_mask: ResourceId,
+    free_pixmap: ResourceId,
+    gc: ResourceId,
+    copy_gc: ResourceId,
+    free_gc: ResourceId,
+    cursor: ResourceId,
+    free_cursor: ResourceId,
+}
+
+fn gc_font_access_fixture() -> GcFontAccessFixture {
+    const FONT: ResourceId = ResourceId(0x0055_0020);
+    const SECOND_FONT: ResourceId = ResourceId(0x0055_0021);
+    const SOURCE: ResourceId = ResourceId(0x0055_0001);
+    const DESTINATION: ResourceId = ResourceId(0x0055_0002);
+    const TILE: ResourceId = ResourceId(0x0055_0003);
+    const STIPPLE: ResourceId = ResourceId(0x0055_0004);
+    const CLIP_MASK: ResourceId = ResourceId(0x0055_0005);
+    const FREE_PIXMAP: ResourceId = ResourceId(0x0055_0006);
+    const GC: ResourceId = ResourceId(0x0055_0010);
+    const COPY_GC: ResourceId = ResourceId(0x0055_0011);
+    const FREE_GC: ResourceId = ResourceId(0x0055_0012);
+    const CURSOR: ResourceId = ResourceId(0x0055_0030);
+    const FREE_CURSOR: ResourceId = ResourceId(0x0055_0031);
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    let mut peer = install_client(&mut state, CLIENT.0);
+    let mut sequence = 1;
+
+    for (font, name) in [(FONT, "fixed"), (SECOND_FONT, "cursor")] {
+        let mut body = font.0.to_le_bytes().to_vec();
+        body.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(name.as_bytes());
+        body.resize(body.len().next_multiple_of(4), 0);
+        let bytes = resource_request(&mut state, &mut backend, &mut peer, sequence, 45, 0, &body);
+        assert_no_error(&bytes, "GC access fixture OpenFont");
+        sequence += 1;
+    }
+
+    for (pixmap, depth) in [
+        (SOURCE, 24),
+        (DESTINATION, 24),
+        (TILE, 24),
+        (STIPPLE, 1),
+        (CLIP_MASK, 1),
+        (FREE_PIXMAP, 24),
+    ] {
+        let body = words(&[pixmap.0, ROOT_WINDOW.0, 8 | (8 << 16)]);
+        let bytes = resource_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            sequence,
+            53,
+            depth,
+            &body,
+        );
+        assert_no_error(&bytes, "GC access fixture CreatePixmap");
+        sequence += 1;
+    }
+
+    for gc in [GC, COPY_GC, FREE_GC] {
+        let foreground = match gc {
+            GC => 0x0011_2233,
+            COPY_GC => 0x0044_5566,
+            _ => 0x0077_8899,
+        };
+        let body = words(&[
+            gc.0,
+            ROOT_WINDOW.0,
+            (1 << 2) | (1 << 14),
+            foreground,
+            FONT.0,
+        ]);
+        let bytes = resource_request(&mut state, &mut backend, &mut peer, sequence, 55, 0, &body);
+        assert_no_error(&bytes, "GC access fixture CreateGC");
+        sequence += 1;
+    }
+
+    for cursor in [CURSOR, FREE_CURSOR] {
+        let body = words(&[cursor.0, SOURCE.0, STIPPLE.0, 0, 0, 0, 0]);
+        let bytes = resource_request(&mut state, &mut backend, &mut peer, sequence, 93, 0, &body);
+        assert_no_error(&bytes, "GC access fixture CreateCursor");
+        sequence += 1;
+    }
+
+    let glyph_cursor = ResourceId(0x0055_0032);
+    let glyph_body = words(&[glyph_cursor.0, FONT.0, SECOND_FONT.0, 0, 0, 0, 0]);
+    let bytes = resource_request(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        sequence,
+        94,
+        0,
+        &glyph_body,
+    );
+    assert_no_error(&bytes, "GC access fixture CreateGlyphCursor");
+
+    GcFontAccessFixture {
+        state,
+        backend,
+        peer,
+        font: FONT,
+        second_font: SECOND_FONT,
+        source: SOURCE,
+        destination: DESTINATION,
+        tile: TILE,
+        stipple: STIPPLE,
+        clip_mask: CLIP_MASK,
+        free_pixmap: FREE_PIXMAP,
+        gc: GC,
+        copy_gc: COPY_GC,
+        free_gc: FREE_GC,
+        cursor: CURSOR,
+        free_cursor: FREE_CURSOR,
+    }
+}
+
+#[derive(Clone)]
+struct GcFontAccessRequest {
+    label: &'static str,
+    opcode: u8,
+    data: u8,
+    body: Vec<u8>,
+    expected: Vec<(ResourceId, ResourceKind, AccessMode, Option<Creation>)>,
+    deny_index: usize,
+}
+
+fn gc_font_access_target(
+    id: ResourceId,
+    kind: ResourceKind,
+    mode: AccessMode,
+) -> (ResourceId, ResourceKind, AccessMode, Option<Creation>) {
+    (id, kind, mode, None)
+}
+
+fn gc_font_access_requests(fx: &GcFontAccessFixture) -> Vec<GcFontAccessRequest> {
+    let creation = |parent| {
+        Some(Creation {
+            parent,
+            owner: CLIENT,
+        })
+    };
+    let gc_mask = (1 << 10) | (1 << 11) | (1 << 14) | (1 << 19);
+    let create_gc_values = words(&[
+        0x0055_0013,
+        ROOT_WINDOW.0,
+        gc_mask,
+        fx.tile.0,
+        fx.stipple.0,
+        fx.font.0,
+        fx.clip_mask.0,
+    ]);
+    let change_gc_values = words(&[
+        fx.gc.0,
+        gc_mask,
+        fx.tile.0,
+        fx.stipple.0,
+        fx.font.0,
+        fx.clip_mask.0,
+    ]);
+    let mut set_dashes = fx.gc.0.to_le_bytes().to_vec();
+    set_dashes.extend_from_slice(&0u16.to_le_bytes());
+    set_dashes.extend_from_slice(&2u16.to_le_bytes());
+    set_dashes.extend_from_slice(&[1, 2, 0, 0]);
+    let mut recolor_cursor = fx.cursor.0.to_le_bytes().to_vec();
+    recolor_cursor.extend_from_slice(&[0; 12]);
+
+    let mut open_font = 0x0055_0022u32.to_le_bytes().to_vec();
+    open_font.extend_from_slice(&5u16.to_le_bytes());
+    open_font.extend_from_slice(&[0, 0]);
+    open_font.extend_from_slice(b"fixed");
+    open_font.resize(open_font.len().next_multiple_of(4), 0);
+
+    let create_pixmap_id = ResourceId(0x0055_0007);
+    let create_cursor_id = ResourceId(0x0055_0033);
+    let create_glyph_cursor_id = ResourceId(0x0055_0034);
+    let cases = vec![
+        GcFontAccessRequest {
+            label: "OpenFont",
+            opcode: 45,
+            data: 0,
+            body: open_font,
+            expected: vec![(
+                ResourceId(0x0055_0022),
+                ResourceKind::Font,
+                AccessMode::CREATE,
+                creation(None),
+            )],
+            deny_index: 0,
+        },
+        GcFontAccessRequest {
+            label: "QueryFont",
+            opcode: 47,
+            data: 0,
+            body: words(&[fx.font.0]),
+            expected: vec![gc_font_access_target(
+                fx.font,
+                ResourceKind::Font,
+                AccessMode::GET_ATTR,
+            )],
+            deny_index: 0,
+        },
+        GcFontAccessRequest {
+            label: "QueryFont(GC fontable)",
+            opcode: 47,
+            data: 0,
+            body: words(&[fx.gc.0]),
+            expected: vec![gc_font_access_target(
+                fx.gc,
+                ResourceKind::Gc,
+                AccessMode::GET_ATTR,
+            )],
+            deny_index: 0,
+        },
+        GcFontAccessRequest {
+            label: "QueryTextExtents",
+            opcode: 48,
+            data: 0,
+            body: words(&[fx.font.0]),
+            expected: vec![gc_font_access_target(
+                fx.font,
+                ResourceKind::Font,
+                AccessMode::GET_ATTR,
+            )],
+            deny_index: 0,
+        },
+        GcFontAccessRequest {
+            label: "QueryTextExtents(GC fontable)",
+            opcode: 48,
+            data: 0,
+            body: words(&[fx.gc.0]),
+            expected: vec![gc_font_access_target(
+                fx.gc,
+                ResourceKind::Gc,
+                AccessMode::GET_ATTR,
+            )],
+            deny_index: 0,
+        },
+        GcFontAccessRequest {
+            label: "CreatePixmap",
+            opcode: 53,
+            data: 24,
+            body: words(&[create_pixmap_id.0, ROOT_WINDOW.0, 8 | (8 << 16)]),
+            expected: vec![
+                gc_font_access_target(ROOT_WINDOW, ResourceKind::Window, AccessMode::GET_ATTR),
+                (
+                    create_pixmap_id,
+                    ResourceKind::Pixmap,
+                    AccessMode::CREATE,
+                    creation(Some(ROOT_WINDOW)),
+                ),
+            ],
+            deny_index: 1,
+        },
+        GcFontAccessRequest {
+            label: "CreateGC",
+            opcode: 55,
+            data: 0,
+            body: create_gc_values,
+            expected: vec![
+                gc_font_access_target(ROOT_WINDOW, ResourceKind::Window, AccessMode::GET_ATTR),
+                gc_font_access_target(fx.tile, ResourceKind::Pixmap, AccessMode::READ),
+                gc_font_access_target(fx.stipple, ResourceKind::Pixmap, AccessMode::READ),
+                gc_font_access_target(fx.font, ResourceKind::Font, AccessMode::USE),
+                gc_font_access_target(fx.clip_mask, ResourceKind::Pixmap, AccessMode::READ),
+                (
+                    ResourceId(0x0055_0013),
+                    ResourceKind::Gc,
+                    AccessMode::CREATE | AccessMode::SET_ATTR,
+                    creation(Some(ROOT_WINDOW)),
+                ),
+            ],
+            deny_index: 5,
+        },
+        GcFontAccessRequest {
+            label: "ChangeGC",
+            opcode: 56,
+            data: 0,
+            body: change_gc_values,
+            expected: vec![
+                gc_font_access_target(fx.gc, ResourceKind::Gc, AccessMode::SET_ATTR),
+                gc_font_access_target(fx.tile, ResourceKind::Pixmap, AccessMode::READ),
+                gc_font_access_target(fx.stipple, ResourceKind::Pixmap, AccessMode::READ),
+                gc_font_access_target(fx.font, ResourceKind::Font, AccessMode::USE),
+                gc_font_access_target(fx.clip_mask, ResourceKind::Pixmap, AccessMode::READ),
+            ],
+            deny_index: 0,
+        },
+        GcFontAccessRequest {
+            label: "CopyGC",
+            opcode: 57,
+            data: 0,
+            body: words(&[fx.gc.0, fx.copy_gc.0, 1 << 2]),
+            expected: vec![
+                gc_font_access_target(fx.gc, ResourceKind::Gc, AccessMode::GET_ATTR),
+                gc_font_access_target(fx.copy_gc, ResourceKind::Gc, AccessMode::SET_ATTR),
+            ],
+            deny_index: 0,
+        },
+        GcFontAccessRequest {
+            label: "SetDashes",
+            opcode: 58,
+            data: 0,
+            body: set_dashes,
+            expected: vec![gc_font_access_target(
+                fx.gc,
+                ResourceKind::Gc,
+                AccessMode::SET_ATTR,
+            )],
+            deny_index: 0,
+        },
+        GcFontAccessRequest {
+            label: "SetClipRectangles",
+            opcode: 59,
+            data: 0,
+            body: words(&[fx.gc.0, 0]),
+            expected: vec![gc_font_access_target(
+                fx.gc,
+                ResourceKind::Gc,
+                AccessMode::SET_ATTR,
+            )],
+            deny_index: 0,
+        },
+        GcFontAccessRequest {
+            label: "CreateCursor",
+            opcode: 93,
+            data: 0,
+            body: words(&[create_cursor_id.0, fx.source.0, fx.stipple.0, 0, 0, 0, 0]),
+            expected: vec![
+                gc_font_access_target(fx.source, ResourceKind::Pixmap, AccessMode::READ),
+                gc_font_access_target(fx.stipple, ResourceKind::Pixmap, AccessMode::READ),
+                (
+                    create_cursor_id,
+                    ResourceKind::Cursor,
+                    AccessMode::CREATE,
+                    creation(None),
+                ),
+            ],
+            deny_index: 2,
+        },
+        GcFontAccessRequest {
+            label: "CreateGlyphCursor",
+            opcode: 94,
+            data: 0,
+            body: words(&[
+                create_glyph_cursor_id.0,
+                fx.font.0,
+                fx.second_font.0,
+                0,
+                0,
+                0,
+                0,
+            ]),
+            expected: vec![
+                gc_font_access_target(fx.font, ResourceKind::Font, AccessMode::USE),
+                gc_font_access_target(fx.second_font, ResourceKind::Font, AccessMode::USE),
+                (
+                    create_glyph_cursor_id,
+                    ResourceKind::Cursor,
+                    AccessMode::CREATE,
+                    creation(None),
+                ),
+            ],
+            deny_index: 2,
+        },
+        GcFontAccessRequest {
+            label: "RecolorCursor",
+            opcode: 96,
+            data: 0,
+            body: recolor_cursor,
+            expected: vec![gc_font_access_target(
+                fx.cursor,
+                ResourceKind::Cursor,
+                AccessMode::WRITE,
+            )],
+            deny_index: 0,
+        },
+        GcFontAccessRequest {
+            label: "CloseFont",
+            opcode: 46,
+            data: 0,
+            body: words(&[fx.second_font.0]),
+            expected: vec![gc_font_access_target(
+                fx.second_font,
+                ResourceKind::Font,
+                AccessMode::DESTROY,
+            )],
+            deny_index: 0,
+        },
+        GcFontAccessRequest {
+            label: "FreePixmap",
+            opcode: 54,
+            data: 0,
+            body: words(&[fx.free_pixmap.0]),
+            expected: vec![gc_font_access_target(
+                fx.free_pixmap,
+                ResourceKind::Pixmap,
+                AccessMode::DESTROY,
+            )],
+            deny_index: 0,
+        },
+        GcFontAccessRequest {
+            label: "FreeGC",
+            opcode: 60,
+            data: 0,
+            body: words(&[fx.free_gc.0]),
+            expected: vec![gc_font_access_target(
+                fx.free_gc,
+                ResourceKind::Gc,
+                AccessMode::DESTROY,
+            )],
+            deny_index: 0,
+        },
+        GcFontAccessRequest {
+            label: "FreeCursor",
+            opcode: 95,
+            data: 0,
+            body: words(&[fx.free_cursor.0]),
+            expected: vec![gc_font_access_target(
+                fx.free_cursor,
+                ResourceKind::Cursor,
+                AccessMode::DESTROY,
+            )],
+            deny_index: 0,
+        },
+    ];
+    cases
+}
+
+fn access_target_snapshot(
+    state: &ServerState,
+    id: ResourceId,
+    kind: ResourceKind,
+) -> Option<String> {
+    match kind {
+        ResourceKind::Pixmap => state.resources.pixmap(id).map(|entry| format!("{entry:?}")),
+        ResourceKind::Gc => state.resources.gc(id).map(|entry| format!("{entry:?}")),
+        ResourceKind::Font => state.resources.font(id).map(|entry| format!("{entry:?}")),
+        ResourceKind::Cursor => state
+            .resources
+            .cursor_exists(id)
+            .then(|| format!("host={:?}", state.resources.cursor_host_xid(id))),
+        ResourceKind::Window => state.resources.window(id).map(|entry| format!("{entry:?}")),
+        _ => panic!("unexpected GC/font access fixture kind: {kind:?}"),
+    }
+}
+
+#[test]
+fn gc_pixmap_cursor_font_requests_ask_expected_targets() {
+    // Mutation: remove or reorder a GC, pixmap, font, or cursor check; the recorded target, mode, creation, and core minor must differ.
+    let mut fixture = gc_font_access_fixture();
+    let cases = gc_font_access_requests(&fixture);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy {
+            decision: Decision::Allow,
+            calls: Arc::clone(&calls),
+        }));
+
+    let mut expected = Vec::new();
+    for (sequence, case) in (70u16..).zip(cases) {
+        let bytes = resource_request(
+            &mut fixture.state,
+            &mut fixture.backend,
+            &mut fixture.peer,
+            sequence,
+            case.opcode,
+            case.data,
+            &case.body,
+        );
+        if matches!(case.opcode, 47 | 48) {
+            assert_eq!(bytes.first(), Some(&1), "{} reply", case.label);
+        } else {
+            assert_no_error(&bytes, case.label);
+        }
+        for (id, kind, mode, creation) in case.expected {
+            let owner = if creation.is_some() {
+                None
+            } else if id == ROOT_WINDOW {
+                Some(crate::resources::SERVER_OWNER)
+            } else {
+                Some(CLIENT)
+            };
+            expected.push((
+                CLIENT,
+                ResourceTarget { id, kind, creation },
+                mode,
+                Some(RequestOpcodes {
+                    major: case.opcode,
+                    minor: 0,
+                }),
+                owner,
+            ));
+        }
+    }
+    let actual: Vec<_> = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|call| {
+            (
+                call.client,
+                call.target.expect("resource target"),
+                call.mode.expect("resource mode"),
+                call.request,
+                call.owner,
+            )
+        })
+        .collect();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        fixture
+            .state
+            .resources
+            .pixmap(ResourceId(0x0055_0007))
+            .map(|_| true),
+        Some(true),
+        "CreatePixmap created its checked ID"
+    );
+    assert!(
+        fixture
+            .state
+            .resources
+            .gc(ResourceId(0x0055_0013))
+            .is_some()
+    );
+    for cursor in [ResourceId(0x0055_0033), ResourceId(0x0055_0034)] {
+        assert!(fixture.state.resources.cursor_exists(cursor));
+    }
+}
+
+#[test]
+fn gc_pixmap_cursor_font_requests_deny_before_effects() {
+    // Mutation: remove the selected target check from a request row; that row must stop returning the policy error before changing state or calling the backend.
+    for case in gc_font_access_requests(&gc_font_access_fixture()) {
+        let mut fixture = gc_font_access_fixture();
+        let (target_id, target_kind, target_mode, creation) = case.expected[case.deny_index];
+        let before_resource = access_target_snapshot(&fixture.state, target_id, target_kind);
+        let before_backend = fixture.backend.calls();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        fixture
+            .state
+            .install_access_policy(Arc::new(WindowResourcePolicy {
+                calls: Arc::clone(&calls),
+                deny_id: Some(Arc::new(AtomicU32::new(target_id.0))),
+                deny_mode: Some(target_mode),
+                deny_hides: false,
+            }));
+
+        let bytes = resource_request(
+            &mut fixture.state,
+            &mut fixture.backend,
+            &mut fixture.peer,
+            90,
+            case.opcode,
+            case.data,
+            &case.body,
+        );
+        assert_x11_error(&bytes, x11::error::BAD_VALUE, 0x55, case.opcode, 90);
+        assert_eq!(
+            fixture.backend.calls(),
+            before_backend,
+            "{} backend",
+            case.label
+        );
+        assert_eq!(
+            access_target_snapshot(&fixture.state, target_id, target_kind),
+            before_resource,
+            "{} target state",
+            case.label
+        );
+        if creation.is_some() {
+            assert!(
+                access_target_snapshot(&fixture.state, target_id, target_kind).is_none(),
+                "{} denied creation installed a resource",
+                case.label
+            );
+        }
+        let recorded = calls.lock().unwrap();
+        assert!(
+            recorded.iter().any(|call| {
+                call.client == CLIENT
+                    && call
+                        .target
+                        .is_some_and(|target| target.id == target_id && target.kind == target_kind)
+                    && call.mode == Some(target_mode)
+            }),
+            "{} selected check was not asked",
+            case.label
+        );
+    }
+}
+
+struct DenyPixmapReads;
+
+impl AccessPolicy for DenyPixmapReads {
+    fn resource(
+        &self,
+        _ctx: &AccessContext<'_>,
+        _client: ClientId,
+        target: &ResourceTarget,
+        mode: AccessMode,
+    ) -> Decision {
+        if target.kind == ResourceKind::Pixmap && mode == AccessMode::READ {
+            Decision::Deny(DenyError {
+                code: x11::error::BAD_ACCESS,
+                value: 0x55,
+            })
+        } else {
+            Decision::Allow
+        }
+    }
+}
+
+#[test]
+fn close_font_and_free_pixmap_denied_keep_the_object() {
+    // Mutation: perform the CloseFont and FreePixmap removals before checking DESTROY; after denial the still-open font and pixmap must remain usable.
+    let mut fixture = gc_font_access_fixture();
+    let denied_id = Arc::new(AtomicU32::new(fixture.font.0));
+    fixture
+        .state
+        .install_access_policy(Arc::new(WindowResourcePolicy {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            deny_id: Some(Arc::clone(&denied_id)),
+            deny_mode: Some(AccessMode::DESTROY),
+            deny_hides: false,
+        }));
+
+    let close_backend_before = fixture.backend.calls();
+    let bytes = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.peer,
+        100,
+        46,
+        0,
+        &words(&[fixture.font.0]),
+    );
+    assert_x11_error(&bytes, x11::error::BAD_VALUE, 0x55, 46, 100);
+    assert_eq!(fixture.backend.calls(), close_backend_before);
+    assert!(fixture.state.resources.font(fixture.font).is_some());
+    let query_font = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.peer,
+        101,
+        47,
+        0,
+        &words(&[fixture.font.0]),
+    );
+    assert_eq!(query_font.first(), Some(&1), "font remains queryable");
+
+    denied_id.store(fixture.source.0, Ordering::SeqCst);
+    let free_backend_before = fixture.backend.calls();
+    let bytes = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.peer,
+        102,
+        54,
+        0,
+        &words(&[fixture.source.0]),
+    );
+    assert_x11_error(&bytes, x11::error::BAD_VALUE, 0x55, 54, 102);
+    assert_eq!(fixture.backend.calls(), free_backend_before);
+    assert!(fixture.state.resources.pixmap(fixture.source).is_some());
+
+    let before_copy = fixture.backend.calls();
+    let mut copy_body = words(&[fixture.source.0, fixture.destination.0, fixture.gc.0]);
+    copy_body.extend_from_slice(&0i16.to_le_bytes());
+    copy_body.extend_from_slice(&0i16.to_le_bytes());
+    copy_body.extend_from_slice(&0i16.to_le_bytes());
+    copy_body.extend_from_slice(&0i16.to_le_bytes());
+    copy_body.extend_from_slice(&8u16.to_le_bytes());
+    copy_body.extend_from_slice(&8u16.to_le_bytes());
+    let bytes = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.peer,
+        103,
+        62,
+        0,
+        &copy_body,
+    );
+    assert_no_error(&bytes, "CopyArea from retained pixmap");
+    assert!(
+        fixture.backend.calls()[before_copy.len()..]
+            .iter()
+            .any(|call| matches!(call, RecordedCall::CopyArea { .. }))
+    );
+}
+
+#[test]
+fn create_gc_unresolved_tile_keeps_todays_behaviour() {
+    // Mutation: check the CreateGC tile XID without first resolving it as a pixmap; the deny-pixmap policy must then reject the request.
+    let mut fixture = gc_font_access_fixture();
+    fixture
+        .state
+        .install_access_policy(Arc::new(DenyPixmapReads));
+    let gc = ResourceId(0x0055_0040);
+    let missing_tile = ResourceId(0x0055_00ff);
+    let body = words(&[gc.0, ROOT_WINDOW.0, 1 << 10, missing_tile.0]);
+
+    let bytes = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.peer,
+        110,
+        55,
+        0,
+        &body,
+    );
+
+    assert!(
+        bytes.is_empty(),
+        "unresolved tile changed CreateGC bytes: {bytes:02x?}"
+    );
+    assert!(fixture.state.resources.gc(gc).is_some());
+}
+
+#[test]
+fn copy_gc_denial_preserves_destination_for_source_and_destination_denial() {
+    // Mutation: copy the selected foreground before checking either GC; each denied row must leave the destination snapshot unchanged.
+    for deny_source in [true, false] {
+        let mut fixture = gc_font_access_fixture();
+        let (denied_id, denied_mode) = if deny_source {
+            (fixture.gc, AccessMode::GET_ATTR)
+        } else {
+            (fixture.copy_gc, AccessMode::SET_ATTR)
+        };
+        let destination_before =
+            access_target_snapshot(&fixture.state, fixture.copy_gc, ResourceKind::Gc);
+        assert_ne!(
+            fixture.state.resources.gc_foreground(fixture.gc),
+            fixture.state.resources.gc_foreground(fixture.copy_gc),
+            "CopyGC source and destination start with different foregrounds"
+        );
+        let backend_before = fixture.backend.calls();
+        fixture
+            .state
+            .install_access_policy(Arc::new(WindowResourcePolicy {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                deny_id: Some(Arc::new(AtomicU32::new(denied_id.0))),
+                deny_mode: Some(denied_mode),
+                deny_hides: false,
+            }));
+
+        let bytes = resource_request(
+            &mut fixture.state,
+            &mut fixture.backend,
+            &mut fixture.peer,
+            120,
+            57,
+            0,
+            &words(&[fixture.gc.0, fixture.copy_gc.0, 1 << 2]),
+        );
+
+        assert_x11_error(&bytes, x11::error::BAD_VALUE, 0x55, 57, 120);
+        assert_eq!(fixture.backend.calls(), backend_before);
+        assert_eq!(
+            access_target_snapshot(&fixture.state, fixture.copy_gc, ResourceKind::Gc),
+            destination_before,
+            "denied CopyGC changed its destination"
+        );
+    }
+}

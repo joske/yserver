@@ -378,7 +378,15 @@ pub fn process_request(
         36 => handle_grab_server(state, client_id, sequence),
         37 => handle_ungrab_server(state, client_id, sequence),
         // ── void requests with local state/backend handling ──
-        96 => handle_recolor_cursor(state, backend, origin, client_id, sequence, body),
+        96 => handle_recolor_cursor(
+            state,
+            backend,
+            origin,
+            client_id,
+            sequence,
+            access_request,
+            body,
+        ),
         102 => {
             // Xorg's XkbSetRepeatKeys: the RepeatKeys control follows the
             // global auto-repeat, with a ControlsNotify for what changed.
@@ -444,7 +452,7 @@ pub fn process_request(
         33 => handle_grab_key(state, client_id, sequence, header, body),
         34 => handle_ungrab_key(state, client_id, sequence, header, body),
         // ── font / size queries (pure state-read replies) ──
-        47 => handle_query_font(state, client_id, sequence, body),
+        47 => handle_query_font(state, client_id, sequence, access_request, body),
         48 => handle_query_text_extents(state, client_id, sequence, header, body),
         97 => handle_query_best_size(state, client_id, sequence, access_request, body),
         // ── properties (state mutation + PropertyNotify fanout) ──
@@ -478,8 +486,24 @@ pub fn process_request(
         24 => handle_convert_selection(state, client_id, sequence, body),
         25 => handle_send_event(state, backend, client_id, sequence, header, body),
         // ── fonts (state mutation + backend lifecycle) ──
-        45 => handle_open_font(state, backend, origin, client_id, sequence, body),
-        46 => handle_close_font(state, backend, origin, client_id, sequence, body),
+        45 => handle_open_font(
+            state,
+            backend,
+            origin,
+            client_id,
+            sequence,
+            access_request,
+            body,
+        ),
+        46 => handle_close_font(
+            state,
+            backend,
+            origin,
+            client_id,
+            sequence,
+            access_request,
+            body,
+        ),
         // ── color queries (no state, just protocol replies) ──
         84 => handle_alloc_color(state, client_id, sequence, body),
         85 => handle_alloc_named_color(state, client_id, sequence, body),
@@ -495,19 +519,51 @@ pub fn process_request(
         101 => handle_get_keyboard_mapping(state, backend, origin, client_id, sequence, body),
         // ── save-set + cursor lifecycle ──
         6 => handle_change_save_set(state, client_id, sequence, header, body),
-        95 => handle_free_cursor(state, backend, origin, client_id, sequence, body),
+        95 => handle_free_cursor(
+            state,
+            backend,
+            origin,
+            client_id,
+            sequence,
+            access_request,
+            body,
+        ),
         // ── pixmaps (state + backend lifecycle) ──
         53 => handle_create_pixmap(state, backend, origin, client_id, sequence, header, body),
-        54 => handle_free_pixmap(state, backend, origin, client_id, sequence, body),
+        54 => handle_free_pixmap(
+            state,
+            backend,
+            origin,
+            client_id,
+            sequence,
+            access_request,
+            body,
+        ),
         // ── font listing (backend proxy with reply sequence rewrite) ──
         49 => handle_list_fonts(state, backend, origin, client_id, sequence, body),
         50 => handle_list_fonts_with_info(state, backend, origin, client_id, sequence, body),
         // ── GContext (pure state mutation) ──
-        55 => handle_create_gc(state, client_id, sequence, body),
+        55 => handle_create_gc(state, client_id, sequence, access_request, body),
         56 => handle_change_gc(state, backend, origin, client_id, sequence, header, body),
-        57 => handle_copy_gc(state, backend, origin, client_id, sequence, body),
+        57 => handle_copy_gc(
+            state,
+            backend,
+            origin,
+            client_id,
+            sequence,
+            access_request,
+            body,
+        ),
         59 => handle_set_clip_rectangles(state, backend, origin, client_id, sequence, header, body),
-        60 => handle_free_gc(state, backend, origin, client_id, sequence, body),
+        60 => handle_free_gc(
+            state,
+            backend,
+            origin,
+            client_id,
+            sequence,
+            access_request,
+            body,
+        ),
         // ── drawing (state read + backend RPC + damage) ──
         61 => handle_clear_area(state, backend, origin, client_id, sequence, header, body),
         62 => handle_copy_area(
@@ -613,8 +669,24 @@ pub fn process_request(
         98 => handle_query_extension(state, backend, client_id, sequence, body),
         99 => handle_list_extensions(state, backend, client_id, sequence),
         // ── cursor creation ──
-        93 => handle_create_cursor(state, backend, origin, client_id, sequence, body),
-        94 => handle_create_glyph_cursor(state, backend, origin, client_id, sequence, body),
+        93 => handle_create_cursor(
+            state,
+            backend,
+            origin,
+            client_id,
+            sequence,
+            access_request,
+            body,
+        ),
+        94 => handle_create_glyph_cursor(
+            state,
+            backend,
+            origin,
+            client_id,
+            sequence,
+            access_request,
+            body,
+        ),
         // ── window queries / circulation ──
         3 => handle_get_window_attributes(state, client_id, sequence, header, body),
         13 => handle_circulate_window(state, backend, client_id, sequence, header, body),
@@ -1202,6 +1274,35 @@ fn validate_resource_access(
         Decision::Allow => Ok(()),
         Decision::Deny(error) => Err((error.code, error.value)),
     }
+}
+
+/// Check an operand whose historical validation is missing, without
+/// introducing a new error when its id does not resolve to this type.
+pub(super) fn validate_resource_if_present(
+    state: &ServerState,
+    client: ClientId,
+    id: ResourceId,
+    kind: ResourceKind,
+    mode: AccessMode,
+    request: RequestOpcodes,
+) -> Result<(), (u8, u32)> {
+    if !state.policies_installed() || client == crate::resources::SERVER_OWNER {
+        return Ok(());
+    }
+    if state.access_resource_owner(id, kind).is_none() {
+        return Ok(());
+    }
+    validate_resource_access(
+        state,
+        client,
+        ResourceTarget {
+            id,
+            kind,
+            creation: None,
+        },
+        mode,
+        request,
+    )
 }
 
 /// Encode an X11 protocol error and ship it to the client through

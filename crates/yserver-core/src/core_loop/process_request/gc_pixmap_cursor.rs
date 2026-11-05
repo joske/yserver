@@ -20,6 +20,7 @@ pub(super) fn handle_recolor_cursor(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let cursor = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
@@ -32,6 +33,19 @@ pub(super) fn handle_recolor_cursor(
             cursor.0,
             96,
         );
+    }
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: cursor,
+            kind: ResourceKind::Cursor,
+            creation: None,
+        },
+        AccessMode::WRITE,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 96);
     }
     let fore = (
         u16::from_le_bytes([body[4], body[5]]),
@@ -120,6 +134,7 @@ pub(super) fn handle_create_cursor(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() >= 28 {
@@ -151,6 +166,35 @@ pub(super) fn handle_create_cursor(
         let hot_x = u16::from_le_bytes([body[24], body[25]]);
         let hot_y = u16::from_le_bytes([body[26], body[27]]);
 
+        for pixmap in [source_id, mask_id] {
+            if let Err((code, bad_value)) = super::validate_resource_if_present(
+                state,
+                client_id,
+                pixmap,
+                ResourceKind::Pixmap,
+                AccessMode::READ,
+                access_request,
+            ) {
+                return emit_x11_error(state, client_id, sequence, code, bad_value, 93);
+            }
+        }
+        if let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: cursor_id,
+                kind: ResourceKind::Cursor,
+                creation: Some(crate::access::Creation {
+                    parent: None,
+                    owner: client_id,
+                }),
+            },
+            AccessMode::CREATE,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 93);
+        }
+
         let src_host = state.resources.pixmap(source_id).and_then(|p| p.host_xid);
         let mask_host = if mask_id.0 == 0 {
             None
@@ -179,6 +223,7 @@ pub(super) fn handle_create_glyph_cursor(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() >= 28
@@ -221,6 +266,35 @@ pub(super) fn handle_create_glyph_cursor(
             u16::from_le_bytes([body[26], body[27]]),
         );
 
+        for font in [source_id, mask_id] {
+            if let Err((code, bad_value)) = super::validate_resource_if_present(
+                state,
+                client_id,
+                font,
+                ResourceKind::Font,
+                AccessMode::USE,
+                access_request,
+            ) {
+                return emit_x11_error(state, client_id, sequence, code, bad_value, 94);
+            }
+        }
+        if let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: cursor,
+                kind: ResourceKind::Cursor,
+                creation: Some(crate::access::Creation {
+                    parent: None,
+                    owner: client_id,
+                }),
+            },
+            AccessMode::CREATE,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 94);
+        }
+
         let src_host = state.resources.font(source_id).map(|f| f.host_xid);
         let mask_host = if mask_id.0 == 0 {
             None
@@ -262,6 +336,7 @@ pub(super) fn handle_create_gc(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if let Some(request) = x11::create_gc_request(body) {
@@ -288,6 +363,52 @@ pub(super) fn handle_create_gc(
         }
         if let Some(bad) = unknown_gc_font(state, request.font) {
             return emit_x11_error(state, client_id, sequence, x11::error::BAD_FONT, bad, 55);
+        }
+        let drawable_kind = if state.resources.window(request.drawable).is_some() {
+            Some(ResourceKind::Window)
+        } else if state.resources.pixmap(request.drawable).is_some() {
+            Some(ResourceKind::Pixmap)
+        } else {
+            None
+        };
+        if let Some(kind) = drawable_kind
+            && let Err((code, bad_value)) = super::validate_resource_if_present(
+                state,
+                client_id,
+                request.drawable,
+                kind,
+                AccessMode::GET_ATTR,
+                access_request,
+            )
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 55);
+        }
+        if let Err((code, bad_value)) = validate_gc_value_list_access(
+            state,
+            client_id,
+            access_request,
+            request.tile,
+            request.stipple,
+            request.font,
+            request.clip_mask,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 55);
+        }
+        if let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: request.gc,
+                kind: ResourceKind::Gc,
+                creation: Some(crate::access::Creation {
+                    parent: Some(request.drawable),
+                    owner: client_id,
+                }),
+            },
+            AccessMode::CREATE | AccessMode::SET_ATTR,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 55);
         }
         state.resources.create_gc(client_id, request);
     }
@@ -320,6 +441,49 @@ fn unknown_gc_font(state: &ServerState, font: Option<ResourceId>) -> Option<u32>
         .map(|id| id.0)
 }
 
+/// Authorize the resource operands in a CreateGC / ChangeGC value list.
+fn validate_gc_value_list_access(
+    state: &ServerState,
+    client_id: ClientId,
+    access_request: RequestOpcodes,
+    tile: Option<ResourceId>,
+    stipple: Option<ResourceId>,
+    font: Option<ResourceId>,
+    clip_mask: Option<Option<ResourceId>>,
+) -> Result<(), (u8, u32)> {
+    for pixmap in [tile, stipple].into_iter().flatten() {
+        super::validate_resource_if_present(
+            state,
+            client_id,
+            pixmap,
+            ResourceKind::Pixmap,
+            AccessMode::READ,
+            access_request,
+        )?;
+    }
+    if let Some(font) = font {
+        super::validate_resource_if_present(
+            state,
+            client_id,
+            font,
+            ResourceKind::Font,
+            AccessMode::USE,
+            access_request,
+        )?;
+    }
+    if let Some(Some(pixmap)) = clip_mask {
+        super::validate_resource_if_present(
+            state,
+            client_id,
+            pixmap,
+            ResourceKind::Pixmap,
+            AccessMode::READ,
+            access_request,
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn handle_change_gc(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -331,13 +495,28 @@ pub(super) fn handle_change_gc(
 ) -> io::Result<RequestOutcome> {
     let access_request = RequestOpcodes::for_request(header);
     if let Some(request) = x11::change_gc_request(body) {
-        if let Err((code, bad_value)) =
-            validate_gc_only(state, client_id, access_request, request.gc, None)
-        {
+        if let Err((code, bad_value)) = validate_gc_only(
+            state,
+            client_id,
+            access_request,
+            request.gc,
+            Some(AccessMode::SET_ATTR),
+        ) {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 56);
         }
         if let Some(bad) = unknown_gc_font(state, request.font) {
             return emit_x11_error(state, client_id, sequence, x11::error::BAD_FONT, bad, 56);
+        }
+        if let Err((code, bad_value)) = validate_gc_value_list_access(
+            state,
+            client_id,
+            access_request,
+            request.tile,
+            request.stipple,
+            request.font,
+            request.clip_mask,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 56);
         }
         let displaced = state.resources.change_gc(client_id, request);
         release_displaced_gc_pixmaps(state, backend, origin, displaced);
@@ -353,12 +532,33 @@ pub(super) fn handle_copy_gc(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() >= 12 {
         let src_gc = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
         let dst_gc = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
         let value_mask = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+        if let Err((code, bad_value)) = super::validate_resource_if_present(
+            state,
+            client_id,
+            src_gc,
+            ResourceKind::Gc,
+            AccessMode::GET_ATTR,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 57);
+        }
+        if let Err((code, bad_value)) = super::validate_resource_if_present(
+            state,
+            client_id,
+            dst_gc,
+            ResourceKind::Gc,
+            AccessMode::SET_ATTR,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 57);
+        }
         let displaced = state.resources.copy_gc(src_gc, dst_gc, value_mask);
         release_displaced_gc_pixmaps(state, backend, origin, displaced);
         super::fonts::release_unreferenced_fonts(state, backend, origin);
@@ -409,6 +609,7 @@ pub(super) fn handle_free_gc(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let Some(gc) = x11::free_resource_id(body) else {
@@ -432,6 +633,19 @@ pub(super) fn handle_free_gc(
             FREE_GC_OPCODE,
         );
     }
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: gc,
+            kind: ResourceKind::Gc,
+            creation: None,
+        },
+        AccessMode::DESTROY,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, FREE_GC_OPCODE);
+    }
     let displaced = state.resources.free_gc(gc);
     release_displaced_gc_pixmaps(state, backend, origin, displaced);
     super::fonts::release_unreferenced_fonts(state, backend, origin);
@@ -453,6 +667,7 @@ pub(super) fn handle_free_cursor(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let Some(cursor) = x11::free_resource_id(body) else {
@@ -473,6 +688,26 @@ pub(super) fn handle_free_cursor(
             sequence,
             x11::error::BAD_CURSOR,
             cursor.0,
+            FREE_CURSOR_OPCODE,
+        );
+    }
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: cursor,
+            kind: ResourceKind::Cursor,
+            creation: None,
+        },
+        AccessMode::DESTROY,
+        access_request,
+    ) {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            code,
+            bad_value,
             FREE_CURSOR_OPCODE,
         );
     }
@@ -552,6 +787,24 @@ pub(super) fn handle_create_pixmap(
             53,
         );
     }
+    let drawable_kind = if state.resources.window(request.drawable).is_some() {
+        ResourceKind::Window
+    } else {
+        ResourceKind::Pixmap
+    };
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: request.drawable,
+            kind: drawable_kind,
+            creation: None,
+        },
+        AccessMode::GET_ATTR,
+        RequestOpcodes::for_request(header),
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 53);
+    }
     if !supported_pixmap_depth(request.depth) {
         return emit_x11_error(
             state,
@@ -561,6 +814,22 @@ pub(super) fn handle_create_pixmap(
             u32::from(request.depth),
             53,
         );
+    }
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: request.pixmap,
+            kind: ResourceKind::Pixmap,
+            creation: Some(crate::access::Creation {
+                parent: Some(request.drawable),
+                owner: client_id,
+            }),
+        },
+        AccessMode::CREATE,
+        RequestOpcodes::for_request(header),
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 53);
     }
     let host_xid = match backend.create_pixmap(origin, request.depth, request.width, request.height)
     {
@@ -598,6 +867,7 @@ pub(super) fn handle_free_pixmap(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let Some(pixmap) = x11::free_resource_id(body) else {
@@ -607,11 +877,41 @@ pub(super) fn handle_free_pixmap(
         );
         return Ok(RequestOutcome::Handled);
     };
-    let Some(removed) = state.resources.free_pixmap(pixmap) else {
+    if state.resources.pixmap(pixmap).is_none() {
         debug!(
             "client {} #{} FreePixmap pixmap=0x{:x} unknown -> BadPixmap",
             client_id.0, sequence.0, pixmap.0
         );
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_PIXMAP,
+            pixmap.0,
+            FREE_PIXMAP_OPCODE,
+        );
+    }
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: pixmap,
+            kind: ResourceKind::Pixmap,
+            creation: None,
+        },
+        AccessMode::DESTROY,
+        access_request,
+    ) {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            code,
+            bad_value,
+            FREE_PIXMAP_OPCODE,
+        );
+    }
+    let Some(removed) = state.resources.free_pixmap(pixmap) else {
         return emit_x11_error(
             state,
             client_id,

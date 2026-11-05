@@ -3500,6 +3500,10 @@ fn free_pixmap_between_park_and_drain_still_executes_the_pinned_copy() {
         None,
         ClientId(CLIENT),
         SequenceNumber(2),
+        crate::access::RequestOpcodes {
+            major: 54,
+            minor: 0,
+        },
         &free_pixmap_body(PIXMAP_XID),
     )
     .expect("free pixmap");
