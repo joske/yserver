@@ -123,7 +123,7 @@ joined with `+`.
 | 4 DestroyWindow | window `DESTROY`; its parent `REMOVE`, if it has one | parent check is new; an id that resolves always has its parent |
 | 5 DestroySubwindows | parent `REMOVE`; each child `DESTROY` in the destroy loop, immediately before its destroy | spec's Xorg order; derived-target ruling |
 | 6 ChangeSaveSet | window `MANAGE` | before the mutable `ClientState` borrow (inventory §5) |
-| 7 ReparentWindow | window `MANAGE`; new parent `ADD`; at the remap, window `SHOW` | remap denial: success, window unmapped |
+| 7 ReparentWindow | window `MANAGE`; new parent `ADD`; then, if the window is mapped, window `SHOW` for the remap | all three asked before any effect; see "ReparentWindow with a denied remap" |
 | 8 MapWindow | window `SHOW` | denial: `Success`, nothing mapped |
 | 9 MapSubwindows | parent `LIST`; each child `SHOW` in the map loop | derived-target ruling |
 | 10 UnmapWindow | window `HIDE` | policy's error |
@@ -194,6 +194,18 @@ screen hooks of Install/Uninstall/ListInstalledColormaps (the spec lists no scre
 `UnmapSubwindows` and `MapSubwindows` decide which children are allowed (asking `HIDE` / `SHOW` per child, in the
 loop's order) and the helper acts on that set; `DestroySubwindows` passes every child, unchecked, because the spec
 makes its bulk unmap unconditional and checks only `DESTROY`. The helper itself never calls a check.
+
+## ReparentWindow with a denied remap
+
+XLibre asks `SHOW` when it remaps, after the reparent (`dix/window.c:2565`, `:2641`); the policy sees the same
+three questions in the same order when yserver asks them all before the first effect, which lets the handler pick
+its path once:
+- `SHOW` allowed (and with no policy): today's path unchanged, including its simulated unmap/remap
+  (`windows.rs:469-526`) and its event order.
+- `SHOW` denied: the window is unmapped first through the same transition a client `UnmapWindow` runs (subtree
+  demotion, storage and redirect lifecycle, focus and grab handling, UnmapNotify; `windows.rs:2569-2637`), exactly
+  once, then reparented with no remap. The client sees UnmapNotify, then ReparentNotify, no MapNotify, and no
+  error, as Xorg's `ReparentWindow` followed by a denied `MapWindow`.
 
 ## Denial test contract
 
@@ -345,8 +357,14 @@ and the request returns no error.
     Mutation: report the policy's error.
   - `map_subwindows_skips_denied_child`: three unmapped children, the middle one denied; the other two get
     MapNotify, the middle one stays unmapped, no error. `unmap_subwindows_skips_denied_child`: the mirror image.
-  - `reparent_denied_remap_leaves_window_reparented_and_unmapped`: a mapped window reparented with its remap `SHOW`
-    denied: ReparentNotify sent, the window is a child of the new parent and unmapped, no error.
+  - `reparent_denied_remap_leaves_window_reparented_and_unmapped`: a viewable window W with a viewable child C
+    holding the input focus (and, second case, an active pointer grab on C), reparented between two viewable
+    parents with W's remap `SHOW` denied. Asserts: UnmapNotify then ReparentNotify, no MapNotify, no error; W is a
+    child of the new parent and unmapped; C is unviewable; focus and grab handled as after a client `UnmapWindow` of
+    W; the `RecordingBackend` lifecycle calls equal those of `UnmapWindow` of W followed by the reparent, with no
+    remap. Mutation: set only W's map state.
+  - `reparent_with_allow_all_policy_keeps_todays_bytes`: the same setup with an allow-all policy and with none:
+    events and backend calls equal today's.
   - `circulate_denied_child_is_not_restacked`: stacking order unchanged, no CirculateNotify, no error.
 - [ ] **Steps 2–5.** Commit `… Task 5: window tree, mapping and pointer queries`.
 
