@@ -30,7 +30,7 @@ use crate::{
         process_disconnect::{
             HostPixmapFrees, destroy_zombie_resources_reporting, process_disconnect_reporting,
         },
-        process_request::install_default_font,
+        process_request::{install_default_font, reinstall_vidmode_gamma},
         run::{
             DeferredRequest, FairRequestQueue, LoopTelemetry, PendingBackendRequests,
             cancel_all_pending_backend_requests,
@@ -437,7 +437,8 @@ pub(crate) fn reset_generation(
         .map(crate::rootless::Rootless::for_next_generation);
     let topology = BackendTopology::from_backend(backend);
     let mut fresh = topology.into_server_state();
-    // The single field that survives literally. X11 timestamps must not
+    // The one session field that survives literally (the VidMode gamma
+    // below is the screen's, not the session's). X11 timestamps must not
     // go backwards: a client reconnecting a millisecond after a reset
     // would otherwise see the server clock jump.
     fresh.start_instant = state.start_instant;
@@ -454,6 +455,9 @@ pub(crate) fn reset_generation(
     for info in inventory.devices_by_source() {
         fresh.xi_register_source(info);
     }
+    // Xorg's `pScrn->gamma` outlives regeneration; step 7 rebuilds the
+    // VidMode table from it.
+    fresh.vidmode_gamma = state.vidmode_gamma;
     // The old generation's fonts go with it, the default one included;
     // step 7 reopens that.
     for host_xid in state.resources.take_all_fonts() {
@@ -471,6 +475,9 @@ pub(crate) fn reset_generation(
     }
     // The fresh state carries identity transforms, as Xorg's reset does.
     backend.randr_layout_changed(state);
+    // The VidMode table from the carried gamma, as ScreenInit's
+    // `xf86HandleColormaps` builds it; no table at 1.0.
+    reinstall_vidmode_gamma(state, backend);
     if let Some(rootless) = rootless {
         crate::rootless::resume(state, backend, rootless);
     }
@@ -1168,8 +1175,66 @@ mod tests {
 
         assert_eq!(
             state.start_instant, epoch,
-            "start_instant is the ONLY field that survives literally — \
+            "start_instant is the only session field that survives literally — \
              X11 timestamps must not go backwards across a reset"
+        );
+    }
+
+    /// The VidMode gamma outlives a reset, as Xorg's `pScrn->gamma` does:
+    /// the new generation reports the same values to `GetGamma`, and its
+    /// table is rebuilt from them and pushed to the backend, so the display
+    /// and the protocol agree. A ramp set only by `SetGammaRamp` falls back
+    /// to the gamma curve, which at 1.0 is no table at all.
+    #[test]
+    fn reset_generation_carries_the_vidmode_gamma_and_rebuilds_its_table() {
+        use crate::backend::gamma::VidModeGammaTable;
+
+        let run_reset = |state: &mut ServerState, backend: &mut RecordingBackend| {
+            let generations = GenerationCounter::new();
+            let registry = setup_thread::make_registry();
+            let inventory = InputInventory::new();
+            let mut locals = Locals::new();
+            let p = poll();
+            reset_generation(
+                state,
+                backend,
+                p.registry(),
+                &generations,
+                &registry,
+                &inventory,
+                locals.borrow(),
+            )
+            .expect("the reset must proceed: this test holds no overlay claim");
+        };
+        let ramp: Vec<u16> = (0..1024u16).map(|i| (1023 - i) << 6).collect();
+
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        let gamma = [2.0, 1.0, 0.5];
+        state.vidmode_gamma = gamma;
+        let ramp_table = VidModeGammaTable::from_ramp(&ramp, &ramp, &ramp);
+        state.vidmode_gamma_table = Some(ramp_table.clone());
+        backend.vidmode_gamma = Some(ramp_table);
+        run_reset(&mut state, &mut backend);
+        let expected = Some(VidModeGammaTable::from_gamma(gamma));
+        assert_eq!(state.vidmode_gamma, gamma, "GetGamma keeps its values");
+        assert_eq!(
+            state.vidmode_gamma_table, expected,
+            "the table is the gamma curve"
+        );
+        assert_eq!(backend.vidmode_gamma, expected, "and the display loads it");
+
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        let ramp_table = VidModeGammaTable::from_ramp(&ramp, &ramp, &ramp);
+        state.vidmode_gamma_table = Some(ramp_table.clone());
+        backend.vidmode_gamma = Some(ramp_table);
+        run_reset(&mut state, &mut backend);
+        assert_eq!(state.vidmode_gamma, [1.0; 3]);
+        assert_eq!(state.vidmode_gamma_table, None, "gamma 1.0 builds no table");
+        assert_eq!(
+            backend.vidmode_gamma, None,
+            "the CRTCs load their RANDR ramps alone"
         );
     }
 

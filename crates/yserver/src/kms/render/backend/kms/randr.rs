@@ -1623,8 +1623,7 @@ impl KmsBackend {
                     .pending_gamma_deadline
                     .set(active.then(|| now + refresh_period));
             }
-            *output.pending_gamma_lut.borrow_mut() =
-                Some((red, green, blue));
+            *output.pending_gamma_lut.borrow_mut() = Some((red, green, blue));
             let deadline_elapsed = output
                 .pending_gamma_deadline
                 .get()
@@ -1688,7 +1687,7 @@ impl KmsBackend {
         Ok(())
     }
 
-    pub(super) fn reapply_gamma_for_output(&self, output_key: &OutputKey) {
+    pub(in crate::kms::render::backend) fn reapply_gamma_for_output(&self, output_key: &OutputKey) {
         if let Err(e) = self.apply_gamma_to_live_output(output_key) {
             log::warn!("kms gamma: reapply for {output_key:?} failed: {e}");
         }

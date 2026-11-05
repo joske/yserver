@@ -545,7 +545,7 @@ fn vidmode_gamma_to_wire(gamma: f32) -> u32 {
 
 /// VidMode's gamma ramp size, as modesetting reports it: the CMap table's
 /// `gammaElements`, whatever the hardware LUT's size; 0 when the CRTC has
-/// no gamma, as Xwayland's.
+/// no gamma, so a backend without gamma advertises no ramp.
 fn vidmode_gamma_ramp_size(backend: &dyn Backend, crtc: u32) -> u16 {
     if backend.crtc_gamma_size(crtc) == 0 {
         0
@@ -565,6 +565,22 @@ fn install_vidmode_gamma_table(
         log::warn!("XF86VidMode gamma apply failed: {e}");
     }
     state.vidmode_gamma_table = Some(table);
+}
+
+/// Rebuild the screen's VidMode gamma table after a server reset, from
+/// the gamma values the new generation carried over, and hand it to the
+/// backend. Xorg keeps `pScrn->gamma` across regeneration (set once in
+/// PreInit by `xf86SetGamma`) and `xf86HandleColormaps` rebuilds the CMap
+/// table from it in ScreenInit, so a ramp set only by `SetGammaRamp` falls
+/// back to the gamma curve, and gamma 1.0 leaves the RANDR ramps alone.
+pub(crate) fn reinstall_vidmode_gamma(state: &mut ServerState, backend: &mut dyn Backend) {
+    #[allow(clippy::float_cmp)]
+    let table = (state.vidmode_gamma != [1.0; 3])
+        .then(|| VidModeGammaTable::from_gamma(state.vidmode_gamma));
+    if let Err(e) = backend.set_vidmode_gamma(table.as_ref()) {
+        log::warn!("XF86VidMode gamma reapply after reset failed: {e}");
+    }
+    state.vidmode_gamma_table = table;
 }
 
 /// A local client's `SetGamma`, `SetGammaRamp` and `LockModeSwitch`, as

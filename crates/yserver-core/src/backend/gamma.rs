@@ -85,6 +85,10 @@ impl VidModeGammaTable {
     /// `VIDMODE_GAMMA_ENTRIES` entries, each kept to its top 10 bits.
     #[must_use]
     pub fn from_ramp(red: &[u16], green: &[u16], blue: &[u16]) -> Self {
+        let entries = usize::from(VIDMODE_GAMMA_ENTRIES);
+        debug_assert_eq!(red.len(), entries, "VidMode red ramp size");
+        debug_assert_eq!(green.len(), entries, "VidMode green ramp size");
+        debug_assert_eq!(blue.len(), entries, "VidMode blue ramp size");
         let channel = |ramp: &[u16]| -> Vec<u16> {
             ramp.iter()
                 .map(|&value| value >> (16 - VIDMODE_GAMMA_BITS))
@@ -130,9 +134,12 @@ impl VidModeGammaTable {
     ///
     /// Xorg's RANDR ramp has the table's 1024 entries, so a palette value
     /// indexes it directly. Yserver's follows the hardware LUT's size, so
-    /// the value is scaled to it; at 1024 entries that is the same index.
-    /// An empty RANDR ramp is Xorg's absent one: the value shifted to 16
-    /// bits.
+    /// a ramp of any other size is first resampled to 1024 entries
+    /// ([`resample_channel`]) and then indexed the same way; that keeps a
+    /// no-op `SetGamma(1, 1, 1)` within one 8-bit step of the RANDR ramp,
+    /// where scaling the index down would truncate most levels a step
+    /// darker. An empty RANDR ramp is Xorg's absent one: the value shifted
+    /// to 16 bits.
     #[must_use]
     pub fn crtc_lut(
         &self,
@@ -158,16 +165,18 @@ fn crtc_channel(table: &[u16], randr: &[u16], size: usize) -> Vec<u16> {
                 .unwrap_or(0)
         })
         .collect();
+    let resampled;
+    let randr = if randr.is_empty() || randr.len() == usize::from(VIDMODE_GAMMA_ENTRIES) {
+        randr
+    } else {
+        resampled = resample_channel(randr, usize::from(VIDMODE_GAMMA_ENTRIES));
+        resampled.as_slice()
+    };
     let lookup = |value: u16| -> u16 {
         if randr.is_empty() {
             return value << (16 - VIDMODE_GAMMA_BITS);
         }
-        let index = if randr.len() == usize::from(VIDMODE_GAMMA_ENTRIES) {
-            usize::from(value)
-        } else {
-            usize::from(value) * (randr.len() - 1) / top
-        };
-        randr[index.min(randr.len() - 1)]
+        randr[usize::from(value).min(randr.len() - 1)]
     };
     if size == 0 {
         return Vec::new();
@@ -338,24 +347,60 @@ mod tests {
         assert_eq!(at(&lut, 255), (0, 65472, 37824));
     }
 
-    /// Yserver's RANDR ramp follows the hardware size: a 256-entry one is
-    /// looked up at the palette value scaled from 1023 to 255, and an empty
-    /// one is Xorg's absent ramp, the value shifted to 16 bits.
+    /// Yserver's RANDR ramp follows the hardware size, which KMS builds as
+    /// 256 entries on most hardware: the path that runs there resamples it
+    /// to 1024 entries and indexes that. A no-op `SetGamma(1, 1, 1)` then
+    /// stays within one 8-bit step of the RANDR ramp at every level, and
+    /// `SetGamma(2, 1, 0.5)` within one 8-bit step of what Xorg loads from
+    /// its 1024-entry ramp (the vectors of the test above). An empty ramp
+    /// is Xorg's absent one, the value shifted to 16 bits.
     #[test]
-    fn vidmode_gamma_table_scales_into_a_hardware_sized_randr_ramp() {
+    fn vidmode_gamma_table_over_a_hardware_sized_randr_ramp() {
         let randr = identity_ramp(256);
-        let lut = VidModeGammaTable::identity().crtc_lut((&randr, &randr, &randr), 256);
+        let randr3 = (randr.as_slice(), randr.as_slice(), randr.as_slice());
+        let lut = VidModeGammaTable::identity().crtc_lut(randr3, 256);
+        for (level, (&got, &want)) in lut.0.iter().zip(&randr).enumerate() {
+            assert!(
+                got.abs_diff(want) < 257,
+                "level {level}: {got} against the RANDR ramp's {want}"
+            );
+            assert_eq!(got >> 8, want >> 8, "level {level}");
+        }
         assert_eq!(at(&lut, 0), (0, 0, 0));
-        // Palette 1 is table[4] = 4, which scales to 4 * 255 / 1023 = 0.
-        assert_eq!(lut.0[1], randr[0]);
-        assert_eq!(lut.0[128], randr[513 * 255 / 1023]);
-        assert_eq!(lut.0[255], 65535);
+        assert_eq!(at(&lut, 1), (256, 256, 256));
+        assert_eq!(at(&lut, 128), (32864, 32864, 32864));
+        assert_eq!(at(&lut, 255), (65535, 65535, 65535));
+
+        let table = VidModeGammaTable::from_gamma([2.0, 1.0, 0.5]);
+        let lut = table.crtc_lut(randr3, 256);
+        let xorg_randr = xorg_randr_ramp(1024, 1.0);
+        let xorg = table.crtc_lut(
+            (
+                xorg_randr.as_slice(),
+                xorg_randr.as_slice(),
+                xorg_randr.as_slice(),
+            ),
+            256,
+        );
+        for level in 0..256 {
+            let (got, want) = (at(&lut, level), at(&xorg, level));
+            assert!(
+                got.0.abs_diff(want.0) < 257
+                    && got.1.abs_diff(want.1) < 257
+                    && got.2.abs_diff(want.2) < 257,
+                "level {level}: {got:?} against Xorg's {want:?}"
+            );
+        }
+        assert_eq!(at(&lut, 1), (4100, 256, 0));
+        assert_eq!(at(&lut, 100), (40999, 25689, 10058));
+        assert_eq!(at(&lut, 128), (46381, 32864, 16464));
+        assert_eq!(at(&lut, 255), (65535, 65535, 65535));
 
         let lut = VidModeGammaTable::identity().crtc_lut((&[], &[], &[]), 256);
         assert_eq!((lut.0[1], lut.0[255]), (4 << 6, 1023 << 6));
         assert!(
             VidModeGammaTable::identity()
-                .crtc_lut((&randr, &randr, &randr), 0)
+                .crtc_lut(randr3, 0)
                 .0
                 .is_empty()
         );
