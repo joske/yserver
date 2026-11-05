@@ -294,9 +294,10 @@ export XAUTHORITY=/mnt/c/Users/<you>/AppData/Local/yserver/Xauthority
 xterm &
 ```
 
-`ssh -X` from Windows' own ssh client does not work yet (it has no `xauth`);
-use `ssh -R 6010:127.0.0.1:6000 host` and add the cookie for `localhost:10`
-on the remote host.
+X11 forwarding with Windows' own ssh client works with `-Y`: the zip ships an
+`xauth.exe`; point `XAuthLocation` in `%USERPROFILE%\.ssh\config` at it and
+`set DISPLAY=127.0.0.1:0`. `-X` fails, because yserver has no SECURITY
+extension for an untrusted cookie.
 
 To build it yourself, `tools/windows/package.ps1` installs the C libraries
 with vcpkg, builds yserver and makes the zip.

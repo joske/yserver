@@ -3,9 +3,9 @@
 Build the portable Windows zip: yserver-<version>-windows-<arch>.zip.
 
 .DESCRIPTION
-Installs the C libraries (build-env.ps1), builds yserver --release for
--Target, checks that yserver.exe needs no DLL beyond the system's, and zips it
-with the XKB data, the launcher, README.txt and the licenses. Works on the
+Installs the C libraries (build-env.ps1), builds yserver and xauth --release
+for -Target, checks that neither exe needs a DLL beyond the system's, and zips
+them with the XKB data, the launcher, README.txt and the licenses. Works on the
 checkout it is part of, from any directory.
 
 .PARAMETER Target
@@ -60,8 +60,10 @@ if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
 $version = ($meta.packages | Where-Object name -EQ 'yserver').version
 
 Invoke-Native cargo @('build', '--release', '--locked', '--manifest-path', "$repo\Cargo.toml",
-    '--target', $Target, '-p', 'yserver', '--bin', 'yserver')
+    '--target', $Target, '-p', 'yserver', '--bin', 'yserver', '-p', 'yserver-xauth', '--bin', 'xauth')
 $exe = "$repo\target\$Target\release\yserver.exe"
+# For ssh's X11 forwarding (XAuthLocation).
+$xauth = "$repo\target\$Target\release\xauth.exe"
 
 # Only system DLLs: the libraries above must be linked in, not imported,
 # and so must the CRT (no vcruntime140.dll, no api-ms-win-crt-*).
@@ -70,21 +72,24 @@ $hostDir = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'Hostarm64' } else { '
 $dumpbin = & $vswhere -latest -products * -find 'VC\Tools\MSVC\**\bin\**\dumpbin.exe' |
     Sort-Object { $_ -notmatch "\\$hostDir\\" } | Select-Object -First 1
 if (-not $dumpbin) { throw 'dumpbin not found' }
-$dependents = & $dumpbin /nologo /dependents $exe |
-    ForEach-Object { $_.Trim() } | Where-Object { $_ -match '\.dll$' }
 $system = '^(api-ms-win-(?!crt-).*|kernel32|ntdll|user32|gdi32|advapi32|ws2_32|bcrypt|bcryptprimitives|' +
     'shell32|ole32|oleaut32|dwmapi|imm32|comctl32|shcore|uxtheme|userenv|secur32|crypt32|' +
     'winmm|version|shlwapi|combase|powrprof|setupapi|dbghelp|vulkan-1)\.dll$'
-Write-Host "yserver.exe imports: $($dependents -join ', ')"
-$foreign = @($dependents | Where-Object { $_ -notmatch $system })
-if ($foreign) { throw "yserver.exe imports non-system DLLs: $($foreign -join ', ')" }
+foreach ($bin in $exe, $xauth) {
+    $leaf = Split-Path -Leaf $bin
+    $dependents = & $dumpbin /nologo /dependents $bin |
+        ForEach-Object { $_.Trim() } | Where-Object { $_ -match '\.dll$' }
+    Write-Host "$leaf imports: $($dependents -join ', ')"
+    $foreign = @($dependents | Where-Object { $_ -notmatch $system })
+    if ($foreign) { throw "$leaf imports non-system DLLs: $($foreign -join ', ')" }
+}
 
 # Stage.
 $name = "yserver-$version-windows-$arch"
 $stage = "$repo\target\dist\$name"
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force "$stage\licenses" | Out-Null
-Copy-Item $exe $stage
+Copy-Item $exe, $xauth $stage
 Copy-Item -Recurse "$XkbData\xkb" "$stage\xkb"
 function Copy-Crlf([string]$From, [string]$To) {
     $text = [IO.File]::ReadAllText($From) -replace "`r?`n", "`r`n"
@@ -103,8 +108,9 @@ foreach ($port in 'libxkbcommon', 'freetype', 'zlib', 'libpng', 'bzip2', 'brotli
     elseif ($port -in 'libxkbcommon', 'freetype') { throw "no license for $port in $installed" }
 }
 
-# The Rust crates linked into the exe: the normal (not build or dev)
-# dependencies of yserver for this target, with their license files.
+# The Rust crates linked into the exes: the normal (not build or dev)
+# dependencies of yserver for this target (xauth's are a subset), with
+# their license files.
 $nodes = @{}
 foreach ($node in $meta.resolve.nodes) { $nodes[$node.id] = $node }
 $packages = @{}
@@ -122,7 +128,7 @@ while ($queue.Count) {
     }
 }
 $crates = [Text.StringBuilder]::new()
-[void]$crates.AppendLine('The Rust crates in yserver.exe, with their licenses.')
+[void]$crates.AppendLine('The Rust crates in yserver.exe and xauth.exe, with their licenses.')
 foreach ($pkg in $seen | Where-Object { $_ -notin $members } | ForEach-Object { $packages[$_] } |
     Sort-Object name, version) {
     $dir = Split-Path $pkg.manifest_path

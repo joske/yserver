@@ -1548,6 +1548,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "yserver-xauth"
+version = "1.8.0"
+dependencies = [
+ "yserver-core",
+]
+
+[[package]]
 name = "zlib-rs"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"

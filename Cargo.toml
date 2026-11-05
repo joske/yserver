@@ -5,6 +5,7 @@ members = [
   "crates/yserver-core",
   "crates/yserver-protocol",
   "crates/yserver-render",
+  "crates/yserver-xauth",
 ]
 exclude = ["third_party"]
 

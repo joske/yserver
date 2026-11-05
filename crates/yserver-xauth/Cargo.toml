@@ -1,0 +1,18 @@
+[package]
+name = "yserver-xauth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# The `xauth list` subset ssh.exe runs for X11 forwarding, shipped in the Windows zip.
+autobins = false
+
+[[bin]]
+name = "xauth"
+path = "src/main.rs"
+
+[dependencies]
+yserver-core.workspace = true
+
+[lints]
+workspace = true
