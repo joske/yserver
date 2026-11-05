@@ -2,7 +2,7 @@
 
 use std::ops::BitOr;
 
-use yserver_protocol::x11::{AtomId, ClientId, ResourceId};
+use yserver_protocol::x11::{AtomId, ClientId, RequestHeader, ResourceId};
 
 use crate::{peer::PeerIdentity, server::ServerState};
 
@@ -115,6 +115,18 @@ pub struct ResourceTarget {
 pub struct RequestOpcodes {
     pub major: u8,
     pub minor: u8,
+}
+
+impl RequestOpcodes {
+    /// The opcode pair Xorg exposes while dispatching this request.
+    /// Core requests use minor opcode zero; extension requests use the
+    /// request's data byte as their minor opcode.
+    pub const fn for_request(header: RequestHeader) -> Self {
+        Self {
+            major: header.opcode,
+            minor: if header.opcode < 128 { 0 } else { header.data },
+        }
+    }
 }
 
 /// The credential that admitted a client, without retaining its secret.

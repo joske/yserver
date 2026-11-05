@@ -3738,6 +3738,10 @@ fn unmap_exposing_an_inhibited_root_paints_nothing_but_still_exposes() {
         None,
         ClientId(INHIBIT_APP),
         SequenceNumber(2),
+        crate::access::RequestOpcodes {
+            major: 10,
+            minor: 0,
+        },
         &INHIBIT_W.to_le_bytes(),
     )
     .expect("handle_unmap_window");

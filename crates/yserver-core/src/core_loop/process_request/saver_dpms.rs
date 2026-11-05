@@ -320,6 +320,7 @@ fn create_screen_saver_window(state: &mut ServerState, backend: &mut dyn Backend
         None,
         server,
         SequenceNumber(0),
+        crate::access::RequestOpcodes { major: 8, minor: 0 },
         &window.0.to_le_bytes(),
     );
     state.screensaver.window_shown = true;

@@ -509,6 +509,7 @@ fn map_window_reapplies_manual_redirect_scene_participation() {
         None,
         ClientId(CLIENT_ID),
         SequenceNumber(1),
+        crate::access::RequestOpcodes { major: 8, minor: 0 },
         &body,
     )
     .expect("handle_map_window");
@@ -612,6 +613,7 @@ fn map_window_emits_damage_on_window_extent() {
         None,
         ClientId(CLIENT_ID),
         SequenceNumber(1),
+        crate::access::RequestOpcodes { major: 8, minor: 0 },
         &body,
     )
     .expect("handle_map_window");
@@ -720,6 +722,7 @@ fn map_window_seeds_damage_for_newly_viewable_descendant() {
         None,
         ClientId(CLIENT_ID),
         SequenceNumber(1),
+        crate::access::RequestOpcodes { major: 8, minor: 0 },
         &body,
     )
     .expect("handle_map_window");
@@ -843,6 +846,7 @@ fn map_window_does_not_rereport_held_nonempty_damage_for_newly_viewable_descenda
         None,
         ClientId(CLIENT_ID),
         SequenceNumber(1),
+        crate::access::RequestOpcodes { major: 8, minor: 0 },
         &body,
     )
     .expect("handle_map_window");

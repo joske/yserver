@@ -557,6 +557,8 @@ pub struct RecordingBackend {
     pub fail_copy_area: bool,
     /// When `true`, `fill_rectangle` records the call but returns `Err`.
     pub fail_fill_rectangle: bool,
+    /// Failure injection for GLX pbuffer backing allocation tests.
+    pub create_pixmap_fails: bool,
     /// The next `open_font` records its call and returns this error kind.
     /// Used to drive reset's fatal default-font reinstall boundary.
     pub fail_open_font: Option<io::ErrorKind>,
@@ -724,6 +726,7 @@ impl RecordingBackend {
             arm_idle_vblanks_result: None,
             fail_copy_area: false,
             fail_fill_rectangle: false,
+            create_pixmap_fails: false,
             fail_open_font: None,
             present_direct_result: false,
             reallocate_fails: false,
@@ -1925,13 +1928,16 @@ impl Backend for RecordingBackend {
         width: u16,
         height: u16,
     ) -> io::Result<PixmapHandle> {
-        let xid = self.allocate_handle();
-        self.live_pixmaps.insert(xid);
         self.record(RecordedCall::CreatePixmap {
             depth,
             width,
             height,
         });
+        if self.create_pixmap_fails {
+            return Err(io::Error::other("create_pixmap failure injected"));
+        }
+        let xid = self.allocate_handle();
+        self.live_pixmaps.insert(xid);
         Ok(PixmapHandle::from_raw_panicking(xid))
     }
 

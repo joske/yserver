@@ -329,10 +329,7 @@ pub(super) fn handle_change_gc(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    let access_request = RequestOpcodes {
-        major: header.opcode,
-        minor: header.data,
-    };
+    let access_request = RequestOpcodes::for_request(header);
     if let Some(request) = x11::change_gc_request(body) {
         if let Err((code, bad_value)) =
             validate_gc_only(state, client_id, access_request, request.gc, None)
@@ -379,10 +376,7 @@ pub(super) fn handle_set_clip_rectangles(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    let access_request = RequestOpcodes {
-        major: header.opcode,
-        minor: header.data,
-    };
+    let access_request = RequestOpcodes::for_request(header);
     if let Some(request) = x11::set_clip_rectangles_request(header.data, body) {
         if let Err((code, bad_value)) = validate_gc_only(
             state,

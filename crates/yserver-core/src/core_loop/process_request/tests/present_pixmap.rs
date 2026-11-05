@@ -114,6 +114,10 @@ fn configure_window_pure_move_emits_present_configure_notify() {
         None,
         ClientId(1),
         SequenceNumber(1),
+        crate::access::RequestOpcodes {
+            major: 12,
+            minor: 0,
+        },
         &body,
     )
     .expect("handle_configure_window");

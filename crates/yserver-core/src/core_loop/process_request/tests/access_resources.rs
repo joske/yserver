@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 const CLIENT: ClientId = ClientId(1);
 const REQUEST: RequestOpcodes = RequestOpcodes { major: 1, minor: 0 };
+type ExpectedResourceAccess = (ResourceId, ResourceKind, AccessMode);
+type WindowAccessCase = (u8, u8, Vec<u8>, Vec<ExpectedResourceAccess>);
 
 fn ask_owner(
     state: &ServerState,
@@ -1205,7 +1207,7 @@ fn every_drawing_request_asks_with_expected_target() {
                     *mode,
                     Some(RequestOpcodes {
                         major: request.opcode,
-                        minor: request.data,
+                        minor: 0,
                     }),
                 )
             })
@@ -2126,7 +2128,7 @@ fn window_resource_request_denials_match_modes_and_stop_before_effects() {
             call.request,
             Some(RequestOpcodes {
                 major: case.opcode,
-                minor: case.data
+                minor: 0
             }),
             "{} request",
             case.label
@@ -2233,60 +2235,42 @@ fn window_resource_requests_present_expected_checks() {
             ROOT_WINDOW,
             ResourceKind::Window,
             AccessMode::ADD,
-            Some(RequestOpcodes {
-                major: 1,
-                minor: 24,
-            }),
+            Some(RequestOpcodes { major: 1, minor: 0 }),
         ),
         (
             CLIENT,
             fixture.background,
             ResourceKind::Pixmap,
             AccessMode::READ,
-            Some(RequestOpcodes {
-                major: 1,
-                minor: 24,
-            }),
+            Some(RequestOpcodes { major: 1, minor: 0 }),
         ),
         (
             CLIENT,
             fixture.colormap,
             ResourceKind::Colormap,
             AccessMode::USE,
-            Some(RequestOpcodes {
-                major: 1,
-                minor: 24,
-            }),
+            Some(RequestOpcodes { major: 1, minor: 0 }),
         ),
         (
             CLIENT,
             fixture.cursor,
             ResourceKind::Cursor,
             AccessMode::USE,
-            Some(RequestOpcodes {
-                major: 1,
-                minor: 24,
-            }),
+            Some(RequestOpcodes { major: 1, minor: 0 }),
         ),
         (
             CLIENT,
             fixture.border,
             ResourceKind::Pixmap,
             AccessMode::READ,
-            Some(RequestOpcodes {
-                major: 1,
-                minor: 24,
-            }),
+            Some(RequestOpcodes { major: 1, minor: 0 }),
         ),
         (
             CLIENT,
             created,
             ResourceKind::Window,
             AccessMode::CREATE | AccessMode::SET_ATTR,
-            Some(RequestOpcodes {
-                major: 1,
-                minor: 24,
-            }),
+            Some(RequestOpcodes { major: 1, minor: 0 }),
         ),
         (
             CLIENT,
@@ -2742,6 +2726,1236 @@ fn destroy_subwindows_bulk_unmap_ignores_hide() {
 }
 
 #[test]
+fn map_window_denied_show_returns_success_and_maps_nothing() {
+    // Mutation: report the MapWindow SHOW denial as an X error; this request must instead succeed without mapping or notifying.
+    let mut fixture = window_access_fixture();
+    fixture
+        .state
+        .clients
+        .get_mut(&CLIENT.0)
+        .expect("requesting client")
+        .event_masks
+        .insert(fixture.window, 0x0002_0000);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(WindowResourcePolicy {
+            calls: Arc::clone(&calls),
+            deny_id: Some(Arc::new(AtomicU32::new(fixture.window.0))),
+            deny_mode: Some(AccessMode::SHOW),
+            deny_hides: false,
+        }));
+    let backend_before = fixture.backend.calls();
+
+    let bytes = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.peer,
+        80,
+        8,
+        0,
+        &words(&[fixture.window.0]),
+    );
+
+    assert!(
+        bytes.is_empty(),
+        "denied MapWindow has no error or MapNotify"
+    );
+    assert_eq!(
+        fixture
+            .state
+            .resources
+            .window(fixture.window)
+            .unwrap()
+            .map_state,
+        crate::resources::MapState::Unmapped
+    );
+    assert_eq!(fixture.backend.calls(), backend_before);
+    assert_eq!(
+        expected_resource_checks(&calls.lock().unwrap()),
+        [(
+            CLIENT,
+            fixture.window,
+            ResourceKind::Window,
+            AccessMode::SHOW,
+            Some(RequestOpcodes { major: 8, minor: 0 }),
+        )]
+    );
+}
+
+#[test]
+fn window_tree_resource_request_access_calls_follow_site_order() {
+    // Mutation: omit or reorder any scoped whole-request or derived-target check; its recorded target/mode sequence must differ.
+    let labels = [
+        "reparent",
+        "map_window",
+        "map_subwindows",
+        "unmap_window",
+        "unmap_subwindows",
+        "configure_window",
+        "circulate_window",
+        "get_geometry_window",
+        "get_geometry_pixmap",
+        "query_tree",
+        "query_pointer",
+        "get_motion_events",
+        "translate_coordinates",
+        "warp_pointer",
+    ];
+
+    for (index, label) in labels.into_iter().enumerate() {
+        let mut fixture = window_access_fixture();
+        let mut setup_sequence = 1;
+        let mut map = |window: ResourceId| {
+            let bytes = resource_request(
+                &mut fixture.state,
+                &mut fixture.backend,
+                &mut fixture.peer,
+                setup_sequence,
+                8,
+                0,
+                &words(&[window.0]),
+            );
+            assert_no_error(&bytes, "window tree access fixture MapWindow");
+            setup_sequence += 1;
+        };
+        let (opcode, data, body, expected): WindowAccessCase = match label {
+            "reparent" => {
+                map(fixture.parent);
+                map(fixture.window);
+                (
+                    7,
+                    0,
+                    words(&[fixture.window.0, fixture.destroy_parent.0, 0]),
+                    vec![
+                        (fixture.window, ResourceKind::Window, AccessMode::MANAGE),
+                        (
+                            fixture.destroy_parent,
+                            ResourceKind::Window,
+                            AccessMode::ADD,
+                        ),
+                        (fixture.window, ResourceKind::Window, AccessMode::SHOW),
+                    ],
+                )
+            }
+            "map_window" => (
+                8,
+                0,
+                words(&[fixture.window.0]),
+                vec![(fixture.window, ResourceKind::Window, AccessMode::SHOW)],
+            ),
+            "map_subwindows" => (
+                9,
+                0,
+                words(&[fixture.subwindows_parent.0]),
+                vec![
+                    (
+                        fixture.subwindows_parent,
+                        ResourceKind::Window,
+                        AccessMode::LIST,
+                    ),
+                    (
+                        fixture.subwindow_children[1],
+                        ResourceKind::Window,
+                        AccessMode::SHOW,
+                    ),
+                    (
+                        fixture.subwindow_children[0],
+                        ResourceKind::Window,
+                        AccessMode::SHOW,
+                    ),
+                ],
+            ),
+            "unmap_window" => {
+                map(fixture.parent);
+                map(fixture.window);
+                (
+                    10,
+                    0,
+                    words(&[fixture.window.0]),
+                    vec![(fixture.window, ResourceKind::Window, AccessMode::HIDE)],
+                )
+            }
+            "unmap_subwindows" => {
+                map(fixture.subwindows_parent);
+                for child in fixture.subwindow_children {
+                    map(child);
+                }
+                (
+                    11,
+                    0,
+                    words(&[fixture.subwindows_parent.0]),
+                    vec![
+                        (
+                            fixture.subwindows_parent,
+                            ResourceKind::Window,
+                            AccessMode::LIST,
+                        ),
+                        (
+                            fixture.subwindow_children[0],
+                            ResourceKind::Window,
+                            AccessMode::HIDE,
+                        ),
+                        (
+                            fixture.subwindow_children[1],
+                            ResourceKind::Window,
+                            AccessMode::HIDE,
+                        ),
+                    ],
+                )
+            }
+            "configure_window" => {
+                let sibling = ResourceId(0x0054_000c);
+                create_test_window(
+                    &mut fixture.state,
+                    &mut fixture.backend,
+                    &mut fixture.peer,
+                    &mut setup_sequence,
+                    sibling,
+                    fixture.parent,
+                );
+                (
+                    12,
+                    0,
+                    words(&[fixture.window.0, 0x0060, sibling.0, 0]),
+                    vec![
+                        (
+                            fixture.window,
+                            ResourceKind::Window,
+                            AccessMode::MANAGE | AccessMode::SET_ATTR,
+                        ),
+                        (sibling, ResourceKind::Window, AccessMode::GET_ATTR),
+                    ],
+                )
+            }
+            "circulate_window" => {
+                map(fixture.subwindows_parent);
+                for child in fixture.subwindow_children {
+                    map(child);
+                }
+                let child = fixture
+                    .state
+                    .circulate_candidate(fixture.subwindows_parent, 0)
+                    .expect("overlapping mapped child is a CirculateWindow target");
+                (
+                    13,
+                    0,
+                    words(&[fixture.subwindows_parent.0]),
+                    vec![
+                        (
+                            fixture.subwindows_parent,
+                            ResourceKind::Window,
+                            AccessMode::MANAGE,
+                        ),
+                        (
+                            child,
+                            ResourceKind::Window,
+                            AccessMode::MANAGE | AccessMode::SET_ATTR,
+                        ),
+                    ],
+                )
+            }
+            "get_geometry_window" => (
+                14,
+                0,
+                words(&[fixture.window.0]),
+                vec![(fixture.window, ResourceKind::Window, AccessMode::GET_ATTR)],
+            ),
+            "get_geometry_pixmap" => (
+                14,
+                0,
+                words(&[fixture.border.0]),
+                vec![(fixture.border, ResourceKind::Pixmap, AccessMode::GET_ATTR)],
+            ),
+            "query_tree" => (
+                15,
+                0,
+                words(&[fixture.window.0]),
+                vec![(fixture.window, ResourceKind::Window, AccessMode::LIST)],
+            ),
+            "query_pointer" => (
+                38,
+                0,
+                words(&[fixture.window.0]),
+                vec![(fixture.window, ResourceKind::Window, AccessMode::GET_ATTR)],
+            ),
+            "get_motion_events" => (
+                39,
+                0,
+                words(&[fixture.window.0, 0, 0]),
+                vec![(fixture.window, ResourceKind::Window, AccessMode::GET_ATTR)],
+            ),
+            "translate_coordinates" => (
+                40,
+                0,
+                words(&[fixture.window.0, fixture.parent.0, 0]),
+                vec![
+                    (fixture.window, ResourceKind::Window, AccessMode::GET_ATTR),
+                    (fixture.parent, ResourceKind::Window, AccessMode::GET_ATTR),
+                ],
+            ),
+            "warp_pointer" => {
+                let mut body = words(&[fixture.parent.0, fixture.window.0]);
+                body.extend_from_slice(&[0; 12]);
+                (
+                    41,
+                    0,
+                    body,
+                    vec![
+                        (fixture.window, ResourceKind::Window, AccessMode::GET_ATTR),
+                        (fixture.parent, ResourceKind::Window, AccessMode::GET_ATTR),
+                    ],
+                )
+            }
+            _ => unreachable!(),
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        fixture
+            .state
+            .install_access_policy(Arc::new(WindowResourcePolicy {
+                calls: Arc::clone(&calls),
+                deny_id: None,
+                deny_mode: None,
+                deny_hides: false,
+            }));
+
+        let bytes = resource_request(
+            &mut fixture.state,
+            &mut fixture.backend,
+            &mut fixture.peer,
+            80 + u16::try_from(index).unwrap(),
+            opcode,
+            data,
+            &body,
+        );
+
+        assert!(
+            bytes.first().is_none_or(|first| *first != 0),
+            "{label} unexpectedly returned an X error: {bytes:02x?}"
+        );
+        let actual = expected_resource_checks(&calls.lock().unwrap());
+        let expected = expected
+            .into_iter()
+            .map(|(id, kind, mode)| {
+                (
+                    CLIENT,
+                    id,
+                    kind,
+                    mode,
+                    Some(RequestOpcodes {
+                        major: opcode,
+                        minor: 0,
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "{label} check order");
+    }
+}
+
+#[test]
+fn window_tree_resource_request_denials_match_modes_and_stop_before_effects() {
+    // Mutation: remove or change a whole-request target check; the policy error, request opcode, backend log, or window snapshot must fail.
+    let mut fixture = window_access_fixture();
+    let mut setup_sequence = 1;
+    for window in [fixture.parent, fixture.window, fixture.subwindows_parent] {
+        let bytes = resource_request(
+            &mut fixture.state,
+            &mut fixture.backend,
+            &mut fixture.peer,
+            setup_sequence,
+            8,
+            0,
+            &words(&[window.0]),
+        );
+        assert_no_error(&bytes, "window request denial fixture MapWindow");
+        setup_sequence += 1;
+    }
+    for child in fixture.subwindow_children {
+        let bytes = resource_request(
+            &mut fixture.state,
+            &mut fixture.backend,
+            &mut fixture.peer,
+            setup_sequence,
+            8,
+            0,
+            &words(&[child.0]),
+        );
+        assert_no_error(&bytes, "window request denial fixture MapWindow child");
+        setup_sequence += 1;
+    }
+    let sibling = ResourceId(0x0054_000c);
+    create_test_window(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.peer,
+        &mut setup_sequence,
+        sibling,
+        fixture.parent,
+    );
+    let reparent_body = words(&[fixture.window.0, fixture.destroy_parent.0, 0]);
+    let configure_body = words(&[fixture.window.0, 0x0001, 17]);
+    let configure_sibling_body = words(&[fixture.window.0, 0x0060, sibling.0, 0]);
+    let mut warp_body = words(&[fixture.parent.0, fixture.window.0]);
+    warp_body.extend_from_slice(&[0; 12]);
+    let cases = vec![
+        WindowDenyCase {
+            label: "ReparentWindow window",
+            opcode: 7,
+            data: 0,
+            body: reparent_body.clone(),
+            target: fixture.window,
+            kind: ResourceKind::Window,
+            mode: AccessMode::MANAGE,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "ReparentWindow new parent",
+            opcode: 7,
+            data: 0,
+            body: reparent_body,
+            target: fixture.destroy_parent,
+            kind: ResourceKind::Window,
+            mode: AccessMode::ADD,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "MapSubwindows parent",
+            opcode: 9,
+            data: 0,
+            body: words(&[fixture.subwindows_parent.0]),
+            target: fixture.subwindows_parent,
+            kind: ResourceKind::Window,
+            mode: AccessMode::LIST,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "UnmapWindow",
+            opcode: 10,
+            data: 0,
+            body: words(&[fixture.window.0]),
+            target: fixture.window,
+            kind: ResourceKind::Window,
+            mode: AccessMode::HIDE,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "UnmapSubwindows parent",
+            opcode: 11,
+            data: 0,
+            body: words(&[fixture.subwindows_parent.0]),
+            target: fixture.subwindows_parent,
+            kind: ResourceKind::Window,
+            mode: AccessMode::LIST,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "ConfigureWindow",
+            opcode: 12,
+            data: 0,
+            body: configure_body,
+            target: fixture.window,
+            kind: ResourceKind::Window,
+            mode: AccessMode::MANAGE | AccessMode::SET_ATTR,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "ConfigureWindow sibling",
+            opcode: 12,
+            data: 0,
+            body: configure_sibling_body,
+            target: sibling,
+            kind: ResourceKind::Window,
+            mode: AccessMode::GET_ATTR,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "CirculateWindow container",
+            opcode: 13,
+            data: 0,
+            body: words(&[fixture.subwindows_parent.0]),
+            target: fixture.subwindows_parent,
+            kind: ResourceKind::Window,
+            mode: AccessMode::MANAGE,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "GetGeometry window",
+            opcode: 14,
+            data: 0,
+            body: words(&[fixture.window.0]),
+            target: fixture.window,
+            kind: ResourceKind::Window,
+            mode: AccessMode::GET_ATTR,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "GetGeometry pixmap",
+            opcode: 14,
+            data: 0,
+            body: words(&[fixture.border.0]),
+            target: fixture.border,
+            kind: ResourceKind::Pixmap,
+            mode: AccessMode::GET_ATTR,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "QueryTree",
+            opcode: 15,
+            data: 0,
+            body: words(&[fixture.window.0]),
+            target: fixture.window,
+            kind: ResourceKind::Window,
+            mode: AccessMode::LIST,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "QueryPointer",
+            opcode: 38,
+            data: 0,
+            body: words(&[fixture.window.0]),
+            target: fixture.window,
+            kind: ResourceKind::Window,
+            mode: AccessMode::GET_ATTR,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "GetMotionEvents",
+            opcode: 39,
+            data: 0,
+            body: words(&[fixture.window.0, 0, 0]),
+            target: fixture.window,
+            kind: ResourceKind::Window,
+            mode: AccessMode::GET_ATTR,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "TranslateCoordinates source",
+            opcode: 40,
+            data: 0,
+            body: words(&[fixture.window.0, fixture.parent.0, 0]),
+            target: fixture.window,
+            kind: ResourceKind::Window,
+            mode: AccessMode::GET_ATTR,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "TranslateCoordinates destination",
+            opcode: 40,
+            data: 0,
+            body: words(&[fixture.window.0, fixture.parent.0, 0]),
+            target: fixture.parent,
+            kind: ResourceKind::Window,
+            mode: AccessMode::GET_ATTR,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "WarpPointer destination",
+            opcode: 41,
+            data: 0,
+            body: warp_body.clone(),
+            target: fixture.window,
+            kind: ResourceKind::Window,
+            mode: AccessMode::GET_ATTR,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "WarpPointer source",
+            opcode: 41,
+            data: 0,
+            body: warp_body,
+            target: fixture.parent,
+            kind: ResourceKind::Window,
+            mode: AccessMode::GET_ATTR,
+            creation: None,
+        },
+    ];
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let denied_id = Arc::new(AtomicU32::new(0));
+    fixture
+        .state
+        .install_access_policy(Arc::new(WindowResourcePolicy {
+            calls: Arc::clone(&calls),
+            deny_id: Some(Arc::clone(&denied_id)),
+            deny_mode: None,
+            deny_hides: false,
+        }));
+
+    for (index, case) in cases.into_iter().enumerate() {
+        denied_id.store(case.target.0, Ordering::SeqCst);
+        let sequence = 100 + u16::try_from(index).unwrap();
+        let backend_before = fixture.backend.calls();
+        let mut windows_before = fixture
+            .state
+            .resources
+            .windows_iter()
+            .map(|window| format!("{window:?}"))
+            .collect::<Vec<_>>();
+        windows_before.sort();
+        let calls_before = calls.lock().unwrap().len();
+
+        let bytes = resource_request(
+            &mut fixture.state,
+            &mut fixture.backend,
+            &mut fixture.peer,
+            sequence,
+            case.opcode,
+            case.data,
+            &case.body,
+        );
+
+        assert_x11_error(&bytes, x11::error::BAD_VALUE, 0x55, case.opcode, sequence);
+        assert_eq!(
+            fixture.backend.calls(),
+            backend_before,
+            "{} backend",
+            case.label
+        );
+        let mut windows_after = fixture
+            .state
+            .resources
+            .windows_iter()
+            .map(|window| format!("{window:?}"))
+            .collect::<Vec<_>>();
+        windows_after.sort();
+        assert_eq!(windows_after, windows_before, "{} state", case.label);
+        let checks = calls.lock().unwrap();
+        assert!(checks.len() > calls_before, "{} check count", case.label);
+        let denied = checks.last().expect("denial was recorded");
+        assert_eq!(denied.client, CLIENT, "{} client", case.label);
+        assert_eq!(
+            denied.target.map(|target| (target.id, target.kind)),
+            Some((case.target, case.kind)),
+            "{} target",
+            case.label
+        );
+        assert_eq!(denied.mode, Some(case.mode), "{} mode", case.label);
+        assert_eq!(
+            denied.request,
+            Some(RequestOpcodes {
+                major: case.opcode,
+                minor: 0
+            }),
+            "{} request",
+            case.label
+        );
+    }
+}
+
+fn three_child_window_access_fixture(map_children: bool) -> DestroySubwindowsFixture {
+    let mut state = ServerState::new();
+    let mut requester = install_client(&mut state, CLIENT.0);
+    let mut observer = install_client(&mut state, 2);
+    let mut backend = RecordingBackend::new();
+    let parent = ResourceId(0x0057_0001);
+    let children = [
+        ResourceId(0x0057_0002),
+        ResourceId(0x0057_0003),
+        ResourceId(0x0057_0004),
+    ];
+    let mut sequence = 1;
+    create_test_window(
+        &mut state,
+        &mut backend,
+        &mut requester,
+        &mut sequence,
+        parent,
+        ROOT_WINDOW,
+    );
+    for child in children {
+        create_test_window(
+            &mut state,
+            &mut backend,
+            &mut requester,
+            &mut sequence,
+            child,
+            parent,
+        );
+    }
+    for window in
+        std::iter::once(parent).chain(map_children.then_some(children).into_iter().flatten())
+    {
+        let bytes = resource_request(
+            &mut state,
+            &mut backend,
+            &mut requester,
+            sequence,
+            8,
+            0,
+            &words(&[window.0]),
+        );
+        assert_no_error(&bytes, "three-child access fixture MapWindow");
+        sequence += 1;
+    }
+    for child in children {
+        state
+            .clients
+            .get_mut(&2)
+            .expect("observer client")
+            .event_masks
+            .insert(child, 0x0002_0000);
+    }
+    let _ = read_all_available(&mut observer);
+    DestroySubwindowsFixture {
+        state,
+        backend,
+        requester,
+        observer,
+        parent,
+        children: children.to_vec(),
+    }
+}
+
+#[test]
+fn map_subwindows_skips_denied_child() {
+    // Mutation: map the denied middle child or stop the loop there; only the two allowed children may map and notify.
+    let mut fixture = three_child_window_access_fixture(false);
+    let [c1, c2, c3] = fixture.children.as_slice() else {
+        panic!("three children");
+    };
+    let (c1, c2, c3) = (*c1, *c2, *c3);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(WindowResourcePolicy {
+            calls: Arc::clone(&calls),
+            deny_id: Some(Arc::new(AtomicU32::new(c2.0))),
+            deny_mode: Some(AccessMode::SHOW),
+            deny_hides: false,
+        }));
+    let host_c1 = fixture
+        .state
+        .resources
+        .window(c1)
+        .and_then(|window| window.host_xid)
+        .expect("child has a backend window")
+        .as_raw();
+    let host_c3 = fixture
+        .state
+        .resources
+        .window(c3)
+        .and_then(|window| window.host_xid)
+        .expect("child has a backend window")
+        .as_raw();
+    let backend_before = fixture.backend.calls();
+
+    let bytes = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.requester,
+        20,
+        9,
+        0,
+        &words(&[fixture.parent.0]),
+    );
+
+    assert!(bytes.is_empty(), "denied child is a successful skip");
+    assert_eq!(
+        event_type_and_window(&read_all_available(&mut fixture.observer)),
+        [(19, c3), (19, c1)]
+    );
+    assert_eq!(
+        fixture.state.resources.window(c1).unwrap().map_state,
+        crate::resources::MapState::Viewable
+    );
+    assert_eq!(
+        fixture.state.resources.window(c2).unwrap().map_state,
+        crate::resources::MapState::Unmapped
+    );
+    assert_eq!(
+        fixture.state.resources.window(c3).unwrap().map_state,
+        crate::resources::MapState::Viewable
+    );
+    let mapped = fixture.backend.calls()[backend_before.len()..]
+        .iter()
+        .filter_map(|call| match call {
+            RecordedCall::MapSubwindow(host) => Some(*host),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(mapped, [host_c3, host_c1]);
+    assert_eq!(
+        expected_resource_checks(&calls.lock().unwrap()),
+        [
+            (
+                CLIENT,
+                fixture.parent,
+                ResourceKind::Window,
+                AccessMode::LIST,
+                Some(RequestOpcodes { major: 9, minor: 0 })
+            ),
+            (
+                CLIENT,
+                c3,
+                ResourceKind::Window,
+                AccessMode::SHOW,
+                Some(RequestOpcodes { major: 9, minor: 0 })
+            ),
+            (
+                CLIENT,
+                c2,
+                ResourceKind::Window,
+                AccessMode::SHOW,
+                Some(RequestOpcodes { major: 9, minor: 0 })
+            ),
+            (
+                CLIENT,
+                c1,
+                ResourceKind::Window,
+                AccessMode::SHOW,
+                Some(RequestOpcodes { major: 9, minor: 0 })
+            ),
+        ]
+    );
+}
+
+#[test]
+fn unmap_subwindows_skips_denied_child() {
+    // Mutation: unmap the denied middle child or stop the loop there; the two allowed children must still unmap.
+    let mut fixture = three_child_window_access_fixture(true);
+    let [c1, c2, c3] = fixture.children.as_slice() else {
+        panic!("three children");
+    };
+    let (c1, c2, c3) = (*c1, *c2, *c3);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(WindowResourcePolicy {
+            calls: Arc::clone(&calls),
+            deny_id: Some(Arc::new(AtomicU32::new(c2.0))),
+            deny_mode: Some(AccessMode::HIDE),
+            deny_hides: false,
+        }));
+    let host_c1 = fixture
+        .state
+        .resources
+        .window(c1)
+        .and_then(|window| window.host_xid)
+        .expect("child has a backend window")
+        .as_raw();
+    let host_c3 = fixture
+        .state
+        .resources
+        .window(c3)
+        .and_then(|window| window.host_xid)
+        .expect("child has a backend window")
+        .as_raw();
+    let backend_before = fixture.backend.calls();
+
+    let bytes = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.requester,
+        21,
+        11,
+        0,
+        &words(&[fixture.parent.0]),
+    );
+
+    assert!(bytes.is_empty(), "denied child is a successful skip");
+    assert_eq!(
+        event_type_and_window(&read_all_available(&mut fixture.observer)),
+        [(18, c1), (18, c3)]
+    );
+    assert_eq!(
+        fixture.state.resources.window(c1).unwrap().map_state,
+        crate::resources::MapState::Unmapped
+    );
+    assert_eq!(
+        fixture.state.resources.window(c2).unwrap().map_state,
+        crate::resources::MapState::Viewable
+    );
+    assert_eq!(
+        fixture.state.resources.window(c3).unwrap().map_state,
+        crate::resources::MapState::Unmapped
+    );
+    let unmapped = fixture.backend.calls()[backend_before.len()..]
+        .iter()
+        .filter_map(|call| match call {
+            RecordedCall::UnmapSubwindow(host) => Some(*host),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(unmapped, [host_c1, host_c3]);
+    assert_eq!(
+        expected_resource_checks(&calls.lock().unwrap()),
+        [
+            (
+                CLIENT,
+                fixture.parent,
+                ResourceKind::Window,
+                AccessMode::LIST,
+                Some(RequestOpcodes {
+                    major: 11,
+                    minor: 0
+                })
+            ),
+            (
+                CLIENT,
+                c1,
+                ResourceKind::Window,
+                AccessMode::HIDE,
+                Some(RequestOpcodes {
+                    major: 11,
+                    minor: 0
+                })
+            ),
+            (
+                CLIENT,
+                c2,
+                ResourceKind::Window,
+                AccessMode::HIDE,
+                Some(RequestOpcodes {
+                    major: 11,
+                    minor: 0
+                })
+            ),
+            (
+                CLIENT,
+                c3,
+                ResourceKind::Window,
+                AccessMode::HIDE,
+                Some(RequestOpcodes {
+                    major: 11,
+                    minor: 0
+                })
+            ),
+        ]
+    );
+}
+
+#[test]
+fn circulate_denied_child_is_not_restacked() {
+    // Mutation: restack the chosen child before or despite its MANAGE+SET_ATTR denial; order, events, and backend calls must stay unchanged.
+    let mut fixture = three_child_window_access_fixture(true);
+    let child = fixture
+        .state
+        .circulate_candidate(fixture.parent, 0)
+        .expect("mapped overlapping child is selected");
+    for window in fixture.children.iter().copied().chain([fixture.parent]) {
+        fixture
+            .state
+            .clients
+            .get_mut(&2)
+            .expect("observer client")
+            .event_masks
+            .insert(window, 0x0002_0000 | 0x0008_0000);
+    }
+    let _ = read_all_available(&mut fixture.observer);
+    let children_before = fixture.state.resources.children(fixture.parent).to_vec();
+    let backend_before = fixture.backend.calls();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(WindowResourcePolicy {
+            calls: Arc::clone(&calls),
+            deny_id: Some(Arc::new(AtomicU32::new(child.0))),
+            deny_mode: Some(AccessMode::MANAGE | AccessMode::SET_ATTR),
+            deny_hides: false,
+        }));
+
+    let bytes = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.requester,
+        22,
+        13,
+        0,
+        &words(&[fixture.parent.0]),
+    );
+
+    assert!(bytes.is_empty(), "denied chosen child is a successful skip");
+    assert_eq!(
+        fixture.state.resources.children(fixture.parent),
+        children_before
+    );
+    assert!(read_all_available(&mut fixture.observer).is_empty());
+    assert_eq!(fixture.backend.calls(), backend_before);
+    assert_eq!(
+        expected_resource_checks(&calls.lock().unwrap()),
+        [
+            (
+                CLIENT,
+                fixture.parent,
+                ResourceKind::Window,
+                AccessMode::MANAGE,
+                Some(RequestOpcodes {
+                    major: 13,
+                    minor: 0
+                })
+            ),
+            (
+                CLIENT,
+                child,
+                ResourceKind::Window,
+                AccessMode::MANAGE | AccessMode::SET_ATTR,
+                Some(RequestOpcodes {
+                    major: 13,
+                    minor: 0
+                })
+            ),
+        ]
+    );
+}
+
+struct ReparentAccessFixture {
+    state: ServerState,
+    backend: RecordingBackend,
+    requester: UnixStream,
+    observer: UnixStream,
+    new_parent: ResourceId,
+    window: ResourceId,
+    child: ResourceId,
+}
+
+fn reparent_access_fixture(with_pointer_grab: bool) -> ReparentAccessFixture {
+    let mut state = ServerState::new();
+    let mut requester = install_client(&mut state, CLIENT.0);
+    let mut observer = install_client(&mut state, 2);
+    let mut backend = RecordingBackend::new();
+    let old_parent = ResourceId(0x0058_0001);
+    let new_parent = ResourceId(0x0058_0002);
+    let window = ResourceId(0x0058_0003);
+    let child = ResourceId(0x0058_0004);
+    let mut sequence = 1;
+    for (id, parent) in [
+        (old_parent, ROOT_WINDOW),
+        (new_parent, ROOT_WINDOW),
+        (window, old_parent),
+        (child, window),
+    ] {
+        create_test_window(
+            &mut state,
+            &mut backend,
+            &mut requester,
+            &mut sequence,
+            id,
+            parent,
+        );
+    }
+    for id in [old_parent, new_parent, window, child] {
+        let bytes = resource_request(
+            &mut state,
+            &mut backend,
+            &mut requester,
+            sequence,
+            8,
+            0,
+            &words(&[id.0]),
+        );
+        assert_no_error(&bytes, "ReparentWindow access fixture MapWindow");
+        sequence += 1;
+    }
+    for (window_id, mask) in [
+        (window, 0x0002_0000),
+        (old_parent, 0x0008_0000),
+        (new_parent, 0x0008_0000),
+    ] {
+        state
+            .clients
+            .get_mut(&2)
+            .expect("observer client")
+            .event_masks
+            .insert(window_id, mask);
+    }
+    let _ = read_all_available(&mut requester);
+    let _ = read_all_available(&mut observer);
+    state.core_focus.raw = child.0;
+    for client in state.clients.values_mut() {
+        client.focused_window = child;
+    }
+    if with_pointer_grab {
+        set_test_pointer_grab(&mut state, CLIENT.0, child.0, false, false);
+    }
+    ReparentAccessFixture {
+        state,
+        backend,
+        requester,
+        observer,
+        new_parent,
+        window,
+        child,
+    }
+}
+
+fn unmap_then_reparent_baseline(with_pointer_grab: bool) -> (Vec<RecordedCall>, u32, u8) {
+    let mut fixture = reparent_access_fixture(with_pointer_grab);
+    let start = fixture.backend.calls().len();
+    let unmap = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.requester,
+        30,
+        10,
+        0,
+        &words(&[fixture.window.0]),
+    );
+    assert!(unmap.is_empty());
+    let reparent = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.requester,
+        31,
+        7,
+        0,
+        &words(&[fixture.window.0, fixture.new_parent.0, 0]),
+    );
+    assert!(reparent.is_empty());
+    let calls = fixture.backend.calls()[start..].to_vec();
+    (
+        calls,
+        fixture.state.core_focus.raw,
+        fixture.state.core_focus.revert_to,
+    )
+}
+
+#[test]
+fn reparent_denied_remap_leaves_window_reparented_and_unmapped() {
+    // Mutation: set only W's map state instead of running UnmapWindow's subtree/focus/grab transition; C or focus/grab state must diverge.
+    for with_pointer_grab in [false, true] {
+        let (expected_backend, expected_focus, expected_revert) =
+            unmap_then_reparent_baseline(with_pointer_grab);
+        let mut fixture = reparent_access_fixture(with_pointer_grab);
+        let start = fixture.backend.calls().len();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        fixture
+            .state
+            .install_access_policy(Arc::new(WindowResourcePolicy {
+                calls: Arc::clone(&calls),
+                deny_id: Some(Arc::new(AtomicU32::new(fixture.window.0))),
+                deny_mode: Some(AccessMode::SHOW),
+                deny_hides: false,
+            }));
+
+        let bytes = resource_request(
+            &mut fixture.state,
+            &mut fixture.backend,
+            &mut fixture.requester,
+            40,
+            7,
+            0,
+            &words(&[fixture.window.0, fixture.new_parent.0, 0]),
+        );
+
+        assert!(bytes.is_empty(), "denied remap returns Success");
+        assert_eq!(
+            event_type_and_window(&read_all_available(&mut fixture.observer)),
+            [
+                (18, fixture.window),
+                (18, fixture.window),
+                (21, fixture.window),
+                (21, fixture.window),
+                (21, fixture.window),
+            ]
+        );
+        assert_eq!(
+            fixture
+                .state
+                .resources
+                .window(fixture.window)
+                .unwrap()
+                .parent,
+            fixture.new_parent
+        );
+        assert_eq!(
+            fixture
+                .state
+                .resources
+                .window(fixture.window)
+                .unwrap()
+                .map_state,
+            crate::resources::MapState::Unmapped
+        );
+        assert_eq!(
+            fixture
+                .state
+                .resources
+                .window(fixture.child)
+                .unwrap()
+                .map_state,
+            crate::resources::MapState::Unviewable
+        );
+        assert_eq!(fixture.state.core_focus.raw, expected_focus);
+        assert_eq!(fixture.state.core_focus.revert_to, expected_revert);
+        assert!(fixture.state.active_pointer_grab.is_none());
+        assert_eq!(fixture.backend.calls()[start..], expected_backend);
+        assert_eq!(
+            expected_resource_checks(&calls.lock().unwrap()),
+            [
+                (
+                    CLIENT,
+                    fixture.window,
+                    ResourceKind::Window,
+                    AccessMode::MANAGE,
+                    Some(RequestOpcodes { major: 7, minor: 0 })
+                ),
+                (
+                    CLIENT,
+                    fixture.new_parent,
+                    ResourceKind::Window,
+                    AccessMode::ADD,
+                    Some(RequestOpcodes { major: 7, minor: 0 })
+                ),
+                (
+                    CLIENT,
+                    fixture.window,
+                    ResourceKind::Window,
+                    AccessMode::SHOW,
+                    Some(RequestOpcodes { major: 7, minor: 0 })
+                ),
+            ]
+        );
+    }
+}
+
+fn reparent_wire_with_allow_policy(install_policy: bool) -> (Vec<u8>, Vec<u8>, Vec<RecordedCall>) {
+    let mut fixture = reparent_access_fixture(false);
+    if install_policy {
+        fixture
+            .state
+            .install_access_policy(Arc::new(WindowResourcePolicy {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                deny_id: None,
+                deny_mode: None,
+                deny_hides: false,
+            }));
+    }
+    let start = fixture.backend.calls().len();
+    let bytes = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.requester,
+        50,
+        7,
+        0,
+        &words(&[fixture.window.0, fixture.new_parent.0, 0]),
+    );
+    let events = read_all_available(&mut fixture.observer);
+    let backend = fixture.backend.calls()[start..].to_vec();
+    (bytes, events, backend)
+}
+
+#[test]
+fn reparent_with_allow_all_policy_keeps_todays_bytes() {
+    // Mutation: take a policy-installed remap branch or change its event/backend sequence; allow-all must match no-policy bytes.
+    let without_policy = reparent_wire_with_allow_policy(false);
+    let with_policy = reparent_wire_with_allow_policy(true);
+    assert_eq!(with_policy, without_policy);
+    assert_eq!(
+        event_type_and_window(&with_policy.1),
+        [
+            (18, ResourceId(0x0058_0003)),
+            (18, ResourceId(0x0058_0003)),
+            (21, ResourceId(0x0058_0003)),
+            (21, ResourceId(0x0058_0003)),
+            (21, ResourceId(0x0058_0003)),
+            (19, ResourceId(0x0058_0003)),
+            (19, ResourceId(0x0058_0003)),
+        ]
+    );
+}
+
+#[test]
 fn destroy_window_checks_parent_remove() {
     // Mutation: omit the parent REMOVE check; DestroyWindow must then destroy the target instead of returning this denial.
     let mut fixture = window_access_fixture();
@@ -2795,5 +4009,388 @@ fn destroy_window_checks_parent_remove() {
                 Some(RequestOpcodes { major: 4, minor: 0 })
             ),
         ]
+    );
+}
+
+#[test]
+fn configure_window_access_checks_precede_later_validation() {
+    // Mutation: defer ConfigureWindow's window or sibling check until after sibling validation; the earlier policy denial must win.
+    let invalid_sibling = ResourceId(0x0054_00ff);
+    let mut fixture = window_access_fixture();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(WindowResourcePolicy {
+            calls: Arc::clone(&calls),
+            deny_id: Some(Arc::new(AtomicU32::new(fixture.window.0))),
+            deny_mode: Some(AccessMode::MANAGE | AccessMode::SET_ATTR),
+            deny_hides: false,
+        }));
+    let backend_before = fixture.backend.calls().to_vec();
+    let window_before = format!("{:?}", fixture.state.resources.window(fixture.window));
+    let stacking_before = fixture.state.resources.children(fixture.parent).to_vec();
+    let bytes = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.peer,
+        80,
+        12,
+        0,
+        &words(&[fixture.window.0, 0x0060, invalid_sibling.0, 0]),
+    );
+    assert_x11_error(&bytes, x11::error::BAD_VALUE, 0x55, 12, 80);
+    assert_eq!(fixture.backend.calls(), backend_before);
+    assert_eq!(
+        format!("{:?}", fixture.state.resources.window(fixture.window)),
+        window_before
+    );
+    assert_eq!(
+        fixture.state.resources.children(fixture.parent),
+        stacking_before
+    );
+    assert_eq!(
+        expected_resource_checks(&calls.lock().unwrap()),
+        [(
+            CLIENT,
+            fixture.window,
+            ResourceKind::Window,
+            AccessMode::MANAGE | AccessMode::SET_ATTR,
+            Some(RequestOpcodes {
+                major: 12,
+                minor: 0
+            }),
+        )]
+    );
+
+    let mut no_policy = window_access_fixture();
+    let bytes = resource_request(
+        &mut no_policy.state,
+        &mut no_policy.backend,
+        &mut no_policy.peer,
+        81,
+        12,
+        0,
+        &words(&[no_policy.window.0, 0x0060, invalid_sibling.0, 0]),
+    );
+    assert_x11_error(&bytes, x11::error::BAD_WINDOW, invalid_sibling.0, 12, 81);
+
+    let mut fixture = window_access_fixture();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(WindowResourcePolicy {
+            calls: Arc::clone(&calls),
+            deny_id: Some(Arc::new(AtomicU32::new(fixture.destroy_parent.0))),
+            deny_mode: Some(AccessMode::GET_ATTR),
+            deny_hides: false,
+        }));
+    let backend_before = fixture.backend.calls().to_vec();
+    let window_before = format!("{:?}", fixture.state.resources.window(fixture.window));
+    let stacking_before = fixture.state.resources.children(fixture.parent).to_vec();
+    let body = words(&[fixture.window.0, 0x0060, fixture.destroy_parent.0, 0]);
+    let bytes = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.peer,
+        82,
+        12,
+        0,
+        &body,
+    );
+    assert_x11_error(&bytes, x11::error::BAD_VALUE, 0x55, 12, 82);
+    assert_eq!(fixture.backend.calls(), backend_before);
+    assert_eq!(
+        format!("{:?}", fixture.state.resources.window(fixture.window)),
+        window_before
+    );
+    assert_eq!(
+        fixture.state.resources.children(fixture.parent),
+        stacking_before
+    );
+    assert_eq!(
+        expected_resource_checks(&calls.lock().unwrap()),
+        [
+            (
+                CLIENT,
+                fixture.window,
+                ResourceKind::Window,
+                AccessMode::MANAGE | AccessMode::SET_ATTR,
+                Some(RequestOpcodes {
+                    major: 12,
+                    minor: 0
+                }),
+            ),
+            (
+                CLIENT,
+                fixture.destroy_parent,
+                ResourceKind::Window,
+                AccessMode::GET_ATTR,
+                Some(RequestOpcodes {
+                    major: 12,
+                    minor: 0
+                }),
+            ),
+        ]
+    );
+
+    let mut no_policy = window_access_fixture();
+    let bytes = resource_request(
+        &mut no_policy.state,
+        &mut no_policy.backend,
+        &mut no_policy.peer,
+        83,
+        12,
+        0,
+        &words(&[no_policy.window.0, 0x0060, no_policy.destroy_parent.0, 0]),
+    );
+    assert_x11_error(&bytes, x11::error::BAD_MATCH, 0, 12, 83);
+}
+
+#[test]
+fn warp_pointer_checks_destination_before_invalid_source() {
+    // Mutation: validate the source before checking the already-resolved destination; the destination's policy error must win.
+    let mut fixture = window_access_fixture();
+    let invalid_source = ResourceId(0x0054_00fe);
+    let mut body = words(&[invalid_source.0, fixture.window.0]);
+    body.extend_from_slice(&[0; 12]);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(WindowResourcePolicy {
+            calls: Arc::clone(&calls),
+            deny_id: Some(Arc::new(AtomicU32::new(fixture.window.0))),
+            deny_mode: Some(AccessMode::GET_ATTR),
+            deny_hides: false,
+        }));
+    let backend_before = fixture.backend.calls().to_vec();
+    let pointer_before = format!("{:?}", fixture.state.pointer_root);
+    let bytes = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.peer,
+        84,
+        41,
+        0,
+        &body,
+    );
+    assert_x11_error(&bytes, x11::error::BAD_VALUE, 0x55, 41, 84);
+    assert_eq!(fixture.backend.calls(), backend_before);
+    assert_eq!(format!("{:?}", fixture.state.pointer_root), pointer_before);
+    assert_eq!(
+        expected_resource_checks(&calls.lock().unwrap()),
+        [(
+            CLIENT,
+            fixture.window,
+            ResourceKind::Window,
+            AccessMode::GET_ATTR,
+            Some(RequestOpcodes {
+                major: 41,
+                minor: 0
+            }),
+        )]
+    );
+
+    let mut no_policy = window_access_fixture();
+    let mut body = words(&[invalid_source.0, no_policy.window.0]);
+    body.extend_from_slice(&[0; 12]);
+    let bytes = resource_request(
+        &mut no_policy.state,
+        &mut no_policy.backend,
+        &mut no_policy.peer,
+        85,
+        41,
+        0,
+        &body,
+    );
+    assert_x11_error(&bytes, x11::error::BAD_WINDOW, invalid_source.0, 41, 85);
+}
+
+#[test]
+fn reparent_access_checks_precede_later_operand_validation() {
+    // Mutation: keep ReparentWindow checks behind check_reparent_window; MANAGE and ADD denials must beat later BadWindow/BadMatch.
+    let mut fixture = window_access_fixture();
+    let invalid_parent = ResourceId(0x0054_00fd);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(WindowResourcePolicy {
+            calls: Arc::clone(&calls),
+            deny_id: Some(Arc::new(AtomicU32::new(fixture.window.0))),
+            deny_mode: Some(AccessMode::MANAGE),
+            deny_hides: false,
+        }));
+    let backend_before = fixture.backend.calls().to_vec();
+    let window_before = format!("{:?}", fixture.state.resources.window(fixture.window));
+    let old_parent = fixture
+        .state
+        .resources
+        .window(fixture.window)
+        .expect("fixture window")
+        .parent;
+    let old_parent_children = fixture.state.resources.children(old_parent).to_vec();
+    let bytes = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.peer,
+        86,
+        7,
+        0,
+        &words(&[fixture.window.0, invalid_parent.0, 0]),
+    );
+    assert_x11_error(&bytes, x11::error::BAD_VALUE, 0x55, 7, 86);
+    assert_eq!(fixture.backend.calls(), backend_before);
+    assert_eq!(
+        format!("{:?}", fixture.state.resources.window(fixture.window)),
+        window_before
+    );
+    assert_eq!(
+        fixture.state.resources.children(old_parent),
+        old_parent_children
+    );
+    assert_eq!(
+        expected_resource_checks(&calls.lock().unwrap()),
+        [(
+            CLIENT,
+            fixture.window,
+            ResourceKind::Window,
+            AccessMode::MANAGE,
+            Some(RequestOpcodes { major: 7, minor: 0 }),
+        )]
+    );
+
+    let mut no_policy = window_access_fixture();
+    let bytes = resource_request(
+        &mut no_policy.state,
+        &mut no_policy.backend,
+        &mut no_policy.peer,
+        87,
+        7,
+        0,
+        &words(&[no_policy.window.0, invalid_parent.0, 0]),
+    );
+    assert_x11_error(&bytes, x11::error::BAD_WINDOW, no_policy.window.0, 7, 87);
+
+    let mut fixture = window_access_fixture();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(WindowResourcePolicy {
+            calls: Arc::clone(&calls),
+            deny_id: Some(Arc::new(AtomicU32::new(fixture.window.0))),
+            deny_mode: Some(AccessMode::ADD),
+            deny_hides: false,
+        }));
+    let backend_before = fixture.backend.calls().to_vec();
+    let window_before = format!("{:?}", fixture.state.resources.window(fixture.window));
+    let old_parent = fixture
+        .state
+        .resources
+        .window(fixture.window)
+        .expect("fixture window")
+        .parent;
+    let old_parent_children = fixture.state.resources.children(old_parent).to_vec();
+    let target_children = fixture.state.resources.children(fixture.window).to_vec();
+    let bytes = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.peer,
+        88,
+        7,
+        0,
+        &words(&[fixture.window.0, fixture.window.0, 0]),
+    );
+    assert_x11_error(&bytes, x11::error::BAD_VALUE, 0x55, 7, 88);
+    assert_eq!(fixture.backend.calls(), backend_before);
+    assert_eq!(
+        format!("{:?}", fixture.state.resources.window(fixture.window)),
+        window_before
+    );
+    assert_eq!(
+        fixture.state.resources.children(old_parent),
+        old_parent_children
+    );
+    assert_eq!(
+        fixture.state.resources.children(fixture.window),
+        target_children
+    );
+    assert_eq!(
+        expected_resource_checks(&calls.lock().unwrap()),
+        [
+            (
+                CLIENT,
+                fixture.window,
+                ResourceKind::Window,
+                AccessMode::MANAGE,
+                Some(RequestOpcodes { major: 7, minor: 0 }),
+            ),
+            (
+                CLIENT,
+                fixture.window,
+                ResourceKind::Window,
+                AccessMode::ADD,
+                Some(RequestOpcodes { major: 7, minor: 0 }),
+            ),
+        ]
+    );
+
+    let mut no_policy = window_access_fixture();
+    let bytes = resource_request(
+        &mut no_policy.state,
+        &mut no_policy.backend,
+        &mut no_policy.peer,
+        89,
+        7,
+        0,
+        &words(&[no_policy.window.0, no_policy.window.0, 0]),
+    );
+    assert_x11_error(&bytes, x11::error::BAD_MATCH, no_policy.window.0, 7, 89);
+}
+
+#[test]
+fn circulate_core_policy_context_uses_zero_minor() {
+    // Mutation: use header.data as the minor for a core request; direction 1 must still reach policy as minor 0 and the error packet must encode 0.
+    let mut fixture = window_access_fixture();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(WindowResourcePolicy {
+            calls: Arc::clone(&calls),
+            deny_id: Some(Arc::new(AtomicU32::new(fixture.subwindows_parent.0))),
+            deny_mode: Some(AccessMode::MANAGE),
+            deny_hides: false,
+        }));
+    let backend_before = fixture.backend.calls().to_vec();
+    let children_before = fixture
+        .state
+        .resources
+        .children(fixture.subwindows_parent)
+        .to_vec();
+    let bytes = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.peer,
+        90,
+        13,
+        1,
+        &words(&[fixture.subwindows_parent.0]),
+    );
+    assert_x11_error(&bytes, x11::error::BAD_VALUE, 0x55, 13, 90);
+    assert_eq!(fixture.backend.calls(), backend_before);
+    assert_eq!(
+        fixture.state.resources.children(fixture.subwindows_parent),
+        children_before
+    );
+    assert_eq!(
+        expected_resource_checks(&calls.lock().unwrap()),
+        [(
+            CLIENT,
+            fixture.subwindows_parent,
+            ResourceKind::Window,
+            AccessMode::MANAGE,
+            Some(RequestOpcodes {
+                major: 13,
+                minor: 0
+            }),
+        )]
     );
 }

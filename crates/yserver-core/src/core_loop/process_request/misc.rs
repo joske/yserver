@@ -1,5 +1,5 @@
 use crate::{
-    access::{AccessMode, Decision, RequestOpcodes},
+    access::{AccessMode, Decision, RequestOpcodes, ResourceKind, ResourceTarget},
     backend::Backend,
     core_loop::{
         auth::HostChangeError,
@@ -609,6 +609,7 @@ pub(super) fn handle_get_motion_events(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
@@ -622,6 +623,19 @@ pub(super) fn handle_get_motion_events(
             39,
         );
     };
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: window,
+            kind: ResourceKind::Window,
+            creation: None,
+        },
+        AccessMode::GET_ATTR,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 39);
+    }
     let (width, height, border) = (win.width, win.height, win.border_width);
     let (origin_x, origin_y) = state.resources.window_absolute_position(window);
     let start = u32::from_le_bytes(body[4..8].try_into().expect("four bytes"));

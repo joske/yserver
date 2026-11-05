@@ -66,10 +66,7 @@ pub(super) fn handle_put_image(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    let access_request = RequestOpcodes {
-        major: header.opcode,
-        minor: header.data,
-    };
+    let access_request = RequestOpcodes::for_request(header);
     let Some(request) = x11::put_image_request(header.data, body) else {
         return Ok(RequestOutcome::Handled);
     };
@@ -330,10 +327,7 @@ pub(super) fn handle_image_text8(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    let access_request = RequestOpcodes {
-        major: header.opcode,
-        minor: header.data,
-    };
+    let access_request = RequestOpcodes::for_request(header);
     if let Some((drawable_raw, gc_id, text_body)) = x11::image_text8_data(body) {
         let drawable = ResourceId(drawable_raw);
         if let Err((code, bad_value)) = validate_drawable_and_gc(
@@ -377,10 +371,7 @@ pub(super) fn handle_image_text16(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    let access_request = RequestOpcodes {
-        major: header.opcode,
-        minor: header.data,
-    };
+    let access_request = RequestOpcodes::for_request(header);
     if let Some((drawable_raw, gc_id, text_body)) = x11::image_text8_data(body) {
         let drawable = ResourceId(drawable_raw);
         if let Err((code, bad_value)) = validate_drawable_and_gc(
@@ -424,10 +415,7 @@ pub(super) fn handle_get_image(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    let access_request = RequestOpcodes {
-        major: header.opcode,
-        minor: header.data,
-    };
+    let access_request = RequestOpcodes::for_request(header);
     debug!("client {} #{} GetImage", client_id.0, sequence.0);
     let Some(req) = x11::get_image_request(header.data, body) else {
         return Ok(RequestOutcome::Handled);
@@ -769,10 +757,7 @@ pub(super) fn handle_poly_point(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    let access_request = RequestOpcodes {
-        major: header.opcode,
-        minor: header.data,
-    };
+    let access_request = RequestOpcodes::for_request(header);
     if body.len() >= 8 {
         let drawable = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
         let gc_id = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
@@ -830,10 +815,7 @@ pub(super) fn handle_poly_line(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    let access_request = RequestOpcodes {
-        major: header.opcode,
-        minor: header.data,
-    };
+    let access_request = RequestOpcodes::for_request(header);
     if let Some((gc_id, points)) = x11::poly_line_data(body)
         && let Some(drawable) = x11::drawable_request_id(body)
     {
@@ -1152,10 +1134,7 @@ pub(super) fn handle_clear_area(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    let access_request = RequestOpcodes {
-        major: header.opcode,
-        minor: header.data,
-    };
+    let access_request = RequestOpcodes::for_request(header);
     let exposures = header.data != 0;
     if let Some(request) = x11::clear_area_request(body) {
         // Validation per Xorg ProcClearToBackground: exposures must
