@@ -77,8 +77,11 @@ These were decided with the user on 2026-11-05 or follow from the spec; each one
   (`poll_tokens.rs`, `ClientIdAllocator::new`). This is how the screensaver's calls to the core handlers
   (`saver_dpms.rs:304-317`) stay unchecked; hit testing, clipping, damage, destroy execution, disconnect and reset
   never call the helpers.
-- **Request opcodes.** Every check made while running a request passes `Some(RequestOpcodes { major, minor })`
-  for that request (core requests: minor = `header.data`, as PR 2's dispatch check), as `check_server` does today.
+- **Request opcodes.** Every check made while running a request passes `Some(RequestOpcodes::for_request(header))`:
+  for a core request (major < 128) the minor is 0, as Xorg's `client->minorOp` (`dix/dispatch.c:532`), because the
+  data byte of a core request is a parameter; for an extension request it is the data byte, as PR 2's dispatch
+  check. A core request's denial error keeps minor 0. (Corrected during Task 5; the first version said
+  `header.data` for core requests too.)
 - **Modes** are XLibre's at each site (`include/dixaccess.h`), taken from the inventory's section 2. `AccessMode`
   gains only the bits the 3a sites use; 3b and 3c add theirs.
 
