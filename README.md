@@ -27,7 +27,17 @@ See [`docs/extensions.txt`](docs/extensions.txt) for a list of all supported/imp
 
 - Windows (x86_64 and aarch64): X clients from WSL or other machines show up
   on the Windows desktop, each in its own window or in one rooted window, with
-  a shared clipboard, a Settings dialog and DPI awareness
+  a shared clipboard, a Settings dialog and DPI awareness; `ssh -Y` from
+  Windows' own ssh client works with the bundled `xauth.exe`
+- window operations 5-700x faster on slow machines: window clip regions are
+  computed in linear time
+- compositors that Present their own buffers (marco, ...) get them flipped to
+  the screen instead of recomposited
+- `xhost` access control (ChangeHosts, ListHosts, SetAccessControl)
+- the first parts of an access control layer for client isolation (@ariel3259)
+- Present keeps going when a monitor's vblank clock freezes (@ariel3259)
+- TCP listens on IPv6 too
+- shaped windows with many rectangles (xeyes) draw like on Xorg
 - macOS: yserver runs in a window on Apple Silicon (Mesa KosmicKrisp), with a
   Dock icon and a Settings window; rootless mode gives every X window its own
   Mac window
@@ -270,9 +280,10 @@ DISPLAY=:1 /opt/X11/bin/xterm
 ### Windows
 
 yserver runs on Windows 11 (x86_64 and aarch64) and needs a GPU driver
-with Vulkan 1.3. Portable zips (`yserver-<version>-windows-<arch>.zip`) are
-built by CI; nothing needs installing, the C runtime and libraries are linked
-in. The zip's `README.txt` covers it in full.
+with Vulkan 1.3. Portable zips (`yserver-<version>-windows-<arch>.zip`, x86_64
+and aarch64) are attached to each GitHub release from 1.9.0 on; nothing needs
+installing, the C runtime and libraries are linked in. The zip's `README.txt`
+covers it in full.
 
 Run `start-yserver.cmd`: it starts display `:0`, creates a cookie in
 `%LOCALAPPDATA%\yserver\Xauthority` on first use and prints it. Clients
