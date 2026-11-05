@@ -1,6 +1,23 @@
 use super::*;
 use crate::resources::MapState;
 
+struct DenyAllAccessPolicy;
+
+impl crate::access::AccessPolicy for DenyAllAccessPolicy {
+    fn resource(
+        &self,
+        _ctx: &crate::access::AccessContext<'_>,
+        _client: ClientId,
+        _target: &crate::access::ResourceTarget,
+        _mode: crate::access::AccessMode,
+    ) -> crate::access::Decision {
+        crate::access::Decision::Deny(crate::access::DenyError {
+            code: x11::error::BAD_ACCESS,
+            value: 0,
+        })
+    }
+}
+
 #[test]
 fn dpms_force_level_rejects_when_disabled() {
     let mut state = ServerState::new();
@@ -947,6 +964,8 @@ fn screen_saver_set_attributes_belongs_to_one_client_and_shows_a_window() {
     let bytes = read_all_available(&mut peer2);
     assert_eq!((bytes[0], bytes[1]), (0, x11::error::BAD_ACCESS));
 
+    // Mutation: remove the SERVER_OWNER fast path; the saver CreateWindow must stay authorized.
+    state.install_access_policy(Arc::new(DenyAllAccessPolicy));
     let saver = crate::resources::SCREEN_SAVER_WINDOW;
     apply_screen_saver_transition(&mut state, &mut backend, ScreenSaverActive::On, true);
     let w = state.resources.window(saver).expect("saver window");

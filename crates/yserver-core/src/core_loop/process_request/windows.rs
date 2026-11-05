@@ -1,4 +1,5 @@
 use crate::{
+    access::{AccessMode, Creation, RequestOpcodes, ResourceKind, ResourceTarget},
     backend::{Backend, OriginContext},
     core_loop::{
         damage_fanout::{
@@ -759,6 +760,10 @@ pub(super) fn handle_create_window(
     let Some(request) = x11::create_window_request(header.data, body) else {
         return Ok(RequestOutcome::Handled);
     };
+    let access_request = RequestOpcodes {
+        major: header.opcode,
+        minor: header.data,
+    };
     debug!(
         "client {} create window 0x{:x} parent=0x{:x} pos=({},{}) size={}x{} mask=0x{:x}",
         client_id.0,
@@ -788,6 +793,19 @@ pub(super) fn handle_create_window(
             parent.0,
             1,
         );
+    }
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: parent,
+            kind: ResourceKind::Window,
+            creation: None,
+        },
+        AccessMode::ADD,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 1);
     }
     // Xorg `dix/window.c::CreateWindow:769-786` resolves
     // `class == CopyFromParent` against the parent, then enforces:
@@ -876,41 +894,82 @@ pub(super) fn handle_create_window(
     // typed enum is CopyFromParent.
     if let Some(bg_pixmap) = request.background_pixmap
         && bg_pixmap.0 > 1
-        && state.resources.pixmap(bg_pixmap).is_none()
     {
-        return emit_x11_error(
+        if state.resources.pixmap(bg_pixmap).is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_PIXMAP,
+                bg_pixmap.0,
+                1,
+            );
+        }
+        if let Err((code, bad_value)) = super::validate_resource_access(
             state,
             client_id,
-            sequence,
-            x11::error::BAD_PIXMAP,
-            bg_pixmap.0,
-            1,
-        );
+            ResourceTarget {
+                id: bg_pixmap,
+                kind: ResourceKind::Pixmap,
+                creation: None,
+            },
+            AccessMode::READ,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 1);
+        }
     }
-    if let Some(Some(colormap)) = request.colormap
-        && state.resources.colormap(colormap).is_none()
-    {
-        return emit_x11_error(
+    if let Some(Some(colormap)) = request.colormap {
+        if state.resources.colormap(colormap).is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_COLORMAP,
+                colormap.0,
+                1,
+            );
+        }
+        if let Err((code, bad_value)) = super::validate_resource_access(
             state,
             client_id,
-            sequence,
-            x11::error::BAD_COLORMAP,
-            colormap.0,
-            1,
-        );
+            ResourceTarget {
+                id: colormap,
+                kind: ResourceKind::Colormap,
+                creation: None,
+            },
+            AccessMode::USE,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 1);
+        }
     }
     if let Some(cursor) = request.cursor
         && cursor.0 != 0
-        && !state.resources.cursor_exists(cursor)
     {
-        return emit_x11_error(
+        if !state.resources.cursor_exists(cursor) {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_CURSOR,
+                cursor.0,
+                1,
+            );
+        }
+        if let Err((code, bad_value)) = super::validate_resource_access(
             state,
             client_id,
-            sequence,
-            x11::error::BAD_CURSOR,
-            cursor.0,
-            1,
-        );
+            ResourceTarget {
+                id: cursor,
+                kind: ResourceKind::Cursor,
+                creation: None,
+            },
+            AccessMode::USE,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 1);
+        }
     }
     // Border validation. The effective depth resolves CopyFromParent
     // (depth 0) against the parent, matching
@@ -962,12 +1021,49 @@ pub(super) fn handle_create_window(
                         1,
                     );
                 }
-                Some(pixmap) if pixmap.depth != effective_depth => {
-                    return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, 1);
+                Some(pixmap) => {
+                    if let Err((code, bad_value)) = super::validate_resource_access(
+                        state,
+                        client_id,
+                        ResourceTarget {
+                            id: border_pixmap,
+                            kind: ResourceKind::Pixmap,
+                            creation: None,
+                        },
+                        AccessMode::READ,
+                        access_request,
+                    ) {
+                        return emit_x11_error(state, client_id, sequence, code, bad_value, 1);
+                    }
+                    if pixmap.depth != effective_depth {
+                        return emit_x11_error(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_MATCH,
+                            0,
+                            1,
+                        );
+                    }
                 }
-                Some(_) => {}
             }
         }
+    }
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: window_id,
+            kind: ResourceKind::Window,
+            creation: Some(Creation {
+                parent: Some(parent),
+                owner: client_id,
+            }),
+        },
+        AccessMode::CREATE | AccessMode::SET_ATTR,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 1);
     }
     state.resources.create_window(client_id, request);
     if mask != 0
@@ -1119,10 +1215,15 @@ pub(super) fn handle_change_window_attributes(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let Some(mut request) = x11::change_window_attributes_request(body) else {
         return Ok(RequestOutcome::Handled);
+    };
+    let access_request = RequestOpcodes {
+        major: header.opcode,
+        minor: header.data,
     };
     if state.resources.window(request.window).is_none() {
         // Xorg `dix/dispatch.c::ProcChangeWindowAttributes` returns
@@ -1139,6 +1240,29 @@ pub(super) fn handle_change_window_attributes(
             request.window.0,
             2,
         );
+    }
+    let event_mask = request.value_mask & 0x0800 != 0;
+    let other_attributes = request.value_mask & !0x0800 != 0;
+    let window_mode = match (event_mask, other_attributes) {
+        (true, true) => Some(AccessMode::RECEIVE | AccessMode::SET_ATTR),
+        (true, false) => Some(AccessMode::RECEIVE),
+        (false, true) => Some(AccessMode::SET_ATTR),
+        (false, false) => None,
+    };
+    if let Some(mode) = window_mode
+        && let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: request.window,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            mode,
+            access_request,
+        )
+    {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 2);
     }
     // Xorg `dix/window.c::ChangeWindowAttributes:1174`: an InputOnly
     // window may only carry the `INPUTONLY_LEGAL_MASK` bits
@@ -1173,41 +1297,82 @@ pub(super) fn handle_change_window_attributes(
     // means CopyFromParent and is resolved against the parent.
     if let Some(bg_pixmap) = request.background_pixmap
         && bg_pixmap.0 > 1
-        && state.resources.pixmap(bg_pixmap).is_none()
     {
-        return emit_x11_error(
+        if state.resources.pixmap(bg_pixmap).is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_PIXMAP,
+                bg_pixmap.0,
+                2,
+            );
+        }
+        if let Err((code, bad_value)) = super::validate_resource_access(
             state,
             client_id,
-            sequence,
-            x11::error::BAD_PIXMAP,
-            bg_pixmap.0,
-            2,
-        );
+            ResourceTarget {
+                id: bg_pixmap,
+                kind: ResourceKind::Pixmap,
+                creation: None,
+            },
+            AccessMode::READ,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 2);
+        }
     }
-    if let Some(Some(colormap)) = request.colormap
-        && state.resources.colormap(colormap).is_none()
-    {
-        return emit_x11_error(
+    if let Some(Some(colormap)) = request.colormap {
+        if state.resources.colormap(colormap).is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_COLORMAP,
+                colormap.0,
+                2,
+            );
+        }
+        if let Err((code, bad_value)) = super::validate_resource_access(
             state,
             client_id,
-            sequence,
-            x11::error::BAD_COLORMAP,
-            colormap.0,
-            2,
-        );
+            ResourceTarget {
+                id: colormap,
+                kind: ResourceKind::Colormap,
+                creation: None,
+            },
+            AccessMode::USE,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 2);
+        }
     }
     if let Some(cursor) = request.cursor
         && cursor.0 != 0
-        && !state.resources.cursor_exists(cursor)
     {
-        return emit_x11_error(
+        if !state.resources.cursor_exists(cursor) {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_CURSOR,
+                cursor.0,
+                2,
+            );
+        }
+        if let Err((code, bad_value)) = super::validate_resource_access(
             state,
             client_id,
-            sequence,
-            x11::error::BAD_CURSOR,
-            cursor.0,
-            2,
-        );
+            ResourceTarget {
+                id: cursor,
+                kind: ResourceKind::Cursor,
+                creation: None,
+            },
+            AccessMode::USE,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 2);
+        }
     }
     // `dix/window.c:1251` CWBorderPixmap. CWBorderPixel overrides it and
     // clears the bit before the pixmap is resolved (`:1298`), so a
@@ -1246,10 +1411,31 @@ pub(super) fn handle_change_window_attributes(
                         2,
                     );
                 }
-                Some(pixmap) if pixmap.depth != own_depth => {
-                    return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, 2);
+                Some(pixmap) => {
+                    if let Err((code, bad_value)) = super::validate_resource_access(
+                        state,
+                        client_id,
+                        ResourceTarget {
+                            id: border_pixmap,
+                            kind: ResourceKind::Pixmap,
+                            creation: None,
+                        },
+                        AccessMode::READ,
+                        access_request,
+                    ) {
+                        return emit_x11_error(state, client_id, sequence, code, bad_value, 2);
+                    }
+                    if pixmap.depth != own_depth {
+                        return emit_x11_error(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_MATCH,
+                            0,
+                            2,
+                        );
+                    }
                 }
-                Some(_) => {}
             }
         }
     }
@@ -2058,6 +2244,7 @@ pub(super) fn handle_destroy_window(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if let Some(window) = x11::free_resource_id(body) {
@@ -2074,6 +2261,43 @@ pub(super) fn handle_destroy_window(
                 window.0,
                 4,
             );
+        }
+        let access_request = RequestOpcodes {
+            major: header.opcode,
+            minor: header.data,
+        };
+        if let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: window,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            AccessMode::DESTROY,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 4);
+        }
+        if window != ROOT_WINDOW {
+            let parent = state
+                .resources
+                .window(window)
+                .expect("window existence verified above")
+                .parent;
+            if let Err((code, bad_value)) = super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: parent,
+                    kind: ResourceKind::Window,
+                    creation: None,
+                },
+                AccessMode::REMOVE,
+                access_request,
+            ) {
+                return emit_x11_error(state, client_id, sequence, code, bad_value, 4);
+            }
         }
         // `ProcDestroyWindow` frees only a window with a parent: root plans
         // nothing and is a successful no-op (#297).
@@ -2094,6 +2318,7 @@ pub(super) fn handle_destroy_subwindows(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() >= 4 {
@@ -2109,6 +2334,23 @@ pub(super) fn handle_destroy_subwindows(
                 parent.0,
                 5,
             );
+        }
+        let access_request = RequestOpcodes {
+            major: header.opcode,
+            minor: header.data,
+        };
+        if let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: parent,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            AccessMode::REMOVE,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 5);
         }
         // Every child is planned and prepared before anything changes, so a
         // failed preparation leaves the request undone.
@@ -2126,6 +2368,22 @@ pub(super) fn handle_destroy_subwindows(
         // of the parent precede the DestroyNotifies (`dix/window.c:1104-1124`).
         unmap_subwindows_with_delta(state, backend, origin, client_id, sequence, body)?;
         for ready in prepared {
+            let child = ready.plan().top();
+            if super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: child,
+                    kind: ResourceKind::Window,
+                    creation: None,
+                },
+                AccessMode::DESTROY,
+                access_request,
+            )
+            .is_err()
+            {
+                break;
+            }
             finish_destroy(state, backend, origin, ready);
         }
     }
@@ -2752,6 +3010,7 @@ pub(super) fn handle_get_window_attributes(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let id = x11::drawable_request_id(body).unwrap_or(ROOT_WINDOW);
@@ -2764,6 +3023,22 @@ pub(super) fn handle_get_window_attributes(
     // protocol error.
     if state.resources.window(id).is_none() {
         return emit_x11_error(state, client_id, sequence, x11::error::BAD_WINDOW, id.0, 3);
+    }
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id,
+            kind: ResourceKind::Window,
+            creation: None,
+        },
+        AccessMode::GET_ATTR,
+        RequestOpcodes {
+            major: header.opcode,
+            minor: header.data,
+        },
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 3);
     }
     let target = id;
     let your_event_mask = state
@@ -2918,18 +3193,36 @@ pub(super) fn handle_change_save_set(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    if body.len() >= 4
-        && let Some(c) = state.clients.get_mut(&client_id.0)
-    {
+    if body.len() >= 4 {
         let win = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
-        match header.data {
-            0 => {
-                c.save_set.insert(win);
+        if state.resources.window(win).is_some()
+            && let Err((code, bad_value)) = super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: win,
+                    kind: ResourceKind::Window,
+                    creation: None,
+                },
+                AccessMode::MANAGE,
+                RequestOpcodes {
+                    major: header.opcode,
+                    minor: header.data,
+                },
+            )
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 6);
+        }
+        if let Some(c) = state.clients.get_mut(&client_id.0) {
+            match header.data {
+                0 => {
+                    c.save_set.insert(win);
+                }
+                1 => {
+                    c.save_set.remove(&win);
+                }
+                _ => {}
             }
-            1 => {
-                c.save_set.remove(&win);
-            }
-            _ => {}
         }
     }
     debug!("client {} #{} ChangeSaveSet", client_id.0, sequence.0);

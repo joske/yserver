@@ -606,7 +606,7 @@ pub fn process_request(
         93 => handle_create_cursor(state, backend, origin, client_id, sequence, body),
         94 => handle_create_glyph_cursor(state, backend, origin, client_id, sequence, body),
         // ── window queries / circulation ──
-        3 => handle_get_window_attributes(state, client_id, sequence, body),
+        3 => handle_get_window_attributes(state, client_id, sequence, header, body),
         13 => handle_circulate_window(state, backend, client_id, sequence, header, body),
         // ── extension extension-protocol arms (standalone, not full
         //    extension dispatchers) ──
@@ -619,12 +619,14 @@ pub fn process_request(
         8 => handle_map_window(state, backend, origin, client_id, sequence, body),
         9 => handle_map_subwindows(state, backend, origin, client_id, sequence, body),
         // ── destroy (window lifecycle) ──
-        4 => handle_destroy_window(state, backend, origin, client_id, sequence, body),
-        5 => handle_destroy_subwindows(state, backend, origin, client_id, sequence, body),
+        4 => handle_destroy_window(state, backend, origin, client_id, sequence, header, body),
+        5 => handle_destroy_subwindows(state, backend, origin, client_id, sequence, header, body),
         // ── configure (window geometry/stacking) ──
         12 => handle_configure_window(state, backend, origin, client_id, sequence, body),
         // ── attributes ──
-        2 => handle_change_window_attributes(state, backend, origin, client_id, sequence, body),
+        2 => handle_change_window_attributes(
+            state, backend, origin, client_id, sequence, header, body,
+        ),
         // ── window create ──
         1 => handle_create_window(state, backend, origin, client_id, sequence, header, body),
         // ── reparent ──

@@ -3,8 +3,8 @@ use super::{
     *,
 };
 use crate::access::{
-    AccessContext, AccessMode, AccessPolicy, Decision, DenyError, RequestOpcodes, ResourceKind,
-    ResourceTarget,
+    AccessContext, AccessMode, AccessPolicy, Creation, Decision, DenyError, RequestOpcodes,
+    ResourceKind, ResourceTarget,
 };
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -1575,4 +1575,1225 @@ fn server_owner_drawing_stays_unchecked() {
     .expect("server-owned PolyPoint");
     assert!(read_all_available(&mut peer).is_empty());
     assert!(calls.lock().unwrap().is_empty());
+}
+
+struct WindowResourcePolicy {
+    calls: Arc<Mutex<Vec<RecordedExtensionCheck>>>,
+    deny_id: Option<Arc<AtomicU32>>,
+    deny_mode: Option<AccessMode>,
+    deny_hides: bool,
+}
+
+impl AccessPolicy for WindowResourcePolicy {
+    fn resource(
+        &self,
+        ctx: &AccessContext<'_>,
+        client: ClientId,
+        target: &ResourceTarget,
+        mode: AccessMode,
+    ) -> Decision {
+        self.calls.lock().unwrap().push(RecordedExtensionCheck {
+            hook: ExtensionHook::Resource,
+            client,
+            extension: "window resources".to_owned(),
+            request: ctx.request(),
+            peer: None,
+            admission: None,
+            owner: ctx.owner(target.id, target.kind),
+            target: Some(*target),
+            property: None,
+            mode: Some(mode),
+        });
+        let deny_id = self
+            .deny_id
+            .as_ref()
+            .is_some_and(|deny_id| deny_id.load(Ordering::SeqCst) == target.id.0);
+        if self.deny_hides && mode == AccessMode::HIDE
+            || deny_id && self.deny_mode.is_none_or(|deny_mode| deny_mode == mode)
+        {
+            Decision::Deny(DenyError {
+                code: x11::error::BAD_VALUE,
+                value: 0x55,
+            })
+        } else {
+            Decision::Allow
+        }
+    }
+}
+
+struct WindowAccessFixture {
+    state: ServerState,
+    backend: RecordingBackend,
+    peer: UnixStream,
+    parent: ResourceId,
+    window: ResourceId,
+    destroy_parent: ResourceId,
+    destroy_window: ResourceId,
+    subwindows_parent: ResourceId,
+    subwindow_children: [ResourceId; 2],
+    background: ResourceId,
+    border: ResourceId,
+    colormap: ResourceId,
+    cursor: ResourceId,
+}
+
+fn simple_window_body(window: ResourceId, parent: ResourceId) -> Vec<u8> {
+    words(&[
+        window.0,
+        parent.0,
+        0,
+        32 | (32 << 16),
+        0,
+        crate::resources::ROOT_VISUAL.0,
+        0,
+    ])
+}
+
+fn create_test_window(
+    state: &mut ServerState,
+    backend: &mut RecordingBackend,
+    peer: &mut UnixStream,
+    sequence: &mut u16,
+    window: ResourceId,
+    parent: ResourceId,
+) {
+    let bytes = resource_request(
+        state,
+        backend,
+        peer,
+        *sequence,
+        1,
+        24,
+        &simple_window_body(window, parent),
+    );
+    assert_no_error(&bytes, "window access fixture CreateWindow");
+    *sequence += 1;
+}
+
+fn create_window_with_access_attributes(
+    window: ResourceId,
+    parent: ResourceId,
+    background: ResourceId,
+    border: ResourceId,
+    colormap: ResourceId,
+    cursor: ResourceId,
+) -> Vec<u8> {
+    let mask = 0x0001 | 0x0004 | 0x2000 | 0x4000;
+    words(&[
+        window.0,
+        parent.0,
+        0,
+        32 | (32 << 16),
+        0,
+        crate::resources::ROOT_VISUAL.0,
+        mask,
+        background.0,
+        border.0,
+        colormap.0,
+        cursor.0,
+    ])
+}
+
+fn change_window_attributes_with_access_operands(
+    window: ResourceId,
+    background: ResourceId,
+    border: ResourceId,
+    colormap: ResourceId,
+    cursor: ResourceId,
+) -> Vec<u8> {
+    let mask = 0x0001 | 0x0004 | 0x0200 | 0x0800 | 0x2000 | 0x4000;
+    words(&[
+        window.0,
+        mask,
+        background.0,
+        border.0,
+        0,
+        1,
+        colormap.0,
+        cursor.0,
+    ])
+}
+
+fn window_access_fixture() -> WindowAccessFixture {
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, CLIENT.0);
+    let mut backend = RecordingBackend::new();
+    let parent = ResourceId(0x0054_0001);
+    let window = ResourceId(0x0054_0002);
+    let destroy_parent = ResourceId(0x0054_0003);
+    let destroy_window = ResourceId(0x0054_0004);
+    let subwindows_parent = ResourceId(0x0054_0005);
+    let subwindow_children = [ResourceId(0x0054_0006), ResourceId(0x0054_0007)];
+    let background = ResourceId(0x0054_0008);
+    let border = ResourceId(0x0054_0009);
+    let colormap = ResourceId(0x0054_000a);
+    let cursor = ResourceId(0x0054_000b);
+    let mut sequence = 1;
+
+    create_test_window(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        &mut sequence,
+        parent,
+        ROOT_WINDOW,
+    );
+    create_test_window(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        &mut sequence,
+        window,
+        parent,
+    );
+    create_test_window(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        &mut sequence,
+        destroy_parent,
+        ROOT_WINDOW,
+    );
+    create_test_window(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        &mut sequence,
+        destroy_window,
+        destroy_parent,
+    );
+    create_test_window(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        &mut sequence,
+        subwindows_parent,
+        ROOT_WINDOW,
+    );
+    for child in subwindow_children {
+        create_test_window(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            &mut sequence,
+            child,
+            subwindows_parent,
+        );
+    }
+    for pixmap in [background, border] {
+        let bytes = resource_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            sequence,
+            53,
+            24,
+            &words(&[pixmap.0, ROOT_WINDOW.0, 16 | (16 << 16)]),
+        );
+        assert_no_error(&bytes, "window access fixture CreatePixmap");
+        sequence += 1;
+    }
+    let bytes = resource_request(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        sequence,
+        78,
+        0,
+        &words(&[colormap.0, ROOT_WINDOW.0, crate::resources::ROOT_VISUAL.0]),
+    );
+    assert_no_error(&bytes, "window access fixture CreateColormap");
+    sequence += 1;
+    let mut cursor_body = words(&[cursor.0, background.0, 0]);
+    cursor_body.extend_from_slice(&[0; 16]);
+    let bytes = resource_request(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        sequence,
+        93,
+        0,
+        &cursor_body,
+    );
+    assert_no_error(&bytes, "window access fixture CreateCursor");
+
+    WindowAccessFixture {
+        state,
+        backend,
+        peer,
+        parent,
+        window,
+        destroy_parent,
+        destroy_window,
+        subwindows_parent,
+        subwindow_children,
+        background,
+        border,
+        colormap,
+        cursor,
+    }
+}
+
+struct WindowDenyCase {
+    label: &'static str,
+    opcode: u8,
+    data: u8,
+    body: Vec<u8>,
+    target: ResourceId,
+    kind: ResourceKind,
+    mode: AccessMode,
+    creation: Option<Creation>,
+}
+
+#[test]
+fn window_resource_request_denials_match_modes_and_stop_before_effects() {
+    // Mutation: remove a listed check or use the wrong CWA mode; its row's error/mode assertion must fail.
+    // Mutation: authorize an unresolved ChangeSaveSet window; it must keep its current no-check success behavior.
+    // Mutation: apply the CWA event-mask selection before checking CW operands; the event-mask snapshot must fail.
+    let mut fixture = window_access_fixture();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let denied_id = Arc::new(AtomicU32::new(0));
+    fixture
+        .state
+        .install_access_policy(Arc::new(WindowResourcePolicy {
+            calls: Arc::clone(&calls),
+            deny_id: Some(Arc::clone(&denied_id)),
+            deny_mode: None,
+            deny_hides: false,
+        }));
+    let created = ResourceId(0x0054_000c);
+    let create_body = create_window_with_access_attributes(
+        created,
+        ROOT_WINDOW,
+        fixture.background,
+        fixture.border,
+        fixture.colormap,
+        fixture.cursor,
+    );
+    let attrs_body = change_window_attributes_with_access_operands(
+        fixture.window,
+        fixture.background,
+        fixture.border,
+        fixture.colormap,
+        fixture.cursor,
+    );
+    let cases = vec![
+        WindowDenyCase {
+            label: "CreateWindow parent ADD",
+            opcode: 1,
+            data: 24,
+            body: create_body.clone(),
+            target: ROOT_WINDOW,
+            kind: ResourceKind::Window,
+            mode: AccessMode::ADD,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "CreateWindow background READ",
+            opcode: 1,
+            data: 24,
+            body: create_body.clone(),
+            target: fixture.background,
+            kind: ResourceKind::Pixmap,
+            mode: AccessMode::READ,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "CreateWindow colormap USE",
+            opcode: 1,
+            data: 24,
+            body: create_body.clone(),
+            target: fixture.colormap,
+            kind: ResourceKind::Colormap,
+            mode: AccessMode::USE,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "CreateWindow cursor USE",
+            opcode: 1,
+            data: 24,
+            body: create_body.clone(),
+            target: fixture.cursor,
+            kind: ResourceKind::Cursor,
+            mode: AccessMode::USE,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "CreateWindow border pixmap READ",
+            opcode: 1,
+            data: 24,
+            body: create_body.clone(),
+            target: fixture.border,
+            kind: ResourceKind::Pixmap,
+            mode: AccessMode::READ,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "CreateWindow creation",
+            opcode: 1,
+            data: 24,
+            body: create_body,
+            target: created,
+            kind: ResourceKind::Window,
+            mode: AccessMode::CREATE | AccessMode::SET_ATTR,
+            creation: Some(Creation {
+                parent: Some(ROOT_WINDOW),
+                owner: CLIENT,
+            }),
+        },
+        WindowDenyCase {
+            label: "ChangeWindowAttributes window",
+            opcode: 2,
+            data: 0,
+            body: attrs_body.clone(),
+            target: fixture.window,
+            kind: ResourceKind::Window,
+            mode: AccessMode::RECEIVE | AccessMode::SET_ATTR,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "ChangeWindowAttributes event mask only",
+            opcode: 2,
+            data: 0,
+            body: words(&[fixture.window.0, 0x0800, 1]),
+            target: fixture.window,
+            kind: ResourceKind::Window,
+            mode: AccessMode::RECEIVE,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "ChangeWindowAttributes non-event attribute only",
+            opcode: 2,
+            data: 0,
+            body: words(&[fixture.window.0, 0x0200, 1]),
+            target: fixture.window,
+            kind: ResourceKind::Window,
+            mode: AccessMode::SET_ATTR,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "ChangeWindowAttributes background READ",
+            opcode: 2,
+            data: 0,
+            body: attrs_body.clone(),
+            target: fixture.background,
+            kind: ResourceKind::Pixmap,
+            mode: AccessMode::READ,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "ChangeWindowAttributes colormap USE",
+            opcode: 2,
+            data: 0,
+            body: attrs_body.clone(),
+            target: fixture.colormap,
+            kind: ResourceKind::Colormap,
+            mode: AccessMode::USE,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "ChangeWindowAttributes cursor USE",
+            opcode: 2,
+            data: 0,
+            body: attrs_body.clone(),
+            target: fixture.cursor,
+            kind: ResourceKind::Cursor,
+            mode: AccessMode::USE,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "ChangeWindowAttributes border pixmap READ",
+            opcode: 2,
+            data: 0,
+            body: attrs_body,
+            target: fixture.border,
+            kind: ResourceKind::Pixmap,
+            mode: AccessMode::READ,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "GetWindowAttributes",
+            opcode: 3,
+            data: 0,
+            body: words(&[fixture.window.0]),
+            target: fixture.window,
+            kind: ResourceKind::Window,
+            mode: AccessMode::GET_ATTR,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "DestroyWindow target",
+            opcode: 4,
+            data: 0,
+            body: words(&[fixture.destroy_window.0]),
+            target: fixture.destroy_window,
+            kind: ResourceKind::Window,
+            mode: AccessMode::DESTROY,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "DestroyWindow parent",
+            opcode: 4,
+            data: 0,
+            body: words(&[fixture.destroy_window.0]),
+            target: fixture.destroy_parent,
+            kind: ResourceKind::Window,
+            mode: AccessMode::REMOVE,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "DestroySubwindows parent",
+            opcode: 5,
+            data: 0,
+            body: words(&[fixture.parent.0]),
+            target: fixture.parent,
+            kind: ResourceKind::Window,
+            mode: AccessMode::REMOVE,
+            creation: None,
+        },
+        WindowDenyCase {
+            label: "ChangeSaveSet",
+            opcode: 6,
+            data: 0,
+            body: words(&[fixture.window.0]),
+            target: fixture.window,
+            kind: ResourceKind::Window,
+            mode: AccessMode::MANAGE,
+            creation: None,
+        },
+    ];
+
+    let mut sequence = 50;
+    for case in cases {
+        denied_id.store(case.target.0, Ordering::SeqCst);
+        let backend_before = fixture.backend.calls();
+        let mut windows_before = fixture
+            .state
+            .resources
+            .windows_iter()
+            .map(|window| format!("{window:?}"))
+            .collect::<Vec<_>>();
+        windows_before.sort();
+        let save_set_before = fixture.state.clients[&CLIENT.0].save_set.clone();
+        let event_masks_before = fixture.state.clients[&CLIENT.0].event_masks.clone();
+        let calls_before = calls.lock().unwrap().len();
+        let bytes = resource_request(
+            &mut fixture.state,
+            &mut fixture.backend,
+            &mut fixture.peer,
+            sequence,
+            case.opcode,
+            case.data,
+            &case.body,
+        );
+        assert_x11_error(&bytes, x11::error::BAD_VALUE, 0x55, case.opcode, sequence);
+        assert_eq!(
+            fixture.backend.calls(),
+            backend_before,
+            "{} backend",
+            case.label
+        );
+        let mut windows_after = fixture
+            .state
+            .resources
+            .windows_iter()
+            .map(|window| format!("{window:?}"))
+            .collect::<Vec<_>>();
+        windows_after.sort();
+        assert_eq!(windows_after, windows_before, "{} window state", case.label);
+        assert_eq!(
+            fixture.state.clients[&CLIENT.0].save_set, save_set_before,
+            "{} save set",
+            case.label
+        );
+        assert_eq!(
+            fixture.state.clients[&CLIENT.0].event_masks, event_masks_before,
+            "{} event selections",
+            case.label
+        );
+        if case.opcode == 1 {
+            assert!(
+                fixture.state.resources.window(created).is_none(),
+                "{} created a window",
+                case.label
+            );
+        }
+        let calls = calls.lock().unwrap();
+        assert!(calls.len() > calls_before, "{} check count", case.label);
+        let call = calls.last().expect("denial was recorded");
+        assert_eq!(call.client, CLIENT, "{} client", case.label);
+        assert_eq!(
+            call.request,
+            Some(RequestOpcodes {
+                major: case.opcode,
+                minor: case.data
+            }),
+            "{} request",
+            case.label
+        );
+        assert_eq!(call.mode, Some(case.mode), "{} mode", case.label);
+        assert_eq!(
+            call.target,
+            Some(ResourceTarget {
+                id: case.target,
+                kind: case.kind,
+                creation: case.creation,
+            }),
+            "{} target",
+            case.label
+        );
+        drop(calls);
+        sequence += 1;
+    }
+    let unresolved_window = ResourceId(0x0054_00ff);
+    denied_id.store(unresolved_window.0, Ordering::SeqCst);
+    let calls_before = calls.lock().unwrap().len();
+    let bytes = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.peer,
+        sequence,
+        6,
+        0,
+        &words(&[unresolved_window.0]),
+    );
+    assert_no_error(
+        &bytes,
+        "unresolved ChangeSaveSet keeps its no-error behavior",
+    );
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        calls_before,
+        "unresolved window is not checked"
+    );
+    assert!(
+        fixture.state.clients[&CLIENT.0]
+            .save_set
+            .contains(&unresolved_window)
+    );
+}
+
+#[test]
+fn window_resource_requests_present_expected_checks() {
+    // Mutation: remove or reorder any row's check; the exact policy call sequence must fail.
+    // Mutation: erase CreateWindow's Creation record; its parent/owner assertion must fail.
+    let mut fixture = window_access_fixture();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy {
+            decision: Decision::Allow,
+            calls: Arc::clone(&calls),
+        }));
+    let created = ResourceId(0x0054_000c);
+    let create_body = create_window_with_access_attributes(
+        created,
+        ROOT_WINDOW,
+        fixture.background,
+        fixture.border,
+        fixture.colormap,
+        fixture.cursor,
+    );
+    let attrs_body = change_window_attributes_with_access_operands(
+        fixture.window,
+        fixture.background,
+        fixture.border,
+        fixture.colormap,
+        fixture.cursor,
+    );
+    for (sequence, (opcode, data, body)) in (70u16..).zip([
+        (1, 24, create_body),
+        (2, 0, attrs_body),
+        (2, 0, words(&[fixture.window.0, 0x0800, 1])),
+        (2, 0, words(&[fixture.window.0, 0x0200, 1])),
+        (3, 0, words(&[fixture.window.0])),
+        (4, 0, words(&[fixture.destroy_window.0])),
+        (5, 0, words(&[fixture.subwindows_parent.0])),
+        (6, 0, words(&[fixture.window.0])),
+    ]) {
+        let bytes = resource_request(
+            &mut fixture.state,
+            &mut fixture.backend,
+            &mut fixture.peer,
+            sequence,
+            opcode,
+            data,
+            &body,
+        );
+        if opcode == 3 {
+            assert_eq!(bytes.first(), Some(&1), "GetWindowAttributes reply");
+        } else {
+            assert_no_error(&bytes, "allowed window access request");
+        }
+    }
+
+    let expected = vec![
+        (
+            CLIENT,
+            ROOT_WINDOW,
+            ResourceKind::Window,
+            AccessMode::ADD,
+            Some(RequestOpcodes {
+                major: 1,
+                minor: 24,
+            }),
+        ),
+        (
+            CLIENT,
+            fixture.background,
+            ResourceKind::Pixmap,
+            AccessMode::READ,
+            Some(RequestOpcodes {
+                major: 1,
+                minor: 24,
+            }),
+        ),
+        (
+            CLIENT,
+            fixture.colormap,
+            ResourceKind::Colormap,
+            AccessMode::USE,
+            Some(RequestOpcodes {
+                major: 1,
+                minor: 24,
+            }),
+        ),
+        (
+            CLIENT,
+            fixture.cursor,
+            ResourceKind::Cursor,
+            AccessMode::USE,
+            Some(RequestOpcodes {
+                major: 1,
+                minor: 24,
+            }),
+        ),
+        (
+            CLIENT,
+            fixture.border,
+            ResourceKind::Pixmap,
+            AccessMode::READ,
+            Some(RequestOpcodes {
+                major: 1,
+                minor: 24,
+            }),
+        ),
+        (
+            CLIENT,
+            created,
+            ResourceKind::Window,
+            AccessMode::CREATE | AccessMode::SET_ATTR,
+            Some(RequestOpcodes {
+                major: 1,
+                minor: 24,
+            }),
+        ),
+        (
+            CLIENT,
+            fixture.window,
+            ResourceKind::Window,
+            AccessMode::RECEIVE | AccessMode::SET_ATTR,
+            Some(RequestOpcodes { major: 2, minor: 0 }),
+        ),
+        (
+            CLIENT,
+            fixture.background,
+            ResourceKind::Pixmap,
+            AccessMode::READ,
+            Some(RequestOpcodes { major: 2, minor: 0 }),
+        ),
+        (
+            CLIENT,
+            fixture.colormap,
+            ResourceKind::Colormap,
+            AccessMode::USE,
+            Some(RequestOpcodes { major: 2, minor: 0 }),
+        ),
+        (
+            CLIENT,
+            fixture.cursor,
+            ResourceKind::Cursor,
+            AccessMode::USE,
+            Some(RequestOpcodes { major: 2, minor: 0 }),
+        ),
+        (
+            CLIENT,
+            fixture.border,
+            ResourceKind::Pixmap,
+            AccessMode::READ,
+            Some(RequestOpcodes { major: 2, minor: 0 }),
+        ),
+        (
+            CLIENT,
+            fixture.window,
+            ResourceKind::Window,
+            AccessMode::RECEIVE,
+            Some(RequestOpcodes { major: 2, minor: 0 }),
+        ),
+        (
+            CLIENT,
+            fixture.window,
+            ResourceKind::Window,
+            AccessMode::SET_ATTR,
+            Some(RequestOpcodes { major: 2, minor: 0 }),
+        ),
+        (
+            CLIENT,
+            fixture.window,
+            ResourceKind::Window,
+            AccessMode::GET_ATTR,
+            Some(RequestOpcodes { major: 3, minor: 0 }),
+        ),
+        (
+            CLIENT,
+            fixture.destroy_window,
+            ResourceKind::Window,
+            AccessMode::DESTROY,
+            Some(RequestOpcodes { major: 4, minor: 0 }),
+        ),
+        (
+            CLIENT,
+            fixture.destroy_parent,
+            ResourceKind::Window,
+            AccessMode::REMOVE,
+            Some(RequestOpcodes { major: 4, minor: 0 }),
+        ),
+        (
+            CLIENT,
+            fixture.subwindows_parent,
+            ResourceKind::Window,
+            AccessMode::REMOVE,
+            Some(RequestOpcodes { major: 5, minor: 0 }),
+        ),
+        (
+            CLIENT,
+            fixture.subwindow_children[0],
+            ResourceKind::Window,
+            AccessMode::DESTROY,
+            Some(RequestOpcodes { major: 5, minor: 0 }),
+        ),
+        (
+            CLIENT,
+            fixture.subwindow_children[1],
+            ResourceKind::Window,
+            AccessMode::DESTROY,
+            Some(RequestOpcodes { major: 5, minor: 0 }),
+        ),
+        (
+            CLIENT,
+            fixture.window,
+            ResourceKind::Window,
+            AccessMode::MANAGE,
+            Some(RequestOpcodes { major: 6, minor: 0 }),
+        ),
+    ];
+    assert_eq!(expected_resource_checks(&calls.lock().unwrap()), expected);
+    let recorded = calls.lock().unwrap();
+    let creation = recorded
+        .iter()
+        .find(|call| call.target.is_some_and(|target| target.id == created))
+        .expect("CreateWindow creation check");
+    assert_eq!(
+        creation.target.unwrap().creation,
+        Some(Creation {
+            parent: Some(ROOT_WINDOW),
+            owner: CLIENT,
+        })
+    );
+    assert!(fixture.state.resources.window(created).is_some());
+}
+
+struct DestroySubwindowsFixture {
+    state: ServerState,
+    backend: RecordingBackend,
+    requester: UnixStream,
+    observer: UnixStream,
+    parent: ResourceId,
+    children: Vec<ResourceId>,
+}
+
+fn mapped_destroy_subwindows_fixture() -> DestroySubwindowsFixture {
+    let mut state = ServerState::new();
+    let mut requester = install_client(&mut state, CLIENT.0);
+    let observer = install_client(&mut state, 2);
+    let mut backend = RecordingBackend::new();
+    let parent = ResourceId(0x0055_0001);
+    let children = [
+        ResourceId(0x0055_0002),
+        ResourceId(0x0055_0003),
+        ResourceId(0x0055_0004),
+    ];
+    let mut sequence = 1;
+    create_test_window(
+        &mut state,
+        &mut backend,
+        &mut requester,
+        &mut sequence,
+        parent,
+        ROOT_WINDOW,
+    );
+    for child in children {
+        create_test_window(
+            &mut state,
+            &mut backend,
+            &mut requester,
+            &mut sequence,
+            child,
+            parent,
+        );
+    }
+    for window in [parent, children[0], children[1], children[2]] {
+        let bytes = resource_request(
+            &mut state,
+            &mut backend,
+            &mut requester,
+            sequence,
+            8,
+            0,
+            &words(&[window.0]),
+        );
+        assert_no_error(&bytes, "DestroySubwindows fixture MapWindow");
+        sequence += 1;
+    }
+    let children = state.resources.children(parent).to_vec();
+    let observer_state = state.clients.get_mut(&2).expect("observer client");
+    for child in &children {
+        observer_state.event_masks.insert(*child, 0x0002_0000);
+    }
+    DestroySubwindowsFixture {
+        state,
+        backend,
+        requester,
+        observer,
+        parent,
+        children,
+    }
+}
+
+fn event_type_and_window(bytes: &[u8]) -> Vec<(u8, ResourceId)> {
+    assert_eq!(bytes.len() % 32, 0, "event stream has complete X11 events");
+    bytes
+        .chunks_exact(32)
+        .map(|event| {
+            (
+                event[0] & 0x7f,
+                ResourceId(u32::from_le_bytes(event[8..12].try_into().unwrap())),
+            )
+        })
+        .collect()
+}
+
+fn destroy_subwindows_wire_bytes(child_count: usize, allow_policy: bool) -> (Vec<u8>, Vec<u8>) {
+    let mut state = ServerState::new();
+    let mut requester = install_client(&mut state, CLIENT.0);
+    let mut observer = install_client(&mut state, 2);
+    let mut backend = RecordingBackend::new();
+    let parent = ResourceId(0x0056_0001);
+    let children = [
+        ResourceId(0x0056_0002),
+        ResourceId(0x0056_0003),
+        ResourceId(0x0056_0004),
+    ];
+    let mut sequence = 1;
+    create_test_window(
+        &mut state,
+        &mut backend,
+        &mut requester,
+        &mut sequence,
+        parent,
+        ROOT_WINDOW,
+    );
+    for child in children.iter().take(child_count) {
+        create_test_window(
+            &mut state,
+            &mut backend,
+            &mut requester,
+            &mut sequence,
+            *child,
+            parent,
+        );
+    }
+    for window in std::iter::once(parent).chain(children.into_iter().take(child_count)) {
+        let bytes = resource_request(
+            &mut state,
+            &mut backend,
+            &mut requester,
+            sequence,
+            8,
+            0,
+            &words(&[window.0]),
+        );
+        assert_no_error(&bytes, "DestroySubwindows byte fixture MapWindow");
+        sequence += 1;
+    }
+    for child in state.resources.children(parent).to_vec() {
+        state
+            .clients
+            .get_mut(&2)
+            .expect("observer client")
+            .event_masks
+            .insert(child, 0x0002_0000);
+    }
+    if allow_policy {
+        state.install_access_policy(Arc::new(RecordingExtensionPolicy {
+            decision: Decision::Allow,
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }));
+    }
+    let request_bytes = resource_request(
+        &mut state,
+        &mut backend,
+        &mut requester,
+        sequence,
+        5,
+        0,
+        &words(&[parent.0]),
+    );
+    let event_bytes = read_all_available(&mut observer);
+    (request_bytes, event_bytes)
+}
+
+#[test]
+fn destroy_subwindows_denied_child_stops_the_loop() {
+    // Mutation: check before the bulk unmap, or continue after the first child denial; each changes these event/state assertions.
+    let mut fixture = mapped_destroy_subwindows_fixture();
+    let [c1, c2, c3] = fixture.children.as_slice() else {
+        panic!("three children");
+    };
+    let c1 = *c1;
+    let c2 = *c2;
+    let c3 = *c3;
+    let child_hosts = fixture
+        .children
+        .iter()
+        .map(|child| {
+            (
+                *child,
+                fixture
+                    .state
+                    .resources
+                    .window(*child)
+                    .and_then(|window| window.host_xid)
+                    .expect("mapped fixture host window")
+                    .as_raw(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(WindowResourcePolicy {
+            calls: Arc::clone(&calls),
+            deny_id: Some(Arc::new(AtomicU32::new(c2.0))),
+            deny_mode: Some(AccessMode::DESTROY),
+            deny_hides: false,
+        }));
+    let backend_before = fixture.backend.calls();
+    let bytes = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.requester,
+        20,
+        5,
+        0,
+        &words(&[fixture.parent.0]),
+    );
+    assert!(bytes.is_empty(), "derived-target denial returns Success");
+    let events = read_all_available(&mut fixture.observer);
+    assert_eq!(
+        event_type_and_window(&events),
+        [(18, c1), (18, c2), (18, c3), (17, c1)],
+        "bulk UnmapNotify events precede the allowed child's DestroyNotify"
+    );
+    assert!(
+        fixture.state.resources.window(c1).is_none(),
+        "first child destroyed"
+    );
+    for child in [c2, c3] {
+        assert_eq!(
+            fixture
+                .state
+                .resources
+                .window(child)
+                .map(|window| window.map_state),
+            Some(crate::resources::MapState::Unmapped),
+            "remaining child stays present and unmapped"
+        );
+    }
+    assert_eq!(fixture.state.resources.children(fixture.parent), &[c2, c3]);
+    let calls_after = fixture.backend.calls();
+    let new_calls = &calls_after[backend_before.len()..];
+    let unmapped = new_calls
+        .iter()
+        .filter_map(|call| match call {
+            RecordedCall::UnmapSubwindow(host) => Some(*host),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        unmapped,
+        fixture
+            .children
+            .iter()
+            .map(|child| child_hosts.iter().find(|(id, _)| id == child).unwrap().1)
+            .collect::<Vec<_>>(),
+        "all children are unmapped before the destroy loop"
+    );
+    let destroyed = new_calls
+        .iter()
+        .filter_map(|call| match call {
+            RecordedCall::DestroySubwindow(host) => Some(*host),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        destroyed,
+        [child_hosts.iter().find(|(id, _)| *id == c1).unwrap().1]
+    );
+    assert_eq!(
+        expected_resource_checks(&calls.lock().unwrap()),
+        [
+            (
+                CLIENT,
+                fixture.parent,
+                ResourceKind::Window,
+                AccessMode::REMOVE,
+                Some(RequestOpcodes { major: 5, minor: 0 })
+            ),
+            (
+                CLIENT,
+                c1,
+                ResourceKind::Window,
+                AccessMode::DESTROY,
+                Some(RequestOpcodes { major: 5, minor: 0 })
+            ),
+            (
+                CLIENT,
+                c2,
+                ResourceKind::Window,
+                AccessMode::DESTROY,
+                Some(RequestOpcodes { major: 5, minor: 0 })
+            ),
+        ]
+    );
+
+    let empty_without_policy = destroy_subwindows_wire_bytes(0, false);
+    let empty_with_policy = destroy_subwindows_wire_bytes(0, true);
+    assert_eq!(
+        empty_with_policy, empty_without_policy,
+        "empty list preserves today's bytes"
+    );
+    let populated_without_policy = destroy_subwindows_wire_bytes(3, false);
+    let populated_with_policy = destroy_subwindows_wire_bytes(3, true);
+    assert_eq!(
+        populated_with_policy, populated_without_policy,
+        "allow-all policy preserves today's event bytes"
+    );
+}
+
+#[test]
+fn destroy_subwindows_bulk_unmap_ignores_hide() {
+    // Mutation: put a HIDE check in the shared unmap helper; denying HIDE must not keep a child mapped here.
+    let mut fixture = mapped_destroy_subwindows_fixture();
+    let [c1, c2, c3] = fixture.children.as_slice() else {
+        panic!("three children");
+    };
+    let (c1, c2, c3) = (*c1, *c2, *c3);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(WindowResourcePolicy {
+            calls: Arc::clone(&calls),
+            deny_id: Some(Arc::new(AtomicU32::new(c2.0))),
+            deny_mode: Some(AccessMode::DESTROY),
+            deny_hides: true,
+        }));
+    let bytes = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.requester,
+        21,
+        5,
+        0,
+        &words(&[fixture.parent.0]),
+    );
+    assert!(bytes.is_empty(), "derived-target denial returns Success");
+    assert_eq!(
+        event_type_and_window(&read_all_available(&mut fixture.observer)),
+        [(18, c1), (18, c2), (18, c3), (17, c1)]
+    );
+    assert!(fixture.state.resources.window(c1).is_none());
+    for child in [c2, c3] {
+        assert_eq!(
+            fixture
+                .state
+                .resources
+                .window(child)
+                .map(|window| window.map_state),
+            Some(crate::resources::MapState::Unmapped)
+        );
+    }
+    assert!(
+        expected_resource_checks(&calls.lock().unwrap())
+            .iter()
+            .all(|(_, _, _, mode, _)| *mode != AccessMode::HIDE),
+        "DestroySubwindows asks only REMOVE and DESTROY"
+    );
+}
+
+#[test]
+fn destroy_window_checks_parent_remove() {
+    // Mutation: omit the parent REMOVE check; DestroyWindow must then destroy the target instead of returning this denial.
+    let mut fixture = window_access_fixture();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(WindowResourcePolicy {
+            calls: Arc::clone(&calls),
+            deny_id: Some(Arc::new(AtomicU32::new(fixture.destroy_parent.0))),
+            deny_mode: Some(AccessMode::REMOVE),
+            deny_hides: false,
+        }));
+    let target_before = format!(
+        "{:?}",
+        fixture.state.resources.window(fixture.destroy_window)
+    );
+    let backend_before = fixture.backend.calls();
+    let bytes = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.peer,
+        30,
+        4,
+        0,
+        &words(&[fixture.destroy_window.0]),
+    );
+    assert_x11_error(&bytes, x11::error::BAD_VALUE, 0x55, 4, 30);
+    assert_eq!(fixture.backend.calls(), backend_before);
+    assert_eq!(
+        format!(
+            "{:?}",
+            fixture.state.resources.window(fixture.destroy_window)
+        ),
+        target_before
+    );
+    assert_eq!(
+        expected_resource_checks(&calls.lock().unwrap()),
+        [
+            (
+                CLIENT,
+                fixture.destroy_window,
+                ResourceKind::Window,
+                AccessMode::DESTROY,
+                Some(RequestOpcodes { major: 4, minor: 0 })
+            ),
+            (
+                CLIENT,
+                fixture.destroy_parent,
+                ResourceKind::Window,
+                AccessMode::REMOVE,
+                Some(RequestOpcodes { major: 4, minor: 0 })
+            ),
+        ]
+    );
 }

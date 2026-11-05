@@ -192,6 +192,11 @@ fn destroy_window_owning_selection_fires_window_destroy_notify_and_clears_owners
         None,
         ClientId(OWNER_ID),
         SequenceNumber(1),
+        RequestHeader {
+            opcode: 4,
+            data: 0,
+            length_units: 2,
+        },
         &body,
     )
     .expect("handle_destroy_window");
@@ -1030,6 +1035,11 @@ fn destroy_window_owning_selection_carries_prior_last_time_changed_in_selection_
         None,
         ClientId(OWNER_ID),
         SequenceNumber(2),
+        RequestHeader {
+            opcode: 4,
+            data: 0,
+            length_units: 2,
+        },
         &destroy_body,
     )
     .expect("handle_destroy_window");
@@ -1435,6 +1445,11 @@ fn assert_stale_set_after_release_is_ignored(release: RecordRelease) {
                 None,
                 ClientId(REC_A),
                 SequenceNumber(4),
+                RequestHeader {
+                    opcode: 4,
+                    data: 0,
+                    length_units: 2,
+                },
                 &REC_WIN_A.to_le_bytes(),
             )
             .expect("handle_destroy_window");

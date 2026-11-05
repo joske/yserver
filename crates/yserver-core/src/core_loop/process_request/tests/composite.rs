@@ -1607,6 +1607,11 @@ fn destroy_window_request(f: &mut CowFixture, window: ResourceId) {
         None,
         ClientId(COW_APP),
         SequenceNumber(5),
+        RequestHeader {
+            opcode: 4,
+            data: 0,
+            length_units: 2,
+        },
         &window.0.to_le_bytes(),
     )
     .expect("DestroyWindow");
@@ -1619,6 +1624,11 @@ fn destroy_subwindows_request(f: &mut CowFixture) {
         None,
         ClientId(COW_APP),
         SequenceNumber(5),
+        RequestHeader {
+            opcode: 5,
+            data: 0,
+            length_units: 2,
+        },
         &ROOT_WINDOW.0.to_le_bytes(),
     )
     .expect("DestroySubwindows");

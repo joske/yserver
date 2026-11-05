@@ -711,6 +711,11 @@ fn cwa_cursor_none_propagates_define_cursor_zero_to_backend() {
         None,
         ClientId(CLIENT_ID),
         SequenceNumber(1),
+        RequestHeader {
+            opcode: 2,
+            data: 0,
+            length_units: 4,
+        },
         &body,
     )
     .expect("handle_change_window_attributes");
@@ -804,6 +809,11 @@ fn cursor_only_cwa_does_not_steal_keyboard_focus() {
         None,
         ClientId(CLIENT_ID),
         SequenceNumber(1),
+        RequestHeader {
+            opcode: 2,
+            data: 0,
+            length_units: 4,
+        },
         &body,
     )
     .expect("handle_change_window_attributes");
@@ -3387,6 +3397,11 @@ fn destroy_window_on_root_is_a_no_op() {
         None,
         ClientId(CLIENT_ID),
         SequenceNumber(1),
+        RequestHeader {
+            opcode: 4,
+            data: 0,
+            length_units: 2,
+        },
         &ROOT_WINDOW.0.to_le_bytes(),
     )
     .expect("handle_destroy_window");
@@ -3721,6 +3736,11 @@ fn destroy_t_and_read_order_stream(state: &mut ServerState, obs: &mut UnixStream
         None,
         ClientId(1),
         SequenceNumber(1),
+        RequestHeader {
+            opcode: 4,
+            data: 0,
+            length_units: 2,
+        },
         &ORDER_T.to_le_bytes(),
     )
     .expect("handle_destroy_window");
@@ -3804,6 +3824,11 @@ fn destroy_window_drops_passive_grabs_and_a_recycled_id_does_not_match_them() {
         None,
         ClientId(1),
         SequenceNumber(1),
+        RequestHeader {
+            opcode: 4,
+            data: 0,
+            length_units: 2,
+        },
         &WIN.to_le_bytes(),
     )
     .expect("handle_destroy_window");
@@ -3991,6 +4016,11 @@ fn disconnect_of_the_selection_setter_sends_client_close_for_a_window_it_does_no
         None,
         ClientId(ORDER_APP),
         SequenceNumber(2),
+        RequestHeader {
+            opcode: 4,
+            data: 0,
+            length_units: 2,
+        },
         &ORDER_T.to_le_bytes(),
     )
     .expect("handle_destroy_window");
