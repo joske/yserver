@@ -19,7 +19,8 @@ name: Release
 # failed distro build would strand a public release, so the order is
 # deliberately inverted.)
 #
-# The release ships the distro packages and nothing else. It used to upload its
+# The release ships the distro packages and the Windows zips, which ci.yml's
+# `windows` job builds inside the `ci` stage. It used to upload its
 # own git-archive tarball plus SHA256SUMS/SHA512SUMS, on the grounds that
 # GitHub's auto-generated /archive/ tarballs are produced on demand and are not
 # guaranteed byte-stable (they changed once in 2023, invalidating pinned
@@ -347,6 +348,38 @@ jobs:
           ref: ${{ needs.checks.outputs.sha }}
           fetch-depth: 0
 
+      # Built by ci.yml's `windows` job in this same run (the `ci` stage), so
+      # `release` never starts if either leg failed. Fetched before the draft
+      # exists so a missing zip fails with nothing created.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: yserver-*-windows-*.zip
+          path: dist-windows
+          merge-multiple: true
+          # The artifacts are bare .zip files (`archive: false`); without this
+          # the action would unpack them.
+          skip-decompress: true
+
+      - name: Check the Windows zips
+        env:
+          V: ${{ needs.checks.outputs.version }}
+        run: |
+          set -eu
+          # Exact names: package.ps1 takes the version from Cargo.toml, which
+          # `checks` matched against the tag.
+          printf 'yserver-%s-windows-%s.zip\n' "$V" aarch64 "$V" x86_64 \
+            | LC_ALL=C sort > winnames
+          got=$(find dist-windows -type f -printf '%f\n' | LC_ALL=C sort)
+          if [ "$got" != "$(cat winnames)" ]; then
+            echo "::error::the Windows zips do not match version $V"
+            echo "expected:"; cat winnames
+            echo "got:"; printf '%s\n' "$got"
+            exit 1
+          fi
+          while read -r z; do
+            unzip -tq "dist-windows/$z" || { echo "::error::$z is not a valid zip"; exit 1; }
+          done < winnames
+
       - name: Create the release as a draft
         env:
           GH_TOKEN: ${{ github.token }}
@@ -377,7 +410,7 @@ jobs:
           set -- --draft --verify-tag --title "yserver $V" --generate-notes
           [ -z "$PREV" ] || set -- "$@" --notes-start-tag "$PREV"
           # No files here: GitHub's own auto-generated source archives are the
-          # source download, and the distro packages are attached below.
+          # source download, and the packages and zips are attached below.
           gh release create "$TAG" "$@"
 
       - name: Attach the distro packages built for this tag
@@ -445,6 +478,7 @@ jobs:
           # rather than fails. Reads the list rather than globbing: the Fedora
           # RPMs arrive nested under RPMS/<arch>/.
           xargs -0 -a pkglist -- gh release upload "$TAG" --clobber
+          sed 's|^|dist-windows/|' winnames | xargs -d '\n' -- gh release upload "$TAG" --clobber
 
       - name: Verify the draft's assets before publishing
         env:
@@ -465,14 +499,15 @@ jobs:
           # unrelated packaging run.
           # LC_ALL=C on both sides: collation of '-' vs '_' is locale-dependent,
           # and the two lists are sorted in different steps.
-          attached=$(printf '%s\n' "$names" | grep -E '\.(rpm|deb|apk)$' | LC_ALL=C sort || true)
-          if [ "$attached" != "$(cat pkgnames)" ]; then
-            echo "::error::attached packages do not match what was downloaded"
-            echo "expected:"; cat pkgnames
+          attached=$(printf '%s\n' "$names" | grep -E '\.(rpm|deb|apk|zip)$' | LC_ALL=C sort || true)
+          expected=$(cat pkgnames winnames | LC_ALL=C sort)
+          if [ "$attached" != "$expected" ]; then
+            echo "::error::attached assets do not match what was downloaded"
+            echo "expected:"; printf '%s\n' "$expected"
             echo "attached:"; printf '%s\n' "$attached"
             exit 1
           fi
-          echo "package inventory matches."
+          echo "asset inventory matches."
 
       - name: Report the source-archive checksums for downstream recipes
         env:
@@ -502,6 +537,12 @@ jobs:
             echo '```'
             echo "sha256  $sha256"
             echo "sha512  $sha512"
+            echo '```'
+            echo
+            echo "Windows zips:"
+            echo
+            echo '```'
+            (cd dist-windows && xargs -a ../winnames sha256sum)
             echo '```'
             echo
             echo "For \`alpine/APKBUILD\` (or run \`abuild checksum\`):"
