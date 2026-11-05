@@ -688,4 +688,5 @@ fn apply_pointer_warp(
     state.barrier_bypass = true;
     backend.warp_pointer_root(state, x, y);
     state.barrier_bypass = prev;
+    crate::rootless::note_warp(state, x, y);
 }

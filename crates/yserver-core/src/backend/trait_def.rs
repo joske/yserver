@@ -3032,6 +3032,13 @@ pub trait Backend {
     /// Default no-op for backends that draw no sprite of their own.
     fn set_cursor_hidden(&mut self, _hidden: bool) {}
 
+    /// Whether the cursor the user sees shows nothing: the `None` cursor,
+    /// XFIXES `HideCursor`, or a cursor whose every pixel is transparent.
+    /// Rootless mode's pointer lock reads it (`rootless/lock.rs`).
+    fn displayed_cursor_hidden(&self) -> bool {
+        false
+    }
+
     /// Take the pending "the effective cursor changed" report, if the sprite
     /// switched to a different cursor since the last call. Drained by the
     /// core after every request and loop iteration to send XFIXES
