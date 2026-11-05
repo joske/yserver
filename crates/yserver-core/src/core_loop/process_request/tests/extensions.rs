@@ -547,6 +547,7 @@ fn extension_access_denial_does_not_deny_dispatch() {
 
 #[test]
 fn every_extension_dispatch_denial_answers_bad_request() {
+    // Value 0 is deliberate, not Xorg parity: Xorg sends the stale client->errorValue here.
     // Mutation: return the policy's DenyError; the packet must still be BadRequest with value 0.
     for extension in crate::nested::EXTENSIONS {
         let mut state = ServerState::new();

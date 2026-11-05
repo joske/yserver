@@ -296,6 +296,10 @@ pub fn process_request(
             }),
         )
     {
+        debug!(
+            "client {} #{} {} request (major {} minor {}) denied by access policy -> BadRequest",
+            client_id.0, sequence.0, extension.name, header.opcode, header.data
+        );
         if extension.name == "BIG-REQUESTS" && header.data == 0 {
             misc::release_big_requests_reader(state, client_id);
         }

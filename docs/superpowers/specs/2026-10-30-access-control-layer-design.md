@@ -220,7 +220,7 @@ Xnamespace tells apart requests that share a mode:
 | Core `SendEvent` | no delivery, and the request succeeds |
 | Receive | no delivery and no error |
 | Extension access | the extension is reported as absent |
-| Extension dispatch | `BadRequest` with value 0, as Xorg (`Xext/xace.c:45-46`), whatever the policy's error |
+| Extension dispatch | `BadRequest` with value 0, whatever the policy's error. Xorg also answers `BadRequest` (`Xext/xace.c:45-46`), but with `client->errorValue` as the value (`dix/dispatch.c:571-573`); that field is not reset between requests and successful handlers set it (`CreateGC`, `dix/dispatch.c:1559`), so Xorg leaks a stale value. Value 0 leaks nothing |
 | `QueryKeymap` and similar reads | the zeroed reply XLibre gives |
 | A derived target in `DestroySubwindows` | the loop stops, the remaining children stay unmapped, and the request succeeds (Xorg `dix/dispatch.c:852`) |
 
