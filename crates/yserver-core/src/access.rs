@@ -126,6 +126,28 @@ pub trait AccessPolicy: Send + Sync {
         Decision::Allow
     }
 
+    /// Decide whether an available extension is visible to a client during
+    /// `QueryExtension` or `ListExtensions` discovery.
+    fn extension_access(
+        &self,
+        _ctx: &AccessContext<'_>,
+        _client: ClientId,
+        _extension: &str,
+    ) -> Decision {
+        Decision::Allow
+    }
+
+    /// Decide whether a request may be dispatched to an extension handler.
+    /// The request opcodes in `ctx` identify the operation being checked.
+    fn extension_dispatch(
+        &self,
+        _ctx: &AccessContext<'_>,
+        _client: ClientId,
+        _extension: &str,
+    ) -> Decision {
+        Decision::Allow
+    }
+
     fn client_connected(
         &self,
         _ctx: &AccessContext<'_>,

@@ -220,6 +220,7 @@ Xnamespace tells apart requests that share a mode:
 | Core `SendEvent` | no delivery, and the request succeeds |
 | Receive | no delivery and no error |
 | Extension access | the extension is reported as absent |
+| Extension dispatch | `BadRequest` with value 0, whatever the policy's error. Xorg also answers `BadRequest` (`Xext/xace.c:45-46`), but with `client->errorValue` as the value (`dix/dispatch.c:571-573`); that field is not reset between requests and successful handlers set it (`CreateGC`, `dix/dispatch.c:1559`), so Xorg leaks a stale value. Value 0 leaks nothing |
 | `QueryKeymap` and similar reads | the zeroed reply XLibre gives |
 | A derived target in `DestroySubwindows` | the loop stops, the remaining children stay unmapped, and the request succeeds (Xorg `dix/dispatch.c:852`) |
 
@@ -355,8 +356,9 @@ they drop what they hold per client.
 
 `reject_non_local_extension_request` is not a permission policy. Its rules come
 from the transport, it must apply with no policy installed, and it answers with
-a specific error per extension and minor. It stays where it is, unchanged, and
-the dispatch check runs right after it.
+a specific error per extension and minor. It stays where it is, unchanged. The
+dispatch check runs after the gate and after the maximum-length `BadLength`, as
+in Xorg (`dix/dispatch.c:546-549`).
 
 ## The series
 

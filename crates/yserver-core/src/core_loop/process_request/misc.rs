@@ -237,42 +237,56 @@ pub(super) fn handle_x_resource_request(
 /// `nested::extension_query_reply` but operates on a live
 /// `&mut dyn Backend` instead of `Option<&Arc<Mutex<dyn Backend>>>`.
 pub(super) fn extension_query_reply(name: &str, backend: &mut dyn Backend) -> Option<(u8, u8, u8)> {
-    use crate::nested::{EXTENSIONS, ExtensionAvailability};
+    use crate::nested::EXTENSIONS;
     let ext = EXTENSIONS.iter().find(|ext| ext.name == name)?;
-    let available = match ext.availability {
-        ExtensionAvailability::Always => true,
-        ExtensionAvailability::HostRender => backend.render_opcode().is_some(),
-        ExtensionAvailability::HostXkb => backend.xkb_opcode().is_some(),
-        ExtensionAvailability::Dri3 => backend.dri3_capabilities().version != (0, 0),
-        ExtensionAvailability::Glx => backend.glx_available(),
-        ExtensionAvailability::Unix => cfg!(unix),
-    };
-    if !available {
+    if !extension_available(ext, backend) {
         return None;
     }
-    if ext.availability == ExtensionAvailability::HostXkb {
+    if ext.availability == crate::nested::ExtensionAvailability::HostXkb {
         let (_, first_event, first_error) = backend.xkb_info()?;
         return Some((ext.major_opcode, first_event, first_error));
     }
     Some((ext.major_opcode, ext.first_event, ext.first_error))
 }
 
+pub(super) fn extension_available(
+    ext: &crate::nested::ExtensionMetadata,
+    backend: &mut dyn Backend,
+) -> bool {
+    use crate::nested::ExtensionAvailability;
+    match ext.availability {
+        ExtensionAvailability::Always => true,
+        ExtensionAvailability::HostRender => backend.render_opcode().is_some(),
+        ExtensionAvailability::HostXkb => backend.xkb_opcode().is_some(),
+        ExtensionAvailability::Dri3 => backend.dri3_capabilities().version != (0, 0),
+        ExtensionAvailability::Glx => backend.glx_available(),
+        ExtensionAvailability::Unix => cfg!(unix),
+    }
+}
+
+/// Find the registered extension handler for a major opcode. Discovery
+/// availability is deliberately not part of this lookup: dispatch is fixed
+/// by the server's opcode table even when a backend hides the extension.
+pub(super) fn extension_by_opcode(major: u8) -> Option<&'static crate::nested::ExtensionMetadata> {
+    crate::nested::EXTENSIONS
+        .iter()
+        .find(|extension| extension.major_opcode == major)
+}
+
+/// Release a reader waiting for the result of BIG-REQUESTS Enable.
+pub(super) fn release_big_requests_reader(state: &ServerState, client_id: ClientId) {
+    if let Some(client) = state.clients.get(&client_id.0)
+        && let Some(tx) = client.reader_control.as_ref()
+    {
+        let _ = tx.send(crate::server::ReaderControl::IgnoreBigRequests);
+    }
+}
+
 pub(super) fn advertised_extension_names(backend: &mut dyn Backend) -> Vec<&'static str> {
-    use crate::nested::{EXTENSIONS, ExtensionAvailability};
-    let render_available = backend.render_opcode().is_some();
-    let xkb_available = backend.xkb_opcode().is_some();
-    let dri3_available = backend.dri3_capabilities().version != (0, 0);
-    let glx_available = backend.glx_available();
+    use crate::nested::EXTENSIONS;
     EXTENSIONS
         .iter()
-        .filter(|ext| match ext.availability {
-            ExtensionAvailability::Always => true,
-            ExtensionAvailability::HostRender => render_available,
-            ExtensionAvailability::HostXkb => xkb_available,
-            ExtensionAvailability::Dri3 => dri3_available,
-            ExtensionAvailability::Glx => glx_available,
-            ExtensionAvailability::Unix => cfg!(unix),
-        })
+        .filter(|ext| extension_available(ext, backend))
         .map(|ext| ext.name)
         .collect()
 }
@@ -693,11 +707,7 @@ pub(super) fn handle_big_requests_request(
         // Apply / Ignore signal after sending the Enable through the
         // channel; unblock it with `IgnoreBigRequests` so it doesn't
         // deadlock.
-        if let Some(client) = state.clients.get(&client_id.0)
-            && let Some(tx) = client.reader_control.as_ref()
-        {
-            let _ = tx.send(crate::server::ReaderControl::IgnoreBigRequests);
-        }
+        release_big_requests_reader(state, client_id);
         return emit_x11_error_with_minor(
             state,
             client_id,
@@ -737,7 +747,23 @@ pub(super) fn handle_query_extension(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let name = x11::query_extension_name(body);
-    let (present, major_opcode, first_event, first_error) = extension_query_reply(&name, backend)
+    let mut extension = extension_query_reply(&name, backend);
+    if state.policies_installed() {
+        extension = extension.filter(|_| {
+            matches!(
+                state.check_extension_access(
+                    client_id,
+                    &name,
+                    Some(RequestOpcodes {
+                        major: 98,
+                        minor: 0,
+                    }),
+                ),
+                Decision::Allow
+            )
+        });
+    }
+    let (present, major_opcode, first_event, first_error) = extension
         .map(|(major_opcode, first_event, first_error)| {
             (true, major_opcode, first_event, first_error)
         })
@@ -773,7 +799,22 @@ pub(super) fn handle_list_extensions(
     sequence: SequenceNumber,
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} ListExtensions", client_id.0, sequence.0);
-    let names = advertised_extension_names(backend);
+    let mut names = advertised_extension_names(backend);
+    if state.policies_installed() {
+        names.retain(|name| {
+            matches!(
+                state.check_extension_access(
+                    client_id,
+                    name,
+                    Some(RequestOpcodes {
+                        major: 99,
+                        minor: 0,
+                    }),
+                ),
+                Decision::Allow
+            )
+        });
+    }
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };

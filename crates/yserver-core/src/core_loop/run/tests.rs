@@ -5251,6 +5251,238 @@ fn run_core_keeps_policies_installed_before_it() {
     assert!(Arc::ptr_eq(&state.host_access.policies[0], &policy));
 }
 
+fn queue_reader_test_client(
+    sender: &crate::core_loop::sender::BoundSender,
+    id: u32,
+    stream: std::os::unix::net::UnixStream,
+) {
+    sender
+        .send(Message::ClientSetupComplete {
+            id: yserver_protocol::x11::ClientId(id),
+            generation: sender.generation(),
+            stream: crate::transport::Transport::Unix(stream),
+            resource_id_base: id << 20,
+            resource_id_mask: 0x000F_FFFF,
+            byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
+            is_local: true,
+            fd_passing: true,
+            internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
+            admission: crate::access::Admission::Internal,
+            setup_reply: Vec::new(),
+        })
+        .expect("queue test client setup");
+}
+
+fn enqueue_test_request(
+    sender: &crate::core_loop::sender::BoundSender,
+    id: u32,
+    sequence: u16,
+    opcode: u8,
+    minor: u8,
+    body: &[u8],
+) {
+    sender
+        .send(Message::Request {
+            id: yserver_protocol::x11::ClientId(id),
+            sequence: yserver_protocol::x11::SequenceNumber(sequence),
+            accepted_at: None,
+            header: yserver_protocol::x11::RequestHeader {
+                opcode,
+                data: minor,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            body: body.to_vec(),
+            attached_fd: None,
+        })
+        .expect("queue test request");
+}
+
+struct DenyExtensionDispatchPolicy;
+
+impl crate::access::AccessPolicy for DenyExtensionDispatchPolicy {
+    fn extension_dispatch(
+        &self,
+        _ctx: &crate::access::AccessContext<'_>,
+        _client: yserver_protocol::x11::ClientId,
+        _extension: &str,
+    ) -> crate::access::Decision {
+        crate::access::Decision::Deny(crate::access::DenyError {
+            code: yserver_protocol::x11::error::BAD_VALUE,
+            value: 0x55,
+        })
+    }
+}
+
+#[test]
+fn denied_big_requests_enable_keeps_the_connection_working() {
+    // Mutation: drop IgnoreBigRequests on dispatch denial; the following GetInputFocus reply times out.
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        time::Duration,
+    };
+
+    let mut state = ServerState::new();
+    state.install_access_policy(std::sync::Arc::new(DenyExtensionDispatchPolicy));
+    let (poll, sender, receiver) = crate::core_loop::channel().expect("core channel");
+    let client_sender = sender.bind();
+    let (server_stream, mut peer) = UnixStream::pair().expect("client socket pair");
+    peer.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("peer read timeout");
+    queue_reader_test_client(&client_sender, 1, server_stream);
+    let sender_for_core = sender.clone_handle();
+    let runner = std::thread::spawn(move || {
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        run_core(
+            poll,
+            receiver,
+            sender_for_core,
+            &mut state,
+            &mut backend,
+            [],
+            &ClientIdAllocator::new(),
+            AuthState::new(None),
+            ResetPolicy::NoReset,
+            None,
+        )
+    });
+
+    let interaction = (|| -> std::io::Result<([u8; 32], [u8; 32])> {
+        // BIG-REQUESTS Enable, followed immediately by normally framed GetInputFocus.
+        peer.write_all(&[135, 0, 1, 0, 43, 0, 1, 0])?;
+        let mut error = [0; 32];
+        peer.read_exact(&mut error)?;
+        let mut focus = [0; 32];
+        peer.read_exact(&mut focus)?;
+        Ok((error, focus))
+    })();
+    sender.send(Message::Shutdown).expect("shutdown core");
+    runner
+        .join()
+        .expect("core thread panicked")
+        .expect("run core");
+    let (error, focus) = interaction.expect("reader resumes after denied Enable");
+    assert_eq!(error[0], 0);
+    assert_eq!(error[1], yserver_protocol::x11::error::BAD_REQUEST);
+    assert_eq!(&error[2..4], &1u16.to_le_bytes());
+    assert_eq!(&error[4..10], &[0; 6]);
+    assert_eq!(error[10], 135);
+    assert_eq!(focus[0], 1, "second request receives GetInputFocus reply");
+    assert_eq!(&focus[2..4], &2u16.to_le_bytes());
+}
+
+struct RevokeOnOwnerDispatch(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl crate::access::AccessPolicy for RevokeOnOwnerDispatch {
+    fn extension_dispatch(
+        &self,
+        _ctx: &crate::access::AccessContext<'_>,
+        client: yserver_protocol::x11::ClientId,
+        _extension: &str,
+    ) -> crate::access::Decision {
+        if client.0 == 1 {
+            // Client A's checked XFIXES request runs only after B's request
+            // has been parked behind A's server grab.
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::access::Decision::Allow
+        } else if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            crate::access::Decision::Deny(crate::access::DenyError {
+                code: yserver_protocol::x11::error::BAD_VALUE,
+                value: 0x55,
+            })
+        } else {
+            crate::access::Decision::Allow
+        }
+    }
+}
+
+#[test]
+fn held_extension_request_is_checked_when_the_grab_releases() {
+    // Mutation: cache B's Allow while queueing its held request; after A revokes, B would get a normal reply.
+    use std::{io::Read, os::unix::net::UnixStream, time::Duration};
+
+    let revoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut state = ServerState::new();
+    state.install_access_policy(std::sync::Arc::new(RevokeOnOwnerDispatch(Arc::clone(
+        &revoked,
+    ))));
+    let (poll, sender, receiver) = crate::core_loop::channel().expect("core channel");
+    let client_sender = sender.bind();
+    let (server_a, mut peer_a) = UnixStream::pair().expect("client A socket pair");
+    let (server_b, mut peer_b) = UnixStream::pair().expect("client B socket pair");
+    for peer in [&peer_a, &peer_b] {
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("peer read timeout");
+    }
+    queue_reader_test_client(&client_sender, 1, server_a);
+    queue_reader_test_client(&client_sender, 2, server_b);
+    let sender_for_core = sender.clone_handle();
+    let runner = std::thread::spawn(move || {
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        run_core(
+            poll,
+            receiver,
+            sender_for_core,
+            &mut state,
+            &mut backend,
+            [],
+            &ClientIdAllocator::new(),
+            AuthState::new(None),
+            ResetPolicy::NoReset,
+            None,
+        )
+    });
+
+    let extension = crate::nested::EXTENSIONS
+        .iter()
+        .find(|extension| extension.name == "XFIXES")
+        .expect("XFIXES metadata");
+    let query_version = [5, 0, 0, 0, 0, 0, 0, 0];
+    enqueue_test_request(&client_sender, 1, 1, 36, 0, &[]); // GrabServer
+    enqueue_test_request(
+        &client_sender,
+        2,
+        1,
+        extension.major_opcode,
+        0,
+        &query_version,
+    );
+    enqueue_test_request(
+        &client_sender,
+        1,
+        2,
+        extension.major_opcode,
+        0,
+        &query_version,
+    );
+    enqueue_test_request(&client_sender, 1, 3, 37, 0, &[]); // UngrabServer
+
+    let replies = (|| -> std::io::Result<([u8; 32], [u8; 32])> {
+        let mut owner_reply = [0; 32];
+        peer_a.read_exact(&mut owner_reply)?;
+        let mut held_reply = [0; 32];
+        peer_b.read_exact(&mut held_reply)?;
+        Ok((owner_reply, held_reply))
+    })();
+    sender.send(Message::Shutdown).expect("shutdown core");
+    runner
+        .join()
+        .expect("core thread panicked")
+        .expect("run core");
+    let (owner_reply, held_reply) = replies.expect("both clients receive their dispatch results");
+    assert!(revoked.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        owner_reply[0], 1,
+        "A's request was allowed before revocation"
+    );
+    assert_eq!(held_reply[0], 0, "B's held request is denied on replay");
+    assert_eq!(held_reply[1], yserver_protocol::x11::error::BAD_REQUEST);
+    assert_eq!(&held_reply[2..4], &1u16.to_le_bytes());
+    assert_eq!(&held_reply[4..10], &[0; 6]);
+    assert_eq!(held_reply[10], extension.major_opcode);
+}
+
 // Mutation: assigning HostAccess to an InternalClient makes the stored-state
 // assertion fail after the production Message::InternalClient dispatch.
 #[test]

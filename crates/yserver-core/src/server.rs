@@ -1640,12 +1640,18 @@ impl ServerState {
         self.host_access.policies.push(policy);
     }
 
-    /// Ask installed policies about a server operation, stopping at the first denial.
-    pub(crate) fn check_server(
+    /// Whether at least one access policy is installed.
+    pub(crate) fn policies_installed(&self) -> bool {
+        !self.host_access.policies.is_empty()
+    }
+
+    fn first_denial(
         &self,
-        client: ClientId,
-        mode: crate::access::AccessMode,
         request: Option<crate::access::RequestOpcodes>,
+        ask: impl Fn(
+            &dyn crate::access::AccessPolicy,
+            &crate::access::AccessContext<'_>,
+        ) -> crate::access::Decision,
     ) -> crate::access::Decision {
         let policies = &self.host_access.policies;
         if policies.is_empty() {
@@ -1654,12 +1660,48 @@ impl ServerState {
 
         let context = crate::access::AccessContext::new(self, request);
         for policy in policies {
-            match policy.server(&context, client, mode) {
+            match ask(policy.as_ref(), &context) {
                 crate::access::Decision::Allow => {}
                 denial @ crate::access::Decision::Deny(_) => return denial,
             }
         }
         crate::access::Decision::Allow
+    }
+
+    /// Ask installed policies about a server operation, stopping at the first denial.
+    pub(crate) fn check_server(
+        &self,
+        client: ClientId,
+        mode: crate::access::AccessMode,
+        request: Option<crate::access::RequestOpcodes>,
+    ) -> crate::access::Decision {
+        self.first_denial(request, |policy, context| {
+            policy.server(context, client, mode)
+        })
+    }
+
+    /// Ask installed policies whether an extension is visible in discovery.
+    pub(crate) fn check_extension_access(
+        &self,
+        client: ClientId,
+        extension: &str,
+        request: Option<crate::access::RequestOpcodes>,
+    ) -> crate::access::Decision {
+        self.first_denial(request, |policy, context| {
+            policy.extension_access(context, client, extension)
+        })
+    }
+
+    /// Ask installed policies whether a request may be dispatched to an extension.
+    pub(crate) fn check_extension_dispatch(
+        &self,
+        client: ClientId,
+        extension: &str,
+        request: Option<crate::access::RequestOpcodes>,
+    ) -> crate::access::Decision {
+        self.first_denial(request, |policy, context| {
+            policy.extension_dispatch(context, client, extension)
+        })
     }
 
     /// Notify every installed policy in installation order.
