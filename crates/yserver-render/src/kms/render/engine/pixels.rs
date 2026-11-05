@@ -64,12 +64,20 @@ pub(super) fn unpack_to_staging(
                 // dst_w*dst_h*4 bytes; row * row_dst_bytes within.
                 unsafe {
                     let dst = dst_ptr.add(row as usize * row_dst_bytes);
-                    std::ptr::copy_nonoverlapping(src_slice.as_ptr(), dst, row_dst_bytes);
                     if src_depth == 24 {
-                        // Stomp alpha to 0xFF every 4th byte.
-                        for col in 0..dst_w as usize {
-                            *dst.add(col * 4 + 3) = 0xFF;
+                        // Alpha stomped to 0xFF as each texel is copied:
+                        // whole words, which the compiler vectorises, and
+                        // one pass over the destination -- which may be
+                        // memory the CPU should touch once (a GPU's).
+                        for (col, texel) in src_slice.chunks_exact(4).enumerate() {
+                            let word = u32::from_le_bytes([texel[0], texel[1], texel[2], texel[3]]);
+                            std::ptr::write_unaligned(
+                                dst.add(col * 4).cast::<u32>(),
+                                (word | 0xFF00_0000).to_le(),
+                            );
                         }
+                    } else {
+                        std::ptr::copy_nonoverlapping(src_slice.as_ptr(), dst, row_dst_bytes);
                     }
                 }
             }
