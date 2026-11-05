@@ -1714,3 +1714,164 @@ fn scrap_then_window_destroy_purge_releases_exactly_once() {
              present_id (harmless no-op on a real backend) and nothing else"
     );
 }
+
+/// Xorg rejects reuse of another client's Present event XID.
+/// Mutation: overwriting the existing selection lets this request succeed
+/// and changes the original owner's selection.
+#[test]
+fn present_select_input_on_other_clients_event_id_is_bad_match() {
+    use yserver_protocol::x11::present as x11present;
+
+    const OWNER: u32 = 1;
+    const WRITER: u32 = 2;
+    const EID: u32 = 0x0100_0042;
+    const OWNER_MASK: u32 = x11present::EVENT_MASK_COMPLETE_NOTIFY;
+
+    let mut state = ServerState::new();
+    let mut owner_peer = install_client(&mut state, OWNER);
+    let mut writer_peer = install_client(&mut state, WRITER);
+    let mut backend = RecordingBackend::new();
+
+    let select_body = |window: ResourceId, mask: u32| {
+        let mut body = EID.to_le_bytes().to_vec();
+        body.extend_from_slice(&window.0.to_le_bytes());
+        body.extend_from_slice(&mask.to_le_bytes());
+        body
+    };
+    process_request(
+        &mut state,
+        &mut backend,
+        ClientId(OWNER),
+        SequenceNumber(1),
+        RequestHeader {
+            opcode: 145,
+            data: x11present::SELECT_INPUT,
+            length_units: 4,
+        },
+        &select_body(ROOT_WINDOW, OWNER_MASK),
+        None,
+    )
+    .expect("owner SelectInput");
+
+    process_request(
+        &mut state,
+        &mut backend,
+        ClientId(WRITER),
+        SequenceNumber(7),
+        RequestHeader {
+            opcode: 145,
+            data: x11present::SELECT_INPUT,
+            length_units: 4,
+        },
+        &select_body(ROOT_WINDOW, x11present::EVENT_MASK_IDLE_NOTIFY),
+        None,
+    )
+    .expect("writer SelectInput");
+
+    let errors = wire_packets(&mut writer_peer);
+    assert_eq!(
+        errors.len(),
+        1,
+        "reusing another client's eid returns BadMatch"
+    );
+    assert_eq!(
+        error_fields(&errors[0]),
+        (
+            yserver_protocol::x11::error::BAD_MATCH,
+            EID,
+            u16::from(x11present::SELECT_INPUT),
+            145,
+        ),
+        "BadMatch carries the eid and Present SelectInput opcodes",
+    );
+
+    // The same owner cannot retarget an existing eid to a different window.
+    process_request(
+        &mut state,
+        &mut backend,
+        ClientId(OWNER),
+        SequenceNumber(2),
+        RequestHeader {
+            opcode: 145,
+            data: x11present::SELECT_INPUT,
+            length_units: 4,
+        },
+        &select_body(ResourceId(0x0000_0010), OWNER_MASK),
+        None,
+    )
+    .expect("owner SelectInput with another window");
+    let owner_errors = wire_packets(&mut owner_peer);
+    assert_eq!(
+        owner_errors.len(),
+        1,
+        "retargeting an existing eid to another window returns BadMatch",
+    );
+    assert_eq!(
+        error_fields(&owner_errors[0]),
+        (
+            yserver_protocol::x11::error::BAD_MATCH,
+            EID,
+            u16::from(x11present::SELECT_INPUT),
+            145,
+        ),
+        "BadMatch carries the eid and Present SelectInput opcodes",
+    );
+    let selection = state
+        .present_event_selections
+        .get(&EID)
+        .expect("owner selection remains present");
+    assert_eq!(selection.owner, ClientId(OWNER));
+    assert_eq!(selection.window, ROOT_WINDOW);
+    assert_eq!(selection.event_mask, OWNER_MASK);
+}
+
+/// Mutation: return BadMatch for every existing eid; the owner's same-window
+/// reselection must instead update only the event mask.
+#[test]
+fn present_select_input_on_existing_owned_event_id_updates_mask() {
+    use yserver_protocol::x11::present as x11present;
+
+    const OWNER: u32 = 1;
+    const EID: u32 = 0x0100_0052;
+    const INITIAL_MASK: u32 = x11present::EVENT_MASK_COMPLETE_NOTIFY;
+    const UPDATED_MASK: u32 = x11present::EVENT_MASK_IDLE_NOTIFY;
+
+    let mut state = ServerState::new();
+    let mut owner_peer = install_client(&mut state, OWNER);
+    let mut backend = RecordingBackend::new();
+
+    let select_body = |mask: u32| {
+        let mut body = EID.to_le_bytes().to_vec();
+        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        body.extend_from_slice(&mask.to_le_bytes());
+        body
+    };
+    for (sequence, mask) in [(1, INITIAL_MASK), (2, UPDATED_MASK)] {
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(OWNER),
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: 145,
+                data: x11present::SELECT_INPUT,
+                length_units: 4,
+            },
+            &select_body(mask),
+            None,
+        )
+        .expect("owner SelectInput");
+    }
+
+    assert!(
+        wire_packets(&mut owner_peer).is_empty(),
+        "reselection has no error"
+    );
+    let selection = state
+        .present_event_selections
+        .get(&EID)
+        .expect("owner selection remains present");
+    assert_eq!(selection.owner, ClientId(OWNER));
+    assert_eq!(selection.window, ROOT_WINDOW);
+    assert_eq!(selection.event_mask, UPDATED_MASK);
+}
