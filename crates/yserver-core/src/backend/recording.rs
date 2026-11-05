@@ -245,6 +245,10 @@ pub enum RecordedCall {
     PolyFillRectangle {
         host_xid: u32,
     },
+    /// `poly_point(host_xid, ..)` called.
+    PolyPoint {
+        host_xid: u32,
+    },
     PutImage {
         host_xid: u32,
         depth: u8,
@@ -2262,12 +2266,13 @@ impl Backend for RecordingBackend {
     fn poly_point(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
+        host_xid: u32,
         _foreground: u32,
         _coordinate_mode: u8,
         _points: &[u8],
     ) -> io::Result<()> {
-        unimplemented!("RecordingBackend: poly_point")
+        self.record(RecordedCall::PolyPoint { host_xid });
+        Ok(())
     }
 
     fn poly_fill_rectangle(

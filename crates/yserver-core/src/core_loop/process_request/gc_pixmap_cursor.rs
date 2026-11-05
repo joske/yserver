@@ -106,9 +106,6 @@ pub(super) fn handle_set_dashes(
     if xid_out_of_client_range(state, client_id, gc.0) || state.resources.gc(gc).is_none() {
         return emit_x11_error(state, client_id, sequence, x11::error::BAD_GC, gc.0, 58);
     }
-    if dashes.contains(&0) {
-        return emit_x11_error(state, client_id, sequence, x11::error::BAD_VALUE, 0, 58);
-    }
     if let Err((code, bad_value)) = super::validate_resource_access(
         state,
         client_id,
@@ -121,6 +118,9 @@ pub(super) fn handle_set_dashes(
         access_request,
     ) {
         return emit_x11_error(state, client_id, sequence, code, bad_value, 58);
+    }
+    if dashes.contains(&0) {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_VALUE, 0, 58);
     }
     state
         .resources

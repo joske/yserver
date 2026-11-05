@@ -933,6 +933,127 @@ fn assert_policy_error(bytes: &[u8], opcode: u8, sequence: u16) {
     assert_x11_error(bytes, x11::error::BAD_ACCESS, 0x55, opcode, sequence);
 }
 
+#[test]
+fn get_image_checks_read_before_bounds_validation() {
+    // Mutation: move GetImage's READ check after rectangle/viewability validation; the denial must win over BadMatch.
+    const DRAWABLE: ResourceId = ResourceId(0x0053_00f0);
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    let mut peer = install_client(&mut state, CLIENT.0);
+    state.resources.create_pixmap(
+        CLIENT,
+        x11::CreatePixmapRequest {
+            depth: 24,
+            pixmap: DRAWABLE,
+            drawable: ROOT_WINDOW,
+            width: 8,
+            height: 8,
+        },
+    );
+    let body = words(&[DRAWABLE.0, 8, 1 | (1 << 16), u32::MAX]);
+
+    let baseline = resource_request(&mut state, &mut backend, &mut peer, 1, 73, 2, &body);
+    assert_x11_error(&baseline, x11::error::BAD_MATCH, DRAWABLE.0, 73, 1);
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let drawable_before = format!("{:?}", state.resources.pixmap(DRAWABLE));
+    state.install_access_policy(Arc::new(DrawingResourcePolicy {
+        label: "GetImage bounds order",
+        calls: Arc::clone(&calls),
+        deny_id: Some(Arc::new(AtomicU32::new(DRAWABLE.0))),
+        deny_all: false,
+        decision: Decision::Deny(DenyError {
+            code: x11::error::BAD_ACCESS,
+            value: 0x55,
+        }),
+    }));
+    let backend_before = backend.calls();
+    let denied = resource_request(&mut state, &mut backend, &mut peer, 2, 73, 2, &body);
+
+    assert_policy_error(&denied, 73, 2);
+    assert_eq!(backend.calls(), backend_before);
+    assert_eq!(
+        format!("{:?}", state.resources.pixmap(DRAWABLE)),
+        drawable_before
+    );
+    assert_eq!(
+        expected_resource_checks(&calls.lock().unwrap()),
+        [(
+            CLIENT,
+            DRAWABLE,
+            ResourceKind::Pixmap,
+            AccessMode::READ,
+            Some(RequestOpcodes {
+                major: 73,
+                minor: 0,
+            }),
+        )]
+    );
+}
+
+#[test]
+fn set_dashes_checks_gc_before_zero_dash_validation() {
+    // Mutation: move SetDashes' SET_ATTR check after zero-dash validation; the policy denial must win over BadValue.
+    let mut baseline = gc_font_access_fixture();
+    let dashes = [baseline.gc.0.to_le_bytes().as_slice(), &[0, 0, 1, 0, 0]].concat();
+    let baseline_bytes = resource_request(
+        &mut baseline.state,
+        &mut baseline.backend,
+        &mut baseline.peer,
+        110,
+        58,
+        0,
+        &dashes,
+    );
+    assert_x11_error(&baseline_bytes, x11::error::BAD_VALUE, 0, 58, 110);
+
+    let mut fixture = gc_font_access_fixture();
+    let gc_before = format!("{:?}", fixture.state.resources.gc(fixture.gc));
+    let backend_before = fixture.backend.calls();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(DrawingResourcePolicy {
+            label: "SetDashes zero value order",
+            calls: Arc::clone(&calls),
+            deny_id: Some(Arc::new(AtomicU32::new(fixture.gc.0))),
+            deny_all: false,
+            decision: Decision::Deny(DenyError {
+                code: x11::error::BAD_ACCESS,
+                value: 0x55,
+            }),
+        }));
+    let denied = resource_request(
+        &mut fixture.state,
+        &mut fixture.backend,
+        &mut fixture.peer,
+        111,
+        58,
+        0,
+        &dashes,
+    );
+
+    assert_policy_error(&denied, 58, 111);
+    assert_eq!(fixture.backend.calls(), backend_before);
+    assert_eq!(
+        format!("{:?}", fixture.state.resources.gc(fixture.gc)),
+        gc_before
+    );
+    assert_eq!(
+        expected_resource_checks(&calls.lock().unwrap()),
+        [(
+            CLIENT,
+            fixture.gc,
+            ResourceKind::Gc,
+            AccessMode::SET_ATTR,
+            Some(RequestOpcodes {
+                major: 58,
+                minor: 0,
+            }),
+        )]
+    );
+}
+
 fn expected_resource_checks(
     calls: &[RecordedExtensionCheck],
 ) -> Vec<(
@@ -5612,10 +5733,6 @@ fn copy_gc_denial_preserves_destination_for_source_and_destination_denial() {
     }
 }
 
-struct AllowAllAccessPolicy;
-
-impl AccessPolicy for AllowAllAccessPolicy {}
-
 #[test]
 #[ignore]
 fn bench_poly_point_with_and_without_policy() {
@@ -5624,7 +5741,7 @@ fn bench_poly_point_with_and_without_policy() {
 
     let run = |with_policy: bool| {
         let mut state = ServerState::new();
-        let _peer = install_client(&mut state, CLIENT.0);
+        let mut peer = install_client(&mut state, CLIENT.0);
         state.resources.create_gc(
             CLIENT,
             CreateGcRequest {
@@ -5655,8 +5772,23 @@ fn bench_poly_point_with_and_without_policy() {
                 arc_mode: None,
             },
         );
+        state
+            .resources
+            .window_mut(ROOT_WINDOW)
+            .expect("root window")
+            .host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(0x100));
+        let calls = Arc::new(Mutex::new(Vec::new()));
         if with_policy {
-            state.install_access_policy(Arc::new(AllowAllAccessPolicy));
+            state.install_access_policy(Arc::new(DrawingResourcePolicy {
+                label: "PolyPoint benchmark allow-all",
+                calls: Arc::clone(&calls),
+                deny_id: None,
+                deny_all: false,
+                decision: Decision::Deny(DenyError {
+                    code: x11::error::BAD_ACCESS,
+                    value: 0x55,
+                }),
+            }));
         }
 
         let mut backend = RecordingBackend::new();
@@ -5682,14 +5814,74 @@ fn bench_poly_point_with_and_without_policy() {
             )
             .expect("valid one-point PolyPoint request");
         }
-        start.elapsed()
+        let elapsed = start.elapsed();
+        let wire_bytes = read_all_available(&mut peer);
+        let point_draws = backend
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| matches!(call, RecordedCall::PolyPoint { .. }))
+            .count();
+        let access_counts = {
+            let calls = calls.lock().unwrap();
+            let drawable_checks = calls
+                .iter()
+                .filter(|call| {
+                    call.client == CLIENT
+                        && call.request
+                            == Some(RequestOpcodes {
+                                major: 64,
+                                minor: 0,
+                            })
+                        && call.target.is_some_and(|target| {
+                            target.id == ROOT_WINDOW && target.kind == ResourceKind::Window
+                        })
+                        && call.mode == Some(AccessMode::WRITE)
+                })
+                .count();
+            let gc_checks = calls
+                .iter()
+                .filter(|call| {
+                    call.client == CLIENT
+                        && call.request
+                            == Some(RequestOpcodes {
+                                major: 64,
+                                minor: 0,
+                            })
+                        && call.target.is_some_and(|target| {
+                            target.id == GC_ID && target.kind == ResourceKind::Gc
+                        })
+                        && call.mode == Some(AccessMode::USE)
+                })
+                .count();
+            (calls.len(), drawable_checks, gc_checks)
+        };
+        (elapsed, wire_bytes, point_draws, access_counts)
     };
 
     let without_policy = run(false);
     let with_policy = run(true);
+    assert!(
+        without_policy.1.is_empty(),
+        "no-policy PolyPoint requests wrote an error or reply"
+    );
+    assert!(
+        with_policy.1.is_empty(),
+        "allow-all-policy PolyPoint requests wrote an error or reply"
+    );
+    // Mutation: skip RecordingBackend::poly_point recording; each phase must record all request draws.
+    assert_eq!(without_policy.2, REQUESTS as usize, "no-policy point draws");
+    assert_eq!(with_policy.2, REQUESTS as usize, "policy point draws");
+    assert_eq!(without_policy.3, (0, 0, 0), "no-policy resource checks");
+    assert_eq!(
+        with_policy.3,
+        (REQUESTS as usize * 2, REQUESTS as usize, REQUESTS as usize,),
+        "allow-all policy asks once for drawable and once for GC per request"
+    );
     println!(
         "PolyPoint ({REQUESTS} requests): no policy = {:.1} ns/request; allow-all policy = {:.1} ns/request",
-        without_policy.as_nanos() as f64 / f64::from(REQUESTS),
-        with_policy.as_nanos() as f64 / f64::from(REQUESTS),
+        without_policy.0.as_nanos() as f64 / f64::from(REQUESTS),
+        with_policy.0.as_nanos() as f64 / f64::from(REQUESTS),
     );
 }

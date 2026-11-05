@@ -434,11 +434,44 @@ pub(super) fn handle_get_image(
             73,
         );
     }
+    let window = state.resources.window(req.drawable);
+    let pixmap = if window.is_none() {
+        state.resources.pixmap(req.drawable)
+    } else {
+        None
+    };
+    if window.is_none() && pixmap.is_none() {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_DRAWABLE,
+            req.drawable.0,
+            73,
+        );
+    }
+    let drawable_kind = if window.is_some() {
+        ResourceKind::Window
+    } else {
+        ResourceKind::Pixmap
+    };
+    if let Decision::Deny(error) = state.check_resource(
+        client_id,
+        &ResourceTarget {
+            id: req.drawable,
+            kind: drawable_kind,
+            creation: None,
+        },
+        AccessMode::READ,
+        Some(access_request),
+    ) {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 73);
+    }
     let rx0 = i32::from(req.x);
     let ry0 = i32::from(req.y);
     let rx1 = rx0 + i32::from(req.width);
     let ry1 = ry0 + i32::from(req.height);
-    if let Some(w) = state.resources.window(req.drawable) {
+    if let Some(w) = window {
         // Windows: must be viewable; the rect may include the BORDER
         // (xts XGetImage-7 reads (-1,-1)) but not extend past its
         // outside edges; and — ignoring overlaps — the rect must be
@@ -487,7 +520,7 @@ pub(super) fn handle_get_image(
                 73,
             );
         }
-    } else if let Some(p) = state.resources.pixmap(req.drawable) {
+    } else if let Some(p) = pixmap {
         if rx0 < 0 || ry0 < 0 || rx1 > i32::from(p.width) || ry1 > i32::from(p.height) {
             return emit_x11_error(
                 state,
@@ -507,23 +540,6 @@ pub(super) fn handle_get_image(
             req.drawable.0,
             73,
         );
-    }
-    let drawable_kind = if state.resources.window(req.drawable).is_some() {
-        ResourceKind::Window
-    } else {
-        ResourceKind::Pixmap
-    };
-    if let Decision::Deny(error) = state.check_resource(
-        client_id,
-        &ResourceTarget {
-            id: req.drawable,
-            kind: drawable_kind,
-            creation: None,
-        },
-        AccessMode::READ,
-        Some(access_request),
-    ) {
-        return emit_x11_error(state, client_id, sequence, error.code, error.value, 73);
     }
     let byte_order = state
         .clients
