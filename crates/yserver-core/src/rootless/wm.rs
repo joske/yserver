@@ -73,7 +73,7 @@ pub(super) fn set_words(
 
 /// A server-owned InputOnly window, unmapped (no wire body, no backend
 /// window: InputOnly has no storage).
-fn create_input_only_as_server(state: &mut ServerState, window: ResourceId) {
+pub(super) fn create_input_only_as_server(state: &mut ServerState, window: ResourceId) {
     state.resources.create_window(
         SERVER_OWNER,
         CreateWindowRequest {
@@ -87,6 +87,21 @@ fn create_input_only_as_server(state: &mut ServerState, window: ResourceId) {
             override_redirect: Some(true),
             ..Default::default()
         },
+    );
+}
+
+/// The check window's `_NET_WM_NAME`: the window manager's name.
+pub(super) fn set_wm_name(state: &mut ServerState, backend: &mut dyn Backend, name: &str) {
+    let property = state.atoms.intern("_NET_WM_NAME", false);
+    let utf8 = state.atoms.intern("UTF8_STRING", false);
+    change_property_as_server(
+        state,
+        backend,
+        ROOTLESS_WM_CHECK_WINDOW,
+        property,
+        utf8,
+        PropertyFormat::F8,
+        name.as_bytes().to_vec(),
     );
 }
 
@@ -106,17 +121,7 @@ pub(super) fn announce(state: &mut ServerState, backend: &mut dyn Backend) {
             &[check.0],
         );
     }
-    let name = state.atoms.intern("_NET_WM_NAME", false);
-    let utf8 = state.atoms.intern("UTF8_STRING", false);
-    change_property_as_server(
-        state,
-        backend,
-        check,
-        name,
-        utf8,
-        PropertyFormat::F8,
-        b"yserver".to_vec(),
-    );
+    set_wm_name(state, backend, "yserver");
     let supported: Vec<u32> = SUPPORTED
         .iter()
         .map(|n| state.atoms.intern(n, false).0)
