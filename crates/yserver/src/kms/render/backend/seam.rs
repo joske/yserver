@@ -449,6 +449,12 @@ pub trait Platform: OutputSink + Sized + 'static {
         yserver_core::randr::RandrLimits::default()
     }
 
+    /// `Backend::on_host_display_ready`: a rootless host's display
+    /// connection is readable; `false` when it closed.
+    fn on_host_display_ready(_b: &mut XBackend<Self>, _state: &mut ServerState) -> bool {
+        true
+    }
+
     fn poll_deferred_input(_b: &mut XBackend<Self>, _state: &mut ServerState) {}
 
     fn start_device_config(

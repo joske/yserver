@@ -416,6 +416,10 @@ impl<P: Platform> Backend for XBackend<P> {
         P::set_logical_screen_size(self, w, h)
     }
 
+    fn on_host_display_ready(&mut self, state: &mut ServerState) -> bool {
+        P::on_host_display_ready(self, state)
+    }
+
     fn on_libinput_ready(&mut self, _state: &mut ServerState) {
         // Direct mode: libinput runs on the dedicated input thread and reaches
         // the core via Message::HostInput, so there is no on-core libinput fd
