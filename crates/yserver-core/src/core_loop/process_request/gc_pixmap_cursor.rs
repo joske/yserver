@@ -1,4 +1,5 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind, ResourceTarget},
     backend::{Backend, OriginContext},
     core_loop::process_request::{
         FREE_CURSOR_OPCODE, FREE_GC_OPCODE, FREE_PIXMAP_OPCODE, RequestOutcome, emit_x11_error,
@@ -62,6 +63,7 @@ pub(super) fn handle_set_dashes(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() < 8 {
@@ -92,6 +94,19 @@ pub(super) fn handle_set_dashes(
     }
     if dashes.contains(&0) {
         return emit_x11_error(state, client_id, sequence, x11::error::BAD_VALUE, 0, 58);
+    }
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: gc,
+            kind: ResourceKind::Gc,
+            creation: None,
+        },
+        AccessMode::SET_ATTR,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 58);
     }
     state
         .resources
@@ -311,10 +326,17 @@ pub(super) fn handle_change_gc(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    let access_request = RequestOpcodes {
+        major: header.opcode,
+        minor: header.data,
+    };
     if let Some(request) = x11::change_gc_request(body) {
-        if let Err((code, bad_value)) = validate_gc_only(state, request.gc) {
+        if let Err((code, bad_value)) =
+            validate_gc_only(state, client_id, access_request, request.gc, None)
+        {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 56);
         }
         if let Some(bad) = unknown_gc_font(state, request.font) {
@@ -357,8 +379,18 @@ pub(super) fn handle_set_clip_rectangles(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    let access_request = RequestOpcodes {
+        major: header.opcode,
+        minor: header.data,
+    };
     if let Some(request) = x11::set_clip_rectangles_request(header.data, body) {
-        if let Err((code, bad_value)) = validate_gc_only(state, request.gc) {
+        if let Err((code, bad_value)) = validate_gc_only(
+            state,
+            client_id,
+            access_request,
+            request.gc,
+            Some(AccessMode::SET_ATTR),
+        ) {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 59);
         }
         let displaced = state.resources.set_clip_rectangles(client_id, request);
@@ -647,8 +679,34 @@ pub(super) fn handle_query_best_size(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    if body.len() >= 4 {
+        let drawable = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+        let kind = if state.resources.window(drawable).is_some() {
+            Some(ResourceKind::Window)
+        } else if state.resources.pixmap(drawable).is_some() {
+            Some(ResourceKind::Pixmap)
+        } else {
+            None
+        };
+        if let Some(kind) = kind
+            && let Err((code, bad_value)) = super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: drawable,
+                    kind,
+                    creation: None,
+                },
+                AccessMode::GET_ATTR,
+                access_request,
+            )
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 97);
+        }
+    }
     let width = if body.len() >= 8 {
         u16::from_le_bytes([body[4], body[5]])
     } else {

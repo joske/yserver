@@ -385,7 +385,18 @@ pub(super) fn handle_mit_shm_put_image(
     );
     let drawable = ResourceId(req.drawable);
     let gc = ResourceId(req.gc);
-    if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, gc) {
+    if let Err((code, bad_value)) = validate_drawable_and_gc(
+        state,
+        client_id,
+        crate::access::RequestOpcodes {
+            major: MIT_SHM_MAJOR_OPCODE,
+            minor: shm::PUT_IMAGE,
+        },
+        drawable,
+        gc,
+        None,
+        None,
+    ) {
         return emit_x11_error_with_minor(
             state,
             client_id,

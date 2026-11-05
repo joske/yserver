@@ -414,8 +414,20 @@ fn change_gc(
     for v in values {
         body.extend(v.to_le_bytes());
     }
-    handle_change_gc(state, backend, None, ClientId(1), SequenceNumber(1), &body)
-        .expect("change gc");
+    handle_change_gc(
+        state,
+        backend,
+        None,
+        ClientId(1),
+        SequenceNumber(1),
+        RequestHeader {
+            opcode: 56,
+            data: 0,
+            length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+        },
+        &body,
+    )
+    .expect("change gc");
 }
 
 fn free_pixmaps(state: &mut ServerState, backend: &mut RecordingBackend, ids: &[u32]) {

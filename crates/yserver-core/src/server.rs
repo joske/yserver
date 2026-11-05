@@ -1750,7 +1750,6 @@ impl ServerState {
     }
 
     /// Ask installed policies whether a client may perform `mode` on a typed resource.
-    #[allow(dead_code)] // Added before the core request-site migration.
     pub(crate) fn check_resource(
         &self,
         client: ClientId,

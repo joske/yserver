@@ -1,4 +1,5 @@
 use crate::{
+    access::{AccessMode, Decision, DenyError, RequestOpcodes, ResourceKind, ResourceTarget},
     backend::{Backend, OriginContext, params::FillState},
     core_loop::{
         damage_fanout::{accumulate_damage_full_to_state, accumulate_damage_to_state},
@@ -65,6 +66,10 @@ pub(super) fn handle_put_image(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    let access_request = RequestOpcodes {
+        major: header.opcode,
+        minor: header.data,
+    };
     let Some(request) = x11::put_image_request(header.data, body) else {
         return Ok(RequestOutcome::Handled);
     };
@@ -83,7 +88,15 @@ pub(super) fn handle_put_image(
         request.depth,
         request.format,
     );
-    if let Err((code, bad_value)) = validate_drawable_and_gc(state, request.drawable, request.gc) {
+    if let Err((code, bad_value)) = validate_drawable_and_gc(
+        state,
+        client_id,
+        access_request,
+        request.drawable,
+        request.gc,
+        Some(AccessMode::WRITE),
+        Some(AccessMode::USE),
+    ) {
         return emit_x11_error(state, client_id, sequence, code, bad_value, 72);
     }
     let draw_state = state.resources.resolve_draw_state(request.gc);
@@ -317,10 +330,21 @@ pub(super) fn handle_image_text8(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    let access_request = RequestOpcodes {
+        major: header.opcode,
+        minor: header.data,
+    };
     if let Some((drawable_raw, gc_id, text_body)) = x11::image_text8_data(body) {
         let drawable = ResourceId(drawable_raw);
-        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
-        {
+        if let Err((code, bad_value)) = validate_drawable_and_gc(
+            state,
+            client_id,
+            access_request,
+            drawable,
+            ResourceId(gc_id),
+            Some(AccessMode::WRITE),
+            Some(AccessMode::USE),
+        ) {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 76);
         }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
@@ -353,10 +377,21 @@ pub(super) fn handle_image_text16(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    let access_request = RequestOpcodes {
+        major: header.opcode,
+        minor: header.data,
+    };
     if let Some((drawable_raw, gc_id, text_body)) = x11::image_text8_data(body) {
         let drawable = ResourceId(drawable_raw);
-        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
-        {
+        if let Err((code, bad_value)) = validate_drawable_and_gc(
+            state,
+            client_id,
+            access_request,
+            drawable,
+            ResourceId(gc_id),
+            Some(AccessMode::WRITE),
+            Some(AccessMode::USE),
+        ) {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 77);
         }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
@@ -389,6 +424,10 @@ pub(super) fn handle_get_image(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    let access_request = RequestOpcodes {
+        major: header.opcode,
+        minor: header.data,
+    };
     debug!("client {} #{} GetImage", client_id.0, sequence.0);
     let Some(req) = x11::get_image_request(header.data, body) else {
         return Ok(RequestOutcome::Handled);
@@ -481,6 +520,23 @@ pub(super) fn handle_get_image(
             73,
         );
     }
+    let drawable_kind = if state.resources.window(req.drawable).is_some() {
+        ResourceKind::Window
+    } else {
+        ResourceKind::Pixmap
+    };
+    if let Decision::Deny(error) = state.check_resource(
+        client_id,
+        &ResourceTarget {
+            id: req.drawable,
+            kind: drawable_kind,
+            creation: None,
+        },
+        AccessMode::READ,
+        Some(access_request),
+    ) {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 73);
+    }
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -561,13 +617,15 @@ pub(super) fn patch_get_image_reply_header(
 /// Rewrite PolyText8/16 embedded font-change items (len == 255):
 /// the wire carries the CLIENT font XID, the backend's font table is
 /// keyed by HOST xids. Returns the translated body plus the last
-/// font's client id (committed to the GC per X11 §8), or
-/// `Err(client_xid)` when an id doesn't resolve (→ BadFont).
+/// font's client id (committed to the GC per X11 §8), or a `DenyError`
+/// for an unresolved font (BadFont) or a resource-policy denial.
 fn translate_poly_text_fonts(
     state: &ServerState,
+    client_id: ClientId,
+    access_request: RequestOpcodes,
     body: &[u8],
     two_byte: bool,
-) -> Result<(Vec<u8>, Option<ResourceId>), u32> {
+) -> Result<(Vec<u8>, Option<ResourceId>), DenyError> {
     let mut out = body.to_vec();
     let mut last: Option<ResourceId> = None;
     let mut off = 12usize;
@@ -580,8 +638,23 @@ fn translate_poly_text_fonts(
             let client_xid =
                 u32::from_be_bytes([out[off + 1], out[off + 2], out[off + 3], out[off + 4]]);
             let Some(font) = state.resources.font(ResourceId(client_xid)) else {
-                return Err(client_xid);
+                return Err(DenyError {
+                    code: x11::error::BAD_FONT,
+                    value: client_xid,
+                });
             };
+            if let Decision::Deny(error) = state.check_resource(
+                client_id,
+                &ResourceTarget {
+                    id: ResourceId(client_xid),
+                    kind: ResourceKind::Font,
+                    creation: None,
+                },
+                AccessMode::USE,
+                Some(access_request),
+            ) {
+                return Err(error);
+            }
             out[off + 1..off + 5].copy_from_slice(&font.host_xid.as_raw().to_be_bytes());
             last = Some(ResourceId(client_xid));
             off += 5;
@@ -599,27 +672,29 @@ pub(super) fn handle_poly_text8(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if let Some((drawable_raw, gc_id, text_body)) = x11::poly_text_data(body) {
         let drawable = ResourceId(drawable_raw);
-        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
-        {
+        if let Err((code, bad_value)) = validate_drawable_and_gc(
+            state,
+            client_id,
+            access_request,
+            drawable,
+            ResourceId(gc_id),
+            Some(AccessMode::WRITE),
+            Some(AccessMode::USE),
+        ) {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 74);
         }
-        let (text_body, last_font) = match translate_poly_text_fonts(state, text_body, false) {
-            Ok(pair) => pair,
-            Err(bad_font) => {
-                return emit_x11_error(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_FONT,
-                    bad_font,
-                    74,
-                );
-            }
-        };
+        let (text_body, last_font) =
+            match translate_poly_text_fonts(state, client_id, access_request, text_body, false) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    return emit_x11_error(state, client_id, sequence, error.code, error.value, 74);
+                }
+            };
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
         let target = state.resources.host_drawable_target(drawable);
         if let Some(target) = target {
@@ -644,27 +719,29 @@ pub(super) fn handle_poly_text16(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if let Some((drawable_raw, gc_id, text_body)) = x11::poly_text_data(body) {
         let drawable = ResourceId(drawable_raw);
-        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
-        {
+        if let Err((code, bad_value)) = validate_drawable_and_gc(
+            state,
+            client_id,
+            access_request,
+            drawable,
+            ResourceId(gc_id),
+            Some(AccessMode::WRITE),
+            Some(AccessMode::USE),
+        ) {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 75);
         }
-        let (text_body, last_font) = match translate_poly_text_fonts(state, text_body, true) {
-            Ok(pair) => pair,
-            Err(bad_font) => {
-                return emit_x11_error(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_FONT,
-                    bad_font,
-                    75,
-                );
-            }
-        };
+        let (text_body, last_font) =
+            match translate_poly_text_fonts(state, client_id, access_request, text_body, true) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    return emit_x11_error(state, client_id, sequence, error.code, error.value, 75);
+                }
+            };
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
         let target = state.resources.host_drawable_target(drawable);
         if let Some(target) = target {
@@ -692,12 +769,23 @@ pub(super) fn handle_poly_point(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    let access_request = RequestOpcodes {
+        major: header.opcode,
+        minor: header.data,
+    };
     if body.len() >= 8 {
         let drawable = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
         let gc_id = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
         let points = &body[8..];
-        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
-        {
+        if let Err((code, bad_value)) = validate_drawable_and_gc(
+            state,
+            client_id,
+            access_request,
+            drawable,
+            ResourceId(gc_id),
+            Some(AccessMode::WRITE),
+            Some(AccessMode::USE),
+        ) {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 64);
         }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
@@ -742,11 +830,22 @@ pub(super) fn handle_poly_line(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    let access_request = RequestOpcodes {
+        major: header.opcode,
+        minor: header.data,
+    };
     if let Some((gc_id, points)) = x11::poly_line_data(body)
         && let Some(drawable) = x11::drawable_request_id(body)
     {
-        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
-        {
+        if let Err((code, bad_value)) = validate_drawable_and_gc(
+            state,
+            client_id,
+            access_request,
+            drawable,
+            ResourceId(gc_id),
+            Some(AccessMode::WRITE),
+            Some(AccessMode::USE),
+        ) {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 65);
         }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
@@ -780,13 +879,21 @@ pub(super) fn handle_poly_segment(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if let Some((gc_id, segments)) = x11::poly_segment_data(body)
         && let Some(drawable) = x11::drawable_request_id(body)
     {
-        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
-        {
+        if let Err((code, bad_value)) = validate_drawable_and_gc(
+            state,
+            client_id,
+            access_request,
+            drawable,
+            ResourceId(gc_id),
+            Some(AccessMode::WRITE),
+            Some(AccessMode::USE),
+        ) {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 66);
         }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
@@ -814,13 +921,21 @@ pub(super) fn handle_poly_rectangle(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if let Some((gc_id, rectangles)) = x11::poly_fill_rectangle_data(body)
         && let Some(drawable) = x11::drawable_request_id(body)
     {
-        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
-        {
+        if let Err((code, bad_value)) = validate_drawable_and_gc(
+            state,
+            client_id,
+            access_request,
+            drawable,
+            ResourceId(gc_id),
+            Some(AccessMode::WRITE),
+            Some(AccessMode::USE),
+        ) {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 67);
         }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
@@ -848,13 +963,21 @@ pub(super) fn handle_poly_arc(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if let Some((gc_id, arcs)) = x11::poly_arc_data(body)
         && let Some(drawable) = x11::drawable_request_id(body)
     {
-        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
-        {
+        if let Err((code, bad_value)) = validate_drawable_and_gc(
+            state,
+            client_id,
+            access_request,
+            drawable,
+            ResourceId(gc_id),
+            Some(AccessMode::WRITE),
+            Some(AccessMode::USE),
+        ) {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 68);
         }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
@@ -882,6 +1005,7 @@ pub(super) fn handle_fill_poly(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() >= 12 {
@@ -889,8 +1013,15 @@ pub(super) fn handle_fill_poly(
         let gc_id = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
         let coord_mode = body[9];
         let points = &body[12..];
-        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
-        {
+        if let Err((code, bad_value)) = validate_drawable_and_gc(
+            state,
+            client_id,
+            access_request,
+            drawable,
+            ResourceId(gc_id),
+            Some(AccessMode::WRITE),
+            Some(AccessMode::USE),
+        ) {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 69);
         }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
@@ -923,13 +1054,21 @@ pub(super) fn handle_poly_fill_rectangle(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if let Some((gc_id, rectangles)) = x11::poly_fill_rectangle_data(body)
         && let Some(drawable) = x11::drawable_request_id(body)
     {
-        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
-        {
+        if let Err((code, bad_value)) = validate_drawable_and_gc(
+            state,
+            client_id,
+            access_request,
+            drawable,
+            ResourceId(gc_id),
+            Some(AccessMode::WRITE),
+            Some(AccessMode::USE),
+        ) {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 70);
         }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
@@ -963,13 +1102,21 @@ pub(super) fn handle_poly_fill_arc(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if let Some((gc_id, arcs)) = x11::poly_fill_arc_data(body)
         && let Some(drawable) = x11::drawable_request_id(body)
     {
-        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
-        {
+        if let Err((code, bad_value)) = validate_drawable_and_gc(
+            state,
+            client_id,
+            access_request,
+            drawable,
+            ResourceId(gc_id),
+            Some(AccessMode::WRITE),
+            Some(AccessMode::USE),
+        ) {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 71);
         }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
@@ -1005,6 +1152,10 @@ pub(super) fn handle_clear_area(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    let access_request = RequestOpcodes {
+        major: header.opcode,
+        minor: header.data,
+    };
     let exposures = header.data != 0;
     if let Some(request) = x11::clear_area_request(body) {
         // Validation per Xorg ProcClearToBackground: exposures must
@@ -1039,6 +1190,19 @@ pub(super) fn handle_clear_area(
                 request.window.0,
                 61,
             );
+        }
+        if let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: request.window,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            AccessMode::WRITE,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 61);
         }
         let (w_width, w_height) = (window.width, window.height);
         let region = clear_area_region(state, request, w_width, w_height);
@@ -1359,6 +1523,7 @@ pub(super) fn handle_copy_area(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let Some(request) = x11::copy_area_request(body) else {
@@ -1381,16 +1546,29 @@ pub(super) fn handle_copy_area(
         request.width,
         request.height
     );
-    // Validate src + dst + gc together. Order mirrors Xorg's
-    // VALIDATE_DRAWABLE_AND_GC: src-side first (BadDrawable / BadMatch
-    // inputonly), then GC (BadGC), then dst-side, then cross-depth
-    // (BadMatch). Note: each call covers BadGC; the second is a
-    // redundant lookup but the cost is tiny and the deduplicated form
-    // would obscure the per-side error ordering Xorg follows.
-    if let Err((code, bad_value)) = validate_drawable_and_gc(state, request.src, request.gc) {
+    // Preserve the existing structural error order (src, GC/depth, then
+    // dst), while policy asks follow this request's target order: src,
+    // dst, GC. The first pass validates the GC but defers its access check.
+    if let Err((code, bad_value)) = validate_drawable_and_gc(
+        state,
+        client_id,
+        access_request,
+        request.src,
+        request.gc,
+        Some(AccessMode::READ),
+        None,
+    ) {
         return emit_x11_error(state, client_id, sequence, code, bad_value, 62);
     }
-    if let Err((code, bad_value)) = validate_drawable_and_gc(state, request.dst, request.gc) {
+    if let Err((code, bad_value)) = validate_drawable_and_gc(
+        state,
+        client_id,
+        access_request,
+        request.dst,
+        request.gc,
+        Some(AccessMode::WRITE),
+        Some(AccessMode::USE),
+    ) {
         return emit_x11_error(state, client_id, sequence, code, bad_value, 62);
     }
     let draw_state = state.resources.resolve_draw_state(request.gc);
@@ -1784,6 +1962,7 @@ pub(super) fn handle_copy_plane(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() < 28 {
@@ -1804,10 +1983,20 @@ pub(super) fn handle_copy_plane(
     }
     // CopyPlane: dst.depth must match gc.depth; src can be any depth
     // (the plane mask extracts a single bit from src).
-    if let Err((code, bad_value)) = validate_drawable_only(state, src) {
+    if let Err((code, bad_value)) =
+        validate_drawable_only(state, client_id, access_request, src, AccessMode::READ)
+    {
         return emit_x11_error(state, client_id, sequence, code, bad_value, 63);
     }
-    if let Err((code, bad_value)) = validate_drawable_and_gc(state, dst, gc) {
+    if let Err((code, bad_value)) = validate_drawable_and_gc(
+        state,
+        client_id,
+        access_request,
+        dst,
+        gc,
+        Some(AccessMode::WRITE),
+        Some(AccessMode::USE),
+    ) {
         return emit_x11_error(state, client_id, sequence, code, bad_value, 63);
     }
     let draw_state = state.resources.resolve_draw_state(gc);

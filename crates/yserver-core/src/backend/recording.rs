@@ -173,6 +173,11 @@ pub enum RecordedCall {
         dst_host_xid: u32,
         plane: u32,
     },
+    PolyText8 {
+        host_xid: u32,
+        foreground: u32,
+        body: Vec<u8>,
+    },
     PaintWindowBackgroundRect {
         host_xid: u32,
         x: i16,
@@ -2322,11 +2327,16 @@ impl Backend for RecordingBackend {
     fn poly_text8(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _foreground: u32,
-        _body: &[u8],
+        host_xid: u32,
+        foreground: u32,
+        body: &[u8],
     ) -> io::Result<()> {
-        unimplemented!("RecordingBackend: poly_text8")
+        self.record(RecordedCall::PolyText8 {
+            host_xid,
+            foreground,
+            body: body.to_vec(),
+        });
+        Ok(())
     }
 
     fn poly_text16(
