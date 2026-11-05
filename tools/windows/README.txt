@@ -63,10 +63,31 @@ DISPLAY at the Windows machine:
   xauth add <windows-host>:0 MIT-MAGIC-COOKIE-1 <cookie>
   export DISPLAY=<windows-host>:0
 
-X11 is not encrypted. Over an untrusted network, tunnel it instead, e.g.
-from Windows `ssh -R 6010:127.0.0.1:6000 remote-host`, and on the remote
-host `xauth add localhost:10 MIT-MAGIC-COOKIE-1 <cookie>` and
-`export DISPLAY=localhost:10`.
+X11 is not encrypted. Over an untrusted network, use ssh's X11 forwarding
+instead (below).
+
+
+ssh -Y from Windows
+-------------------
+
+Windows' own ssh needs xauth to hand the cookie to the remote X clients;
+this zip has one. Tell ssh where it is, in %USERPROFILE%\.ssh\config:
+
+  XAuthLocation "C:\path\to\yserver\xauth.exe"
+
+then, in cmd:
+
+  set DISPLAY=127.0.0.1:0
+  ssh -Y remote-host
+
+Not :0 (yserver has no local socket), and not localhost:0, which works but
+makes every X connection 2 seconds slower. xauth.exe reads XAUTHORITY, else
+YSERVER_AUTH, else the cookie file start-yserver.cmd made.
+
+Use -Y, not -X: -X asks for an untrusted cookie, which needs the X SECURITY
+extension yserver does not have, so ssh says "untrusted X11 forwarding setup
+failed" and forwards nothing. `ForwardX11Trusted yes` in the config makes -X
+the same as -Y.
 
 
 Graphics
@@ -92,6 +113,7 @@ Files
 
   yserver.exe          the server
   start-yserver.cmd    starts it with a cookie
+  xauth.exe            the cookie for ssh -Y (`xauth list` only)
   xkb\                 keyboard data (xkeyboard-config); XKB_CONFIG_ROOT
                        overrides it
   LICENSE.txt          yserver's license
