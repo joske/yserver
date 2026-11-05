@@ -5094,6 +5094,94 @@ fn handled_request_does_not_mark_the_backend_dirty() {
     );
 }
 
+/// Mutation: drop the reader release on the max-length `BadLength`; the GetInputFocus reply times out.
+#[test]
+fn oversized_big_requests_enable_keeps_the_connection_working() {
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        time::Duration,
+    };
+
+    let mut state = ServerState::new();
+    let (poll, sender, receiver) = crate::core_loop::channel().expect("core channel");
+    let client_sender = sender.bind();
+    let (server_stream, mut peer) = UnixStream::pair().expect("client socket pair");
+    peer.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("peer read timeout");
+    client_sender
+        .send(Message::ClientSetupComplete {
+            id: yserver_protocol::x11::ClientId(1),
+            generation: client_sender.generation(),
+            stream: crate::transport::Transport::Unix(server_stream),
+            resource_id_base: 1 << 20,
+            resource_id_mask: 0x000F_FFFF,
+            byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
+            is_local: true,
+            fd_passing: true,
+            internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
+            admission: crate::access::Admission::Internal,
+            setup_reply: Vec::new(),
+        })
+        .expect("queue test client setup");
+    let sender_for_core = sender.clone_handle();
+    let runner = std::thread::spawn(move || {
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        run_core(
+            poll,
+            receiver,
+            sender_for_core,
+            &mut state,
+            &mut backend,
+            [],
+            &ClientIdAllocator::new(),
+            AuthState::new(None),
+            ResetPolicy::NoReset,
+            None,
+        )
+    });
+
+    let interaction = (|| -> std::io::Result<([u8; 32], [u8; 32], [u8; 32])> {
+        peer.write_all(&[135, 0, 1, 0])?;
+        let mut enable = [0; 32];
+        peer.read_exact(&mut enable)?;
+        // A second Enable in big-request form whose big length (1) cannot hold its header.
+        peer.write_all(&[135, 0, 0, 0, 1, 0, 0, 0, 43, 0, 1, 0])?;
+        let mut error = [0; 32];
+        peer.read_exact(&mut error)?;
+        let mut focus = [0; 32];
+        peer.read_exact(&mut focus)?;
+        Ok((enable, error, focus))
+    })();
+    sender.send(Message::Shutdown).expect("shutdown core");
+    runner
+        .join()
+        .expect("core thread panicked")
+        .expect("run core");
+    let (enable, error, focus) = interaction.expect("reader resumes after the oversized Enable");
+    assert_eq!(enable[0], 1, "first Enable is answered");
+    // Xorg: BadLength, value 0, minor 0, major (os/io.c:450-459, Xext/bigreq.c REQUEST_SIZE_MATCH).
+    assert_eq!(
+        &error[..11],
+        &[
+            0,
+            yserver_protocol::x11::error::BAD_LENGTH,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            135
+        ]
+    );
+    assert_eq!(focus[0], 1, "GetInputFocus is answered");
+    assert_eq!(&focus[2..4], &3u16.to_le_bytes());
+}
+
 #[test]
 fn run_core_installs_its_auth_state_as_the_host_access_handle() {
     let mut state = ServerState::new();

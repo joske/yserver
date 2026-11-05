@@ -274,6 +274,16 @@ pub fn process_request(
         u32::from(u16::MAX)
     };
     if header.length_units > max_length_units {
+        // The reader parks on every Enable until the core answers it.
+        if header.opcode == 135
+            && header.data == 0
+            && let Some(tx) = state
+                .clients
+                .get(&client_id.0)
+                .and_then(|client| client.reader_control.as_ref())
+        {
+            let _ = tx.send(crate::server::ReaderControl::IgnoreBigRequests);
+        }
         return emit_x11_error(
             state,
             client_id,
