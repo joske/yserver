@@ -14,11 +14,11 @@ run when the recipes disagree with `Cargo.toml`.
 
 In this repo:
 
-- `Cargo.toml:11` — the **only** version reference in the tree (verify with
+- `Cargo.toml:13` — the **only** version reference in the tree (verify with
   `grep -rn '<old version>' --include='*.toml' --include='*.rs' .`).
-- `Cargo.lock` — run `cargo check` and commit the result; the four
+- `Cargo.lock` — run `cargo check` and commit the result; the five
   workspace crates (`yserver`, `yserver-core`, `yserver-protocol`,
-  `yserver-render`) follow.
+  `yserver-render`, `yserver-xauth`) follow.
 
 In `yserver-packaging`, all three recipes, which `build.yml` requires to equal
 `Cargo.toml` exactly:
@@ -110,7 +110,7 @@ recipe version(s) disagree with upstream 1.5.0 — bump the recipes
 Fix the recipes, push packaging, re-dispatch. Nothing was published.
 
 **`release`** — creates the release as a **draft**, downloads the packaging
-artifacts, attaches the `.rpm`/`.deb`/`.apk` (debuginfo, debugsource, dbgsym
+artifacts, attaches the `.rpm`/`.deb`/`.apk` and the Windows zips from `ci` (debuginfo, debugsource, dbgsym
 and `.src.rpm` excluded: ~40 MB of ~46 MB), asserts the attached inventory
 matches what was downloaded exactly, reports the tag archive's sha256/sha512
 in the job summary, re-verifies the tag has not moved, and only then

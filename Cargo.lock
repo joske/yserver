@@ -1490,7 +1490,7 @@ dependencies = [
 
 [[package]]
 name = "yserver"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "ash",
  "block2",
@@ -1528,7 +1528,7 @@ dependencies = [
 
 [[package]]
 name = "yserver-core"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "crossbeam-channel",
  "libc",
@@ -1541,14 +1541,14 @@ dependencies = [
 
 [[package]]
 name = "yserver-protocol"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "yserver-render"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "ash",
  "libc",
@@ -1560,7 +1560,7 @@ dependencies = [
 
 [[package]]
 name = "yserver-xauth"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "yserver-core",
 ]
