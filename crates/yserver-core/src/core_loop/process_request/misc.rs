@@ -532,6 +532,7 @@ pub(super) fn handle_kill_client(
     backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() < 4 {
@@ -574,6 +575,38 @@ pub(super) fn handle_kill_client(
             113,
         );
     };
+    if state.policies_installed() {
+        let id = ResourceId(resource);
+        // Follow resource_owner's core-store order. In particular, do not
+        // widen KillClient's existing misses to colormaps or extension stores.
+        let kind = [
+            ResourceKind::Window,
+            ResourceKind::Pixmap,
+            ResourceKind::Gc,
+            ResourceKind::Font,
+            ResourceKind::Cursor,
+            ResourceKind::Picture,
+            ResourceKind::GlyphSet,
+            ResourceKind::Dri3Syncobj,
+        ]
+        .into_iter()
+        .find(|kind| state.access_resource_owner(id, *kind).is_some());
+        if let Some(kind) = kind
+            && let Err((code, bad_value)) = super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id,
+                    kind,
+                    creation: None,
+                },
+                AccessMode::GET_ATTR,
+                access_request,
+            )
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 113);
+        }
+    }
     if owner == crate::resources::SERVER_OWNER {
         // Server-reserved resource (root window, overlay, etc.). Noop.
         return Ok(RequestOutcome::Handled);

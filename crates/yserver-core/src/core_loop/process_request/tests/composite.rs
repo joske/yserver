@@ -1290,6 +1290,10 @@ fn kill_client_releases_the_victims_overlay_claim() {
         &mut backend,
         ClientId(1),
         SequenceNumber(1),
+        crate::access::RequestOpcodes {
+            major: 113,
+            minor: 0,
+        },
         &victim_window.0.to_le_bytes(),
     )
     .expect("KillClient");

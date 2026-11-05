@@ -118,6 +118,21 @@ pub(super) fn handle_set_input_focus(
         if let Some((code, value)) = core_focus_window_error(state, window) {
             return emit_x11_error(state, client_id, sequence, code, value, 42);
         }
+        if window.0 > 1
+            && let Err((code, bad_value)) = super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: window,
+                    kind: ResourceKind::Window,
+                    creation: None,
+                },
+                AccessMode::SET_ATTR,
+                RequestOpcodes::for_request(header),
+            )
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 42);
+        }
         let time = body
             .get(4..8)
             .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));

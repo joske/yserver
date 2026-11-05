@@ -1,4 +1,5 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind, ResourceTarget},
     backend::Backend,
     core_loop::{
         fanout::{
@@ -21,6 +22,7 @@ pub(super) fn handle_set_selection_owner(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() < 8 {
@@ -40,9 +42,9 @@ pub(super) fn handle_set_selection_owner(
 
     // Xorg `dixSetSelectionOwner` (dix/selection.c:156-211) ordering:
     //   1. Reject future timestamps silently (line 166-167)
-    //   2. Validate window + atom (line 169-178) — we accept any
-    //      window here pre-existing behaviour; tightening that is
-    //      a separate audit item
+    //   2. Validate the window, check access, then validate the atom
+    //      (line 169-178) — we accept any window here pre-existing
+    //      behaviour; tightening that is a separate audit item
     //   3. Reject stale timestamps silently vs prior lastTimeChanged
     //      (line 192-193)
     //   4. Update ownership + lastTimeChanged (line 204-207)
@@ -78,6 +80,21 @@ pub(super) fn handle_set_selection_owner(
             22,
         );
     }
+    if window.0 != 0
+        && let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: window,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            AccessMode::SET_ATTR,
+            access_request,
+        )
+    {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 22);
+    }
     // BadAtom if the selection atom isn't allocated
     // (`dix/selection.c:175-178`). `state.atoms.exists` is the
     // equivalent of Xorg's `ValidAtom`.
@@ -97,7 +114,6 @@ pub(super) fn handle_set_selection_owner(
         // Stale: silent no-op.
         return Ok(RequestOutcome::Handled);
     }
-
     // Snapshot prior ownership BEFORE we mutate state.selections so
     // the SelectionClear gate / event payload sees the previous
     // owner: its window and the client that set it. A release (None)
@@ -300,6 +316,7 @@ pub(super) fn handle_convert_selection(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() < 20 {
@@ -323,6 +340,19 @@ pub(super) fn handle_convert_selection(
             24,
         );
     }
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: requestor,
+            kind: ResourceKind::Window,
+            creation: None,
+        },
+        AccessMode::SET_ATTR,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 24);
+    }
     if !state.atoms.exists(selection)
         || !state.atoms.exists(target_atom)
         || (property.0 != 0 && !state.atoms.exists(property))
@@ -336,7 +366,6 @@ pub(super) fn handle_convert_selection(
             24,
         );
     }
-
     if let Some((owner_window, owner_id)) = selection_owner_target_id(state, selection) {
         let _dropped = fanout_event_to_clients(state, &[owner_id], |buf, seq, order| {
             x11::encode_selection_request_event(

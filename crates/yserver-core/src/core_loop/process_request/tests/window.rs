@@ -3713,6 +3713,10 @@ fn set_order_selection(state: &mut ServerState, obs: &mut UnixStream, client: u3
         state,
         ClientId(client),
         SequenceNumber(1),
+        crate::access::RequestOpcodes {
+            major: 22,
+            minor: 0,
+        },
         &body,
     )
     .expect("handle_set_selection_owner");
@@ -4183,6 +4187,10 @@ fn selection_request_and_clear_go_to_the_setting_client() {
         &mut state,
         ClientId(ORDER_OBS),
         SequenceNumber(2),
+        crate::access::RequestOpcodes {
+            major: 24,
+            minor: 0,
+        },
         &body,
     )
     .expect("handle_convert_selection");
@@ -4201,6 +4209,10 @@ fn selection_request_and_clear_go_to_the_setting_client() {
         &mut state,
         ClientId(ORDER_OBS),
         SequenceNumber(3),
+        crate::access::RequestOpcodes {
+            major: 22,
+            minor: 0,
+        },
         &body,
     )
     .expect("handle_set_selection_owner");
@@ -4250,6 +4262,10 @@ fn selection_clear_is_gated_on_the_setting_client_not_the_window_owner() {
             state,
             ClientId(client),
             SequenceNumber(2),
+            crate::access::RequestOpcodes {
+                major: 22,
+                minor: 0,
+            },
             &body,
         )
         .expect("handle_set_selection_owner");

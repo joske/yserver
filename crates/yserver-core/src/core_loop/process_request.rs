@@ -428,7 +428,7 @@ pub fn process_request(
         // ── SetCloseDownMode: validate mode (0/1/2 valid) ──
         112 => handle_set_close_down_mode(state, client_id, sequence, header),
         // ── KillClient (AllTemporary or by resource owner) ──
-        113 => handle_kill_client(state, backend, client_id, sequence, body),
+        113 => handle_kill_client(state, backend, client_id, sequence, access_request, body),
         // ── pointer/modifier mapping (reply + MappingNotify fanout) ──
         116 => handle_set_pointer_mapping(state, client_id, sequence, header, body),
         118 => {
@@ -446,7 +446,7 @@ pub fn process_request(
         27 => handle_ungrab_pointer(state, backend, client_id, sequence, body),
         28 => handle_grab_button(state, client_id, sequence, header, body),
         29 => handle_ungrab_button(state, client_id, sequence, header, body),
-        30 => handle_change_active_pointer_grab(state, client_id, sequence, body),
+        30 => handle_change_active_pointer_grab(state, client_id, sequence, access_request, body),
         31 => handle_grab_keyboard(state, client_id, sequence, header, body),
         32 => handle_ungrab_keyboard(state, client_id, sequence, body),
         33 => handle_grab_key(state, client_id, sequence, header, body),
@@ -482,8 +482,8 @@ pub fn process_request(
         ),
         119 => handle_get_modifier_mapping(state, backend, origin, client_id, sequence),
         // ── selections + SendEvent (cross-client fanout) ──
-        22 => handle_set_selection_owner(state, client_id, sequence, body),
-        24 => handle_convert_selection(state, client_id, sequence, body),
+        22 => handle_set_selection_owner(state, client_id, sequence, access_request, body),
+        24 => handle_convert_selection(state, client_id, sequence, access_request, body),
         25 => handle_send_event(state, backend, client_id, sequence, header, body),
         // ── fonts (state mutation + backend lifecycle) ──
         45 => handle_open_font(

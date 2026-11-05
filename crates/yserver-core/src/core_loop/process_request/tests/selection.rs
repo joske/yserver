@@ -1,5 +1,15 @@
 use super::*;
+use crate::access::RequestOpcodes;
 use yserver_protocol::x11::AtomId;
+
+const SET_SELECTION_OWNER_REQUEST: RequestOpcodes = RequestOpcodes {
+    major: 22,
+    minor: 0,
+};
+const CONVERT_SELECTION_REQUEST: RequestOpcodes = RequestOpcodes {
+    major: 24,
+    minor: 0,
+};
 
 /// Audit #9 (`docs/protocol-audit-2026-05-19.md`): when a client
 /// takes ownership of a selection via core `SetSelectionOwner`, the
@@ -63,8 +73,14 @@ fn set_selection_owner_emits_xfixes_set_owner_notify_to_subscribers() {
     body.extend_from_slice(&OWNER_WIN.to_le_bytes());
     body.extend_from_slice(&PRIMARY.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes());
-    handle_set_selection_owner(&mut state, ClientId(APP), SequenceNumber(1), &body)
-        .expect("handle_set_selection_owner");
+    handle_set_selection_owner(
+        &mut state,
+        ClientId(APP),
+        SequenceNumber(1),
+        SET_SELECTION_OWNER_REQUEST,
+        &body,
+    )
+    .expect("handle_set_selection_owner");
 
     // Drain clipboard mgr's socket and locate the XFixesSelectionNotify.
     peer.set_nonblocking(true).unwrap();
@@ -421,8 +437,14 @@ fn set_selection_owner_no_clear_when_same_client_moves_between_own_windows() {
     body.extend_from_slice(&WIN_B.to_le_bytes());
     body.extend_from_slice(&PRIMARY.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes()); // time=CurrentTime
-    handle_set_selection_owner(&mut state, ClientId(APP), SequenceNumber(1), &body)
-        .expect("handle_set_selection_owner");
+    handle_set_selection_owner(
+        &mut state,
+        ClientId(APP),
+        SequenceNumber(1),
+        SET_SELECTION_OWNER_REQUEST,
+        &body,
+    )
+    .expect("handle_set_selection_owner");
 
     peer.set_nonblocking(true).unwrap();
     let mut all = Vec::new();
@@ -506,8 +528,14 @@ fn set_selection_owner_clear_event_uses_resolved_time_when_client_sends_zero() {
     body.extend_from_slice(&NEW_WIN.to_le_bytes());
     body.extend_from_slice(&PRIMARY.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes()); // time=CurrentTime
-    handle_set_selection_owner(&mut state, ClientId(NEW_OWNER), SequenceNumber(1), &body)
-        .expect("handle_set_selection_owner");
+    handle_set_selection_owner(
+        &mut state,
+        ClientId(NEW_OWNER),
+        SequenceNumber(1),
+        SET_SELECTION_OWNER_REQUEST,
+        &body,
+    )
+    .expect("handle_set_selection_owner");
 
     peer.set_nonblocking(true).unwrap();
     let mut all = Vec::new();
@@ -707,8 +735,14 @@ fn set_selection_owner_with_future_time_is_silently_ignored() {
     body.extend_from_slice(&OWNER_WIN.to_le_bytes());
     body.extend_from_slice(&PRIMARY.to_le_bytes());
     body.extend_from_slice(&u32::MAX.to_le_bytes());
-    handle_set_selection_owner(&mut state, ClientId(OWNER_ID), SequenceNumber(1), &body)
-        .expect("handle_set_selection_owner");
+    handle_set_selection_owner(
+        &mut state,
+        ClientId(OWNER_ID),
+        SequenceNumber(1),
+        SET_SELECTION_OWNER_REQUEST,
+        &body,
+    )
+    .expect("handle_set_selection_owner");
 
     assert!(
         !state.selections.contains_key(&AtomId(PRIMARY)),
@@ -800,8 +834,14 @@ fn set_selection_owner_with_stale_time_is_silently_ignored() {
     body.extend_from_slice(&NEW_OWNER_WIN.to_le_bytes());
     body.extend_from_slice(&PRIMARY.to_le_bytes());
     body.extend_from_slice(&STALE_TIME.to_le_bytes());
-    handle_set_selection_owner(&mut state, ClientId(NEW_OWNER_ID), SequenceNumber(1), &body)
-        .expect("handle_set_selection_owner");
+    handle_set_selection_owner(
+        &mut state,
+        ClientId(NEW_OWNER_ID),
+        SequenceNumber(1),
+        SET_SELECTION_OWNER_REQUEST,
+        &body,
+    )
+    .expect("handle_set_selection_owner");
 
     let preserved = state
         .selections
@@ -1146,8 +1186,14 @@ fn set_selection_owner_emits_one_event_per_subscription_when_client_has_two_wind
     body.extend_from_slice(&OWNER_WIN.to_le_bytes());
     body.extend_from_slice(&PRIMARY.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes());
-    handle_set_selection_owner(&mut state, ClientId(APP), SequenceNumber(1), &body)
-        .expect("handle_set_selection_owner");
+    handle_set_selection_owner(
+        &mut state,
+        ClientId(APP),
+        SequenceNumber(1),
+        SET_SELECTION_OWNER_REQUEST,
+        &body,
+    )
+    .expect("handle_set_selection_owner");
 
     peer.set_nonblocking(true).unwrap();
     let mut all = Vec::new();
@@ -1207,8 +1253,14 @@ fn set_selection_owner_skips_subscribers_whose_mask_excludes_set_owner() {
     body.extend_from_slice(&0x0090_0001u32.to_le_bytes()); // owner window
     body.extend_from_slice(&PRIMARY.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes()); // time
-    handle_set_selection_owner(&mut state, ClientId(APP), SequenceNumber(1), &body)
-        .expect("handle_set_selection_owner");
+    handle_set_selection_owner(
+        &mut state,
+        ClientId(APP),
+        SequenceNumber(1),
+        SET_SELECTION_OWNER_REQUEST,
+        &body,
+    )
+    .expect("handle_set_selection_owner");
 
     peer.set_nonblocking(true).unwrap();
     let mut all = Vec::new();
@@ -1276,8 +1328,14 @@ fn record_set_owner(
     for word in [window, selection.0, time] {
         body.extend_from_slice(&word.to_le_bytes());
     }
-    handle_set_selection_owner(state, ClientId(client), SequenceNumber(1), &body)
-        .expect("handle_set_selection_owner");
+    handle_set_selection_owner(
+        state,
+        ClientId(client),
+        SequenceNumber(1),
+        SET_SELECTION_OWNER_REQUEST,
+        &body,
+    )
+    .expect("handle_set_selection_owner");
 }
 
 /// GetSelectionOwner as `b` issues it.
@@ -1319,6 +1377,7 @@ fn record_convert(state: &mut ServerState, client: u32, requestor: u32, selectio
         state,
         ClientId(client),
         SequenceNumber(3),
+        CONVERT_SELECTION_REQUEST,
         &body,
     )
     .expect("handle_convert_selection");
@@ -1380,6 +1439,7 @@ fn convert_selection_with_a_bad_requestor_or_atom_is_an_error_and_sends_nothing(
             state,
             ClientId(REC_B),
             SequenceNumber(3),
+            CONVERT_SELECTION_REQUEST,
             &body,
         )
         .expect("handle_convert_selection");
