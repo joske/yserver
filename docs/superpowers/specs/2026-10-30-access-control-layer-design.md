@@ -217,11 +217,14 @@ Xnamespace tells apart requests that share a mode:
 |---|---|
 | Resource, property, device, client, server on a whole request | the policy's `DenyError` |
 | A check per returned entry, such as `XResQueryClients` | the entry is left out and the reply succeeds |
+| `ListProperties` property entry | the entry is left out; the reply succeeds |
 | Core `SendEvent` | no delivery, and the request succeeds |
 | Receive | no delivery and no error |
 | Extension access | the extension is reported as absent |
 | Extension dispatch | `BadRequest` with value 0, whatever the policy's error. Xorg also answers `BadRequest` (`Xext/xace.c:45-46`), but with `client->errorValue` as the value (`dix/dispatch.c:571-573`); that field is not reset between requests and successful handlers set it (`CreateGC`, `dix/dispatch.c:1559`), so Xorg leaks a stale value. Value 0 leaks nothing |
 | `QueryKeymap` and similar reads | the zeroed reply XLibre gives |
+| `MapWindow` / `ReparentWindow` remap | `Success`; the window stays unmapped |
+| `MapSubwindows` / `UnmapSubwindows` / `CirculateWindow` derived child | the child is skipped; the request succeeds |
 | A derived target in `DestroySubwindows` | the loop stops, the remaining children stay unmapped, and the request succeeds (Xorg `dix/dispatch.c:852`) |
 
 A check authorizes either a whole request or one entry of a list, and the plan
@@ -254,6 +257,9 @@ consolidate it.
 Operands are not the only targets. When a request acts on objects it derives,
 each one gets its own check with the requesting client, as `DestroySubwindows`
 does for every child. Traversing to find them stays unchecked server work.
+Work run as `SERVER_OWNER` is server work. Subtree descendants that follow an
+authorized ancestor's map, unmap, or destroy are consequences, not derived
+targets to check.
 
 ### Denial with several targets
 

@@ -5611,3 +5611,85 @@ fn copy_gc_denial_preserves_destination_for_source_and_destination_denial() {
         );
     }
 }
+
+struct AllowAllAccessPolicy;
+
+impl AccessPolicy for AllowAllAccessPolicy {}
+
+#[test]
+#[ignore]
+fn bench_poly_point_with_and_without_policy() {
+    const REQUESTS: u32 = 100_000;
+    const GC_ID: ResourceId = ResourceId(0x0055_0090);
+
+    let run = |with_policy: bool| {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT.0);
+        state.resources.create_gc(
+            CLIENT,
+            CreateGcRequest {
+                gc: GC_ID,
+                drawable: ROOT_WINDOW,
+                function: None,
+                plane_mask: None,
+                foreground: None,
+                background: None,
+                line_width: None,
+                line_style: None,
+                cap_style: None,
+                join_style: None,
+                fill_style: None,
+                fill_rule: None,
+                tile: None,
+                stipple: None,
+                tile_x_origin: None,
+                tile_y_origin: None,
+                font: None,
+                subwindow_mode: None,
+                graphics_exposures: None,
+                clip_x_origin: None,
+                clip_y_origin: None,
+                clip_mask: None,
+                dash_offset: None,
+                dashes: None,
+                arc_mode: None,
+            },
+        );
+        if with_policy {
+            state.install_access_policy(Arc::new(AllowAllAccessPolicy));
+        }
+
+        let mut backend = RecordingBackend::new();
+        let mut body = [0u8; 12];
+        body[..4].copy_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        body[4..8].copy_from_slice(&GC_ID.0.to_le_bytes());
+        let start = std::time::Instant::now();
+        for sequence in 0..REQUESTS {
+            // Mutation: make `handle_poly_point` propagate an I/O error
+            // instead of `Handled`; this request-level expect must fail.
+            process_request(
+                &mut state,
+                &mut backend,
+                CLIENT,
+                SequenceNumber(sequence as u16),
+                RequestHeader {
+                    opcode: 64,
+                    data: 0,
+                    length_units: 4,
+                },
+                &body,
+                None,
+            )
+            .expect("valid one-point PolyPoint request");
+        }
+        start.elapsed()
+    };
+
+    let without_policy = run(false);
+    let with_policy = run(true);
+    println!(
+        "PolyPoint ({REQUESTS} requests): no policy = {:.1} ns/request; allow-all policy = {:.1} ns/request",
+        without_policy.as_nanos() as f64 / f64::from(REQUESTS),
+        with_policy.as_nanos() as f64 / f64::from(REQUESTS),
+    );
+}
