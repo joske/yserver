@@ -1267,6 +1267,20 @@ pub trait Backend {
     /// the destination disappeared).
     fn finish_present_source_wait(&mut self, _wait_id: u64) {}
 
+    /// Whether a Present that is not yet executed is scrapped (completed as
+    /// Skip) by a later one for the same window and target MSC, as Xorg's
+    /// `present_scmd.c` does ("don't bother doing the previous one if this
+    /// one will overwrite it in the same frame"). Default true. A backend
+    /// whose windows are another window system's says false, since that
+    /// window system -- not the X server -- decides which frame a refresh
+    /// shows, and copies each present in turn. Xwayland scraps no copy at
+    /// arrival (`xwl_present_pixmap`); what it does scrap is a flip queued
+    /// behind a pending one (`xwl_present_execute`'s mailbox handling), and
+    /// such a backend has no flips.
+    fn present_supersedes_same_msc(&self) -> bool {
+        true
+    }
+
     /// A scanout pageflip is submitted and not yet retired. Used ONLY by
     /// the immediate-target arrival rule (spec §msc-due). Default false:
     /// non-KMS backends execute everything at arrival.
