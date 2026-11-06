@@ -2578,19 +2578,27 @@ mod tests {
         // host's destination origin.
         let mut items = Vec::new();
         items.extend_from_slice(&glyphcmd(1, 10, 20)); // run 1
-        items.extend_from_slice(&yserver_protocol::x11::render_composite_glyphset_switch(0)); // glyphset switch
+        items.extend_from_slice(&[0xaa, 0, 0, 0]); // one glyph id + 4-byte padding
+        let glyphset = 0x1234_56ff;
+        let switch = yserver_protocol::x11::render_composite_glyphset_switch(glyphset);
+        let switch_offset = items.len();
+        items.extend_from_slice(&switch);
         items.extend_from_slice(&glyphcmd(2, 30, 40)); // run 2
+        items.extend_from_slice(&[0xbb, 0xcc, 0, 0]); // two glyph ids + 4-byte padding
 
         super::patch_glyph_command_offsets(&mut items, 5, -3, 1);
 
         assert_eq!(read_dx(&items, 0), 15);
         assert_eq!(read_dy(&items, 0), 17);
-        // 255 sentinel cmd untouched (its delta bytes are still 0).
-        assert_eq!(read_dx(&items, 8), 0);
-        assert_eq!(read_dy(&items, 8), 0);
+        assert_eq!(
+            &items[switch_offset..switch_offset + switch.len()],
+            &switch,
+            "switch header and XID are unchanged",
+        );
         // Second run patched too.
-        assert_eq!(read_dx(&items, 20), 35);
-        assert_eq!(read_dy(&items, 20), 37);
+        assert_eq!(items[24], 2, "second run count remains unchanged");
+        assert_eq!(read_dx(&items, 24), 35);
+        assert_eq!(read_dy(&items, 24), 37);
     }
 
     #[test]
