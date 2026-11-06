@@ -694,6 +694,23 @@ fn xfixes_verify_cursor(
     ))
 }
 
+/// Build the cursor target for a displayed backend cursor. A record is used
+/// as an explicit target owner only after its original XID no longer resolves
+/// to that same owner (including when the XID has been recycled).
+fn xfixes_cursor_host_target(
+    state: &ServerState,
+    host: u32,
+) -> Option<crate::access::ResourceTarget> {
+    let (id, owner) = state.resources.cursor_host_origin(host)?;
+    let live_owner = state.access_resource_owner(id, crate::access::ResourceKind::Cursor);
+    Some(crate::access::ResourceTarget {
+        owner: (live_owner != Some(owner)).then_some(owner),
+        id,
+        kind: crate::access::ResourceKind::Cursor,
+        creation: None,
+    })
+}
+
 /// Xorg `ReplaceCursor` for XFIXES `ChangeCursor` / `ChangeCursorByName`:
 /// every cursor XID and every displayed use of host cursor `old_host`
 /// switches to `source`'s cursor. Replacing a cursor with itself is a
@@ -970,6 +987,11 @@ pub(super) fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
+                check_resource!(
+                    ResourceId(req.window),
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR
+                );
                 let key = (
                     client_id.0,
                     ResourceId(req.window),
@@ -1008,6 +1030,11 @@ pub(super) fn handle_xfixes_request(
                         header.opcode,
                     );
                 }
+                check_resource!(
+                    ResourceId(req.window),
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR
+                );
                 let key = (client_id.0, ResourceId(req.window));
                 if req.event_mask == 0 {
                     state.xfixes_cursor_masks.remove(&key);
@@ -1023,7 +1050,28 @@ pub(super) fn handle_xfixes_request(
             // back to the empty reply so existing client behaviour
             // doesn't regress (a 0×0 reply is still a valid X11
             // GetCursorImage response).
-            let reply = match backend.get_active_cursor_image() {
+            let active_image = backend.get_active_cursor_image();
+            if let Some(img) = &active_image
+                && let Some(target) = xfixes_cursor_host_target(state, img.host_xid)
+                && let Err((code, value)) = super::validate_resource_access(
+                    state,
+                    client_id,
+                    target,
+                    AccessMode::READ,
+                    access_request,
+                )
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
+            let reply = match active_image {
                 Some(img) => x11xfixes::encode_get_cursor_image_reply(
                     byte_order,
                     sequence,
@@ -1050,7 +1098,28 @@ pub(super) fn handle_xfixes_request(
             // cursor; with no reply they block forever in poll(). The
             // name is the displayed cursor's XFIXES name (Xorg
             // `pCursor->name`), empty when it was never named.
-            let reply = match backend.get_active_cursor_image() {
+            let active_image = backend.get_active_cursor_image();
+            if let Some(img) = &active_image
+                && let Some(target) = xfixes_cursor_host_target(state, img.host_xid)
+                && let Err((code, value)) = super::validate_resource_access(
+                    state,
+                    client_id,
+                    target,
+                    AccessMode::READ | AccessMode::GET_ATTR,
+                    access_request,
+                )
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
+            let reply = match active_image {
                 Some(img) => {
                     let atom = state
                         .resources
@@ -1143,6 +1212,11 @@ pub(super) fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
+                check_resource!(
+                    ResourceId(req.window),
+                    ResourceKind::Window,
+                    AccessMode::READ
+                );
                 for &d in &req.devices {
                     if !(d == 0 || d == 1 || d == 2) {
                         return emit_x11_error_with_minor(
@@ -1176,6 +1250,27 @@ pub(super) fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
+                super::return_on_access_denial!(
+                    super::validate_resource_access(
+                        state,
+                        client_id,
+                        ResourceTarget {
+                            owner: None,
+                            id: ResourceId(req.barrier),
+                            kind: ResourceKind::PointerBarrier,
+                            creation: Some(Creation {
+                                parent: Some(ResourceId(req.window)),
+                                owner: client_id,
+                            }),
+                        },
+                        AccessMode::CREATE,
+                        access_request,
+                    ),
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                );
                 let (mut x1, mut x2) = (req.x1, req.x2);
                 let (mut y1, mut y2) = (req.y1, req.y2);
                 if x1 >= 0 && x2 >= 0 && x1 > x2 {
@@ -1218,6 +1313,13 @@ pub(super) fn handle_xfixes_request(
         }
         x11xfixes::DELETE_POINTER_BARRIER => {
             if let Some(bid) = x11xfixes::parse_delete_pointer_barrier(body) {
+                if state.pointer_barriers.contains_key(&bid) {
+                    check_resource!(
+                        ResourceId(bid),
+                        ResourceKind::PointerBarrier,
+                        AccessMode::DESTROY
+                    );
+                }
                 match state.pointer_barriers.get(&bid) {
                     None => {
                         return emit_x11_error(
@@ -1611,10 +1713,12 @@ pub(super) fn handle_xfixes_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11xfixes::CHANGE_SAVE_SET => {
-            if let Some(req) = x11xfixes::parse_change_save_set(body)
-                && let Some(c) = state.clients.get_mut(&client_id.0)
-            {
+            if let Some(req) = x11xfixes::parse_change_save_set(body) {
                 let win = ResourceId(req.window);
+                check_resource!(win, ResourceKind::Window, AccessMode::MANAGE);
+                let Some(c) = state.clients.get_mut(&client_id.0) else {
+                    return Ok(RequestOutcome::Handled);
+                };
                 match req.mode {
                     0 => {
                         c.save_set.insert(win);
@@ -1767,6 +1871,16 @@ pub(super) fn handle_xfixes_request(
                     Ok(host) => host,
                     Err(outcome) => return outcome,
                 };
+            check_resource!(
+                ResourceId(source),
+                ResourceKind::Cursor,
+                AccessMode::READ | AccessMode::GET_ATTR
+            );
+            check_resource!(
+                ResourceId(destination),
+                ResourceKind::Cursor,
+                AccessMode::WRITE | AccessMode::SET_ATTR
+            );
             if let Some(dest_host) = dest_host {
                 xfixes_replace_cursor(state, backend, origin, dest_host, ResourceId(source));
             }
@@ -1781,11 +1895,36 @@ pub(super) fn handle_xfixes_request(
                 {
                     return outcome;
                 }
+                check_resource!(
+                    ResourceId(cursor_xid),
+                    ResourceKind::Cursor,
+                    AccessMode::READ | AccessMode::GET_ATTR
+                );
                 let name = std::str::from_utf8(name_bytes).unwrap_or("");
                 let atom = state.atoms.intern(name, true);
                 if atom.0 != 0 {
                     for host in state.resources.cursor_hosts_named(atom) {
-                        xfixes_replace_cursor(state, backend, origin, host, ResourceId(cursor_xid));
+                        let allowed = if let Some(target) = xfixes_cursor_host_target(state, host) {
+                            super::validate_resource_access(
+                                state,
+                                client_id,
+                                target,
+                                AccessMode::WRITE | AccessMode::SET_ATTR,
+                                access_request,
+                            )
+                            .is_ok()
+                        } else {
+                            true
+                        };
+                        if allowed {
+                            xfixes_replace_cursor(
+                                state,
+                                backend,
+                                origin,
+                                host,
+                                ResourceId(cursor_xid),
+                            );
+                        }
                     }
                 }
             }
@@ -1861,6 +2000,11 @@ pub(super) fn handle_xfixes_request(
                 {
                     return outcome;
                 }
+                check_resource!(
+                    ResourceId(cursor_xid),
+                    ResourceKind::Cursor,
+                    AccessMode::SET_ATTR
+                );
                 let name = std::str::from_utf8(name_bytes).unwrap_or("");
                 let atom = state.atoms.intern(name, false);
                 state
@@ -1891,6 +2035,11 @@ pub(super) fn handle_xfixes_request(
             {
                 return outcome;
             }
+            check_resource!(
+                ResourceId(cursor_xid),
+                ResourceKind::Cursor,
+                AccessMode::GET_ATTR
+            );
             let atom = state
                 .resources
                 .cursor_name_atom(ResourceId(cursor_xid))
@@ -1938,6 +2087,11 @@ pub(super) fn handle_xfixes_request(
                     header.opcode,
                 );
             }
+            check_resource!(
+                ResourceId(window),
+                ResourceKind::Window,
+                AccessMode::GET_ATTR
+            );
             if minor == x11xfixes::HIDE_CURSOR {
                 let was_visible = state.xfixes_cursor_hide_counts.is_empty();
                 *state

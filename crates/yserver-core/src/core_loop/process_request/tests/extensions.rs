@@ -34,6 +34,7 @@ pub(super) struct RecordingExtensionPolicy {
     calls: Arc<Mutex<Vec<RecordedExtensionCheck>>>,
     resource_denial: Option<(ResourceId, Option<AccessMode>, DenyError)>,
     deny_all_resources: Option<DenyError>,
+    deny_resources_not_owned_by_requester: Option<DenyError>,
 }
 
 impl RecordingExtensionPolicy {
@@ -43,6 +44,7 @@ impl RecordingExtensionPolicy {
             calls,
             resource_denial: None,
             deny_all_resources: None,
+            deny_resources_not_owned_by_requester: None,
         }
     }
 
@@ -57,6 +59,7 @@ impl RecordingExtensionPolicy {
             calls,
             resource_denial: Some((id, mode, error)),
             deny_all_resources: None,
+            deny_resources_not_owned_by_requester: None,
         }
     }
 
@@ -69,6 +72,20 @@ impl RecordingExtensionPolicy {
             calls,
             resource_denial: None,
             deny_all_resources: Some(error),
+            deny_resources_not_owned_by_requester: None,
+        }
+    }
+
+    pub(super) fn denying_resources_not_owned_by_requester(
+        calls: Arc<Mutex<Vec<RecordedExtensionCheck>>>,
+        error: DenyError,
+    ) -> Self {
+        Self {
+            decision: Decision::Allow,
+            calls,
+            resource_denial: None,
+            deny_all_resources: None,
+            deny_resources_not_owned_by_requester: Some(error),
         }
     }
 
@@ -82,24 +99,24 @@ impl RecordingExtensionPolicy {
         property: Option<(ResourceId, AtomId)>,
         mode: Option<AccessMode>,
     ) -> Decision {
-        let decision = match (
-            &hook,
-            target,
-            mode,
-            self.deny_all_resources,
-            self.resource_denial,
-        ) {
-            (ExtensionHook::Resource, _, _, Some(error), _) => Decision::Deny(error),
-            (
-                ExtensionHook::Resource,
-                Some(target),
-                mode,
-                None,
-                Some((id, expected_mode, error)),
-            ) if target.id == id && expected_mode.is_none_or(|expected| mode == Some(expected)) => {
+        let decision = if hook == ExtensionHook::Resource {
+            if let Some(error) = self.deny_all_resources {
                 Decision::Deny(error)
+            } else if let Some((id, expected_mode, error)) = self.resource_denial
+                && target.is_some_and(|target| {
+                    target.id == id && expected_mode.is_none_or(|expected| mode == Some(expected))
+                })
+            {
+                Decision::Deny(error)
+            } else if let Some(error) = self.deny_resources_not_owned_by_requester
+                && target.is_some_and(|target| ctx.target_owner(&target) != Some(client))
+            {
+                Decision::Deny(error)
+            } else {
+                self.decision
             }
-            _ => self.decision,
+        } else {
+            self.decision
         };
         self.calls.lock().unwrap().push(RecordedExtensionCheck {
             hook,
