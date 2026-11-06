@@ -1,4 +1,5 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind},
     backend::{Backend, OriginContext},
     core_loop::process_request::{
         RequestOutcome, XI2_MAJOR_OPCODE, emit_x11_error_with_minor,
@@ -49,6 +50,33 @@ pub(super) fn handle_xi_change_cursor(
     }
     let window = ResourceId(u32::from_le_bytes(body[0..4].try_into().expect("4 bytes")));
     let cursor = ResourceId(u32::from_le_bytes(body[4..8].try_into().expect("4 bytes")));
+    let access_request = RequestOpcodes {
+        major: XI2_MAJOR_OPCODE,
+        minor: 42,
+    };
+    for (id, kind, mode) in [
+        (window, ResourceKind::Window, AccessMode::SET_ATTR),
+        (cursor, ResourceKind::Cursor, AccessMode::USE),
+    ] {
+        if let Err((code, value)) = crate::core_loop::process_request::validate_resource_if_present(
+            state,
+            client_id,
+            id,
+            kind,
+            mode,
+            access_request,
+        ) {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                code,
+                value,
+                42,
+                XI2_MAJOR_OPCODE,
+            );
+        }
+    }
     let host_window_raw = if window == ROOT_WINDOW {
         Some(backend.window_id())
     } else {
@@ -112,6 +140,27 @@ pub(super) fn handle_xi_query_pointer(
         } else {
             ROOT_WINDOW
         };
+        if let Err((code, value)) = crate::core_loop::process_request::validate_resource_if_present(
+            state,
+            client_id,
+            queried_window,
+            ResourceKind::Window,
+            AccessMode::GET_ATTR,
+            RequestOpcodes {
+                major: XI2_MAJOR_OPCODE,
+                minor: 40,
+            },
+        ) {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                code,
+                value,
+                40,
+                XI2_MAJOR_OPCODE,
+            );
+        }
         let pointer = backend.query_pointer(origin).ok();
         let (root_x_int, root_y_int, mask, same_screen) =
             if let Some(p) = pointer.filter(|p| p.same_screen) {
@@ -316,6 +365,22 @@ pub(super) fn handle_xi1_set_device_focus(
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
         }
+        if !matches!(focus, 0 | 1 | 3)
+            && let Err((code, value)) =
+                crate::core_loop::process_request::validate_resource_if_present(
+                    state,
+                    client_id,
+                    ResourceId(focus),
+                    ResourceKind::Window,
+                    AccessMode::SET_ATTR,
+                    RequestOpcodes {
+                        major: XI2_MAJOR_OPCODE,
+                        minor,
+                    },
+                )
+        {
+            return xi1_error(state, client_id, sequence, code, value, minor);
+        }
         // Timestamp gate (dix/events.c:4920-4922): CurrentTime(0)
         // maps to the server clock; a time later than "now" or
         // earlier than the last-focus-change time is a silent no-op.
@@ -406,7 +471,7 @@ pub(super) fn handle_xi_barrier_release_pointer(
                         XI2_MAJOR_OPCODE,
                     );
                 }
-                let Some(barrier) = state.pointer_barriers.get_mut(&barrier_id) else {
+                if !state.pointer_barriers.contains_key(&barrier_id) {
                     return emit_x11_error_with_minor(
                         state,
                         client_id,
@@ -416,7 +481,34 @@ pub(super) fn handle_xi_barrier_release_pointer(
                         61,
                         XI2_MAJOR_OPCODE,
                     );
-                };
+                }
+                if let Err((code, value)) =
+                    crate::core_loop::process_request::validate_resource_if_present(
+                        state,
+                        client_id,
+                        ResourceId(barrier_id),
+                        ResourceKind::PointerBarrier,
+                        AccessMode::READ,
+                        RequestOpcodes {
+                            major: XI2_MAJOR_OPCODE,
+                            minor: 61,
+                        },
+                    )
+                {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        code,
+                        value,
+                        61,
+                        XI2_MAJOR_OPCODE,
+                    );
+                }
+                let barrier = state
+                    .pointer_barriers
+                    .get_mut(&barrier_id)
+                    .expect("barrier still exists after access check");
                 if barrier.owner != client_id {
                     return emit_x11_error_with_minor(
                         state,

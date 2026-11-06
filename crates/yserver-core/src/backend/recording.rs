@@ -112,6 +112,10 @@ pub enum RecordedCall {
     OpenFont(String),
     CloseFont(u32),
     Ping,
+    XkbProxy {
+        minor: u8,
+    },
+    QueryPointer,
     ReleaseRedirectedBacking(u32),
     RetainBackingStorage(u32),
     DropBackingStorage(u32),
@@ -2769,10 +2773,11 @@ impl Backend for RecordingBackend {
     fn xkb_proxy(
         &mut self,
         _origin: Option<OriginContext>,
-        _minor: u8,
+        minor: u8,
         _body: &[u8],
         _intern_atom: &mut dyn FnMut(&str) -> u32,
     ) -> io::Result<Option<Vec<u8>>> {
+        self.record(RecordedCall::XkbProxy { minor });
         Ok(None)
     }
 
@@ -2834,6 +2839,7 @@ impl Backend for RecordingBackend {
     }
 
     fn query_pointer(&mut self, _origin: Option<OriginContext>) -> io::Result<PointerPosition> {
+        self.record(RecordedCall::QueryPointer);
         Ok(PointerPosition {
             same_screen: true,
             win_x: 0,

@@ -156,8 +156,8 @@ pub(in crate::core_loop::process_request) fn handle_xi2_request(
     match minor {
         1 => handle_xi1_get_extension_version(state, client_id, sequence, header, body, byte_order),
         42 => handle_xi_change_cursor(state, backend, origin, client_id, sequence, body),
-        44 => handle_xi_set_client_pointer(client_id, sequence),
-        45 => handle_xi_get_client_pointer(state, client_id, sequence, byte_order),
+        44 => handle_xi_set_client_pointer(state, client_id, sequence, body),
+        45 => handle_xi_get_client_pointer(state, client_id, sequence, body, byte_order),
         46 => handle_xi_select_events(state, backend, origin, client_id, sequence, header, body),
         47 => handle_xi_query_version(state, client_id, sequence, body, byte_order),
         48 => handle_xi_query_device(state, client_id, sequence, body, byte_order),
@@ -238,7 +238,7 @@ pub(in crate::core_loop::process_request) fn handle_xi2_request(
         35 => handle_xi1_change_device_control(state, client_id, sequence, body, byte_order, minor),
         50 => handle_xi_get_focus(state, client_id, sequence, body, byte_order, minor),
         61 => handle_xi_barrier_release_pointer(state, client_id, sequence, body),
-        41 => handle_xi_warp_pointer(state, backend, origin, client_id, sequence, body),
+        41 => handle_xi_warp_pointer(state, backend, origin, client_id, sequence, header, body),
         43 => handle_xi_change_hierarchy(state, client_id, sequence, byte_order, body),
         49 => handle_xi_set_focus(state, client_id, sequence, body),
         // Every minor in 1..=XINPUT_LAST_REQUEST has an arm above; like
