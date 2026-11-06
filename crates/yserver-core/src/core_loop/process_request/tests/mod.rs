@@ -1,5 +1,6 @@
 mod access_grabs;
 mod access_properties;
+mod access_render;
 mod access_resources;
 mod composite;
 mod core_misc;

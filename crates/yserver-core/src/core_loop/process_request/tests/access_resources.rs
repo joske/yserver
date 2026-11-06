@@ -455,10 +455,10 @@ fn owner_resolver_answers_every_kind() {
         ResourceKind::RandrProvider,
     ];
     let calls = Arc::new(Mutex::new(Vec::new()));
-    state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-        decision: Decision::Allow,
-        calls: Arc::clone(&calls),
-    }));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        Decision::Allow,
+        Arc::clone(&calls),
+    )));
 
     for kind in expected_kinds {
         assert!(
@@ -523,10 +523,10 @@ fn owner_resolver_keeps_retained_owner() {
     assert!(state.zombie_clients.contains_key(&CLIENT.0));
 
     let calls = Arc::new(Mutex::new(Vec::new()));
-    state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-        decision: Decision::Allow,
-        calls: Arc::clone(&calls),
-    }));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        Decision::Allow,
+        Arc::clone(&calls),
+    )));
     assert_eq!(
         ask_owner(&state, pixmap, ResourceKind::Pixmap, &calls),
         Some(CLIENT)
@@ -542,10 +542,10 @@ fn kill_client_colormap_result(with_policy: bool) -> (Vec<u8>, Vec<RecordedExten
     let mut peer = install_client(&mut state, CLIENT.0);
     let calls = Arc::new(Mutex::new(Vec::new()));
     if with_policy {
-        state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-            decision: Decision::Allow,
-            calls: Arc::clone(&calls),
-        }));
+        state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+            Decision::Allow,
+            Arc::clone(&calls),
+        )));
     }
 
     let colormap = ResourceId(0x0052_0001);
@@ -590,13 +590,13 @@ fn server_owner_is_never_checked() {
     // Mutation: remove either SERVER_OWNER fast path; its matching Allow assertion must fail.
     let mut state = ServerState::new();
     let calls = Arc::new(Mutex::new(Vec::new()));
-    state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-        decision: Decision::Deny(DenyError {
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        Decision::Deny(DenyError {
             code: yserver_protocol::x11::error::BAD_VALUE,
             value: 0x55,
         }),
-        calls: Arc::clone(&calls),
-    }));
+        Arc::clone(&calls),
+    )));
     let server = crate::resources::SERVER_OWNER;
     assert_eq!(
         state.check_resource(
@@ -2740,10 +2740,10 @@ fn window_resource_requests_present_expected_checks() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     fixture
         .state
-        .install_access_policy(Arc::new(RecordingExtensionPolicy {
-            decision: Decision::Allow,
-            calls: Arc::clone(&calls),
-        }));
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+            Decision::Allow,
+            Arc::clone(&calls),
+        )));
     let created = ResourceId(0x0054_000c);
     let create_body = create_window_with_access_attributes(
         created,
@@ -3076,10 +3076,10 @@ fn destroy_subwindows_wire_bytes(child_count: usize, allow_policy: bool) -> (Vec
             .insert(child, 0x0002_0000);
     }
     if allow_policy {
-        state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-            decision: Decision::Allow,
-            calls: Arc::new(Mutex::new(Vec::new())),
-        }));
+        state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+            Decision::Allow,
+            Arc::new(Mutex::new(Vec::new())),
+        )));
     }
     let request_bytes = resource_request(
         &mut state,
@@ -5420,10 +5420,10 @@ fn gc_pixmap_cursor_font_requests_ask_expected_targets() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     fixture
         .state
-        .install_access_policy(Arc::new(RecordingExtensionPolicy {
-            decision: Decision::Allow,
-            calls: Arc::clone(&calls),
-        }));
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+            Decision::Allow,
+            Arc::clone(&calls),
+        )));
 
     let mut expected = Vec::new();
     for (sequence, case) in (70u16..).zip(cases) {

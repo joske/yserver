@@ -27,11 +27,33 @@ pub(super) struct RecordedExtensionCheck {
 }
 
 pub(super) struct RecordingExtensionPolicy {
-    pub(super) decision: Decision,
-    pub(super) calls: Arc<Mutex<Vec<RecordedExtensionCheck>>>,
+    decision: Decision,
+    calls: Arc<Mutex<Vec<RecordedExtensionCheck>>>,
+    resource_denial: Option<(ResourceId, Option<AccessMode>, DenyError)>,
 }
 
 impl RecordingExtensionPolicy {
+    pub(super) fn new(decision: Decision, calls: Arc<Mutex<Vec<RecordedExtensionCheck>>>) -> Self {
+        Self {
+            decision,
+            calls,
+            resource_denial: None,
+        }
+    }
+
+    pub(super) fn denying_resource(
+        calls: Arc<Mutex<Vec<RecordedExtensionCheck>>>,
+        id: ResourceId,
+        mode: Option<AccessMode>,
+        error: DenyError,
+    ) -> Self {
+        Self {
+            decision: Decision::Allow,
+            calls,
+            resource_denial: Some((id, mode, error)),
+        }
+    }
+
     fn check(
         &self,
         hook: ExtensionHook,
@@ -42,6 +64,15 @@ impl RecordingExtensionPolicy {
         property: Option<(ResourceId, AtomId)>,
         mode: Option<AccessMode>,
     ) -> Decision {
+        let decision = match (&hook, target, mode, self.resource_denial) {
+            (ExtensionHook::Resource, Some(target), mode, Some((id, expected_mode, error)))
+                if target.id == id
+                    && expected_mode.is_none_or(|expected| mode == Some(expected)) =>
+            {
+                Decision::Deny(error)
+            }
+            _ => self.decision,
+        };
         self.calls.lock().unwrap().push(RecordedExtensionCheck {
             hook,
             client,
@@ -54,7 +85,7 @@ impl RecordingExtensionPolicy {
             property,
             mode,
         });
-        self.decision
+        decision
     }
 }
 
@@ -380,10 +411,10 @@ fn extension_access_asks_once_per_available_extension() {
     let expected_peer = state.clients[&1].peer;
     let expected_admission = state.clients[&1].admission;
     let calls = Arc::new(Mutex::new(Vec::new()));
-    state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-        decision: Decision::Allow,
-        calls: Arc::clone(&calls),
-    }));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        Decision::Allow,
+        Arc::clone(&calls),
+    )));
     let mut backend = RecordingBackend::new();
 
     dispatch_extension_request(
@@ -461,10 +492,10 @@ fn extension_access_allow_keeps_bytes() {
     let advertised = names_from_list_reply(&baseline_list);
 
     let mut allow_state = ServerState::new();
-    allow_state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-        decision: Decision::Allow,
-        calls: Arc::new(Mutex::new(Vec::new())),
-    }));
+    allow_state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        Decision::Allow,
+        Arc::new(Mutex::new(Vec::new())),
+    )));
     let mut allow_backend = RecordingBackend::new();
     assert_eq!(
         list_extensions(&mut allow_state, &mut allow_backend),
@@ -478,10 +509,10 @@ fn extension_access_allow_keeps_bytes() {
         let baseline = query_extension(&mut baseline_state, &mut baseline_backend, sequence, name);
 
         let mut allow_state = ServerState::new();
-        allow_state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-            decision: Decision::Allow,
-            calls: Arc::new(Mutex::new(Vec::new())),
-        }));
+        allow_state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+            Decision::Allow,
+            Arc::new(Mutex::new(Vec::new())),
+        )));
         let mut allow_backend = RecordingBackend::new();
         let allowed = query_extension(&mut allow_state, &mut allow_backend, sequence, name);
         assert_eq!(allowed, baseline, "QueryExtension({name}) wire reply");
@@ -505,7 +536,7 @@ fn extension_access_first_denial_wins() {
         (deny, Arc::clone(&deny_calls)),
         (Decision::Allow, Arc::clone(&after_deny_calls)),
     ] {
-        state.install_access_policy(Arc::new(RecordingExtensionPolicy { decision, calls }));
+        state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(decision, calls)));
     }
     let mut backend = RecordingBackend::new();
     dispatch_extension_request(
@@ -527,14 +558,14 @@ fn extension_access_first_denial_wins() {
     let mut peer = install_client(&mut state, 1);
     let deny_calls = Arc::new(Mutex::new(Vec::new()));
     let allow_calls = Arc::new(Mutex::new(Vec::new()));
-    state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-        decision: deny,
-        calls: Arc::clone(&deny_calls),
-    }));
-    state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-        decision: Decision::Allow,
-        calls: Arc::clone(&allow_calls),
-    }));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        deny,
+        Arc::clone(&deny_calls),
+    )));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        Decision::Allow,
+        Arc::clone(&allow_calls),
+    )));
     let mut backend = RecordingBackend::new();
     dispatch_extension_request(
         &mut state,
@@ -629,13 +660,13 @@ fn every_extension_dispatch_denial_answers_bad_request() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let calls = Arc::new(Mutex::new(Vec::new()));
-        state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-            decision: Decision::Deny(DenyError {
+        state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+            Decision::Deny(DenyError {
                 code: x11::error::BAD_VALUE,
                 value: 0x55,
             }),
-            calls: Arc::clone(&calls),
-        }));
+            Arc::clone(&calls),
+        )));
         let mut backend = RecordingBackend::new();
         let body = [0u8; 8];
         dispatch_extension_request(
@@ -696,13 +727,13 @@ fn extension_dispatch_preserves_nonzero_minor_in_check_and_error() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let mut state = ServerState::new();
     let mut peer = install_client(&mut state, 1);
-    state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-        decision: Decision::Deny(DenyError {
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        Decision::Deny(DenyError {
             code: x11::error::BAD_VALUE,
             value: 0x55,
         }),
-        calls: Arc::clone(&calls),
-    }));
+        Arc::clone(&calls),
+    )));
     let mut backend = RecordingBackend::new();
     dispatch_extension_request(&mut state, &mut backend, ClientId(1), 9, major, 1, &[0; 8]);
 
@@ -731,13 +762,13 @@ fn denied_big_requests_enable_releases_the_reader() {
     let mut peer = install_client(&mut state, 1);
     let (control_tx, control_rx) = crossbeam_channel::unbounded();
     state.clients.get_mut(&1).unwrap().reader_control = Some(control_tx);
-    state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-        decision: Decision::Deny(DenyError {
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        Decision::Deny(DenyError {
             code: x11::error::BAD_VALUE,
             value: 0x55,
         }),
-        calls: Arc::new(Mutex::new(Vec::new())),
-    }));
+        Arc::new(Mutex::new(Vec::new())),
+    )));
     let mut backend = RecordingBackend::new();
 
     dispatch_extension_request(
@@ -781,10 +812,10 @@ fn extension_dispatch_asks_with_client_name_and_opcodes() {
     let mut state = ServerState::new();
     let mut peer = install_client(&mut state, 1);
     let calls = Arc::new(Mutex::new(Vec::new()));
-    state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-        decision: Decision::Allow,
-        calls: Arc::clone(&calls),
-    }));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        Decision::Allow,
+        Arc::clone(&calls),
+    )));
     let mut backend = RecordingBackend::new();
 
     dispatch_extension_request(
@@ -892,13 +923,13 @@ fn transport_gate_and_max_length_answer_before_the_dispatch_check() {
     state.clients.get_mut(&1).unwrap().is_local = false;
     state.clients.get_mut(&1).unwrap().fd_passing = false;
     let calls = Arc::new(Mutex::new(Vec::new()));
-    state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-        decision: Decision::Deny(DenyError {
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        Decision::Deny(DenyError {
             code: x11::error::BAD_VALUE,
             value: 0x55,
         }),
-        calls: Arc::clone(&calls),
-    }));
+        Arc::clone(&calls),
+    )));
     dispatch_extension_request(
         &mut state,
         &mut RecordingBackend::new(),
@@ -935,13 +966,13 @@ fn transport_gate_and_max_length_answer_before_the_dispatch_check() {
     let mut state = ServerState::new();
     let mut peer = install_client(&mut state, 1);
     let calls = Arc::new(Mutex::new(Vec::new()));
-    state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-        decision: Decision::Deny(DenyError {
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        Decision::Deny(DenyError {
             code: x11::error::BAD_VALUE,
             value: 0x55,
         }),
-        calls: Arc::clone(&calls),
-    }));
+        Arc::clone(&calls),
+    )));
     process_request(
         &mut state,
         &mut RecordingBackend::new(),
@@ -986,7 +1017,7 @@ fn extension_dispatch_first_denial_wins_and_revocation_applies() {
         (deny, Arc::clone(&deny_calls)),
         (Decision::Allow, Arc::clone(&after_deny_calls)),
     ] {
-        state.install_access_policy(Arc::new(RecordingExtensionPolicy { decision, calls }));
+        state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(decision, calls)));
     }
     let mut backend = RecordingBackend::new();
     dispatch_extension_request(&mut state, &mut backend, ClientId(1), 1, major, 0, &body);
@@ -999,14 +1030,14 @@ fn extension_dispatch_first_denial_wins_and_revocation_applies() {
     let mut peer = install_client(&mut state, 1);
     let deny_calls = Arc::new(Mutex::new(Vec::new()));
     let allow_calls = Arc::new(Mutex::new(Vec::new()));
-    state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-        decision: deny,
-        calls: Arc::clone(&deny_calls),
-    }));
-    state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-        decision: Decision::Allow,
-        calls: Arc::clone(&allow_calls),
-    }));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        deny,
+        Arc::clone(&deny_calls),
+    )));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        Decision::Allow,
+        Arc::clone(&allow_calls),
+    )));
     dispatch_extension_request(&mut state, &mut backend, ClientId(1), 1, major, 0, &body);
     dispatch_error(&read_all_available(&mut peer), 1, 0, major);
     assert_eq!(deny_calls.lock().unwrap().len(), 1);
