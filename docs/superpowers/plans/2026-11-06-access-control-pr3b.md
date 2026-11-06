@@ -72,7 +72,11 @@ contract of plan 3a ("Denial test contract") applies to every row here. Rulings 
     (`change_picture_translate_xids`).
   The fix, before any check: the core translates each switch value from a client glyphset XID to its backend
   handle before forwarding, and writes 0 (which the renderer already ignores) for a value that is not a client
-  glyphset; CreatePicture reuses ChangePicture's translation. This changes client-visible behaviour the way Xorg
+  glyphset. CreatePicture shares ChangePicture's per-value translation but keeps its own outcome for a value that
+  does not resolve: it forwards 0 for that attribute (no alpha map, no clip mask) and registers the picture as it
+  does today, since CreatePicture's registry is authoritative once no error was sent and the raw client XID it
+  forwards today already selects nothing. ChangePicture keeps its historical rule unchanged: an unresolved
+  attribute drops the whole request (`c00ddeb2`, Phase 3.5 spec, "dropping missing translations"). This changes client-visible behaviour the way Xorg
   behaves (switches take effect; a backend handle is no longer accepted), and it is the only behaviour change in
   this plan. Unknown values keep today's outcome: ignored, no error (no new validity errors).
 - **Retained cursor identity.** A cursor's XID can be freed while a window still displays it: `free_cursor` drops the
@@ -80,10 +84,15 @@ contract of plan 3a ("Denial test contract") applies to every row here. Rulings 
   (`d746bc3c`, `docs/status.md:720-723`: "a freed-but-displayed cursor still matches"). Such a cursor is still a
   client's object, so it keeps an identity: the `ResourceTable` records, for each host cursor, the XID and owner it
   was first bound under (the XID whose creation produced it; a later `ChangeCursor` alias does not replace it), and
-  forgets it exactly when the host cursor is released on the backend. `AccessContext::owner(id, Cursor)` answers a
-  live cursor's owner first, else the recorded owner of a retained host cursor carrying that XID, else `None`. Host
-  cursors with no record (server cursors: none, the root default) are not checked. If a live cursor and a retained
-  one share an XID (the client reused it), the live one answers; both belong to the client that owns the XID's base.
+  forgets it exactly when the host cursor is released on the backend. The owner belongs to that host-cursor
+  instance, not to the number: after its owner disconnects, the XID base is recycled (`8677f535`, `d5609288`) and
+  another client can create a live cursor with the same XID while the retained one is still displayed. So a check on
+  a retained instance carries its recorded owner in the target: `ResourceTarget` gains `owner: Option<ClientId>`,
+  `None` at every existing site (the object is live and the resolver answers), set from the record for a retained
+  host cursor. `AccessContext` gains `target_owner(&ResourceTarget) -> Option<ClientId>`, which answers
+  `target.owner` when set and `owner(id, kind)` otherwise; policies use it. `AccessContext::owner` itself stays a
+  resolver of live objects only. Host cursors with no record (server cursors: none, the root default) are not
+  checked.
 - **`GetCursorImage` and `GetCursorImageAndName`** check the displayed cursor, which they derive, with `READ`
   (`+GET_ATTR` for the name), as XLibre, against the recorded XID of the displayed host cursor. A displayed host cursor
   with no record is a server cursor and is not checked.
@@ -241,6 +250,12 @@ kind, shared by the sites that need it (reuse `change_picture_translate_xids`).
     backend handle (and is not a client glyphset XID) reaches the backend as 0.
   - `create_picture_alpha_map_and_clip_mask_are_translated`: the backend receives the alpha map picture's and the
     clip mask pixmap's backend handles. Mutation: pass `req.values` unchanged.
+  - `create_picture_unresolved_alpha_map_still_registers_picture`: CreatePicture with a valid drawable and an alpha
+    map value that is no picture: the backend receives 0 for it, the picture exists, and a later
+    SetPictureTransform on it succeeds; scalar attributes in the same list (repeat) still apply. Mutation: drop the
+    request as ChangePicture does.
+  - `change_picture_unresolved_alpha_map_still_drops_request`: ChangePicture's existing drop of the whole request,
+    scalar attributes included, is unchanged. Mutation: forward 0 as CreatePicture does.
   - the existing Stage 3d inline-switch test keeps passing (both glyphsets' atlas entries read).
 - [ ] **Steps 2–4:** run, fail; implement; run, pass, whole suite unmodified.
 - [ ] **Step 5: Commit** `fix(render): translate CompositeGlyphs switches and CreatePicture's alpha map and clip mask to backend handles`.
@@ -295,25 +310,30 @@ kind, shared by the sites that need it (reuse `change_picture_translate_xids`).
 
 ### Task 5: Retained cursor identity
 
-**Files:** `resources/picture_font_cursor.rs`, `resources/mod.rs` (the record beside `cursor_host_names`),
-`resources/cleanup.rs` (`access_owner`), and the host-cursor release paths (`free_cursor`, `cursor_host_released`,
+**Files:** `access.rs` (`ResourceTarget::owner`, `AccessContext::target_owner`), `resources/picture_font_cursor.rs`,
+`resources/mod.rs` (the record beside `cursor_host_names`), every existing `ResourceTarget` construction (adds
+`owner: None`), and the host-cursor release paths (`free_cursor`, `cursor_host_released`,
 `take_unreferenced_cursor_hosts` and their callers); tests in `process_request/tests/access_resources.rs` or a new
 `access_cursors.rs`.
 
-**Interfaces:** Produces `ResourceTable::cursor_host_origin(host: u32) -> Option<(ResourceId, ClientId)>` and the
-`access_owner` fallback described in Scope decisions. Consumed by Task 6.
+**Interfaces:** Produces `ResourceTable::cursor_host_origin(host: u32) -> Option<(ResourceId, ClientId)>`,
+`ResourceTarget::owner: Option<ClientId>` (every existing construction passes `None`) and
+`AccessContext::target_owner(&ResourceTarget) -> Option<ClientId>`, as described in Scope decisions. Consumed by
+Task 6.
 
 **Invariants:** a host cursor has a record from the moment it is first bound to a client cursor XID until the moment
 it is released on the backend, and never otherwise; an alias (`retarget_cursor_host`) never creates or overwrites a
 record; `resource_owner` and `KillClient` are unchanged.
 
 - [ ] **Step 1: Failing tests** (through `process_request`):
-  - `freed_displayed_cursor_keeps_owner_for_policies`: A creates cursor C, sets it on a window, frees C; a recording
-    policy asked about C's XID sees owner A through `ctx.owner(C, Cursor)`. After the window's cursor changes and
-    the host cursor is released, `ctx.owner` answers `None`. Mutation: drop the record in `free_cursor`; keep it
-    after release.
-  - `reused_cursor_xid_answers_the_live_cursor`: A frees C while displayed and creates a new cursor with the same
-    XID: `ctx.owner` answers A for the live one; the retained one's record still names A.
+  - `freed_displayed_cursor_record_lives_until_release`: A creates cursor C, sets it on a window, frees C: the host
+    cursor's record names (C, A). After the window's cursor changes and the host cursor is released, the record is
+    gone. Mutation: drop the record in `free_cursor`; keep it after release.
+  - `recycled_base_cursor_keeps_its_owner`: A's cursor C is displayed on B's window; A disconnects; client D gets A's
+    recycled base and creates a live cursor with XID C. A check on the retained instance presents
+    `target_owner` = A while `ctx.owner(C, Cursor)` answers D for the live one. With two retained host cursors
+    sharing the number C (one from A, one from D after D frees its own while displayed), each check presents its
+    own owner. Mutation: resolve the retained instance's owner through `ctx.owner`.
   - `change_cursor_alias_keeps_creator_record`: XFIXES ChangeCursor makes B's cursor share A's host cursor; the record
     of that host cursor still names A's XID.
 - [ ] **Steps 2–5.** Commit `… Task 5: retained cursor identity`.
@@ -329,7 +349,9 @@ record; `resource_owner` and `KillClient` are unchanged.
   (B's GetCursorImage and GetCursorImageAndName answer the policy's error, no image bytes),
   `change_cursor_by_name_freed_displayed_cursor_denied_keeps_image`, and
   `change_cursor_by_name_freed_displayed_cursor_no_policy_matches_today` (with no policy the replacement happens
-  exactly as today). Mutation: skip the check when the XID is not live.
+  exactly as today). Mutation: skip the check when the XID is not live. Plus, through the recycled-base setup of
+  Task 5: D's GetCursorImage of A's retained cursor is asked with owner A, and a policy allowing only the
+  requester's own resources denies it.
 - [ ] **Steps 2–5.** Commit `… Task 6: XFIXES cursors, windows and barriers`.
 
 ### Task 7: Composite and DAMAGE
