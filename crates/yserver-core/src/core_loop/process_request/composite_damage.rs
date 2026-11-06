@@ -31,6 +31,7 @@ pub(super) fn handle_composite_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    use crate::access::{AccessMode, Creation, RequestOpcodes, ResourceKind, ResourceTarget};
     use yserver_protocol::x11::{ClientByteOrder, composite as x11composite};
     const COMPOSITE_MAJOR_OPCODE: u8 = 144;
     let byte_order = state
@@ -38,6 +39,49 @@ pub(super) fn handle_composite_request(
         .get(&client_id.0)
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
+    let access_request = RequestOpcodes::for_request(header);
+    macro_rules! check_resource {
+        ($id:expr, $kind:expr, $mode:expr) => {
+            super::return_on_access_denial!(
+                super::validate_resource_if_present(
+                    state,
+                    client_id,
+                    $id,
+                    $kind,
+                    $mode,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
+        };
+    }
+    macro_rules! check_region_creation {
+        ($id:expr, $parent:expr $(,)?) => {
+            super::return_on_access_denial!(
+                super::validate_resource_access(
+                    state,
+                    client_id,
+                    ResourceTarget {
+                        id: ResourceId($id),
+                        kind: ResourceKind::Region,
+                        creation: Some(Creation {
+                            parent: $parent,
+                            owner: client_id,
+                        }),
+                    },
+                    AccessMode::CREATE,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
+        };
+    }
     match minor {
         x11composite::QUERY_VERSION => {
             let _ = x11composite::parse_query_version(body);
@@ -186,6 +230,12 @@ pub(super) fn handle_composite_request(
         }
         x11composite::CREATE_REGION_FROM_BORDER_CLIP => {
             if let Some((region, window)) = x11composite::parse_u32_pair(body) {
+                check_resource!(
+                    ResourceId(window),
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR
+                );
+                check_region_creation!(region, Some(ResourceId(window)));
                 let rects = vec![drawable_full_rect_xfixes(state, ResourceId(window))];
                 state.xfixes_regions.insert(
                     region,

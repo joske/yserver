@@ -853,12 +853,56 @@ pub(super) fn handle_xfixes_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    use crate::access::{AccessMode, Creation, RequestOpcodes, ResourceKind, ResourceTarget};
     use yserver_protocol::x11::{ClientByteOrder, xfixes as x11xfixes};
     let byte_order = state
         .clients
         .get(&client_id.0)
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
+    let access_request = RequestOpcodes::for_request(header);
+    macro_rules! check_resource {
+        ($id:expr, $kind:expr, $mode:expr) => {
+            super::return_on_access_denial!(
+                super::validate_resource_if_present(
+                    state,
+                    client_id,
+                    $id,
+                    $kind,
+                    $mode,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
+        };
+    }
+    macro_rules! check_region_creation {
+        ($id:expr, $parent:expr $(,)?) => {
+            super::return_on_access_denial!(
+                super::validate_resource_access(
+                    state,
+                    client_id,
+                    ResourceTarget {
+                        id: ResourceId($id),
+                        kind: ResourceKind::Region,
+                        creation: Some(Creation {
+                            parent: $parent,
+                            owner: client_id,
+                        }),
+                    },
+                    AccessMode::CREATE,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
+        };
+    }
     match minor {
         x11xfixes::QUERY_VERSION => {
             // Xorg `ProcXFixesQueryVersion`: REQUEST_SIZE_MATCH, then the
@@ -1050,6 +1094,7 @@ pub(super) fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
+                check_region_creation!(region, None);
                 state.xfixes_regions.insert(
                     region,
                     crate::server::XFixesRegion {
@@ -1261,6 +1306,8 @@ pub(super) fn handle_xfixes_request(
                             XFIXES_MAJOR_OPCODE,
                         );
                     };
+                    check_resource!(gc, ResourceKind::Gc, AccessMode::GET_ATTR);
+                    check_region_creation!(region, None);
                     // Audit #7 (docs/protocol-audit-2026-05-19.md):
                     // copy the GC's clip rects RAW — Xorg's
                     // `ProcXFixesCreateRegionFromGC`
@@ -1280,6 +1327,8 @@ pub(super) fn handle_xfixes_request(
                         },
                     );
                 } else {
+                    check_resource!(ResourceId(source), ResourceKind::Pixmap, AccessMode::READ);
+                    check_region_creation!(region, Some(ResourceId(source)));
                     state.xfixes_regions.insert(
                         region,
                         crate::server::XFixesRegion {
@@ -1330,6 +1379,11 @@ pub(super) fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
+                check_resource!(
+                    ResourceId(window),
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR
+                );
                 let shape = crate::nested::shape_region_or_default(state, ResourceId(window), kind);
                 trace!(
                     target: "yserver::xfixes::region",
@@ -1337,6 +1391,7 @@ pub(super) fn handle_xfixes_request(
                     kind,
                     format_region_rects(&shape.to_rects()),
                 );
+                check_region_creation!(region, Some(ResourceId(window)));
                 state.xfixes_regions.insert(
                     region,
                     crate::server::XFixesRegion {
@@ -1391,6 +1446,11 @@ pub(super) fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
+                check_resource!(
+                    ResourceId(picture),
+                    ResourceKind::Picture,
+                    AccessMode::GET_ATTR
+                );
                 // An unbacked Picture has no clip set, like a fresh one.
                 let client_clip = match picture_state.host_picture_xid {
                     Some(hp) => backend.picture_client_clip_rects(hp.as_raw()),
@@ -1416,6 +1476,7 @@ pub(super) fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 };
+                check_region_creation!(region, None);
                 state.xfixes_regions.insert(
                     region,
                     crate::server::XFixesRegion {
@@ -1427,19 +1488,24 @@ pub(super) fn handle_xfixes_request(
         }
         x11xfixes::DESTROY_REGION => {
             if let Some((region, _)) = x11xfixes::parse_u32_pair(body) {
+                check_resource!(ResourceId(region), ResourceKind::Region, AccessMode::WRITE);
                 state.xfixes_regions.remove(&region);
             } else if body.len() >= 4 {
                 let region = u32::from_le_bytes(body[0..4].try_into().unwrap());
+                check_resource!(ResourceId(region), ResourceKind::Region, AccessMode::WRITE);
                 state.xfixes_regions.remove(&region);
             }
         }
         x11xfixes::SET_REGION => {
             if let Some((region, rects)) = x11xfixes::parse_create_region(body) {
+                check_resource!(ResourceId(region), ResourceKind::Region, AccessMode::WRITE);
                 store_xfixes_region(state, region, client_id, Region::from_wire_rects(&rects));
             }
         }
         x11xfixes::COPY_REGION => {
             if let Some((source, dest)) = x11xfixes::parse_u32_pair(body) {
+                check_resource!(ResourceId(source), ResourceKind::Region, AccessMode::READ);
+                check_resource!(ResourceId(dest), ResourceKind::Region, AccessMode::WRITE);
                 let region = xfixes_region(state, source);
                 trace!(
                     target: "yserver::xfixes::region",
@@ -1451,6 +1517,9 @@ pub(super) fn handle_xfixes_request(
         }
         x11xfixes::UNION_REGION | x11xfixes::INTERSECT_REGION | x11xfixes::SUBTRACT_REGION => {
             if let Some((source1, source2, dest)) = x11xfixes::parse_u32_triplet(body) {
+                check_resource!(ResourceId(source1), ResourceKind::Region, AccessMode::READ);
+                check_resource!(ResourceId(source2), ResourceKind::Region, AccessMode::READ);
+                check_resource!(ResourceId(dest), ResourceKind::Region, AccessMode::WRITE);
                 let empty = Region::default();
                 let a = state
                     .xfixes_regions
@@ -1484,6 +1553,8 @@ pub(super) fn handle_xfixes_request(
         }
         x11xfixes::INVERT_REGION => {
             if let Some((source, bounds, dest)) = x11xfixes::parse_invert_region(body) {
+                check_resource!(ResourceId(source), ResourceKind::Region, AccessMode::READ);
+                check_resource!(ResourceId(dest), ResourceKind::Region, AccessMode::WRITE);
                 let region = state
                     .xfixes_regions
                     .get(&source)
@@ -1492,20 +1563,27 @@ pub(super) fn handle_xfixes_request(
             }
         }
         x11xfixes::TRANSLATE_REGION => {
-            if let Some((region_id, dx, dy)) = x11xfixes::parse_translate_region(body)
-                && let Some(region) = state.xfixes_regions.get_mut(&region_id)
-            {
-                region.region = std::mem::take(&mut region.region)
-                    .translate_clipped(i32::from(dx), i32::from(dy));
-                trace!(
-                    target: "yserver::xfixes::region",
-                    "TranslateRegion region=0x{region_id:08x} delta=({dx}, {dy}) after{}",
-                    format_region_rects(&region.rects()),
+            if let Some((region_id, dx, dy)) = x11xfixes::parse_translate_region(body) {
+                check_resource!(
+                    ResourceId(region_id),
+                    ResourceKind::Region,
+                    AccessMode::WRITE
                 );
+                if let Some(region) = state.xfixes_regions.get_mut(&region_id) {
+                    region.region = std::mem::take(&mut region.region)
+                        .translate_clipped(i32::from(dx), i32::from(dy));
+                    trace!(
+                        target: "yserver::xfixes::region",
+                        "TranslateRegion region=0x{region_id:08x} delta=({dx}, {dy}) after{}",
+                        format_region_rects(&region.rects()),
+                    );
+                }
             }
         }
         x11xfixes::REGION_EXTENTS => {
             if let Some((source, dest)) = x11xfixes::parse_u32_pair(body) {
+                check_resource!(ResourceId(source), ResourceKind::Region, AccessMode::READ);
+                check_resource!(ResourceId(dest), ResourceKind::Region, AccessMode::WRITE);
                 let rect = xfixes_region(state, source).extents_rect();
                 store_xfixes_region(state, dest, client_id, Region::rect(rect));
             }
@@ -1515,6 +1593,7 @@ pub(super) fn handle_xfixes_request(
                 .get(0..4)
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                 .unwrap_or(0);
+            check_resource!(ResourceId(region), ResourceKind::Region, AccessMode::READ);
             // A fetched damage region can include coalesced paint that did
             // not generate another DamageNotify. Submit it before the reply
             // lets an external compositor sample the corresponding pixels.
@@ -1552,6 +1631,12 @@ pub(super) fn handle_xfixes_request(
         x11xfixes::SET_GC_CLIP_REGION => {
             if let Some(req) = x11xfixes::parse_set_gc_clip_region(body) {
                 let gc_id = ResourceId(req.gc);
+                check_resource!(gc_id, ResourceKind::Gc, AccessMode::SET_ATTR);
+                check_resource!(
+                    ResourceId(req.region),
+                    ResourceKind::Region,
+                    AccessMode::READ
+                );
                 // A clip-mask pixmap this displaces is released as by
                 // SetClipRectangles (`ChangeClip`, `dix/gc.c`).
                 let displaced = if req.region == 0 {
@@ -1588,6 +1673,12 @@ pub(super) fn handle_xfixes_request(
         x11xfixes::SET_WINDOW_SHAPE_REGION => {
             if let Some(req) = x11xfixes::parse_set_window_shape_region(body) {
                 let window = ResourceId(req.dest);
+                check_resource!(window, ResourceKind::Window, AccessMode::SET_ATTR);
+                check_resource!(
+                    ResourceId(req.region),
+                    ResourceKind::Region,
+                    AccessMode::WRITE
+                );
                 if req.region == 0 {
                     crate::nested::clear_shape_rects(state, window, req.dest_kind);
                 } else {
@@ -1603,6 +1694,12 @@ pub(super) fn handle_xfixes_request(
         x11xfixes::SET_PICTURE_CLIP_REGION => {
             if let Some(req) = x11xfixes::parse_set_picture_clip_region(body) {
                 let pic_id = ResourceId(req.picture);
+                check_resource!(pic_id, ResourceKind::Picture, AccessMode::SET_ATTR);
+                check_resource!(
+                    ResourceId(req.region),
+                    ResourceKind::Region,
+                    AccessMode::READ
+                );
                 let host_pic = state
                     .resources
                     .picture(pic_id)
@@ -1719,6 +1816,16 @@ pub(super) fn handle_xfixes_request(
                     );
                 }
             }
+            check_resource!(
+                ResourceId(req.source),
+                ResourceKind::Region,
+                AccessMode::READ
+            );
+            check_resource!(
+                ResourceId(req.destination),
+                ResourceKind::Region,
+                AccessMode::WRITE
+            );
             let source = state.xfixes_regions[&req.source].rects();
             // An empty source leaves the destination untouched (Xorg only
             // rewrites it inside `if (nBoxes)`; confirmed on Xvfb).
