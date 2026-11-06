@@ -214,21 +214,6 @@ pub(super) fn handle_render_request(
             }
             $(check_resource!($id, ResourceKind::Picture, $mode);)+
         };
-        // Kept for the later RENDER glyphset/cursor task: these existing callers
-        // still use VERIFY_PICTURE's historical resolution only.
-        ($($id:expr),+ $(,)?) => {
-            if let Some(bad) = first_missing_picture(state, &[$($id),+]) {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    crate::nested::RENDER_FIRST_ERROR + 1,
-                    bad.0,
-                    u16::from(minor),
-                    header.opcode,
-                );
-            }
-        };
     }
     match minor {
         0 => {
@@ -631,6 +616,7 @@ pub(super) fn handle_render_request(
             let Some((gs_id, fmt)) = x11::render_create_glyphset_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            check_creation!(gs_id, ResourceKind::GlyphSet, AccessMode::CREATE, None);
             let host_gs = backend.render_create_glyphset(origin, fmt).ok().flatten();
             if let Some(host_gs) = host_gs {
                 state.resources.create_glyphset(
@@ -647,6 +633,13 @@ pub(super) fn handle_render_request(
             else {
                 return Ok(RequestOutcome::Handled);
             };
+            check_resource!(existing, ResourceKind::GlyphSet, AccessMode::GET_ATTR);
+            check_creation!(
+                new_glyphset,
+                ResourceKind::GlyphSet,
+                AccessMode::CREATE,
+                None
+            );
             let _ = state
                 .resources
                 .reference_glyphset(client_id, new_glyphset, existing);
@@ -655,6 +648,7 @@ pub(super) fn handle_render_request(
             let Some(gs_id) = x11::render_free_resource_id(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            check_resource!(gs_id, ResourceKind::GlyphSet, AccessMode::DESTROY);
             let st = state.resources.free_glyphset(gs_id);
             if let Some(st) = st {
                 let _ = backend.render_free_glyphset(origin, st.host_glyphset_xid.as_raw());
@@ -664,6 +658,7 @@ pub(super) fn handle_render_request(
             let Some((gs_id, tail)) = x11::render_add_glyphs_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            check_resource!(gs_id, ResourceKind::GlyphSet, AccessMode::ADD);
             let host_gs = state
                 .resources
                 .glyphset(gs_id)
@@ -676,6 +671,7 @@ pub(super) fn handle_render_request(
             let Some((gs_id, glyph_ids)) = x11::render_free_glyphs_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            check_resource!(gs_id, ResourceKind::GlyphSet, AccessMode::REMOVE);
             let host_gs = state
                 .resources
                 .glyphset(gs_id)
@@ -698,7 +694,41 @@ pub(super) fn handle_render_request(
                 );
                 return Ok(RequestOutcome::Handled);
             };
-            verify_pictures!(req.src, req.dst);
+            verify_pictures!((req.src, AccessMode::READ), (req.dst, AccessMode::WRITE));
+            check_resource!(req.glyphset, ResourceKind::GlyphSet, AccessMode::USE);
+            let mut switch_access_error = None;
+            let translated_items = composite_glyphs_translate_glyphsets(minor, &req.items, |xid| {
+                if switch_access_error.is_some() {
+                    return None;
+                }
+                let glyphset = ResourceId(xid);
+                if let Err(error) = validate_resource_if_present(
+                    state,
+                    client_id,
+                    glyphset,
+                    ResourceKind::GlyphSet,
+                    AccessMode::USE,
+                    access_request,
+                ) {
+                    switch_access_error = Some(error);
+                    return None;
+                }
+                state
+                    .resources
+                    .glyphset(glyphset)
+                    .map(|g| g.host_glyphset_xid.as_raw())
+            });
+            if let Some((code, value)) = switch_access_error {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
             if dst_picture_is_sourceless(state, req.dst) {
                 return emit_x11_error_with_minor(
                     state,
@@ -758,13 +788,6 @@ pub(super) fn handle_render_request(
                 return Ok(RequestOutcome::Handled);
             }
             if let (Some(host_src), Some(host_dst), Some(host_gs)) = (host_src, host_dst, host_gs) {
-                let translated_items =
-                    composite_glyphs_translate_glyphsets(minor, &req.items, |xid| {
-                        state
-                            .resources
-                            .glyphset(ResourceId(xid))
-                            .map(|g| g.host_glyphset_xid.as_raw())
-                    });
                 let mask_fmt = if req.mask_format == 0 {
                     0
                 } else {
@@ -891,9 +914,10 @@ pub(super) fn handle_render_request(
             }
             let cursor_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
             let src_pic_id = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
-            verify_pictures!(src_pic_id);
+            verify_pictures!((src_pic_id, AccessMode::READ));
             let x = u16::from_le_bytes([body[8], body[9]]);
             let y = u16::from_le_bytes([body[10], body[11]]);
+            check_creation!(cursor_id, ResourceKind::Cursor, AccessMode::CREATE, None);
             let host_src = state
                 .resources
                 .picture(src_pic_id)
@@ -1121,6 +1145,7 @@ pub(super) fn handle_render_request(
                         header.opcode,
                     );
                 }
+                check_resource!(sub, ResourceKind::Cursor, AccessMode::READ);
                 if let Some(host_raw) = state.resources.cursor_host_xid(sub) {
                     if first_host.is_none() {
                         first_host = Some(host_raw);
@@ -1130,6 +1155,7 @@ pub(super) fn handle_render_request(
                     }
                 }
             }
+            check_creation!(cursor_id, ResourceKind::Cursor, AccessMode::CREATE, None);
             // Backend-side animation. `Ok(None)` (default impl /
             // ynest) → static degeneration to frame 0's handle. A
             // backend Err is "can't happen" after the validation

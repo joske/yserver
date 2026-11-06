@@ -13,6 +13,12 @@ const SRC: ResourceId = ResourceId(0x0020_0010);
 const DST: ResourceId = ResourceId(0x0020_0011);
 const MASK: ResourceId = ResourceId(0x0020_0012);
 const NEW_PICTURE: ResourceId = ResourceId(0x0020_0020);
+const GLYPHSET: ResourceId = ResourceId(0x0020_0030);
+const SWITCH_GLYPHSET: ResourceId = ResourceId(0x0020_0031);
+const NEW_GLYPHSET: ResourceId = ResourceId(0x0020_0032);
+const FRAME_CURSOR: ResourceId = ResourceId(0x0020_0040);
+const SECOND_FRAME_CURSOR: ResourceId = ResourceId(0x0020_0041);
+const NEW_CURSOR: ResourceId = ResourceId(0x0020_0042);
 const ERROR_VALUE: u32 = 0x55aa;
 
 #[derive(Clone)]
@@ -79,6 +85,25 @@ fn change_picture_body(mask: u32, values: &[u32]) -> Vec<u8> {
     let mut body = words(&[SRC.0, mask]);
     body.extend_from_slice(&words(values));
     body
+}
+
+fn glyph_items_with_switch(minor: u8, glyphset: ResourceId) -> Vec<u8> {
+    let id_size = match minor {
+        23 => 1,
+        24 => 2,
+        25 => 4,
+        _ => unreachable!("CompositeGlyphs8/16/32 minor opcode"),
+    };
+    let mut items = vec![2, 0, 0, 0, 0, 0, 0, 0];
+    let payload_bytes = 2 * id_size;
+    items.extend((0..payload_bytes).map(|n| u8::try_from(n).unwrap()));
+    items.resize(items.len() + ((4 - payload_bytes % 4) % 4), 0);
+    items.extend_from_slice(&[255, 0, 0, 0]);
+    items.extend_from_slice(&glyphset.0.to_le_bytes());
+    items.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+    items.extend(std::iter::repeat_n(0, id_size));
+    items.resize(items.len() + ((4 - id_size % 4) % 4), 0);
+    items
 }
 
 fn composite_body() -> Vec<u8> {
@@ -526,6 +551,346 @@ fn recorded_checks(calls: &[RecordedExtensionCheck]) -> Vec<(ResourceTarget, Acc
             )
         })
         .collect()
+}
+
+#[derive(Clone, Copy)]
+enum SeedResource {
+    GlyphSet(ResourceId, u32),
+    Cursor(ResourceId, u32),
+}
+
+impl SeedResource {
+    fn install(self, state: &mut ServerState) {
+        match self {
+            Self::GlyphSet(id, host) => {
+                state.resources.create_glyphset(
+                    id,
+                    crate::resources::GlyphSetState {
+                        client: CLIENT,
+                        host_glyphset_xid: crate::backend::GlyphSetHandle::from_raw_for_test(host),
+                    },
+                );
+            }
+            Self::Cursor(id, host) => {
+                state.resources.create_glyph_cursor(CLIENT, id);
+                state
+                    .resources
+                    .set_cursor_host_xid(id, crate::backend::CursorHandle::from_raw_for_test(host));
+            }
+        }
+    }
+
+    fn exists(self, state: &ServerState) -> bool {
+        match self {
+            Self::GlyphSet(id, _) => state.resources.glyphset(id).is_some(),
+            Self::Cursor(id, _) => state.resources.cursor_exists(id),
+        }
+    }
+}
+
+struct GlyphCursorRequestCase {
+    name: &'static str,
+    minor: u8,
+    body: Vec<u8>,
+    seeded: Vec<SeedResource>,
+    expected: Vec<ExpectedCheck>,
+    created_resource: Option<(ResourceId, ResourceKind)>,
+}
+
+fn glyph_cursor_cases() -> Vec<GlyphCursorRequestCase> {
+    use crate::access::ResourceKind::{Cursor, GlyphSet, Picture};
+
+    let mut cases = vec![GlyphCursorRequestCase {
+        name: "CreateGlyphSet",
+        minor: 17,
+        body: words(&[NEW_GLYPHSET.0, yserver_protocol::x11::RENDER_FMT_XRGB32]),
+        seeded: vec![],
+        expected: vec![created(NEW_GLYPHSET, GlyphSet, AccessMode::CREATE, None)],
+        created_resource: Some((NEW_GLYPHSET, GlyphSet)),
+    }];
+
+    cases.push(GlyphCursorRequestCase {
+        name: "ReferenceGlyphSet",
+        minor: 18,
+        body: words(&[NEW_GLYPHSET.0, GLYPHSET.0]),
+        seeded: vec![SeedResource::GlyphSet(GLYPHSET, 0xbb30)],
+        expected: vec![
+            existing(GLYPHSET, GlyphSet, AccessMode::GET_ATTR),
+            created(NEW_GLYPHSET, GlyphSet, AccessMode::CREATE, None),
+        ],
+        created_resource: Some((NEW_GLYPHSET, GlyphSet)),
+    });
+    cases.push(GlyphCursorRequestCase {
+        name: "FreeGlyphSet",
+        minor: 19,
+        body: words(&[GLYPHSET.0]),
+        seeded: vec![SeedResource::GlyphSet(GLYPHSET, 0xbb30)],
+        expected: vec![existing(GLYPHSET, GlyphSet, AccessMode::DESTROY)],
+        created_resource: None,
+    });
+    cases.push(GlyphCursorRequestCase {
+        name: "AddGlyphs",
+        minor: 20,
+        body: words(&[GLYPHSET.0, 0]),
+        seeded: vec![SeedResource::GlyphSet(GLYPHSET, 0xbb30)],
+        expected: vec![existing(GLYPHSET, GlyphSet, AccessMode::ADD)],
+        created_resource: None,
+    });
+    cases.push(GlyphCursorRequestCase {
+        name: "FreeGlyphs",
+        minor: 22,
+        body: words(&[GLYPHSET.0]),
+        seeded: vec![SeedResource::GlyphSet(GLYPHSET, 0xbb30)],
+        expected: vec![existing(GLYPHSET, GlyphSet, AccessMode::REMOVE)],
+        created_resource: None,
+    });
+
+    for minor in 23..=25 {
+        let items = glyph_items_with_switch(minor, SWITCH_GLYPHSET);
+        let mut body = vec![0u8; 24];
+        body[0] = 3;
+        body[4..8].copy_from_slice(&SRC.0.to_le_bytes());
+        body[8..12].copy_from_slice(&DST.0.to_le_bytes());
+        body[16..20].copy_from_slice(&GLYPHSET.0.to_le_bytes());
+        body.extend_from_slice(&items);
+        cases.push(GlyphCursorRequestCase {
+            name: match minor {
+                23 => "CompositeGlyphs8",
+                24 => "CompositeGlyphs16",
+                _ => "CompositeGlyphs32",
+            },
+            minor,
+            body,
+            seeded: vec![
+                SeedResource::GlyphSet(GLYPHSET, 0xbb30),
+                SeedResource::GlyphSet(SWITCH_GLYPHSET, 0xbb31),
+            ],
+            expected: vec![
+                existing(SRC, Picture, AccessMode::READ),
+                existing(DST, Picture, AccessMode::WRITE),
+                existing(GLYPHSET, GlyphSet, AccessMode::USE),
+                existing(SWITCH_GLYPHSET, GlyphSet, AccessMode::USE),
+            ],
+            created_resource: None,
+        });
+    }
+
+    let mut create_cursor = words(&[NEW_CURSOR.0, SRC.0]);
+    create_cursor.extend_from_slice(&words(&[1, 2]));
+    cases.push(GlyphCursorRequestCase {
+        name: "CreateCursor",
+        minor: 27,
+        body: create_cursor,
+        seeded: vec![],
+        expected: vec![
+            existing(SRC, Picture, AccessMode::READ),
+            created(NEW_CURSOR, Cursor, AccessMode::CREATE, None),
+        ],
+        created_resource: Some((NEW_CURSOR, Cursor)),
+    });
+
+    let mut anim_cursor = words(&[NEW_CURSOR.0]);
+    anim_cursor.extend_from_slice(&words(&[FRAME_CURSOR.0, 50, SECOND_FRAME_CURSOR.0, 75]));
+    cases.push(GlyphCursorRequestCase {
+        name: "CreateAnimCursor",
+        minor: 31,
+        body: anim_cursor,
+        seeded: vec![
+            SeedResource::Cursor(FRAME_CURSOR, 0xcc40),
+            SeedResource::Cursor(SECOND_FRAME_CURSOR, 0xcc41),
+        ],
+        expected: vec![
+            existing(FRAME_CURSOR, Cursor, AccessMode::READ),
+            existing(SECOND_FRAME_CURSOR, Cursor, AccessMode::READ),
+            created(NEW_CURSOR, Cursor, AccessMode::CREATE, None),
+        ],
+        created_resource: Some((NEW_CURSOR, Cursor)),
+    });
+
+    cases
+}
+
+fn setup_glyph_cursor_case(state: &mut ServerState, case: &GlyphCursorRequestCase) {
+    for resource in &case.seeded {
+        resource.install(state);
+    }
+}
+
+fn assert_created_resource_absent(
+    state: &ServerState,
+    created: Option<(ResourceId, ResourceKind)>,
+) {
+    let Some((id, kind)) = created else {
+        return;
+    };
+    let exists = match kind {
+        ResourceKind::GlyphSet => state.resources.glyphset(id).is_some(),
+        ResourceKind::Cursor => state.resources.cursor_exists(id),
+        _ => unreachable!("glyph/cursor test creates only those resource kinds"),
+    };
+    assert!(!exists, "denied creation registered resource {:#x}", id.0);
+}
+
+#[test]
+fn render_glyph_cursor_requests_ask_expected_targets() {
+    // Mutation: omit or change a glyphset/cursor check, mode, or order.
+    for case in glyph_cursor_cases() {
+        let (mut state, mut backend, mut peer) = fixture();
+        setup_glyph_cursor_case(&mut state, &case);
+        backend.render_create_glyphset_returns_handle = true;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+            Decision::Allow,
+            Arc::clone(&calls),
+        )));
+
+        let _bytes =
+            dispatch_with_peer(&mut state, &mut backend, &mut peer, case.minor, &case.body);
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded_checks(&recorded),
+            case.expected
+                .iter()
+                .map(|expected| (expected.target, expected.mode))
+                .collect::<Vec<_>>(),
+            "{}: checked targets",
+            case.name,
+        );
+        for call in &recorded {
+            assert_eq!(
+                call.request,
+                Some(RequestOpcodes {
+                    major: 133,
+                    minor: case.minor,
+                }),
+                "{}: request context",
+                case.name,
+            );
+        }
+    }
+}
+
+#[test]
+fn render_glyph_cursor_requests_deny_before_effects() {
+    // Mutation: bypass a RENDER glyphset or cursor resource check.
+    for case in glyph_cursor_cases() {
+        for (denied_index, denied) in case.expected.iter().enumerate() {
+            let (mut state, mut backend, mut peer) = fixture();
+            setup_glyph_cursor_case(&mut state, &case);
+            backend.render_create_glyphset_returns_handle = true;
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+                Arc::clone(&calls),
+                denied.target.id,
+                Some(denied.mode),
+                DenyError {
+                    code: x11::error::BAD_VALUE,
+                    value: ERROR_VALUE,
+                },
+            )));
+
+            let bytes =
+                dispatch_with_peer(&mut state, &mut backend, &mut peer, case.minor, &case.body);
+            assert_policy_error(&bytes, case.minor, case.name);
+            assert_eq!(
+                recorded_checks(&calls.lock().unwrap()),
+                case.expected[..=denied_index]
+                    .iter()
+                    .map(|expected| (expected.target, expected.mode))
+                    .collect::<Vec<_>>(),
+                "{}: checks before denial",
+                case.name,
+            );
+            assert!(
+                backend.calls().is_empty(),
+                "{}: backend was reached",
+                case.name
+            );
+            for resource in &case.seeded {
+                assert!(
+                    resource.exists(&state),
+                    "{}: seeded resource changed",
+                    case.name
+                );
+            }
+            assert_created_resource_absent(&state, case.created_resource);
+        }
+    }
+}
+
+#[test]
+fn composite_glyphs_denied_stream_switch_draws_nothing() {
+    // Mutation: check each stream switch only after preceding glyphs were drawn.
+    let case = glyph_cursor_cases()
+        .into_iter()
+        .find(|case| case.minor == 23)
+        .expect("CompositeGlyphs8 case");
+    let (mut state, mut backend, mut peer) = fixture();
+    setup_glyph_cursor_case(&mut state, &case);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+        Arc::clone(&calls),
+        SWITCH_GLYPHSET,
+        Some(AccessMode::USE),
+        DenyError {
+            code: x11::error::BAD_VALUE,
+            value: ERROR_VALUE,
+        },
+    )));
+
+    let bytes = dispatch_with_peer(&mut state, &mut backend, &mut peer, case.minor, &case.body);
+
+    assert_policy_error(&bytes, case.minor, case.name);
+    assert!(
+        backend
+            .calls()
+            .iter()
+            .all(|call| !matches!(call, RecordedCall::RenderCompositeGlyphs { .. })),
+        "glyphs before denied stream switch reached the backend",
+    );
+    assert_eq!(
+        recorded_checks(&calls.lock().unwrap()),
+        case.expected[..]
+            .iter()
+            .map(|expected| (expected.target, expected.mode))
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn create_anim_cursor_denied_frame_creates_nothing() {
+    // Mutation: skip the frame cursor READ check before animated cursor creation.
+    let case = glyph_cursor_cases()
+        .into_iter()
+        .find(|case| case.minor == 31)
+        .expect("CreateAnimCursor case");
+    let (mut state, mut backend, mut peer) = fixture();
+    setup_glyph_cursor_case(&mut state, &case);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+        Arc::clone(&calls),
+        FRAME_CURSOR,
+        Some(AccessMode::READ),
+        DenyError {
+            code: x11::error::BAD_VALUE,
+            value: ERROR_VALUE,
+        },
+    )));
+
+    let bytes = dispatch_with_peer(&mut state, &mut backend, &mut peer, case.minor, &case.body);
+
+    assert_policy_error(&bytes, case.minor, case.name);
+    assert!(!state.resources.cursor_exists(NEW_CURSOR));
+    assert!(state.resources.cursor_exists(FRAME_CURSOR));
+    assert!(state.resources.cursor_exists(SECOND_FRAME_CURSOR));
+    assert!(backend.calls().is_empty());
+    assert_eq!(
+        recorded_checks(&calls.lock().unwrap()),
+        vec![(
+            render_target(FRAME_CURSOR, ResourceKind::Cursor, None),
+            AccessMode::READ,
+        )],
+    );
 }
 
 #[test]

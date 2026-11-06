@@ -164,6 +164,28 @@ pub enum RecordedCall {
         host_pic: u32,
         body: Vec<u8>,
     },
+    RenderCreateGlyphSet {
+        ynest_format: u32,
+    },
+    RenderFreeGlyphSet {
+        host_gs: u32,
+    },
+    RenderAddGlyphs {
+        host_gs: u32,
+        body_tail: Vec<u8>,
+    },
+    RenderFreeGlyphs {
+        host_gs: u32,
+        glyph_ids: Vec<u8>,
+    },
+    RenderCreateCursor {
+        host_src_pic: u32,
+        x: u16,
+        y: u16,
+    },
+    CreateAnimCursor {
+        frames: Vec<(u32, u32)>,
+    },
     RenderCompositeGlyphs {
         minor: u8,
         op: u8,
@@ -2036,6 +2058,20 @@ impl Backend for RecordingBackend {
         Ok(CursorHandle::from_raw_panicking(xid))
     }
 
+    fn create_anim_cursor(
+        &mut self,
+        _origin: Option<OriginContext>,
+        frames: &[(CursorHandle, u32)],
+    ) -> io::Result<Option<CursorHandle>> {
+        self.record(RecordedCall::CreateAnimCursor {
+            frames: frames
+                .iter()
+                .map(|(cursor, delay)| (cursor.as_raw(), *delay))
+                .collect(),
+        });
+        Ok(None)
+    }
+
     fn create_glyph_cursor(
         &mut self,
         _origin: Option<OriginContext>,
@@ -2482,8 +2518,9 @@ impl Backend for RecordingBackend {
     fn render_create_glyphset(
         &mut self,
         _origin: Option<OriginContext>,
-        _ynest_format: u32,
+        ynest_format: u32,
     ) -> io::Result<Option<GlyphSetHandle>> {
+        self.record(RecordedCall::RenderCreateGlyphSet { ynest_format });
         Ok(self
             .render_create_glyphset_returns_handle
             .then(|| GlyphSetHandle::from_raw_panicking(self.allocate_handle())))
@@ -2492,26 +2529,35 @@ impl Backend for RecordingBackend {
     fn render_free_glyphset(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_gs: u32,
+        host_gs: u32,
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderFreeGlyphSet { host_gs });
         Ok(())
     }
 
     fn render_add_glyphs(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_gs: u32,
-        _body_tail: &[u8],
+        host_gs: u32,
+        body_tail: &[u8],
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderAddGlyphs {
+            host_gs,
+            body_tail: body_tail.to_vec(),
+        });
         Ok(())
     }
 
     fn render_free_glyphs(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_gs: u32,
-        _glyph_ids: &[u8],
+        host_gs: u32,
+        glyph_ids: &[u8],
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderFreeGlyphs {
+            host_gs,
+            glyph_ids: glyph_ids.to_vec(),
+        });
         Ok(())
     }
 
@@ -2657,10 +2703,15 @@ impl Backend for RecordingBackend {
     fn render_create_cursor(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_src_pic: PictureHandle,
-        _x: u16,
-        _y: u16,
+        host_src_pic: PictureHandle,
+        x: u16,
+        y: u16,
     ) -> io::Result<Option<CursorHandle>> {
+        self.record(RecordedCall::RenderCreateCursor {
+            host_src_pic: host_src_pic.as_raw(),
+            x,
+            y,
+        });
         Ok(None)
     }
 
