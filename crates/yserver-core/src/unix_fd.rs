@@ -93,11 +93,11 @@ pub fn recv_with_fds(stream: &mut UnixStream, buf: &mut [u8]) -> io::Result<(usi
     Ok((n as usize, fds))
 }
 
-/// Send `bytes` together with `fd` over `stream` using `sendmsg(2)` so
-/// the receiving end gets the FD via `SCM_RIGHTS`. Used by
-/// MIT-SHM::CreateSegment to pass a server-allocated `memfd_create`
-/// descriptor back to the client in its reply.
-pub fn send_with_fd(stream: &mut UnixStream, bytes: &[u8], fd: RawFd) -> io::Result<()> {
+/// One `sendmsg(2)` of `bytes` over `stream` with `fd` in its `SCM_RIGHTS`,
+/// which the receiving end gets with the first byte: the bytes it took. The
+/// rest is the caller's to send without the descriptor
+/// (`client_io::drain_outbound`).
+pub fn send_with_fd(stream: &mut UnixStream, bytes: &[u8], fd: RawFd) -> io::Result<usize> {
     let mut iov = libc::iovec {
         iov_base: bytes.as_ptr() as *mut _,
         iov_len: bytes.len(),
@@ -125,8 +125,8 @@ pub fn send_with_fd(stream: &mut UnixStream, bytes: &[u8], fd: RawFd) -> io::Res
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
+        Ok(n as usize)
     }
-    Ok(())
 }
 
 /// `Read` adapter over a `UnixStream` that uses `recvmsg(2)` under the hood

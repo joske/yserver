@@ -686,6 +686,7 @@ fn add_client(state: &mut ServerState, id: u32, mask: u32) -> std::os::unix::net
             xi1_event_classes: HashSet::new(),
             xi1_window_event_classes: HashMap::new(),
             outbound: VecDeque::new(),
+            outbound_fds: Default::default(),
             watching_writable: false,
             write_failed: false,
             gone: false,

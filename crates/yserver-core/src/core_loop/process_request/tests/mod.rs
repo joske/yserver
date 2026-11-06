@@ -139,6 +139,7 @@ fn install_client_with_transport(
             xi1_event_classes: HashSet::new(),
             xi1_window_event_classes: HashMap::new(),
             outbound: VecDeque::new(),
+            outbound_fds: Default::default(),
             watching_writable: false,
             write_failed: false,
             gone: false,

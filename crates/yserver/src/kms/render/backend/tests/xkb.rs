@@ -37,6 +37,7 @@ fn xkb_use_extension_from_a_big_endian_client_is_refused_in_its_byte_order() {
             xi1_event_classes: HashSet::new(),
             xi1_window_event_classes: HashMap::new(),
             outbound: VecDeque::new(),
+            outbound_fds: Default::default(),
             watching_writable: false,
             write_failed: false,
             gone: false,

@@ -17,11 +17,18 @@
 //! locks the mutex; once D2 lands we strip the lock without touching
 //! call sites.
 
-use std::io::{self, ErrorKind, Write};
+use std::{
+    collections::VecDeque,
+    io::{self, ErrorKind, Write},
+};
 
 use yserver_protocol::x11::ClientId;
 
-use crate::server::ClientState;
+use crate::{
+    fd::{OwnedFd, RawFd},
+    server::ClientState,
+    transport::Transport,
+};
 
 /// Maximum bytes queued per client before we treat the peer as
 /// unrecoverably slow and disconnect.
@@ -45,6 +52,123 @@ pub enum WriteOutcome {
     /// Peer is gone or buffer exceeded `OUTBOUND_CAP`. The client is
     /// marked `write_failed`, so the core loop drops it.
     Disconnect,
+}
+
+/// Descriptors waiting in `ClientState::outbound`, each with the offset and
+/// length there of its reply. A descriptor goes in the `SCM_RIGHTS` of a
+/// `sendmsg` of its reply's bytes, as Xorg's `WriteFdToClient` (`os/io.c`)
+/// leaves it to xtrans's next flush: queued with the output, never waited
+/// for.
+#[derive(Debug, Default)]
+pub struct OutboundFds(VecDeque<QueuedFd>);
+
+#[derive(Debug)]
+struct QueuedFd {
+    at: usize,
+    len: usize,
+    fd: OwnedFd,
+}
+
+impl OutboundFds {
+    fn next_at(&self) -> Option<usize> {
+        self.0.front().map(|queued| queued.at)
+    }
+
+    /// `n` bytes went, with the front descriptor when `with_front`.
+    fn sent(&mut self, n: usize, with_front: bool) {
+        if with_front {
+            self.0.pop_front();
+        }
+        for queued in &mut self.0 {
+            queued.at -= n;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// Queue `bytes` behind the client's output with `fd`, which their first
+/// byte carries, and write what the socket takes now. The descriptor is
+/// duplicated: the caller keeps and closes its own.
+pub fn write_with_fd(
+    client: &mut ClientState,
+    bytes: &[u8],
+    fd: RawFd,
+) -> io::Result<WriteOutcome> {
+    if client.gone {
+        return Ok(WriteOutcome::Done);
+    }
+    if client.write_failed {
+        return Ok(WriteOutcome::Disconnect);
+    }
+    let outcome = write_with_fd_inner(client, bytes, fd);
+    note_failure(client, outcome)
+}
+
+fn write_with_fd_inner(
+    client: &mut ClientState,
+    bytes: &[u8],
+    fd: RawFd,
+) -> io::Result<WriteOutcome> {
+    if !client.outbound.is_empty() && client.outbound.len() + bytes.len() > OUTBOUND_CAP {
+        log::warn!(
+            "client_io: outbound cap exceeded — outbound={} bytes pending, +{} new with a descriptor ⇒ Disconnect",
+            client.outbound.len(),
+            bytes.len(),
+        );
+        return Ok(WriteOutcome::Disconnect);
+    }
+    let fd = duplicate(fd)?;
+    let at = client.outbound.len();
+    client.outbound_fds.0.push_back(QueuedFd {
+        at,
+        len: bytes.len(),
+        fd,
+    });
+    client.outbound.extend(bytes.iter().copied());
+    drain_outbound_inner(client)
+}
+
+#[cfg(unix)]
+fn duplicate(fd: RawFd) -> io::Result<OwnedFd> {
+    // SAFETY: the caller's descriptor is open for the call.
+    unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()
+}
+
+/// No Windows transport passes descriptors, so `fd_passing` is never set.
+#[cfg(windows)]
+fn duplicate(_fd: RawFd) -> io::Result<OwnedFd> {
+    Err(unsupported())
+}
+
+fn unsupported() -> io::Error {
+    io::Error::new(
+        ErrorKind::Unsupported,
+        "file descriptor passing is unavailable on this transport",
+    )
+}
+
+/// One `sendmsg` of `chunk` with `fd`: the bytes it took.
+#[cfg(unix)]
+fn send_with_fd(writer: &mut Transport, chunk: &[u8], fd: &OwnedFd) -> io::Result<usize> {
+    let Transport::Unix(stream) = writer else {
+        return Err(unsupported());
+    };
+    match crate::unix_fd::send_with_fd(stream, chunk, std::os::fd::AsRawFd::as_raw_fd(fd)) {
+        // The BSDs' unix stream socket (macOS's among them) shrinks the
+        // sender's limit as the peer's buffer fills, and refuses a message
+        // whose descriptor no longer fits with EMSGSIZE rather than EAGAIN.
+        // It fits once the client reads.
+        Err(e) if e.raw_os_error() == Some(libc::EMSGSIZE) => Err(ErrorKind::WouldBlock.into()),
+        other => other,
+    }
+}
+
+#[cfg(windows)]
+fn send_with_fd(_writer: &mut Transport, _chunk: &[u8], fd: &OwnedFd) -> io::Result<usize> {
+    match *fd {}
 }
 
 /// Write `bytes` to the client. Drains any already-buffered outbound
@@ -141,6 +265,7 @@ fn buffer_or_disconnect(client: &mut ClientState, bytes: &[u8]) -> WriteOutcome 
 pub fn drain_outbound(client: &mut ClientState) -> io::Result<WriteOutcome> {
     if client.gone {
         client.outbound.clear();
+        client.outbound_fds.clear();
         return Ok(WriteOutcome::Done);
     }
     if client.write_failed {
@@ -154,18 +279,32 @@ fn drain_outbound_inner(client: &mut ClientState) -> io::Result<WriteOutcome> {
     let writer_arc = client.writer.clone();
     let mut writer = writer_arc.lock().unwrap();
     while !client.outbound.is_empty() {
+        // A descriptor goes with its reply's bytes alone, and any other
+        // chunk ends where the next descriptor's reply begins.
+        let with_fd = client.outbound_fds.next_at() == Some(0);
+        let end = if with_fd {
+            client.outbound_fds.0.front().map(|queued| queued.len)
+        } else {
+            client.outbound_fds.next_at()
+        }
+        .unwrap_or(usize::MAX);
         // VecDeque can wrap; iterate over the contiguous front slice
         // first. `as_slices().0` is the front; `.1` is everything past
         // the wrap point. Copy out a small chunk to dodge a borrow
         // conflict with the subsequent `drain` call.
         let chunk: Vec<u8> = {
             let (front, _) = client.outbound.as_slices();
-            front[..front.len().min(8 * 1024)].to_vec()
+            front[..front.len().min(8 * 1024).min(end)].to_vec()
         };
-        match writer.write(&chunk) {
+        let written = match client.outbound_fds.0.front() {
+            Some(queued) if with_fd => send_with_fd(&mut writer, &chunk, &queued.fd),
+            _ => writer.write(&chunk),
+        };
+        match written {
             Ok(0) => return Ok(WriteOutcome::Disconnect),
             Ok(n) => {
                 client.outbound.drain(..n);
+                client.outbound_fds.sent(n, with_fd);
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(WriteOutcome::WouldBlock),
             Err(e) if disconnect_kind(e.kind()) => return Ok(WriteOutcome::Disconnect),
@@ -223,6 +362,7 @@ mod tests {
             xi1_event_classes: HashSet::new(),
             xi1_window_event_classes: HashMap::new(),
             outbound: VecDeque::new(),
+            outbound_fds: Default::default(),
             watching_writable: false,
             write_failed: false,
             gone: false,
@@ -372,6 +512,57 @@ mod tests {
         let mut clients = HashMap::new();
         clients.insert(9, c);
         assert!(failed_writers(&clients).is_empty());
+    }
+
+    /// A reply with a descriptor to a client that is not reading is queued
+    /// at once, as Xorg's `WriteFdToClient` queues it: the core thread never
+    /// waits for the client. Once the client reads, each descriptor arrives
+    /// with its own reply's first byte, two replies in a row included.
+    #[test]
+    fn an_fd_reply_to_a_full_socket_is_queued_and_each_fd_goes_with_its_reply() {
+        let (a, mut b) = pair_with_small_sndbuf();
+        let mut c = make_client(a);
+        let filler = vec![7u8; 64 * 1024];
+        assert_eq!(
+            write_or_buffer(&mut c, &filler).unwrap(),
+            WriteOutcome::WouldBlock
+        );
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let null_fd = std::os::fd::AsRawFd::as_raw_fd(&null);
+        let started = std::time::Instant::now();
+        for reply in [[1u8; 32], [2u8; 32]] {
+            assert_eq!(
+                write_with_fd(&mut c, &reply, null_fd).unwrap(),
+                WriteOutcome::WouldBlock
+            );
+        }
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        drop(null);
+
+        b.set_nonblocking(true).unwrap();
+        let total = filler.len() + 64;
+        let mut received = Vec::new();
+        let mut fd_offsets = Vec::new();
+        let mut buf = [0u8; 4096];
+        while received.len() < total {
+            let _ = drain_outbound(&mut c).unwrap();
+            match crate::unix_fd::recv_with_fds(&mut b, &mut buf) {
+                Ok((n, fds)) => {
+                    for fd in fds {
+                        fd_offsets.push(received.len());
+                        // SAFETY: received for this test, closed once.
+                        unsafe { libc::close(fd) };
+                    }
+                    received.extend_from_slice(&buf[..n]);
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(e) => panic!("recvmsg: {e}"),
+            }
+        }
+        assert_eq!(fd_offsets, [filler.len(), filler.len() + 32]);
+        assert_eq!(&received[filler.len()..filler.len() + 32], &[1u8; 32]);
+        assert_eq!(&received[filler.len() + 32..], &[2u8; 32]);
+        assert!(c.outbound.is_empty() && c.outbound_fds.0.is_empty());
     }
 
     #[test]

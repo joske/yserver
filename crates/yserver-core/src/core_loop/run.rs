@@ -4710,6 +4710,7 @@ fn handle_client_setup_complete(
             xi1_event_classes: std::collections::HashSet::new(),
             xi1_window_event_classes: std::collections::HashMap::new(),
             outbound: std::collections::VecDeque::new(),
+            outbound_fds: Default::default(),
             watching_writable: false,
             #[cfg(windows)]
             writable_source: None,

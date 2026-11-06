@@ -3353,6 +3353,8 @@ pub struct ClientState {
     /// Outbound bytes buffered when the client write fd would block.
     /// Populated in D2.
     pub outbound: std::collections::VecDeque<u8>,
+    /// Descriptors that go with bytes in `outbound`.
+    pub outbound_fds: crate::core_loop::client_io::OutboundFds,
     /// Whether the core's mio poller currently watches this client's
     /// writer fd for WRITABLE.  Used in I2.
     pub watching_writable: bool,

@@ -1003,6 +1003,7 @@ fn add_present_test_client(state: &mut yserver_core::server::ServerState, client
             xi1_event_classes: HashSet::new(),
             xi1_window_event_classes: HashMap::new(),
             outbound: Default::default(),
+            outbound_fds: Default::default(),
             watching_writable: false,
             write_failed: false,
             gone: false,

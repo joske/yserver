@@ -1008,54 +1008,15 @@ fn send_reply_with_fd(
             "file descriptor passing is unavailable on this transport",
         ));
     }
-    // Drain whatever's pending so the SCM_RIGHTS frame lands in order.
-    while !client.outbound.is_empty() {
-        match client_io::drain_outbound(client)? {
-            client_io::WriteOutcome::Done => break,
-            client_io::WriteOutcome::WouldBlock => {
-                std::thread::yield_now();
-            }
-            client_io::WriteOutcome::Disconnect => {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "client outbound disconnect during fd send",
-                ));
-            }
-        }
+    // Queued with the client's output, as Xorg's `WriteFdToClient`: a
+    // client that reads slowly holds up only itself.
+    match client_io::write_with_fd(client, bytes, fd)? {
+        client_io::WriteOutcome::Done | client_io::WriteOutcome::WouldBlock => Ok(()),
+        client_io::WriteOutcome::Disconnect => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "client outbound disconnect during fd send",
+        )),
     }
-    send_with_fd(client, bytes, fd)
-}
-
-#[cfg(unix)]
-fn send_with_fd(
-    client: &crate::server::ClientState,
-    bytes: &[u8],
-    fd: crate::fd::RawFd,
-) -> io::Result<()> {
-    let writer_arc = client.writer.clone();
-    let mut w = writer_arc
-        .lock()
-        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "client writer mutex poisoned"))?;
-    let crate::transport::Transport::Unix(stream) = &mut *w else {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "file descriptor passing is unavailable on this transport",
-        ));
-    };
-    crate::unix_fd::send_with_fd(stream, bytes, fd)
-}
-
-/// No Windows transport passes descriptors, so `fd_passing` is never set.
-#[cfg(windows)]
-fn send_with_fd(
-    _client: &crate::server::ClientState,
-    _bytes: &[u8],
-    _fd: crate::fd::RawFd,
-) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "file descriptor passing is unavailable on this transport",
-    ))
 }
 
 /// A window or pixmap of that id.

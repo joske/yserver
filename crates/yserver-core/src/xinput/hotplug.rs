@@ -550,6 +550,7 @@ mod tests {
                     HashSet::from([XI1_DEVICE_PRESENCE_CLASS]),
                 )]),
                 outbound: VecDeque::new(),
+                outbound_fds: Default::default(),
                 watching_writable: false,
                 write_failed: false,
                 gone: false,
