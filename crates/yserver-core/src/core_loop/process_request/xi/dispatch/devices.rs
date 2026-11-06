@@ -67,31 +67,23 @@ pub(super) fn handle_xi_set_client_pointer(
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
+    access_request: RequestOpcodes,
 ) -> io::Result<RequestOutcome> {
     if body.len() >= 4 {
         let id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
-        if let Err((code, value)) =
+        crate::core_loop::process_request::return_on_access_denial!(
             crate::core_loop::process_request::validate_core_resource_if_present(
                 state,
                 client_id,
                 id,
                 AccessMode::GET_ATTR,
-                RequestOpcodes {
-                    major: XI2_MAJOR_OPCODE,
-                    minor: 44,
-                },
-            )
-        {
-            return emit_x11_error_with_minor(
-                state,
-                client_id,
-                sequence,
-                code,
-                value,
-                44,
-                XI2_MAJOR_OPCODE,
-            );
-        }
+                access_request,
+            ),
+            state,
+            client_id,
+            sequence,
+            access_request,
+        );
     }
     debug!("client {} #{} XISetClientPointer", client_id.0, sequence.0);
     return Ok(RequestOutcome::Handled);
@@ -103,31 +95,23 @@ pub(super) fn handle_xi_get_client_pointer(
     sequence: SequenceNumber,
     body: &[u8],
     byte_order: ClientByteOrder,
+    access_request: RequestOpcodes,
 ) -> io::Result<RequestOutcome> {
     if body.len() >= 4 {
         let id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
-        if let Err((code, value)) =
+        crate::core_loop::process_request::return_on_access_denial!(
             crate::core_loop::process_request::validate_core_resource_if_present(
                 state,
                 client_id,
                 id,
                 AccessMode::GET_ATTR,
-                RequestOpcodes {
-                    major: XI2_MAJOR_OPCODE,
-                    minor: 45,
-                },
-            )
-        {
-            return emit_x11_error_with_minor(
-                state,
-                client_id,
-                sequence,
-                code,
-                value,
-                45,
-                XI2_MAJOR_OPCODE,
-            );
-        }
+                access_request,
+            ),
+            state,
+            client_id,
+            sequence,
+            access_request,
+        );
     }
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     {

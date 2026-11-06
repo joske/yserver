@@ -900,9 +900,27 @@ fn create_anim_cursor_denied_frame_creates_nothing() {
 
 #[test]
 fn render_picture_requests_deny_before_effects() {
-    // Mutation: bypass the RENDER resource checks.
+    // Mutation: bypass a RENDER resource check or move AddTraps' check after
+    // damage accumulation; the denial/error and state snapshots must fail.
     for case in cases() {
         let (mut state, mut backend, mut peer) = fixture();
+        let _ = state.resources.map_window(DRAWABLE);
+        let _damage_peer = install_client(&mut state, 2);
+        const DAMAGE: u32 = 0x0020_0050;
+        state.damage_objects.insert(
+            DAMAGE,
+            crate::server::DamageObject {
+                owner: ClientId(2),
+                drawable: DRAWABLE,
+                level: 3,
+                rects: Vec::new(),
+                pending_notify_fired: false,
+                last_reported_geometry: None,
+                list_pos: 0,
+                created: 0,
+            },
+        );
+        let damage_before = state.damage_objects.clone();
         let calls = Arc::new(Mutex::new(Vec::new()));
         state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
             Arc::clone(&calls),
@@ -935,6 +953,11 @@ fn render_picture_requests_deny_before_effects() {
             "{}: backend was reached",
             case.name
         );
+        assert_eq!(
+            state.damage_objects, damage_before,
+            "{}: denied request changed DAMAGE state",
+            case.name,
+        );
         for id in [SRC, DST, MASK] {
             assert!(
                 state.resources.picture(id).is_some(),
@@ -951,6 +974,74 @@ fn render_picture_requests_deny_before_effects() {
             );
         }
     }
+}
+
+#[test]
+fn render_checks_each_picture_before_resolving_the_next() {
+    // Mutation: resolve all RENDER pictures before checking the first one.
+    const MISSING: ResourceId = ResourceId(0x0020_00ff);
+    let mut body = trapezoid_body();
+    body[8..12].copy_from_slice(&MISSING.0.to_le_bytes());
+
+    let (mut state, mut backend, mut peer) = fixture();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+        Arc::clone(&calls),
+        SRC,
+        Some(AccessMode::READ),
+        DenyError {
+            code: x11::error::BAD_VALUE,
+            value: ERROR_VALUE,
+        },
+    )));
+    let bytes = dispatch_with_peer(&mut state, &mut backend, &mut peer, 10, &body);
+    assert_policy_error(
+        &bytes,
+        10,
+        "Trapezoids denied source before missing destination",
+    );
+    let recorded = calls.lock().unwrap();
+    let resource_checks = recorded
+        .iter()
+        .filter(|call| call.hook == ExtensionHook::Resource)
+        .collect::<Vec<_>>();
+    assert_eq!(resource_checks.len(), 1);
+    let source = resource_checks[0];
+    assert_eq!(source.client, CLIENT);
+    assert_eq!(
+        source.target,
+        Some(render_target(SRC, ResourceKind::Picture, None))
+    );
+    assert_eq!(source.mode, Some(AccessMode::READ));
+    assert_eq!(source.owner, Some(CLIENT));
+    assert_eq!(source.target_owner, Some(CLIENT));
+    assert_eq!(
+        source.request,
+        Some(RequestOpcodes {
+            major: 133,
+            minor: 10,
+        })
+    );
+    drop(recorded);
+    assert!(
+        backend.calls().is_empty(),
+        "denied Composite reached backend"
+    );
+
+    let (mut state, mut backend, mut peer) = fixture();
+    let bytes = dispatch_with_peer(&mut state, &mut backend, &mut peer, 10, &body);
+    assert_eq!(
+        bytes.len(),
+        32,
+        "missing destination should yield one error"
+    );
+    assert_eq!(bytes[1], crate::nested::RENDER_FIRST_ERROR + 1);
+    assert_eq!(
+        u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        MISSING.0
+    );
+    assert_eq!(u16::from_le_bytes(bytes[8..10].try_into().unwrap()), 10);
+    assert_eq!(bytes[10], 133);
 }
 
 #[test]
