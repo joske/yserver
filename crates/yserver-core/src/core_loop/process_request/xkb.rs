@@ -1,4 +1,5 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind},
     backend::{Backend, OriginContext},
     core_loop::{
         fanout::fanout_event_to_clients,
@@ -77,6 +78,29 @@ pub(super) fn handle_xkb_request(
             sequence,
             x11::error::BAD_ACCESS,
             0,
+            u16::from(minor),
+            header.opcode,
+        );
+    }
+    if minor == 3
+        && body.len() >= 24
+        && let Err((code, value)) = crate::core_loop::process_request::validate_resource_if_present(
+            state,
+            client_id,
+            yserver_protocol::x11::ResourceId(u32::from_le_bytes(
+                body[20..24].try_into().expect("four bytes"),
+            )),
+            ResourceKind::Window,
+            AccessMode::GET_ATTR,
+            RequestOpcodes::for_request(header),
+        )
+    {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            code,
+            value,
             u16::from(minor),
             header.opcode,
         );

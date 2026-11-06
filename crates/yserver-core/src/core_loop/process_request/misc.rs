@@ -577,34 +577,13 @@ pub(super) fn handle_kill_client(
     };
     if state.policies_installed() {
         let id = ResourceId(resource);
-        // Follow resource_owner's core-store order. In particular, do not
-        // widen KillClient's existing misses to colormaps or extension stores.
-        let kind = [
-            ResourceKind::Window,
-            ResourceKind::Pixmap,
-            ResourceKind::Gc,
-            ResourceKind::Font,
-            ResourceKind::Cursor,
-            ResourceKind::Picture,
-            ResourceKind::GlyphSet,
-            ResourceKind::Dri3Syncobj,
-        ]
-        .into_iter()
-        .find(|kind| state.access_resource_owner(id, *kind).is_some());
-        if let Some(kind) = kind
-            && let Err((code, bad_value)) = super::validate_resource_access(
-                state,
-                client_id,
-                ResourceTarget {
-                    owner: None,
-                    id,
-                    kind,
-                    creation: None,
-                },
-                AccessMode::GET_ATTR,
-                access_request,
-            )
-        {
+        if let Err((code, bad_value)) = super::validate_core_resource_if_present(
+            state,
+            client_id,
+            id,
+            AccessMode::GET_ATTR,
+            access_request,
+        ) {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 113);
         }
     }

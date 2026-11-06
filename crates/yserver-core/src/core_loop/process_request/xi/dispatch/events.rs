@@ -1,4 +1,5 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind},
     backend::{Backend, OriginContext},
     core_loop::{
         fanout::fanout_event_to_clients,
@@ -104,6 +105,24 @@ pub(super) fn handle_xi_select_events(
             masks.push((deviceid, u64::from_le_bytes(word)));
             pos += byte_len;
         }
+        if let Err((code, value)) = crate::core_loop::process_request::validate_resource_if_present(
+            state,
+            client_id,
+            window,
+            ResourceKind::Window,
+            AccessMode::RECEIVE,
+            RequestOpcodes::for_request(header),
+        ) {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                code,
+                value,
+                u16::from(header.data),
+                header.opcode,
+            );
+        }
         if let Some(client) = state.clients.get_mut(&client_id.0) {
             for (deviceid, mask) in masks {
                 debug!(
@@ -151,6 +170,19 @@ pub(super) fn handle_xi_get_selected_events(
             return Ok(RequestOutcome::Handled);
         }
         let window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+        if let Err((code, value)) = crate::core_loop::process_request::validate_resource_if_present(
+            state,
+            client_id,
+            window,
+            ResourceKind::Window,
+            AccessMode::GET_ATTR,
+            RequestOpcodes {
+                major: XI2_MAJOR_OPCODE,
+                minor: 60,
+            },
+        ) {
+            return emit_x11_error_with_minor(state, client_id, sequence, code, value, 60, 137);
+        }
         // Xorg ProcXIGetSelectedEvents: one xXIEventMask per device
         // in device-id order, each trimmed to the words that hold set
         // bits. deviceid/mask_len follow the client byte order; the
@@ -267,6 +299,19 @@ pub(super) fn handle_xi1_select_extension_event(
             u16::from(minor),
             XI2_MAJOR_OPCODE,
         );
+    }
+    if let Err((code, value)) = crate::core_loop::process_request::validate_resource_if_present(
+        state,
+        client_id,
+        ResourceId(sel_window),
+        ResourceKind::Window,
+        AccessMode::RECEIVE,
+        RequestOpcodes {
+            major: XI2_MAJOR_OPCODE,
+            minor,
+        },
+    ) {
+        return xi1_error(state, client_id, sequence, code, value, minor);
     }
     // Xorg's HandleDevicePresenceMask runs before ordinary XI1
     // class validation and removes every class whose device field
@@ -427,6 +472,19 @@ pub(super) fn handle_xi1_get_selected_extension_events(
                 minor,
             );
         }
+        if let Err((code, value)) = crate::core_loop::process_request::validate_resource_if_present(
+            state,
+            client_id,
+            ResourceId(win),
+            ResourceKind::Window,
+            AccessMode::GET_ATTR,
+            RequestOpcodes {
+                major: XI2_MAJOR_OPCODE,
+                minor,
+            },
+        ) {
+            return xi1_error(state, client_id, sequence, code, value, minor);
+        }
         let window = ResourceId(win);
         let mut this_client: Vec<u32> = state
             .clients
@@ -516,6 +574,19 @@ pub(super) fn handle_xi1_change_device_dont_propagate_list(
             }
             classes.push(class);
         }
+        if let Err((code, value)) = crate::core_loop::process_request::validate_resource_if_present(
+            state,
+            client_id,
+            ResourceId(win),
+            ResourceKind::Window,
+            AccessMode::SET_ATTR,
+            RequestOpcodes {
+                major: XI2_MAJOR_OPCODE,
+                minor,
+            },
+        ) {
+            return xi1_error(state, client_id, sequence, code, value, minor);
+        }
         // mode 0 = AddToList, 1 = DeleteFromList. Xorg
         // `Xi/chgdprop.c::ChangeDeviceDontPropagateList` applies the
         // change to `OtherInputMasks.dontPropagateMask[deviceid]`;
@@ -578,6 +649,19 @@ pub(super) fn handle_xi1_get_device_dont_propagate_list(
                 win,
                 minor,
             );
+        }
+        if let Err((code, value)) = crate::core_loop::process_request::validate_resource_if_present(
+            state,
+            client_id,
+            ResourceId(win),
+            ResourceKind::Window,
+            AccessMode::GET_ATTR,
+            RequestOpcodes {
+                major: XI2_MAJOR_OPCODE,
+                minor,
+            },
+        ) {
+            return xi1_error(state, client_id, sequence, code, value, minor);
         }
         let classes: Vec<u32> = state
             .xi1_window_dont_propagate

@@ -1,6 +1,7 @@
 mod dispatch;
 
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind},
     backend::{Backend, OriginContext},
     core_loop::process_request::{
         RequestOutcome, XI2_MAJOR_OPCODE, emit_x11_error_with_minor,
@@ -274,6 +275,22 @@ fn handle_xi_set_focus(
         if let Some((code, value)) = core_focus_window_error(state, ResourceId(focus)) {
             return xi1_error(state, client_id, sequence, code, value, MINOR);
         }
+        if !matches!(focus, 0 | 1 | 3)
+            && let Err((code, value)) =
+                crate::core_loop::process_request::validate_resource_if_present(
+                    state,
+                    client_id,
+                    ResourceId(focus),
+                    ResourceKind::Window,
+                    AccessMode::SET_ATTR,
+                    RequestOpcodes {
+                        major: XI2_MAJOR_OPCODE,
+                        minor: MINOR,
+                    },
+                )
+        {
+            return xi1_error(state, client_id, sequence, code, value, MINOR);
+        }
         apply_core_input_focus(
             state,
             client_id,
@@ -286,6 +303,21 @@ fn handle_xi_set_focus(
     }
     if focus != xi1_focus::FOCUS_FOLLOW_KEYBOARD
         && let Some((code, value)) = core_focus_window_error(state, ResourceId(focus))
+    {
+        return xi1_error(state, client_id, sequence, code, value, MINOR);
+    }
+    if !matches!(focus, 0 | 1 | 3)
+        && let Err((code, value)) = crate::core_loop::process_request::validate_resource_if_present(
+            state,
+            client_id,
+            ResourceId(focus),
+            ResourceKind::Window,
+            AccessMode::SET_ATTR,
+            RequestOpcodes {
+                major: XI2_MAJOR_OPCODE,
+                minor: MINOR,
+            },
+        )
     {
         return xi1_error(state, client_id, sequence, code, value, MINOR);
     }
