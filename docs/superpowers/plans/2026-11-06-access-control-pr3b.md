@@ -6,7 +6,7 @@
 cursor and barrier operands of XInput, XKB and XTEST, with no change any client can observe while no policy is
 installed.
 
-**Architecture:** Only new check sites. PR 3a (#342, merged as 2ed4e5b9) provides everything they call:
+**Architecture:** New check sites, plus one addition under them: the identity of a cursor that is still displayed after its XID was freed (Task 5). PR 3a (#342, merged as 2ed4e5b9) provides everything they call:
 `ServerState::check_resource`, `AccessContext::owner` for every `ResourceKind`, `RequestOpcodes::for_request`, the
 `validate_resource_access` / `validate_resource_if_present` helpers in `core_loop/process_request.rs`, and every
 `AccessMode` bit these sites use. Each site asks right after its operand's existing validation, in yserver's order.
@@ -60,9 +60,20 @@ contract of plan 3a ("Denial test contract") applies to every row here. Rulings 
     skipped cursor keeps its image.
   - Windows, grabs and aliases that merely reference a changed cursor are consequences, not targets (the cursor
     object changes; they keep the same reference).
-- **`GetCursorImage` and `GetCursorImageAndName`** check the current cursor, which they derive, with `READ`
-  (`+GET_ATTR` for the name), as XLibre. The current cursor is a resolvable XID only when a client cursor is shown;
-  a server cursor (none or the root default) is not checked.
+- **Retained cursor identity.** A cursor's XID can be freed while a window still displays it: `free_cursor` drops the
+  table entry and keeps the host cursor (`resources/picture_font_cursor.rs`), and its name keeps matching
+  (`d746bc3c`, `docs/status.md:720-723`: "a freed-but-displayed cursor still matches"). Such a cursor is still a
+  client's object, so it keeps an identity: the `ResourceTable` records, for each host cursor, the XID and owner it
+  was first bound under (the XID whose creation produced it; a later `ChangeCursor` alias does not replace it), and
+  forgets it exactly when the host cursor is released on the backend. `AccessContext::owner(id, Cursor)` answers a
+  live cursor's owner first, else the recorded owner of a retained host cursor carrying that XID, else `None`. Host
+  cursors with no record (server cursors: none, the root default) are not checked. If a live cursor and a retained
+  one share an XID (the client reused it), the live one answers; both belong to the client that owns the XID's base.
+- **`GetCursorImage` and `GetCursorImageAndName`** check the displayed cursor, which they derive, with `READ`
+  (`+GET_ATTR` for the name), as XLibre, against the recorded XID of the displayed host cursor. A displayed host cursor
+  with no record is a server cursor and is not checked.
+- **`ChangeCursorByName`'s derived cursors** are today's match set unchanged: every host cursor with that name,
+  retained ones included. Each one with a record is checked against its recorded XID; one without a record is not.
 - **XInput `XISetClientPointer` / `XIGetClientPointer`** name an arbitrary resource whose owner is the target
   client; yserver ignores the body today. The resource part is checked with `GET_ATTR` only when the id resolves
   through `resource_owner`'s stores, exactly as 3a's `KillClient` row; the client and device parts are PR 5.
@@ -186,7 +197,9 @@ check runs only when it resolves.
 3. Derived targets (`RedirectSubwindows`, `DAMAGE Add`, `ChangeCursorByName`): a skipped one is exactly unchanged
    and the request still succeeds and acts on the rest.
 4. `XIBarrierReleasePointer`'s partial effects on denial match today's partial effects on a missing barrier.
-5. Stubs and ignored bodies (`GetOverlayWindow`'s window, `XISetClientPointer`): with no policy nothing they answer
+5. The retained cursor record's lifetime: created once, never by an alias, removed exactly at backend release on
+   every release path (XID free, window cursor change, ChangeCursor retarget, disconnect, reset).
+6. Stubs and ignored bodies (`GetOverlayWindow`'s window, `XISetClientPointer`): with no policy nothing they answer
    changes; with a policy, an id that does not resolve is not asked.
 
 ---
@@ -239,16 +252,46 @@ check runs only when it resolves.
   unused id with a deny-all policy: today's bytes, the new region exists owned by the requester).
 - [ ] **Steps 2–5.** Commit `… Task 4: XFIXES regions`.
 
-### Task 5: XFIXES cursors, windows and barriers
+### Task 5: Retained cursor identity
+
+**Files:** `resources/picture_font_cursor.rs`, `resources/mod.rs` (the record beside `cursor_host_names`),
+`resources/cleanup.rs` (`access_owner`), and the host-cursor release paths (`free_cursor`, `cursor_host_released`,
+`take_unreferenced_cursor_hosts` and their callers); tests in `process_request/tests/access_resources.rs` or a new
+`access_cursors.rs`.
+
+**Interfaces:** Produces `ResourceTable::cursor_host_origin(host: u32) -> Option<(ResourceId, ClientId)>` and the
+`access_owner` fallback described in Scope decisions. Consumed by Task 6.
+
+**Invariants:** a host cursor has a record from the moment it is first bound to a client cursor XID until the moment
+it is released on the backend, and never otherwise; an alias (`retarget_cursor_host`) never creates or overwrites a
+record; `resource_owner` and `KillClient` are unchanged.
+
+- [ ] **Step 1: Failing tests** (through `process_request`):
+  - `freed_displayed_cursor_keeps_owner_for_policies`: A creates cursor C, sets it on a window, frees C; a recording
+    policy asked about C's XID sees owner A through `ctx.owner(C, Cursor)`. After the window's cursor changes and
+    the host cursor is released, `ctx.owner` answers `None`. Mutation: drop the record in `free_cursor`; keep it
+    after release.
+  - `reused_cursor_xid_answers_the_live_cursor`: A frees C while displayed and creates a new cursor with the same
+    XID: `ctx.owner` answers A for the live one; the retained one's record still names A.
+  - `change_cursor_alias_keeps_creator_record`: XFIXES ChangeCursor makes B's cursor share A's host cursor; the record
+    of that host cursor still names A's XID.
+- [ ] **Steps 2–5.** Commit `… Task 5: retained cursor identity`.
+
+### Task 6: XFIXES cursors, windows and barriers
 
 **Sites:** XFIXES rows 1–4, 23–27, 29–32.
 
 - [ ] **Step 1: Failing tests:** deny and ask tables; `change_cursor_by_name_skips_denied_cursor` (two cursors
   named "x", one denied: the allowed one takes the source image, the denied one keeps its own, no error);
-  `get_cursor_image_server_cursor_is_not_asked`; `xfixes_change_save_set_denied_leaves_save_set_unchanged`.
-- [ ] **Steps 2–5.** Commit `… Task 5: XFIXES cursors, windows and barriers`.
+  `get_cursor_image_server_cursor_is_not_asked`; `xfixes_change_save_set_denied_leaves_save_set_unchanged`;
+  for a named, displayed cursor after `FreeCursor` (Task 5's record): `get_cursor_image_of_freed_displayed_cursor_denied`
+  (B's GetCursorImage and GetCursorImageAndName answer the policy's error, no image bytes),
+  `change_cursor_by_name_freed_displayed_cursor_denied_keeps_image`, and
+  `change_cursor_by_name_freed_displayed_cursor_no_policy_matches_today` (with no policy the replacement happens
+  exactly as today). Mutation: skip the check when the XID is not live.
+- [ ] **Steps 2–5.** Commit `… Task 6: XFIXES cursors, windows and barriers`.
 
-### Task 6: Composite and DAMAGE
+### Task 7: Composite and DAMAGE
 
 **Sites:** Composite rows 144/1–4, 6–8; DAMAGE rows 143/1–4.
 
@@ -256,9 +299,9 @@ check runs only when it resolves.
   middle one denied: the others redirected with backings, the middle one not, no error; the future-child rule is
   still recorded); `damage_add_skips_denied_damage` (two Damage objects on the drawable, one denied: only the other
   accumulates, no error); `damage_subtract_denied_parts_writes_nothing`.
-- [ ] **Steps 2–5.** Commit `… Task 6: Composite and DAMAGE`.
+- [ ] **Steps 2–5.** Commit `… Task 7: Composite and DAMAGE`.
 
-### Task 7: XInput, XKB and XTEST window, cursor and barrier operands
+### Task 8: XInput, XKB and XTEST window, cursor and barrier operands
 
 **Files:** `core_loop/process_request/xi/dispatch/*.rs`, `xi/mod.rs`, `focus_pointer.rs` (XIWarpPointer),
 `xkb.rs`, `xtest.rs`; tests `process_request/tests/access_input.rs`.
@@ -268,14 +311,15 @@ check runs only when it resolves.
 - [ ] **Step 1: Failing tests:** deny and ask tables (device operands valid, so only the resource checks decide);
   `barrier_release_denied_second_entry_keeps_first_release` (mutation: check all barriers before releasing any);
   `xi_set_client_pointer_unresolved_id_is_not_asked`.
-- [ ] **Steps 2–5.** Commit `… Task 7: XInput, XKB and XTEST operands`.
+- [ ] **Steps 2–5.** Commit `… Task 8: XInput, XKB and XTEST operands`.
 
-### Task 8: Spec rows and gate
+### Task 9: Spec rows and gate
 
 - [ ] **Step 1:** spec, "A denial is interpreted by its site": rows for the 3b derived targets (`RedirectSubwindows`
   / `UnredirectSubwindows` children, `DAMAGE Add` Damage objects, `ChangeCursorByName` cursors: skipped, the request
   succeeds) and for `XIBarrierReleasePointer` (policy error after earlier entries took effect). "What a policy can
-  see": state that advertised descriptors (PictFormat) are not checked.
+  see": state that advertised descriptors (PictFormat) are not checked, and that a cursor still displayed after its
+  XID was freed keeps its creator's XID and owner until the host cursor is released.
 - [ ] **Step 2: Gate:** `cargo +nightly fmt -- --check`; `cargo clippy --all-targets -- -D warnings`, also with
   `--features tcp-transport` and `--features xdmcp`; FreeBSD clippy; `cargo check -p yserver-core --target
   x86_64-pc-windows-gnu`; `cargo test --workspace` and with `--features xdmcp`; each `crates/*/tests` file;
