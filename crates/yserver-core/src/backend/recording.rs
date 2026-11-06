@@ -187,6 +187,36 @@ pub enum RecordedCall {
     RenderFillRectangles {
         host_dst: u32,
     },
+    RenderFormatForYnestId {
+        format: u32,
+    },
+    RenderTrapezoids {
+        host_src: u32,
+        host_dst: u32,
+    },
+    RenderTriangles {
+        minor: u8,
+        host_src: u32,
+        host_dst: u32,
+    },
+    RenderCreateSolidFill {
+        color: [u8; 8],
+    },
+    RenderCreateLinearGradient {
+        picture: Option<u32>,
+    },
+    RenderCreateRadialGradient {
+        picture: Option<u32>,
+    },
+    RenderSetPictureClipRectangles {
+        host_pic: u32,
+    },
+    RenderSetPictureFilter {
+        host_pic: u32,
+    },
+    RenderSetPictureTransform {
+        host_pic: u32,
+    },
     CopyPlane {
         src_host_xid: u32,
         dst_host_xid: u32,
@@ -1327,7 +1357,8 @@ impl Backend for RecordingBackend {
         self.redirect_activation_supported
     }
 
-    fn render_format_for_ynest_id(&self, _ynest_fmt: u32) -> Option<u32> {
+    fn render_format_for_ynest_id(&self, ynest_fmt: u32) -> Option<u32> {
+        self.record(RecordedCall::RenderFormatForYnestId { format: ynest_fmt });
         None
     }
 
@@ -2403,8 +2434,7 @@ impl Backend for RecordingBackend {
         unimplemented!("RecordingBackend: image_text16")
     }
 
-    // RENDER — Picture create/free and the Composite/FillRectangles paints are recorded;
-    // the rest are no-ops.
+    // RENDER — methods that these request paths use are recorded.
 
     fn render_create_picture(
         &mut self,
@@ -2554,8 +2584,8 @@ impl Backend for RecordingBackend {
         &mut self,
         _origin: Option<OriginContext>,
         _op: u8,
-        _host_src: u32,
-        _host_dst: u32,
+        host_src: u32,
+        host_dst: u32,
         _host_mask_format: u32,
         _src_x: i16,
         _src_y: i16,
@@ -2563,16 +2593,17 @@ impl Backend for RecordingBackend {
         _x_off: i16,
         _y_off: i16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
+        self.record(RecordedCall::RenderTrapezoids { host_src, host_dst });
         Ok(self.render_return_region.clone())
     }
 
     fn render_triangles_op(
         &mut self,
         _origin: Option<OriginContext>,
-        _minor: u8,
+        minor: u8,
         _op: u8,
-        _host_src: u32,
-        _host_dst: u32,
+        host_src: u32,
+        host_dst: u32,
         _host_mask_format: u32,
         _src_x: i16,
         _src_y: i16,
@@ -2580,30 +2611,46 @@ impl Backend for RecordingBackend {
         _x_off: i16,
         _y_off: i16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
+        self.record(RecordedCall::RenderTriangles {
+            minor,
+            host_src,
+            host_dst,
+        });
         Ok(self.render_return_region.clone())
     }
 
     fn render_create_solid_fill(
         &mut self,
         _origin: Option<OriginContext>,
-        _color: [u8; 8],
+        color: [u8; 8],
     ) -> io::Result<Option<PictureHandle>> {
+        self.record(RecordedCall::RenderCreateSolidFill { color });
         Ok(None)
     }
 
     fn render_create_linear_gradient(
         &mut self,
         _origin: Option<OriginContext>,
-        _body: &[u8],
+        body: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
+        self.record(RecordedCall::RenderCreateLinearGradient {
+            picture: body
+                .get(..4)
+                .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+        });
         Ok(None)
     }
 
     fn render_create_radial_gradient(
         &mut self,
         _origin: Option<OriginContext>,
-        _body: &[u8],
+        body: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
+        self.record(RecordedCall::RenderCreateRadialGradient {
+            picture: body
+                .get(..4)
+                .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+        });
         Ok(None)
     }
 
@@ -2620,27 +2667,30 @@ impl Backend for RecordingBackend {
     fn render_set_picture_clip_rectangles(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
+        host_pic: u32,
         _body: &[u8],
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderSetPictureClipRectangles { host_pic });
         Ok(())
     }
 
     fn render_set_picture_filter(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
+        host_pic: u32,
         _body: &[u8],
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderSetPictureFilter { host_pic });
         Ok(())
     }
 
     fn render_set_picture_transform(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
+        host_pic: u32,
         _body: &[u8],
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderSetPictureTransform { host_pic });
         Ok(())
     }
 
