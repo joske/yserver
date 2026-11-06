@@ -1998,6 +1998,107 @@ fn xfixes_change_cursor_retargets_cursor_and_backend() {
     );
 }
 
+#[test]
+fn xfixes_change_cursor_checks_source_before_resolving_destination() {
+    // Mutation: resolve the ChangeCursor destination before checking its source.
+    use super::extensions::{ExtensionHook, RecordingExtensionPolicy};
+    use crate::access::{AccessMode, DenyError, RequestOpcodes, ResourceKind};
+    use yserver_protocol::x11::xfixes as x11xfixes;
+    const SOURCE: ResourceId = ResourceId(0x0040_0030);
+    const MISSING: u32 = 0x0bad_bad0;
+    const ERROR_VALUE: u32 = 0x5a17;
+
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    state.xfixes_client_major.insert(1, 5);
+    state.resources.create_cursor(ClientId(1), SOURCE);
+    let mut backend = RecordingBackend::new();
+    let source_host_before = state.resources.cursor_host_xid(SOURCE);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+        Arc::clone(&calls),
+        SOURCE,
+        Some(AccessMode::READ | AccessMode::GET_ATTR),
+        DenyError {
+            code: x11::error::BAD_VALUE,
+            value: ERROR_VALUE,
+        },
+    )));
+
+    xfixes_req(
+        &mut state,
+        &mut backend,
+        1,
+        x11xfixes::CHANGE_CURSOR,
+        &xfixes_u32s(&[SOURCE.0, MISSING]),
+    );
+    let packets = wire_packets(&mut peer);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(
+        error_fields(&packets[0]),
+        (
+            x11::error::BAD_VALUE,
+            ERROR_VALUE,
+            u16::from(x11xfixes::CHANGE_CURSOR),
+            XFIXES_MAJOR_OPCODE,
+        )
+    );
+    let recorded = calls.lock().unwrap();
+    let checks = recorded
+        .iter()
+        .filter(|call| call.hook == ExtensionHook::Resource)
+        .collect::<Vec<_>>();
+    assert_eq!(checks.len(), 1);
+    let source = checks[0];
+    assert_eq!(source.client, ClientId(1));
+    assert_eq!(
+        source.target,
+        Some(crate::access::ResourceTarget {
+            owner: None,
+            id: SOURCE,
+            kind: ResourceKind::Cursor,
+            creation: None,
+        })
+    );
+    assert_eq!(source.mode, Some(AccessMode::READ | AccessMode::GET_ATTR));
+    assert_eq!(source.owner, Some(ClientId(1)));
+    assert_eq!(source.target_owner, Some(ClientId(1)));
+    assert_eq!(
+        source.request,
+        Some(RequestOpcodes {
+            major: XFIXES_MAJOR_OPCODE,
+            minor: x11xfixes::CHANGE_CURSOR,
+        })
+    );
+    drop(recorded);
+    assert!(backend.calls().is_empty());
+    assert!(state.resources.cursor_exists(SOURCE));
+    assert!(!state.resources.cursor_exists(ResourceId(MISSING)));
+    assert_eq!(state.resources.cursor_host_xid(SOURCE), source_host_before);
+
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    state.xfixes_client_major.insert(1, 5);
+    state.resources.create_cursor(ClientId(1), SOURCE);
+    let mut backend = RecordingBackend::new();
+    xfixes_req(
+        &mut state,
+        &mut backend,
+        1,
+        x11xfixes::CHANGE_CURSOR,
+        &xfixes_u32s(&[SOURCE.0, MISSING]),
+    );
+    assert_eq!(
+        error_fields(&wire_packets(&mut peer)[0]),
+        (
+            x11::error::BAD_CURSOR,
+            MISSING,
+            u16::from(x11xfixes::CHANGE_CURSOR),
+            XFIXES_MAJOR_OPCODE,
+        )
+    );
+}
+
 /// ChangeCursorByName matches the cursor object's name even after the
 /// client freed its XID (the window still shows it); a name nobody
 /// interned matches nothing and is not an error (Xvfb: OK).

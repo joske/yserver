@@ -154,66 +154,61 @@ pub(super) fn handle_render_request(
     let access_request = RequestOpcodes::for_request(header);
     macro_rules! check_resource {
         ($id:expr, $kind:expr, $mode:expr) => {
-            if let Err((code, value)) =
-                validate_resource_if_present(state, client_id, $id, $kind, $mode, access_request)
-            {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    code,
-                    value,
-                    u16::from(minor),
-                    header.opcode,
-                );
-            }
+            crate::core_loop::process_request::return_on_access_denial!(
+                validate_resource_if_present(state, client_id, $id, $kind, $mode, access_request),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
         };
     }
     macro_rules! check_creation {
         ($id:expr, $kind:expr, $mode:expr, $parent:expr $(,)?) => {
-            if let Err((code, value)) = validate_resource_access(
+            crate::core_loop::process_request::return_on_access_denial!(
+                validate_resource_access(
+                    state,
+                    client_id,
+                    ResourceTarget {
+                        owner: None,
+                        id: $id,
+                        kind: $kind,
+                        creation: Some(Creation {
+                            parent: $parent,
+                            owner: client_id,
+                        }),
+                    },
+                    $mode,
+                    access_request,
+                ),
                 state,
                 client_id,
-                ResourceTarget {
-                    owner: None,
-                    id: $id,
-                    kind: $kind,
-                    creation: Some(Creation {
-                        parent: $parent,
-                        owner: client_id,
-                    }),
-                },
-                $mode,
+                sequence,
                 access_request,
-            ) {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    code,
-                    value,
-                    u16::from(minor),
-                    header.opcode,
-                );
-            }
+            );
         };
     }
-    // Resolve every Picture first, preserving BadPicture precedence, then ask each
-    // resource check in the same order as the request's operands.
+    // Validate and check each Picture in operand order. A valid denied
+    // operand takes precedence over a missing later Picture.
     macro_rules! verify_pictures {
         ($(($id:expr, $mode:expr)),+ $(,)?) => {
-            if let Some(bad) = first_missing_picture(state, &[$($id),+]) {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    crate::nested::RENDER_FIRST_ERROR + 1,
-                    bad.0,
-                    u16::from(minor),
-                    header.opcode,
-                );
-            }
-            $(check_resource!($id, ResourceKind::Picture, $mode);)+
+            $(
+                {
+                    let picture = $id;
+                    if state.resources.picture(picture).is_none() {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            crate::nested::RENDER_FIRST_ERROR + 1,
+                            picture.0,
+                            u16::from(minor),
+                            header.opcode,
+                        );
+                    }
+                    check_resource!(picture, ResourceKind::Picture, $mode);
+                }
+            )+
         };
     }
     match minor {
@@ -314,16 +309,15 @@ pub(super) fn handle_render_request(
             ) {
                 Ok(Some(values)) => values,
                 Ok(None) => Vec::new(),
-                Err((code, value)) => {
-                    return emit_x11_error_with_minor(
+                Err(error) => {
+                    crate::core_loop::process_request::return_on_access_denial!(
+                        Err::<(), _>(error),
                         state,
                         client_id,
                         sequence,
-                        code,
-                        value,
-                        u16::from(minor),
-                        header.opcode,
+                        access_request,
                     );
+                    unreachable!("access denial returns from the request handler");
                 }
             };
             translated_values.extend_from_slice(&req.values[translated_bytes..]);
@@ -396,16 +390,15 @@ pub(super) fn handle_render_request(
                 None,
             ) {
                 Ok(translated) => translated,
-                Err((code, value)) => {
-                    return emit_x11_error_with_minor(
+                Err(error) => {
+                    crate::core_loop::process_request::return_on_access_denial!(
+                        Err::<(), _>(error),
                         state,
                         client_id,
                         sequence,
-                        code,
-                        value,
-                        u16::from(minor),
-                        header.opcode,
+                        access_request,
                     );
+                    unreachable!("access denial returns from the request handler");
                 }
             };
             let Some(translated_values) = translated else {
@@ -720,14 +713,12 @@ pub(super) fn handle_render_request(
                     .map(|g| g.host_glyphset_xid.as_raw())
             });
             if let Some((code, value)) = switch_access_error {
-                return emit_x11_error_with_minor(
+                crate::core_loop::process_request::return_on_access_denial!(
+                    Err::<(), _>((code, value)),
                     state,
                     client_id,
                     sequence,
-                    code,
-                    value,
-                    u16::from(minor),
-                    header.opcode,
+                    access_request,
                 );
             }
             if dst_picture_is_sourceless(state, req.dst) {
@@ -1284,14 +1275,6 @@ pub(super) fn render_picture_damage_drawable(
         .resources
         .composite_named_pixmap_owner_window(drawable)
         .unwrap_or(drawable)
-}
-
-/// Xorg VERIFY_PICTURE (`render/picturestr.h:363`, error value set at
-/// `render/render.c:252`): the first of `ids` that names no Picture.
-fn first_missing_picture(state: &ServerState, ids: &[ResourceId]) -> Option<ResourceId> {
-    ids.iter()
-        .copied()
-        .find(|id| state.resources.picture(*id).is_none())
 }
 
 /// A RENDER destination Picture on an unviewable window: Xorg's composite clip is the

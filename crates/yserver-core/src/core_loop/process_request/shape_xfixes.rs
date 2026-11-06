@@ -325,24 +325,20 @@ fn handle_shape_request_ops(
     let access_request = RequestOpcodes::for_request(header);
     macro_rules! check_resource {
         ($id:expr, $kind:expr, $mode:expr) => {
-            if let Err((code, value)) = super::validate_resource_if_present(
-                state,
-                client_id,
-                $id,
-                $kind,
-                $mode,
-                access_request,
-            ) {
-                return emit_x11_error_with_minor(
+            super::return_on_access_denial!(
+                super::validate_resource_if_present(
                     state,
                     client_id,
-                    sequence,
-                    code,
-                    value,
-                    u16::from(minor),
-                    header.opcode,
-                );
-            }
+                    $id,
+                    $kind,
+                    $mode,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
         };
     }
     debug!(
@@ -1053,22 +1049,19 @@ pub(super) fn handle_xfixes_request(
             let active_image = backend.get_active_cursor_image();
             if let Some(img) = &active_image
                 && let Some(target) = xfixes_cursor_host_target(state, img.host_xid)
-                && let Err((code, value)) = super::validate_resource_access(
-                    state,
-                    client_id,
-                    target,
-                    AccessMode::READ,
-                    access_request,
-                )
             {
-                return emit_x11_error_with_minor(
+                super::return_on_access_denial!(
+                    super::validate_resource_access(
+                        state,
+                        client_id,
+                        target,
+                        AccessMode::READ,
+                        access_request,
+                    ),
                     state,
                     client_id,
                     sequence,
-                    code,
-                    value,
-                    u16::from(minor),
-                    header.opcode,
+                    access_request,
                 );
             }
             let reply = match active_image {
@@ -1101,22 +1094,19 @@ pub(super) fn handle_xfixes_request(
             let active_image = backend.get_active_cursor_image();
             if let Some(img) = &active_image
                 && let Some(target) = xfixes_cursor_host_target(state, img.host_xid)
-                && let Err((code, value)) = super::validate_resource_access(
-                    state,
-                    client_id,
-                    target,
-                    AccessMode::READ | AccessMode::GET_ATTR,
-                    access_request,
-                )
             {
-                return emit_x11_error_with_minor(
+                super::return_on_access_denial!(
+                    super::validate_resource_access(
+                        state,
+                        client_id,
+                        target,
+                        AccessMode::READ | AccessMode::GET_ATTR,
+                        access_request,
+                    ),
                     state,
                     client_id,
                     sequence,
-                    code,
-                    value,
-                    u16::from(minor),
-                    header.opcode,
+                    access_request,
                 );
             }
             let reply = match active_image {
@@ -1866,16 +1856,16 @@ pub(super) fn handle_xfixes_request(
             if let Err(outcome) = xfixes_verify_cursor(state, client_id, sequence, header, source) {
                 return outcome;
             }
-            let dest_host =
-                match xfixes_verify_cursor(state, client_id, sequence, header, destination) {
-                    Ok(host) => host,
-                    Err(outcome) => return outcome,
-                };
             check_resource!(
                 ResourceId(source),
                 ResourceKind::Cursor,
                 AccessMode::READ | AccessMode::GET_ATTR
             );
+            let dest_host =
+                match xfixes_verify_cursor(state, client_id, sequence, header, destination) {
+                    Ok(host) => host,
+                    Err(outcome) => return outcome,
+                };
             check_resource!(
                 ResourceId(destination),
                 ResourceKind::Cursor,

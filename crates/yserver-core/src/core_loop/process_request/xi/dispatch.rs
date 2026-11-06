@@ -28,6 +28,7 @@ mod props;
 pub(in crate::core_loop::process_request) use grabs::deactivate_xi2_device_grab;
 
 use crate::{
+    access::RequestOpcodes,
     backend::{Backend, OriginContext},
     core_loop::process_request::{
         RequestOutcome, XINPUT_LAST_REQUEST, emit_x11_error_with_minor,
@@ -153,31 +154,91 @@ pub(in crate::core_loop::process_request) fn handle_xi2_request(
             header.opcode,
         );
     }
+    let access_request = RequestOpcodes::for_request(header);
     match minor {
         1 => handle_xi1_get_extension_version(state, client_id, sequence, header, body, byte_order),
-        42 => handle_xi_change_cursor(state, backend, origin, client_id, sequence, body),
-        44 => handle_xi_set_client_pointer(state, client_id, sequence, body),
-        45 => handle_xi_get_client_pointer(state, client_id, sequence, body, byte_order),
-        46 => handle_xi_select_events(state, backend, origin, client_id, sequence, header, body),
+        42 => handle_xi_change_cursor(
+            state,
+            backend,
+            origin,
+            client_id,
+            sequence,
+            body,
+            access_request,
+        ),
+        44 => handle_xi_set_client_pointer(state, client_id, sequence, body, access_request),
+        45 => handle_xi_get_client_pointer(
+            state,
+            client_id,
+            sequence,
+            body,
+            byte_order,
+            access_request,
+        ),
+        46 => handle_xi_select_events(
+            state,
+            backend,
+            origin,
+            client_id,
+            sequence,
+            header,
+            body,
+            access_request,
+        ),
         47 => handle_xi_query_version(state, client_id, sequence, body, byte_order),
         48 => handle_xi_query_device(state, client_id, sequence, body, byte_order),
         56 => handle_xi_list_properties(state, client_id, sequence, body, byte_order),
         57 => handle_xi_change_property(state, backend, client_id, sequence, body, byte_order),
         58 => handle_xi_delete_property(state, client_id, sequence, body),
         59 => handle_xi_get_property(state, client_id, sequence, body, byte_order),
-        60 => handle_xi_get_selected_events(state, client_id, sequence, body, byte_order),
+        60 => handle_xi_get_selected_events(
+            state,
+            client_id,
+            sequence,
+            body,
+            byte_order,
+            access_request,
+        ),
         40 => handle_xi_query_pointer(
-            state, backend, origin, client_id, sequence, body, byte_order,
+            state,
+            backend,
+            origin,
+            client_id,
+            sequence,
+            body,
+            byte_order,
+            access_request,
         ),
         51 => handle_xi_grab_device(
-            state, backend, origin, client_id, sequence, body, byte_order,
+            state,
+            backend,
+            origin,
+            client_id,
+            sequence,
+            body,
+            byte_order,
+            access_request,
         ),
         52 => handle_xi_ungrab_device(state, backend, origin, client_id, sequence, body),
         53 => handle_xi_allow_events(state, backend, client_id, sequence, body),
-        54 => handle_xi_passive_grab_device(state, client_id, sequence, body, byte_order),
-        55 => handle_xi_passive_ungrab_device(state, client_id, sequence, body),
+        54 => handle_xi_passive_grab_device(
+            state,
+            client_id,
+            sequence,
+            body,
+            byte_order,
+            access_request,
+        ),
+        55 => handle_xi_passive_ungrab_device(state, client_id, sequence, body, access_request),
         2 => handle_xi1_list_input_devices(state, client_id, sequence, byte_order),
-        6 => handle_xi1_select_extension_event(state, client_id, sequence, body, minor),
+        6 => handle_xi1_select_extension_event(
+            state,
+            client_id,
+            sequence,
+            body,
+            minor,
+            access_request,
+        ),
         36 => handle_xi1_list_device_properties(state, client_id, sequence, body, byte_order),
         37 => {
             handle_xi1_change_device_property(state, backend, client_id, sequence, body, byte_order)
@@ -188,11 +249,30 @@ pub(in crate::core_loop::process_request) fn handle_xi2_request(
         4 => handle_xi1_close_device(state, client_id, sequence, body, minor),
         5 => handle_xi1_set_device_mode(state, client_id, sequence, body, byte_order, minor),
         7 => handle_xi1_get_selected_extension_events(
-            state, client_id, sequence, body, byte_order, minor,
+            state,
+            client_id,
+            sequence,
+            body,
+            byte_order,
+            minor,
+            access_request,
         ),
-        8 => handle_xi1_change_device_dont_propagate_list(state, client_id, sequence, body, minor),
+        8 => handle_xi1_change_device_dont_propagate_list(
+            state,
+            client_id,
+            sequence,
+            body,
+            minor,
+            access_request,
+        ),
         9 => handle_xi1_get_device_dont_propagate_list(
-            state, client_id, sequence, body, byte_order, minor,
+            state,
+            client_id,
+            sequence,
+            body,
+            byte_order,
+            minor,
+            access_request,
         ),
         10 => {
             handle_xi1_get_device_motion_events(state, client_id, sequence, body, byte_order, minor)
@@ -201,15 +281,27 @@ pub(in crate::core_loop::process_request) fn handle_xi2_request(
             handle_xi1_change_keyboard_device(state, client_id, sequence, body, byte_order, minor)
         }
         12 => handle_xi1_change_pointer_device(state, client_id, sequence, minor),
-        13 => handle_xi1_grab_device(state, client_id, sequence, body, byte_order, minor),
+        13 => handle_xi1_grab_device(
+            state,
+            client_id,
+            sequence,
+            body,
+            byte_order,
+            minor,
+            access_request,
+        ),
         14 => handle_xi1_ungrab_device(state, client_id, sequence, body, minor),
-        15 => handle_xi1_grab_device_key(state, client_id, sequence, body, minor),
-        16 => handle_xi1_ungrab_device_key(state, client_id, sequence, body, minor),
-        17 => handle_xi1_grab_device_button(state, client_id, sequence, body, minor),
-        18 => handle_xi1_ungrab_device_button(state, client_id, sequence, body, minor),
+        15 => handle_xi1_grab_device_key(state, client_id, sequence, body, minor, access_request),
+        16 => handle_xi1_ungrab_device_key(state, client_id, sequence, body, minor, access_request),
+        17 => {
+            handle_xi1_grab_device_button(state, client_id, sequence, body, minor, access_request)
+        }
+        18 => {
+            handle_xi1_ungrab_device_button(state, client_id, sequence, body, minor, access_request)
+        }
         19 => handle_xi1_allow_device_events(state, backend, client_id, sequence, body, minor),
         20 => handle_xi1_get_device_focus(state, client_id, sequence, body, byte_order, minor),
-        21 => handle_xi1_set_device_focus(state, client_id, sequence, body, minor),
+        21 => handle_xi1_set_device_focus(state, client_id, sequence, body, minor, access_request),
         22 => handle_xi1_get_feedback_control(state, client_id, sequence, body, byte_order, minor),
         23 => handle_xi1_change_feedback_control(state, client_id, sequence, body, minor),
         24 => handle_xi1_get_device_key_mapping(
@@ -237,10 +329,10 @@ pub(in crate::core_loop::process_request) fn handle_xi2_request(
         34 => handle_xi1_get_device_control(state, client_id, sequence, body, byte_order, minor),
         35 => handle_xi1_change_device_control(state, client_id, sequence, body, byte_order, minor),
         50 => handle_xi_get_focus(state, client_id, sequence, body, byte_order, minor),
-        61 => handle_xi_barrier_release_pointer(state, client_id, sequence, body),
+        61 => handle_xi_barrier_release_pointer(state, client_id, sequence, body, access_request),
         41 => handle_xi_warp_pointer(state, backend, origin, client_id, sequence, header, body),
         43 => handle_xi_change_hierarchy(state, client_id, sequence, byte_order, body),
-        49 => handle_xi_set_focus(state, client_id, sequence, body),
+        49 => handle_xi_set_focus(state, client_id, sequence, body, access_request),
         // Every minor in 1..=XINPUT_LAST_REQUEST has an arm above; like
         // Xorg's ProcIDispatch, anything else is BadRequest.
         _ => {
