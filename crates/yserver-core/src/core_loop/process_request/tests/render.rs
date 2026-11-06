@@ -554,6 +554,23 @@ fn drain_errors(peer: &mut UnixStream) -> Vec<(u8, u32)> {
     out
 }
 
+fn drain_error_details(peer: &mut UnixStream) -> Vec<(u8, u32, u16, u8)> {
+    peer.set_nonblocking(true).unwrap();
+    let mut out = Vec::new();
+    let mut buf = [0u8; 32];
+    while peer.read_exact(&mut buf).is_ok() {
+        if buf[0] == 0 {
+            out.push((
+                buf[1],
+                u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
+                u16::from_le_bytes([buf[8], buf[9]]),
+                buf[10],
+            ));
+        }
+    }
+    out
+}
+
 fn create_render_picture(
     state: &mut ServerState,
     backend: &mut RecordingBackend,
@@ -637,8 +654,9 @@ fn composite_glyph_items_with_switch(minor: u8, glyphset: u32) -> (Vec<u8>, usiz
     items.resize(items.len() + ((4 - payload_bytes % 4) % 4), 0);
 
     let switch_offset = items.len();
-    items.extend_from_slice(&[255, 0, 0, 0]);
-    items.extend_from_slice(&glyphset.to_le_bytes());
+    items.extend_from_slice(&yserver_protocol::x11::render_composite_glyphset_switch(
+        glyphset,
+    ));
     items.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
     items.extend(std::iter::repeat_n(0, id_size));
     items.resize(items.len() + ((4 - id_size % 4) % 4), 0);
@@ -719,7 +737,7 @@ fn composite_glyphs_switch_is_translated_to_backend_handle() {
         assert_eq!(host_gs, HOST_G1);
         assert_eq!(
             u32::from_le_bytes(
-                forwarded_items[switch_offset + 4..switch_offset + 8]
+                forwarded_items[switch_offset + 8..switch_offset + 12]
                     .try_into()
                     .unwrap()
             ),
@@ -731,8 +749,8 @@ fn composite_glyphs_switch_is_translated_to_backend_handle() {
 }
 
 #[test]
-fn composite_glyphs_switch_to_backend_handle_value_is_ignored() {
-    // Mutation: accept a backend handle value as though it were a client glyphset XID.
+fn composite_glyphs_switch_to_non_glyphset_is_bad_glyphset() {
+    // Mutation: forward an unknown switch as backend handle 0 instead of returning BadGlyphSet.
     const CLIENT: u32 = 7;
     const OTHER_CLIENT: u32 = 8;
     const G1: u32 = 0x0020_0030;
@@ -740,6 +758,7 @@ fn composite_glyphs_switch_to_backend_handle_value_is_ignored() {
     const HOST_G1: u32 = 0xAA03;
     const OTHER_HOST_GLYPHSET: u32 = 0xAA04;
     let (mut state, mut backend) = render_damage_fixture(Vec::new());
+    let mut peer = install_client(&mut state, CLIENT);
     let _other_peer = install_client(&mut state, OTHER_CLIENT);
     state.resources.create_glyphset(
         ResourceId(G1),
@@ -763,24 +782,103 @@ fn composite_glyphs_switch_to_backend_handle_value_is_ignored() {
             .glyphset(ResourceId(OTHER_HOST_GLYPHSET))
             .is_none()
     );
-    let (items, switch_offset) = composite_glyph_items_with_switch(23, OTHER_HOST_GLYPHSET);
+    for minor in [23, 24, 25] {
+        backend.calls.lock().unwrap().clear();
+        let (items, _) = composite_glyph_items_with_switch(minor, OTHER_HOST_GLYPHSET);
+
+        dispatch_composite_glyphs(&mut state, &mut backend, CLIENT, minor, G1, &items);
+
+        assert_eq!(
+            drain_error_details(&mut peer),
+            vec![(
+                crate::nested::RENDER_BAD_GLYPHSET_ERROR,
+                OTHER_HOST_GLYPHSET,
+                u16::from(minor),
+                133,
+            )],
+            "minor {minor} must report the invalid client glyphset XID",
+        );
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .all(|call| !matches!(call, RecordedCall::RenderCompositeGlyphs { .. })),
+            "minor {minor} must reject the entire request before forwarding",
+        );
+    }
+}
+
+#[test]
+fn composite_glyphs_bad_switch_after_good_glyphs_draws_nothing() {
+    // Mutation: validate the switch only after forwarding the preceding glyph run.
+    const CLIENT: u32 = 7;
+    const G1: u32 = 0x0020_0030;
+    const BAD_GLYPHSET: u32 = 0xDEAD_BEEF;
+    const HOST_G1: u32 = 0xAA03;
+    let (mut state, mut backend) = render_damage_fixture(Vec::new());
+    let mut peer = install_client(&mut state, CLIENT);
+    state.resources.create_glyphset(
+        ResourceId(G1),
+        crate::resources::GlyphSetState {
+            client: ClientId(CLIENT),
+            host_glyphset_xid: crate::backend::GlyphSetHandle::from_raw_for_test(HOST_G1),
+        },
+    );
+    backend.calls.lock().unwrap().clear();
+
+    let mut items = vec![1, 0, 0, 0, 0, 0, 0, 0, 0x10, 0, 0, 0];
+    items.extend_from_slice(&yserver_protocol::x11::render_composite_glyphset_switch(
+        BAD_GLYPHSET,
+    ));
+    items.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0, 0x20, 0, 0, 0]);
 
     dispatch_composite_glyphs(&mut state, &mut backend, CLIENT, 23, G1, &items);
 
-    let call = backend.calls().into_iter().find_map(|call| match call {
-        RecordedCall::RenderCompositeGlyphs { items, .. } => Some(items),
-        _ => None,
-    });
-    let forwarded_items = call.expect("backend composite glyph call");
     assert_eq!(
-        u32::from_le_bytes(
-            forwarded_items[switch_offset + 4..switch_offset + 8]
-                .try_into()
-                .unwrap()
-        ),
-        0,
-        "a backend handle that is not a client glyphset XID must be ignored",
+        drain_error_details(&mut peer),
+        vec![(
+            crate::nested::RENDER_BAD_GLYPHSET_ERROR,
+            BAD_GLYPHSET,
+            23,
+            133,
+        )],
     );
+    assert!(
+        backend
+            .calls()
+            .iter()
+            .all(|call| !matches!(call, RecordedCall::RenderCompositeGlyphs { .. })),
+        "a later bad switch rejects earlier glyphs too",
+    );
+}
+
+#[test]
+fn composite_glyphs_switch_at_stream_end_is_not_checked() {
+    // Mutation: use `<=` for Xorg's strict switch lookup boundary.
+    const CLIENT: u32 = 7;
+    const G1: u32 = 0x0020_0030;
+    const FINAL_UNKNOWN_GLYPHSET: u32 = 0xDEAD_BEEF;
+    const HOST_G1: u32 = 0xAA03;
+    let (mut state, mut backend) = render_damage_fixture(Vec::new());
+    let mut peer = install_client(&mut state, CLIENT);
+    state.resources.create_glyphset(
+        ResourceId(G1),
+        crate::resources::GlyphSetState {
+            client: ClientId(CLIENT),
+            host_glyphset_xid: crate::backend::GlyphSetHandle::from_raw_for_test(HOST_G1),
+        },
+    );
+    backend.calls.lock().unwrap().clear();
+    let items = yserver_protocol::x11::render_composite_glyphset_switch(FINAL_UNKNOWN_GLYPHSET);
+
+    dispatch_composite_glyphs(&mut state, &mut backend, CLIENT, 23, G1, &items);
+
+    assert!(drain_error_details(&mut peer).is_empty());
+    assert!(backend.calls().iter().any(|call| matches!(
+        call,
+        RecordedCall::RenderCompositeGlyphs { items: forwarded, .. }
+            if forwarded == &items
+    )));
 }
 
 #[test]

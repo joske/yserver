@@ -2377,9 +2377,9 @@ fn patch_glyph_command_offsets(items: &mut [u8], x_off: i16, y_off: i16, id_size
     while pos + 8 <= items.len() {
         let count = items[pos];
         if count == 255 {
-            // Glyphset-switch sentinel: 8 bytes total (count, pad×3, glyphset
-            // XID), no payload follows.
-            pos += 8;
+            // Glyphset switch: the 8-byte xGlyphElt header is followed by
+            // its 4-byte XID.
+            pos += 12;
             continue;
         }
         let dx = i16::from_le_bytes([items[pos + 4], items[pos + 5]]).wrapping_add(x_off);
@@ -2578,8 +2578,7 @@ mod tests {
         // host's destination origin.
         let mut items = Vec::new();
         items.extend_from_slice(&glyphcmd(1, 10, 20)); // run 1
-        items.extend_from_slice(&glyphcmd(255, 0, 0)); // glyphset switch
-        items.extend_from_slice(&[0u8; 4]); // 8-byte alignment for the 255 cmd
+        items.extend_from_slice(&yserver_protocol::x11::render_composite_glyphset_switch(0)); // glyphset switch
         items.extend_from_slice(&glyphcmd(2, 30, 40)); // run 2
 
         super::patch_glyph_command_offsets(&mut items, 5, -3, 1);

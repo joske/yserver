@@ -81,7 +81,8 @@ pub(super) fn handle_render_request(
 ) -> io::Result<RequestOutcome> {
     use crate::{
         nested::{
-            ChangePictureAttr, change_picture_translate_xids, composite_glyphs_translate_glyphsets,
+            ChangePictureAttr, change_picture_translate_xids, composite_glyphs_bad_glyphset,
+            composite_glyphs_translate_glyphsets,
         },
         resources::{ARGB_VISUAL, GlyphSetState, PictureState},
     };
@@ -569,9 +570,6 @@ pub(super) fn handle_render_request(
                     header.opcode,
                 );
             }
-            if dst_picture_window_unviewable(state, req.dst) {
-                return Ok(RequestOutcome::Handled);
-            }
             let host_src = state
                 .resources
                 .picture(req.src)
@@ -599,6 +597,25 @@ pub(super) fn handle_render_request(
                     req.glyphset.0,
                     if host_gs.is_none() { " MISSING" } else { "" },
                 );
+            }
+            let bad_glyphset = host_gs.and_then(|_| {
+                composite_glyphs_bad_glyphset(minor, &req.items, |xid| {
+                    state.resources.glyphset(ResourceId(xid)).is_some()
+                })
+            });
+            if let Some(bad_glyphset) = bad_glyphset {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    crate::nested::RENDER_BAD_GLYPHSET_ERROR,
+                    bad_glyphset,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
+            if dst_picture_window_unviewable(state, req.dst) {
+                return Ok(RequestOutcome::Handled);
             }
             if let (Some(host_src), Some(host_dst), Some(host_gs)) = (host_src, host_dst, host_gs) {
                 let translated_items =

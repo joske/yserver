@@ -39,6 +39,7 @@ const RANDR_FIRST_ERROR: u8 = 147;
 const RENDER_MAJOR_OPCODE: u8 = 133;
 const RENDER_FIRST_EVENT: u8 = 0;
 pub(crate) const RENDER_FIRST_ERROR: u8 = 152;
+pub(crate) const RENDER_BAD_GLYPHSET_ERROR: u8 = RENDER_FIRST_ERROR + 3;
 
 const GE_MAJOR_OPCODE: u8 = 138;
 
@@ -503,10 +504,9 @@ where
     Some(out)
 }
 
-/// Translate the glyphset XID in each complete inline-switch item in a
-/// `CompositeGlyphs{8,16,32}` stream. An unresolved client XID becomes zero,
-/// which the renderer treats as an ignored switch. Incomplete item tails are
-/// left untouched because the renderer stops before consuming them.
+/// Translate the glyphset XID in each inline-switch item in a
+/// `CompositeGlyphs{8,16,32}` stream. Incomplete item tails are left untouched
+/// because the renderer stops before consuming them.
 pub(crate) fn composite_glyphs_translate_glyphsets<F>(
     minor: u8,
     items: &[u8],
@@ -515,36 +515,80 @@ pub(crate) fn composite_glyphs_translate_glyphsets<F>(
 where
     F: FnMut(u32) -> Option<u32>,
 {
+    let mut out = items.to_vec();
+    composite_glyphs_visit_switches(minor, items, |pos, xid| {
+        if let Some(host_xid) = translate(xid) {
+            out[pos + 8..pos + 12].copy_from_slice(&host_xid.to_le_bytes());
+        }
+        true
+    });
+    out
+}
+
+/// Return the first looked-up switch value that is not a client glyphset.
+pub(crate) fn composite_glyphs_bad_glyphset<F>(
+    minor: u8,
+    items: &[u8],
+    mut is_glyphset: F,
+) -> Option<u32>
+where
+    F: FnMut(u32) -> bool,
+{
+    let mut bad = None;
+    composite_glyphs_visit_switches(minor, items, |_, xid| {
+        if is_glyphset(xid) {
+            true
+        } else {
+            bad = Some(xid);
+            false
+        }
+    });
+    bad
+}
+
+fn composite_glyphs_visit_switches<F>(minor: u8, items: &[u8], mut visit: F)
+where
+    F: FnMut(usize, u32) -> bool,
+{
     let id_size = match minor {
         23 => 1,
         24 => 2,
         25 => 4,
-        _ => return items.to_vec(),
+        _ => return,
     };
-    let mut out = items.to_vec();
     let mut pos = 0usize;
-    while pos + 8 <= out.len() {
-        let count = out[pos];
+    while pos + 8 <= items.len() {
+        let count = items[pos];
         if count == u8::MAX {
-            let xid = u32::from_le_bytes([out[pos + 4], out[pos + 5], out[pos + 6], out[pos + 7]]);
-            let host_xid = if xid == 0 {
-                0
-            } else {
-                translate(xid).unwrap_or(0)
-            };
-            out[pos + 4..pos + 8].copy_from_slice(&host_xid.to_le_bytes());
-            pos += 8;
+            let switch_end = pos + 12;
+            if switch_end > items.len() {
+                break;
+            }
+
+            // Mirrors Xorg render/render.c:1152: after the 8-byte header,
+            // it looks up the XID only when buffer + sizeof(GlyphSet) < end.
+            // Thus an XID ending exactly at the stream end is not checked.
+            if switch_end < items.len() {
+                let xid = u32::from_le_bytes(
+                    items[pos + 8..switch_end]
+                        .try_into()
+                        .expect("glyphset XID is four bytes"),
+                );
+                if !visit(pos, xid) {
+                    return;
+                }
+            }
+            pos = switch_end;
             continue;
         }
 
         let payload_bytes = usize::from(count) * id_size;
         let padded_payload_bytes = (payload_bytes + 3) & !3;
-        if pos + 8 + padded_payload_bytes > out.len() {
+        if pos + 8 + padded_payload_bytes > items.len() {
             break;
         }
         pos += 8 + padded_payload_bytes;
     }
-    out
 }
 
 pub(crate) fn normalize_region_rects(
