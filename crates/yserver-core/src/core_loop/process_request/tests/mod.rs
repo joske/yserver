@@ -1,3 +1,4 @@
+mod access_cursors;
 mod access_grabs;
 mod access_properties;
 mod access_render;

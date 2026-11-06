@@ -39,7 +39,12 @@ struct PictureRequestCase {
 }
 
 fn render_target(id: ResourceId, kind: ResourceKind, creation: Option<Creation>) -> ResourceTarget {
-    ResourceTarget { id, kind, creation }
+    ResourceTarget {
+        owner: None,
+        id,
+        kind,
+        creation,
+    }
 }
 
 fn existing(id: ResourceId, kind: ResourceKind, mode: AccessMode) -> ExpectedCheck {

@@ -175,6 +175,7 @@ pub(super) fn handle_render_request(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: $id,
                     kind: $kind,
                     creation: Some(Creation {

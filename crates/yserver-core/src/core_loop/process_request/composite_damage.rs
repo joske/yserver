@@ -65,6 +65,7 @@ pub(super) fn handle_composite_request(
                     state,
                     client_id,
                     ResourceTarget {
+                        owner: None,
                         id: ResourceId($id),
                         kind: ResourceKind::Region,
                         creation: Some(Creation {

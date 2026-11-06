@@ -123,6 +123,7 @@ pub(super) fn handle_set_input_focus(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: window,
                     kind: ResourceKind::Window,
                     creation: None,
@@ -408,6 +409,7 @@ pub(super) fn handle_query_pointer(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: queried_window,
                 kind: ResourceKind::Window,
                 creation: None,
@@ -520,6 +522,7 @@ pub(super) fn handle_warp_pointer(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: window,
                     kind: ResourceKind::Window,
                     creation: None,

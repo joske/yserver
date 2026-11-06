@@ -584,6 +584,7 @@ pub(super) fn handle_grab_pointer(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: confine_to,
                     kind: ResourceKind::Window,
                     creation: None,
@@ -638,6 +639,7 @@ pub(super) fn handle_grab_pointer(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: grab_window,
                 kind: ResourceKind::Window,
                 creation: None,
@@ -662,6 +664,7 @@ pub(super) fn handle_grab_pointer(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: cursor,
                     kind: ResourceKind::Cursor,
                     creation: None,
@@ -1096,6 +1099,7 @@ pub(super) fn handle_grab_button(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: grab_window,
                 kind: ResourceKind::Window,
                 creation: None,
@@ -1120,6 +1124,7 @@ pub(super) fn handle_grab_button(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: confine_to,
                     kind: ResourceKind::Window,
                     creation: None,
@@ -1145,6 +1150,7 @@ pub(super) fn handle_grab_button(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: cursor,
                     kind: ResourceKind::Cursor,
                     creation: None,
@@ -1237,6 +1243,7 @@ pub(super) fn handle_ungrab_button(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: grab_window,
                 kind: ResourceKind::Window,
                 creation: None,
@@ -1299,6 +1306,7 @@ pub(super) fn handle_change_active_pointer_grab(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: cursor,
                     kind: ResourceKind::Cursor,
                     creation: None,
@@ -1390,6 +1398,7 @@ pub(super) fn handle_grab_keyboard(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: grab_window,
                 kind: ResourceKind::Window,
                 creation: None,
@@ -1697,6 +1706,7 @@ pub(super) fn handle_grab_key(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: grab_window,
                 kind: ResourceKind::Window,
                 creation: None,
@@ -1773,6 +1783,7 @@ pub(super) fn handle_ungrab_key(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: grab_window,
                 kind: ResourceKind::Window,
                 creation: None,

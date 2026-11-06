@@ -596,6 +596,7 @@ pub(super) fn handle_kill_client(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id,
                     kind,
                     creation: None,
@@ -660,6 +661,7 @@ pub(super) fn handle_get_motion_events(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: window,
             kind: ResourceKind::Window,
             creation: None,

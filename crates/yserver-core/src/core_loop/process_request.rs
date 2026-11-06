@@ -1181,6 +1181,7 @@ fn validate_drawable_and_gc(
             state,
             client,
             ResourceTarget {
+                owner: None,
                 id: drawable,
                 kind: drawable_kind,
                 creation: None,
@@ -1197,6 +1198,7 @@ fn validate_drawable_and_gc(
             state,
             client,
             ResourceTarget {
+                owner: None,
                 id: gc,
                 kind: ResourceKind::Gc,
                 creation: None,
@@ -1239,6 +1241,7 @@ fn validate_drawable_only(
         state,
         client,
         ResourceTarget {
+            owner: None,
             id: drawable,
             kind,
             creation: None,
@@ -1265,6 +1268,7 @@ fn validate_gc_only(
                 state,
                 client,
                 ResourceTarget {
+                    owner: None,
                     id: gc,
                     kind: ResourceKind::Gc,
                     creation: None,
@@ -1313,6 +1317,7 @@ pub(super) fn validate_resource_if_present(
         state,
         client,
         ResourceTarget {
+            owner: None,
             id,
             kind,
             creation: None,

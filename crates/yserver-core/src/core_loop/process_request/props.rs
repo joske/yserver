@@ -879,6 +879,7 @@ pub(super) fn handle_list_properties(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: window,
                     kind: ResourceKind::Window,
                     creation: None,
@@ -1022,6 +1023,7 @@ pub(super) fn handle_change_property(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: req.window,
             kind: ResourceKind::Window,
             creation: None,
@@ -1253,6 +1255,7 @@ pub(super) fn handle_get_property(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: req.window,
             kind: ResourceKind::Window,
             creation: None,
@@ -1401,6 +1404,7 @@ pub(super) fn handle_delete_property(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: req.window,
             kind: ResourceKind::Window,
             creation: None,
@@ -1482,6 +1486,7 @@ pub(super) fn handle_rotate_properties(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: req.window,
             kind: ResourceKind::Window,
             creation: None,
