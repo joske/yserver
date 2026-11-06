@@ -1,3 +1,4 @@
+mod access_composite_damage;
 mod access_cursors;
 mod access_grabs;
 mod access_properties;
