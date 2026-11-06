@@ -189,6 +189,7 @@ fn resource_call(opcode: u8, mode: AccessMode) -> AccessCall {
             minor: 0,
         }),
         target: ResourceTarget {
+            owner: None,
             id: WINDOW,
             kind: ResourceKind::Window,
             creation: None,

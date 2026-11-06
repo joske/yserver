@@ -24,6 +24,7 @@ fn ask_owner(
         state.check_resource(
             CLIENT,
             &ResourceTarget {
+                owner: None,
                 id,
                 kind,
                 creation: None,
@@ -602,6 +603,7 @@ fn server_owner_is_never_checked() {
         state.check_resource(
             server,
             &ResourceTarget {
+                owner: None,
                 id: ROOT_WINDOW,
                 kind: ResourceKind::Window,
                 creation: None,
@@ -633,6 +635,7 @@ fn empty_policy_list_checks_allow() {
         state.check_resource(
             CLIENT,
             &ResourceTarget {
+                owner: None,
                 id: ResourceId(0x0060_0001),
                 kind: ResourceKind::Pixmap,
                 creation: None,
@@ -678,6 +681,7 @@ impl AccessPolicy for DrawingResourcePolicy {
             peer: None,
             admission: None,
             owner: ctx.owner(target.id, target.kind),
+            target_owner: ctx.target_owner(target),
             target: Some(*target),
             property: None,
             mode: Some(mode),
@@ -1618,6 +1622,7 @@ impl AccessPolicy for RevocableDrawingPolicy {
             peer: None,
             admission: None,
             owner: ctx.owner(target.id, target.kind),
+            target_owner: ctx.target_owner(target),
             target: Some(*target),
             property: None,
             mode: Some(mode),
@@ -1724,6 +1729,7 @@ impl AccessPolicy for WindowResourcePolicy {
             peer: None,
             admission: None,
             owner: ctx.owner(target.id, target.kind),
+            target_owner: ctx.target_owner(target),
             target: Some(*target),
             property: None,
             mode: Some(mode),
@@ -2259,6 +2265,7 @@ fn window_resource_request_denials_match_modes_and_stop_before_effects() {
         assert_eq!(
             call.target,
             Some(ResourceTarget {
+                owner: None,
                 id: case.target,
                 kind: case.kind,
                 creation: case.creation,
@@ -2311,6 +2318,7 @@ struct ColormapAccessCase {
 
 fn colormap_target(id: ResourceId, creation: Option<Creation>) -> ResourceTarget {
     ResourceTarget {
+        owner: None,
         id,
         kind: ResourceKind::Colormap,
         creation,
@@ -2319,6 +2327,7 @@ fn colormap_target(id: ResourceId, creation: Option<Creation>) -> ResourceTarget
 
 fn colormap_access_cases() -> Vec<ColormapAccessCase> {
     let window = ResourceTarget {
+        owner: None,
         id: ROOT_WINDOW,
         kind: ResourceKind::Window,
         creation: None,
@@ -5451,7 +5460,12 @@ fn gc_pixmap_cursor_font_requests_ask_expected_targets() {
             };
             expected.push((
                 CLIENT,
-                ResourceTarget { id, kind, creation },
+                ResourceTarget {
+                    owner: None,
+                    id,
+                    kind,
+                    creation,
+                },
                 mode,
                 Some(RequestOpcodes {
                     major: case.opcode,

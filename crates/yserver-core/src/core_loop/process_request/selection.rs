@@ -85,6 +85,7 @@ pub(super) fn handle_set_selection_owner(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: window,
                 kind: ResourceKind::Window,
                 creation: None,
@@ -344,6 +345,7 @@ pub(super) fn handle_convert_selection(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: requestor,
             kind: ResourceKind::Window,
             creation: None,

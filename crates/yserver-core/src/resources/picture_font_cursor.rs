@@ -153,13 +153,23 @@ impl ResourceTable {
     }
 
     pub fn set_cursor_host_xid(&mut self, id: ResourceId, handle: crate::backend::CursorHandle) {
-        if let Some(c) = self.cursors.get_mut(&id.0) {
-            c.host_xid = Some(handle);
-        }
+        let Some(cursor) = self.cursors.get_mut(&id.0) else {
+            return;
+        };
+        cursor.host_xid = Some(handle);
+        self.cursor_host_origins
+            .entry(handle.as_raw())
+            .or_insert((id, cursor.owner));
     }
 
     pub fn cursor_host_xid(&self, id: ResourceId) -> Option<u32> {
         self.cursors.get(&id.0)?.host_xid.map(|h| h.as_raw())
+    }
+
+    /// Original client cursor identity for a backend cursor handle.
+    #[must_use]
+    pub fn cursor_host_origin(&self, host: u32) -> Option<(ResourceId, ClientId)> {
+        self.cursor_host_origins.get(&host).copied()
     }
 
     /// True iff `id` is a live cursor in the resource table — the
@@ -276,19 +286,16 @@ impl ResourceTable {
     pub fn free_cursor(&mut self, id: ResourceId) -> Option<u32> {
         let host_xid = self.cursors.get(&id.0).and_then(|c| c.host_xid);
         self.cursors.remove(&id.0);
-        let freed = host_xid
+        host_xid
             .map(|h| h.as_raw())
-            .filter(|host| !self.cursor_host_referenced(*host));
-        if let Some(host) = freed {
-            self.cursor_host_released(host);
-        }
-        freed
+            .filter(|host| !self.cursor_host_referenced(*host))
     }
 
     /// The caller frees host cursor `host` itself: no pending window drop
     /// may free it again.
     pub fn cursor_host_released(&mut self, host: u32) {
         self.dropped_cursor_hosts.retain(|&h| h != host);
+        self.cursor_host_origins.remove(&host);
     }
 
     /// Mark a cursor as animated (RENDER CreateAnimCursor product).

@@ -714,8 +714,8 @@ fn xfixes_replace_cursor(
     state.resources.retarget_cursor_host(old_host, source);
     let _ = backend.replace_cursor(origin, old_host, new_host);
     if !state.resources.cursor_host_referenced(old_host) {
-        state.resources.cursor_host_released(old_host);
         let _ = backend.free_cursor(origin, old_host);
+        state.resources.cursor_host_released(old_host);
     }
 }
 
@@ -886,6 +886,7 @@ pub(super) fn handle_xfixes_request(
                     state,
                     client_id,
                     ResourceTarget {
+                        owner: None,
                         id: ResourceId($id),
                         kind: ResourceKind::Region,
                         creation: Some(Creation {

@@ -282,6 +282,7 @@ fn shape_access_checks_ask_the_expected_targets_modes_and_order() {
             .map(|check| {
                 (
                     ResourceTarget {
+                        owner: None,
                         id: check.id,
                         kind: check.kind,
                         creation: None,
@@ -376,6 +377,7 @@ fn shape_access_denials_stop_before_state_or_backend_effects() {
                 .map(|check| {
                     (
                         crate::access::ResourceTarget {
+                            owner: None,
                             id: check.id,
                             kind: check.kind,
                             creation: None,
@@ -659,6 +661,7 @@ fn xfixes_existing_check(
 ) -> XfixesAccessCheck {
     XfixesAccessCheck {
         target: crate::access::ResourceTarget {
+            owner: None,
             id,
             kind,
             creation: None,
@@ -670,6 +673,7 @@ fn xfixes_existing_check(
 fn xfixes_creation_check(id: ResourceId, parent: Option<ResourceId>) -> XfixesAccessCheck {
     XfixesAccessCheck {
         target: crate::access::ResourceTarget {
+            owner: None,
             id,
             kind: crate::access::ResourceKind::Region,
             creation: Some(crate::access::Creation {

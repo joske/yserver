@@ -23,7 +23,10 @@ pub(super) struct RecordedExtensionCheck {
     pub(super) target: Option<ResourceTarget>,
     pub(super) property: Option<(ResourceId, AtomId)>,
     pub(super) mode: Option<AccessMode>,
+    /// Owner returned by the live-resource resolver.
     pub(super) owner: Option<ClientId>,
+    /// Owner associated with this particular target instance.
+    pub(super) target_owner: Option<ClientId>,
 }
 
 pub(super) struct RecordingExtensionPolicy {
@@ -106,6 +109,7 @@ impl RecordingExtensionPolicy {
             peer: ctx.peer(client).copied(),
             admission: ctx.admission(client).cloned(),
             owner: target.and_then(|target| ctx.owner(target.id, target.kind)),
+            target_owner: target.and_then(|target| ctx.target_owner(&target)),
             target,
             property,
             mode,
@@ -489,6 +493,7 @@ fn extension_access_asks_once_per_available_extension() {
         property: None,
         mode: None,
         owner: None,
+        target_owner: None,
     }];
     expected.extend(advertised.iter().map(|name| RecordedExtensionCheck {
         hook: ExtensionHook::Access,
@@ -504,6 +509,7 @@ fn extension_access_asks_once_per_available_extension() {
         property: None,
         mode: None,
         owner: None,
+        target_owner: None,
     }));
     assert_eq!(*calls.lock().unwrap(), expected);
 }
@@ -731,6 +737,7 @@ fn every_extension_dispatch_denial_answers_bad_request() {
                 property: None,
                 mode: None,
                 owner: None,
+                target_owner: None,
             }],
             "one dispatch check for {}",
             extension.name,
@@ -776,6 +783,7 @@ fn extension_dispatch_preserves_nonzero_minor_in_check_and_error() {
             property: None,
             mode: None,
             owner: None,
+            target_owner: None,
         }],
     );
 }
@@ -898,6 +906,7 @@ fn extension_dispatch_asks_with_client_name_and_opcodes() {
                 property: None,
                 mode: None,
                 owner: None,
+                target_owner: None,
             },
             RecordedExtensionCheck {
                 hook: ExtensionHook::Dispatch,
@@ -913,6 +922,7 @@ fn extension_dispatch_asks_with_client_name_and_opcodes() {
                 property: None,
                 mode: None,
                 owner: None,
+                target_owner: None,
             },
         ]
     );
