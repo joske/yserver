@@ -156,6 +156,53 @@ where
     }
 }
 
+/// The render node of a server with no KMS card: the one
+/// `YSERVER_DRI_RENDER_NODE` names, else the one the selected Vulkan device
+/// advertises through `VK_EXT_physical_device_drm`, else the machine's only
+/// one. `None` (DRI3 stays off) when there is none.
+///
+/// A software Vulkan device (lavapipe) drives no GPU, so it has no render
+/// node of its own and DRI3 stays off unless `YSERVER_DRI_RENDER_NODE` names
+/// one: then the clients' GPU allocates on that node and the server imports
+/// their LINEAR buffers (`VK_EXT_external_memory_dma_buf`). Asked for, never
+/// guessed, because every GL and Vulkan client then renders on that GPU
+/// rather than on the CPU.
+fn headless_render_node(vk: &VkContext) -> Option<crate::kms::render_node::OpenedRenderNode> {
+    if vk.device_type == ash::vk::PhysicalDeviceType::CPU {
+        if !crate::kms::render_node::render_node_named() {
+            return None;
+        }
+        if vk.external_memory_fd.is_none() {
+            log::warn!(
+                "DRI3: the software Vulkan device cannot import dma-bufs \
+                 (VK_KHR_external_memory_fd); DRI3 is off"
+            );
+            return None;
+        }
+    }
+    let advertised = vk
+        .selected_drm_identity
+        .and_then(|identity| identity.render);
+    match crate::kms::render_node::open_headless(advertised) {
+        Ok(Some(node)) => {
+            log::info!(
+                "DRI3 render node ready for the card-less server: path={:?} rdev={}",
+                node.path(),
+                node.key(),
+            );
+            Some(node)
+        }
+        Ok(None) => {
+            log::info!("DRI3: the card-less server has no render node; DRI3 is off");
+            None
+        }
+        Err(error) => {
+            log::warn!("DRI3: render node unavailable for the card-less server: {error}");
+            None
+        }
+    }
+}
+
 /// Whether the node exports a syncobj as an opaque descriptor
 /// (`SYNCOBJ_HANDLE_TO_FD` without the sync-file flag). DRI3 1.4's explicit
 /// sync is built on that: a client exports each image's timeline syncobjs
@@ -444,6 +491,14 @@ impl PlatformBackend {
             vk.driver_id,
             vk.device_type,
         );
+        // A server that owns no card (a rootless host's) still has a GPU
+        // when Vulkan found one: DRI3 needs its render node, which no KMS
+        // card led to.
+        let render_node = match render_node {
+            Some(node) => Some(node),
+            None if devices.is_empty() => headless_render_node(&vk),
+            None => None,
+        };
         let (render_devices, selected_render_device) =
             build_render_device_inventory(&vk, render_node)?;
         let selected_renderer = render_devices
