@@ -33,6 +33,10 @@ fn configure_window_noop_restack_emits_no_configure_notify() {
         None,
         ClientId(1),
         SequenceNumber(1),
+        crate::access::RequestOpcodes {
+            major: 12,
+            minor: 0,
+        },
         &body,
     )
     .expect("handle_configure_window");
@@ -69,6 +73,10 @@ fn configure_window_real_restack_emits_one_configure_notify() {
         None,
         ClientId(1),
         SequenceNumber(1),
+        crate::access::RequestOpcodes {
+            major: 12,
+            minor: 0,
+        },
         &body,
     )
     .expect("handle_configure_window");
@@ -184,6 +192,10 @@ fn resize_and_read(
         None,
         ClientId(1),
         SequenceNumber(1),
+        crate::access::RequestOpcodes {
+            major: 12,
+            minor: 0,
+        },
         &body,
     )
     .expect("handle_configure_window");
@@ -251,6 +263,10 @@ fn configure_window_pure_move_emits_no_expose() {
         None,
         ClientId(1),
         SequenceNumber(1),
+        crate::access::RequestOpcodes {
+            major: 12,
+            minor: 0,
+        },
         &body,
     )
     .expect("handle_configure_window");
@@ -299,8 +315,17 @@ fn translate_coordinates_skips_empty_input_shaped_cow() {
         body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
         body.extend_from_slice(&715i16.to_le_bytes());
         body.extend_from_slice(&327i16.to_le_bytes());
-        handle_translate_coordinates(state, ClientId(1), SequenceNumber(1), &body)
-            .expect("handle_translate_coordinates");
+        handle_translate_coordinates(
+            state,
+            ClientId(1),
+            SequenceNumber(1),
+            crate::access::RequestOpcodes {
+                major: 40,
+                minor: 0,
+            },
+            &body,
+        )
+        .expect("handle_translate_coordinates");
         let bytes = read_all_available(&mut peer);
         assert_eq!(bytes.len(), 32);
         assert_eq!(bytes[0], 1, "reply");
@@ -381,6 +406,10 @@ fn configure_window_resize_applies_win_gravity_and_emits_gravity_notify() {
         None,
         ClientId(1),
         SequenceNumber(1),
+        crate::access::RequestOpcodes {
+            major: 12,
+            minor: 0,
+        },
         &body,
     )
     .expect("handle_configure_window");
@@ -488,6 +517,7 @@ fn map_window_on_already_mapped_window_is_no_op() {
         None,
         ClientId(CLIENT_ID),
         SequenceNumber(1),
+        crate::access::RequestOpcodes { major: 8, minor: 0 },
         &body,
     )
     .expect("handle_map_window first");
@@ -530,6 +560,7 @@ fn map_window_on_already_mapped_window_is_no_op() {
         None,
         ClientId(CLIENT_ID),
         SequenceNumber(2),
+        crate::access::RequestOpcodes { major: 8, minor: 0 },
         &body,
     )
     .expect("handle_map_window second");
@@ -618,6 +649,7 @@ fn map_window_on_root_does_not_emit_phantom_map_request() {
         None,
         ClientId(SAVER_ID),
         SequenceNumber(1),
+        crate::access::RequestOpcodes { major: 8, minor: 0 },
         &body,
     )
     .expect("handle_map_window root");
@@ -711,6 +743,11 @@ fn cwa_cursor_none_propagates_define_cursor_zero_to_backend() {
         None,
         ClientId(CLIENT_ID),
         SequenceNumber(1),
+        RequestHeader {
+            opcode: 2,
+            data: 0,
+            length_units: 4,
+        },
         &body,
     )
     .expect("handle_change_window_attributes");
@@ -804,6 +841,11 @@ fn cursor_only_cwa_does_not_steal_keyboard_focus() {
         None,
         ClientId(CLIENT_ID),
         SequenceNumber(1),
+        RequestHeader {
+            opcode: 2,
+            data: 0,
+            length_units: 4,
+        },
         &body,
     )
     .expect("handle_change_window_attributes");
@@ -890,6 +932,10 @@ fn window_storage_follows_viewability_delta_in_order() {
             None,
             ClientId(1),
             SequenceNumber(1),
+            crate::access::RequestOpcodes {
+                major: 10,
+                minor: 0,
+            },
             &w.0.to_le_bytes(),
         )
         .expect("UnmapWindow");
@@ -901,6 +947,7 @@ fn window_storage_follows_viewability_delta_in_order() {
             None,
             ClientId(1),
             SequenceNumber(2),
+            crate::access::RequestOpcodes { major: 8, minor: 0 },
             &w.0.to_le_bytes(),
         )
         .expect("MapWindow");
@@ -977,6 +1024,7 @@ fn map_subwindows_delta_includes_promoted_grandchildren() {
         None,
         ClientId(1),
         SequenceNumber(1),
+        crate::access::RequestOpcodes { major: 9, minor: 0 },
         &f.0.to_le_bytes(),
     )
     .expect("MapSubwindows");
@@ -1002,6 +1050,7 @@ fn unmap_subwindows_delta_is_union_in_post_order() {
         ClientId(1),
         SequenceNumber(1),
         &f.0.to_le_bytes(),
+        None,
     )
     .expect("UnmapSubwindows");
     assert!(delta.became_viewable.is_empty());
@@ -1023,6 +1072,10 @@ fn query_tree_of_the_root_hides_the_overlay_window() {
         &mut state,
         ClientId(1),
         SequenceNumber(1),
+        crate::access::RequestOpcodes {
+            major: 15,
+            minor: 0,
+        },
         &ROOT_WINDOW.0.to_le_bytes(),
     )
     .expect("QueryTree");
@@ -1054,6 +1107,7 @@ fn unmap_subwindows_of_the_root_leaves_the_overlay_window_mapped() {
         ClientId(1),
         SequenceNumber(1),
         &ROOT_WINDOW.0.to_le_bytes(),
+        None,
     )
     .expect("UnmapSubwindows");
     assert_eq!(delta.became_unviewable, vec![child]);
@@ -1093,6 +1147,7 @@ fn map_and_unmap_under_unmapped_parent_still_send_notify() {
         None,
         ClientId(1),
         SequenceNumber(1),
+        crate::access::RequestOpcodes { major: 8, minor: 0 },
         &a1.0.to_le_bytes(),
     )
     .expect("MapWindow");
@@ -1109,6 +1164,10 @@ fn map_and_unmap_under_unmapped_parent_still_send_notify() {
         None,
         ClientId(1),
         SequenceNumber(2),
+        crate::access::RequestOpcodes {
+            major: 10,
+            minor: 0,
+        },
         &a1.0.to_le_bytes(),
     )
     .expect("UnmapWindow");
@@ -1229,6 +1288,7 @@ fn map_subwindows_exposes_grandchild_promoted_by_viewability_cascade() {
         None,
         ClientId(CLIENT_ID),
         SequenceNumber(1),
+        crate::access::RequestOpcodes { major: 9, minor: 0 },
         &body,
     )
     .expect("handle_map_subwindows");
@@ -1351,6 +1411,7 @@ fn map_window_emits_map_notify_before_damage_notify() {
         None,
         ClientId(CLIENT_ID),
         SequenceNumber(1),
+        crate::access::RequestOpcodes { major: 8, minor: 0 },
         &body,
     )
     .expect("handle_map_window");
@@ -1450,6 +1511,7 @@ fn map_window_emits_visibility_notify_unobscured() {
         None,
         ClientId(CLIENT_ID),
         SequenceNumber(1),
+        crate::access::RequestOpcodes { major: 8, minor: 0 },
         &body,
     )
     .expect("handle_map_window");
@@ -3019,6 +3081,7 @@ fn map_redirected_frame_events(background_pixel: bool) -> (Vec<String>, Vec<Stri
         None,
         ClientId(APP),
         SequenceNumber(2),
+        crate::access::RequestOpcodes { major: 8, minor: 0 },
         &W.to_le_bytes(),
     )
     .expect("handle_map_window");
@@ -3197,6 +3260,7 @@ fn reparent_of_a_mapped_window_unmaps_it_on_the_backend_before_the_exposure_pain
         None,
         ClientId(1),
         SequenceNumber(1),
+        crate::access::RequestOpcodes { major: 7, minor: 0 },
         &body,
     )
     .expect("ReparentWindow");
@@ -3285,6 +3349,10 @@ fn a_parent_resize_unmaps_an_unmap_gravity_child() {
             None,
             ClientId(1),
             SequenceNumber(1),
+            crate::access::RequestOpcodes {
+                major: 12,
+                minor: 0,
+            },
             &cw_restack_body(w.0, mask, values),
         )
         .expect("ConfigureWindow");
@@ -3387,6 +3455,11 @@ fn destroy_window_on_root_is_a_no_op() {
         None,
         ClientId(CLIENT_ID),
         SequenceNumber(1),
+        RequestHeader {
+            opcode: 4,
+            data: 0,
+            length_units: 2,
+        },
         &ROOT_WINDOW.0.to_le_bytes(),
     )
     .expect("handle_destroy_window");
@@ -3640,6 +3713,10 @@ fn set_order_selection(state: &mut ServerState, obs: &mut UnixStream, client: u3
         state,
         ClientId(client),
         SequenceNumber(1),
+        crate::access::RequestOpcodes {
+            major: 22,
+            minor: 0,
+        },
         &body,
     )
     .expect("handle_set_selection_owner");
@@ -3721,6 +3798,11 @@ fn destroy_t_and_read_order_stream(state: &mut ServerState, obs: &mut UnixStream
         None,
         ClientId(1),
         SequenceNumber(1),
+        RequestHeader {
+            opcode: 4,
+            data: 0,
+            length_units: 2,
+        },
         &ORDER_T.to_le_bytes(),
     )
     .expect("handle_destroy_window");
@@ -3804,6 +3886,11 @@ fn destroy_window_drops_passive_grabs_and_a_recycled_id_does_not_match_them() {
         None,
         ClientId(1),
         SequenceNumber(1),
+        RequestHeader {
+            opcode: 4,
+            data: 0,
+            length_units: 2,
+        },
         &WIN.to_le_bytes(),
     )
     .expect("handle_destroy_window");
@@ -3991,6 +4078,11 @@ fn disconnect_of_the_selection_setter_sends_client_close_for_a_window_it_does_no
         None,
         ClientId(ORDER_APP),
         SequenceNumber(2),
+        RequestHeader {
+            opcode: 4,
+            data: 0,
+            length_units: 2,
+        },
         &ORDER_T.to_le_bytes(),
     )
     .expect("handle_destroy_window");
@@ -4095,6 +4187,10 @@ fn selection_request_and_clear_go_to_the_setting_client() {
         &mut state,
         ClientId(ORDER_OBS),
         SequenceNumber(2),
+        crate::access::RequestOpcodes {
+            major: 24,
+            minor: 0,
+        },
         &body,
     )
     .expect("handle_convert_selection");
@@ -4113,6 +4209,10 @@ fn selection_request_and_clear_go_to_the_setting_client() {
         &mut state,
         ClientId(ORDER_OBS),
         SequenceNumber(3),
+        crate::access::RequestOpcodes {
+            major: 22,
+            minor: 0,
+        },
         &body,
     )
     .expect("handle_set_selection_owner");
@@ -4162,6 +4262,10 @@ fn selection_clear_is_gated_on_the_setting_client_not_the_window_owner() {
             state,
             ClientId(client),
             SequenceNumber(2),
+            crate::access::RequestOpcodes {
+                major: 22,
+                minor: 0,
+            },
             &body,
         )
         .expect("handle_set_selection_owner");

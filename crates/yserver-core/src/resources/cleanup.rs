@@ -243,4 +243,42 @@ impl ResourceTable {
         }
         None
     }
+
+    /// Resolve the owner of an access-control resource without changing
+    /// `resource_owner`, whose narrower lookup preserves KillClient behavior.
+    #[must_use]
+    pub(crate) fn access_owner(
+        &self,
+        id: ResourceId,
+        kind: crate::access::ResourceKind,
+    ) -> Option<ClientId> {
+        use crate::access::ResourceKind;
+
+        match kind {
+            ResourceKind::Window => self.window_owner(id),
+            ResourceKind::Pixmap => self.pixmap(id).map(|pixmap| pixmap.owner),
+            ResourceKind::Gc => self.gc(id).map(|gc| gc.owner),
+            ResourceKind::Font => self.font(id).map(|font| font.owner),
+            ResourceKind::Cursor => self.cursors.get(&id.0).map(|cursor| cursor.owner),
+            ResourceKind::Colormap => self.colormap(id).map(|colormap| colormap.owner),
+            ResourceKind::Picture => self.pictures.get(&id.0).map(|picture| picture.client),
+            ResourceKind::GlyphSet => self.glyphsets.get(&id.0).map(|glyphset| glyphset.client),
+            ResourceKind::Dri3Syncobj => self.dri3_syncobj_owner(id),
+            ResourceKind::Region
+            | ResourceKind::PointerBarrier
+            | ResourceKind::SyncCounter
+            | ResourceKind::SyncAlarm
+            | ResourceKind::SyncFence
+            | ResourceKind::Damage
+            | ResourceKind::PresentEventSelection
+            | ResourceKind::ShmSegment
+            | ResourceKind::GlxContext
+            | ResourceKind::GlxDrawable
+            | ResourceKind::RecordContext
+            | ResourceKind::RandrOutput
+            | ResourceKind::RandrCrtc
+            | ResourceKind::RandrMode
+            | ResourceKind::RandrProvider => None,
+        }
+    }
 }

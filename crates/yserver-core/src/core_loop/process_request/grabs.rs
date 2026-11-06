@@ -1,4 +1,5 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind, ResourceTarget},
     backend::Backend,
     core_loop::{
         fanout::{emit_window_event_to_state, fanout_event_to_clients},
@@ -578,6 +579,21 @@ pub(super) fn handle_grab_pointer(
                 26,
             );
         }
+        if confine_to.0 != 0
+            && let Err((code, bad_value)) = super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: confine_to,
+                    kind: ResourceKind::Window,
+                    creation: None,
+                },
+                AccessMode::SET_ATTR,
+                RequestOpcodes::for_request(header),
+            )
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 26);
+        }
         if body[7] > 1 {
             return emit_x11_error(
                 state,
@@ -618,6 +634,19 @@ pub(super) fn handle_grab_pointer(
                 26,
             );
         }
+        if let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: grab_window,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            AccessMode::SET_ATTR,
+            RequestOpcodes::for_request(header),
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 26);
+        }
         if cursor.0 != 0 && !state.resources.cursor_exists(cursor) {
             return emit_x11_error(
                 state,
@@ -627,6 +656,21 @@ pub(super) fn handle_grab_pointer(
                 cursor.0,
                 26,
             );
+        }
+        if cursor.0 != 0
+            && let Err((code, bad_value)) = super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: cursor,
+                    kind: ResourceKind::Cursor,
+                    creation: None,
+                },
+                AccessMode::USE,
+                RequestOpcodes::for_request(header),
+            )
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 26);
         }
         // Grab status, in Xorg GrabDevice's check order (X.h values:
         // GrabSuccess 0, AlreadyGrabbed 1, GrabInvalidTime 2,
@@ -1048,6 +1092,19 @@ pub(super) fn handle_grab_button(
                 28,
             );
         }
+        if let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: grab_window,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            AccessMode::SET_ATTR,
+            RequestOpcodes::for_request(header),
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 28);
+        }
         if confine_to.0 != 0 && state.resources.window(confine_to).is_none() {
             return emit_x11_error(
                 state,
@@ -1058,6 +1115,21 @@ pub(super) fn handle_grab_button(
                 28,
             );
         }
+        if confine_to.0 != 0
+            && let Err((code, bad_value)) = super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: confine_to,
+                    kind: ResourceKind::Window,
+                    creation: None,
+                },
+                AccessMode::SET_ATTR,
+                RequestOpcodes::for_request(header),
+            )
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 28);
+        }
         if cursor.0 != 0 && !state.resources.cursor_exists(cursor) {
             return emit_x11_error(
                 state,
@@ -1067,6 +1139,21 @@ pub(super) fn handle_grab_button(
                 cursor.0,
                 28,
             );
+        }
+        if cursor.0 != 0
+            && let Err((code, bad_value)) = super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: cursor,
+                    kind: ResourceKind::Cursor,
+                    creation: None,
+                },
+                AccessMode::USE,
+                RequestOpcodes::for_request(header),
+            )
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 28);
         }
         // A passive grab that would override another client's grab on
         // the same window is a BadAccess (Xorg GrabMatchesSecond via
@@ -1146,6 +1233,19 @@ pub(super) fn handle_ungrab_button(
                 29,
             );
         }
+        if let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: grab_window,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            AccessMode::READ,
+            RequestOpcodes::for_request(header),
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 29);
+        }
         state.button_grabs.retain(|g| {
             !(g.owner == client_id
                 && g.grab_window == grab_window
@@ -1165,6 +1265,7 @@ pub(super) fn handle_change_active_pointer_grab(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() >= 12 {
@@ -1192,6 +1293,21 @@ pub(super) fn handle_change_active_pointer_grab(
                 cursor.0,
                 30,
             );
+        }
+        if cursor.0 != 0
+            && let Err((code, bad_value)) = super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: cursor,
+                    kind: ResourceKind::Cursor,
+                    creation: None,
+                },
+                AccessMode::USE,
+                access_request,
+            )
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 30);
         }
         // Xorg ProcChangeActivePointerGrab: no-op when the request
         // time is LATER than current or EARLIER than the grab time.
@@ -1269,6 +1385,19 @@ pub(super) fn handle_grab_keyboard(
                 grab_window.0,
                 31,
             );
+        }
+        if let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: grab_window,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            AccessMode::SET_ATTR,
+            RequestOpcodes::for_request(header),
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 31);
         }
         // Grab status, mirroring handle_grab_pointer (Xorg GrabDevice
         // check order). Failure leaves all grab state untouched.
@@ -1564,6 +1693,19 @@ pub(super) fn handle_grab_key(
                 33,
             );
         }
+        if let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: grab_window,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            AccessMode::SET_ATTR,
+            RequestOpcodes::for_request(header),
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 33);
+        }
         // BadAccess when another client already holds an overlapping
         // passive key grab on this window — see the GrabButton
         // conflict check for the overlap rule.
@@ -1626,6 +1768,19 @@ pub(super) fn handle_ungrab_key(
                 grab_window.0,
                 34,
             );
+        }
+        if let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: grab_window,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            AccessMode::GET_ATTR,
+            RequestOpcodes::for_request(header),
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 34);
         }
         if req.keycode != 0 && req.keycode < 8 {
             return emit_x11_error(

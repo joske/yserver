@@ -1,4 +1,5 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind, ResourceTarget},
     backend::{Backend, OriginContext},
     core_loop::{
         fanout::{emit_window_event_to_state, emit_xi2_focus_event_to_state},
@@ -116,6 +117,21 @@ pub(super) fn handle_set_input_focus(
         }
         if let Some((code, value)) = core_focus_window_error(state, window) {
             return emit_x11_error(state, client_id, sequence, code, value, 42);
+        }
+        if window.0 > 1
+            && let Err((code, bad_value)) = super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: window,
+                    kind: ResourceKind::Window,
+                    creation: None,
+                },
+                AccessMode::SET_ATTR,
+                RequestOpcodes::for_request(header),
+            )
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 42);
         }
         let time = body
             .get(4..8)
@@ -379,6 +395,7 @@ pub(super) fn handle_query_pointer(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let queried_window = if body.len() >= 4 {
@@ -386,6 +403,21 @@ pub(super) fn handle_query_pointer(
     } else {
         ROOT_WINDOW
     };
+    if state.resources.window(queried_window).is_some()
+        && let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: queried_window,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            AccessMode::GET_ATTR,
+            access_request,
+        )
+    {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 38);
+    }
     let pointer = backend.query_pointer(origin).ok().filter(|p| p.same_screen);
     let reply_data = if let Some(pointer) = pointer {
         // The KMS backend's PointerPosition carries cursor coordinates
@@ -454,6 +486,7 @@ pub(super) fn handle_warp_pointer(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() >= 20 {
@@ -469,8 +502,33 @@ pub(super) fn handle_warp_pointer(
             dst_x: i32::from(rd16(16)),
             dst_y: i32::from(rd16(18)),
         };
-        if let Some(bad) = warp_pointer_bad_window(state, &req) {
-            return emit_x11_error(state, client_id, sequence, x11::error::BAD_WINDOW, bad, 41);
+        for window in [req.dst, req.src] {
+            if window.0 == 0 {
+                continue;
+            }
+            if state.resources.window(window).is_none() {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_WINDOW,
+                    window.0,
+                    41,
+                );
+            }
+            if let Err((code, bad_value)) = super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: window,
+                    kind: ResourceKind::Window,
+                    creation: None,
+                },
+                AccessMode::GET_ATTR,
+                access_request,
+            ) {
+                return emit_x11_error(state, client_id, sequence, code, bad_value, 41);
+            }
         }
         if !warp_pointer_src_allows(state, &req, WarpSrcRule::Core) {
             debug!(

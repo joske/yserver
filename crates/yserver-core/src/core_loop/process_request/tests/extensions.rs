@@ -1,26 +1,34 @@
 use super::*;
-use crate::access::{AccessContext, AccessPolicy, Decision, DenyError, RequestOpcodes};
+use crate::access::{
+    AccessContext, AccessMode, AccessPolicy, Decision, DenyError, RequestOpcodes, ResourceTarget,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum ExtensionHook {
+pub(super) enum ExtensionHook {
     Access,
     Dispatch,
+    Resource,
+    Property,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RecordedExtensionCheck {
-    hook: ExtensionHook,
-    client: ClientId,
-    extension: String,
-    request: Option<RequestOpcodes>,
-    peer: Option<crate::peer::PeerIdentity>,
-    admission: Option<crate::access::Admission>,
+pub(super) struct RecordedExtensionCheck {
+    pub(super) hook: ExtensionHook,
+    pub(super) client: ClientId,
+    pub(super) extension: String,
+    pub(super) request: Option<RequestOpcodes>,
+    pub(super) peer: Option<crate::peer::PeerIdentity>,
+    pub(super) admission: Option<crate::access::Admission>,
+    pub(super) target: Option<ResourceTarget>,
+    pub(super) property: Option<(ResourceId, AtomId)>,
+    pub(super) mode: Option<AccessMode>,
+    pub(super) owner: Option<ClientId>,
 }
 
-struct RecordingExtensionPolicy {
-    decision: Decision,
-    calls: Arc<Mutex<Vec<RecordedExtensionCheck>>>,
+pub(super) struct RecordingExtensionPolicy {
+    pub(super) decision: Decision,
+    pub(super) calls: Arc<Mutex<Vec<RecordedExtensionCheck>>>,
 }
 
 impl RecordingExtensionPolicy {
@@ -30,6 +38,9 @@ impl RecordingExtensionPolicy {
         ctx: &AccessContext<'_>,
         client: ClientId,
         extension: &str,
+        target: Option<ResourceTarget>,
+        property: Option<(ResourceId, AtomId)>,
+        mode: Option<AccessMode>,
     ) -> Decision {
         self.calls.lock().unwrap().push(RecordedExtensionCheck {
             hook,
@@ -38,6 +49,10 @@ impl RecordingExtensionPolicy {
             request: ctx.request(),
             peer: ctx.peer(client).copied(),
             admission: ctx.admission(client).cloned(),
+            owner: target.and_then(|target| ctx.owner(target.id, target.kind)),
+            target,
+            property,
+            mode,
         });
         self.decision
     }
@@ -50,7 +65,15 @@ impl AccessPolicy for RecordingExtensionPolicy {
         client: ClientId,
         extension: &str,
     ) -> Decision {
-        self.check(ExtensionHook::Access, ctx, client, extension)
+        self.check(
+            ExtensionHook::Access,
+            ctx,
+            client,
+            extension,
+            None,
+            None,
+            None,
+        )
     }
 
     fn extension_dispatch(
@@ -59,7 +82,52 @@ impl AccessPolicy for RecordingExtensionPolicy {
         client: ClientId,
         extension: &str,
     ) -> Decision {
-        self.check(ExtensionHook::Dispatch, ctx, client, extension)
+        self.check(
+            ExtensionHook::Dispatch,
+            ctx,
+            client,
+            extension,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn resource(
+        &self,
+        ctx: &AccessContext<'_>,
+        client: ClientId,
+        target: &ResourceTarget,
+        mode: AccessMode,
+    ) -> Decision {
+        self.check(
+            ExtensionHook::Resource,
+            ctx,
+            client,
+            "",
+            Some(*target),
+            None,
+            Some(mode),
+        )
+    }
+
+    fn property(
+        &self,
+        ctx: &AccessContext<'_>,
+        client: ClientId,
+        window: ResourceId,
+        property: AtomId,
+        mode: AccessMode,
+    ) -> Decision {
+        self.check(
+            ExtensionHook::Property,
+            ctx,
+            client,
+            "",
+            None,
+            Some((window, property)),
+            Some(mode),
+        )
     }
 }
 
@@ -361,6 +429,10 @@ fn extension_access_asks_once_per_available_extension() {
         }),
         peer: Some(expected_peer),
         admission: Some(expected_admission),
+        target: None,
+        property: None,
+        mode: None,
+        owner: None,
     }];
     expected.extend(advertised.iter().map(|name| RecordedExtensionCheck {
         hook: ExtensionHook::Access,
@@ -372,6 +444,10 @@ fn extension_access_asks_once_per_available_extension() {
         }),
         peer: Some(expected_peer),
         admission: Some(expected_admission),
+        target: None,
+        property: None,
+        mode: None,
+        owner: None,
     }));
     assert_eq!(*calls.lock().unwrap(), expected);
 }
@@ -595,6 +671,10 @@ fn every_extension_dispatch_denial_answers_bad_request() {
                 }),
                 peer: Some(state.clients[&1].peer),
                 admission: Some(state.clients[&1].admission),
+                target: None,
+                property: None,
+                mode: None,
+                owner: None,
             }],
             "one dispatch check for {}",
             extension.name,
@@ -636,6 +716,10 @@ fn extension_dispatch_preserves_nonzero_minor_in_check_and_error() {
             request: Some(RequestOpcodes { major, minor: 1 }),
             peer: Some(state.clients[&1].peer),
             admission: Some(state.clients[&1].admission),
+            target: None,
+            property: None,
+            mode: None,
+            owner: None,
         }],
     );
 }
@@ -754,6 +838,10 @@ fn extension_dispatch_asks_with_client_name_and_opcodes() {
                 }),
                 peer: Some(state.clients[&1].peer),
                 admission: Some(state.clients[&1].admission),
+                target: None,
+                property: None,
+                mode: None,
+                owner: None,
             },
             RecordedExtensionCheck {
                 hook: ExtensionHook::Dispatch,
@@ -765,6 +853,10 @@ fn extension_dispatch_asks_with_client_name_and_opcodes() {
                 }),
                 peer: Some(state.clients[&1].peer),
                 admission: Some(state.clients[&1].admission),
+                target: None,
+                property: None,
+                mode: None,
+                owner: None,
             },
         ]
     );

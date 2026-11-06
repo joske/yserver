@@ -1,4 +1,5 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind, ResourceTarget},
     backend::{Backend, OriginContext},
     core_loop::process_request::{RequestOutcome, emit_x11_error, write_to_client},
     server::ServerState,
@@ -226,6 +227,7 @@ pub(super) fn handle_open_font(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let Some(request) = x11::open_font_request(body) else {
@@ -257,6 +259,22 @@ pub(super) fn handle_open_font(
             new_id,
             45,
         );
+    }
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: request.font,
+            kind: ResourceKind::Font,
+            creation: Some(crate::access::Creation {
+                parent: None,
+                owner: client_id,
+            }),
+        },
+        AccessMode::CREATE,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 45);
     }
     let host_result = match backend.open_font(origin, &request.name) {
         Ok(pair) => Some(pair),
@@ -463,14 +481,29 @@ pub(super) fn handle_close_font(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let Some(font) = x11::free_resource_id(body) else {
         return Ok(RequestOutcome::Handled);
     };
-    if !state.resources.close_font(font) {
+    if state.resources.font(font).is_none() {
         return emit_x11_error(state, client_id, sequence, x11::error::BAD_FONT, font.0, 46);
     }
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: font,
+            kind: ResourceKind::Font,
+            creation: None,
+        },
+        AccessMode::DESTROY,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 46);
+    }
+    let _ = state.resources.close_font(font);
     release_unreferenced_fonts(state, backend, origin);
     debug!("client {} #{} CloseFont", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
@@ -491,20 +524,52 @@ pub(super) fn handle_query_font(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} QueryFont", client_id.0, sequence.0);
     let font_id = x11::drawable_request_id(body);
-    let Some(metrics) = font_id
-        .and_then(|id| state.resources.fontable(id))
-        .map(|font| font.metrics.clone())
-    else {
+    let Some(font_id) = font_id else {
         // Unknown/invalid fontable → BadFont (Xorg), not a zeroed
         // metrics reply that misleads the client into thinking the
         // font loaded.
-        let bad = font_id.map_or(0, |id| id.0);
-        return emit_x11_error(state, client_id, sequence, x11::error::BAD_FONT, bad, 47);
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_FONT, 0, 47);
     };
+    let Some(kind) = state.resources.fontable(font_id).map(|_| {
+        if state.resources.gc(font_id).is_some() {
+            ResourceKind::Gc
+        } else {
+            ResourceKind::Font
+        }
+    }) else {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_FONT,
+            font_id.0,
+            47,
+        );
+    };
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: font_id,
+            kind,
+            creation: None,
+        },
+        AccessMode::GET_ATTR,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 47);
+    }
+    let metrics = state
+        .resources
+        .fontable(font_id)
+        .expect("fontable was just resolved")
+        .metrics
+        .clone();
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
@@ -523,17 +588,45 @@ pub(super) fn handle_query_text_extents(
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} QueryTextExtents", client_id.0, sequence.0);
     let req = x11::query_text_extents_request(header.data, body);
-    let extents = req.as_ref().and_then(|req| {
-        state
-            .resources
-            .fontable(req.fontable)
-            .map(|font| font.metrics.text_extents(&req.chars))
-    });
-    let Some(extents) = extents else {
+    let Some(req) = req else {
         // Unknown/invalid fontable → BadFont (Xorg), not zeroed extents.
-        let bad = req.map_or(0, |r| r.fontable.0);
-        return emit_x11_error(state, client_id, sequence, x11::error::BAD_FONT, bad, 48);
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_FONT, 0, 48);
     };
+    let Some(kind) = state.resources.fontable(req.fontable).map(|_| {
+        if state.resources.gc(req.fontable).is_some() {
+            ResourceKind::Gc
+        } else {
+            ResourceKind::Font
+        }
+    }) else {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_FONT,
+            req.fontable.0,
+            48,
+        );
+    };
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: req.fontable,
+            kind,
+            creation: None,
+        },
+        AccessMode::GET_ATTR,
+        RequestOpcodes::for_request(header),
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 48);
+    }
+    let extents = state
+        .resources
+        .fontable(req.fontable)
+        .expect("fontable was just resolved")
+        .metrics
+        .text_extents(&req.chars);
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };

@@ -1,4 +1,5 @@
 use crate::{
+    access::{AccessMode, Decision, RequestOpcodes, ResourceKind, ResourceTarget},
     backend::{Backend, OriginContext},
     core_loop::{
         fanout::{emit_window_event_to_state, fanout_event_to_clients},
@@ -863,19 +864,49 @@ pub(super) fn handle_list_properties(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} ListProperties", client_id.0, sequence.0);
-    let atoms: Vec<AtomId> = if body.len() >= 4 {
-        let window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
-        state
-            .resources
-            .window(window)
-            .map(|w| w.properties.keys().copied().collect())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let access_request = RequestOpcodes::for_request(header);
+    let mut atoms = Vec::new();
+    if let Some(bytes) = body.get(..4) {
+        let window = ResourceId(u32::from_le_bytes(
+            bytes.try_into().expect("four-byte window id"),
+        ));
+        if state.resources.window(window).is_some() {
+            if let Err((code, value)) = super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: window,
+                    kind: ResourceKind::Window,
+                    creation: None,
+                },
+                AccessMode::LIST_PROP,
+                access_request,
+            ) {
+                return emit_x11_error(state, client_id, sequence, code, value, 21);
+            }
+            atoms = state
+                .resources
+                .window(window)
+                .map(|w| w.properties.keys().copied().collect())
+                .unwrap_or_default();
+            atoms.retain(|&property| {
+                matches!(
+                    state.check_property(
+                        client_id,
+                        window,
+                        property,
+                        AccessMode::GET_ATTR,
+                        Some(access_request),
+                    ),
+                    Decision::Allow
+                )
+            });
+        }
+    }
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
@@ -986,6 +1017,20 @@ pub(super) fn handle_change_property(
             18,
         );
     }
+    let access_request = RequestOpcodes::for_request(header);
+    if let Err((code, value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: req.window,
+            kind: ResourceKind::Window,
+            creation: None,
+        },
+        AccessMode::SET_PROP,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, value, 18);
+    }
     if !state.atoms.exists(req.property) {
         return emit_x11_error(
             state,
@@ -1005,6 +1050,26 @@ pub(super) fn handle_change_property(
             req.r#type.0,
             18,
         );
+    }
+    let existing = state
+        .resources
+        .window_property(req.window, req.property)
+        .cloned();
+    let property_mode = match (mode, existing.is_some()) {
+        (_, false) => AccessMode::CREATE | AccessMode::WRITE,
+        (properties::ChangeMode::Replace, true) => AccessMode::WRITE,
+        (properties::ChangeMode::Append | properties::ChangeMode::Prepend, true) => {
+            AccessMode::BLEND
+        }
+    };
+    if let Decision::Deny(error) = state.check_property(
+        client_id,
+        req.window,
+        req.property,
+        property_mode,
+        Some(access_request),
+    ) {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 18);
     }
     // Diagnostic: log WM_CLASS (and _NET_WM_PID) so we can map
     // yserver client_id → user-space process when debugging
@@ -1072,10 +1137,6 @@ pub(super) fn handle_change_property(
             );
         }
     }
-    let existing = state
-        .resources
-        .window_property(req.window, req.property)
-        .cloned();
     let new_value =
         match properties::apply_change(existing.as_ref(), mode, req.r#type, format, &req.data) {
             Ok(v) => v,
@@ -1182,6 +1243,25 @@ pub(super) fn handle_get_property(
             20,
         );
     }
+    let access_request = RequestOpcodes::for_request(header);
+    let window_mode = if req.delete {
+        AccessMode::GET_PROP | AccessMode::SET_PROP
+    } else {
+        AccessMode::GET_PROP
+    };
+    if let Err((code, value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: req.window,
+            kind: ResourceKind::Window,
+            creation: None,
+        },
+        window_mode,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, value, 20);
+    }
     if !state.atoms.exists(req.property) {
         return emit_x11_error(
             state,
@@ -1202,14 +1282,30 @@ pub(super) fn handle_get_property(
             20,
         );
     }
+    let existing = state
+        .resources
+        .window_property(req.window, req.property)
+        .cloned();
+    if existing.is_some() {
+        let property_mode = if req.delete {
+            AccessMode::READ | AccessMode::DESTROY
+        } else {
+            AccessMode::READ
+        };
+        if let Decision::Deny(error) = state.check_property(
+            client_id,
+            req.window,
+            req.property,
+            property_mode,
+            Some(access_request),
+        ) {
+            return emit_x11_error(state, client_id, sequence, error.code, error.value, 20);
+        }
+    }
     // Build the reply against an immutable borrow of state.resources,
     // copy the bytes into an owned buffer, then drop the borrow before
     // we touch state again for the optional delete + fanout.
     let (reply_bytes, type_matched, slice_bytes_after, existing_some) = {
-        let existing = state
-            .resources
-            .window_property(req.window, req.property)
-            .cloned();
         let slice = match properties::slice_for_get(
             existing.as_ref(),
             req.r#type,
@@ -1284,6 +1380,7 @@ pub(super) fn handle_delete_property(
     backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
+    header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let Some(req) = x11::delete_property_request(body) else {
@@ -1298,6 +1395,34 @@ pub(super) fn handle_delete_property(
             req.window.0,
             19,
         );
+    }
+    let access_request = RequestOpcodes::for_request(header);
+    if let Err((code, value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: req.window,
+            kind: ResourceKind::Window,
+            creation: None,
+        },
+        AccessMode::SET_PROP,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, value, 19);
+    }
+    if state
+        .resources
+        .window_property(req.window, req.property)
+        .is_some()
+        && let Decision::Deny(error) = state.check_property(
+            client_id,
+            req.window,
+            req.property,
+            AccessMode::DESTROY,
+            Some(access_request),
+        )
+    {
+        return emit_x11_error(state, client_id, sequence, error.code, error.value, 19);
     }
     let removed = state
         .resources
@@ -1328,6 +1453,7 @@ pub(super) fn handle_rotate_properties(
     backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
+    header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     const OPCODE: u8 = 114;
@@ -1350,6 +1476,20 @@ pub(super) fn handle_rotate_properties(
             req.window.0,
             OPCODE,
         );
+    }
+    let access_request = RequestOpcodes::for_request(header);
+    if let Err((code, value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: req.window,
+            kind: ResourceKind::Window,
+            creation: None,
+        },
+        AccessMode::SET_PROP,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, value, OPCODE);
     }
     let atoms = &req.properties;
     let mut saved = Vec::with_capacity(atoms.len());
@@ -1387,6 +1527,15 @@ pub(super) fn handle_rotate_properties(
                 OPCODE,
             );
         };
+        if let Decision::Deny(error) = state.check_property(
+            client_id,
+            req.window,
+            atom,
+            AccessMode::READ | AccessMode::WRITE,
+            Some(access_request),
+        ) {
+            return emit_x11_error(state, client_id, sequence, error.code, error.value, OPCODE);
+        }
         saved.push(value.clone());
     }
     let n = atoms.len();

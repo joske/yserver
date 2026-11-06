@@ -173,6 +173,11 @@ pub enum RecordedCall {
         dst_host_xid: u32,
         plane: u32,
     },
+    PolyText8 {
+        host_xid: u32,
+        foreground: u32,
+        body: Vec<u8>,
+    },
     PaintWindowBackgroundRect {
         host_xid: u32,
         x: i16,
@@ -238,6 +243,10 @@ pub enum RecordedCall {
     ApplyClipState(ClipState),
     /// `poly_fill_rectangle(host_xid, ..)` called.
     PolyFillRectangle {
+        host_xid: u32,
+    },
+    /// `poly_point(host_xid, ..)` called.
+    PolyPoint {
         host_xid: u32,
     },
     PutImage {
@@ -552,6 +561,8 @@ pub struct RecordingBackend {
     pub fail_copy_area: bool,
     /// When `true`, `fill_rectangle` records the call but returns `Err`.
     pub fail_fill_rectangle: bool,
+    /// Failure injection for GLX pbuffer backing allocation tests.
+    pub create_pixmap_fails: bool,
     /// The next `open_font` records its call and returns this error kind.
     /// Used to drive reset's fatal default-font reinstall boundary.
     pub fail_open_font: Option<io::ErrorKind>,
@@ -599,6 +610,8 @@ pub struct RecordingBackend {
     pub client_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Returned by `glx_available`.
     pub glx_available: bool,
+    /// Let request-path tests create a glyphset without a host renderer.
+    pub render_create_glyphset_returns_handle: bool,
     /// Whether the test backend simulates queueing the input pause barrier.
     pub vt_release_pause_queued: bool,
     /// Set when the release has crossed the test backend's yield boundary.
@@ -717,6 +730,7 @@ impl RecordingBackend {
             arm_idle_vblanks_result: None,
             fail_copy_area: false,
             fail_fill_rectangle: false,
+            create_pixmap_fails: false,
             fail_open_font: None,
             present_direct_result: false,
             reallocate_fails: false,
@@ -731,6 +745,7 @@ impl RecordingBackend {
             platform_events: 0,
             client_count: std::sync::Arc::default(),
             glx_available: true,
+            render_create_glyphset_returns_handle: false,
             vt_release_pause_queued: false,
             vt_release_finished: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
@@ -1917,13 +1932,16 @@ impl Backend for RecordingBackend {
         width: u16,
         height: u16,
     ) -> io::Result<PixmapHandle> {
-        let xid = self.allocate_handle();
-        self.live_pixmaps.insert(xid);
         self.record(RecordedCall::CreatePixmap {
             depth,
             width,
             height,
         });
+        if self.create_pixmap_fails {
+            return Err(io::Error::other("create_pixmap failure injected"));
+        }
+        let xid = self.allocate_handle();
+        self.live_pixmaps.insert(xid);
         Ok(PixmapHandle::from_raw_panicking(xid))
     }
 
@@ -2248,12 +2266,13 @@ impl Backend for RecordingBackend {
     fn poly_point(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
+        host_xid: u32,
         _foreground: u32,
         _coordinate_mode: u8,
         _points: &[u8],
     ) -> io::Result<()> {
-        unimplemented!("RecordingBackend: poly_point")
+        self.record(RecordedCall::PolyPoint { host_xid });
+        Ok(())
     }
 
     fn poly_fill_rectangle(
@@ -2319,11 +2338,16 @@ impl Backend for RecordingBackend {
     fn poly_text8(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _foreground: u32,
-        _body: &[u8],
+        host_xid: u32,
+        foreground: u32,
+        body: &[u8],
     ) -> io::Result<()> {
-        unimplemented!("RecordingBackend: poly_text8")
+        self.record(RecordedCall::PolyText8 {
+            host_xid,
+            foreground,
+            body: body.to_vec(),
+        });
+        Ok(())
     }
 
     fn poly_text16(
@@ -2405,7 +2429,9 @@ impl Backend for RecordingBackend {
         _origin: Option<OriginContext>,
         _ynest_format: u32,
     ) -> io::Result<Option<GlyphSetHandle>> {
-        Ok(None)
+        Ok(self
+            .render_create_glyphset_returns_handle
+            .then(|| GlyphSetHandle::from_raw_panicking(self.allocate_handle())))
     }
 
     fn render_free_glyphset(

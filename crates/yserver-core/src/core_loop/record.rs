@@ -250,6 +250,12 @@ pub struct RecordState {
 }
 
 impl RecordState {
+    /// Owner of the live RECORD context named by `id`.
+    #[must_use]
+    pub(crate) fn owner(&self, id: u32) -> Option<ClientId> {
+        self.contexts.get(&id).map(|context| context.owner)
+    }
+
     #[must_use]
     pub fn contains(&self, id: u32) -> bool {
         self.contexts.contains_key(&id)

@@ -1,7 +1,13 @@
 use super::*;
-use crate::core_loop::process_request::glx::{
-    drawable_attributes_for, glx_extension_string, glx_fbconfig_depth, glx_fbconfig_visual,
-    glx_visual_fbconfig, synthesise_glx_fb_configs, synthesise_glx_visual_configs,
+use crate::{
+    access::{
+        AccessContext, AccessMode, AccessPolicy, Decision, DenyError, RequestOpcodes, ResourceKind,
+        ResourceTarget,
+    },
+    core_loop::process_request::glx::{
+        drawable_attributes_for, glx_extension_string, glx_fbconfig_depth, glx_fbconfig_visual,
+        glx_visual_fbconfig, synthesise_glx_fb_configs, synthesise_glx_visual_configs,
+    },
 };
 
 // #96: each visual-backed GLX FBConfig must advertise GLX_PBUFFER_BIT plus
@@ -449,6 +455,121 @@ fn glx_legacy_fixture() -> (ServerState, RecordingBackend, UnixStream) {
     client.resource_id_base = GLX_TEST_XID_BASE;
     client.resource_id_mask = GLX_TEST_XID_MASK;
     (state, RecordingBackend::new(), peer)
+}
+
+type RecordedResourceAccess = (
+    ResourceTarget,
+    AccessMode,
+    Option<RequestOpcodes>,
+    Option<ClientId>,
+);
+
+struct DenyPbufferGeometryPolicy {
+    calls: Arc<Mutex<Vec<RecordedResourceAccess>>>,
+}
+
+impl AccessPolicy for DenyPbufferGeometryPolicy {
+    fn resource(
+        &self,
+        ctx: &AccessContext<'_>,
+        _client: ClientId,
+        target: &ResourceTarget,
+        mode: AccessMode,
+    ) -> Decision {
+        self.calls.lock().unwrap().push((
+            *target,
+            mode,
+            ctx.request(),
+            ctx.owner(target.id, target.kind),
+        ));
+        if target.kind == ResourceKind::GlxDrawable {
+            Decision::Deny(DenyError {
+                code: yserver_protocol::x11::error::BAD_VALUE,
+                value: 0x55,
+            })
+        } else {
+            Decision::Allow
+        }
+    }
+}
+
+#[test]
+fn get_geometry_checks_glx_drawable_without_backing_pixmap() {
+    // Mutation: check only windows and pixmaps; a pbuffer with no backing pixmap must still be checked as GlxDrawable.
+    let (mut state, mut backend, mut owner_peer) = glx_legacy_fixture();
+    let mut other_peer = install_client(&mut state, 2);
+    let pbuffer = GLX_TEST_XID_BASE | 0x70;
+    backend.create_pixmap_fails = true;
+    use yserver_protocol::x11::glx;
+    let pbuffer_body = glx_legacy_words(&[
+        0,
+        0x101,
+        pbuffer,
+        2,
+        glx::GLX_PBUFFER_WIDTH,
+        64,
+        glx::GLX_PBUFFER_HEIGHT,
+        32,
+    ]);
+    assert!(
+        glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut owner_peer,
+            1,
+            glx::CREATE_PBUFFER,
+            &pbuffer_body,
+        )
+        .is_empty()
+    );
+    assert!(state.glx_drawables.contains_key(&pbuffer));
+    assert!(state.resources.pixmap(ResourceId(pbuffer)).is_none());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.install_access_policy(Arc::new(DenyPbufferGeometryPolicy {
+        calls: Arc::clone(&calls),
+    }));
+    let backend_before = backend.calls();
+
+    process_request(
+        &mut state,
+        &mut backend,
+        ClientId(2),
+        SequenceNumber(9),
+        RequestHeader {
+            opcode: 14,
+            data: 0,
+            length_units: 2,
+        },
+        &pbuffer.to_le_bytes(),
+        None,
+    )
+    .expect("GetGeometry on pbuffer");
+    let bytes = read_all_or_buffered(&mut state, 2, &mut other_peer);
+    let mut expected = vec![0, yserver_protocol::x11::error::BAD_VALUE];
+    expected.extend_from_slice(&9u16.to_le_bytes());
+    expected.extend_from_slice(&0x55u32.to_le_bytes());
+    expected.extend_from_slice(&0u16.to_le_bytes());
+    expected.push(14);
+    expected.extend_from_slice(&[0; 21]);
+    assert_eq!(bytes, expected, "policy error, with no geometry reply");
+    assert_eq!(backend.calls(), backend_before);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [(
+            ResourceTarget {
+                id: ResourceId(pbuffer),
+                kind: ResourceKind::GlxDrawable,
+                creation: None,
+            },
+            AccessMode::GET_ATTR,
+            Some(RequestOpcodes {
+                major: 14,
+                minor: 0
+            }),
+            Some(ClientId(1)),
+        )]
+    );
+    assert!(read_all_available(&mut owner_peer).is_empty());
 }
 
 fn glx_legacy_x_pixmap(state: &mut ServerState, xid: u32, depth: u8, host: Option<u32>) {

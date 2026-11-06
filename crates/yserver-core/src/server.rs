@@ -1676,6 +1676,118 @@ impl ServerState {
         crate::access::Decision::Allow
     }
 
+    /// Resolve a resource's owner from the store for its exact resource kind.
+    /// This remains separate from `ResourceTable::resource_owner`, whose
+    /// narrower lookup is part of KillClient's existing BadValue behavior.
+    #[must_use]
+    pub(crate) fn access_resource_owner(
+        &self,
+        id: ResourceId,
+        kind: crate::access::ResourceKind,
+    ) -> Option<ClientId> {
+        use crate::access::ResourceKind;
+
+        let server_owner = crate::resources::SERVER_OWNER;
+        match kind {
+            ResourceKind::Window
+            | ResourceKind::Pixmap
+            | ResourceKind::Gc
+            | ResourceKind::Font
+            | ResourceKind::Cursor
+            | ResourceKind::Colormap
+            | ResourceKind::Picture
+            | ResourceKind::GlyphSet
+            | ResourceKind::Dri3Syncobj => self.resources.access_owner(id, kind),
+            ResourceKind::Region => self.xfixes_regions.get(&id.0).map(|region| region.owner),
+            ResourceKind::PointerBarrier => self
+                .pointer_barriers
+                .get(&id.0)
+                .map(|barrier| barrier.owner),
+            ResourceKind::SyncCounter => {
+                if crate::core_loop::sync_await::is_system_counter(id.0) {
+                    Some(server_owner)
+                } else {
+                    self.sync_counters.get(&id.0).map(|counter| counter.owner)
+                }
+            }
+            ResourceKind::SyncAlarm => self.sync_alarms.get(&id.0).map(|alarm| alarm.owner),
+            ResourceKind::SyncFence => self.sync_fences.get(&id.0).map(|fence| fence.owner),
+            ResourceKind::Damage => self.damage_objects.get(&id.0).map(|damage| damage.owner),
+            ResourceKind::PresentEventSelection => self
+                .present_event_selections
+                .get(&id.0)
+                .map(|selection| selection.owner),
+            ResourceKind::ShmSegment => self
+                .mit_shm_segments
+                .get(&id.0)
+                .map(|segment| segment.owner),
+            ResourceKind::GlxContext => self.glx_contexts.get(&id.0).map(|context| context.owner),
+            ResourceKind::GlxDrawable => {
+                self.glx_drawables.get(&id.0).map(|drawable| drawable.owner)
+            }
+            ResourceKind::RecordContext => self.record.owner(id.0),
+            ResourceKind::RandrOutput => self
+                .randr
+                .outputs
+                .iter()
+                .any(|output| output.output_id == id.0)
+                .then_some(server_owner),
+            ResourceKind::RandrCrtc => self
+                .randr
+                .outputs
+                .iter()
+                .any(|output| output.crtc_id == id.0)
+                .then_some(server_owner),
+            ResourceKind::RandrMode => self
+                .randr
+                .mode_table
+                .iter()
+                .chain(self.randr.modes.iter())
+                .any(|mode| mode.mode_id == id.0)
+                .then_some(server_owner),
+            ResourceKind::RandrProvider => self.randr.provider(id.0).map(|_| server_owner),
+        }
+    }
+
+    /// Ask installed policies whether a client may perform `mode` on a typed resource.
+    pub(crate) fn check_resource(
+        &self,
+        client: ClientId,
+        target: &crate::access::ResourceTarget,
+        mode: crate::access::AccessMode,
+        request: Option<crate::access::RequestOpcodes>,
+    ) -> crate::access::Decision {
+        if !self.policies_installed() {
+            return crate::access::Decision::Allow;
+        }
+        if client == crate::resources::SERVER_OWNER {
+            return crate::access::Decision::Allow;
+        }
+        self.first_denial(request, |policy, context| {
+            policy.resource(context, client, target, mode)
+        })
+    }
+
+    /// Ask installed policies whether a client may perform `mode` on a property.
+    pub(crate) fn check_property(
+        &self,
+        client: ClientId,
+        window: ResourceId,
+        property: AtomId,
+        mode: crate::access::AccessMode,
+        request: Option<crate::access::RequestOpcodes>,
+    ) -> crate::access::Decision {
+        if !self.policies_installed() {
+            return crate::access::Decision::Allow;
+        }
+        if client == crate::resources::SERVER_OWNER {
+            return crate::access::Decision::Allow;
+        }
+        self.first_denial(request, |policy, context| {
+            policy.property(context, client, window, property, mode)
+        })
+    }
+
     /// Ask installed policies about a server operation, stopping at the first denial.
     pub(crate) fn check_server(
         &self,

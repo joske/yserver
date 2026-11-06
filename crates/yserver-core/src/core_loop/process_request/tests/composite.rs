@@ -1290,6 +1290,10 @@ fn kill_client_releases_the_victims_overlay_claim() {
         &mut backend,
         ClientId(1),
         SequenceNumber(1),
+        crate::access::RequestOpcodes {
+            major: 113,
+            minor: 0,
+        },
         &victim_window.0.to_le_bytes(),
     )
     .expect("KillClient");
@@ -1607,6 +1611,11 @@ fn destroy_window_request(f: &mut CowFixture, window: ResourceId) {
         None,
         ClientId(COW_APP),
         SequenceNumber(5),
+        RequestHeader {
+            opcode: 4,
+            data: 0,
+            length_units: 2,
+        },
         &window.0.to_le_bytes(),
     )
     .expect("DestroyWindow");
@@ -1619,6 +1628,11 @@ fn destroy_subwindows_request(f: &mut CowFixture) {
         None,
         ClientId(COW_APP),
         SequenceNumber(5),
+        RequestHeader {
+            opcode: 5,
+            data: 0,
+            length_units: 2,
+        },
         &ROOT_WINDOW.0.to_le_bytes(),
     )
     .expect("DestroySubwindows");
@@ -3728,6 +3742,10 @@ fn unmap_exposing_an_inhibited_root_paints_nothing_but_still_exposes() {
         None,
         ClientId(INHIBIT_APP),
         SequenceNumber(2),
+        crate::access::RequestOpcodes {
+            major: 10,
+            minor: 0,
+        },
         &INHIBIT_W.to_le_bytes(),
     )
     .expect("handle_unmap_window");

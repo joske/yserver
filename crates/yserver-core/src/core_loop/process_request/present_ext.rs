@@ -1697,14 +1697,33 @@ pub(super) fn handle_present_request(
                     "client {} #{} PRESENT::SelectInput eid=0x{:x} window=0x{:x} mask=0x{:x}",
                     client_id.0, sequence.0, req.eid, req.window, req.event_mask
                 );
-                state.present_event_selections.insert(
-                    req.eid,
-                    crate::server::PresentEventSelection {
+                let window = ResourceId(req.window);
+                if state
+                    .present_event_selections
+                    .get(&req.eid)
+                    .is_some_and(|selection| {
+                        selection.owner != client_id || selection.window != window
+                    })
+                {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_MATCH,
+                        req.eid,
+                        u16::from(minor),
+                        PRESENT_MAJOR_OPCODE,
+                    );
+                }
+                state
+                    .present_event_selections
+                    .entry(req.eid)
+                    .and_modify(|selection| selection.event_mask = req.event_mask)
+                    .or_insert(crate::server::PresentEventSelection {
                         owner: client_id,
-                        window: ResourceId(req.window),
+                        window,
                         event_mask: req.event_mask,
-                    },
-                );
+                    });
             } else {
                 debug!(
                     "client {} #{} PRESENT::SelectInput parse failed body_len={}",

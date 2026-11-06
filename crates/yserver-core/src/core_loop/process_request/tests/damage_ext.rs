@@ -509,6 +509,7 @@ fn map_window_reapplies_manual_redirect_scene_participation() {
         None,
         ClientId(CLIENT_ID),
         SequenceNumber(1),
+        crate::access::RequestOpcodes { major: 8, minor: 0 },
         &body,
     )
     .expect("handle_map_window");
@@ -612,6 +613,7 @@ fn map_window_emits_damage_on_window_extent() {
         None,
         ClientId(CLIENT_ID),
         SequenceNumber(1),
+        crate::access::RequestOpcodes { major: 8, minor: 0 },
         &body,
     )
     .expect("handle_map_window");
@@ -720,6 +722,7 @@ fn map_window_seeds_damage_for_newly_viewable_descendant() {
         None,
         ClientId(CLIENT_ID),
         SequenceNumber(1),
+        crate::access::RequestOpcodes { major: 8, minor: 0 },
         &body,
     )
     .expect("handle_map_window");
@@ -843,6 +846,7 @@ fn map_window_does_not_rereport_held_nonempty_damage_for_newly_viewable_descenda
         None,
         ClientId(CLIENT_ID),
         SequenceNumber(1),
+        crate::access::RequestOpcodes { major: 8, minor: 0 },
         &body,
     )
     .expect("handle_map_window");
@@ -1117,6 +1121,114 @@ fn damage_subtract_with_no_repair_returns_old_damage_in_parts_and_clears() {
     assert!(
         !damage.pending_notify_fired,
         "Subtract is the cycle boundary — pending_notify_fired must reset"
+    );
+}
+
+/// A writer does not take ownership of an existing DAMAGE parts region.
+/// Mutation: assigning Subtract's parts region to the writer makes the
+/// owner's post-disconnect FetchRegion reply disappear.
+#[test]
+fn damage_subtract_parts_keeps_existing_region_owner() {
+    use crate::server::DamageObject;
+    use yserver_protocol::x11::{RequestHeader, damage as x11damage, xfixes};
+
+    const OWNER: u32 = 1;
+    const WRITER: u32 = 2;
+    const DAMAGE_ID: u32 = 0x0080_0020;
+    const PARTS_ID: u32 = 0x0080_0021;
+    let damaged_rect = xfixes::RegionRect {
+        x: 10,
+        y: 20,
+        width: 30,
+        height: 40,
+    };
+
+    let mut state = ServerState::new();
+    let mut owner_peer = install_client(&mut state, OWNER);
+    let _writer_peer = install_client(&mut state, WRITER);
+    state.xfixes_client_major.insert(OWNER, 5);
+    let mut backend = RecordingBackend::new();
+
+    // Owner creates the existing parts region through the request path.
+    let mut create_body = PARTS_ID.to_le_bytes().to_vec();
+    create_body.extend_from_slice(&0_i16.to_le_bytes());
+    create_body.extend_from_slice(&0_i16.to_le_bytes());
+    create_body.extend_from_slice(&1_u16.to_le_bytes());
+    create_body.extend_from_slice(&1_u16.to_le_bytes());
+    process_request(
+        &mut state,
+        &mut backend,
+        ClientId(OWNER),
+        SequenceNumber(1),
+        RequestHeader {
+            opcode: XFIXES_MAJOR_OPCODE,
+            data: xfixes::CREATE_REGION,
+            length_units: 4,
+        },
+        &create_body,
+        None,
+    )
+    .expect("CreateRegion");
+
+    state.damage_objects.insert(
+        DAMAGE_ID,
+        DamageObject {
+            owner: ClientId(OWNER),
+            drawable: ROOT_WINDOW,
+            level: x11damage::report_level::RAW_RECTANGLES,
+            rects: vec![damaged_rect],
+            pending_notify_fired: false,
+            last_reported_geometry: None,
+            list_pos: 0,
+            created: 0,
+        },
+    );
+    let mut subtract_body = Vec::with_capacity(12);
+    subtract_body.extend_from_slice(&DAMAGE_ID.to_le_bytes());
+    subtract_body.extend_from_slice(&0_u32.to_le_bytes());
+    subtract_body.extend_from_slice(&PARTS_ID.to_le_bytes());
+    process_request(
+        &mut state,
+        &mut backend,
+        ClientId(WRITER),
+        SequenceNumber(1),
+        RequestHeader {
+            opcode: 143,
+            data: x11damage::SUBTRACT,
+            length_units: 4,
+        },
+        &subtract_body,
+        None,
+    )
+    .expect("Subtract");
+
+    crate::core_loop::process_disconnect::process_disconnect(
+        &mut state,
+        &mut backend,
+        ClientId(WRITER),
+    );
+
+    process_request(
+        &mut state,
+        &mut backend,
+        ClientId(OWNER),
+        SequenceNumber(2),
+        RequestHeader {
+            opcode: XFIXES_MAJOR_OPCODE,
+            data: xfixes::FETCH_REGION,
+            length_units: 2,
+        },
+        &PARTS_ID.to_le_bytes(),
+        None,
+    )
+    .expect("FetchRegion");
+    let reply = read_all_available(&mut owner_peer);
+    assert_eq!(reply.len(), 40, "FetchRegion returns the parts rectangle");
+    assert_eq!(reply[0], 1, "the owner's parts region survives disconnect");
+    assert_eq!(
+        &reply[32..40],
+        &[10, 0, 20, 0, 30, 0, 40, 0],
+        "Subtract copied the damage rectangles into the owner's parts region",
     );
 }
 

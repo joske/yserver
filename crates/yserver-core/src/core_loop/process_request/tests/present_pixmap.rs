@@ -114,6 +114,10 @@ fn configure_window_pure_move_emits_present_configure_notify() {
         None,
         ClientId(1),
         SequenceNumber(1),
+        crate::access::RequestOpcodes {
+            major: 12,
+            minor: 0,
+        },
         &body,
     )
     .expect("handle_configure_window");
@@ -3496,6 +3500,10 @@ fn free_pixmap_between_park_and_drain_still_executes_the_pinned_copy() {
         None,
         ClientId(CLIENT),
         SequenceNumber(2),
+        crate::access::RequestOpcodes {
+            major: 54,
+            minor: 0,
+        },
         &free_pixmap_body(PIXMAP_XID),
     )
     .expect("free pixmap");

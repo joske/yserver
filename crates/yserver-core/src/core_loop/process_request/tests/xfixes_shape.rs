@@ -163,6 +163,240 @@ fn xfixes_u32s(values: &[u32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
+const XFIXES_OWNER: u32 = 1;
+const XFIXES_WRITER: u32 = 2;
+const XFIXES_REGION: u32 = 0x0100_0001;
+const XFIXES_SOURCE: u32 = 0x0100_0002;
+const XFIXES_SOURCE2: u32 = 0x0100_0003;
+
+fn xfixes_rect_body(id: u32, rect: yserver_protocol::x11::xfixes::RegionRect) -> Vec<u8> {
+    let mut body = id.to_le_bytes().to_vec();
+    body.extend_from_slice(&rect.x.to_le_bytes());
+    body.extend_from_slice(&rect.y.to_le_bytes());
+    body.extend_from_slice(&rect.width.to_le_bytes());
+    body.extend_from_slice(&rect.height.to_le_bytes());
+    body
+}
+
+fn assert_xfixes_single_write_preserves_owner(
+    minor: u8,
+    body: &[u8],
+    expected: &[(i16, i16, u16, u16)],
+) {
+    use yserver_protocol::x11::xfixes as x11xfixes;
+
+    let mut state = ServerState::new();
+    let mut owner_peer = install_client(&mut state, XFIXES_OWNER);
+    let mut writer_peer = install_client(&mut state, XFIXES_WRITER);
+    state.xfixes_client_major.insert(XFIXES_OWNER, 5);
+    state.xfixes_client_major.insert(XFIXES_WRITER, 5);
+    let mut backend = RecordingBackend::new();
+
+    let rect = |x, y, width, height| yserver_protocol::x11::xfixes::RegionRect {
+        x,
+        y,
+        width,
+        height,
+    };
+    for (id, initial) in [
+        (XFIXES_REGION, rect(1, 2, 3, 4)),
+        (XFIXES_SOURCE, rect(10, 20, 30, 40)),
+        (XFIXES_SOURCE2, rect(12, 22, 6, 8)),
+    ] {
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            XFIXES_OWNER,
+            x11xfixes::CREATE_REGION,
+            &xfixes_rect_body(id, initial),
+        );
+    }
+
+    // Each invocation starts from fresh owner-created regions and sends one
+    // destination-writing request from the other client.
+    xfixes_req(&mut state, &mut backend, XFIXES_WRITER, minor, body);
+    assert!(
+        wire_packets(&mut writer_peer).is_empty(),
+        "writer request succeeds"
+    );
+
+    crate::core_loop::process_disconnect::process_disconnect(
+        &mut state,
+        &mut backend,
+        ClientId(XFIXES_WRITER),
+    );
+
+    xfixes_req(
+        &mut state,
+        &mut backend,
+        XFIXES_OWNER,
+        x11xfixes::FETCH_REGION,
+        &XFIXES_REGION.to_le_bytes(),
+    );
+    let reply = read_all_available(&mut owner_peer);
+    let expected_wire: Vec<u8> = expected
+        .iter()
+        .flat_map(|(x, y, width, height)| {
+            x.to_le_bytes()
+                .into_iter()
+                .chain(y.to_le_bytes())
+                .chain(width.to_le_bytes())
+                .chain(height.to_le_bytes())
+        })
+        .collect();
+    assert_eq!(
+        reply.len(),
+        32 + expected_wire.len(),
+        "FetchRegion returns every expected rectangle after writer disconnect",
+    );
+    assert_eq!(reply.first(), Some(&1), "FetchRegion returns a reply");
+    assert_eq!(
+        &reply[32..],
+        expected_wire,
+        "FetchRegion returns the written region contents",
+    );
+}
+
+/// Mutation: make `store_xfixes_region` assign an existing destination to the
+/// writer; CopyRegion's rectangle must still be fetchable after disconnect.
+#[test]
+fn xfixes_write_into_other_clients_region_keeps_owner() {
+    use yserver_protocol::x11::xfixes as x11xfixes;
+
+    assert_xfixes_single_write_preserves_owner(
+        x11xfixes::COPY_REGION,
+        &xfixes_u32s(&[XFIXES_SOURCE, XFIXES_REGION]),
+        &[(10, 20, 30, 40)],
+    );
+}
+
+/// Mutation: make `store_xfixes_region` assign an existing destination to the
+/// writer; SetRegion's replacement must survive that writer's disconnect.
+#[test]
+fn xfixes_set_region_into_other_clients_region_keeps_owner() {
+    use yserver_protocol::x11::xfixes as x11xfixes;
+
+    assert_xfixes_single_write_preserves_owner(
+        x11xfixes::SET_REGION,
+        &xfixes_rect_body(
+            XFIXES_REGION,
+            yserver_protocol::x11::xfixes::RegionRect {
+                x: 2,
+                y: 3,
+                width: 4,
+                height: 5,
+            },
+        ),
+        &[(2, 3, 4, 5)],
+    );
+}
+
+/// Mutation: make `store_xfixes_region` assign an existing destination to the
+/// writer; UnionRegion's result must survive that writer's disconnect.
+#[test]
+fn xfixes_union_region_into_other_clients_region_keeps_owner() {
+    use yserver_protocol::x11::xfixes as x11xfixes;
+
+    assert_xfixes_single_write_preserves_owner(
+        x11xfixes::UNION_REGION,
+        &xfixes_u32s(&[XFIXES_SOURCE, XFIXES_SOURCE2, XFIXES_REGION]),
+        &[(10, 20, 30, 40)],
+    );
+}
+
+/// Mutation: make `store_xfixes_region` assign an existing destination to the
+/// writer; IntersectRegion's result must survive that writer's disconnect.
+#[test]
+fn xfixes_intersect_region_into_other_clients_region_keeps_owner() {
+    use yserver_protocol::x11::xfixes as x11xfixes;
+
+    assert_xfixes_single_write_preserves_owner(
+        x11xfixes::INTERSECT_REGION,
+        &xfixes_u32s(&[XFIXES_SOURCE, XFIXES_SOURCE2, XFIXES_REGION]),
+        &[(12, 22, 6, 8)],
+    );
+}
+
+/// Mutation: make `store_xfixes_region` assign an existing destination to the
+/// writer; SubtractRegion's result must survive that writer's disconnect.
+#[test]
+fn xfixes_subtract_region_into_other_clients_region_keeps_owner() {
+    use yserver_protocol::x11::xfixes as x11xfixes;
+
+    assert_xfixes_single_write_preserves_owner(
+        x11xfixes::SUBTRACT_REGION,
+        &xfixes_u32s(&[XFIXES_SOURCE, XFIXES_SOURCE2, XFIXES_REGION]),
+        &[
+            (10, 20, 30, 2),
+            (10, 22, 2, 8),
+            (18, 22, 22, 8),
+            (10, 30, 30, 30),
+        ],
+    );
+}
+
+/// Mutation: make `store_xfixes_region` assign an existing destination to the
+/// writer; InvertRegion's four output rectangles must survive disconnect.
+#[test]
+fn xfixes_invert_region_into_other_clients_region_keeps_owner() {
+    use yserver_protocol::x11::xfixes as x11xfixes;
+
+    let mut body = XFIXES_SOURCE.to_le_bytes().to_vec();
+    body.extend_from_slice(&0_i16.to_le_bytes());
+    body.extend_from_slice(&0_i16.to_le_bytes());
+    body.extend_from_slice(&100_u16.to_le_bytes());
+    body.extend_from_slice(&100_u16.to_le_bytes());
+    body.extend_from_slice(&XFIXES_REGION.to_le_bytes());
+    assert_xfixes_single_write_preserves_owner(
+        x11xfixes::INVERT_REGION,
+        &body,
+        &[
+            (0, 0, 100, 20),
+            (0, 20, 10, 40),
+            (40, 20, 60, 40),
+            (0, 60, 100, 40),
+        ],
+    );
+}
+
+/// Mutation: make `store_xfixes_region` assign an existing destination to the
+/// writer; RegionExtents' rectangle must survive that writer's disconnect.
+#[test]
+fn xfixes_region_extents_into_other_clients_region_keeps_owner() {
+    use yserver_protocol::x11::xfixes as x11xfixes;
+
+    assert_xfixes_single_write_preserves_owner(
+        x11xfixes::REGION_EXTENTS,
+        &xfixes_u32s(&[XFIXES_SOURCE, XFIXES_REGION]),
+        &[(10, 20, 30, 40)],
+    );
+}
+
+/// Mutation: assign the destination's owner to the writer in TranslateRegion;
+/// the translated rectangle must remain fetchable after disconnect.
+#[test]
+fn xfixes_translate_region_into_other_clients_region_keeps_owner() {
+    use yserver_protocol::x11::xfixes as x11xfixes;
+
+    let mut body = XFIXES_REGION.to_le_bytes().to_vec();
+    body.extend_from_slice(&1_i16.to_le_bytes());
+    body.extend_from_slice(&2_i16.to_le_bytes());
+    assert_xfixes_single_write_preserves_owner(x11xfixes::TRANSLATE_REGION, &body, &[(2, 4, 3, 4)]);
+}
+
+/// Mutation: assign the destination's owner to the writer in ExpandRegion;
+/// the expanded rectangle must remain fetchable after disconnect.
+#[test]
+fn xfixes_expand_region_into_other_clients_region_keeps_owner() {
+    use yserver_protocol::x11::xfixes as x11xfixes;
+
+    let mut body = xfixes_u32s(&[XFIXES_SOURCE, XFIXES_REGION]);
+    for margin in [1_u16, 2, 3, 4] {
+        body.extend_from_slice(&margin.to_le_bytes());
+    }
+    assert_xfixes_single_write_preserves_owner(x11xfixes::EXPAND_REGION, &body, &[(9, 17, 33, 47)]);
+}
+
 /// QueryVersion follows Xorg's rule and gates requests on the
 /// negotiated major. Ground truth: Xorg 21.1.24 Xvfb, raw xcb probe —
 /// HideCursor before QueryVersion is BadRequest (major 138 there,

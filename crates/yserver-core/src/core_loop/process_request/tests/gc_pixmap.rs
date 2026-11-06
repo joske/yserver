@@ -332,6 +332,10 @@ fn free_pixmap_retains_host_pixmap_while_gc_clip_mask_still_references_it() {
         None,
         ClientId(1),
         SequenceNumber(1),
+        crate::access::RequestOpcodes {
+            major: 54,
+            minor: 0,
+        },
         &free_pixmap_body(0x3000),
     )
     .expect("free pixmap");
@@ -414,8 +418,20 @@ fn change_gc(
     for v in values {
         body.extend(v.to_le_bytes());
     }
-    handle_change_gc(state, backend, None, ClientId(1), SequenceNumber(1), &body)
-        .expect("change gc");
+    handle_change_gc(
+        state,
+        backend,
+        None,
+        ClientId(1),
+        SequenceNumber(1),
+        RequestHeader {
+            opcode: 56,
+            data: 0,
+            length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+        },
+        &body,
+    )
+    .expect("change gc");
 }
 
 fn free_pixmaps(state: &mut ServerState, backend: &mut RecordingBackend, ids: &[u32]) {
@@ -426,6 +442,10 @@ fn free_pixmaps(state: &mut ServerState, backend: &mut RecordingBackend, ids: &[
             None,
             ClientId(1),
             SequenceNumber(1),
+            crate::access::RequestOpcodes {
+                major: 54,
+                minor: 0,
+            },
             &free_pixmap_body(id),
         )
         .expect("free pixmap");
@@ -597,6 +617,10 @@ fn copy_gc_releases_freed_pixmaps_it_overwrites() {
         None,
         ClientId(1),
         SequenceNumber(1),
+        crate::access::RequestOpcodes {
+            major: 57,
+            minor: 0,
+        },
         &body,
     )
     .expect("copy gc");
@@ -621,6 +645,10 @@ fn free_gc_releases_the_freed_pixmaps_it_held() {
         None,
         ClientId(1),
         SequenceNumber(1),
+        crate::access::RequestOpcodes {
+            major: 60,
+            minor: 0,
+        },
         &0x2100u32.to_le_bytes(),
     )
     .expect("free gc");
@@ -686,6 +714,10 @@ fn free_pixmap_retains_host_pixmap_while_a_window_border_still_references_it() {
         None,
         ClientId(1),
         SequenceNumber(2),
+        crate::access::RequestOpcodes {
+            major: 54,
+            minor: 0,
+        },
         &free_pixmap_body(tile.0),
     )
     .expect("free pixmap");
@@ -785,6 +817,10 @@ fn a_host_pixmap_shared_as_background_and_border_frees_only_when_both_let_go() {
         None,
         ClientId(1),
         SequenceNumber(3),
+        crate::access::RequestOpcodes {
+            major: 54,
+            minor: 0,
+        },
         &free_pixmap_body(tile.0),
     )
     .expect("free pixmap");
@@ -850,6 +886,10 @@ fn destroying_a_window_releases_the_border_tile_it_was_keeping_alive() {
         None,
         ClientId(1),
         SequenceNumber(2),
+        crate::access::RequestOpcodes {
+            major: 54,
+            minor: 0,
+        },
         &free_pixmap_body(tile.0),
     )
     .expect("free pixmap");
@@ -936,6 +976,10 @@ fn replacing_a_shared_background_and_border_frees_the_host_tile_once() {
         None,
         ClientId(1),
         SequenceNumber(2),
+        crate::access::RequestOpcodes {
+            major: 54,
+            minor: 0,
+        },
         &free_pixmap_body(old.0),
     )
     .expect("free pixmap");
@@ -1014,6 +1058,10 @@ fn free_pixmap_retains_host_pixmap_while_gc_tile_still_references_it() {
         None,
         ClientId(1),
         SequenceNumber(1),
+        crate::access::RequestOpcodes {
+            major: 54,
+            minor: 0,
+        },
         &free_pixmap_body(0x3001),
     )
     .expect("free pixmap");

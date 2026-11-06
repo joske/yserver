@@ -1,4 +1,5 @@
 use crate::{
+    access::{AccessMode, Creation, RequestOpcodes, ResourceKind, ResourceTarget},
     backend::{Backend, OriginContext},
     core_loop::{
         damage_fanout::{
@@ -461,17 +462,44 @@ pub(super) fn handle_reparent_window(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let Some(request) = x11::reparent_window_request(body) else {
         return Ok(RequestOutcome::Handled);
     };
-    // Xorg ReparentWindow unmaps a mapped window first (`dix/window.c:2519`):
-    // UnmapNotify, and the pointer leaves it while it is still in the old
-    // place. Its map state is only hidden for that hit-test; the reparent
-    // below keeps the window mapped, and the MapNotify after ReparentNotify
-    // stands for Xorg's MapWindow.
-    let unmapped = if state.resources.check_reparent_window(request).is_ok() {
+    if state.resources.window(request.window).is_some() {
+        if let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: request.window,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            AccessMode::MANAGE,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 7);
+        }
+        if state.resources.window(request.parent).is_some()
+            && let Err((code, bad_value)) = super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: request.parent,
+                    kind: ResourceKind::Window,
+                    creation: None,
+                },
+                AccessMode::ADD,
+                access_request,
+            )
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 7);
+        }
+    }
+    let valid = state.resources.check_reparent_window(request).is_ok();
+    let mapped = valid.then(|| {
         state.resources.window(request.window).and_then(|w| {
             (w.map_state != MapState::Unmapped).then_some((
                 w.parent,
@@ -479,9 +507,36 @@ pub(super) fn handle_reparent_window(
                 w.override_redirect,
             ))
         })
+    });
+    let mapped = mapped.flatten();
+    let remap_denied = if valid
+        && mapped.is_some()
+        && super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: request.window,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            AccessMode::SHOW,
+            access_request,
+        )
+        .is_err()
+    {
+        // XLibre's denied MapWindow is Success. Reuse the client
+        // UnmapWindow transition once, then reparent without remapping.
+        unmap_window(state, backend, origin, request.window, false);
+        true
     } else {
-        None
+        false
     };
+    // Xorg ReparentWindow unmaps a mapped window first (`dix/window.c:2519`):
+    // UnmapNotify, and the pointer leaves it while it is still in the old
+    // place. Its map state is only hidden for that hit-test; the reparent
+    // below keeps the window mapped, and the MapNotify after ReparentNotify
+    // stands for Xorg's MapWindow.
+    let unmapped = if valid && !remap_denied { mapped } else { None };
     let unmapped_host = unmapped
         .and_then(|_| state.resources.window(request.window))
         .and_then(|w| w.host_xid)
@@ -759,6 +814,7 @@ pub(super) fn handle_create_window(
     let Some(request) = x11::create_window_request(header.data, body) else {
         return Ok(RequestOutcome::Handled);
     };
+    let access_request = RequestOpcodes::for_request(header);
     debug!(
         "client {} create window 0x{:x} parent=0x{:x} pos=({},{}) size={}x{} mask=0x{:x}",
         client_id.0,
@@ -788,6 +844,19 @@ pub(super) fn handle_create_window(
             parent.0,
             1,
         );
+    }
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: parent,
+            kind: ResourceKind::Window,
+            creation: None,
+        },
+        AccessMode::ADD,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 1);
     }
     // Xorg `dix/window.c::CreateWindow:769-786` resolves
     // `class == CopyFromParent` against the parent, then enforces:
@@ -876,41 +945,82 @@ pub(super) fn handle_create_window(
     // typed enum is CopyFromParent.
     if let Some(bg_pixmap) = request.background_pixmap
         && bg_pixmap.0 > 1
-        && state.resources.pixmap(bg_pixmap).is_none()
     {
-        return emit_x11_error(
+        if state.resources.pixmap(bg_pixmap).is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_PIXMAP,
+                bg_pixmap.0,
+                1,
+            );
+        }
+        if let Err((code, bad_value)) = super::validate_resource_access(
             state,
             client_id,
-            sequence,
-            x11::error::BAD_PIXMAP,
-            bg_pixmap.0,
-            1,
-        );
+            ResourceTarget {
+                id: bg_pixmap,
+                kind: ResourceKind::Pixmap,
+                creation: None,
+            },
+            AccessMode::READ,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 1);
+        }
     }
-    if let Some(Some(colormap)) = request.colormap
-        && state.resources.colormap(colormap).is_none()
-    {
-        return emit_x11_error(
+    if let Some(Some(colormap)) = request.colormap {
+        if state.resources.colormap(colormap).is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_COLORMAP,
+                colormap.0,
+                1,
+            );
+        }
+        if let Err((code, bad_value)) = super::validate_resource_access(
             state,
             client_id,
-            sequence,
-            x11::error::BAD_COLORMAP,
-            colormap.0,
-            1,
-        );
+            ResourceTarget {
+                id: colormap,
+                kind: ResourceKind::Colormap,
+                creation: None,
+            },
+            AccessMode::USE,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 1);
+        }
     }
     if let Some(cursor) = request.cursor
         && cursor.0 != 0
-        && !state.resources.cursor_exists(cursor)
     {
-        return emit_x11_error(
+        if !state.resources.cursor_exists(cursor) {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_CURSOR,
+                cursor.0,
+                1,
+            );
+        }
+        if let Err((code, bad_value)) = super::validate_resource_access(
             state,
             client_id,
-            sequence,
-            x11::error::BAD_CURSOR,
-            cursor.0,
-            1,
-        );
+            ResourceTarget {
+                id: cursor,
+                kind: ResourceKind::Cursor,
+                creation: None,
+            },
+            AccessMode::USE,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 1);
+        }
     }
     // Border validation. The effective depth resolves CopyFromParent
     // (depth 0) against the parent, matching
@@ -962,12 +1072,49 @@ pub(super) fn handle_create_window(
                         1,
                     );
                 }
-                Some(pixmap) if pixmap.depth != effective_depth => {
-                    return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, 1);
+                Some(pixmap) => {
+                    if let Err((code, bad_value)) = super::validate_resource_access(
+                        state,
+                        client_id,
+                        ResourceTarget {
+                            id: border_pixmap,
+                            kind: ResourceKind::Pixmap,
+                            creation: None,
+                        },
+                        AccessMode::READ,
+                        access_request,
+                    ) {
+                        return emit_x11_error(state, client_id, sequence, code, bad_value, 1);
+                    }
+                    if pixmap.depth != effective_depth {
+                        return emit_x11_error(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_MATCH,
+                            0,
+                            1,
+                        );
+                    }
                 }
-                Some(_) => {}
             }
         }
+    }
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: window_id,
+            kind: ResourceKind::Window,
+            creation: Some(Creation {
+                parent: Some(parent),
+                owner: client_id,
+            }),
+        },
+        AccessMode::CREATE | AccessMode::SET_ATTR,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 1);
     }
     state.resources.create_window(client_id, request);
     if mask != 0
@@ -1119,11 +1266,13 @@ pub(super) fn handle_change_window_attributes(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let Some(mut request) = x11::change_window_attributes_request(body) else {
         return Ok(RequestOutcome::Handled);
     };
+    let access_request = RequestOpcodes::for_request(header);
     if state.resources.window(request.window).is_none() {
         // Xorg `dix/dispatch.c::ProcChangeWindowAttributes` returns
         // BadWindow via dixLookupWindow before applying any attribute
@@ -1139,6 +1288,29 @@ pub(super) fn handle_change_window_attributes(
             request.window.0,
             2,
         );
+    }
+    let event_mask = request.value_mask & 0x0800 != 0;
+    let other_attributes = request.value_mask & !0x0800 != 0;
+    let window_mode = match (event_mask, other_attributes) {
+        (true, true) => Some(AccessMode::RECEIVE | AccessMode::SET_ATTR),
+        (true, false) => Some(AccessMode::RECEIVE),
+        (false, true) => Some(AccessMode::SET_ATTR),
+        (false, false) => None,
+    };
+    if let Some(mode) = window_mode
+        && let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: request.window,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            mode,
+            access_request,
+        )
+    {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 2);
     }
     // Xorg `dix/window.c::ChangeWindowAttributes:1174`: an InputOnly
     // window may only carry the `INPUTONLY_LEGAL_MASK` bits
@@ -1173,41 +1345,82 @@ pub(super) fn handle_change_window_attributes(
     // means CopyFromParent and is resolved against the parent.
     if let Some(bg_pixmap) = request.background_pixmap
         && bg_pixmap.0 > 1
-        && state.resources.pixmap(bg_pixmap).is_none()
     {
-        return emit_x11_error(
+        if state.resources.pixmap(bg_pixmap).is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_PIXMAP,
+                bg_pixmap.0,
+                2,
+            );
+        }
+        if let Err((code, bad_value)) = super::validate_resource_access(
             state,
             client_id,
-            sequence,
-            x11::error::BAD_PIXMAP,
-            bg_pixmap.0,
-            2,
-        );
+            ResourceTarget {
+                id: bg_pixmap,
+                kind: ResourceKind::Pixmap,
+                creation: None,
+            },
+            AccessMode::READ,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 2);
+        }
     }
-    if let Some(Some(colormap)) = request.colormap
-        && state.resources.colormap(colormap).is_none()
-    {
-        return emit_x11_error(
+    if let Some(Some(colormap)) = request.colormap {
+        if state.resources.colormap(colormap).is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_COLORMAP,
+                colormap.0,
+                2,
+            );
+        }
+        if let Err((code, bad_value)) = super::validate_resource_access(
             state,
             client_id,
-            sequence,
-            x11::error::BAD_COLORMAP,
-            colormap.0,
-            2,
-        );
+            ResourceTarget {
+                id: colormap,
+                kind: ResourceKind::Colormap,
+                creation: None,
+            },
+            AccessMode::USE,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 2);
+        }
     }
     if let Some(cursor) = request.cursor
         && cursor.0 != 0
-        && !state.resources.cursor_exists(cursor)
     {
-        return emit_x11_error(
+        if !state.resources.cursor_exists(cursor) {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_CURSOR,
+                cursor.0,
+                2,
+            );
+        }
+        if let Err((code, bad_value)) = super::validate_resource_access(
             state,
             client_id,
-            sequence,
-            x11::error::BAD_CURSOR,
-            cursor.0,
-            2,
-        );
+            ResourceTarget {
+                id: cursor,
+                kind: ResourceKind::Cursor,
+                creation: None,
+            },
+            AccessMode::USE,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 2);
+        }
     }
     // `dix/window.c:1251` CWBorderPixmap. CWBorderPixel overrides it and
     // clears the bit before the pixmap is resolved (`:1298`), so a
@@ -1246,10 +1459,31 @@ pub(super) fn handle_change_window_attributes(
                         2,
                     );
                 }
-                Some(pixmap) if pixmap.depth != own_depth => {
-                    return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, 2);
+                Some(pixmap) => {
+                    if let Err((code, bad_value)) = super::validate_resource_access(
+                        state,
+                        client_id,
+                        ResourceTarget {
+                            id: border_pixmap,
+                            kind: ResourceKind::Pixmap,
+                            creation: None,
+                        },
+                        AccessMode::READ,
+                        access_request,
+                    ) {
+                        return emit_x11_error(state, client_id, sequence, code, bad_value, 2);
+                    }
+                    if pixmap.depth != own_depth {
+                        return emit_x11_error(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_MATCH,
+                            0,
+                            2,
+                        );
+                    }
                 }
-                Some(_) => {}
             }
         }
     }
@@ -1528,6 +1762,7 @@ pub(super) fn handle_configure_window(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let Some(request) = x11::configure_window_request(body) else {
@@ -1541,6 +1776,7 @@ pub(super) fn handle_configure_window(
         sequence,
         request,
         crate::rootless::ConfigureSource::Client,
+        Some(access_request),
     )
 }
 
@@ -1553,6 +1789,7 @@ pub(crate) fn configure_window_apply(
     sequence: SequenceNumber,
     request: x11::ConfigureWindowRequest,
     source: crate::rootless::ConfigureSource,
+    access_request: Option<RequestOpcodes>,
 ) -> io::Result<RequestOutcome> {
     log::trace!(
         target: "yserver::input::restack",
@@ -1574,6 +1811,21 @@ pub(crate) fn configure_window_apply(
     // of the KMS scanout dims. xts5 produced a 70x61 root resize that
     // cascaded into ~1000 UNRES.
     if request.window == ROOT_WINDOW {
+        if let Some(access_request) = access_request
+            && let Err((code, bad_value)) = super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: request.window,
+                    kind: ResourceKind::Window,
+                    creation: None,
+                },
+                AccessMode::MANAGE | AccessMode::SET_ATTR,
+                access_request,
+            )
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 12);
+        }
         debug!(
             "client {} #{} ConfigureWindow on root — dropped (matches Xorg semantics)",
             client_id.0, sequence.0
@@ -1596,6 +1848,21 @@ pub(crate) fn configure_window_apply(
             request.window.0,
             12,
         );
+    }
+    if let Some(access_request) = access_request
+        && let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: request.window,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            AccessMode::MANAGE | AccessMode::SET_ATTR,
+            access_request,
+        )
+    {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 12);
     }
     // Xorg `dix/window.c::ConfigureWindow` checks (in order, before
     // any geometry change or SubstructureRedirect dispatch):
@@ -1651,6 +1918,21 @@ pub(crate) fn configure_window_apply(
                 sibling.0,
                 12,
             );
+        }
+        if let Some(access_request) = access_request
+            && let Err((code, bad_value)) = super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: sibling,
+                    kind: ResourceKind::Window,
+                    creation: None,
+                },
+                AccessMode::GET_ATTR,
+                access_request,
+            )
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 12);
         }
         let sibling_parent = sibling_window.map(|w| w.parent);
         if sibling_parent != Some(window_parent) || sibling == request.window {
@@ -2058,6 +2340,7 @@ pub(super) fn handle_destroy_window(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if let Some(window) = x11::free_resource_id(body) {
@@ -2074,6 +2357,40 @@ pub(super) fn handle_destroy_window(
                 window.0,
                 4,
             );
+        }
+        let access_request = RequestOpcodes::for_request(header);
+        if let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: window,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            AccessMode::DESTROY,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 4);
+        }
+        if window != ROOT_WINDOW {
+            let parent = state
+                .resources
+                .window(window)
+                .expect("window existence verified above")
+                .parent;
+            if let Err((code, bad_value)) = super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: parent,
+                    kind: ResourceKind::Window,
+                    creation: None,
+                },
+                AccessMode::REMOVE,
+                access_request,
+            ) {
+                return emit_x11_error(state, client_id, sequence, code, bad_value, 4);
+            }
         }
         // `ProcDestroyWindow` frees only a window with a parent: root plans
         // nothing and is a successful no-op (#297).
@@ -2094,6 +2411,7 @@ pub(super) fn handle_destroy_subwindows(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() >= 4 {
@@ -2110,6 +2428,20 @@ pub(super) fn handle_destroy_subwindows(
                 5,
             );
         }
+        let access_request = RequestOpcodes::for_request(header);
+        if let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: parent,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            AccessMode::REMOVE,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 5);
+        }
         // Every child is planned and prepared before anything changes, so a
         // failed preparation leaves the request undone.
         let mut prepared = Vec::new();
@@ -2124,8 +2456,24 @@ pub(super) fn handle_destroy_subwindows(
         }
         // Xorg unmaps them all first, so all UnmapNotifies and one exposure
         // of the parent precede the DestroyNotifies (`dix/window.c:1104-1124`).
-        unmap_subwindows_with_delta(state, backend, origin, client_id, sequence, body)?;
+        unmap_subwindows_with_delta(state, backend, origin, client_id, sequence, body, None)?;
         for ready in prepared {
+            let child = ready.plan().top();
+            if super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: child,
+                    kind: ResourceKind::Window,
+                    creation: None,
+                },
+                AccessMode::DESTROY,
+                access_request,
+            )
+            .is_err()
+            {
+                break;
+            }
             finish_destroy(state, backend, origin, ready);
         }
     }
@@ -2137,21 +2485,17 @@ pub(super) fn handle_get_geometry(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let drawable = x11::drawable_request_id(body).unwrap_or(ROOT_WINDOW);
-    let geometry = state
-        .resources
-        .window(drawable)
-        .map(window_geometry)
-        .or_else(|| state.resources.pixmap(drawable).map(pixmap_geometry))
-        // #96: a GLX pbuffer is a drawable but lives only in glx_drawables,
-        // not the core resource store. Mesa's loader_dri3 calls GetGeometry on
-        // the pbuffer XID to size its DRI3 backing; without this it gets
-        // BadDrawable → "failed to create drawable" → ANGLE (Chromium) can't
-        // create its init pbuffer → GPU process dies.
-        .or_else(|| glx_pbuffer_geometry(state, drawable));
-    let Some(geometry) = geometry else {
+    let (geometry, kind) = if let Some(window) = state.resources.window(drawable) {
+        (window_geometry(window), ResourceKind::Window)
+    } else if let Some(pixmap) = state.resources.pixmap(drawable) {
+        (pixmap_geometry(pixmap), ResourceKind::Pixmap)
+    } else if let Some(geometry) = glx_pbuffer_geometry(state, drawable) {
+        (geometry, ResourceKind::GlxDrawable)
+    } else {
         // Spec: BadDrawable on unknown drawable. xts probes
         // destroyed/stale IDs and expects the protocol error.
         return emit_x11_error(
@@ -2163,6 +2507,19 @@ pub(super) fn handle_get_geometry(
             14,
         );
     };
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: drawable,
+            kind,
+            creation: None,
+        },
+        AccessMode::GET_ATTR,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 14);
+    }
     debug!(
         "client {} #{} GetGeometry 0x{:x} -> root=0x{:x} pos=({},{}) size=({}x{}) border={} depth={}",
         client_id.0,
@@ -2189,6 +2546,7 @@ pub(super) fn handle_query_tree(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let window = x11::drawable_request_id(body).unwrap_or(ROOT_WINDOW);
@@ -2206,6 +2564,19 @@ pub(super) fn handle_query_tree(
             15,
         );
     };
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: window,
+            kind: ResourceKind::Window,
+            creation: None,
+        },
+        AccessMode::LIST,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 15);
+    }
     // X11 spec: the root window's parent is None. Internally we store
     // root.parent = root (self) and other code relies on that invariant, so
     // translate the self-parent to None only here on the QueryTree wire reply.
@@ -2254,6 +2625,7 @@ pub(super) fn handle_map_window(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let Some(window) = x11::map_window_id(body) else {
@@ -2277,6 +2649,22 @@ pub(super) fn handle_map_window(
             8,
         );
     };
+
+    if super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: window,
+            kind: ResourceKind::Window,
+            creation: None,
+        },
+        AccessMode::SHOW,
+        request,
+    )
+    .is_err()
+    {
+        return Ok(RequestOutcome::Handled);
+    }
 
     // Per X11 protocol (Xorg `dix/window.c:2661`): "If the window is
     // already mapped, this request has no effect." This MUST guard
@@ -2419,10 +2807,19 @@ pub(super) fn handle_map_subwindows(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    map_subwindows_with_delta(state, backend, origin, client_id, sequence, body)
-        .map(|(outcome, _delta)| outcome)
+    map_subwindows_with_delta(
+        state,
+        backend,
+        origin,
+        client_id,
+        sequence,
+        access_request,
+        body,
+    )
+    .map(|(outcome, _delta)| outcome)
 }
 
 /// MapSubwindows; also returns the union of the children's viewability deltas.
@@ -2432,6 +2829,7 @@ pub(super) fn map_subwindows_with_delta(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<(RequestOutcome, ViewabilityDelta)> {
     let mut delta = ViewabilityDelta::default();
@@ -2452,6 +2850,20 @@ pub(super) fn map_subwindows_with_delta(
         )
         .map(|outcome| (outcome, delta));
     }
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: parent,
+            kind: ResourceKind::Window,
+            creation: None,
+        },
+        AccessMode::LIST,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 9)
+            .map(|outcome| (outcome, delta));
+    }
     // Xorg walks firstChild→nextSib, top-most first, mapping, notifying and
     // realizing each in turn (`dix/window.c:2739-2758`).
     let children: Vec<ResourceId> = state
@@ -2463,6 +2875,21 @@ pub(super) fn map_subwindows_with_delta(
         .collect();
     let mut newly_viewable = Vec::new();
     for child in children {
+        if super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: child,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            AccessMode::SHOW,
+            access_request,
+        )
+        .is_err()
+        {
+            continue;
+        }
         let transition = state.resources.map_window(child);
         let was_unmapped = transition.mapping_changed;
         let host_xid = state.resources.window(child).and_then(|w| w.host_xid);
@@ -2521,6 +2948,7 @@ pub(super) fn handle_unmap_window(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if let Some(window) = x11::map_window_id(body) {
@@ -2536,6 +2964,19 @@ pub(super) fn handle_unmap_window(
                 window.0,
                 10,
             );
+        }
+        if let Err((code, bad_value)) = super::validate_resource_access(
+            state,
+            client_id,
+            ResourceTarget {
+                id: window,
+                kind: ResourceKind::Window,
+                creation: None,
+            },
+            AccessMode::HIDE,
+            access_request,
+        ) {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 10);
         }
         unmap_window(state, backend, origin, window, false);
     }
@@ -2662,10 +3103,65 @@ pub(super) fn handle_unmap_subwindows(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    unmap_subwindows_with_delta(state, backend, origin, client_id, sequence, body)
-        .map(|(outcome, _delta)| outcome)
+    let Some(parent) = x11::map_window_id(body) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    let Some(mut children) = state.resources.mapped_children_bottom_to_top(parent) else {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_WINDOW,
+            parent.0,
+            11,
+        );
+    };
+    if parent == ROOT_WINDOW {
+        children.retain(|child| *child != COMPOSITE_OVERLAY_WINDOW);
+    }
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: parent,
+            kind: ResourceKind::Window,
+            creation: None,
+        },
+        AccessMode::LIST,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 11);
+    }
+    let denied_children = children
+        .into_iter()
+        .filter(|child| {
+            super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: *child,
+                    kind: ResourceKind::Window,
+                    creation: None,
+                },
+                AccessMode::HIDE,
+                access_request,
+            )
+            .is_err()
+        })
+        .collect::<HashSet<_>>();
+    unmap_subwindows_with_delta(
+        state,
+        backend,
+        origin,
+        client_id,
+        sequence,
+        body,
+        Some(&denied_children),
+    )
+    .map(|(outcome, _delta)| outcome)
 }
 
 /// UnmapSubwindows; also returns the union of the children's viewability deltas.
@@ -2676,6 +3172,7 @@ pub(super) fn unmap_subwindows_with_delta(
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
+    denied_children: Option<&HashSet<ResourceId>>,
 ) -> io::Result<(RequestOutcome, ViewabilityDelta)> {
     let mut delta = ViewabilityDelta::default();
     let Some(parent) = x11::map_window_id(body) else {
@@ -2700,6 +3197,9 @@ pub(super) fn unmap_subwindows_with_delta(
     // overlay window stays mapped.
     if parent == ROOT_WINDOW {
         children.retain(|child| *child != COMPOSITE_OVERLAY_WINDOW);
+    }
+    if let Some(denied_children) = denied_children {
+        children.retain(|child| !denied_children.contains(child));
     }
     let clip_before = crate::core_loop::clip_list::clip_list(state, parent);
     // Snapshot mapping order + collect host xids; unmap each in the
@@ -2752,6 +3252,7 @@ pub(super) fn handle_get_window_attributes(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let id = x11::drawable_request_id(body).unwrap_or(ROOT_WINDOW);
@@ -2764,6 +3265,19 @@ pub(super) fn handle_get_window_attributes(
     // protocol error.
     if state.resources.window(id).is_none() {
         return emit_x11_error(state, client_id, sequence, x11::error::BAD_WINDOW, id.0, 3);
+    }
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id,
+            kind: ResourceKind::Window,
+            creation: None,
+        },
+        AccessMode::GET_ATTR,
+        RequestOpcodes::for_request(header),
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 3);
     }
     let target = id;
     let your_event_mask = state
@@ -2856,9 +3370,38 @@ pub(super) fn handle_circulate_window(
             13,
         );
     }
+    let access_request = RequestOpcodes::for_request(header);
+    if let Err((code, bad_value)) = super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: container,
+            kind: ResourceKind::Window,
+            creation: None,
+        },
+        AccessMode::MANAGE,
+        access_request,
+    ) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 13);
+    }
     let Some(child) = state.circulate_candidate(container, direction) else {
         return Ok(RequestOutcome::Handled);
     };
+    if super::validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            id: child,
+            kind: ResourceKind::Window,
+            creation: None,
+        },
+        AccessMode::MANAGE | AccessMode::SET_ATTR,
+        access_request,
+    )
+    .is_err()
+    {
+        return Ok(RequestOutcome::Handled);
+    }
     // SubstructureRedirect on the container by another client turns it into
     // a CirculateRequest (Xorg MaybeDeliverEventsToClient skips the
     // requester).
@@ -2918,18 +3461,33 @@ pub(super) fn handle_change_save_set(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    if body.len() >= 4
-        && let Some(c) = state.clients.get_mut(&client_id.0)
-    {
+    if body.len() >= 4 {
         let win = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
-        match header.data {
-            0 => {
-                c.save_set.insert(win);
+        if state.resources.window(win).is_some()
+            && let Err((code, bad_value)) = super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: win,
+                    kind: ResourceKind::Window,
+                    creation: None,
+                },
+                AccessMode::MANAGE,
+                RequestOpcodes::for_request(header),
+            )
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 6);
+        }
+        if let Some(c) = state.clients.get_mut(&client_id.0) {
+            match header.data {
+                0 => {
+                    c.save_set.insert(win);
+                }
+                1 => {
+                    c.save_set.remove(&win);
+                }
+                _ => {}
             }
-            1 => {
-                c.save_set.remove(&win);
-            }
-            _ => {}
         }
     }
     debug!("client {} #{} ChangeSaveSet", client_id.0, sequence.0);
@@ -2987,6 +3545,7 @@ pub(super) fn handle_translate_coordinates(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    access_request: RequestOpcodes,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let (child, dst_x, dst_y, log_src, log_dst, log_src_xy) = if body.len() >= 12 {
@@ -2994,6 +3553,36 @@ pub(super) fn handle_translate_coordinates(
         let dst_window = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
         let src_x = i16::from_le_bytes([body[8], body[9]]);
         let src_y = i16::from_le_bytes([body[10], body[11]]);
+        if state.resources.window(src_window).is_some()
+            && let Err((code, bad_value)) = super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: src_window,
+                    kind: ResourceKind::Window,
+                    creation: None,
+                },
+                AccessMode::GET_ATTR,
+                access_request,
+            )
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 40);
+        }
+        if state.resources.window(dst_window).is_some()
+            && let Err((code, bad_value)) = super::validate_resource_access(
+                state,
+                client_id,
+                ResourceTarget {
+                    id: dst_window,
+                    kind: ResourceKind::Window,
+                    creation: None,
+                },
+                AccessMode::GET_ATTR,
+                access_request,
+            )
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 40);
+        }
         let (src_abs_x, src_abs_y) = state.resources.window_absolute_position(src_window);
         let abs_x = src_abs_x + i32::from(src_x);
         let abs_y = src_abs_y + i32::from(src_y);

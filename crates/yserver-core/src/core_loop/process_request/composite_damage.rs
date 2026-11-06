@@ -639,10 +639,14 @@ pub(super) fn handle_damage_request(
                     .map(crate::region::Region::to_rects)
                     .unwrap_or_default();
                 if parts != 0 {
+                    let parts_owner = state
+                        .xfixes_regions
+                        .get(&parts)
+                        .map_or(client_id, |region| region.owner);
                     state.xfixes_regions.insert(
                         parts,
                         crate::server::XFixesRegion {
-                            owner: client_id,
+                            owner: parts_owner,
                             region: parts_region,
                         },
                     );

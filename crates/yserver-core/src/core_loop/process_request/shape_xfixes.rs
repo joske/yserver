@@ -728,6 +728,18 @@ fn xfixes_region(state: &ServerState, id: u32) -> Region {
         .unwrap_or_default()
 }
 
+/// Replace a region's contents without changing the owner of an existing
+/// XID. A new destination keeps the current requester's ownership.
+fn store_xfixes_region(state: &mut ServerState, id: u32, owner: ClientId, region: Region) {
+    if let Some(existing) = state.xfixes_regions.get_mut(&id) {
+        existing.region = region;
+    } else {
+        state
+            .xfixes_regions
+            .insert(id, crate::server::XFixesRegion { owner, region });
+    }
+}
+
 /// `ProcXFixesInvertRegion`'s bounds: the far edges stop at `MAXSHORT`.
 fn invert_bounds(r: yserver_protocol::x11::xfixes::RegionRect) -> crate::region::Box32 {
     let max = i32::from(i16::MAX);
@@ -1388,14 +1400,7 @@ pub(super) fn handle_xfixes_request(
         }
         x11xfixes::SET_REGION => {
             if let Some((region, rects)) = x11xfixes::parse_create_region(body) {
-                state
-                    .xfixes_regions
-                    .entry(region)
-                    .and_modify(|r| r.region = Region::from_wire_rects(&rects))
-                    .or_insert_with(|| crate::server::XFixesRegion {
-                        owner: client_id,
-                        region: Region::from_wire_rects(&rects),
-                    });
+                store_xfixes_region(state, region, client_id, Region::from_wire_rects(&rects));
             }
         }
         x11xfixes::COPY_REGION => {
@@ -1406,13 +1411,7 @@ pub(super) fn handle_xfixes_request(
                     "CopyRegion src=0x{source:08x} dst=0x{dest:08x} rects{}",
                     format_region_rects(&region.to_rects()),
                 );
-                state.xfixes_regions.insert(
-                    dest,
-                    crate::server::XFixesRegion {
-                        owner: client_id,
-                        region,
-                    },
-                );
+                store_xfixes_region(state, dest, client_id, region);
             }
         }
         x11xfixes::UNION_REGION | x11xfixes::INTERSECT_REGION | x11xfixes::SUBTRACT_REGION => {
@@ -1445,13 +1444,7 @@ pub(super) fn handle_xfixes_request(
                     format_region_rects(&b.to_rects()),
                     format_region_rects(&region.to_rects()),
                 );
-                state.xfixes_regions.insert(
-                    dest,
-                    crate::server::XFixesRegion {
-                        owner: client_id,
-                        region,
-                    },
-                );
+                store_xfixes_region(state, dest, client_id, region);
             }
         }
         x11xfixes::INVERT_REGION => {
@@ -1460,13 +1453,7 @@ pub(super) fn handle_xfixes_request(
                     .xfixes_regions
                     .get(&source)
                     .map_or_else(Region::default, |r| r.region.inverse(invert_bounds(bounds)));
-                state.xfixes_regions.insert(
-                    dest,
-                    crate::server::XFixesRegion {
-                        owner: client_id,
-                        region,
-                    },
-                );
+                store_xfixes_region(state, dest, client_id, region);
             }
         }
         x11xfixes::TRANSLATE_REGION => {
@@ -1485,13 +1472,7 @@ pub(super) fn handle_xfixes_request(
         x11xfixes::REGION_EXTENTS => {
             if let Some((source, dest)) = x11xfixes::parse_u32_pair(body) {
                 let rect = xfixes_region(state, source).extents_rect();
-                state.xfixes_regions.insert(
-                    dest,
-                    crate::server::XFixesRegion {
-                        owner: client_id,
-                        region: Region::rect(rect),
-                    },
-                );
+                store_xfixes_region(state, dest, client_id, Region::rect(rect));
             }
         }
         x11xfixes::FETCH_REGION => {
