@@ -361,6 +361,9 @@ pub struct RecordingBackend {
     /// `take_displayed_cursor_change`. Tests set it to stand in for a KMS
     /// sprite change.
     pub displayed_cursor_change: Option<crate::backend::DisplayedCursor>,
+    /// Canned active cursor image returned by `get_active_cursor_image`.
+    /// Defaults to `None`, matching backends without a sprite snapshot.
+    pub active_cursor_image: Option<crate::backend::ActiveCursorImage>,
     next_handle: Mutex<u32>,
     fake_window_id: u32,
     fake_root_visual_xid: u32,
@@ -716,6 +719,7 @@ impl RecordingBackend {
         Self {
             calls: Mutex::new(Vec::new()),
             displayed_cursor_change: None,
+            active_cursor_image: None,
             next_handle: Mutex::new(0x0001_0000),
             fake_window_id: 0x0000_0100,
             fake_root_visual_xid: 0x0000_0021,
@@ -2791,6 +2795,10 @@ impl Backend for RecordingBackend {
 
     fn take_displayed_cursor_change(&mut self) -> Option<crate::backend::DisplayedCursor> {
         self.displayed_cursor_change.take()
+    }
+
+    fn get_active_cursor_image(&self) -> Option<crate::backend::ActiveCursorImage> {
+        self.active_cursor_image.clone()
     }
 
     fn set_shape_rectangles(
