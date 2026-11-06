@@ -315,12 +315,36 @@ fn handle_shape_request_ops(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    use crate::access::{AccessMode, RequestOpcodes, ResourceKind};
     use yserver_protocol::x11::{ClientByteOrder, shape as x11shape};
     let byte_order = state
         .clients
         .get(&client_id.0)
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
+    let access_request = RequestOpcodes::for_request(header);
+    macro_rules! check_resource {
+        ($id:expr, $kind:expr, $mode:expr) => {
+            if let Err((code, value)) = super::validate_resource_if_present(
+                state,
+                client_id,
+                $id,
+                $kind,
+                $mode,
+                access_request,
+            ) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
+        };
+    }
     debug!(
         "client {} #{} SHAPE::minor={} body_len={}",
         client_id.0,
@@ -364,6 +388,7 @@ fn handle_shape_request_ops(
                         header.opcode,
                     );
                 }
+                check_resource!(window, ResourceKind::Window, AccessMode::SET_ATTR);
                 debug!(
                     "client {} SHAPE::Rectangles dest=0x{:x} kind={} op={} off=({},{}) nrects={}",
                     client_id.0,
@@ -394,6 +419,7 @@ fn handle_shape_request_ops(
         x11shape::MASK => {
             if let Some(req) = x11shape::parse_mask_request(body) {
                 let window = ResourceId(req.dest);
+                check_resource!(window, ResourceKind::Window, AccessMode::SET_ATTR);
                 debug!(
                     "client {} SHAPE::Mask dest=0x{:x} kind={} op={} src=0x{:x} off=({},{})",
                     client_id.0, req.dest, req.dest_kind, req.op, req.src, req.x_off, req.y_off,
@@ -413,6 +439,7 @@ fn handle_shape_request_ops(
                 // (host-X11 proxy mode), preserving the previous
                 // best-effort behaviour for that path.
                 let src_id = ResourceId(req.src);
+                check_resource!(src_id, ResourceKind::Pixmap, AccessMode::READ);
                 let host_xid = state.resources.pixmap(src_id).and_then(|p| p.host_xid);
                 let banded = if let Some(host) = host_xid {
                     match backend.read_depth1_pixmap(origin, host.as_raw()) {
@@ -476,6 +503,8 @@ fn handle_shape_request_ops(
             if let Some(req) = x11shape::parse_combine_request(body) {
                 let dest = ResourceId(req.dest);
                 let src = ResourceId(req.src);
+                check_resource!(src, ResourceKind::Window, AccessMode::GET_ATTR);
+                check_resource!(dest, ResourceKind::Window, AccessMode::SET_ATTR);
                 debug!(
                     "client {} SHAPE::Combine dest=0x{:x} dest_kind={} src=0x{:x} src_kind={} op={} off=({},{})",
                     client_id.0,
@@ -513,6 +542,7 @@ fn handle_shape_request_ops(
         x11shape::OFFSET => {
             if let Some(req) = x11shape::parse_offset_request(body) {
                 let dest = ResourceId(req.dest);
+                check_resource!(dest, ResourceKind::Window, AccessMode::SET_ATTR);
                 if let Some(region) = crate::nested::shape_region(state, dest, req.dest_kind) {
                     let region = region
                         .clone()
@@ -526,6 +556,7 @@ fn handle_shape_request_ops(
         }
         x11shape::QUERY_EXTENTS => {
             let window = ResourceId(x11shape::parse_window(body).unwrap_or(ROOT_WINDOW.0));
+            check_resource!(window, ResourceKind::Window, AccessMode::GET_ATTR);
             let extents =
                 |kind| crate::nested::shape_region_or_default(state, window, kind).extents_rect();
             let bounding = extents(x11shape::KIND_BOUNDING);
@@ -549,7 +580,9 @@ fn handle_shape_request_ops(
         }
         x11shape::SELECT_INPUT => {
             if let Some(req) = x11shape::parse_select_input_request(body) {
-                let key = (client_id.0, ResourceId(req.window));
+                let window = ResourceId(req.window);
+                check_resource!(window, ResourceKind::Window, AccessMode::RECEIVE);
+                let key = (client_id.0, window);
                 if req.enable {
                     state.shape_select_masks.insert(key, true);
                 } else {
@@ -559,6 +592,7 @@ fn handle_shape_request_ops(
         }
         x11shape::INPUT_SELECTED => {
             let window = ResourceId(x11shape::parse_window(body).unwrap_or(ROOT_WINDOW.0));
+            check_resource!(window, ResourceKind::Window, AccessMode::GET_ATTR);
             let enabled = state
                 .shape_select_masks
                 .get(&(client_id.0, window))
@@ -575,6 +609,7 @@ fn handle_shape_request_ops(
             let (window, kind) = x11shape::parse_get_rectangles_request(body)
                 .map(|(w, k)| (ResourceId(w), k))
                 .unwrap_or((ROOT_WINDOW, x11shape::KIND_BOUNDING));
+            check_resource!(window, ResourceKind::Window, AccessMode::GET_ATTR);
             let rects = get_rectangles_rects(state, window, kind);
             let reply = x11shape::encode_get_rectangles_reply(
                 byte_order,

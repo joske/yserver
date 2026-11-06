@@ -1,5 +1,464 @@
 use super::*;
 
+const SHAPE_ACCESS_CLIENT: u32 = 1;
+const SHAPE_ACCESS_DEST: ResourceId = ResourceId(0x0100_1001);
+const SHAPE_ACCESS_SOURCE: ResourceId = ResourceId(0x0100_1002);
+const SHAPE_ACCESS_PIXMAP: ResourceId = ResourceId(0x0100_1003);
+const SHAPE_ACCESS_ERROR_VALUE: u32 = 0x5a17;
+
+#[derive(Clone, Copy)]
+struct ShapeAccessCheck {
+    id: ResourceId,
+    kind: crate::access::ResourceKind,
+    mode: crate::access::AccessMode,
+}
+
+struct ShapeAccessCase {
+    name: &'static str,
+    minor: u8,
+    body: Vec<u8>,
+    expected: Vec<ShapeAccessCheck>,
+}
+
+fn shape_access_fixture(with_resources: bool) -> (ServerState, RecordingBackend, UnixStream) {
+    let mut state = ServerState::new();
+    let peer = install_client(&mut state, SHAPE_ACCESS_CLIENT);
+    if with_resources {
+        for id in [SHAPE_ACCESS_DEST, SHAPE_ACCESS_SOURCE] {
+            state.resources.create_window(
+                ClientId(SHAPE_ACCESS_CLIENT),
+                CreateWindowRequest {
+                    depth: 24,
+                    window: id,
+                    parent: ROOT_WINDOW,
+                    width: 20,
+                    height: 20,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            crate::nested::set_shape_region(
+                &mut state,
+                id,
+                yserver_protocol::x11::shape::KIND_INPUT,
+                crate::region::Region::rect(yserver_protocol::x11::xfixes::RegionRect {
+                    x: 1,
+                    y: 2,
+                    width: 3,
+                    height: 4,
+                }),
+            );
+        }
+        state.resources.create_pixmap(
+            ClientId(SHAPE_ACCESS_CLIENT),
+            CreatePixmapRequest {
+                depth: 1,
+                pixmap: SHAPE_ACCESS_PIXMAP,
+                drawable: SHAPE_ACCESS_DEST,
+                width: 4,
+                height: 4,
+            },
+        );
+    }
+    (state, RecordingBackend::new(), peer)
+}
+
+fn shape_access_cases(
+    dest: ResourceId,
+    source: ResourceId,
+    pixmap: ResourceId,
+) -> Vec<ShapeAccessCase> {
+    use crate::access::{AccessMode, ResourceKind};
+    use yserver_protocol::x11::shape as x11shape;
+
+    let rect = || {
+        let mut body = vec![
+            x11shape::OP_SET,
+            x11shape::KIND_INPUT,
+            x11shape::ORDERING_YX_BANDED,
+            0,
+        ];
+        body.extend_from_slice(&dest.0.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&[0, 0, 2, 0, 2, 0, 2, 0]);
+        body
+    };
+    let mut mask = vec![x11shape::OP_SET, x11shape::KIND_INPUT, 0, 0];
+    mask.extend_from_slice(&dest.0.to_le_bytes());
+    mask.extend_from_slice(&0i16.to_le_bytes());
+    mask.extend_from_slice(&0i16.to_le_bytes());
+    mask.extend_from_slice(&pixmap.0.to_le_bytes());
+    let mut combine = vec![
+        x11shape::OP_SET,
+        x11shape::KIND_INPUT,
+        x11shape::KIND_INPUT,
+        0,
+    ];
+    combine.extend_from_slice(&dest.0.to_le_bytes());
+    combine.extend_from_slice(&0i16.to_le_bytes());
+    combine.extend_from_slice(&0i16.to_le_bytes());
+    combine.extend_from_slice(&source.0.to_le_bytes());
+    let mut offset = vec![x11shape::KIND_INPUT, 0, 0, 0];
+    offset.extend_from_slice(&dest.0.to_le_bytes());
+    offset.extend_from_slice(&1i16.to_le_bytes());
+    offset.extend_from_slice(&1i16.to_le_bytes());
+    let mut select = dest.0.to_le_bytes().to_vec();
+    select.extend_from_slice(&[1, 0, 0, 0]);
+    let mut get_rectangles = dest.0.to_le_bytes().to_vec();
+    get_rectangles.extend_from_slice(&[x11shape::KIND_INPUT, 0, 0, 0]);
+
+    vec![
+        ShapeAccessCase {
+            name: "Rectangles destination",
+            minor: x11shape::RECTANGLES,
+            body: rect(),
+            expected: vec![ShapeAccessCheck {
+                id: dest,
+                kind: ResourceKind::Window,
+                mode: AccessMode::SET_ATTR,
+            }],
+        },
+        ShapeAccessCase {
+            name: "Mask destination then source pixmap",
+            minor: x11shape::MASK,
+            body: mask,
+            expected: vec![
+                ShapeAccessCheck {
+                    id: dest,
+                    kind: ResourceKind::Window,
+                    mode: AccessMode::SET_ATTR,
+                },
+                ShapeAccessCheck {
+                    id: pixmap,
+                    kind: ResourceKind::Pixmap,
+                    mode: AccessMode::READ,
+                },
+            ],
+        },
+        ShapeAccessCase {
+            name: "Combine source then destination",
+            minor: x11shape::COMBINE,
+            body: combine,
+            expected: vec![
+                ShapeAccessCheck {
+                    id: source,
+                    kind: ResourceKind::Window,
+                    mode: AccessMode::GET_ATTR,
+                },
+                ShapeAccessCheck {
+                    id: dest,
+                    kind: ResourceKind::Window,
+                    mode: AccessMode::SET_ATTR,
+                },
+            ],
+        },
+        ShapeAccessCase {
+            name: "Offset destination",
+            minor: x11shape::OFFSET,
+            body: offset,
+            expected: vec![ShapeAccessCheck {
+                id: dest,
+                kind: ResourceKind::Window,
+                mode: AccessMode::SET_ATTR,
+            }],
+        },
+        ShapeAccessCase {
+            name: "QueryExtents window",
+            minor: x11shape::QUERY_EXTENTS,
+            body: dest.0.to_le_bytes().to_vec(),
+            expected: vec![ShapeAccessCheck {
+                id: dest,
+                kind: ResourceKind::Window,
+                mode: AccessMode::GET_ATTR,
+            }],
+        },
+        ShapeAccessCase {
+            name: "SelectInput window",
+            minor: x11shape::SELECT_INPUT,
+            body: select,
+            expected: vec![ShapeAccessCheck {
+                id: dest,
+                kind: ResourceKind::Window,
+                mode: AccessMode::RECEIVE,
+            }],
+        },
+        ShapeAccessCase {
+            name: "InputSelected window",
+            minor: x11shape::INPUT_SELECTED,
+            body: dest.0.to_le_bytes().to_vec(),
+            expected: vec![ShapeAccessCheck {
+                id: dest,
+                kind: ResourceKind::Window,
+                mode: AccessMode::GET_ATTR,
+            }],
+        },
+        ShapeAccessCase {
+            name: "GetRectangles window",
+            minor: x11shape::GET_RECTANGLES,
+            body: get_rectangles,
+            expected: vec![ShapeAccessCheck {
+                id: dest,
+                kind: ResourceKind::Window,
+                mode: AccessMode::GET_ATTR,
+            }],
+        },
+    ]
+}
+
+fn shape_access_request(
+    state: &mut ServerState,
+    backend: &mut RecordingBackend,
+    body: &[u8],
+    minor: u8,
+    sequence: u16,
+) {
+    process_request(
+        state,
+        backend,
+        ClientId(SHAPE_ACCESS_CLIENT),
+        SequenceNumber(sequence),
+        RequestHeader {
+            opcode: 141,
+            data: minor,
+            length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+        },
+        body,
+        None,
+    )
+    .expect("SHAPE request");
+}
+
+fn shape_resource_checks(
+    calls: &[super::extensions::RecordedExtensionCheck],
+) -> Vec<(crate::access::ResourceTarget, crate::access::AccessMode)> {
+    calls
+        .iter()
+        .filter(|call| call.hook == super::extensions::ExtensionHook::Resource)
+        .map(|call| {
+            (
+                call.target.expect("resource hook target"),
+                call.mode.expect("resource hook mode"),
+            )
+        })
+        .collect()
+}
+
+fn shape_assert_policy_error(bytes: &[u8], minor: u8) {
+    assert_eq!(bytes.len(), 32, "policy denial is an X error packet");
+    assert_eq!(bytes[0], 0, "error packet type");
+    assert_eq!(bytes[1], yserver_protocol::x11::error::BAD_VALUE);
+    assert_eq!(
+        u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        SHAPE_ACCESS_ERROR_VALUE
+    );
+    assert_eq!(
+        u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+        u16::from(minor)
+    );
+    assert_eq!(bytes[10], 141, "error identifies the SHAPE major opcode");
+}
+
+#[test]
+fn shape_access_checks_ask_the_expected_targets_modes_and_order() {
+    // Mutation: remove the SHAPE::Rectangles destination SET_ATTR check.
+    use super::extensions::{ExtensionHook, RecordedExtensionCheck, RecordingExtensionPolicy};
+    use crate::access::{Decision, RequestOpcodes, ResourceTarget};
+
+    for case in shape_access_cases(SHAPE_ACCESS_DEST, SHAPE_ACCESS_SOURCE, SHAPE_ACCESS_PIXMAP) {
+        let (mut state, mut backend, _peer) = shape_access_fixture(true);
+        let calls = Arc::new(Mutex::new(Vec::<RecordedExtensionCheck>::new()));
+        state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+            Decision::Allow,
+            Arc::clone(&calls),
+        )));
+        shape_access_request(&mut state, &mut backend, &case.body, case.minor, 1);
+        let recorded = calls.lock().unwrap();
+        let checks = shape_resource_checks(&recorded);
+        let expected = case
+            .expected
+            .iter()
+            .map(|check| {
+                (
+                    ResourceTarget {
+                        id: check.id,
+                        kind: check.kind,
+                        creation: None,
+                    },
+                    check.mode,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(checks, expected, "{}: resource checks", case.name);
+        assert!(recorded.iter().any(|call| {
+            call.hook == ExtensionHook::Dispatch
+                && call.request
+                    == Some(RequestOpcodes {
+                        major: 141,
+                        minor: case.minor,
+                    })
+        }));
+        for call in recorded
+            .iter()
+            .filter(|call| call.hook == ExtensionHook::Resource)
+        {
+            assert_eq!(
+                call.client,
+                ClientId(SHAPE_ACCESS_CLIENT),
+                "{}: client",
+                case.name
+            );
+            assert_eq!(
+                call.request,
+                Some(RequestOpcodes {
+                    major: 141,
+                    minor: case.minor,
+                }),
+                "{}: request context",
+                case.name,
+            );
+            assert_eq!(
+                call.owner,
+                Some(ClientId(SHAPE_ACCESS_CLIENT)),
+                "{}: owner",
+                case.name
+            );
+        }
+    }
+}
+
+#[test]
+fn shape_access_denials_stop_before_state_or_backend_effects() {
+    // Mutations: bypass SHAPE::Mask's source pixmap READ check, or insert a SelectInput
+    // selection before checking its window; each must fail its denial assertion.
+    use super::extensions::{RecordedExtensionCheck, RecordingExtensionPolicy};
+    use crate::access::DenyError;
+
+    for case in shape_access_cases(SHAPE_ACCESS_DEST, SHAPE_ACCESS_SOURCE, SHAPE_ACCESS_PIXMAP) {
+        for (denied_index, denied) in case.expected.iter().enumerate() {
+            let (mut state, mut backend, mut peer) = shape_access_fixture(true);
+            let previous_shapes = state.shape_windows.clone();
+            let previous_select_masks = state.shape_select_masks.clone();
+            let calls = Arc::new(Mutex::new(Vec::<RecordedExtensionCheck>::new()));
+            state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+                Arc::clone(&calls),
+                denied.id,
+                Some(denied.mode),
+                DenyError {
+                    code: yserver_protocol::x11::error::BAD_VALUE,
+                    value: SHAPE_ACCESS_ERROR_VALUE,
+                },
+            )));
+
+            shape_access_request(&mut state, &mut backend, &case.body, case.minor, 1);
+            let bytes = read_all_available(&mut peer);
+            shape_assert_policy_error(&bytes, case.minor);
+            assert_eq!(
+                state.shape_windows, previous_shapes,
+                "{}: state changed",
+                case.name
+            );
+            assert_eq!(
+                state.shape_select_masks, previous_select_masks,
+                "{}: SHAPE selection state changed",
+                case.name
+            );
+            assert!(
+                backend.calls().is_empty(),
+                "{}: backend was reached",
+                case.name
+            );
+            let recorded = calls.lock().unwrap();
+            let checks = shape_resource_checks(&recorded);
+            let expected = case.expected[..=denied_index]
+                .iter()
+                .map(|check| {
+                    (
+                        crate::access::ResourceTarget {
+                            id: check.id,
+                            kind: check.kind,
+                            creation: None,
+                        },
+                        check.mode,
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(checks, expected, "{}: checks before denial", case.name);
+        }
+    }
+}
+
+#[test]
+fn shape_unresolved_operands_keep_no_policy_wire_bytes() {
+    // Mutation: reject an unresolved SHAPE operand on the empty-policy fast path.
+    use yserver_protocol::x11::{ClientByteOrder, shape as x11shape, xfixes::RegionRect};
+
+    const MISSING: ResourceId = ResourceId(0x7f00_1234);
+    const MISSING_SOURCE: ResourceId = ResourceId(0x7f00_1235);
+    for case in shape_access_cases(MISSING, MISSING_SOURCE, MISSING_SOURCE) {
+        let (mut state, mut backend, mut peer) = shape_access_fixture(false);
+        shape_access_request(&mut state, &mut backend, &case.body, case.minor, 1);
+        let expected_bytes = match case.minor {
+            x11shape::QUERY_EXTENTS => x11shape::encode_query_extents_reply(
+                ClientByteOrder::LittleEndian,
+                SequenceNumber(1),
+                false,
+                false,
+                RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+                RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+            ),
+            x11shape::INPUT_SELECTED => x11shape::encode_input_selected_reply(
+                ClientByteOrder::LittleEndian,
+                SequenceNumber(1),
+                false,
+            ),
+            x11shape::GET_RECTANGLES => x11shape::encode_get_rectangles_reply(
+                ClientByteOrder::LittleEndian,
+                SequenceNumber(1),
+                x11shape::ORDERING_YX_BANDED,
+                &[],
+            ),
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            read_all_available(&mut peer),
+            expected_bytes,
+            "{}: bytes without policy",
+            case.name,
+        );
+        assert!(
+            state
+                .clients
+                .get(&SHAPE_ACCESS_CLIENT)
+                .unwrap()
+                .outbound
+                .is_empty(),
+            "{}: no buffered extra bytes",
+            case.name,
+        );
+        if case.minor == x11shape::SELECT_INPUT {
+            assert_eq!(
+                state
+                    .shape_select_masks
+                    .get(&(SHAPE_ACCESS_CLIENT, MISSING)),
+                Some(&true),
+                "SelectInput's unresolved window keeps its historical selection entry",
+            );
+        }
+    }
+}
+
 /// XFixes `SetCursorName(cursor, "name")` interns the name as an
 /// atom and stores it on the cursor; the subsequent
 /// `GetCursorName(cursor)` returns the same atom + name bytes.
