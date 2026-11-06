@@ -156,6 +156,32 @@ where
     }
 }
 
+/// Whether the node exports a syncobj as an opaque descriptor
+/// (`SYNCOBJ_HANDLE_TO_FD` without the sync-file flag). DRI3 1.4's explicit
+/// sync is built on that: a client exports each image's timeline syncobjs
+/// so, and imports them into the server with `DRI3ImportSyncobj`. A node
+/// that has timeline syncobjs but not that export (a driver that serves
+/// sync files only) would have Mesa's WSI choose explicit sync and then
+/// fail to make its swapchain, so DRI3 stays at 1.3 there, with implicit
+/// sync.
+fn syncobj_exports_as_descriptor(device: &drm::Device) -> bool {
+    let Ok(handle) = device.create_syncobj(false) else {
+        return false;
+    };
+    let exported = device.syncobj_to_fd(handle, false);
+    let _ = device.destroy_syncobj(handle);
+    match exported {
+        Ok(_fd) => true,
+        Err(error) => {
+            log::info!(
+                "DRI3: the render node exports no syncobj as a descriptor ({error}); \
+                 explicit sync is off"
+            );
+            false
+        }
+    }
+}
+
 fn build_render_device_inventory(
     vk: &Arc<VkContext>,
     render_node: Option<crate::kms::render_node::OpenedRenderNode>,
@@ -226,7 +252,10 @@ fn build_render_device_inventory(
                     .get_driver_capability(::drm::DriverCapability::TimelineSyncObj)
                     .ok()
             })
-            .is_some_and(|value| value != 0);
+            .is_some_and(|value| value != 0)
+            && render_node_device
+                .as_deref()
+                .is_some_and(syncobj_exports_as_descriptor);
         selected.render_node = Some(render_node);
         selected.render_node_device = render_node_device;
         selected.syncobj_timeline = syncobj_timeline;
