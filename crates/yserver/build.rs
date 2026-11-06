@@ -28,6 +28,12 @@ fn main() {
         "tcp_transport",
         env::var_os("CARGO_FEATURE_TCP_TRANSPORT").is_some() || os == "windows",
     );
+    // `cfg(wayland_host)`: the rootless Wayland host (`src/wayland/`)
+    // builds: the feature, on Linux, where its dependencies are.
+    emit_cfg(
+        "wayland_host",
+        env::var_os("CARGO_FEATURE_WAYLAND").is_some() && os == "linux",
+    );
     // The `xkbcommon` crate links `-lxkbcommon` without a search path, and
     // neither Homebrew's lib dir (macOS) nor vcpkg's (Windows) is on the
     // linker's default path.

@@ -52,7 +52,10 @@ impl KmsBackend {
     /// # Errors
     ///
     /// Resizing the virtual screen failed.
-    #[allow(dead_code, reason = "the Wayland host attaches itself with it")]
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host attaches itself with it")
+    )]
     pub(crate) fn attach_rootless_host(&mut self, host: SharedHost) -> io::Result<()> {
         let (screen, layout) = {
             let host = host.borrow();
@@ -101,7 +104,10 @@ impl KmsBackend {
     /// # Errors
     ///
     /// What `yserver_core::rootless::enable` refuses.
-    #[allow(dead_code, reason = "the Wayland host starts rootless mode with it")]
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host starts rootless mode with it")
+    )]
     pub(crate) fn start_rootless(&mut self, state: &mut ServerState) -> Result<(), RootlessError> {
         let Some(host) = self.pstate.rootless.as_ref().map(|r| r.host.clone()) else {
             return Ok(());
@@ -196,12 +202,16 @@ impl KmsBackend {
     }
 
     /// Once per loop iteration, before the reconcile: the host's own work
-    /// with the state in hand.
+    /// with the state in hand, then what it queued since its connection was
+    /// last read.
     pub(in crate::kms::render::backend) fn rootless_service(&mut self, state: &mut ServerState) {
         let Some(host) = self.pstate.rootless.as_ref().map(|r| r.host.clone()) else {
             return;
         };
         host.borrow_mut().service(state, self);
+        let mut work = HostWork::default();
+        host.borrow_mut().take_queued(&mut work);
+        self.apply_host_work(state, work);
     }
 
     /// The presenter's share of `maybe_composite`, then the cursor, and

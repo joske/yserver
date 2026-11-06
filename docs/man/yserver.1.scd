@@ -241,6 +241,19 @@ above.
 	Log filter. Defaults to *info*; *warn* is quieter, *debug* and *trace*
 	are for diagnosis.
 
+*YSERVER_BACKEND*
+	*wayland* runs the server rootless as a client of the Wayland
+	compositor *WAYLAND_DISPLAY* names: each top-level X window is a window
+	of the compositor's, input comes from the compositor's seat, and the
+	server opens no console, KMS card or input device. Needs a build with
+	the *wayland* feature (Linux only); without it the server refuses to
+	start.
+
+*YSERVER_WM_NAME*
+	Under *YSERVER_BACKEND=wayland*, the window manager's name
+	(*\_NET_WM_NAME* of the *\_NET_SUPPORTING_WM_CHECK* window) when the
+	compositor's process name cannot be read from its socket.
+
 *YSERVER_DRM_DEVICE*
 	Path to the sole KMS device to use instead of auto-selecting devices,
 	e.g. _/dev/dri/card1_. Ignored when *YSERVER_DRM_DEVICES* is set.

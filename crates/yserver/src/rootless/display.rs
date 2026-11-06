@@ -28,7 +28,10 @@ use crate::kms::vk::device::VkContext;
 pub(crate) enum HostItem {
     Request(HostRequest),
     Input(HostInputEvent),
-    #[allow(dead_code, reason = "the Wayland host queues its frame events")]
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host queues its frame events")
+    )]
     Frame(FrameEvent),
 }
 
@@ -48,9 +51,34 @@ impl HostWork {
         self.0.push(HostItem::Input(event));
     }
 
-    #[allow(dead_code, reason = "the Wayland host queues its frame events")]
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host queues its frame events")
+    )]
     pub(crate) fn frame(&mut self, event: FrameEvent) {
         self.0.push(HostItem::Frame(event));
+    }
+
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host queues work between reads")
+    )]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// `other`'s items after this queue's.
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host queues work between reads")
+    )]
+    pub(crate) fn append(&mut self, mut other: HostWork) {
+        self.0.append(&mut other.0);
+    }
+
+    #[cfg(all(test, wayland_host))]
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, HostItem> {
+        self.0.iter()
     }
 }
 
@@ -83,6 +111,12 @@ pub(crate) trait DisplayHost: RootlessHost {
     ///
     /// The window system closed the connection.
     fn dispatch(&mut self, work: &mut HostWork) -> io::Result<()>;
+    /// What the host queued since its connection was last read, into
+    /// `work`: the frame events of the presenter's last tick, which come
+    /// back from the host's own calls rather than from the window system.
+    /// The platform takes it each loop iteration; a host that has some
+    /// asks for one with [`DisplayHost::next_wakeup`].
+    fn take_queued(&mut self, _work: &mut HostWork) {}
     /// Once per loop iteration, with the state in hand, for work that is not
     /// a window's (a clipboard bridge). The host must not call back into the
     /// platform's rootless state from here.

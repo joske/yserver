@@ -3578,3 +3578,138 @@ fn xi_change_cursor_propagates_define_cursor_to_backend() {
              semantics as the CWA cursor path.",
     );
 }
+
+/// XI2 generic events of `evtype` on `wire`, as `(deviceid, sourceid)`:
+/// DeviceChanged keeps its source at bytes 18-19 (`xXIDeviceChangedEvent`),
+/// a raw event after its detail, at 20-21 (`xXIRawEvent`).
+fn xi2_sources(wire: &[u8], evtype: u16) -> Vec<(u16, u16)> {
+    let source_at = if evtype == 1 { 18 } else { 20 };
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at + 32 <= wire.len() {
+        let length = if wire[at] == 35 || wire[at] == 1 {
+            32 + u32::from_le_bytes(wire[at + 4..at + 8].try_into().unwrap()) as usize * 4
+        } else {
+            32
+        };
+        if wire[at] == 35 && u16::from_le_bytes([wire[at + 8], wire[at + 9]]) == evtype {
+            found.push((
+                u16::from_le_bytes([wire[at + 10], wire[at + 11]]),
+                u16::from_le_bytes([wire[at + source_at], wire[at + source_at + 1]]),
+            ));
+        }
+        at += length;
+    }
+    found
+}
+
+/// A window system's seat as slaves of the core pair (a rootless host's
+/// "Wayland pointer", as Xwayland's xwayland-pointer): its button reaches
+/// Wine's raw-input selection on the masters with the slave as its source,
+/// after a SlaveSwitch naming that slave, which Wine opens with XOpenDevice
+/// (`X11DRV_RawButtonEvent`, `X11DRV_DeviceChanged`). A master as either
+/// source is BadDevice to XOpenDevice and ends the Wine process.
+#[test]
+fn a_seat_slaves_button_names_the_slave_as_its_source() {
+    use crate::{
+        backend::recording::RecordingBackend,
+        core_loop::{DeviceInfo, InputOrigin, pointer_fanout::pointer_event_fanout_to_state},
+        host_x11::{HostPointerEvent, HostXidMap, PointerEventKind},
+        xinput::{InputCapabilities, InputSourceId},
+    };
+    const XI_RAW_BUTTON_PRESS: u16 = 15;
+
+    let mut state = ServerState::new();
+    let mut peer = install_capture_client(&mut state, 101);
+    let mut backend = RecordingBackend::new();
+    let request = |state: &mut ServerState, backend: &mut RecordingBackend, minor, body: &[u8]| {
+        handle_xi2_request(
+            state,
+            backend,
+            None,
+            ClientId(101),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 131,
+                data: minor,
+                length_units: u32::try_from((4 + body.len()).div_ceil(4)).unwrap(),
+            },
+            body,
+        )
+        .expect("XI request");
+    };
+    // XIQueryVersion 2.2, then Wine's selection on the masters.
+    request(&mut state, &mut backend, 47, &[2, 0, 2, 0]);
+    let mut select = Vec::new();
+    select.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+    select.extend_from_slice(&1u16.to_le_bytes());
+    select.extend_from_slice(&0u16.to_le_bytes());
+    select.extend_from_slice(&1u16.to_le_bytes()); // XIAllMasterDevices
+    select.extend_from_slice(&1u16.to_le_bytes());
+    select.extend_from_slice(
+        &(XI2_DEVICE_CHANGED_MASK | (1u32 << XI_RAW_BUTTON_PRESS)).to_le_bytes(),
+    );
+    request(&mut state, &mut backend, 46, &select);
+    let _ = read_all_available(&mut peer);
+
+    let source = InputSourceId(u64::MAX - 1);
+    let slave = state.xi_register_source(&DeviceInfo {
+        source_id: source,
+        enabled: true,
+        resume_key: None,
+        capabilities: InputCapabilities {
+            keyboard: false,
+            pointer: true,
+            touch: false,
+        },
+        name: "Wayland pointer".to_owned(),
+        device_node: String::new(),
+        sysname: String::new(),
+        vendor_id: 0,
+        product_id: 0,
+        is_touchpad: false,
+        config: Default::default(),
+    })[0];
+    assert_ne!(slave, crate::xinput::DEVICEID_MASTER_POINTER);
+    let press = HostPointerEvent {
+        origin: InputOrigin::Physical(source),
+        kind: PointerEventKind::ButtonPress,
+        detail: 1,
+        host_xid: 0,
+        time: 2,
+        root_x: 10,
+        root_y: 20,
+        event_x: 10,
+        event_y: 20,
+        state: 0,
+        crossing_mode: 0,
+        child: 0,
+        raw_dx: 0,
+        raw_dy: 0,
+        tree_change: false,
+    };
+    let _dropped = pointer_event_fanout_to_state(
+        &mut state,
+        &mut backend,
+        &HostXidMap::new(),
+        press,
+        true,
+        false,
+    );
+    let wire = read_all_available(&mut peer);
+    let switches = xi2_sources(&wire, 1);
+    let raw = xi2_sources(&wire, XI_RAW_BUTTON_PRESS);
+    assert!(
+        !raw.is_empty(),
+        "the raw button reached the masters' selection"
+    );
+    assert_eq!(
+        switches,
+        [(crate::xinput::DEVICEID_MASTER_POINTER, slave)],
+        "one SlaveSwitch, naming the slave"
+    );
+    assert!(
+        raw.iter().all(|&(_, sourceid)| sourceid == slave),
+        "raw buttons sourced from the slave: {raw:?}"
+    );
+}
