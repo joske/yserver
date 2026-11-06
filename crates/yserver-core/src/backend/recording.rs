@@ -440,6 +440,10 @@ pub struct RecordingBackend {
     /// coincidental default matching elsewhere) set it to something
     /// else first.
     pub glx_vendor_names: &'static str,
+    /// Result returned by `picture_client_clip_rects`, including the
+    /// distinction between an unavailable query and an unset clip.
+    pub picture_client_clip_rects_result:
+        Option<Option<Vec<yserver_protocol::x11::xfixes::RegionRect>>>,
     /// When set, `set_dpms_power` returns Err; tests assert the
     /// transition helper advances state anyway.
     pub dpms_set_returns_err: bool,
@@ -737,6 +741,7 @@ impl RecordingBackend {
             randr_modes: Vec::new(),
             randr_providers: Vec::new(),
             glx_vendor_names: glx::VENDOR_NAMES,
+            picture_client_clip_rects_result: None,
             dpms_set_returns_err: false,
             provider_output_source_changed: true,
             provider_output_source_error: None,
@@ -2723,6 +2728,14 @@ impl Backend for RecordingBackend {
     ) -> io::Result<()> {
         self.record(RecordedCall::RenderSetPictureClipRectangles { host_pic });
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn picture_client_clip_rects(
+        &mut self,
+        _host_pic: u32,
+    ) -> Option<Option<Vec<yserver_protocol::x11::xfixes::RegionRect>>> {
+        self.picture_client_clip_rects_result.clone()
     }
 
     fn render_set_picture_filter(

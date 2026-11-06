@@ -30,6 +30,7 @@ pub(super) struct RecordingExtensionPolicy {
     decision: Decision,
     calls: Arc<Mutex<Vec<RecordedExtensionCheck>>>,
     resource_denial: Option<(ResourceId, Option<AccessMode>, DenyError)>,
+    deny_all_resources: Option<DenyError>,
 }
 
 impl RecordingExtensionPolicy {
@@ -38,6 +39,7 @@ impl RecordingExtensionPolicy {
             decision,
             calls,
             resource_denial: None,
+            deny_all_resources: None,
         }
     }
 
@@ -51,6 +53,19 @@ impl RecordingExtensionPolicy {
             decision: Decision::Allow,
             calls,
             resource_denial: Some((id, mode, error)),
+            deny_all_resources: None,
+        }
+    }
+
+    pub(super) fn denying_all_resources(
+        calls: Arc<Mutex<Vec<RecordedExtensionCheck>>>,
+        error: DenyError,
+    ) -> Self {
+        Self {
+            decision: Decision::Allow,
+            calls,
+            resource_denial: None,
+            deny_all_resources: Some(error),
         }
     }
 
@@ -64,11 +79,21 @@ impl RecordingExtensionPolicy {
         property: Option<(ResourceId, AtomId)>,
         mode: Option<AccessMode>,
     ) -> Decision {
-        let decision = match (&hook, target, mode, self.resource_denial) {
-            (ExtensionHook::Resource, Some(target), mode, Some((id, expected_mode, error)))
-                if target.id == id
-                    && expected_mode.is_none_or(|expected| mode == Some(expected)) =>
-            {
+        let decision = match (
+            &hook,
+            target,
+            mode,
+            self.deny_all_resources,
+            self.resource_denial,
+        ) {
+            (ExtensionHook::Resource, _, _, Some(error), _) => Decision::Deny(error),
+            (
+                ExtensionHook::Resource,
+                Some(target),
+                mode,
+                None,
+                Some((id, expected_mode, error)),
+            ) if target.id == id && expected_mode.is_none_or(|expected| mode == Some(expected)) => {
                 Decision::Deny(error)
             }
             _ => self.decision,

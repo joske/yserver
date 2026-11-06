@@ -147,6 +147,23 @@ use crate::{
     server::ServerState,
 };
 
+macro_rules! return_on_access_denial {
+    ($result:expr, $state:ident, $client_id:ident, $sequence:ident, $request:ident $(,)?) => {
+        if let Err((code, value)) = $result {
+            return $crate::core_loop::process_request::emit_x11_error_with_minor(
+                $state,
+                $client_id,
+                $sequence,
+                code,
+                value,
+                u16::from($request.minor),
+                $request.major,
+            );
+        }
+    };
+}
+pub(crate) use return_on_access_denial;
+
 /// XI2 major opcode assigned by `extension_metadata("XInputExtension")`.
 /// This matches the `XI2_MAJOR_OPCODE` constant in nested.rs and goes
 /// away in H1 with that file.
