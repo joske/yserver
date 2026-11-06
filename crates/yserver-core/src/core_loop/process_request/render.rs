@@ -80,7 +80,9 @@ pub(super) fn handle_render_request(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     use crate::{
-        nested::{ChangePictureAttr, change_picture_translate_xids},
+        nested::{
+            ChangePictureAttr, change_picture_translate_xids, composite_glyphs_translate_glyphsets,
+        },
         resources::{ARGB_VISUAL, GlyphSetState, PictureState},
     };
     use yserver_protocol::x11::ClientByteOrder;
@@ -176,6 +178,40 @@ pub(super) fn handle_render_request(
                 );
             }
             let damage_drawable = render_picture_damage_drawable(state, req.drawable);
+            let values_in_request = req.value_mask.count_ones() as usize;
+            let complete_values = values_in_request.min(req.values.len() / 4);
+            let mut complete_value_mask = 0u32;
+            let mut complete_value_count = 0usize;
+            for bit in 0..32 {
+                let bit_mask = 1u32 << bit;
+                if req.value_mask & bit_mask != 0 && complete_value_count < complete_values {
+                    complete_value_mask |= bit_mask;
+                    complete_value_count += 1;
+                }
+            }
+            let translated_bytes = complete_value_count * 4;
+            let mut translated_values = change_picture_translate_xids(
+                complete_value_mask,
+                &req.values[..translated_bytes],
+                |attr, xid| {
+                    let resource = ResourceId(xid);
+                    let host_xid = match attr {
+                        ChangePictureAttr::ClipMask => state
+                            .resources
+                            .pixmap(resource)
+                            .and_then(|p| p.host_xid)
+                            .map(|h| h.as_raw()),
+                        ChangePictureAttr::AlphaMap => state
+                            .resources
+                            .picture(resource)
+                            .and_then(|p| p.host_picture_xid)
+                            .map(|h| h.as_raw()),
+                    };
+                    Some(host_xid.unwrap_or(0))
+                },
+            )
+            .unwrap_or_default();
+            translated_values.extend_from_slice(&req.values[translated_bytes..]);
             let drawable_origin = state
                 .resources
                 .window(req.drawable)
@@ -198,7 +234,7 @@ pub(super) fn handle_render_request(
                         host_drawable,
                         req.format,
                         req.value_mask,
-                        &req.values,
+                        &translated_values,
                     )
                     .ok()
                     .flatten()
@@ -565,6 +601,13 @@ pub(super) fn handle_render_request(
                 );
             }
             if let (Some(host_src), Some(host_dst), Some(host_gs)) = (host_src, host_dst, host_gs) {
+                let translated_items =
+                    composite_glyphs_translate_glyphsets(minor, &req.items, |xid| {
+                        state
+                            .resources
+                            .glyphset(ResourceId(xid))
+                            .map(|g| g.host_glyphset_xid.as_raw())
+                    });
                 let mask_fmt = if req.mask_format == 0 {
                     0
                 } else {
@@ -574,8 +617,18 @@ pub(super) fn handle_render_request(
                 };
                 let painted = backend
                     .render_composite_glyphs(
-                        origin, minor, req.op, host_src, host_dst, mask_fmt, host_gs, req.src_x,
-                        req.src_y, &req.items, 0, 0,
+                        origin,
+                        minor,
+                        req.op,
+                        host_src,
+                        host_dst,
+                        mask_fmt,
+                        host_gs,
+                        req.src_x,
+                        req.src_y,
+                        &translated_items,
+                        0,
+                        0,
                     )
                     .unwrap_or_default();
                 debug!(

@@ -157,6 +157,25 @@ pub enum RecordedCall {
     RenderCreatePicture {
         host_drawable: AnyHandle,
         host_pic: u32,
+        value_mask: u32,
+        values: Vec<u8>,
+    },
+    RenderChangePicture {
+        host_pic: u32,
+        body: Vec<u8>,
+    },
+    RenderCompositeGlyphs {
+        minor: u8,
+        op: u8,
+        host_src: u32,
+        host_dst: u32,
+        mask_fmt: u32,
+        host_gs: u32,
+        src_x: i16,
+        src_y: i16,
+        items: Vec<u8>,
+        x_off: i16,
+        y_off: i16,
     },
     RenderFreePicture {
         host_pic: u32,
@@ -2392,8 +2411,8 @@ impl Backend for RecordingBackend {
         _origin: Option<OriginContext>,
         host_drawable: AnyHandle,
         _ynest_format: u32,
-        _value_mask: u32,
-        _values: &[u8],
+        value_mask: u32,
+        values: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
         if self.render_create_picture_fails {
             return Ok(None);
@@ -2402,6 +2421,8 @@ impl Backend for RecordingBackend {
         self.record(RecordedCall::RenderCreatePicture {
             host_drawable,
             host_pic,
+            value_mask,
+            values: values.to_vec(),
         });
         Ok(PictureHandle::from_raw(host_pic))
     }
@@ -2409,9 +2430,13 @@ impl Backend for RecordingBackend {
     fn render_change_picture(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
-        _body: &[u8],
+        host_pic: u32,
+        body: &[u8],
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderChangePicture {
+            host_pic,
+            body: body.to_vec(),
+        });
         Ok(())
     }
 
@@ -2483,18 +2508,31 @@ impl Backend for RecordingBackend {
     fn render_composite_glyphs(
         &mut self,
         _origin: Option<OriginContext>,
-        _minor: u8,
-        _op: u8,
-        _host_src: u32,
-        _host_dst: u32,
-        _mask_fmt: u32,
-        _host_gs: u32,
-        _src_x: i16,
-        _src_y: i16,
-        _items: &[u8],
-        _x_off: i16,
-        _y_off: i16,
+        minor: u8,
+        op: u8,
+        host_src: u32,
+        host_dst: u32,
+        mask_fmt: u32,
+        host_gs: u32,
+        src_x: i16,
+        src_y: i16,
+        items: &[u8],
+        x_off: i16,
+        y_off: i16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
+        self.record(RecordedCall::RenderCompositeGlyphs {
+            minor,
+            op,
+            host_src,
+            host_dst,
+            mask_fmt,
+            host_gs,
+            src_x,
+            src_y,
+            items: items.to_vec(),
+            x_off,
+            y_off,
+        });
         Ok(self.render_return_region.clone())
     }
 

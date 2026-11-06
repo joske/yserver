@@ -503,6 +503,50 @@ where
     Some(out)
 }
 
+/// Translate the glyphset XID in each complete inline-switch item in a
+/// `CompositeGlyphs{8,16,32}` stream. An unresolved client XID becomes zero,
+/// which the renderer treats as an ignored switch. Incomplete item tails are
+/// left untouched because the renderer stops before consuming them.
+pub(crate) fn composite_glyphs_translate_glyphsets<F>(
+    minor: u8,
+    items: &[u8],
+    mut translate: F,
+) -> Vec<u8>
+where
+    F: FnMut(u32) -> Option<u32>,
+{
+    let id_size = match minor {
+        23 => 1,
+        24 => 2,
+        25 => 4,
+        _ => return items.to_vec(),
+    };
+    let mut out = items.to_vec();
+    let mut pos = 0usize;
+    while pos + 8 <= out.len() {
+        let count = out[pos];
+        if count == u8::MAX {
+            let xid = u32::from_le_bytes([out[pos + 4], out[pos + 5], out[pos + 6], out[pos + 7]]);
+            let host_xid = if xid == 0 {
+                0
+            } else {
+                translate(xid).unwrap_or(0)
+            };
+            out[pos + 4..pos + 8].copy_from_slice(&host_xid.to_le_bytes());
+            pos += 8;
+            continue;
+        }
+
+        let payload_bytes = usize::from(count) * id_size;
+        let padded_payload_bytes = (payload_bytes + 3) & !3;
+        if pos + 8 + padded_payload_bytes > out.len() {
+            break;
+        }
+        pos += 8 + padded_payload_bytes;
+    }
+    out
+}
+
 pub(crate) fn normalize_region_rects(
     mut rects: Vec<x11xfixes::RegionRect>,
 ) -> Vec<x11xfixes::RegionRect> {

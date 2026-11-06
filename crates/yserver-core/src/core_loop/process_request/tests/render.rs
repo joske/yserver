@@ -624,6 +624,267 @@ fn render_paints(backend: &RecordingBackend) -> Vec<RecordedCall> {
         .collect()
 }
 
+fn composite_glyph_items_with_switch(minor: u8, glyphset: u32) -> (Vec<u8>, usize) {
+    let id_size = match minor {
+        23 => 1,
+        24 => 2,
+        25 => 4,
+        _ => unreachable!(),
+    };
+    let mut items = vec![2, 0, 0, 0, 0, 0, 0, 0];
+    let payload_bytes = 2 * id_size;
+    items.extend((0..payload_bytes).map(|n| u8::try_from(n).unwrap()));
+    items.resize(items.len() + ((4 - payload_bytes % 4) % 4), 0);
+
+    let switch_offset = items.len();
+    items.extend_from_slice(&[255, 0, 0, 0]);
+    items.extend_from_slice(&glyphset.to_le_bytes());
+    items.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+    items.extend(std::iter::repeat_n(0, id_size));
+    items.resize(items.len() + ((4 - id_size % 4) % 4), 0);
+    (items, switch_offset)
+}
+
+fn dispatch_composite_glyphs(
+    state: &mut ServerState,
+    backend: &mut RecordingBackend,
+    client: u32,
+    minor: u8,
+    glyphset: u32,
+    items: &[u8],
+) {
+    const SRC_PIC: u32 = 0x0020_0010;
+    const DST_PIC: u32 = 0x0020_0011;
+    let mut body = vec![0u8; 24];
+    body[0] = 3;
+    body[4..8].copy_from_slice(&SRC_PIC.to_le_bytes());
+    body[8..12].copy_from_slice(&DST_PIC.to_le_bytes());
+    body[16..20].copy_from_slice(&glyphset.to_le_bytes());
+    body.extend_from_slice(items);
+    picture_request(state, backend, client, 133, minor, &body);
+}
+
+fn create_render_picture_with_values(
+    state: &mut ServerState,
+    backend: &mut RecordingBackend,
+    client: u32,
+    picture: u32,
+    drawable: u32,
+    value_mask: u32,
+    values: &[u8],
+) {
+    let mut body = Vec::with_capacity(16 + values.len());
+    for value in [picture, drawable, 0, value_mask] {
+        body.extend_from_slice(&value.to_le_bytes());
+    }
+    body.extend_from_slice(values);
+    picture_request(state, backend, client, 133, 4, &body);
+}
+
+#[test]
+fn composite_glyphs_switch_is_translated_to_backend_handle() {
+    // Mutation: forward the item bytes unchanged.
+    const CLIENT: u32 = 7;
+    const G1: u32 = 0x0020_0030;
+    const G2: u32 = 0x0020_0031;
+    const HOST_G1: u32 = 0xAA03;
+    const HOST_G2: u32 = 0xAA04;
+    let (mut state, mut backend) = render_damage_fixture(Vec::new());
+    for (xid, host) in [(G1, HOST_G1), (G2, HOST_G2)] {
+        state.resources.create_glyphset(
+            ResourceId(xid),
+            crate::resources::GlyphSetState {
+                client: ClientId(CLIENT),
+                host_glyphset_xid: crate::backend::GlyphSetHandle::from_raw_for_test(host),
+            },
+        );
+    }
+
+    for (minor, switch_offset) in [(23, 12), (24, 12), (25, 16)] {
+        let (items, actual_switch_offset) = composite_glyph_items_with_switch(minor, G2);
+        assert_eq!(actual_switch_offset, switch_offset);
+        dispatch_composite_glyphs(&mut state, &mut backend, CLIENT, minor, G1, &items);
+
+        let calls = backend.calls();
+        let call = calls.iter().find_map(|call| match call {
+            RecordedCall::RenderCompositeGlyphs {
+                minor: got_minor,
+                host_gs,
+                items,
+                ..
+            } if *got_minor == minor => Some((*host_gs, items)),
+            _ => None,
+        });
+        let (host_gs, forwarded_items) = call.expect("backend composite glyph call");
+        assert_eq!(host_gs, HOST_G1);
+        assert_eq!(
+            u32::from_le_bytes(
+                forwarded_items[switch_offset + 4..switch_offset + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            HOST_G2,
+            "minor {minor} switch item must carry G2's backend handle",
+        );
+        backend.calls.lock().unwrap().clear();
+    }
+}
+
+#[test]
+fn composite_glyphs_switch_to_backend_handle_value_is_ignored() {
+    // Mutation: accept a backend handle value as though it were a client glyphset XID.
+    const CLIENT: u32 = 7;
+    const OTHER_CLIENT: u32 = 8;
+    const G1: u32 = 0x0020_0030;
+    const OTHER_GLYPHSET: u32 = 0x0030_0030;
+    const HOST_G1: u32 = 0xAA03;
+    const OTHER_HOST_GLYPHSET: u32 = 0xAA04;
+    let (mut state, mut backend) = render_damage_fixture(Vec::new());
+    let _other_peer = install_client(&mut state, OTHER_CLIENT);
+    state.resources.create_glyphset(
+        ResourceId(G1),
+        crate::resources::GlyphSetState {
+            client: ClientId(CLIENT),
+            host_glyphset_xid: crate::backend::GlyphSetHandle::from_raw_for_test(HOST_G1),
+        },
+    );
+    state.resources.create_glyphset(
+        ResourceId(OTHER_GLYPHSET),
+        crate::resources::GlyphSetState {
+            client: ClientId(OTHER_CLIENT),
+            host_glyphset_xid: crate::backend::GlyphSetHandle::from_raw_for_test(
+                OTHER_HOST_GLYPHSET,
+            ),
+        },
+    );
+    assert!(
+        state
+            .resources
+            .glyphset(ResourceId(OTHER_HOST_GLYPHSET))
+            .is_none()
+    );
+    let (items, switch_offset) = composite_glyph_items_with_switch(23, OTHER_HOST_GLYPHSET);
+
+    dispatch_composite_glyphs(&mut state, &mut backend, CLIENT, 23, G1, &items);
+
+    let call = backend.calls().into_iter().find_map(|call| match call {
+        RecordedCall::RenderCompositeGlyphs { items, .. } => Some(items),
+        _ => None,
+    });
+    let forwarded_items = call.expect("backend composite glyph call");
+    assert_eq!(
+        u32::from_le_bytes(
+            forwarded_items[switch_offset + 4..switch_offset + 8]
+                .try_into()
+                .unwrap()
+        ),
+        0,
+        "a backend handle that is not a client glyphset XID must be ignored",
+    );
+}
+
+#[test]
+fn create_picture_alpha_map_and_clip_mask_are_translated() {
+    // Mutation: pass req.values unchanged.
+    const PICTURE: u32 = PIC_B | 14;
+    const VALUE_MASK: u32 = (1 << 0) | (1 << 1) | (1 << 6);
+    let (mut state, mut backend, _peer_a, _peer_b) = cross_client_picture_fixture();
+    let alpha_map = host_pic_of(&state, PIC_ON_WIN);
+    const CLIP_MASK: u32 = 0x00E0_0100;
+    assert_ne!(alpha_map, PIC_ON_WIN);
+    assert_ne!(CLIP_MASK, PIC_PIXMAP);
+    backend.calls.lock().unwrap().clear();
+
+    let mut values = Vec::new();
+    for value in [1u32, PIC_ON_WIN, PIC_PIXMAP] {
+        values.extend_from_slice(&value.to_le_bytes());
+    }
+    create_render_picture_with_values(
+        &mut state,
+        &mut backend,
+        2,
+        PICTURE,
+        PIC_PIXMAP,
+        VALUE_MASK,
+        &values,
+    );
+
+    let call = backend.calls().into_iter().find_map(|call| match call {
+        RecordedCall::RenderCreatePicture {
+            value_mask, values, ..
+        } => Some((value_mask, values)),
+        _ => None,
+    });
+    let (value_mask, got_values) = call.expect("backend create picture call");
+    assert_eq!(value_mask, VALUE_MASK);
+    let mut expected_values = Vec::new();
+    for value in [1u32, alpha_map, CLIP_MASK] {
+        expected_values.extend_from_slice(&value.to_le_bytes());
+    }
+    assert_eq!(got_values, expected_values);
+}
+
+#[test]
+fn create_picture_unresolved_alpha_map_still_registers_picture() {
+    // Mutation: drop the request as ChangePicture does.
+    const PICTURE: u32 = PIC_B | 15;
+    const UNKNOWN_PICTURE: u32 = PIC_B | 16;
+    let (mut state, mut backend, _peer_a, mut peer_b) = cross_client_picture_fixture();
+    backend.calls.lock().unwrap().clear();
+
+    let mut values = Vec::new();
+    values.extend_from_slice(&1u32.to_le_bytes()); // CPRepeat remains scalar.
+    values.extend_from_slice(&UNKNOWN_PICTURE.to_le_bytes()); // unresolved CPAlphaMap.
+    create_render_picture_with_values(
+        &mut state,
+        &mut backend,
+        2,
+        PICTURE,
+        PIC_PIXMAP,
+        (1 << 0) | (1 << 1),
+        &values,
+    );
+
+    assert!(state.resources.picture(ResourceId(PICTURE)).is_some());
+    let call = backend.calls().into_iter().find_map(|call| match call {
+        RecordedCall::RenderCreatePicture { values, .. } => Some(values),
+        _ => None,
+    });
+    let mut expected_values = Vec::new();
+    expected_values.extend_from_slice(&1u32.to_le_bytes());
+    expected_values.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(call.expect("backend create picture call"), expected_values);
+
+    let mut transform = vec![0u8; 40];
+    transform[..4].copy_from_slice(&PICTURE.to_le_bytes());
+    picture_request(&mut state, &mut backend, 2, 133, 28, &transform);
+    assert!(drain_errors(&mut peer_b).is_empty());
+}
+
+#[test]
+fn change_picture_unresolved_alpha_map_still_drops_request() {
+    // Mutation: forward 0 as CreatePicture does.
+    const UNKNOWN_PICTURE: u32 = PIC_B | 17;
+    let (mut state, mut backend, _peer_a, mut peer_b) = cross_client_picture_fixture();
+    backend.calls.lock().unwrap().clear();
+    let mut body = Vec::new();
+    let value_mask: u32 = (1 << 0) | (1 << 1);
+    body.extend_from_slice(&PIC_ON_WIN.to_le_bytes());
+    body.extend_from_slice(&value_mask.to_le_bytes());
+    body.extend_from_slice(&1u32.to_le_bytes()); // CPRepeat scalar.
+    body.extend_from_slice(&UNKNOWN_PICTURE.to_le_bytes()); // unresolved CPAlphaMap.
+
+    picture_request(&mut state, &mut backend, 2, 133, 5, &body);
+
+    assert!(drain_errors(&mut peer_b).is_empty());
+    assert!(
+        backend
+            .calls()
+            .iter()
+            .all(|call| { !matches!(call, RecordedCall::RenderChangePicture { .. }) })
+    );
+}
+
 /// Client A owns a mapped top-level `PIC_WIN`; client B holds a Picture on it and
 /// one on its own pixmap.
 fn cross_client_picture_fixture() -> (ServerState, RecordingBackend, UnixStream, UnixStream) {
