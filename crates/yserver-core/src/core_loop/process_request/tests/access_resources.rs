@@ -46,7 +46,7 @@ fn ask_owner(
     call.owner
 }
 
-fn resource_request(
+pub(super) fn resource_request(
     state: &mut ServerState,
     backend: &mut RecordingBackend,
     peer: &mut UnixStream,
@@ -100,7 +100,7 @@ fn resource_request_with_fd(
     read_all_available(peer)
 }
 
-fn words(words: &[u32]) -> Vec<u8> {
+pub(super) fn words(words: &[u32]) -> Vec<u8> {
     words
         .iter()
         .fold(
