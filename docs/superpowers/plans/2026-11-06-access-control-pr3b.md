@@ -60,6 +60,21 @@ contract of plan 3a ("Denial test contract") applies to every row here. Rulings 
     skipped cursor keeps its image.
   - Windows, grabs and aliases that merely reference a changed cursor are consequences, not targets (the cursor
     object changes; they keep the same reference).
+- **A client value never reaches the backend as a backend handle (bug fix first, Task 0).** Two RENDER paths
+  forward client XIDs where the renderer expects its own handles, which are allocated separately
+  (`render_ops.rs` `render_create_glyphset` uses `next_host_xid()`):
+  - CompositeGlyphs forwards the item stream unchanged, and the renderer treats a glyphset switch's 32-bit value
+    as a key of its glyphset table (`portable/text.rs`, `glyphsets.contains_key(&new_xid)`). A real client's
+    switch (a client XID) is therefore ignored today, and a value equal to some backend handle switches to that
+    glyphset, whoever owns it. Xorg resolves the switch as a GlyphSet XID (`render/render.c`).
+  - CreatePicture forwards its value list unchanged (`render.rs`, `render_create_picture(.., req.values)`), so the
+    alpha map and clip mask reach the backend as client XIDs; ChangePicture already translates them
+    (`change_picture_translate_xids`).
+  The fix, before any check: the core translates each switch value from a client glyphset XID to its backend
+  handle before forwarding, and writes 0 (which the renderer already ignores) for a value that is not a client
+  glyphset; CreatePicture reuses ChangePicture's translation. This changes client-visible behaviour the way Xorg
+  behaves (switches take effect; a backend handle is no longer accepted), and it is the only behaviour change in
+  this plan. Unknown values keep today's outcome: ignored, no error (no new validity errors).
 - **Retained cursor identity.** A cursor's XID can be freed while a window still displays it: `free_cursor` drops the
   table entry and keeps the host cursor (`resources/picture_font_cursor.rs`), and its name keeps matching
   (`d746bc3c`, `docs/status.md:720-723`: "a freed-but-displayed cursor still matches"). Such a cursor is still a
@@ -102,7 +117,7 @@ constraint applies. Modes are XLibre's (`include/dixaccess.h`), joined with `+`.
 | 19 FreeGlyphSet | glyphset `DESTROY`, before removal |
 | 20 AddGlyphs | glyphset `ADD` |
 | 22 FreeGlyphs | glyphset `REMOVE` |
-| 23–25 CompositeGlyphs8/16/32 | src `READ`, dst `WRITE`, initial glyphset `USE`, each glyphset a stream switch names `USE`, all before the stream reaches the backend |
+| 23–25 CompositeGlyphs8/16/32 | src `READ`, dst `WRITE`, initial glyphset `USE`, each glyphset a stream switch names `USE` (the client XID, resolved in Task 0's translation pass), all before the stream reaches the backend |
 | 26 FillRectangles | dst `WRITE` |
 | 27 CreateCursor | source picture `READ`; new cursor `CREATE`, `Creation { parent: None }` |
 | 29 QueryFilters | drawable `GET_ATTR` |
@@ -190,6 +205,8 @@ check runs only when it resolves.
 
 ## Review Focus
 
+0. Task 0's translation: every path that forwards a client value the renderer uses as a key (glyphset switches,
+   CreatePicture and ChangePicture attributes) goes through a translation, and none accepts a backend handle.
 1. `verify_pictures!`: every RENDER request that uses it asks for each picture with the row's mode, in argument
    order, and a picture-less (sourceless) drawable path does not skip the check.
 2. Regions written by one client and owned by another (Task 1 of 3a kept the owner): a denied `WRITE` leaves the
@@ -203,6 +220,30 @@ check runs only when it resolves.
    changes; with a policy, an id that does not resolve is not asked.
 
 ---
+
+### Task 0: RENDER client values are translated to backend handles
+
+A bug fix, separate from the access layer, committed first because Tasks 1 and 2 check the client XIDs this
+translation resolves.
+
+**Files:** `core_loop/process_request/render.rs` (CreatePicture; CompositeGlyphs8/16/32); tests in the existing
+RENDER test file under `process_request/tests`.
+
+**Invariants:** no client-supplied value reaches a backend lookup without translation; a backend handle value from a
+client never selects a backend object; an unknown switch value is forwarded as 0. One translation helper per value
+kind, shared by the sites that need it (reuse `change_picture_translate_xids`).
+
+- [ ] **Step 1: Failing tests** through `process_request` with a backend whose handles differ from the client XIDs
+  (`RecordingBackend` records the arguments it receives):
+  - `composite_glyphs_switch_is_translated_to_backend_handle`: a stream that switches from glyphset G1 to G2 reaches
+    the backend with G2's backend handle in the switch item. Mutation: forward the item bytes unchanged.
+  - `composite_glyphs_switch_to_backend_handle_value_is_ignored`: a switch whose value equals another client's
+    backend handle (and is not a client glyphset XID) reaches the backend as 0.
+  - `create_picture_alpha_map_and_clip_mask_are_translated`: the backend receives the alpha map picture's and the
+    clip mask pixmap's backend handles. Mutation: pass `req.values` unchanged.
+  - the existing Stage 3d inline-switch test keeps passing (both glyphsets' atlas entries read).
+- [ ] **Steps 2–4:** run, fail; implement; run, pass, whole suite unmodified.
+- [ ] **Step 5: Commit** `fix(render): translate CompositeGlyphs switches and CreatePicture's alpha map and clip mask to backend handles`.
 
 ### Task 1: RENDER pictures and drawing
 
