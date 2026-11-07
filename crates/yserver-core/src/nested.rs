@@ -525,27 +525,6 @@ where
     out
 }
 
-/// Return the first looked-up switch value that is not a client glyphset.
-pub(crate) fn composite_glyphs_bad_glyphset<F>(
-    minor: u8,
-    items: &[u8],
-    mut is_glyphset: F,
-) -> Option<u32>
-where
-    F: FnMut(u32) -> bool,
-{
-    let mut bad = None;
-    composite_glyphs_visit_switches(minor, items, |_, xid| {
-        if is_glyphset(xid) {
-            true
-        } else {
-            bad = Some(xid);
-            false
-        }
-    });
-    bad
-}
-
 fn composite_glyphs_visit_switches<F>(minor: u8, items: &[u8], mut visit: F)
 where
     F: FnMut(usize, u32) -> bool,

@@ -16,6 +16,7 @@ const NEW_PICTURE: ResourceId = ResourceId(0x0020_0020);
 const GLYPHSET: ResourceId = ResourceId(0x0020_0030);
 const SWITCH_GLYPHSET: ResourceId = ResourceId(0x0020_0031);
 const NEW_GLYPHSET: ResourceId = ResourceId(0x0020_0032);
+const BAD_GLYPHSET: ResourceId = ResourceId(0xdead_beef);
 const FRAME_CURSOR: ResourceId = ResourceId(0x0020_0040);
 const SECOND_FRAME_CURSOR: ResourceId = ResourceId(0x0020_0041);
 const NEW_CURSOR: ResourceId = ResourceId(0x0020_0042);
@@ -93,6 +94,10 @@ fn change_picture_body(mask: u32, values: &[u32]) -> Vec<u8> {
 }
 
 fn glyph_items_with_switch(minor: u8, glyphset: ResourceId) -> Vec<u8> {
+    glyph_items_with_switches(minor, &[glyphset])
+}
+
+fn glyph_items_with_switches(minor: u8, glyphsets: &[ResourceId]) -> Vec<u8> {
     let id_size = match minor {
         23 => 1,
         24 => 2,
@@ -103,11 +108,14 @@ fn glyph_items_with_switch(minor: u8, glyphset: ResourceId) -> Vec<u8> {
     let payload_bytes = 2 * id_size;
     items.extend((0..payload_bytes).map(|n| u8::try_from(n).unwrap()));
     items.resize(items.len() + ((4 - payload_bytes % 4) % 4), 0);
-    items.extend_from_slice(&[255, 0, 0, 0]);
-    items.extend_from_slice(&glyphset.0.to_le_bytes());
-    items.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
-    items.extend(std::iter::repeat_n(0, id_size));
-    items.resize(items.len() + ((4 - id_size % 4) % 4), 0);
+    for glyphset in glyphsets {
+        items.extend_from_slice(&yserver_protocol::x11::render_composite_glyphset_switch(
+            glyphset.0,
+        ));
+        items.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+        items.extend(std::iter::repeat_n(0, id_size));
+        items.resize(items.len() + ((4 - id_size % 4) % 4), 0);
+    }
     items
 }
 
@@ -523,17 +531,21 @@ fn dispatch_with_peer(
 }
 
 fn assert_policy_error(bytes: &[u8], minor: u8, name: &str) {
+    assert_request_error(bytes, x11::error::BAD_VALUE, ERROR_VALUE, minor, name);
+}
+
+fn assert_request_error(bytes: &[u8], code: u8, value: u32, minor: u8, name: &str) {
     assert_eq!(
         bytes.len(),
         32,
         "{name}: expected one X error: {bytes:02x?}"
     );
     assert_eq!(bytes[0], 0, "{name}: error packet type");
-    assert_eq!(bytes[1], x11::error::BAD_VALUE, "{name}: policy error code");
+    assert_eq!(bytes[1], code, "{name}: error code");
     assert_eq!(
         u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-        ERROR_VALUE,
-        "{name}: policy error value",
+        value,
+        "{name}: error value",
     );
     assert_eq!(
         u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
@@ -556,6 +568,40 @@ fn recorded_checks(calls: &[RecordedExtensionCheck]) -> Vec<(ResourceTarget, Acc
             )
         })
         .collect()
+}
+
+fn assert_resource_check(
+    call: &RecordedExtensionCheck,
+    target: ResourceTarget,
+    mode: AccessMode,
+    request: RequestOpcodes,
+    owner: Option<ClientId>,
+) {
+    assert_eq!(call.hook, ExtensionHook::Resource);
+    assert_eq!(call.client, CLIENT);
+    assert_eq!(call.target, Some(target));
+    assert_eq!(call.mode, Some(mode));
+    assert_eq!(call.request, Some(request));
+    assert_eq!(call.owner, owner);
+    assert_eq!(call.target_owner, target.owner.or(owner));
+}
+
+fn assert_resource_checks(calls: &[RecordedExtensionCheck], expected: &[ExpectedCheck], minor: u8) {
+    let resource_calls = calls
+        .iter()
+        .filter(|call| call.hook == ExtensionHook::Resource)
+        .collect::<Vec<_>>();
+    assert_eq!(resource_calls.len(), expected.len(), "resource check count");
+    for (call, expected) in resource_calls.into_iter().zip(expected) {
+        let owner = expected.target.creation.is_none().then_some(CLIENT);
+        assert_resource_check(
+            call,
+            expected.target,
+            expected.mode,
+            RequestOpcodes { major: 133, minor },
+            owner,
+        );
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -761,15 +807,21 @@ fn render_glyph_cursor_requests_ask_expected_targets() {
             "{}: checked targets",
             case.name,
         );
-        for call in &recorded {
-            assert_eq!(
-                call.request,
-                Some(RequestOpcodes {
+        let resource_calls = recorded
+            .iter()
+            .filter(|call| call.hook == ExtensionHook::Resource)
+            .collect::<Vec<_>>();
+        for (call, expected) in resource_calls.iter().zip(&case.expected) {
+            let owner = expected.target.creation.is_none().then_some(CLIENT);
+            assert_resource_check(
+                call,
+                expected.target,
+                expected.mode,
+                RequestOpcodes {
                     major: 133,
                     minor: case.minor,
-                }),
-                "{}: request context",
-                case.name,
+                },
+                owner,
             );
         }
     }
@@ -825,7 +877,7 @@ fn render_glyph_cursor_requests_deny_before_effects() {
 
 #[test]
 fn composite_glyphs_denied_stream_switch_draws_nothing() {
-    // Mutation: check each stream switch only after preceding glyphs were drawn.
+    // Mutation: check a stream switch only after forwarding the preceding glyph run.
     let case = glyph_cursor_cases()
         .into_iter()
         .find(|case| case.minor == 23)
@@ -860,6 +912,133 @@ fn composite_glyphs_denied_stream_switch_draws_nothing() {
             .map(|expected| (expected.target, expected.mode))
             .collect::<Vec<_>>(),
     );
+    assert_resource_checks(&calls.lock().unwrap(), &case.expected, case.minor);
+    assert!(state.resources.glyphset(GLYPHSET).is_some());
+    assert!(state.resources.glyphset(SWITCH_GLYPHSET).is_some());
+}
+
+#[test]
+fn composite_glyphs_bad_switch_before_denied_switch_reports_bad_glyphset() {
+    // Mutation: ask the policy about a switch XID before confirming it is a client GlyphSet.
+    let case = glyph_cursor_cases()
+        .into_iter()
+        .find(|case| case.minor == 23)
+        .expect("CompositeGlyphs8 case");
+    let (mut state, mut backend, mut peer) = fixture();
+    setup_glyph_cursor_case(&mut state, &case);
+    let invalid_switch_calls = Arc::new(Mutex::new(Vec::new()));
+    let denied_switch_calls = Arc::new(Mutex::new(Vec::new()));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+        Arc::clone(&invalid_switch_calls),
+        BAD_GLYPHSET,
+        Some(AccessMode::USE),
+        DenyError {
+            code: x11::error::BAD_VALUE,
+            value: ERROR_VALUE,
+        },
+    )));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+        Arc::clone(&denied_switch_calls),
+        SWITCH_GLYPHSET,
+        Some(AccessMode::USE),
+        DenyError {
+            code: x11::error::BAD_VALUE,
+            value: ERROR_VALUE,
+        },
+    )));
+
+    let mut body = case.body[..24].to_vec();
+    body.extend_from_slice(&glyph_items_with_switches(
+        case.minor,
+        &[BAD_GLYPHSET, SWITCH_GLYPHSET],
+    ));
+    let bytes = dispatch_with_peer(&mut state, &mut backend, &mut peer, case.minor, &body);
+
+    assert_request_error(
+        &bytes,
+        crate::nested::RENDER_BAD_GLYPHSET_ERROR,
+        BAD_GLYPHSET.0,
+        case.minor,
+        "invalid stream switch precedes denied switch",
+    );
+    assert!(
+        backend
+            .calls()
+            .iter()
+            .all(|call| !matches!(call, RecordedCall::RenderCompositeGlyphs { .. })),
+        "invalid stream switch must reject the whole request before drawing",
+    );
+    let invalid_calls = invalid_switch_calls.lock().unwrap().clone();
+    assert!(
+        invalid_calls
+            .iter()
+            .all(|call| { call.target.is_none_or(|target| target.id != BAD_GLYPHSET) }),
+        "the invalid XID was sent to the resource policy",
+    );
+    let denied_calls = denied_switch_calls.lock().unwrap().clone();
+    assert!(
+        denied_calls.iter().all(|call| {
+            call.target
+                .is_none_or(|target| target.id != SWITCH_GLYPHSET)
+        }),
+        "a later switch was checked after the earlier invalid XID",
+    );
+    let expected_before_switch = &case.expected[..3];
+    assert_resource_checks(&invalid_calls, expected_before_switch, case.minor);
+    assert_resource_checks(&denied_calls, expected_before_switch, case.minor);
+    assert!(state.resources.glyphset(GLYPHSET).is_some());
+    assert!(state.resources.glyphset(SWITCH_GLYPHSET).is_some());
+}
+
+#[test]
+fn composite_glyphs_denied_switch_before_bad_switch_reports_policy_error() {
+    // Mutation: pre-scan all switch XIDs for BadGlyphSet before checking access in stream order.
+    let case = glyph_cursor_cases()
+        .into_iter()
+        .find(|case| case.minor == 23)
+        .expect("CompositeGlyphs8 case");
+    let (mut state, mut backend, mut peer) = fixture();
+    setup_glyph_cursor_case(&mut state, &case);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+        Arc::clone(&calls),
+        SWITCH_GLYPHSET,
+        Some(AccessMode::USE),
+        DenyError {
+            code: x11::error::BAD_VALUE,
+            value: ERROR_VALUE,
+        },
+    )));
+
+    let mut body = case.body[..24].to_vec();
+    body.extend_from_slice(&glyph_items_with_switches(
+        case.minor,
+        &[SWITCH_GLYPHSET, BAD_GLYPHSET],
+    ));
+    let bytes = dispatch_with_peer(&mut state, &mut backend, &mut peer, case.minor, &body);
+
+    assert_policy_error(
+        &bytes,
+        case.minor,
+        "denied stream switch precedes invalid switch",
+    );
+    assert!(
+        backend
+            .calls()
+            .iter()
+            .all(|call| !matches!(call, RecordedCall::RenderCompositeGlyphs { .. })),
+        "denied stream switch must reject the whole request before drawing",
+    );
+    let recorded = calls.lock().unwrap().clone();
+    assert_resource_checks(&recorded, &case.expected, case.minor);
+    assert!(
+        recorded
+            .iter()
+            .all(|call| { call.target.is_none_or(|target| target.id != BAD_GLYPHSET) }),
+        "the invalid switch after a denial was checked",
+    );
+    assert!(state.resources.glyphset(GLYPHSET).is_some());
+    assert!(state.resources.glyphset(SWITCH_GLYPHSET).is_some());
 }
 
 #[test]
