@@ -402,6 +402,14 @@ impl Platform for PlatformBackend {
         false
     }
 
+    fn refresh_pixmap_for_read(b: &mut KmsBackend, host_xid: u32) {
+        b.refresh_mapped_pixmap(host_xid);
+    }
+
+    fn pixmap_freed(b: &mut KmsBackend, host_xid: u32) {
+        let _ = b.pstate.dri3_mapped.remove(&host_xid);
+    }
+
     fn maybe_teardown_export(b: &mut KmsBackend, id: DrawableId) {
         b.maybe_teardown_export(id);
     }
