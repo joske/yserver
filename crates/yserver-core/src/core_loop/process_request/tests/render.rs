@@ -809,6 +809,43 @@ fn composite_glyphs_switch_to_non_glyphset_is_bad_glyphset() {
 }
 
 #[test]
+fn composite_glyphs_unknown_initial_glyphset_with_bad_switch_is_dropped_silently() {
+    // Mutation: remove the initial-glyphset gate and run the switch pass unconditionally.
+    const CLIENT: u32 = 7;
+    const UNKNOWN_INITIAL_GLYPHSET: u32 = 0x0020_0030;
+    const NON_GLYPHSET: u32 = 0x0020_0010;
+    let (mut state, mut backend) = render_damage_fixture(Vec::new());
+    let mut peer = install_client(&mut state, CLIENT);
+    assert!(
+        state
+            .resources
+            .glyphset(ResourceId(UNKNOWN_INITIAL_GLYPHSET))
+            .is_none()
+    );
+    assert!(state.resources.picture(ResourceId(NON_GLYPHSET)).is_some());
+    backend.calls.lock().unwrap().clear();
+
+    let (items, switch_offset) = composite_glyph_items_with_switch(23, NON_GLYPHSET);
+    assert_eq!(switch_offset, 12, "CompositeGlyphs8 switch is 12 bytes");
+    dispatch_composite_glyphs(
+        &mut state,
+        &mut backend,
+        CLIENT,
+        23,
+        UNKNOWN_INITIAL_GLYPHSET,
+        &items,
+    );
+
+    assert!(drain_error_details(&mut peer).is_empty());
+    assert!(
+        backend
+            .calls()
+            .iter()
+            .all(|call| !matches!(call, RecordedCall::RenderCompositeGlyphs { .. }))
+    );
+}
+
+#[test]
 fn composite_glyphs_bad_switch_after_good_glyphs_draws_nothing() {
     // Mutation: validate the switch only after forwarding the preceding glyph run.
     const CLIENT: u32 = 7;

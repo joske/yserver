@@ -139,10 +139,7 @@ pub(super) fn handle_render_request(
 ) -> io::Result<RequestOutcome> {
     use crate::{
         access::{AccessMode, Creation, RequestOpcodes, ResourceKind, ResourceTarget},
-        nested::{
-            ChangePictureAttr, change_picture_translate_xids, composite_glyphs_bad_glyphset,
-            composite_glyphs_translate_glyphsets,
-        },
+        nested::composite_glyphs_translate_glyphsets,
         resources::{ARGB_VISUAL, GlyphSetState, PictureState},
     };
     use yserver_protocol::x11::ClientByteOrder;
@@ -690,37 +687,6 @@ pub(super) fn handle_render_request(
             };
             verify_pictures!((req.src, AccessMode::READ), (req.dst, AccessMode::WRITE));
             check_resource!(req.glyphset, ResourceKind::GlyphSet, AccessMode::USE);
-            let mut switch_access_error = None;
-            let translated_items = composite_glyphs_translate_glyphsets(minor, &req.items, |xid| {
-                if switch_access_error.is_some() {
-                    return None;
-                }
-                let glyphset = ResourceId(xid);
-                if let Err(error) = validate_resource_if_present(
-                    state,
-                    client_id,
-                    glyphset,
-                    ResourceKind::GlyphSet,
-                    AccessMode::USE,
-                    access_request,
-                ) {
-                    switch_access_error = Some(error);
-                    return None;
-                }
-                state
-                    .resources
-                    .glyphset(glyphset)
-                    .map(|g| g.host_glyphset_xid.as_raw())
-            });
-            if let Some((code, value)) = switch_access_error {
-                crate::core_loop::process_request::return_on_access_denial!(
-                    Err::<(), _>((code, value)),
-                    state,
-                    client_id,
-                    sequence,
-                    access_request,
-                );
-            }
             if dst_picture_is_sourceless(state, req.dst) {
                 return emit_x11_error_with_minor(
                     state,
@@ -760,26 +726,55 @@ pub(super) fn handle_render_request(
                     if host_gs.is_none() { " MISSING" } else { "" },
                 );
             }
-            let bad_glyphset = host_gs.and_then(|_| {
-                composite_glyphs_bad_glyphset(minor, &req.items, |xid| {
-                    state.resources.glyphset(ResourceId(xid)).is_some()
-                })
-            });
-            if let Some(bad_glyphset) = bad_glyphset {
-                return emit_x11_error_with_minor(
+            let (translated_items, switch_error) = if host_gs.is_some() {
+                let mut switch_error = None;
+                let translated_items =
+                    composite_glyphs_translate_glyphsets(minor, &req.items, |xid| {
+                        if switch_error.is_some() {
+                            return None;
+                        }
+                        let glyphset = ResourceId(xid);
+                        let Some(glyphset_state) = state.resources.glyphset(glyphset) else {
+                            switch_error =
+                                Some((crate::nested::RENDER_BAD_GLYPHSET_ERROR, glyphset.0));
+                            return None;
+                        };
+                        if let Err(error) = validate_resource_access(
+                            state,
+                            client_id,
+                            ResourceTarget {
+                                owner: None,
+                                id: glyphset,
+                                kind: ResourceKind::GlyphSet,
+                                creation: None,
+                            },
+                            AccessMode::USE,
+                            access_request,
+                        ) {
+                            switch_error = Some(error);
+                            return None;
+                        }
+                        Some(glyphset_state.host_glyphset_xid.as_raw())
+                    });
+                (Some(translated_items), switch_error)
+            } else {
+                (None, None)
+            };
+            if let Some(error) = switch_error {
+                crate::core_loop::process_request::return_on_access_denial!(
+                    Err::<(), _>(error),
                     state,
                     client_id,
                     sequence,
-                    crate::nested::RENDER_BAD_GLYPHSET_ERROR,
-                    bad_glyphset,
-                    u16::from(minor),
-                    header.opcode,
+                    access_request,
                 );
             }
             if dst_picture_window_unviewable(state, req.dst) {
                 return Ok(RequestOutcome::Handled);
             }
-            if let (Some(host_src), Some(host_dst), Some(host_gs)) = (host_src, host_dst, host_gs) {
+            if let (Some(host_src), Some(host_dst), Some(host_gs), Some(translated_items)) =
+                (host_src, host_dst, host_gs, translated_items)
+            {
                 let mask_fmt = if req.mask_format == 0 {
                     0
                 } else {

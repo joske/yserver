@@ -63,22 +63,23 @@ contract of plan 3a ("Denial test contract") applies to every row here. Rulings 
 - **A client value never reaches the backend as a backend handle (bug fix first, Task 0).** Two RENDER paths
   forward client XIDs where the renderer expects its own handles, which are allocated separately
   (`render_ops.rs` `render_create_glyphset` uses `next_host_xid()`):
-  - CompositeGlyphs forwards the item stream unchanged, and the renderer treats a glyphset switch's 32-bit value
-    as a key of its glyphset table (`portable/text.rs`, `glyphsets.contains_key(&new_xid)`). A real client's
-    switch (a client XID) is therefore ignored today, and a value equal to some backend handle switches to that
-    glyphset, whoever owns it. Xorg resolves the switch as a GlyphSet XID (`render/render.c`).
+  - CompositeGlyphs carries a client GlyphSet XID in each switch. The core resolves a looked-up switch as a
+    GlyphSet before translating it to the renderer's handle; a switch that does not name a client GlyphSet
+    returns `BadGlyphSet` and the request draws nothing. Xorg does not look up a switch whose XID ends exactly
+    at the end of the stream (`render/render.c`).
   - CreatePicture forwards its value list unchanged (`render.rs`, `render_create_picture(.., req.values)`), so the
     alpha map and clip mask reach the backend as client XIDs; ChangePicture already translates them
     (`change_picture_translate_xids`).
-  The fix, before any check: the core translates each switch value from a client glyphset XID to its backend
-  handle before forwarding, and writes 0 (which the renderer already ignores) for a value that is not a client
-  glyphset. CreatePicture shares ChangePicture's per-value translation but keeps its own outcome for a value that
+  Task 0 translates each valid switch value from a client GlyphSet XID to its backend handle before forwarding;
+  PR 3b performs the switch's `USE` check in that same pass, after the earlier operands' checks. CreatePicture
+  shares ChangePicture's per-value translation but keeps its own outcome for a value that
   does not resolve: it forwards 0 for that attribute (no alpha map, no clip mask) and registers the picture as it
   does today, since CreatePicture's registry is authoritative once no error was sent and the raw client XID it
-  forwards today already selects nothing. ChangePicture keeps its historical rule unchanged: an unresolved
+  forwards today already selects nothing. A looked-up unknown CompositeGlyphs switch returns `BadGlyphSet` as #347
+  requires; the access layer checks `USE` in the same stream-order pass that validates and translates each switch.
+  ChangePicture keeps its historical rule unchanged: an unresolved
   attribute drops the whole request (`c00ddeb2`, Phase 3.5 spec, "dropping missing translations"). This changes client-visible behaviour the way Xorg
-  behaves (switches take effect; a backend handle is no longer accepted), and it is the only behaviour change in
-  this plan. Unknown values keep today's outcome: ignored, no error (no new validity errors).
+  behaves (switches take effect; a backend handle is no longer accepted).
 - **Retained cursor identity.** A cursor's XID can be freed while a window still displays it: `free_cursor` drops the
   table entry and keeps the host cursor (`resources/picture_font_cursor.rs`), and its name keeps matching
   (`d746bc3c`, `docs/status.md:720-723`: "a freed-but-displayed cursor still matches"). Such a cursor is still a
@@ -126,7 +127,7 @@ constraint applies. Modes are XLibre's (`include/dixaccess.h`), joined with `+`.
 | 19 FreeGlyphSet | glyphset `DESTROY`, before removal |
 | 20 AddGlyphs | glyphset `ADD` |
 | 22 FreeGlyphs | glyphset `REMOVE` |
-| 23–25 CompositeGlyphs8/16/32 | src `READ`, dst `WRITE`, initial glyphset `USE`, each glyphset a stream switch names `USE` (the client XID, resolved in Task 0's translation pass), all before the stream reaches the backend |
+| 23–25 CompositeGlyphs8/16/32 | src `READ`, dst `WRITE`, initial glyphset `USE`, then each looked-up stream switch is resolved as a client GlyphSet and checked for `USE` in stream order in the same translation pass; an unknown switch returns `BadGlyphSet`; all before the stream reaches the backend |
 | 26 FillRectangles | dst `WRITE` |
 | 27 CreateCursor | source picture `READ`; new cursor `CREATE`, `Creation { parent: None }` |
 | 29 QueryFilters | drawable `GET_ATTR` |
@@ -239,15 +240,17 @@ translation resolves.
 RENDER test file under `process_request/tests`.
 
 **Invariants:** no client-supplied value reaches a backend lookup without translation; a backend handle value from a
-client never selects a backend object; an unknown switch value is forwarded as 0. One translation helper per value
-kind, shared by the sites that need it (reuse `change_picture_translate_xids`).
+client never selects a backend object; a looked-up switch that is not a client GlyphSet returns `BadGlyphSet`.
+Switch existence and the PR 3b `USE` check are evaluated together in stream order, preserving Xorg's end-of-stream
+lookup boundary. One translation helper per value kind, shared by the sites that need it (reuse
+`change_picture_translate_xids`).
 
 - [ ] **Step 1: Failing tests** through `process_request` with a backend whose handles differ from the client XIDs
   (`RecordingBackend` records the arguments it receives):
   - `composite_glyphs_switch_is_translated_to_backend_handle`: a stream that switches from glyphset G1 to G2 reaches
     the backend with G2's backend handle in the switch item. Mutation: forward the item bytes unchanged.
-  - `composite_glyphs_switch_to_backend_handle_value_is_ignored`: a switch whose value equals another client's
-    backend handle (and is not a client glyphset XID) reaches the backend as 0.
+  - `composite_glyphs_switch_to_non_glyphset_is_bad_glyphset`: a switch whose value equals another client's
+    backend handle (and is not a client GlyphSet XID) reports `BadGlyphSet` before forwarding or drawing.
   - `create_picture_alpha_map_and_clip_mask_are_translated`: the backend receives the alpha map picture's and the
     clip mask pixmap's backend handles. Mutation: pass `req.values` unchanged.
   - `create_picture_unresolved_alpha_map_still_registers_picture`: CreatePicture with a valid drawable and an alpha
