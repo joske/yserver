@@ -2664,26 +2664,14 @@ fn xi_master_classes_store_last_slave_shape_after_removal_then_xtest_switch() {
         46,
         &select,
     );
+    // Master 2 still has its own CorePointerProc classes: no slave has
+    // switched it, so there is no SlaveSwitch to report (Xorg sends no
+    // DeviceChanged on XISelectEvents at all).
     let initial_bootstrap = xi_master_changed_summaries(&selection_result);
     assert_eq!(
         initial_bootstrap.len(),
-        1,
-        "master selection gets one bootstrap"
-    );
-    assert_eq!(
-        initial_bootstrap[0],
-        (
-            2,
-            2,
-            1,
-            XiMasterClassSummary {
-                class_types: vec![1, 2, 2],
-                class_source_ids: vec![2; 3],
-                button_count: Some(10),
-                scroll_flags: vec![],
-            },
-        ),
-        "the initial DeviceChanged block matches master 2's stored CorePointerProc classes"
+        0,
+        "a fresh master's selection gets no bootstrap"
     );
     let selected_masks = (
         state.clients[&CLIENT].event_masks.clone(),
