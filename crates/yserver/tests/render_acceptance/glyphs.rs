@@ -1351,9 +1351,9 @@ fn one_request_mixing_a8_and_component_alpha_glyphs_paints_both() {
     items.extend_from_slice(&i16::to_le_bytes(0));
     items.extend_from_slice(&i16::to_le_bytes(0));
     items.extend_from_slice(&[1u8, 0, 0, 0]);
-    items.push(255);
-    items.extend_from_slice(&[0u8, 0, 0]);
-    items.extend_from_slice(&gs_ca.to_le_bytes());
+    items.extend_from_slice(&yserver_protocol::x11::render_composite_glyphset_switch(
+        gs_ca,
+    ));
     items.extend_from_slice(&[1u8, 0, 0, 0]);
     items.extend_from_slice(&i16::to_le_bytes(0));
     items.extend_from_slice(&i16::to_le_bytes(0));
