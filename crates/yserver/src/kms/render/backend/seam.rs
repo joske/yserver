@@ -492,6 +492,14 @@ pub trait Platform: OutputSink + Sized + 'static {
         Dri3Caps::unsupported()
     }
 
+    /// Drawable `host_xid` is about to be read (a copy's source, a
+    /// `GetImage`): a platform whose pixmap is a copy of a client's buffer
+    /// brings it up to date first.
+    fn refresh_pixmap_for_read(_b: &mut XBackend<Self>, _host_xid: u32) {}
+
+    /// A client freed pixmap `host_xid`, before its storage goes.
+    fn pixmap_freed(_b: &mut XBackend<Self>, _host_xid: u32) {}
+
     fn dri3_import_pixmap(
         _b: &mut XBackend<Self>,
         _fd: yserver_core::fd::OwnedFd,

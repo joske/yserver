@@ -606,7 +606,7 @@ mod tests {
         );
         assert_eq!(presence, [ClientId(1)]);
         assert_eq!(hierarchy, [ClientId(1)]);
-        assert_eq!(state.clients[&1].outbound.len(), client_io::OUTBOUND_CAP);
+        assert_eq!(state.clients[&1].outbound.len(), client_io::outbound_cap());
         assert_eq!(client_io::failed_writers(&state.clients), [ClientId(1)]);
 
         fast.set_nonblocking(true).unwrap();

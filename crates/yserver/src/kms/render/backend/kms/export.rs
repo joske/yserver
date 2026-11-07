@@ -477,6 +477,21 @@ impl KmsBackend {
             ),
         };
         let modifier = vk_modifier;
+        // Without modifiers the renderer imports LINEAR at its own pitch
+        // and size: a buffer laid out otherwise is mapped (`dri3_mapped.rs`).
+        if !vk.image_drm_format_modifier
+            && modifier == crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR
+            && !Self::linear_layout_is(
+                &vk,
+                format,
+                (width, height),
+                offset,
+                stride,
+                Self::fd_len(&fd),
+            )
+        {
+            return self.dri3_import_mapped(fd, (width, height), stride, offset, depth);
+        }
         let drawable = crate::kms::vk::dri3::import_dmabuf_reporting(
             vk.clone(),
             fd,

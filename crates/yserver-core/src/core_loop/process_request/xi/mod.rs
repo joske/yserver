@@ -556,10 +556,23 @@ fn emit_xi2_device_changed_bootstrap(
         // Xorg serializes the source ID retained by each copied class
         // (`Xi/xiquerydevice.c:278,326`); it is independent of `lastSlave`,
         // which may already have been cleared by disable/removal.
+        //
+        // Xorg sends no DeviceChanged on XISelectEvents at all
+        // (`Xi/xiselectev.c`): its only `XISlaveSwitch` is the one
+        // `dix/getevents.c:699` sends when an event comes from another
+        // slave than the last, naming that slave. This bootstrap stands for
+        // that event, so it goes only once a slave has driven the master
+        // and names that slave. A master that still carries its own
+        // classes has had no switch to report, and a SlaveSwitch naming
+        // the master itself is one no X server sends: Wine's winex11 opens
+        // a SlaveSwitch's source with XOpenDevice to read its button map,
+        // which is BadDevice for a master, and Xlib's default handler then
+        // ends the process.
         let Some(sourceid) = state
             .xi_devices
             .device(master_id)
             .map(|device| device.class_sourceid)
+            .filter(|&sourceid| sourceid != master_id)
         else {
             continue;
         };
@@ -582,6 +595,9 @@ fn emit_xi2_device_changed_bootstrap(
             &classes,
         );
         buf.extend_from_slice(&event_buf);
+    }
+    if buf.is_empty() {
+        return Ok(());
     }
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(());

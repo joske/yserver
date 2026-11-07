@@ -257,7 +257,10 @@ above.
 	Path to the Vulkan/DRI3 render node to use instead of resolving one from
 	the first successfully opened KMS device, e.g. _/dev/dri/renderD128_.
 	Useful on split display/render systems and systems without sysfs-style
-	card/render parent metadata.
+	card/render parent metadata. A server with no KMS card otherwise uses
+	the render node of its Vulkan device; with a software Vulkan device
+	(lavapipe), DRI3 is on only when this names a node, and clients then
+	render on that GPU.
 
 *YSERVER_MODE*
 	Force a mode instead of the connector's preferred mode, as
