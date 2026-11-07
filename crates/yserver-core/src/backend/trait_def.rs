@@ -2643,9 +2643,10 @@ pub trait Backend {
     /// its client went away.
     fn release_dri3_export(&mut self, _token: Dri3ExportToken) {}
 
-    /// Import a `sync_file` fd as the backing of an XSync `Fence`
-    /// resource. The fd ownership transfers into the backend; on
-    /// success the backend owns a `VkSemaphore` keyed by `fence_xid`.
+    /// Import a DRI3 FenceFromFD fd (an xshmfence, or a `sync_file`) as
+    /// the backing of an XSync `Fence` resource keyed by `fence_xid`. The
+    /// fd ownership transfers into the backend. An error is the client's
+    /// BadValue, and no fence is made.
     ///
     /// Default impl is unsupported.
     fn dri3_fence_from_fd(&mut self, _fence_xid: u32, _fd: crate::fd::OwnedFd) -> io::Result<()> {

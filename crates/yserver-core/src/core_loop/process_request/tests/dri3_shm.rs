@@ -1345,3 +1345,172 @@ fn fence_from_fd_takes_an_xshmfence_without_sync_fd_semaphores() {
         "no reply, no error"
     );
 }
+
+/// FenceFromFD checks as Xorg's `proc_dri3_fence_from_fd`: an ID outside
+/// the client's range or already in use (another client's fence) is
+/// BadIDChoice, a missing drawable BadDrawable, a missing fd BadValue,
+/// and a fd the backend can't take BadValue with no fence made
+/// (`miSyncShmCreateFenceFromFd`). None of them touches the fence that
+/// was there, and a destroyed fence's ID can be taken again.
+#[test]
+fn fence_from_fd_checks_ids_drawable_and_fd_as_xorg() {
+    const FENCE: u32 = 0x0040_0002;
+    const OTHER: u32 = 0x0080_0002;
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let mut peer2 = install_client(&mut state, 2);
+    {
+        let c2 = state.clients.get_mut(&2).unwrap();
+        c2.resource_id_base = 0x0080_0000;
+        c2.resource_id_mask = 0x001f_ffff;
+    }
+    let mut backend = RecordingBackend::new();
+    let body = |drawable: u32, fence: u32| {
+        let mut body = vec![0u8; 12];
+        body[0..4].copy_from_slice(&drawable.to_le_bytes());
+        body[4..8].copy_from_slice(&fence.to_le_bytes());
+        body
+    };
+    let fd = || -> Option<std::os::fd::OwnedFd> {
+        let (fd, _other) = std::os::unix::net::UnixStream::pair().unwrap();
+        Some(fd.into())
+    };
+    let request = |state: &mut ServerState,
+                   backend: &mut RecordingBackend,
+                   client: u32,
+                   data: u8,
+                   body: &[u8],
+                   fd: Option<std::os::fd::OwnedFd>| {
+        process_request(
+            state,
+            backend,
+            ClientId(client),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 147,
+                data,
+                length_units: u32::try_from((4 + body.len()).div_ceil(4)).unwrap(),
+            },
+            body,
+            fd,
+        )
+        .unwrap()
+    };
+    let error = |peer: &mut std::os::unix::net::UnixStream| {
+        let buf = read_all_available(peer);
+        assert_eq!(buf.len(), 32, "one error: {buf:02x?}");
+        (
+            read_error(&buf),
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+        )
+    };
+
+    // Client 1 makes FENCE; client 2 can't take it (in use), nor an ID
+    // outside its own range.
+    request(
+        &mut state,
+        &mut backend,
+        1,
+        4,
+        &body(ROOT_WINDOW.0, FENCE),
+        fd(),
+    );
+    assert!(read_all_available(&mut peer).is_empty());
+    assert_eq!(state.sync_fences[&FENCE].owner, ClientId(1));
+    request(
+        &mut state,
+        &mut backend,
+        2,
+        4,
+        &body(ROOT_WINDOW.0, FENCE),
+        fd(),
+    );
+    assert_eq!(error(&mut peer2), (x11::error::BAD_ID_CHOICE, FENCE));
+    assert_eq!(
+        state.sync_fences[&FENCE].owner,
+        ClientId(1),
+        "not overwritten"
+    );
+    request(
+        &mut state,
+        &mut backend,
+        2,
+        4,
+        &body(ROOT_WINDOW.0, 0x0040_0003),
+        fd(),
+    );
+    assert_eq!(error(&mut peer2), (x11::error::BAD_ID_CHOICE, 0x0040_0003));
+
+    // A drawable that doesn't exist, then no fd, then a fd the backend
+    // can't take: each an error, and no fence.
+    request(
+        &mut state,
+        &mut backend,
+        2,
+        4,
+        &body(0x0099_0000, OTHER),
+        fd(),
+    );
+    assert_eq!(error(&mut peer2), (x11::error::BAD_DRAWABLE, 0x0099_0000));
+    request(
+        &mut state,
+        &mut backend,
+        2,
+        4,
+        &body(ROOT_WINDOW.0, OTHER),
+        None,
+    );
+    assert_eq!(error(&mut peer2).0, x11::error::BAD_VALUE);
+    backend.refuse_fence_fds = true;
+    request(
+        &mut state,
+        &mut backend,
+        2,
+        4,
+        &body(ROOT_WINDOW.0, OTHER),
+        fd(),
+    );
+    assert_eq!(error(&mut peer2).0, x11::error::BAD_VALUE);
+    assert!(
+        !state.sync_fences.contains_key(&OTHER),
+        "no server-only fence"
+    );
+    backend.refuse_fence_fds = false;
+    request(
+        &mut state,
+        &mut backend,
+        2,
+        4,
+        &body(ROOT_WINDOW.0, OTHER),
+        fd(),
+    );
+    assert!(read_all_available(&mut peer2).is_empty());
+    assert_eq!(state.sync_fences[&OTHER].owner, ClientId(2));
+
+    // SYNC DestroyFence (142, minor 17) frees FENCE; client 1 takes it again.
+    process_request(
+        &mut state,
+        &mut backend,
+        ClientId(1),
+        SequenceNumber(2),
+        RequestHeader {
+            opcode: 142,
+            data: yserver_protocol::x11::sync::DESTROY_FENCE,
+            length_units: 2,
+        },
+        &FENCE.to_le_bytes(),
+        None,
+    )
+    .unwrap();
+    assert!(!state.sync_fences.contains_key(&FENCE));
+    request(
+        &mut state,
+        &mut backend,
+        1,
+        4,
+        &body(ROOT_WINDOW.0, FENCE),
+        fd(),
+    );
+    assert!(read_all_available(&mut peer).is_empty());
+    assert!(state.sync_fences.contains_key(&FENCE));
+}

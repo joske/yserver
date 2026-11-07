@@ -473,6 +473,8 @@ pub struct RecordingBackend {
     /// `(xid, triggered)` of each shared-memory fence `dri3_destroy_fence`
     /// unmapped, with its in-memory state at unmap time.
     pub destroyed_shm_fences: Vec<(u32, bool)>,
+    /// `dri3_fence_from_fd` fails, as for a fd that isn't an xshmfence.
+    pub refuse_fence_fds: bool,
     /// `(syncobj_xid, value)` passed to `dri3_signal_syncobj`, in call
     /// order — Task 8: lets a `PixmapSynced` supersession/copy-failure
     /// release be asserted the same way `triggered_dri3_fences` covers
@@ -719,6 +721,7 @@ impl RecordingBackend {
             triggered_dri3_fences: Vec::new(),
             shm_fences: std::collections::HashMap::new(),
             destroyed_shm_fences: Vec::new(),
+            refuse_fence_fds: false,
             signalled_dri3_syncobjs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             dri3_syncobj_owners: std::collections::HashMap::new(),
             dri3_caps: crate::backend::Dri3Caps::unsupported(),
@@ -1003,6 +1006,17 @@ impl Backend for RecordingBackend {
 
     fn release_present_source(&mut self, pin_id: u64) {
         self.released_present_sources.push(pin_id);
+    }
+
+    fn dri3_fence_from_fd(
+        &mut self,
+        _fence_xid: u32,
+        _fd: crate::fd::OwnedFd,
+    ) -> std::io::Result<()> {
+        if self.refuse_fence_fds {
+            return Err(std::io::Error::other("not an xshmfence"));
+        }
+        Ok(())
     }
 
     fn dri3_trigger_fence(&mut self, fence_xid: u32) -> std::io::Result<()> {
