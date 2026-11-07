@@ -1271,3 +1271,77 @@ fn buffers_from_pixmap_export_failure_returns_bad_pixmap() {
         buf[1]
     );
 }
+
+/// A renderer without SYNC_FD semaphores (`fence_fd: false`, lavapipe) still
+/// takes FenceFromFD: Mesa's X11 swapchain shares an xshmfence per buffer
+/// through it and waits on it, which Xorg accepts on every screen
+/// (`miSyncShmFenceFromFD`). Refused (BadImplementation), every present
+/// waited for ever. FDFromFence, which exports a SYNC_FD, stays refused,
+/// and an AwaitFence on the client's untriggered fence parks the client
+/// rather than waiting on the core thread.
+#[test]
+fn fence_from_fd_takes_an_xshmfence_without_sync_fd_semaphores() {
+    use yserver_protocol::x11::sync as s;
+    const FENCE: u32 = 0x0040_0002;
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let mut backend = RecordingBackend::new();
+    backend.dri3_caps = crate::backend::Dri3Caps {
+        version: (1, 2),
+        modifiers: false,
+        fence_fd: false,
+        syncobj: false,
+    };
+    let (fd, _other) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut body = vec![0u8; 12];
+    body[0..4].copy_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+    body[4..8].copy_from_slice(&FENCE.to_le_bytes());
+    let request = |state: &mut ServerState,
+                   backend: &mut RecordingBackend,
+                   opcode: u8,
+                   data: u8,
+                   body: &[u8],
+                   fd: Option<std::os::fd::OwnedFd>| {
+        process_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode,
+                data,
+                length_units: u32::try_from((4 + body.len()).div_ceil(4)).unwrap(),
+            },
+            body,
+            fd,
+        )
+        .unwrap()
+    };
+    request(&mut state, &mut backend, 147, 4, &body, Some(fd.into()));
+    peer.set_nonblocking(true).unwrap();
+    assert!(
+        read_all_available(&mut peer).is_empty(),
+        "FenceFromFD answered without an error"
+    );
+    assert!(state.sync_fences.contains_key(&FENCE), "the fence exists");
+
+    request(&mut state, &mut backend, 147, 5, &FENCE.to_le_bytes(), None);
+    let refused = read_all_available(&mut peer);
+    assert_eq!(read_error(&refused[..32]), x11::error::BAD_IMPLEMENTATION);
+
+    // AwaitFence (SYNC 142, minor 19) on the untriggered fence returns at
+    // once, the client parked until the fence triggers.
+    let outcome = request(
+        &mut state,
+        &mut backend,
+        142,
+        s::AWAIT_FENCE,
+        &FENCE.to_le_bytes(),
+        None,
+    );
+    assert!(matches!(outcome, RequestOutcome::Handled));
+    assert!(
+        read_all_available(&mut peer).is_empty(),
+        "no reply, no error"
+    );
+}
