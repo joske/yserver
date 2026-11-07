@@ -1027,10 +1027,11 @@ pub(super) fn disconnect_failed_writers(
             return;
         }
         for client in failed {
+            // Why (the peer gone, or the cap) was said where the write
+            // failed (`client_io`).
             warn!(
-                "client {}: output could not be written (peer gone or {} bytes unread); disconnecting",
-                client.0,
-                client_io::OUTBOUND_CAP
+                "client {}: output could not be written; disconnecting",
+                client.0
             );
             disconnect_with_pending_cleanup(
                 state,
