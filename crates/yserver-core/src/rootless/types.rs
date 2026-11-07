@@ -209,6 +209,13 @@ pub enum RootlessEvent {
     ScreenChanged {
         root: (u16, u16),
     },
+    /// Lock the host's pointer on `id`'s native window (`Some`), or let it
+    /// go (`None`): a client grabbed a hidden pointer (`lock.rs`). While it
+    /// is held the host sends `RootlessInput::PointerRelative` rather than
+    /// positions.
+    PointerLock {
+        id: Option<ToplevelId>,
+    },
 }
 
 /// One native output in X pixels, root coordinates (spec §5).
@@ -276,6 +283,17 @@ pub enum RootlessInput {
     },
     PointerLeave {
         origin: InputOrigin,
+        time: u32,
+    },
+    /// While the host holds the pointer locked (`RootlessEvent::PointerLock`):
+    /// it moved by `delta` (accelerated) and `unaccelerated`, in X pixels.
+    /// X's pointer moves by the whole pixels of `delta` from where X has
+    /// it; `unaccelerated` is XI2's raw motion. Dropped when no lock is
+    /// held.
+    PointerRelative {
+        origin: InputOrigin,
+        delta: (f64, f64),
+        unaccelerated: (f64, f64),
         time: u32,
     },
 }

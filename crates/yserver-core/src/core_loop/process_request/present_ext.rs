@@ -315,6 +315,9 @@ pub(super) fn supersede_covered_pending_presents(
     let Some(target) = successor.effective_target_msc else {
         return;
     };
+    if !backend.present_supersedes_same_msc() {
+        return;
+    }
     let window = successor.request.window();
     let (successor_msc_due, _, _) =
         classify_present_pixmap_msc_due_at_arrival(state, backend, successor);

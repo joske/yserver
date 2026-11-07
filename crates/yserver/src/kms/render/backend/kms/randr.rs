@@ -655,6 +655,17 @@ impl KmsBackend {
             PROVIDER_CAPABILITY_SINK_OUTPUT, PROVIDER_CAPABILITY_SOURCE_OUTPUT,
         };
 
+        // A rootless server has no device of its own. Its Vulkan renderer
+        // would be listed as a provider that owns no CRTC and no output,
+        // beside no provider that does, and a client that looks for the
+        // screen's outputs under its providers finds none: Wine's X driver
+        // then has no monitor, and its server divides by a DPI of zero.
+        // Xwayland lists no provider, and clients fall back to the
+        // screen's resources (spec §5).
+        if self.rootless_active() {
+            return Vec::new();
+        }
+
         self.reserve_randr_provider_ids();
         let selected_endpoint = self.selected_render_provider_endpoint();
         let distinct_renderer = match selected_endpoint {
@@ -776,6 +787,10 @@ impl KmsBackend {
         Vec<yserver_core::randr::RandrMode>,
     ) {
         use yserver_core::randr::{RandrMode, RandrOutput};
+
+        if self.rootless_active() {
+            return self.rootless_randr_outputs_and_modes();
+        }
 
         // Provider ids share the same XID source as outputs, CRTCs, and modes
         // even before providers are exposed on the wire. Reserve every
@@ -1065,12 +1080,14 @@ impl KmsBackend {
             yserver_core::randr::RandrState::from_outputs_with_modes(new_ts, outputs, mode_table);
         // CRTC transforms are client-owned, like the logical size below.
         state.randr.restore_crtc_transforms(prev_transforms);
-        let associations = self
+        let associations: Vec<(u32, u32)> = self
             .pstate
             .randr_id_alloc
             .entries()
             .filter(|(_, entry)| entry.crtc_associated)
-            .map(|(_, entry)| (entry.ids.output_id, entry.ids.crtc_id));
+            .map(|(_, entry)| (entry.ids.output_id, entry.ids.crtc_id))
+            .chain(self.rootless_crtc_association())
+            .collect();
         state.randr.set_output_crtc_associations(associations);
         state.randr.set_providers(providers);
         // Carry forward the client-set logical size (from_outputs reseeds

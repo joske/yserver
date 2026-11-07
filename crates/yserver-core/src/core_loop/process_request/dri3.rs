@@ -409,18 +409,15 @@ pub(super) fn handle_dri3_request(
             };
             return Ok(write_to_client(client, client_id, &reply));
         }
+        // Not gated on `caps.fence_fd`, which is the renderer's SYNC_FD
+        // semaphores (FDFromFence's export needs them): what a client
+        // sends here is Mesa's xshmfence, shared memory the backend maps
+        // without Vulkan, and Xorg takes it on every screen
+        // (`miSyncShmFenceFromFD`). A sync_file the renderer cannot import
+        // falls back to a server-only fence below. Refused, every Vulkan
+        // swapchain on such a renderer (lavapipe) waited on its buffers
+        // for ever.
         x11dri3::FENCE_FROM_FD => {
-            if !caps.fence_fd {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_IMPLEMENTATION,
-                    0,
-                    u16::from(header.data),
-                    DRI3_MAJOR_OPCODE,
-                );
-            }
             let Some(req) = x11dri3::parse_fence_from_fd(body) else {
                 return emit_x11_error_with_minor(
                     state,

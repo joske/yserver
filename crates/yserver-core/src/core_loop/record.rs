@@ -2146,9 +2146,9 @@ mod tests {
         let c = state.clients.get_mut(&client).unwrap();
         c.writer.lock().unwrap().set_nonblocking(true).unwrap();
         c.outbound
-            .extend(std::iter::repeat_n(0u8, client_io::OUTBOUND_CAP));
+            .extend(std::iter::repeat_n(0u8, client_io::outbound_cap()));
         let _ = client_io::drain_outbound(c);
-        let missing = client_io::OUTBOUND_CAP - c.outbound.len();
+        let missing = client_io::outbound_cap() - c.outbound.len();
         c.outbound.extend(std::iter::repeat_n(0u8, missing));
     }
 

@@ -4,8 +4,9 @@
 //! `write_or_buffer`. It tries a direct non-blocking `write(2)` first;
 //! on `EAGAIN`/partial write it buffers the remainder on
 //! `ClientState::outbound` and returns `WouldBlock` so the caller can
-//! arrange `WRITABLE` interest in the poller (I2). When the buffer is
-//! about to exceed `OUTBOUND_CAP` we return `Disconnect`.
+//! arrange `WRITABLE` interest in the poller (I2). The buffer grows as
+//! Xorg's does (`FlushClient`, `os/io.c`), up to `INT_MAX`; only past
+//! that do we return `Disconnect`.
 //!
 //! Every failed write also marks the client `write_failed`: later writes
 //! to it are refused without touching the socket, and the core loop
@@ -31,16 +32,42 @@ use crate::{
 };
 
 /// Maximum bytes queued per client before we treat the peer as
-/// unrecoverably slow and disconnect.
+/// unrecoverably slow and disconnect: Xorg's, whose `FlushClient`
+/// (`os/io.c`) grows a client's output buffer for as long as
+/// `notWritten + BUFSIZE <= INT_MAX` and aborts the client only past it.
 ///
-/// Sized to fit a single legitimate large reply with headroom for
-/// additional traffic. The motivating case is a QueryFont reply for an
-/// ISO10646 host font (`-Misc-Fixed-*-ISO10646-1`): m=65536 CHAR_INFOs
-/// ⇒ 32 + 4·(7 + 2n + 3·65536) ≈ 786 KB. With Linux's default
-/// 208 KB unix-socket send buffer the partial-write tail is ~578 KB,
-/// so a smaller cap would force a spurious slow-client disconnect on a
-/// fast client that simply hasn't read the reply yet.
-pub const OUTBOUND_CAP: usize = 4 * 1024 * 1024;
+/// It was 4 MiB, sized to one large QueryFont reply. A client that
+/// stopped reading for a while was dropped at that cap, where Xorg would
+/// have kept its output.
+pub const OUTBOUND_CAP: usize = i32::MAX as usize;
+
+/// Queued output this large is logged, and each doubling past it: a
+/// client that stopped reading, and what it is sent.
+const BACKLOG_REPORT: usize = 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// The cap tests saturate, a test thread's own: 4 MiB unless a test
+    /// sets it, so a saturated client costs no more than that.
+    static TEST_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(4 * 1024 * 1024) };
+}
+
+/// The cap in force: [`OUTBOUND_CAP`], or a test thread's.
+pub fn outbound_cap() -> usize {
+    #[cfg(test)]
+    return TEST_CAP.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    OUTBOUND_CAP
+}
+
+/// Test support: run `f` with the production cap in force on this thread.
+#[cfg(test)]
+pub(crate) fn with_production_cap<T>(f: impl FnOnce() -> T) -> T {
+    let before = TEST_CAP.with(|cap| cap.replace(OUTBOUND_CAP));
+    let out = f();
+    TEST_CAP.with(|cap| cap.set(before));
+    out
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum WriteOutcome {
@@ -112,9 +139,10 @@ fn write_with_fd_inner(
     bytes: &[u8],
     fd: RawFd,
 ) -> io::Result<WriteOutcome> {
-    if !client.outbound.is_empty() && client.outbound.len() + bytes.len() > OUTBOUND_CAP {
+    if !client.outbound.is_empty() && client.outbound.len() + bytes.len() > outbound_cap() {
         log::warn!(
-            "client_io: outbound cap exceeded — outbound={} bytes pending, +{} new with a descriptor ⇒ Disconnect",
+            "client_io: client 0x{:x}: outbound cap exceeded -- {} bytes unread, +{} new with a descriptor; disconnecting",
+            client.resource_id_base,
             client.outbound.len(),
             bytes.len(),
         );
@@ -223,7 +251,7 @@ fn write_or_buffer_inner(client: &mut ClientState, bytes: &[u8]) -> io::Result<W
     let mut writer = writer_arc.lock().unwrap();
     match writer.write(bytes) {
         Ok(n) if n == bytes.len() => Ok(WriteOutcome::Done),
-        Ok(0) => Ok(WriteOutcome::Disconnect),
+        Ok(0) => Ok(peer_gone(client, "write returned 0")),
         Ok(n) => {
             drop(writer);
             Ok(buffer_or_disconnect(client, &bytes[n..]))
@@ -232,31 +260,70 @@ fn write_or_buffer_inner(client: &mut ClientState, bytes: &[u8]) -> io::Result<W
             drop(writer);
             Ok(buffer_or_disconnect(client, bytes))
         }
-        Err(e) if disconnect_kind(e.kind()) => Ok(WriteOutcome::Disconnect),
+        Err(e) if disconnect_kind(e.kind()) => Ok(peer_gone(client, &e.to_string())),
         Err(e) => Err(e),
     }
 }
 
 /// Push `bytes` onto `client.outbound`, or return `Disconnect` if
-/// doing so would exceed `OUTBOUND_CAP`.
+/// doing so would exceed the cap ([`OUTBOUND_CAP`]).
 fn buffer_or_disconnect(client: &mut ClientState, bytes: &[u8]) -> WriteOutcome {
-    if !client.outbound.is_empty() && client.outbound.len() + bytes.len() > OUTBOUND_CAP {
+    let before = client.outbound.len();
+    if before != 0 && before + bytes.len() > outbound_cap() {
         log::warn!(
-            "client_io: outbound cap exceeded — outbound={} bytes pending, +{} new ⇒ Disconnect",
-            client.outbound.len(),
+            "client_io: client 0x{:x}: outbound cap exceeded -- {} bytes unread, +{} new; disconnecting",
+            client.resource_id_base,
+            before,
             bytes.len(),
         );
         return WriteOutcome::Disconnect;
     }
-    let was_empty = client.outbound.is_empty();
     client.outbound.extend(bytes.iter().copied());
-    if was_empty {
-        log::trace!(
-            "client_io: starting to buffer outbound — {} bytes (kernel buffer full)",
-            client.outbound.len(),
+    let after = client.outbound.len();
+    if before == 0 {
+        log::trace!("client_io: starting to buffer outbound -- {after} bytes (kernel buffer full)");
+    }
+    if crossed_report(before, after) {
+        log::info!(
+            "client_io: client 0x{:x} reads slowly: {} bytes unread; the newest message {}",
+            client.resource_id_base,
+            after,
+            describe(bytes),
         );
     }
     WriteOutcome::WouldBlock
+}
+
+/// Whether the backlog went past [`BACKLOG_REPORT`] or one of its
+/// doublings.
+fn crossed_report(before: usize, after: usize) -> bool {
+    let mut mark = BACKLOG_REPORT;
+    while mark <= after {
+        if before < mark {
+            return true;
+        }
+        match mark.checked_mul(2) {
+            Some(next) => mark = next,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// An outgoing message by its header, for the backlog log: a reply, an
+/// error, an event by code, a GenericEvent by extension and type.
+fn describe(bytes: &[u8]) -> String {
+    match bytes {
+        [] => "(none)".into(),
+        [0, code, ..] => format!("is error {code} ({} bytes)", bytes.len()),
+        [1, ..] => format!("is a reply ({} bytes)", bytes.len()),
+        [35, extension, _, _, _, _, _, _, low, high, ..] => format!(
+            "is GenericEvent of extension {extension}, type {} ({} bytes)",
+            u16::from_le_bytes([*low, *high]),
+            bytes.len()
+        ),
+        [code, ..] => format!("is event {} ({} bytes)", code & 0x7f, bytes.len()),
+    }
 }
 
 /// Push as much of `client.outbound` to the wire as possible without
@@ -301,17 +368,28 @@ fn drain_outbound_inner(client: &mut ClientState) -> io::Result<WriteOutcome> {
             _ => writer.write(&chunk),
         };
         match written {
-            Ok(0) => return Ok(WriteOutcome::Disconnect),
+            Ok(0) => return Ok(peer_gone(client, "write returned 0")),
             Ok(n) => {
                 client.outbound.drain(..n);
                 client.outbound_fds.sent(n, with_fd);
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(WriteOutcome::WouldBlock),
-            Err(e) if disconnect_kind(e.kind()) => return Ok(WriteOutcome::Disconnect),
+            Err(e) if disconnect_kind(e.kind()) => return Ok(peer_gone(client, &e.to_string())),
             Err(e) => return Err(e),
         }
     }
     Ok(WriteOutcome::Done)
+}
+
+/// The peer went: said once, since the client's writes stop here, so the
+/// disconnect that follows says why.
+fn peer_gone(client: &ClientState, why: &str) -> WriteOutcome {
+    log::info!(
+        "client_io: client 0x{:x}: the peer is gone ({why}), {} bytes unread",
+        client.resource_id_base,
+        client.outbound.len(),
+    );
+    WriteOutcome::Disconnect
 }
 
 fn disconnect_kind(k: ErrorKind) -> bool {
@@ -322,15 +400,15 @@ fn disconnect_kind(k: ErrorKind) -> bool {
 }
 
 /// Test support: fill `client`'s socket, then its outbound buffer to
-/// `OUTBOUND_CAP`, so its next write overflows.
+/// the cap ([`outbound_cap`]), so its next write overflows.
 #[cfg(test)]
 pub(crate) fn saturate_for_test(client: &mut ClientState) {
     client.writer.lock().unwrap().set_nonblocking(true).unwrap();
     client
         .outbound
-        .extend(std::iter::repeat_n(0u8, OUTBOUND_CAP));
+        .extend(std::iter::repeat_n(0u8, outbound_cap()));
     let _ = drain_outbound(client);
-    let missing = OUTBOUND_CAP - client.outbound.len();
+    let missing = outbound_cap() - client.outbound.len();
     client.outbound.extend(std::iter::repeat_n(0u8, missing));
     assert!(!client.write_failed);
 }
@@ -410,7 +488,7 @@ mod tests {
         let payload = vec![0xABu8; 32 * 1024];
         let outcome = write_or_buffer(&mut c, &payload).unwrap();
         // Either WouldBlock (some buffered) or Disconnect (overflowed cap).
-        // For 32 KiB <= OUTBOUND_CAP (64 KiB), it should be WouldBlock.
+        // For 32 KiB <= outbound_cap(), it should be WouldBlock.
         assert_eq!(outcome, WriteOutcome::WouldBlock);
         assert!(!c.outbound.is_empty(), "remainder should be buffered");
         // Drain the peer; outbound should now drain to empty.
@@ -439,8 +517,8 @@ mod tests {
         let mut c = make_client(a);
         // Fill the kernel buffer first so the next call must buffer.
         let _ = write_or_buffer(&mut c, &vec![0u8; 8 * 1024]).unwrap();
-        // Now hand it more than OUTBOUND_CAP — must Disconnect.
-        let huge = vec![0u8; OUTBOUND_CAP + 1];
+        // Now hand it more than the cap — must Disconnect.
+        let huge = vec![0u8; outbound_cap() + 1];
         let outcome = write_or_buffer(&mut c, &huge).unwrap();
         assert_eq!(outcome, WriteOutcome::Disconnect);
     }
@@ -458,7 +536,7 @@ mod tests {
             WriteOutcome::Disconnect
         );
         assert!(c.write_failed);
-        assert_eq!(c.outbound.len(), OUTBOUND_CAP);
+        assert_eq!(c.outbound.len(), outbound_cap());
 
         b.set_nonblocking(true).unwrap();
         let mut sink = vec![0u8; 1 << 20];
@@ -468,7 +546,7 @@ mod tests {
             WriteOutcome::Disconnect
         );
         assert_eq!(drain_outbound(&mut c).unwrap(), WriteOutcome::Disconnect);
-        assert_eq!(c.outbound.len(), OUTBOUND_CAP);
+        assert_eq!(c.outbound.len(), outbound_cap());
         assert!(b.read(&mut sink).is_err(), "no byte after the failure");
 
         let mut clients = HashMap::new();
@@ -569,7 +647,7 @@ mod tests {
     fn single_oversized_reply_buffers_when_outbound_empty() {
         let (a, _b) = pair_with_small_sndbuf();
         let mut c = make_client(a);
-        let big = vec![0u8; OUTBOUND_CAP + 1_000_000];
+        let big = vec![0u8; outbound_cap() + 1_000_000];
         let outcome = buffer_or_disconnect(&mut c, &big);
         assert_eq!(outcome, WriteOutcome::WouldBlock);
         assert_eq!(c.outbound.len(), big.len());
@@ -580,7 +658,7 @@ mod tests {
         let (a, _b) = pair_with_small_sndbuf();
         let mut c = make_client(a);
         c.outbound
-            .extend(std::iter::repeat_n(0u8, OUTBOUND_CAP - 10));
+            .extend(std::iter::repeat_n(0u8, outbound_cap() - 10));
         let outcome = buffer_or_disconnect(&mut c, &[0u8; 1000]);
         assert_eq!(outcome, WriteOutcome::Disconnect);
     }
@@ -618,6 +696,88 @@ mod tests {
             }
         }
         assert!(c.outbound.is_empty(), "buffer should drain to empty");
+    }
+
+    /// A client that stopped reading was dropped once 4 MiB were queued
+    /// for it. Xorg keeps buffering (`FlushClient`, up to `INT_MAX`): so does the core now.
+    /// What that could cost instead: a writer stalled on the client that
+    /// does not read, or bytes out of order. Neither: each write returns at
+    /// once, a client that reads is served meanwhile, and the slow one gets
+    /// every byte in order once it reads.
+    #[test]
+    fn a_client_that_stops_reading_keeps_its_output_as_xorg_does() {
+        with_production_cap(|| {
+            let (a, mut slow_peer) = pair_with_small_sndbuf();
+            let mut slow = make_client(a);
+            let (b, mut fast_peer) = UnixStream::pair().unwrap();
+            b.set_nonblocking(true).unwrap();
+            let mut fast = make_client(b);
+            let event = |n: u32| {
+                let mut bytes = [0u8; 32];
+                bytes[0] = 6; // MotionNotify
+                bytes[4..8].copy_from_slice(&n.to_le_bytes());
+                bytes
+            };
+            // 16 MiB of events, four times the old cap, the peer reading
+            // nothing (a write that waited would hang here); another
+            // client's write between every 4096.
+            let count = 16 * 1024 * 1024 / 32;
+            for n in 0..count {
+                let outcome = write_or_buffer(&mut slow, &event(n)).unwrap();
+                assert_ne!(outcome, WriteOutcome::Disconnect, "event {n}");
+                if n % 4096 == 0 {
+                    assert_eq!(
+                        write_or_buffer(&mut fast, &event(n)).unwrap(),
+                        WriteOutcome::Done
+                    );
+                    let mut got = [0u8; 32];
+                    fast_peer.read_exact(&mut got).unwrap();
+                    assert_eq!(got, event(n));
+                }
+            }
+            assert!(!slow.write_failed);
+            assert!(slow.outbound.len() > 4 * 1024 * 1024);
+            // The peer reads; every event arrives, in order.
+            slow_peer.set_nonblocking(true).unwrap();
+            let mut next = 0u32;
+            let mut pending = Vec::new();
+            let mut sink = vec![0u8; 64 * 1024];
+            while next < count {
+                let _ = drain_outbound(&mut slow).unwrap();
+                match slow_peer.read(&mut sink) {
+                    Ok(n) => pending.extend_from_slice(&sink[..n]),
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("read: {e}"),
+                }
+                let whole = pending.len() / 32 * 32;
+                for chunk in pending[..whole].chunks_exact(32) {
+                    assert_eq!(chunk, event(next));
+                    next += 1;
+                }
+                pending.drain(..whole);
+            }
+            assert!(slow.outbound.is_empty());
+        });
+    }
+
+    #[test]
+    fn a_backlog_is_reported_at_a_mebibyte_and_each_doubling() {
+        let mib = 1024 * 1024;
+        assert!(!crossed_report(0, mib - 1));
+        assert!(crossed_report(mib - 1, mib));
+        assert!(!crossed_report(mib, mib + 32));
+        assert!(crossed_report(3 * mib, 4 * mib + 1));
+        assert!(!crossed_report(4 * mib + 1, 5 * mib));
+        assert!(!crossed_report(usize::MAX - 1, usize::MAX));
+        let mut generic = [0u8; 32];
+        generic[0] = 35;
+        generic[1] = 131;
+        generic[8] = 17;
+        assert_eq!(
+            describe(&generic),
+            "is GenericEvent of extension 131, type 17 (32 bytes)"
+        );
+        assert_eq!(describe(&[0x86, 0, 0, 0]), "is event 6 (4 bytes)");
     }
 
     #[test]

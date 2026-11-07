@@ -28,6 +28,8 @@ pub(crate) mod surface;
 pub mod version;
 #[cfg(kms)]
 mod vt;
+#[cfg(wayland_host)]
+mod wayland;
 #[cfg(windows)]
 mod windows;
 
@@ -87,7 +89,8 @@ fn ensure_input_devices_opened(opened: usize) -> io::Result<()> {
 }
 
 /// What the startup path should do about input: spawn the input thread if a
-/// libinput context was created, or refuse to start if not.
+/// libinput context was created, or refuse to start if not. A rootless host's
+/// seat is the input of a server that has one, and libinput is not used.
 #[cfg(kms)]
 #[derive(Debug, PartialEq, Eq)]
 enum InputStartup {
@@ -95,6 +98,11 @@ enum InputStartup {
     DirectSpawn,
     /// No libinput context at all — refuse to start.
     AbortNoInput,
+    /// The host's seat is the input (the Wayland host): the host's window
+    /// system owns the devices, so no libinput context was made
+    /// ([`crate::kms::outputs::InputSource::HostSeat`]) and no input thread
+    /// starts.
+    HostSeat,
 }
 
 /// Decide the input-startup action. yserver is always Direct and requires
@@ -105,8 +113,10 @@ enum InputStartup {
 /// group / not on the console). Extracted as a pure fn so the abort is
 /// unit-testable; `run()` itself is not.
 #[cfg(kms)]
-fn input_startup_action(has_input_ctx: bool) -> InputStartup {
-    if has_input_ctx {
+fn input_startup_action(has_input_ctx: bool, host_seat: bool) -> InputStartup {
+    if host_seat {
+        InputStartup::HostSeat
+    } else if has_input_ctx {
         InputStartup::DirectSpawn
     } else {
         InputStartup::AbortNoInput
@@ -813,8 +823,20 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // would otherwise kill the whole session when the user hits Ctrl-C
     // inside an X client. Skipped silently when not on a Linux VC (pty
     // under SSH or a graphical terminal emulator).
-    let console_guard = crate::kms::console::ConsoleGuard::acquire(opts.vt)?;
-    let device_paths = crate::platform::drm::resolve_default_kms_devices()?;
+    //
+    // A client of a Wayland compositor owns neither the console nor a card:
+    // the compositor has both, and the server runs on its renderer alone.
+    let wayland = wayland_requested();
+    let console_guard = if wayland {
+        None
+    } else {
+        crate::kms::console::ConsoleGuard::acquire(opts.vt)?
+    };
+    let device_paths = if wayland {
+        Vec::new()
+    } else {
+        crate::platform::drm::resolve_default_kms_devices()?
+    };
     if device_paths.is_empty() {
         log::info!("yserver: no DRM devices to open; starting zero-card headless");
     } else {
@@ -831,8 +853,31 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // Always Direct (self-managed DRM master + VT_PROCESS): open DRM +
     // libinput directly, arming VT_PROCESS when a controlling console is
     // present.
-    let mut backend =
-        build_kms_backend(&device_paths, console_guard, opts.layout.clone(), opts.vrr)?;
+    // A host's seat is the input: no libinput context is made for it.
+    let input = if wayland {
+        crate::kms::outputs::InputSource::HostSeat
+    } else {
+        crate::kms::outputs::InputSource::Libinput
+    };
+    let mut backend = build_kms_backend(
+        &device_paths,
+        input,
+        console_guard,
+        opts.layout.clone(),
+        opts.vrr,
+    )?;
+    // The rootless Wayland host, which the root's size and the keymap come
+    // from: attached before the topology is read.
+    #[cfg(wayland_host)]
+    let wayland_host = if wayland {
+        let host = std::rc::Rc::new(std::cell::RefCell::new(wayland::WaylandHost::connect()?));
+        backend.attach_rootless_host(host.clone())?;
+        let (width, height) = backend.fb_dimensions();
+        log::info!("wayland: the root window is the compositor's screen, {width}x{height}");
+        Some(host)
+    } else {
+        None
+    };
     // One snapshot of everything `ServerState` needs from the live
     // backend — screen extent, RandR outputs/modes/providers, backend
     // capabilities. The server-reset boundary re-derives a generation
@@ -855,6 +900,17 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     crate::clock::init(state.start_instant);
     install_backend_root_bindings(&mut state, &backend);
     yserver_core::core_loop::process_request::install_default_font(&mut state, &mut backend)?;
+    #[cfg(wayland_host)]
+    if let Some(host) = &wayland_host {
+        backend
+            .start_rootless(&mut state)
+            .map_err(|e| io::Error::other(format!("rootless: {e}")))?;
+        if let Some(name) = host.borrow().window_manager_name() {
+            log::info!("wayland: the window manager is {name}");
+            yserver_core::rootless::name_window_manager(&mut state, &mut backend, &name);
+        }
+        log::info!("yserver: rootless, on the Wayland compositor");
+    }
 
     let socket_dir = PathBuf::from("/tmp/.X11-unix");
     fs::create_dir_all(&socket_dir).map_err(|e| {
@@ -928,7 +984,11 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // `SendContext::new()` failed — libinput unavailable, or every input
     // device was permission-denied — so we refuse to start below.
     let direct_input_ctx = backend.take_input_ctx();
-    match input_startup_action(direct_input_ctx.is_some()) {
+    match input_startup_action(direct_input_ctx.is_some(), wayland) {
+        InputStartup::HostSeat => {
+            debug_assert!(direct_input_ctx.is_none(), "a host seat opens no libinput");
+            log::info!("yserver: input comes from the host's seat; no libinput");
+        }
         InputStartup::AbortNoInput => {
             // libinput could not be set up at all (`SendContext::new()` failed
             // → `take_input_ctx()` is None). Refuse to start: a session with no
@@ -1187,6 +1247,20 @@ fn spawn_signal_thread(
     Ok(())
 }
 
+/// Whether `YSERVER_BACKEND=wayland` asks for the rootless Wayland host.
+/// Asked for in a build without the `wayland` feature, it is refused rather
+/// than ignored, since the server would take the console and the card of a
+/// machine whose compositor has them.
+#[cfg(kms)]
+fn wayland_requested() -> bool {
+    let asked = std::env::var("YSERVER_BACKEND").is_ok_and(|value| value == "wayland");
+    if asked && !cfg!(wayland_host) {
+        log::error!("yserver: YSERVER_BACKEND=wayland, but this build has no Wayland host");
+        std::process::exit(1);
+    }
+    asked
+}
+
 /// Build a `KmsBackend`. yserver is always Direct — self-managed DRM master
 /// with VT_PROCESS — so this opens DRM + libinput directly, arming VT_PROCESS
 /// when a real controlling console is present. (libseat/logind session
@@ -1194,11 +1268,12 @@ fn spawn_signal_thread(
 #[cfg(kms)]
 fn build_kms_backend(
     device_paths: &[std::path::PathBuf],
+    input: crate::kms::outputs::InputSource,
     console_guard: crate::kms::ConsoleGuardOpt,
     layout: Option<String>,
     vrr_mode: crate::launch::VrrMode,
 ) -> io::Result<crate::kms::render::KmsBackend> {
-    crate::kms::render::KmsBackend::open(device_paths, console_guard, layout, vrr_mode)
+    crate::kms::render::KmsBackend::open(device_paths, input, console_guard, layout, vrr_mode)
 }
 
 /// Map a delivered signal to the core-loop message it requests, plus a
@@ -1661,13 +1736,25 @@ mod tests {
         // (`SendContext::new()` Err → `take_input_ctx()` None) must abort,
         // not fall through to a dead session that can't be zapped. This is
         // the gap the `opened == 0` guard did NOT cover.
-        assert_eq!(input_startup_action(false), InputStartup::AbortNoInput);
+        assert_eq!(
+            input_startup_action(false, false),
+            InputStartup::AbortNoInput
+        );
     }
 
     #[cfg(kms)]
     #[test]
     fn with_input_ctx_spawns_input_thread() {
-        assert_eq!(input_startup_action(true), InputStartup::DirectSpawn);
+        assert_eq!(input_startup_action(true, false), InputStartup::DirectSpawn);
+    }
+
+    /// A rootless host's seat is the input: no libinput thread, whether or
+    /// not a context opened, and no refusal for want of devices.
+    #[cfg(kms)]
+    #[test]
+    fn a_host_seat_takes_the_place_of_libinput() {
+        assert_eq!(input_startup_action(true, true), InputStartup::HostSeat);
+        assert_eq!(input_startup_action(false, true), InputStartup::HostSeat);
     }
 
     // TCP-only behaviour of `validate_tcp_startup` (auth-file requirement,

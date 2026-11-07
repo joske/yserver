@@ -56,6 +56,11 @@ input.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 udev.workspace = true
+# The rootless Wayland host (`src/wayland/`), behind feature `wayland`:
+# wayland-client on its own Rust implementation of the wire (not the
+# `system` libwayland one), and the protocols beyond the core it speaks.
+wayland-client = { version = "0.31.15", optional = true }
+wayland-protocols = { version = "0.32.13", features = ["client", "staging", "unstable"], optional = true }
 
 # The AppKit window shell (`src/macos/`).
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -100,6 +105,12 @@ windows-sys = { version = "0.61", features = [
 default = []
 tcp-transport = []
 xdmcp = ["tcp-transport", "yserver-core/xdmcp"]
+# The rootless Wayland host (`src/wayland/`): each top-level X window an
+# `xdg_toplevel` of the compositor `WAYLAND_DISPLAY` names, under
+# `YSERVER_BACKEND=wayland`. Off by default, so a build that does not ask
+# for it pulls in no Wayland crates. Linux only. xkbcommon's own `wayland`
+# feature reads the compositor's keymap from its descriptor.
+wayland = ["dep:wayland-client", "dep:wayland-protocols", "xkbcommon/wayland"]
 
 [lints]
 workspace = true

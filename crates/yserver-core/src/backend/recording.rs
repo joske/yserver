@@ -290,6 +290,8 @@ pub struct RecordingBackend {
     /// `take_displayed_cursor_change`. Tests set it to stand in for a KMS
     /// sprite change.
     pub displayed_cursor_change: Option<crate::backend::DisplayedCursor>,
+    /// What `displayed_cursor_hidden` answers.
+    pub displayed_cursor_hidden: bool,
     next_handle: Mutex<u32>,
     fake_window_id: u32,
     fake_root_visual_xid: u32,
@@ -641,6 +643,7 @@ impl RecordingBackend {
         Self {
             calls: Mutex::new(Vec::new()),
             displayed_cursor_change: None,
+            displayed_cursor_hidden: false,
             next_handle: Mutex::new(0x0001_0000),
             fake_window_id: 0x0000_0100,
             fake_root_visual_xid: 0x0000_0021,
@@ -874,6 +877,10 @@ impl crate::backend::SyncobjHandle for RecordingSyncobjHandle {
 }
 
 impl Backend for RecordingBackend {
+    fn displayed_cursor_hidden(&self) -> bool {
+        self.displayed_cursor_hidden
+    }
+
     // State accessors — return fixed sentinels so the call sites that
     // need a real number get a real number; record nothing.
 

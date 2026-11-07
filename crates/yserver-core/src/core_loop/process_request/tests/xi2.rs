@@ -1901,11 +1901,33 @@ fn xi2_keyboard_grabs_keep_their_event_mask() {
     assert_eq!(state.key_grabs.last().map(|g| g.xi2_mask), Some(MASK));
 }
 
+/// XI_DeviceChanged events (GenericEvent 35, evtype 1) on `wire`, as
+/// `(deviceid, sourceid, reason)`.
+fn device_changed_events(wire: &[u8]) -> Vec<(u16, u16, u8)> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at + 32 <= wire.len() {
+        let length = if wire[at] == 35 || wire[at] == 1 {
+            32 + u32::from_le_bytes(wire[at + 4..at + 8].try_into().unwrap()) as usize * 4
+        } else {
+            32
+        };
+        if wire[at] == 35 && u16::from_le_bytes([wire[at + 8], wire[at + 9]]) == 1 {
+            found.push((
+                u16::from_le_bytes([wire[at + 10], wire[at + 11]]),
+                u16::from_le_bytes([wire[at + 18], wire[at + 19]]),
+                wire[at + 20],
+            ));
+        }
+        at += length;
+    }
+    found
+}
+
 #[test]
-fn xi_select_events_on_root_bootstraps_device_changed() {
-    // Xorg initializes the core pair with CorePointerProc (devices.c:724-730,
-    // :655-694), so a fresh master bootstrap has 3 classes, not the old
-    // unconditional physical-pointer set of 7.
+fn xi_select_events_on_root_sends_no_device_changed_for_a_fresh_master() {
+    // Xorg sends no DeviceChanged on XISelectEvents (Xi/xiselectev.c); a
+    // master no slave has driven has no switch to report.
     let mut state = ServerState::new();
     let mut peer = install_client(&mut state, 1);
     let mut backend = RecordingBackend::new();
@@ -1933,21 +1955,59 @@ fn xi_select_events_on_root_bootstraps_device_changed() {
     )
     .expect("XISelectEvents");
 
-    let wire = read_all_available(&mut peer);
-    let event_offset = (0..wire.len().saturating_sub(32))
-        .find(|&i| wire[i] == 35 && u16::from_le_bytes([wire[i + 8], wire[i + 9]]) == 1)
-        .expect("bootstrap XI_DeviceChanged event");
-    assert_eq!(wire[event_offset + 10], 2, "deviceid low byte");
-    assert_eq!(
-        wire[event_offset + 16],
+    assert_eq!(device_changed_events(&read_all_available(&mut peer)), []);
+}
+
+/// Wine's winex11 at start (`x11drv_xinput2_init`): DeviceChanged selected
+/// on the root for XIAllMasterDevices, then XIGetClientPointer and
+/// XIQueryDevice of that pointer. A SlaveSwitch it is then sent makes it
+/// XOpenDevice the event's sourceid (`update_device_mapping`), so no event
+/// may name a master there: XOpenDevice of a master is BadDevice, as in
+/// Xorg, and ends the Wine process.
+#[test]
+fn wines_xinput2_start_is_sent_no_switch_to_a_master() {
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let mut wire = Vec::new();
+    let mut select = Vec::new();
+    select.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+    select.extend_from_slice(&1u16.to_le_bytes());
+    select.extend_from_slice(&0u16.to_le_bytes());
+    select.extend_from_slice(&1u16.to_le_bytes()); // XIAllMasterDevices
+    select.extend_from_slice(&1u16.to_le_bytes());
+    select.extend_from_slice(&XI2_DEVICE_CHANGED_MASK.to_le_bytes());
+    wire.extend(dispatch_xi_request_wire(
+        &mut state, &mut peer, 26, 46, &select,
+    ));
+    // XIGetClientPointer(None).
+    let pointer = dispatch_xi_request_wire(&mut state, &mut peer, 27, 45, &[0; 4]);
+    assert_eq!(pointer[0], 1, "XIGetClientPointer reply");
+    let deviceid = u16::from_le_bytes([pointer[10], pointer[11]]);
+    assert_eq!(deviceid, crate::xinput::DEVICEID_MASTER_POINTER);
+    let mut query = deviceid.to_le_bytes().to_vec();
+    query.extend_from_slice(&[0, 0]);
+    let queried = dispatch_xi_request_wire(&mut state, &mut peer, 28, 48, &query);
+    assert_eq!(queried[0], 1, "XIQueryDevice reply");
+    wire.extend(read_all_available(&mut peer));
+    for (_, sourceid, _) in device_changed_events(&wire) {
+        assert!(
+            state
+                .xi_devices
+                .device(sourceid)
+                .is_some_and(|device| device.attached_master.is_some()),
+            "a DeviceChanged names master {sourceid} as its source"
+        );
+    }
+    // What winex11 would then ask, and Xorg refuses (Xi/opendev.c).
+    let opened = dispatch_wire_request(
+        &mut state,
+        &mut peer,
+        34,
+        XI2_MAJOR_OPCODE,
         3,
-        "the initial master uses CorePointerProc's three classes"
+        &[2, 0, 0, 0],
     );
-    assert_eq!(
-        wire[event_offset + 18],
-        2,
-        "sourceid falls back to master pointer"
-    );
+    assert_eq!(opened[0], 0, "XOpenDevice of a master is an error");
 }
 
 #[test]
@@ -2050,9 +2110,9 @@ fn xi_slave_switch_bootstrap_uses_last_pointer_slave_or_master_classes() {
     );
     let fallback = read_all_available(&mut bootstrap_peer);
     assert_eq!(
-        device_changed(&fallback),
-        (2, 2, 1, 3, None),
-        "the initial class set has CorePointerProc shape and sourceid 2"
+        device_changed_events(&fallback),
+        [],
+        "no slave has driven the master: no switch to report"
     );
 
     let source = InputSourceId(0xA71);
@@ -2880,11 +2940,11 @@ fn xi_xtest_classes_xi1_list_and_open_device_match_xtest_pointer() {
 }
 
 #[test]
-fn xi2_device_changed_bootstrap_matches_initial_master_query_classes() {
-    // Before: this asserted seven physical classes and two scroll classes
-    // on a fresh master. Xorg's CorePointerProc creates 10 buttons and two
-    // relative valuators with no scroll classes (dix/devices.c:655-700;
-    // InitCoreDevices calls it at :724-730).
+fn a_fresh_master_keeps_core_pointer_classes_of_its_own_and_is_sent_no_bootstrap() {
+    // Xorg's CorePointerProc creates 10 buttons and two relative valuators
+    // with no scroll classes (dix/devices.c:655-700; InitCoreDevices calls
+    // it at :724-730), each class sourced from the master itself
+    // (dix/devices.c:1357,1433). Selecting DeviceChanged reports nothing.
     let mut state = ServerState::new();
     let mut peer = install_client(&mut state, 1);
     let mut select_body = Vec::new();
@@ -2895,20 +2955,10 @@ fn xi2_device_changed_bootstrap_matches_initial_master_query_classes() {
     select_body.extend_from_slice(&1u16.to_le_bytes());
     select_body.extend_from_slice(&XI2_DEVICE_CHANGED_MASK.to_le_bytes());
     let wire = dispatch_xi_request_wire(&mut state, &mut peer, 1, 46, &select_body);
-    // Locate the XI_DeviceChanged event (opcode 35, evtype 1).
-    let off = (0..wire.len().saturating_sub(32))
-        .find(|&i| wire[i] == 35 && u16::from_le_bytes([wire[i + 8], wire[i + 9]]) == 1)
-        .expect("XI_DeviceChanged event in wire");
-    assert_eq!(wire[off + 1], XI2_MAJOR_OPCODE, "major opcode = XI2 ext");
-    let num_classes = u16::from_le_bytes([wire[off + 16], wire[off + 17]]);
-    assert_eq!(num_classes, 3, "initial CorePointerProc classes");
-    let event_class_len =
-        u32::from_le_bytes(wire[off + 4..off + 8].try_into().unwrap()) as usize * 4;
-    let event_classes = &wire[off + 32..off + 32 + event_class_len];
+    assert_eq!(device_changed_events(&wire), []);
     let (query_classes, query_num_classes) = query_device_class_block(&mut state, &mut peer, 2);
     assert_eq!(query_num_classes, 3);
-    assert_eq!(event_classes, query_classes);
-    let class_headers = parse_xi2_class_headers(event_classes, num_classes);
+    let class_headers = parse_xi2_class_headers(&query_classes, query_num_classes);
     assert_eq!(
         class_headers
             .iter()
@@ -2917,13 +2967,14 @@ fn xi2_device_changed_bootstrap_matches_initial_master_query_classes() {
         [1, 2, 2]
     );
     assert_eq!(
-        u16::from_le_bytes([event_classes[6], event_classes[7]]),
+        u16::from_le_bytes([query_classes[4], query_classes[5]]),
+        2,
+        "the master's own classes are sourced from it"
+    );
+    assert_eq!(
+        u16::from_le_bytes([query_classes[6], query_classes[7]]),
         10,
         "CorePointerProc button class has ten buttons"
-    );
-    assert!(
-        class_headers.iter().all(|class| class.0 != 3),
-        "the fresh master has no scroll class or absent valuator reference"
     );
 }
 
@@ -3525,5 +3576,140 @@ fn xi_change_cursor_propagates_define_cursor_to_backend() {
         "XIChangeCursor with cursor=None (xid 0) must invoke \
              `backend.define_cursor(window, 0)` — same X11 None \
              semantics as the CWA cursor path.",
+    );
+}
+
+/// XI2 generic events of `evtype` on `wire`, as `(deviceid, sourceid)`:
+/// DeviceChanged keeps its source at bytes 18-19 (`xXIDeviceChangedEvent`),
+/// a raw event after its detail, at 20-21 (`xXIRawEvent`).
+fn xi2_sources(wire: &[u8], evtype: u16) -> Vec<(u16, u16)> {
+    let source_at = if evtype == 1 { 18 } else { 20 };
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at + 32 <= wire.len() {
+        let length = if wire[at] == 35 || wire[at] == 1 {
+            32 + u32::from_le_bytes(wire[at + 4..at + 8].try_into().unwrap()) as usize * 4
+        } else {
+            32
+        };
+        if wire[at] == 35 && u16::from_le_bytes([wire[at + 8], wire[at + 9]]) == evtype {
+            found.push((
+                u16::from_le_bytes([wire[at + 10], wire[at + 11]]),
+                u16::from_le_bytes([wire[at + source_at], wire[at + source_at + 1]]),
+            ));
+        }
+        at += length;
+    }
+    found
+}
+
+/// A window system's seat as slaves of the core pair (a rootless host's
+/// "Wayland pointer", as Xwayland's xwayland-pointer): its button reaches
+/// Wine's raw-input selection on the masters with the slave as its source,
+/// after a SlaveSwitch naming that slave, which Wine opens with XOpenDevice
+/// (`X11DRV_RawButtonEvent`, `X11DRV_DeviceChanged`). A master as either
+/// source is BadDevice to XOpenDevice and ends the Wine process.
+#[test]
+fn a_seat_slaves_button_names_the_slave_as_its_source() {
+    use crate::{
+        backend::recording::RecordingBackend,
+        core_loop::{DeviceInfo, InputOrigin, pointer_fanout::pointer_event_fanout_to_state},
+        host_x11::{HostPointerEvent, HostXidMap, PointerEventKind},
+        xinput::{InputCapabilities, InputSourceId},
+    };
+    const XI_RAW_BUTTON_PRESS: u16 = 15;
+
+    let mut state = ServerState::new();
+    let mut peer = install_capture_client(&mut state, 101);
+    let mut backend = RecordingBackend::new();
+    let request = |state: &mut ServerState, backend: &mut RecordingBackend, minor, body: &[u8]| {
+        handle_xi2_request(
+            state,
+            backend,
+            None,
+            ClientId(101),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 131,
+                data: minor,
+                length_units: u32::try_from((4 + body.len()).div_ceil(4)).unwrap(),
+            },
+            body,
+        )
+        .expect("XI request");
+    };
+    // XIQueryVersion 2.2, then Wine's selection on the masters.
+    request(&mut state, &mut backend, 47, &[2, 0, 2, 0]);
+    let mut select = Vec::new();
+    select.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+    select.extend_from_slice(&1u16.to_le_bytes());
+    select.extend_from_slice(&0u16.to_le_bytes());
+    select.extend_from_slice(&1u16.to_le_bytes()); // XIAllMasterDevices
+    select.extend_from_slice(&1u16.to_le_bytes());
+    select.extend_from_slice(
+        &(XI2_DEVICE_CHANGED_MASK | (1u32 << XI_RAW_BUTTON_PRESS)).to_le_bytes(),
+    );
+    request(&mut state, &mut backend, 46, &select);
+    let _ = read_all_available(&mut peer);
+
+    let source = InputSourceId(u64::MAX - 1);
+    let slave = state.xi_register_source(&DeviceInfo {
+        source_id: source,
+        enabled: true,
+        resume_key: None,
+        capabilities: InputCapabilities {
+            keyboard: false,
+            pointer: true,
+            touch: false,
+        },
+        name: "Wayland pointer".to_owned(),
+        device_node: String::new(),
+        sysname: String::new(),
+        vendor_id: 0,
+        product_id: 0,
+        is_touchpad: false,
+        config: Default::default(),
+    })[0];
+    assert_ne!(slave, crate::xinput::DEVICEID_MASTER_POINTER);
+    let press = HostPointerEvent {
+        origin: InputOrigin::Physical(source),
+        kind: PointerEventKind::ButtonPress,
+        detail: 1,
+        host_xid: 0,
+        time: 2,
+        root_x: 10,
+        root_y: 20,
+        event_x: 10,
+        event_y: 20,
+        state: 0,
+        crossing_mode: 0,
+        child: 0,
+        raw_dx: 0,
+        raw_dy: 0,
+        tree_change: false,
+    };
+    let _dropped = pointer_event_fanout_to_state(
+        &mut state,
+        &mut backend,
+        &HostXidMap::new(),
+        press,
+        true,
+        false,
+    );
+    let wire = read_all_available(&mut peer);
+    let switches = xi2_sources(&wire, 1);
+    let raw = xi2_sources(&wire, XI_RAW_BUTTON_PRESS);
+    assert!(
+        !raw.is_empty(),
+        "the raw button reached the masters' selection"
+    );
+    assert_eq!(
+        switches,
+        [(crate::xinput::DEVICEID_MASTER_POINTER, slave)],
+        "one SlaveSwitch, naming the slave"
+    );
+    assert!(
+        raw.iter().all(|&(_, sourceid)| sourceid == slave),
+        "raw buttons sourced from the slave: {raw:?}"
     );
 }

@@ -1183,15 +1183,30 @@ fn store_window_property(
     {
         crate::core_loop::xkb_layout::apply_rules_names_change(state, backend, &value);
     }
+    emit_property_notify(state, window, property, false);
+}
+
+/// PropertyNotify of `property` on `window`, `deleted` or a new value, to
+/// the clients that select PropertyChange there, and to a rootless host's
+/// selection bridge when the window is one it watches.
+fn emit_property_notify(
+    state: &mut ServerState,
+    window: ResourceId,
+    property: AtomId,
+    deleted: bool,
+) {
     let timestamp = state.timestamp_now();
     let _dropped = emit_window_event_to_state(
         state,
         window,
         0x0040_0000, // PropertyChangeMask
         |buf, seq, order| {
-            x11::encode_property_notify_event(buf, seq, order, window, property, timestamp, false);
+            x11::encode_property_notify_event(
+                buf, seq, order, window, property, timestamp, deleted,
+            );
         },
     );
+    crate::rootless::selection::note_property_notify(state, window, property, timestamp, deleted);
 }
 
 /// ChangeProperty (Replace) as the server; `data` is in server (LE) order.
@@ -1364,12 +1379,7 @@ pub(super) fn handle_get_property(
             .delete_window_property(req.window, req.property);
         backend.on_window_property_changed(state, window_host_xid(state, req.window), req.property);
         crate::rootless::note_property_changed(state, req.window, req.property);
-        let timestamp = state.timestamp_now();
-        let window = req.window;
-        let property = req.property;
-        let _dropped = emit_window_event_to_state(state, window, 0x0040_0000, |buf, seq, order| {
-            x11::encode_property_notify_event(buf, seq, order, window, property, timestamp, true);
-        });
+        emit_property_notify(state, req.window, req.property, true);
     }
     debug!("client {} #{} GetProperty", client_id.0, sequence.0);
     Ok(outcome)
@@ -1424,21 +1434,29 @@ pub(super) fn handle_delete_property(
     {
         return emit_x11_error(state, client_id, sequence, error.code, error.value, 19);
     }
-    let removed = state
-        .resources
-        .delete_window_property(req.window, req.property);
-    if removed.is_some() {
-        backend.on_window_property_changed(state, window_host_xid(state, req.window), req.property);
-        crate::rootless::note_property_changed(state, req.window, req.property);
-        let timestamp = state.timestamp_now();
-        let window = req.window;
-        let property = req.property;
-        let _dropped = emit_window_event_to_state(state, window, 0x0040_0000, |buf, seq, order| {
-            x11::encode_property_notify_event(buf, seq, order, window, property, timestamp, true);
-        });
-    }
+    delete_window_property(state, backend, req.window, req.property);
     debug!("client {} #{} DeleteProperty", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
+}
+
+/// DeleteProperty after validation, the request's or the server's own: a
+/// property that was there is removed, and PropertyNotify says so.
+pub(crate) fn delete_window_property(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    window: ResourceId,
+    property: AtomId,
+) {
+    if state
+        .resources
+        .delete_window_property(window, property)
+        .is_none()
+    {
+        return;
+    }
+    backend.on_window_property_changed(state, window_host_xid(state, window), property);
+    crate::rootless::note_property_changed(state, window, property);
+    emit_property_notify(state, window, property, true);
 }
 
 /// `RotateProperties`, as Xorg's `ProcRotateProperties`
@@ -1556,13 +1574,7 @@ pub(super) fn handle_rotate_properties(
         for &property in atoms {
             backend.on_window_property_changed(state, host, property);
             crate::rootless::note_property_changed(state, window, property);
-            let timestamp = state.timestamp_now();
-            let _dropped =
-                emit_window_event_to_state(state, window, 0x0040_0000, |buf, seq, order| {
-                    x11::encode_property_notify_event(
-                        buf, seq, order, window, property, timestamp, false,
-                    );
-                });
+            emit_property_notify(state, window, property, false);
         }
     }
     debug!(

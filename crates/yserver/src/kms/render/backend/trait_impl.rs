@@ -277,6 +277,10 @@ impl<P: Platform> Backend for XBackend<P> {
         P::begin_ready_present_destination_write(self, wait_id)
     }
 
+    fn present_supersedes_same_msc(&self) -> bool {
+        P::present_supersedes_same_msc(self)
+    }
+
     fn finish_present_source_wait(&mut self, wait_id: u64) {
         P::finish_present_source_wait(self, wait_id)
     }
@@ -414,6 +418,10 @@ impl<P: Platform> Backend for XBackend<P> {
 
     fn set_logical_screen_size(&mut self, w: u16, h: u16) -> io::Result<()> {
         P::set_logical_screen_size(self, w, h)
+    }
+
+    fn on_host_display_ready(&mut self, state: &mut ServerState) -> bool {
+        P::on_host_display_ready(self, state)
     }
 
     fn on_libinput_ready(&mut self, _state: &mut ServerState) {
@@ -879,6 +887,7 @@ impl<P: Platform> Backend for XBackend<P> {
     }
 
     fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        P::pixmap_freed(self, host_xid);
         Self::backend_redirect_free_pixmap(self, _origin, host_xid)
     }
 
@@ -1098,6 +1107,7 @@ impl<P: Platform> Backend for XBackend<P> {
         height: u16,
     ) -> io::Result<()> {
         P::note_tearing_copy_damage(self, dst_host_xid);
+        P::refresh_pixmap_for_read(self, src_host_xid);
         Self::backend_draw_copy_area(
             self,
             _origin,
@@ -1125,6 +1135,7 @@ impl<P: Platform> Backend for XBackend<P> {
         height: u16,
         plane: u32,
     ) -> io::Result<()> {
+        P::refresh_pixmap_for_read(self, src_host_xid);
         Self::backend_draw_copy_plane(
             self,
             _origin,
@@ -1167,6 +1178,7 @@ impl<P: Platform> Backend for XBackend<P> {
         height: u16,
         plane_mask: u32,
     ) -> io::Result<Option<Vec<u8>>> {
+        P::refresh_pixmap_for_read(self, host_xid);
         Self::backend_draw_get_image(
             self, _origin, host_xid, format, x, y, width, height, plane_mask,
         )
@@ -1922,6 +1934,10 @@ impl<P: Platform> Backend for XBackend<P> {
 
     fn set_cursor_hidden(&mut self, hidden: bool) {
         self.apply_cursor_hidden(hidden);
+    }
+
+    fn displayed_cursor_hidden(&self) -> bool {
+        self.effective_cursor_hidden()
     }
 
     fn take_displayed_cursor_change(&mut self) -> Option<yserver_core::backend::DisplayedCursor> {

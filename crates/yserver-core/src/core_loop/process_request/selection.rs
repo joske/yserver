@@ -51,16 +51,7 @@ pub(super) fn handle_set_selection_owner(
     //   5. Call the SelectionCallback → XFixesSelectionNotify
     //      with timestamp = currentTime, selection_timestamp = the
     //      *new* lastTimeChanged (xfixes/select.c:88-89)
-    let current_time = state.timestamp_now();
-    // `ClientTimeToServerTime`: X11 time=0 (`CurrentTime`) resolves
-    // to the server's current time; otherwise the client's value
-    // wins unless future-shifted by step 1 above.
-    let resolved_time = if time_val == 0 {
-        current_time
-    } else {
-        time_val
-    };
-    if time_val != 0 && time_val > current_time {
+    if time_val != 0 && time_val > state.timestamp_now() {
         // Future-shifted: silent no-op (Success per Xorg).
         return Ok(RequestOutcome::Handled);
     }
@@ -108,11 +99,40 @@ pub(super) fn handle_set_selection_owner(
             22,
         );
     }
+    apply_set_selection_owner(state, client_id, sequence, window, selection, time_val);
+    Ok(RequestOutcome::Handled)
+}
+
+/// SetSelectionOwner after validation: `window` is `None` or a window
+/// `client_id` may set attributes on, and `selection` an atom. A time in
+/// the future or before the selection's last change is ignored, as the
+/// request's.
+pub(crate) fn apply_set_selection_owner(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    window: ResourceId,
+    selection: AtomId,
+    time_val: u32,
+) {
+    let current_time = state.timestamp_now();
+    // `ClientTimeToServerTime`: X11 time=0 (`CurrentTime`) resolves
+    // to the server's current time; otherwise the client's value
+    // wins, unless it is in the future (step 1 of the handler's order),
+    // which is ignored.
+    let resolved_time = if time_val == 0 {
+        current_time
+    } else {
+        time_val
+    };
+    if time_val != 0 && time_val > current_time {
+        return;
+    }
     if let Some(prior) = state.selections.get(&selection)
         && resolved_time < prior.last_time_changed
     {
         // Stale: silent no-op.
-        return Ok(RequestOutcome::Handled);
+        return;
     }
     // Snapshot prior ownership BEFORE we mutate state.selections so
     // the SelectionClear gate / event payload sees the previous
@@ -186,8 +206,6 @@ pub(super) fn handle_set_selection_owner(
         current_time,
         resolved_time,
     );
-
-    Ok(RequestOutcome::Handled)
 }
 
 /// Xorg `DeleteWindowFromAnySelections` (`dix/selection.c:113-125`): every
@@ -366,6 +384,54 @@ pub(super) fn handle_convert_selection(
             24,
         );
     }
+    apply_convert_selection(
+        state,
+        client_id,
+        sequence,
+        requestor,
+        [selection, target_atom, property],
+        time_val,
+    );
+    Ok(RequestOutcome::Handled)
+}
+
+/// ConvertSelection after validation: `requestor` is a window `client_id`
+/// may set attributes on, and `selection`, `target_atom` and `property`
+/// (unless `None`) are atoms.
+pub(crate) fn apply_convert_selection(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    requestor: ResourceId,
+    [selection, target_atom, property]: [AtomId; 3],
+    time_val: u32,
+) {
+    // A selection the server's own window owns is answered by the rootless
+    // host that made it, which has no connection for the SelectionRequest.
+    if let Some(owner) = state
+        .selections
+        .get(&selection)
+        .map(|owner| owner.window)
+        .filter(|window| window.0 != 0)
+        && crate::rootless::selection::note_request(
+            state,
+            owner,
+            crate::rootless::SelectionEvent::Request {
+                time: time_val,
+                requestor,
+                selection,
+                target: target_atom,
+                property,
+            },
+        )
+    {
+        debug!(
+            "client {} #{} ConvertSelection -> the server's window 0x{:x}",
+            client_id.0, sequence.0, owner.0
+        );
+        return;
+    }
+
     if let Some((owner_window, owner_id)) = selection_owner_target_id(state, selection) {
         let _dropped = fanout_event_to_clients(state, &[owner_id], |buf, seq, order| {
             x11::encode_selection_request_event(
@@ -384,6 +450,8 @@ pub(super) fn handle_convert_selection(
             "client {} #{} ConvertSelection -> owner 0x{:x}",
             client_id.0, sequence.0, owner_window.0
         );
+    } else if crate::rootless::selection::note_refusal(state, requestor, selection, target_atom) {
+        // No owner, and the server's window asked: its host hears it.
     } else {
         // No owner, or its setter is gone (`dix/selection.c:297-301`):
         // SelectionNotify(None) to the client that issued ConvertSelection
@@ -408,7 +476,6 @@ pub(super) fn handle_convert_selection(
             client_id.0, sequence.0
         );
     }
-    Ok(RequestOutcome::Handled)
 }
 
 pub(super) fn handle_send_event(
@@ -468,6 +535,34 @@ pub(super) fn handle_send_event(
             req.event_mask,
             25,
         );
+    }
+    // A SelectionNotify for the server's own selection window, the answer
+    // to the rootless host's ConvertSelection: the host takes it, as no
+    // client can.
+    if event_type == 31 {
+        let word = |at: usize| {
+            let bytes = [
+                req.event[at],
+                req.event[at + 1],
+                req.event[at + 2],
+                req.event[at + 3],
+            ];
+            match sender_byte_order {
+                ClientByteOrder::BigEndian => u32::from_be_bytes(bytes),
+                ClientByteOrder::LittleEndian => u32::from_le_bytes(bytes),
+            }
+        };
+        if crate::rootless::selection::note_selection_notify(
+            state,
+            req.destination,
+            [word(12), word(16), word(20)],
+        ) {
+            debug!(
+                "client {} #{} SendEvent SelectionNotify to the server's window 0x{:x}",
+                client_id.0, sequence.0, req.destination.0
+            );
+            return Ok(RequestOutcome::Handled);
+        }
     }
     let targets = match send_event_recipients(state, req.destination, req.event_mask, header.data) {
         Ok(targets) => targets,
