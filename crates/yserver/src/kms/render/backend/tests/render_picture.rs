@@ -1967,9 +1967,9 @@ fn composite_glyphs_inline_glyphset_change_parsed() {
     items.extend_from_slice(&[1u8, 0, 0, 0, 0, 0, 0, 0]);
     items.extend_from_slice(&[0x10, 0, 0, 0]); // padded ids
     // Element 2: glyphset change.
-    items.push(255);
-    items.extend_from_slice(&[0u8, 0, 0]);
-    items.extend_from_slice(&gs_b.to_le_bytes());
+    items.extend_from_slice(&yserver_protocol::x11::render_composite_glyphset_switch(
+        gs_b,
+    ));
     // Element 3: 1 glyph @ (+1,0).
     items.extend_from_slice(&[1u8, 0, 0, 0, 1, 0, 0, 0]);
     items.extend_from_slice(&[0x20, 0, 0, 0]);
@@ -2022,7 +2022,7 @@ fn composite_glyphs_inline_glyphset_change_parsed() {
         ignored[change_at], 255,
         "fixture: the change element is here"
     );
-    ignored[change_at + 4..change_at + 8].copy_from_slice(&0xDEAD_BEEF_u32.to_le_bytes());
+    ignored[change_at + 8..change_at + 12].copy_from_slice(&0xDEAD_BEEF_u32.to_le_bytes());
     let parsed_ignored = parse_composite_glyph_items(&b.core.glyphsets, 23, gs_a, 0, 0, &ignored);
     assert_eq!(
         parsed_ignored
@@ -2034,6 +2034,75 @@ fn composite_glyphs_inline_glyphset_change_parsed() {
         "with the change unresolvable, only the first glyph can be found",
     );
     assert_eq!(parsed_ignored.missing, 1, "0x20 is not in gs_a");
+}
+
+#[test]
+fn composite_glyphs_switch_xid_follows_the_eight_byte_header() {
+    // Mutation: read the XID at header offset 4 and advance by only 8 bytes.
+    use crate::kms::{
+        core::{GlyphSetFormat, GlyphSetState, StoredGlyph},
+        render::backend::parse_composite_glyph_items,
+    };
+
+    const CLIENT_G2_XID: u32 = 0x0020_0031;
+    const BACKEND_G1: u32 = 0x4B01;
+    const BACKEND_G2: u32 = 0x4B02;
+
+    let glyph = |format, pixel| StoredGlyph {
+        width: 1,
+        height: 1,
+        x: 0,
+        y: 0,
+        x_off: 1,
+        y_off: 0,
+        pixels: vec![pixel],
+        format,
+    };
+    let mut glyphsets = HashMap::new();
+    glyphsets.insert(
+        BACKEND_G1,
+        GlyphSetState {
+            format: GlyphSetFormat::A8,
+            glyphs: HashMap::from([(0x10, glyph(GlyphSetFormat::A8, 0xAA))]),
+        },
+    );
+    glyphsets.insert(
+        BACKEND_G2,
+        GlyphSetState {
+            format: GlyphSetFormat::A8,
+            glyphs: HashMap::from([(0x20, glyph(GlyphSetFormat::A8, 0xBB))]),
+        },
+    );
+
+    let mut backend_items = vec![1, 0, 0, 0, 0, 0, 0, 0, 0x10, 0, 0, 0];
+    let switch_offset = backend_items.len();
+    // The core has translated this client XID to the distinct backend handle.
+    backend_items.extend_from_slice(&yserver_protocol::x11::render_composite_glyphset_switch(
+        CLIENT_G2_XID,
+    ));
+    backend_items[switch_offset + 8..switch_offset + 12].copy_from_slice(&BACKEND_G2.to_le_bytes());
+    assert_eq!(
+        u32::from_le_bytes(
+            backend_items[switch_offset + 8..switch_offset + 12]
+                .try_into()
+                .unwrap()
+        ),
+        BACKEND_G2,
+        "the backend XID occupies the four bytes after the 8-byte header",
+    );
+    backend_items.extend_from_slice(&[1, 0, 0, 0, 1, 0, 0, 0, 0x20, 0, 0, 0]);
+
+    let parsed = parse_composite_glyph_items(&glyphsets, 23, BACKEND_G1, 0, 0, &backend_items);
+    assert_eq!(
+        parsed
+            .glyphs
+            .iter()
+            .map(|glyph| (glyph.gs_xid, glyph.glyph_id))
+            .collect::<Vec<_>>(),
+        vec![(BACKEND_G1, 0x10), (BACKEND_G2, 0x20)],
+        "the next glyph run must parse after the full 12-byte switch and draw from G2",
+    );
+    assert_eq!(parsed.missing, 0);
 }
 
 /// Two glyphsets — A8 and ARGB32 — and an items stream that
@@ -2090,8 +2159,9 @@ fn mixed_format_items_fixture() -> (HashMap<u32, crate::kms::core::GlyphSetState
         }
     };
     let switch_to = |items: &mut Vec<u8>, xid: u32| {
-        items.extend_from_slice(&[255u8, 0, 0, 0]);
-        items.extend_from_slice(&xid.to_le_bytes());
+        items.extend_from_slice(&yserver_protocol::x11::render_composite_glyphset_switch(
+            xid,
+        ));
     };
     element(&mut items, &[1, 2]); // glyphs 0,1 — A8 (initial gs)
     switch_to(&mut items, GS_ARGB32);
