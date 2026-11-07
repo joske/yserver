@@ -1,6 +1,9 @@
 use std::{
-    io::{Read, Write},
-    os::unix::net::{UnixListener, UnixStream},
+    io::{ErrorKind, Read, Write},
+    os::{
+        fd::AsRawFd,
+        unix::net::{UnixListener, UnixStream},
+    },
     path::PathBuf,
     sync::atomic::{AtomicU32, Ordering},
     thread::JoinHandle,
@@ -569,39 +572,48 @@ fn a_reset_disarms_the_new_generation() {
 // -- the generation quarantine: producers bound at creation time ---
 
 /// Watch a socket for `QUIET` and report whether the server wrote
-/// **no bytes** to it. Restores the long timeout, so the caller can
-/// keep using the socket afterwards.
+/// **no bytes** to it.
+///
+/// It waits with `poll(2)` rather than a read timeout: macOS refuses
+/// `SO_RCVTIMEO` with EINVAL on a socket whose peer has closed, which
+/// is one of the outcomes this watches for.
 ///
 /// "The far end went away without writing" counts as quiet, and has
-/// three shapes here: a timeout (nobody holds the other half open),
-/// `Ok(0)`, and — when the other half is dropped while bytes we sent
-/// are still unread in its queue, which is exactly what discarding a
-/// message carrying a `Transport` does — `ECONNRESET`. What must not
-/// happen is bytes arriving; a caller that also cares whether the
-/// peer is still *alive* follows this with a `round_trip`.
+/// three shapes here: no readiness within `QUIET` (nobody holds the
+/// other half open), end of file, and — when the other half is dropped
+/// while bytes we sent are still unread in its queue, which is exactly
+/// what discarding a message carrying a `Transport` does —
+/// `ECONNRESET`. What must not happen is bytes arriving; a caller that
+/// also cares whether the peer is still *alive* follows this with a
+/// `round_trip`.
 fn stays_quiet(peer: &mut UnixStream) -> bool {
-    peer.set_read_timeout(Some(QUIET)).expect("read timeout");
+    let mut pfd = libc::pollfd {
+        fd: peer.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = libc::c_int::try_from(QUIET.as_millis()).expect("QUIET fits a c_int");
+    loop {
+        // SAFETY: `pfd` is one valid pollfd for the length of the call.
+        let n = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if n == 0 {
+            return true;
+        }
+        if n > 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        assert_eq!(err.kind(), ErrorKind::Interrupted, "poll: {err}");
+    }
+    // Readable or hung up: the read returns at once.
     let mut byte = [0_u8; 1];
-    let quiet = match peer.read(&mut byte) {
-        Ok(0) => true,
-        Ok(_) => false,
+    match peer.read(&mut byte) {
+        Ok(n) => n == 0,
         Err(err) => matches!(
             err.kind(),
-            std::io::ErrorKind::WouldBlock
-                | std::io::ErrorKind::TimedOut
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::UnexpectedEof
+            ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof
         ),
-    };
-    // macOS fails SO_RCVTIMEO with EINVAL once the peer has closed.
-    if let Err(err) = peer.set_read_timeout(Some(TIMEOUT)) {
-        assert_eq!(
-            err.kind(),
-            std::io::ErrorKind::InvalidInput,
-            "read timeout: {err}"
-        );
     }
-    quiet
 }
 
 /// The hole the quarantine exists to close: a producer belonging to
