@@ -330,6 +330,11 @@ pub trait Platform: OutputSink + Sized + 'static {
 
     fn finish_present_source_wait(_b: &mut XBackend<Self>, _wait_id: u64) {}
 
+    /// `Backend::present_supersedes_same_msc`.
+    fn present_supersedes_same_msc(_b: &XBackend<Self>) -> bool {
+        true
+    }
+
     fn present_flip_in_flight(_b: &XBackend<Self>, _crtc_id: u32) -> bool {
         false
     }
@@ -449,6 +454,12 @@ pub trait Platform: OutputSink + Sized + 'static {
         yserver_core::randr::RandrLimits::default()
     }
 
+    /// `Backend::on_host_display_ready`: a rootless host's display
+    /// connection is readable; `false` when it closed.
+    fn on_host_display_ready(_b: &mut XBackend<Self>, _state: &mut ServerState) -> bool {
+        true
+    }
+
     fn poll_deferred_input(_b: &mut XBackend<Self>, _state: &mut ServerState) {}
 
     fn start_device_config(
@@ -491,6 +502,14 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn dri3_capabilities(_b: &XBackend<Self>) -> Dri3Caps {
         Dri3Caps::unsupported()
     }
+
+    /// Drawable `host_xid` is about to be read (a copy's source, a
+    /// `GetImage`): a platform whose pixmap is a copy of a client's buffer
+    /// brings it up to date first.
+    fn refresh_pixmap_for_read(_b: &mut XBackend<Self>, _host_xid: u32) {}
+
+    /// A client freed pixmap `host_xid`, before its storage goes.
+    fn pixmap_freed(_b: &mut XBackend<Self>, _host_xid: u32) {}
 
     fn dri3_import_pixmap(
         _b: &mut XBackend<Self>,

@@ -476,3 +476,95 @@ fn dri3_import_syncobj_errs_without_a_usable_drm_handle() {
         "importing a non-syncobj fd must Err",
     );
 }
+
+/// A LINEAR buffer the renderer cannot import as it lies (here a stride
+/// lavapipe would not choose, the buffer ending at its last pixel) is
+/// mapped: its pixmap reads back the client's pixels, and a buffer shorter
+/// than its layout is refused rather than mapped past its end.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn dri3_a_linear_buffer_at_a_foreign_pitch_is_mapped_and_read() {
+    use std::os::fd::AsRawFd as _;
+
+    use yserver_core::backend::Dri3ImportModifier;
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skip: no Vk: {e}");
+            return;
+        }
+    };
+    if b.platform
+        .gpu
+        .vk
+        .as_ref()
+        .is_some_and(|vk| vk.image_drm_format_modifier)
+    {
+        eprintln!("skip: the renderer imports LINEAR at any pitch");
+        return;
+    }
+    let (w, h, stride) = (64u16, 30u16, 512u32);
+    let len = stride as usize * (usize::from(h) - 1) + usize::from(w) * 4;
+    let pixel = |x: usize, y: usize| [x as u8, y as u8, (x ^ y) as u8, 0xff];
+    let mut bytes = vec![0u8; stride as usize * usize::from(h)];
+    for y in 0..usize::from(h) {
+        for x in 0..usize::from(w) {
+            let at = y * stride as usize + x * 4;
+            bytes[at..at + 4].copy_from_slice(&pixel(x, y));
+        }
+    }
+    let buffer = |len: usize| {
+        let fd = yserver_core::anon_shm::create_anon_shm(c"yserver_dri3_mapped").expect("memfd");
+        let wrote = unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), len) };
+        assert_eq!(wrote, len as isize);
+        fd
+    };
+
+    let short = b.dri3_import_pixmap(
+        buffer(len - 1),
+        w,
+        h,
+        stride,
+        0,
+        Dri3ImportModifier::Explicit(0),
+        24,
+        32,
+    );
+    assert!(
+        short.is_err(),
+        "a buffer shorter than its layout is refused"
+    );
+
+    // Ending at its last pixel (rows packed to read), and with its last
+    // row's padding too (rows read in place).
+    for len in [len, bytes.len()] {
+        let handle = b
+            .dri3_import_pixmap(
+                buffer(len),
+                w,
+                h,
+                stride,
+                0,
+                Dri3ImportModifier::Explicit(0),
+                24,
+                32,
+            )
+            .expect("a mapped import");
+        assert!(b.pstate.dri3_mapped.contains_key(&handle.as_raw()));
+        let image = b
+            .get_image(None, handle.as_raw(), 2, 0, 0, w, h, !0)
+            .expect("get_image")
+            .expect("pixels");
+        // The GetImage reply: a 32-byte header, then the pixels.
+        let image = &image[32..];
+        for y in 0..usize::from(h) {
+            for x in 0..usize::from(w) {
+                let at = (y * usize::from(w) + x) * 4;
+                assert_eq!(image[at..at + 3], pixel(x, y)[..3], "pixel ({x}, {y})");
+            }
+        }
+        b.free_pixmap(None, handle.as_raw()).expect("free");
+        assert!(!b.pstate.dri3_mapped.contains_key(&handle.as_raw()));
+    }
+}

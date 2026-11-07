@@ -1171,7 +1171,7 @@ mod tests {
             &[28u8; 32],
             ClientByteOrder::LittleEndian,
         );
-        assert_eq!(state.clients[&1].outbound.len(), client_io::OUTBOUND_CAP);
+        assert_eq!(state.clients[&1].outbound.len(), client_io::outbound_cap());
         let mut got = [0u8; 128];
         assert_eq!(fast.read(&mut got).unwrap(), 96);
         assert_eq!(client_io::failed_writers(&state.clients), [ClientId(1)]);

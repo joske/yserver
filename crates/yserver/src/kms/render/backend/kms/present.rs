@@ -1611,11 +1611,19 @@ impl KmsBackend {
             return Ok(PresentSourceWait::Ready);
         };
         let mut fds = Vec::new();
+        // A mapped DRI3 buffer (`dri3_mapped.rs`) is read when the present
+        // executes, so its writes are waited for here as an import's are.
+        let mapped_fd = self
+            .pstate
+            .dri3_mapped
+            .get(&src_pixmap_host_xid)
+            .map(|mapped| std::os::fd::AsFd::as_fd(&mapped.fd));
         if let Some(fd) = self
             .store
             .get(src_id)
             .and_then(|d| d.storage.imported_drawable.as_ref())
             .and_then(crate::kms::vk::target::DrawableImage::imported_dma_buf_fd)
+            .or(mapped_fd)
         {
             match export_dmabuf_read_access_sync_file(fd) {
                 ExportedSyncFile::Idle => {}

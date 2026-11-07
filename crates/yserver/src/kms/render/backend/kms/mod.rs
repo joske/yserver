@@ -1,9 +1,11 @@
 mod crtc_config;
+pub(in crate::kms::render::backend) mod dri3_mapped;
 mod export;
 mod platform_hooks;
 mod present;
 mod randr;
 mod readback;
+pub(crate) mod rootless;
 mod scanout;
 mod server_scanout;
 pub(in crate::kms::render::backend) mod session;

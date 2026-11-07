@@ -94,6 +94,10 @@ pub enum BackendFdKind {
     /// fences which gate a copied scanout path. Readiness means work rendered
     /// on the source GPU may advance to the sink-GPU copy.
     ScanoutRenderCompletion,
+    /// A rootless host's connection to its window system, served on the
+    /// core thread (a Wayland compositor's socket). Readiness drives
+    /// `Backend::on_host_display_ready`.
+    HostDisplay,
 }
 
 /// Result of arming the implicit producer fence for a `PresentPixmap`
@@ -968,6 +972,15 @@ pub trait Backend {
     /// input thread and never registers this fd.
     fn on_libinput_ready(&mut self, _state: &mut ServerState) {}
 
+    /// The rootless host's display connection is readable
+    /// ([`BackendFdKind::HostDisplay`]): read its events and act on them
+    /// with `state` in hand. `false` when the window system closed the
+    /// connection, which ends the server as the loss of its only display
+    /// would. Default: `true`; only a host that registers the fd sees this.
+    fn on_host_display_ready(&mut self, _state: &mut ServerState) -> bool {
+        true
+    }
+
     /// Called once per core-loop iteration (with `state`) so a backend can
     /// service time-based backend work that isn't tied to an fd readiness
     /// edge. The backend reports any deadline via [`Backend::next_wakeup`] so
@@ -1253,6 +1266,21 @@ pub trait Backend {
     /// this after it has recorded the deferred copy (or abandoned it because
     /// the destination disappeared).
     fn finish_present_source_wait(&mut self, _wait_id: u64) {}
+
+    /// Whether a Present that is not yet executed is scrapped (completed as
+    /// Skip) by a later one for the same window and target MSC, as Xorg's
+    /// `present_scmd.c` does ("don't bother doing the previous one if this
+    /// one will overwrite it in the same frame"). Default true. A backend
+    /// whose windows are another window system's says false: Xwayland's
+    /// `xwl_present_pixmap` scraps nothing for a shared target but executes
+    /// each in turn, and queues a flip behind a pending one, since the
+    /// window system -- not the X server -- decides which frame a refresh
+    /// shows. Two presents a game sends a millisecond apart (FSR3 frame
+    /// generation's generated and real frame) then are two frames on the
+    /// screen rather than one.
+    fn present_supersedes_same_msc(&self) -> bool {
+        true
+    }
 
     /// A scanout pageflip is submitted and not yet retired. Used ONLY by
     /// the immediate-target arrival rule (spec §msc-due). Default false:
@@ -3018,6 +3046,13 @@ pub trait Backend {
     /// this on the edges: the first hide by any client and the last show.
     /// Default no-op for backends that draw no sprite of their own.
     fn set_cursor_hidden(&mut self, _hidden: bool) {}
+
+    /// Whether the cursor the user sees shows nothing: the `None` cursor,
+    /// XFIXES `HideCursor`, or a cursor whose every pixel is transparent.
+    /// Rootless mode's pointer lock reads it (`rootless/lock.rs`).
+    fn displayed_cursor_hidden(&self) -> bool {
+        false
+    }
 
     /// Take the pending "the effective cursor changed" report, if the sprite
     /// switched to a different cursor since the last call. Drained by the
