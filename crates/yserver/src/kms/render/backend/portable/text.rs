@@ -501,8 +501,8 @@ fn glyph_mono_spans(bitmap: &freetype::Bitmap, ox: i32, oy: i32, out: &mut Vec<R
 /// Element size depends on the minor opcode: `CompositeGlyphs8` (23)
 /// → 1-byte ids, 16 (24) → 2, 32 (25) → 4. Each element starts with
 /// `count(u8) pad pad pad dx(i16) dy(i16)`; if `count == 255` the
-/// same 8 bytes instead carry an inline **glyphset change**, with the
-/// new glyphset xid in the trailing u32. `x_off` / `y_off` seed the
+/// 8-byte header is followed by the new glyphset XID in a 4-byte field.
+/// `x_off` / `y_off` seed the
 /// pen and each element's `dx` / `dy` accumulates onto it.
 ///
 /// That inline form is why one request can mix glyph source formats:
@@ -539,16 +539,19 @@ pub(in crate::kms::render) fn parse_composite_glyph_items(
     while pos + 8 <= items.len() {
         let count = items[pos] as usize;
         if count == 255 {
-            let new_xid = u32::from_le_bytes([
-                items[pos + 4],
-                items[pos + 5],
-                items[pos + 6],
-                items[pos + 7],
-            ]);
+            let switch_end = pos + 12;
+            if switch_end > items.len() {
+                break;
+            }
+            let new_xid = u32::from_le_bytes(
+                items[pos + 8..switch_end]
+                    .try_into()
+                    .expect("glyphset XID is four bytes"),
+            );
             if new_xid != 0 && glyphsets.contains_key(&new_xid) {
                 active_gs_xid = new_xid;
             }
-            pos += 8;
+            pos = switch_end;
             continue;
         }
         out.elements += 1;

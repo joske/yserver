@@ -147,6 +147,23 @@ use crate::{
     server::ServerState,
 };
 
+macro_rules! return_on_access_denial {
+    ($result:expr, $state:ident, $client_id:ident, $sequence:ident, $request:ident $(,)?) => {
+        if let Err((code, value)) = $result {
+            return $crate::core_loop::process_request::emit_x11_error_with_minor(
+                $state,
+                $client_id,
+                $sequence,
+                code,
+                value,
+                u16::from($request.minor),
+                $request.major,
+            );
+        }
+    };
+}
+pub(crate) use return_on_access_denial;
+
 /// XI2 major opcode assigned by `extension_metadata("XInputExtension")`.
 /// This matches the `XI2_MAJOR_OPCODE` constant in nested.rs and goes
 /// away in H1 with that file.
@@ -1125,6 +1142,7 @@ fn validate_drawable_and_gc(
             state,
             client,
             ResourceTarget {
+                owner: None,
                 id: drawable,
                 kind: drawable_kind,
                 creation: None,
@@ -1141,6 +1159,7 @@ fn validate_drawable_and_gc(
             state,
             client,
             ResourceTarget {
+                owner: None,
                 id: gc,
                 kind: ResourceKind::Gc,
                 creation: None,
@@ -1183,6 +1202,7 @@ fn validate_drawable_only(
         state,
         client,
         ResourceTarget {
+            owner: None,
             id: drawable,
             kind,
             creation: None,
@@ -1209,6 +1229,7 @@ fn validate_gc_only(
                 state,
                 client,
                 ResourceTarget {
+                    owner: None,
                     id: gc,
                     kind: ResourceKind::Gc,
                     creation: None,
@@ -1237,6 +1258,56 @@ fn validate_resource_access(
     }
 }
 
+/// Resolve a core X resource's concrete kind using the same narrow store
+/// order that KillClient uses. Extension resources and colormaps remain out
+/// of this lookup so their existing KillClient behavior stays unchanged.
+pub(super) fn core_resource_kind_for_access(
+    state: &ServerState,
+    id: ResourceId,
+) -> Option<ResourceKind> {
+    [
+        ResourceKind::Window,
+        ResourceKind::Pixmap,
+        ResourceKind::Gc,
+        ResourceKind::Font,
+        ResourceKind::Cursor,
+        ResourceKind::Picture,
+        ResourceKind::GlyphSet,
+        ResourceKind::Dri3Syncobj,
+    ]
+    .into_iter()
+    .find(|kind| state.access_resource_owner(id, *kind).is_some())
+}
+
+/// Check an arbitrary core X resource operand, preserving unresolved-id
+/// behavior and KillClient's core-store scope.
+pub(super) fn validate_core_resource_if_present(
+    state: &ServerState,
+    client: ClientId,
+    id: ResourceId,
+    mode: AccessMode,
+    request: RequestOpcodes,
+) -> Result<(), (u8, u32)> {
+    if !state.policies_installed() || client == crate::resources::SERVER_OWNER {
+        return Ok(());
+    }
+    let Some(kind) = core_resource_kind_for_access(state, id) else {
+        return Ok(());
+    };
+    validate_resource_access(
+        state,
+        client,
+        ResourceTarget {
+            owner: None,
+            id,
+            kind,
+            creation: None,
+        },
+        mode,
+        request,
+    )
+}
+
 /// Check an operand whose historical validation is missing, without
 /// introducing a new error when its id does not resolve to this type.
 pub(super) fn validate_resource_if_present(
@@ -1257,6 +1328,7 @@ pub(super) fn validate_resource_if_present(
         state,
         client,
         ResourceTarget {
+            owner: None,
             id,
             kind,
             creation: None,

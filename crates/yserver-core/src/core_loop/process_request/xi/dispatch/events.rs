@@ -1,4 +1,5 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind},
     backend::{Backend, OriginContext},
     core_loop::{
         fanout::fanout_event_to_clients,
@@ -32,6 +33,7 @@ pub(super) fn handle_xi_select_events(
     sequence: SequenceNumber,
     header: RequestHeader,
     body: &[u8],
+    access_request: RequestOpcodes,
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} XISelectEvents", client_id.0, sequence.0);
     let mut send_device_changed_bootstrap = false;
@@ -104,6 +106,20 @@ pub(super) fn handle_xi_select_events(
             masks.push((deviceid, u64::from_le_bytes(word)));
             pos += byte_len;
         }
+        crate::core_loop::process_request::return_on_access_denial!(
+            crate::core_loop::process_request::validate_resource_if_present(
+                state,
+                client_id,
+                window,
+                ResourceKind::Window,
+                AccessMode::RECEIVE,
+                access_request,
+            ),
+            state,
+            client_id,
+            sequence,
+            access_request,
+        );
         if let Some(client) = state.clients.get_mut(&client_id.0) {
             for (deviceid, mask) in masks {
                 debug!(
@@ -143,6 +159,7 @@ pub(super) fn handle_xi_get_selected_events(
     sequence: SequenceNumber,
     body: &[u8],
     byte_order: ClientByteOrder,
+    access_request: RequestOpcodes,
 ) -> io::Result<RequestOutcome> {
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     {
@@ -151,6 +168,20 @@ pub(super) fn handle_xi_get_selected_events(
             return Ok(RequestOutcome::Handled);
         }
         let window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+        crate::core_loop::process_request::return_on_access_denial!(
+            crate::core_loop::process_request::validate_resource_if_present(
+                state,
+                client_id,
+                window,
+                ResourceKind::Window,
+                AccessMode::GET_ATTR,
+                access_request,
+            ),
+            state,
+            client_id,
+            sequence,
+            access_request,
+        );
         // Xorg ProcXIGetSelectedEvents: one xXIEventMask per device
         // in device-id order, each trimmed to the words that hold set
         // bits. deviceid/mask_len follow the client byte order; the
@@ -228,6 +259,7 @@ pub(super) fn handle_xi1_select_extension_event(
     sequence: SequenceNumber,
     body: &[u8],
     minor: u8,
+    access_request: RequestOpcodes,
 ) -> io::Result<RequestOutcome> {
     if body.len() < 8 {
         return emit_x11_error_with_minor(
@@ -268,6 +300,20 @@ pub(super) fn handle_xi1_select_extension_event(
             XI2_MAJOR_OPCODE,
         );
     }
+    crate::core_loop::process_request::return_on_access_denial!(
+        crate::core_loop::process_request::validate_resource_if_present(
+            state,
+            client_id,
+            ResourceId(sel_window),
+            ResourceKind::Window,
+            AccessMode::RECEIVE,
+            access_request,
+        ),
+        state,
+        client_id,
+        sequence,
+        access_request,
+    );
     // Xorg's HandleDevicePresenceMask runs before ordinary XI1
     // class validation and removes every class whose device field
     // is 256. Only its `_devicePresence` class selects a mask.
@@ -408,6 +454,7 @@ pub(super) fn handle_xi1_get_selected_extension_events(
     body: &[u8],
     byte_order: ClientByteOrder,
     minor: u8,
+    access_request: RequestOpcodes,
 ) -> io::Result<RequestOutcome> {
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     {
@@ -427,6 +474,20 @@ pub(super) fn handle_xi1_get_selected_extension_events(
                 minor,
             );
         }
+        crate::core_loop::process_request::return_on_access_denial!(
+            crate::core_loop::process_request::validate_resource_if_present(
+                state,
+                client_id,
+                ResourceId(win),
+                ResourceKind::Window,
+                AccessMode::GET_ATTR,
+                access_request,
+            ),
+            state,
+            client_id,
+            sequence,
+            access_request,
+        );
         let window = ResourceId(win);
         let mut this_client: Vec<u32> = state
             .clients
@@ -468,6 +529,7 @@ pub(super) fn handle_xi1_change_device_dont_propagate_list(
     sequence: SequenceNumber,
     body: &[u8],
     minor: u8,
+    access_request: RequestOpcodes,
 ) -> io::Result<RequestOutcome> {
     {
         if body.len() < 8 {
@@ -516,6 +578,20 @@ pub(super) fn handle_xi1_change_device_dont_propagate_list(
             }
             classes.push(class);
         }
+        crate::core_loop::process_request::return_on_access_denial!(
+            crate::core_loop::process_request::validate_resource_if_present(
+                state,
+                client_id,
+                ResourceId(win),
+                ResourceKind::Window,
+                AccessMode::SET_ATTR,
+                access_request,
+            ),
+            state,
+            client_id,
+            sequence,
+            access_request,
+        );
         // mode 0 = AddToList, 1 = DeleteFromList. Xorg
         // `Xi/chgdprop.c::ChangeDeviceDontPropagateList` applies the
         // change to `OtherInputMasks.dontPropagateMask[deviceid]`;
@@ -560,6 +636,7 @@ pub(super) fn handle_xi1_get_device_dont_propagate_list(
     body: &[u8],
     byte_order: ClientByteOrder,
     minor: u8,
+    access_request: RequestOpcodes,
 ) -> io::Result<RequestOutcome> {
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     {
@@ -579,6 +656,20 @@ pub(super) fn handle_xi1_get_device_dont_propagate_list(
                 minor,
             );
         }
+        crate::core_loop::process_request::return_on_access_denial!(
+            crate::core_loop::process_request::validate_resource_if_present(
+                state,
+                client_id,
+                ResourceId(win),
+                ResourceKind::Window,
+                AccessMode::GET_ATTR,
+                access_request,
+            ),
+            state,
+            client_id,
+            sequence,
+            access_request,
+        );
         let classes: Vec<u32> = state
             .xi1_window_dont_propagate
             .get(&ResourceId(win))

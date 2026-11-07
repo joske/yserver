@@ -39,6 +39,7 @@ const RANDR_FIRST_ERROR: u8 = 147;
 const RENDER_MAJOR_OPCODE: u8 = 133;
 const RENDER_FIRST_EVENT: u8 = 0;
 pub(crate) const RENDER_FIRST_ERROR: u8 = 152;
+pub(crate) const RENDER_BAD_GLYPHSET_ERROR: u8 = RENDER_FIRST_ERROR + 3;
 
 const GE_MAJOR_OPCODE: u8 = 138;
 
@@ -501,6 +502,72 @@ where
         idx += 1;
     }
     Some(out)
+}
+
+/// Translate the glyphset XID in each inline-switch item in a
+/// `CompositeGlyphs{8,16,32}` stream. Incomplete item tails are left untouched
+/// because the renderer stops before consuming them.
+pub(crate) fn composite_glyphs_translate_glyphsets<F>(
+    minor: u8,
+    items: &[u8],
+    mut translate: F,
+) -> Vec<u8>
+where
+    F: FnMut(u32) -> Option<u32>,
+{
+    let mut out = items.to_vec();
+    composite_glyphs_visit_switches(minor, items, |pos, xid| {
+        if let Some(host_xid) = translate(xid) {
+            out[pos + 8..pos + 12].copy_from_slice(&host_xid.to_le_bytes());
+        }
+        true
+    });
+    out
+}
+
+fn composite_glyphs_visit_switches<F>(minor: u8, items: &[u8], mut visit: F)
+where
+    F: FnMut(usize, u32) -> bool,
+{
+    let id_size = match minor {
+        23 => 1,
+        24 => 2,
+        25 => 4,
+        _ => return,
+    };
+    let mut pos = 0usize;
+    while pos + 8 <= items.len() {
+        let count = items[pos];
+        if count == u8::MAX {
+            let switch_end = pos + 12;
+            if switch_end > items.len() {
+                break;
+            }
+
+            // Mirrors Xorg render/render.c:1152: after the 8-byte header,
+            // it looks up the XID only when buffer + sizeof(GlyphSet) < end.
+            // Thus an XID ending exactly at the stream end is not checked.
+            if switch_end < items.len() {
+                let xid = u32::from_le_bytes(
+                    items[pos + 8..switch_end]
+                        .try_into()
+                        .expect("glyphset XID is four bytes"),
+                );
+                if !visit(pos, xid) {
+                    return;
+                }
+            }
+            pos = switch_end;
+            continue;
+        }
+
+        let payload_bytes = usize::from(count) * id_size;
+        let padded_payload_bytes = (payload_bytes + 3) & !3;
+        if pos + 8 + padded_payload_bytes > items.len() {
+            break;
+        }
+        pos += 8 + padded_payload_bytes;
+    }
 }
 
 pub(crate) fn normalize_region_rects(

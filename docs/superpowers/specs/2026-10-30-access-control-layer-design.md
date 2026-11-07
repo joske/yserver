@@ -149,12 +149,19 @@ and they must not hold references into server state between calls.
 | Through the context | Source today |
 |---|---|
 | Owner of a checked object, including retained, colormap and extension resources | a resolver for this context, below |
+| Creator XID and owner of a retained displayed cursor | recorded for the host cursor until it is released |
 | Whether a window is a root window | screen state |
 | Atom name | atom table |
 | A client's peer identity | `ClientState.peer` (#321) |
 | How a client was admitted | new, below |
 | Opcodes of the request being run, if any | dispatcher |
 | Input focus, time of last user input | server state, added only with the policy that reads them |
+
+Advertised descriptors such as RENDER `PictFormat`s are not checked. They are
+static server tables without an owner or `ResourceKind`, so a policy cannot
+distinguish one client's use from another's. A cursor can remain displayed
+after its XID is freed; its retained host cursor keeps the creator's XID and
+owner until that host cursor is released.
 
 The context is built only when the list is not empty. Handlers often hold a
 mutable borrow of their client when they reach a check, as `handle_list_hosts`
@@ -226,6 +233,10 @@ Xnamespace tells apart requests that share a mode:
 | `MapWindow` / `ReparentWindow` remap | `Success`; the window stays unmapped |
 | `MapSubwindows` / `UnmapSubwindows` / `CirculateWindow` derived child | the child is skipped; the request succeeds |
 | A derived target in `DestroySubwindows` | the loop stops, the remaining children stay unmapped, and the request succeeds (Xorg `dix/dispatch.c:852`) |
+| A child of `RedirectSubwindows` / `UnredirectSubwindows` | the child is skipped; its current redirect state stays unchanged, and the request succeeds |
+| A Damage object targeted by `DAMAGE Add` | the object is skipped; it does not accumulate the added region, and the request succeeds |
+| A matching cursor targeted by `ChangeCursorByName` | the cursor is skipped; its image stays unchanged, and the request succeeds |
+| An entry in `XIBarrierReleasePointer` | the policy's error is returned; earlier entries have already taken effect |
 
 A check authorizes either a whole request or one entry of a list, and the plan
 records which for each site. Rewriting is out of scope, but because sites own

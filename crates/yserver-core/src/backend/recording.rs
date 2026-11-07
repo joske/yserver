@@ -112,6 +112,10 @@ pub enum RecordedCall {
     OpenFont(String),
     CloseFont(u32),
     Ping,
+    XkbProxy {
+        minor: u8,
+    },
+    QueryPointer,
     ReleaseRedirectedBacking(u32),
     RetainBackingStorage(u32),
     DropBackingStorage(u32),
@@ -157,6 +161,47 @@ pub enum RecordedCall {
     RenderCreatePicture {
         host_drawable: AnyHandle,
         host_pic: u32,
+        value_mask: u32,
+        values: Vec<u8>,
+    },
+    RenderChangePicture {
+        host_pic: u32,
+        body: Vec<u8>,
+    },
+    RenderCreateGlyphSet {
+        ynest_format: u32,
+    },
+    RenderFreeGlyphSet {
+        host_gs: u32,
+    },
+    RenderAddGlyphs {
+        host_gs: u32,
+        body_tail: Vec<u8>,
+    },
+    RenderFreeGlyphs {
+        host_gs: u32,
+        glyph_ids: Vec<u8>,
+    },
+    RenderCreateCursor {
+        host_src_pic: u32,
+        x: u16,
+        y: u16,
+    },
+    CreateAnimCursor {
+        frames: Vec<(u32, u32)>,
+    },
+    RenderCompositeGlyphs {
+        minor: u8,
+        op: u8,
+        host_src: u32,
+        host_dst: u32,
+        mask_fmt: u32,
+        host_gs: u32,
+        src_x: i16,
+        src_y: i16,
+        items: Vec<u8>,
+        x_off: i16,
+        y_off: i16,
     },
     RenderFreePicture {
         host_pic: u32,
@@ -167,6 +212,36 @@ pub enum RecordedCall {
     },
     RenderFillRectangles {
         host_dst: u32,
+    },
+    RenderFormatForYnestId {
+        format: u32,
+    },
+    RenderTrapezoids {
+        host_src: u32,
+        host_dst: u32,
+    },
+    RenderTriangles {
+        minor: u8,
+        host_src: u32,
+        host_dst: u32,
+    },
+    RenderCreateSolidFill {
+        color: [u8; 8],
+    },
+    RenderCreateLinearGradient {
+        picture: Option<u32>,
+    },
+    RenderCreateRadialGradient {
+        picture: Option<u32>,
+    },
+    RenderSetPictureClipRectangles {
+        host_pic: u32,
+    },
+    RenderSetPictureFilter {
+        host_pic: u32,
+    },
+    RenderSetPictureTransform {
+        host_pic: u32,
     },
     CopyPlane {
         src_host_xid: u32,
@@ -290,6 +365,9 @@ pub struct RecordingBackend {
     /// `take_displayed_cursor_change`. Tests set it to stand in for a KMS
     /// sprite change.
     pub displayed_cursor_change: Option<crate::backend::DisplayedCursor>,
+    /// Canned active cursor image returned by `get_active_cursor_image`.
+    /// Defaults to `None`, matching backends without a sprite snapshot.
+    pub active_cursor_image: Option<crate::backend::ActiveCursorImage>,
     next_handle: Mutex<u32>,
     fake_window_id: u32,
     fake_root_visual_xid: u32,
@@ -369,6 +447,10 @@ pub struct RecordingBackend {
     /// coincidental default matching elsewhere) set it to something
     /// else first.
     pub glx_vendor_names: &'static str,
+    /// Result returned by `picture_client_clip_rects`, including the
+    /// distinction between an unavailable query and an unset clip.
+    pub picture_client_clip_rects_result:
+        Option<Option<Vec<yserver_protocol::x11::xfixes::RegionRect>>>,
     /// When set, `set_dpms_power` returns Err; tests assert the
     /// transition helper advances state anyway.
     pub dpms_set_returns_err: bool,
@@ -641,6 +723,7 @@ impl RecordingBackend {
         Self {
             calls: Mutex::new(Vec::new()),
             displayed_cursor_change: None,
+            active_cursor_image: None,
             next_handle: Mutex::new(0x0001_0000),
             fake_window_id: 0x0000_0100,
             fake_root_visual_xid: 0x0000_0021,
@@ -666,6 +749,7 @@ impl RecordingBackend {
             randr_modes: Vec::new(),
             randr_providers: Vec::new(),
             glx_vendor_names: glx::VENDOR_NAMES,
+            picture_client_clip_rects_result: None,
             dpms_set_returns_err: false,
             provider_output_source_changed: true,
             provider_output_source_error: None,
@@ -1308,7 +1392,8 @@ impl Backend for RecordingBackend {
         self.redirect_activation_supported
     }
 
-    fn render_format_for_ynest_id(&self, _ynest_fmt: u32) -> Option<u32> {
+    fn render_format_for_ynest_id(&self, ynest_fmt: u32) -> Option<u32> {
+        self.record(RecordedCall::RenderFormatForYnestId { format: ynest_fmt });
         None
     }
 
@@ -1986,6 +2071,20 @@ impl Backend for RecordingBackend {
         Ok(CursorHandle::from_raw_panicking(xid))
     }
 
+    fn create_anim_cursor(
+        &mut self,
+        _origin: Option<OriginContext>,
+        frames: &[(CursorHandle, u32)],
+    ) -> io::Result<Option<CursorHandle>> {
+        self.record(RecordedCall::CreateAnimCursor {
+            frames: frames
+                .iter()
+                .map(|(cursor, delay)| (cursor.as_raw(), *delay))
+                .collect(),
+        });
+        Ok(None)
+    }
+
     fn create_glyph_cursor(
         &mut self,
         _origin: Option<OriginContext>,
@@ -2384,16 +2483,15 @@ impl Backend for RecordingBackend {
         unimplemented!("RecordingBackend: image_text16")
     }
 
-    // RENDER — Picture create/free and the Composite/FillRectangles paints are recorded;
-    // the rest are no-ops.
+    // RENDER — methods that these request paths use are recorded.
 
     fn render_create_picture(
         &mut self,
         _origin: Option<OriginContext>,
         host_drawable: AnyHandle,
         _ynest_format: u32,
-        _value_mask: u32,
-        _values: &[u8],
+        value_mask: u32,
+        values: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
         if self.render_create_picture_fails {
             return Ok(None);
@@ -2402,6 +2500,8 @@ impl Backend for RecordingBackend {
         self.record(RecordedCall::RenderCreatePicture {
             host_drawable,
             host_pic,
+            value_mask,
+            values: values.to_vec(),
         });
         Ok(PictureHandle::from_raw(host_pic))
     }
@@ -2409,9 +2509,13 @@ impl Backend for RecordingBackend {
     fn render_change_picture(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
-        _body: &[u8],
+        host_pic: u32,
+        body: &[u8],
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderChangePicture {
+            host_pic,
+            body: body.to_vec(),
+        });
         Ok(())
     }
 
@@ -2427,8 +2531,9 @@ impl Backend for RecordingBackend {
     fn render_create_glyphset(
         &mut self,
         _origin: Option<OriginContext>,
-        _ynest_format: u32,
+        ynest_format: u32,
     ) -> io::Result<Option<GlyphSetHandle>> {
+        self.record(RecordedCall::RenderCreateGlyphSet { ynest_format });
         Ok(self
             .render_create_glyphset_returns_handle
             .then(|| GlyphSetHandle::from_raw_panicking(self.allocate_handle())))
@@ -2437,26 +2542,35 @@ impl Backend for RecordingBackend {
     fn render_free_glyphset(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_gs: u32,
+        host_gs: u32,
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderFreeGlyphSet { host_gs });
         Ok(())
     }
 
     fn render_add_glyphs(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_gs: u32,
-        _body_tail: &[u8],
+        host_gs: u32,
+        body_tail: &[u8],
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderAddGlyphs {
+            host_gs,
+            body_tail: body_tail.to_vec(),
+        });
         Ok(())
     }
 
     fn render_free_glyphs(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_gs: u32,
-        _glyph_ids: &[u8],
+        host_gs: u32,
+        glyph_ids: &[u8],
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderFreeGlyphs {
+            host_gs,
+            glyph_ids: glyph_ids.to_vec(),
+        });
         Ok(())
     }
 
@@ -2483,18 +2597,31 @@ impl Backend for RecordingBackend {
     fn render_composite_glyphs(
         &mut self,
         _origin: Option<OriginContext>,
-        _minor: u8,
-        _op: u8,
-        _host_src: u32,
-        _host_dst: u32,
-        _mask_fmt: u32,
-        _host_gs: u32,
-        _src_x: i16,
-        _src_y: i16,
-        _items: &[u8],
-        _x_off: i16,
-        _y_off: i16,
+        minor: u8,
+        op: u8,
+        host_src: u32,
+        host_dst: u32,
+        mask_fmt: u32,
+        host_gs: u32,
+        src_x: i16,
+        src_y: i16,
+        items: &[u8],
+        x_off: i16,
+        y_off: i16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
+        self.record(RecordedCall::RenderCompositeGlyphs {
+            minor,
+            op,
+            host_src,
+            host_dst,
+            mask_fmt,
+            host_gs,
+            src_x,
+            src_y,
+            items: items.to_vec(),
+            x_off,
+            y_off,
+        });
         Ok(self.render_return_region.clone())
     }
 
@@ -2516,8 +2643,8 @@ impl Backend for RecordingBackend {
         &mut self,
         _origin: Option<OriginContext>,
         _op: u8,
-        _host_src: u32,
-        _host_dst: u32,
+        host_src: u32,
+        host_dst: u32,
         _host_mask_format: u32,
         _src_x: i16,
         _src_y: i16,
@@ -2525,16 +2652,17 @@ impl Backend for RecordingBackend {
         _x_off: i16,
         _y_off: i16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
+        self.record(RecordedCall::RenderTrapezoids { host_src, host_dst });
         Ok(self.render_return_region.clone())
     }
 
     fn render_triangles_op(
         &mut self,
         _origin: Option<OriginContext>,
-        _minor: u8,
+        minor: u8,
         _op: u8,
-        _host_src: u32,
-        _host_dst: u32,
+        host_src: u32,
+        host_dst: u32,
         _host_mask_format: u32,
         _src_x: i16,
         _src_y: i16,
@@ -2542,67 +2670,99 @@ impl Backend for RecordingBackend {
         _x_off: i16,
         _y_off: i16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
+        self.record(RecordedCall::RenderTriangles {
+            minor,
+            host_src,
+            host_dst,
+        });
         Ok(self.render_return_region.clone())
     }
 
     fn render_create_solid_fill(
         &mut self,
         _origin: Option<OriginContext>,
-        _color: [u8; 8],
+        color: [u8; 8],
     ) -> io::Result<Option<PictureHandle>> {
+        self.record(RecordedCall::RenderCreateSolidFill { color });
         Ok(None)
     }
 
     fn render_create_linear_gradient(
         &mut self,
         _origin: Option<OriginContext>,
-        _body: &[u8],
+        body: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
+        self.record(RecordedCall::RenderCreateLinearGradient {
+            picture: body
+                .get(..4)
+                .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+        });
         Ok(None)
     }
 
     fn render_create_radial_gradient(
         &mut self,
         _origin: Option<OriginContext>,
-        _body: &[u8],
+        body: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
+        self.record(RecordedCall::RenderCreateRadialGradient {
+            picture: body
+                .get(..4)
+                .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+        });
         Ok(None)
     }
 
     fn render_create_cursor(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_src_pic: PictureHandle,
-        _x: u16,
-        _y: u16,
+        host_src_pic: PictureHandle,
+        x: u16,
+        y: u16,
     ) -> io::Result<Option<CursorHandle>> {
+        self.record(RecordedCall::RenderCreateCursor {
+            host_src_pic: host_src_pic.as_raw(),
+            x,
+            y,
+        });
         Ok(None)
     }
 
     fn render_set_picture_clip_rectangles(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
+        host_pic: u32,
         _body: &[u8],
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderSetPictureClipRectangles { host_pic });
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn picture_client_clip_rects(
+        &mut self,
+        _host_pic: u32,
+    ) -> Option<Option<Vec<yserver_protocol::x11::xfixes::RegionRect>>> {
+        self.picture_client_clip_rects_result.clone()
     }
 
     fn render_set_picture_filter(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
+        host_pic: u32,
         _body: &[u8],
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderSetPictureFilter { host_pic });
         Ok(())
     }
 
     fn render_set_picture_transform(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
+        host_pic: u32,
         _body: &[u8],
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderSetPictureTransform { host_pic });
         Ok(())
     }
 
@@ -2613,10 +2773,11 @@ impl Backend for RecordingBackend {
     fn xkb_proxy(
         &mut self,
         _origin: Option<OriginContext>,
-        _minor: u8,
+        minor: u8,
         _body: &[u8],
         _intern_atom: &mut dyn FnMut(&str) -> u32,
     ) -> io::Result<Option<Vec<u8>>> {
+        self.record(RecordedCall::XkbProxy { minor });
         Ok(None)
     }
 
@@ -2639,6 +2800,10 @@ impl Backend for RecordingBackend {
 
     fn take_displayed_cursor_change(&mut self) -> Option<crate::backend::DisplayedCursor> {
         self.displayed_cursor_change.take()
+    }
+
+    fn get_active_cursor_image(&self) -> Option<crate::backend::ActiveCursorImage> {
+        self.active_cursor_image.clone()
     }
 
     fn set_shape_rectangles(
@@ -2674,6 +2839,7 @@ impl Backend for RecordingBackend {
     }
 
     fn query_pointer(&mut self, _origin: Option<OriginContext>) -> io::Result<PointerPosition> {
+        self.record(RecordedCall::QueryPointer);
         Ok(PointerPosition {
             same_screen: true,
             win_x: 0,

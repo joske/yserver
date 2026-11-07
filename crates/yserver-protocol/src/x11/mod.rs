@@ -4432,6 +4432,15 @@ pub struct RenderCompositeGlyphsRequest {
     pub items: Vec<u8>,
 }
 
+/// Encode a CompositeGlyphs inline glyphset switch: the 8-byte `xGlyphElt`
+/// header followed by the 4-byte glyphset XID.
+pub fn render_composite_glyphset_switch(glyphset: u32) -> [u8; 12] {
+    let mut out = [0u8; 12];
+    out[0] = u8::MAX;
+    out[8..12].copy_from_slice(&glyphset.to_le_bytes());
+    out
+}
+
 pub struct RenderFillRectanglesRequest {
     pub op: u8,
     pub dst: ResourceId,

@@ -1,5 +1,9 @@
+mod access_composite_damage;
+mod access_cursors;
 mod access_grabs;
+mod access_input;
 mod access_properties;
+mod access_render;
 mod access_resources;
 mod composite;
 mod core_misc;

@@ -92,6 +92,9 @@ pub struct ResourceTable {
     /// `XDefineCursor` is the common Xlib idiom) — `CursorNotify` and
     /// `ChangeCursorByName` must still see it.
     cursor_host_names: HashMap<u32, yserver_protocol::x11::AtomId>,
+    /// The first client cursor XID and owner bound to each host cursor.
+    /// These entries survive XID removal while a window still holds the host.
+    cursor_host_origins: HashMap<u32, (ResourceId, ClientId)>,
     pub pictures: HashMap<u32, PictureState>,
     pub glyphsets: HashMap<u32, GlyphSetState>,
     host_glyphset_refcounts: HashMap<u32, usize>,
@@ -237,6 +240,7 @@ impl Default for ResourceTable {
             released_fonts: Vec::new(),
             cursors: HashMap::new(),
             cursor_host_names: HashMap::new(),
+            cursor_host_origins: HashMap::new(),
             pictures: HashMap::new(),
             glyphsets: HashMap::new(),
             host_glyphset_refcounts: HashMap::new(),

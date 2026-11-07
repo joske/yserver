@@ -6,7 +6,8 @@ use crate::{
             accumulate_damage_to_state,
         },
         process_request::{
-            RENDER_LAST_REQUEST, RequestOutcome, emit_x11_error_with_minor, window_unviewable,
+            RENDER_LAST_REQUEST, RequestOutcome, emit_x11_error_with_minor,
+            validate_resource_access, validate_resource_if_present, window_unviewable,
             write_to_client,
         },
     },
@@ -69,6 +70,63 @@ fn clip_fill_rects_by_children(
     out
 }
 
+/// Check and translate the XID-valued Picture attributes in a RENDER value
+/// list. `unresolved_value` preserves each request's existing outcome for an
+/// attribute whose XID does not resolve to the expected resource kind.
+fn check_and_translate_picture_values(
+    state: &mut ServerState,
+    client_id: ClientId,
+    value_mask: u32,
+    values: &[u8],
+    access_request: crate::access::RequestOpcodes,
+    unresolved_value: Option<u32>,
+) -> Result<Option<Vec<u8>>, (u8, u32)> {
+    use crate::{
+        access::{AccessMode, ResourceKind},
+        nested::{ChangePictureAttr, change_picture_translate_xids},
+    };
+
+    let mut access_error = None;
+    let translated = change_picture_translate_xids(value_mask, values, |attr, xid| {
+        let resource = ResourceId(xid);
+        let kind = match attr {
+            ChangePictureAttr::ClipMask => ResourceKind::Pixmap,
+            ChangePictureAttr::AlphaMap => ResourceKind::Picture,
+        };
+        if let Err(error) = validate_resource_if_present(
+            state,
+            client_id,
+            resource,
+            kind,
+            AccessMode::READ,
+            access_request,
+        ) {
+            access_error = Some(error);
+            return None;
+        }
+
+        let host_xid = match attr {
+            ChangePictureAttr::ClipMask => state
+                .resources
+                .pixmap(resource)
+                .and_then(|pixmap| pixmap.host_xid)
+                .map(|handle| handle.as_raw()),
+            ChangePictureAttr::AlphaMap => state
+                .resources
+                .picture(resource)
+                .and_then(|picture| picture.host_picture_xid)
+                .map(|handle| handle.as_raw()),
+        };
+        host_xid.or(unresolved_value)
+    });
+
+    if let Some(error) = access_error {
+        Err(error)
+    } else {
+        Ok(translated)
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn handle_render_request(
     state: &mut ServerState,
@@ -80,7 +138,8 @@ pub(super) fn handle_render_request(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     use crate::{
-        nested::{ChangePictureAttr, change_picture_translate_xids},
+        access::{AccessMode, Creation, RequestOpcodes, ResourceKind, ResourceTarget},
+        nested::composite_glyphs_translate_glyphsets,
         resources::{ARGB_VISUAL, GlyphSetState, PictureState},
     };
     use yserver_protocol::x11::ClientByteOrder;
@@ -89,20 +148,64 @@ pub(super) fn handle_render_request(
         .get(&client_id.0)
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
-    // RenderErrBase + BadPicture for the first unknown Picture, in Xorg's per-request order.
-    macro_rules! verify_pictures {
-        ($($id:expr),+) => {
-            if let Some(bad) = first_missing_picture(state, &[$($id),+]) {
-                return emit_x11_error_with_minor(
+    let access_request = RequestOpcodes::for_request(header);
+    macro_rules! check_resource {
+        ($id:expr, $kind:expr, $mode:expr) => {
+            crate::core_loop::process_request::return_on_access_denial!(
+                validate_resource_if_present(state, client_id, $id, $kind, $mode, access_request),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
+        };
+    }
+    macro_rules! check_creation {
+        ($id:expr, $kind:expr, $mode:expr, $parent:expr $(,)?) => {
+            crate::core_loop::process_request::return_on_access_denial!(
+                validate_resource_access(
                     state,
                     client_id,
-                    sequence,
-                    crate::nested::RENDER_FIRST_ERROR + 1,
-                    bad.0,
-                    u16::from(minor),
-                    header.opcode,
-                );
-            }
+                    ResourceTarget {
+                        owner: None,
+                        id: $id,
+                        kind: $kind,
+                        creation: Some(Creation {
+                            parent: $parent,
+                            owner: client_id,
+                        }),
+                    },
+                    $mode,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
+        };
+    }
+    // Validate and check each Picture in operand order. A valid denied
+    // operand takes precedence over a missing later Picture.
+    macro_rules! verify_pictures {
+        ($(($id:expr, $mode:expr)),+ $(,)?) => {
+            $(
+                {
+                    let picture = $id;
+                    if state.resources.picture(picture).is_none() {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            crate::nested::RENDER_FIRST_ERROR + 1,
+                            picture.0,
+                            u16::from(minor),
+                            header.opcode,
+                        );
+                    }
+                    check_resource!(picture, ResourceKind::Picture, $mode);
+                }
+            )+
         };
     }
     match minor {
@@ -149,9 +252,20 @@ pub(super) fn handle_render_request(
             };
             // Xorg dixLookupDrawable (render.c:575): BadDrawable if unknown, BadMatch for
             // an InputOnly window (dix/dixutils.c:208-213).
-            let input_only = match state.resources.window(req.drawable) {
-                Some(w) => w.class == crate::resources::WindowClass::InputOnly,
-                None if state.resources.pixmap(req.drawable).is_some() => false,
+            let drawable_kind = match state.resources.window(req.drawable) {
+                Some(w) if w.class == crate::resources::WindowClass::InputOnly => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_MATCH,
+                        req.drawable.0,
+                        u16::from(minor),
+                        header.opcode,
+                    );
+                }
+                Some(_) => ResourceKind::Window,
+                None if state.resources.pixmap(req.drawable).is_some() => ResourceKind::Pixmap,
                 None => {
                     return emit_x11_error_with_minor(
                         state,
@@ -164,18 +278,52 @@ pub(super) fn handle_render_request(
                     );
                 }
             };
-            if input_only {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_MATCH,
-                    req.drawable.0,
-                    u16::from(minor),
-                    header.opcode,
-                );
-            }
+            check_resource!(
+                req.drawable,
+                drawable_kind,
+                AccessMode::READ | AccessMode::ADD
+            );
             let damage_drawable = render_picture_damage_drawable(state, req.drawable);
+            let values_in_request = req.value_mask.count_ones() as usize;
+            let complete_values = values_in_request.min(req.values.len() / 4);
+            let mut complete_value_mask = 0u32;
+            let mut complete_value_count = 0usize;
+            for bit in 0..32 {
+                let bit_mask = 1u32 << bit;
+                if req.value_mask & bit_mask != 0 && complete_value_count < complete_values {
+                    complete_value_mask |= bit_mask;
+                    complete_value_count += 1;
+                }
+            }
+            let translated_bytes = complete_value_count * 4;
+            let mut translated_values = match check_and_translate_picture_values(
+                state,
+                client_id,
+                complete_value_mask,
+                &req.values[..translated_bytes],
+                access_request,
+                Some(0),
+            ) {
+                Ok(Some(values)) => values,
+                Ok(None) => Vec::new(),
+                Err(error) => {
+                    crate::core_loop::process_request::return_on_access_denial!(
+                        Err::<(), _>(error),
+                        state,
+                        client_id,
+                        sequence,
+                        access_request,
+                    );
+                    unreachable!("access denial returns from the request handler");
+                }
+            };
+            translated_values.extend_from_slice(&req.values[translated_bytes..]);
+            check_creation!(
+                req.picture,
+                ResourceKind::Picture,
+                AccessMode::CREATE | AccessMode::SET_ATTR,
+                Some(req.drawable),
+            );
             let drawable_origin = state
                 .resources
                 .window(req.drawable)
@@ -198,7 +346,7 @@ pub(super) fn handle_render_request(
                         host_drawable,
                         req.format,
                         req.value_mask,
-                        &req.values,
+                        &translated_values,
                     )
                     .ok()
                     .flatten()
@@ -228,23 +376,28 @@ pub(super) fn handle_render_request(
                 return Ok(RequestOutcome::Handled);
             }
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
-            verify_pictures!(pic_id);
+            verify_pictures!((pic_id, AccessMode::SET_ATTR));
             let value_mask = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
-            let translated = change_picture_translate_xids(value_mask, &body[8..], |attr, xid| {
-                let resource = ResourceId(xid);
-                match attr {
-                    ChangePictureAttr::ClipMask => state
-                        .resources
-                        .pixmap(resource)
-                        .and_then(|p| p.host_xid)
-                        .map(|h| h.as_raw()),
-                    ChangePictureAttr::AlphaMap => state
-                        .resources
-                        .picture(resource)
-                        .and_then(|p| p.host_picture_xid)
-                        .map(|h| h.as_raw()),
+            let translated = match check_and_translate_picture_values(
+                state,
+                client_id,
+                value_mask,
+                &body[8..],
+                access_request,
+                None,
+            ) {
+                Ok(translated) => translated,
+                Err(error) => {
+                    crate::core_loop::process_request::return_on_access_denial!(
+                        Err::<(), _>(error),
+                        state,
+                        client_id,
+                        sequence,
+                        access_request,
+                    );
+                    unreachable!("access denial returns from the request handler");
                 }
-            });
+            };
             let Some(translated_values) = translated else {
                 return Ok(RequestOutcome::Handled);
             };
@@ -265,7 +418,7 @@ pub(super) fn handle_render_request(
                 return Ok(RequestOutcome::Handled);
             }
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
-            verify_pictures!(pic_id);
+            verify_pictures!((pic_id, AccessMode::SET_ATTR));
             let host_pic = state
                 .resources
                 .picture(pic_id)
@@ -279,7 +432,7 @@ pub(super) fn handle_render_request(
             let Some(pic_id) = x11::render_free_resource_id(body) else {
                 return Ok(RequestOutcome::Handled);
             };
-            verify_pictures!(pic_id);
+            verify_pictures!((pic_id, AccessMode::DESTROY));
             let st = state.resources.free_picture(pic_id);
             if let Some(st) = st {
                 if let Some(hp) = st.host_picture_xid {
@@ -294,7 +447,7 @@ pub(super) fn handle_render_request(
             let Some(req) = x11::render_composite_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
-            verify_pictures!(req.dst);
+            verify_pictures!((req.dst, AccessMode::WRITE));
             if dst_picture_is_sourceless(state, req.dst) {
                 return emit_x11_error_with_minor(
                     state,
@@ -306,9 +459,9 @@ pub(super) fn handle_render_request(
                     header.opcode,
                 );
             }
-            verify_pictures!(req.src);
+            verify_pictures!((req.src, AccessMode::READ));
             if req.mask.0 != 0 {
-                verify_pictures!(req.mask);
+                verify_pictures!((req.mask, AccessMode::READ));
             }
             if dst_picture_window_unviewable(state, req.dst) {
                 return Ok(RequestOutcome::Handled);
@@ -371,7 +524,7 @@ pub(super) fn handle_render_request(
             let src_x = i16::from_le_bytes([body[16], body[17]]);
             let src_y = i16::from_le_bytes([body[18], body[19]]);
             let primitives = &body[20..];
-            verify_pictures!(src, dst);
+            verify_pictures!((src, AccessMode::READ), (dst, AccessMode::WRITE));
             if dst_picture_is_sourceless(state, dst) {
                 return emit_x11_error_with_minor(
                     state,
@@ -454,6 +607,7 @@ pub(super) fn handle_render_request(
             let Some((gs_id, fmt)) = x11::render_create_glyphset_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            check_creation!(gs_id, ResourceKind::GlyphSet, AccessMode::CREATE, None);
             let host_gs = backend.render_create_glyphset(origin, fmt).ok().flatten();
             if let Some(host_gs) = host_gs {
                 state.resources.create_glyphset(
@@ -470,6 +624,13 @@ pub(super) fn handle_render_request(
             else {
                 return Ok(RequestOutcome::Handled);
             };
+            check_resource!(existing, ResourceKind::GlyphSet, AccessMode::GET_ATTR);
+            check_creation!(
+                new_glyphset,
+                ResourceKind::GlyphSet,
+                AccessMode::CREATE,
+                None
+            );
             let _ = state
                 .resources
                 .reference_glyphset(client_id, new_glyphset, existing);
@@ -478,6 +639,7 @@ pub(super) fn handle_render_request(
             let Some(gs_id) = x11::render_free_resource_id(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            check_resource!(gs_id, ResourceKind::GlyphSet, AccessMode::DESTROY);
             let st = state.resources.free_glyphset(gs_id);
             if let Some(st) = st {
                 let _ = backend.render_free_glyphset(origin, st.host_glyphset_xid.as_raw());
@@ -487,6 +649,7 @@ pub(super) fn handle_render_request(
             let Some((gs_id, tail)) = x11::render_add_glyphs_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            check_resource!(gs_id, ResourceKind::GlyphSet, AccessMode::ADD);
             let host_gs = state
                 .resources
                 .glyphset(gs_id)
@@ -499,6 +662,7 @@ pub(super) fn handle_render_request(
             let Some((gs_id, glyph_ids)) = x11::render_free_glyphs_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            check_resource!(gs_id, ResourceKind::GlyphSet, AccessMode::REMOVE);
             let host_gs = state
                 .resources
                 .glyphset(gs_id)
@@ -521,7 +685,8 @@ pub(super) fn handle_render_request(
                 );
                 return Ok(RequestOutcome::Handled);
             };
-            verify_pictures!(req.src, req.dst);
+            verify_pictures!((req.src, AccessMode::READ), (req.dst, AccessMode::WRITE));
+            check_resource!(req.glyphset, ResourceKind::GlyphSet, AccessMode::USE);
             if dst_picture_is_sourceless(state, req.dst) {
                 return emit_x11_error_with_minor(
                     state,
@@ -532,9 +697,6 @@ pub(super) fn handle_render_request(
                     u16::from(minor),
                     header.opcode,
                 );
-            }
-            if dst_picture_window_unviewable(state, req.dst) {
-                return Ok(RequestOutcome::Handled);
             }
             let host_src = state
                 .resources
@@ -564,7 +726,55 @@ pub(super) fn handle_render_request(
                     if host_gs.is_none() { " MISSING" } else { "" },
                 );
             }
-            if let (Some(host_src), Some(host_dst), Some(host_gs)) = (host_src, host_dst, host_gs) {
+            let (translated_items, switch_error) = if host_gs.is_some() {
+                let mut switch_error = None;
+                let translated_items =
+                    composite_glyphs_translate_glyphsets(minor, &req.items, |xid| {
+                        if switch_error.is_some() {
+                            return None;
+                        }
+                        let glyphset = ResourceId(xid);
+                        let Some(glyphset_state) = state.resources.glyphset(glyphset) else {
+                            switch_error =
+                                Some((crate::nested::RENDER_BAD_GLYPHSET_ERROR, glyphset.0));
+                            return None;
+                        };
+                        if let Err(error) = validate_resource_access(
+                            state,
+                            client_id,
+                            ResourceTarget {
+                                owner: None,
+                                id: glyphset,
+                                kind: ResourceKind::GlyphSet,
+                                creation: None,
+                            },
+                            AccessMode::USE,
+                            access_request,
+                        ) {
+                            switch_error = Some(error);
+                            return None;
+                        }
+                        Some(glyphset_state.host_glyphset_xid.as_raw())
+                    });
+                (Some(translated_items), switch_error)
+            } else {
+                (None, None)
+            };
+            if let Some(error) = switch_error {
+                crate::core_loop::process_request::return_on_access_denial!(
+                    Err::<(), _>(error),
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                );
+            }
+            if dst_picture_window_unviewable(state, req.dst) {
+                return Ok(RequestOutcome::Handled);
+            }
+            if let (Some(host_src), Some(host_dst), Some(host_gs), Some(translated_items)) =
+                (host_src, host_dst, host_gs, translated_items)
+            {
                 let mask_fmt = if req.mask_format == 0 {
                     0
                 } else {
@@ -574,8 +784,18 @@ pub(super) fn handle_render_request(
                 };
                 let painted = backend
                     .render_composite_glyphs(
-                        origin, minor, req.op, host_src, host_dst, mask_fmt, host_gs, req.src_x,
-                        req.src_y, &req.items, 0, 0,
+                        origin,
+                        minor,
+                        req.op,
+                        host_src,
+                        host_dst,
+                        mask_fmt,
+                        host_gs,
+                        req.src_x,
+                        req.src_y,
+                        &translated_items,
+                        0,
+                        0,
                     )
                     .unwrap_or_default();
                 debug!(
@@ -615,7 +835,7 @@ pub(super) fn handle_render_request(
             let Some(req) = x11::render_fill_rectangles_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
-            verify_pictures!(req.dst);
+            verify_pictures!((req.dst, AccessMode::WRITE));
             if dst_picture_is_sourceless(state, req.dst) {
                 return emit_x11_error_with_minor(
                     state,
@@ -681,9 +901,10 @@ pub(super) fn handle_render_request(
             }
             let cursor_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
             let src_pic_id = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
-            verify_pictures!(src_pic_id);
+            verify_pictures!((src_pic_id, AccessMode::READ));
             let x = u16::from_le_bytes([body[8], body[9]]);
             let y = u16::from_le_bytes([body[10], body[11]]);
+            check_creation!(cursor_id, ResourceKind::Cursor, AccessMode::CREATE, None);
             let host_src = state
                 .resources
                 .picture(src_pic_id)
@@ -705,7 +926,7 @@ pub(super) fn handle_render_request(
                 return Ok(RequestOutcome::Handled);
             }
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
-            verify_pictures!(pic_id);
+            verify_pictures!((pic_id, AccessMode::SET_ATTR));
             let host_pic = state
                 .resources
                 .picture(pic_id)
@@ -716,6 +937,14 @@ pub(super) fn handle_render_request(
             }
         }
         29 => {
+            if body.len() >= 4 {
+                let drawable = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                if state.resources.window(drawable).is_some() {
+                    check_resource!(drawable, ResourceKind::Window, AccessMode::GET_ATTR);
+                } else if state.resources.pixmap(drawable).is_some() {
+                    check_resource!(drawable, ResourceKind::Pixmap, AccessMode::GET_ATTR);
+                }
+            }
             let mut buf: Vec<u8> = Vec::with_capacity(64);
             x11::write_render_query_filters_reply(&mut buf, byte_order, sequence)?;
             let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -729,7 +958,7 @@ pub(super) fn handle_render_request(
                 return Ok(RequestOutcome::Handled);
             }
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
-            verify_pictures!(pic_id);
+            verify_pictures!((pic_id, AccessMode::SET_ATTR));
             let host_pic = state
                 .resources
                 .picture(pic_id)
@@ -743,6 +972,7 @@ pub(super) fn handle_render_request(
             let Some((pic_id, color)) = x11::render_create_solid_fill_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            check_creation!(pic_id, ResourceKind::Picture, AccessMode::CREATE, None);
             let host_pic = backend
                 .render_create_solid_fill(origin, color)
                 .ok()
@@ -764,6 +994,7 @@ pub(super) fn handle_render_request(
                 return Ok(RequestOutcome::Handled);
             }
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            check_creation!(pic_id, ResourceKind::Picture, AccessMode::CREATE, None);
             let host_pic = backend
                 .render_create_linear_gradient(origin, body)
                 .ok()
@@ -785,6 +1016,7 @@ pub(super) fn handle_render_request(
                 return Ok(RequestOutcome::Handled);
             }
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            check_creation!(pic_id, ResourceKind::Picture, AccessMode::CREATE, None);
             let host_pic = backend
                 .render_create_radial_gradient(origin, body)
                 .ok()
@@ -900,6 +1132,7 @@ pub(super) fn handle_render_request(
                         header.opcode,
                     );
                 }
+                check_resource!(sub, ResourceKind::Cursor, AccessMode::READ);
                 if let Some(host_raw) = state.resources.cursor_host_xid(sub) {
                     if first_host.is_none() {
                         first_host = Some(host_raw);
@@ -909,6 +1142,7 @@ pub(super) fn handle_render_request(
                     }
                 }
             }
+            check_creation!(cursor_id, ResourceKind::Cursor, AccessMode::CREATE, None);
             // Backend-side animation. `Ok(None)` (default impl /
             // ynest) → static degeneration to frame 0's handle. A
             // backend Err is "can't happen" after the validation
@@ -966,6 +1200,7 @@ pub(super) fn handle_render_request(
                 return Ok(RequestOutcome::Handled);
             }
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            check_creation!(pic_id, ResourceKind::Picture, AccessMode::CREATE, None);
             state.resources.create_picture(
                 pic_id,
                 PictureState {
@@ -988,7 +1223,7 @@ pub(super) fn handle_render_request(
             // y_off(2) then variable trapezoid list.
             if body.len() >= 4 {
                 let pic = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
-                verify_pictures!(pic);
+                verify_pictures!((pic, AccessMode::WRITE));
                 if let Some(dst_drawable) = state.resources.picture(pic).and_then(|p| p.drawable) {
                     let _dropped = accumulate_damage_full_to_state(state, dst_drawable);
                 }
@@ -1035,14 +1270,6 @@ pub(super) fn render_picture_damage_drawable(
         .resources
         .composite_named_pixmap_owner_window(drawable)
         .unwrap_or(drawable)
-}
-
-/// Xorg VERIFY_PICTURE (`render/picturestr.h:363`, error value set at
-/// `render/render.c:252`): the first of `ids` that names no Picture.
-fn first_missing_picture(state: &ServerState, ids: &[ResourceId]) -> Option<ResourceId> {
-    ids.iter()
-        .copied()
-        .find(|id| state.resources.picture(*id).is_none())
 }
 
 /// A RENDER destination Picture on an unviewable window: Xorg's composite clip is the

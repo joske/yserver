@@ -264,6 +264,7 @@ pub(super) fn handle_open_font(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: request.font,
             kind: ResourceKind::Font,
             creation: Some(crate::access::Creation {
@@ -494,6 +495,7 @@ pub(super) fn handle_close_font(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: font,
             kind: ResourceKind::Font,
             creation: None,
@@ -555,6 +557,7 @@ pub(super) fn handle_query_font(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: font_id,
             kind,
             creation: None,
@@ -612,6 +615,7 @@ pub(super) fn handle_query_text_extents(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: req.fontable,
             kind,
             creation: None,

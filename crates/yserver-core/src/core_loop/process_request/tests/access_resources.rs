@@ -24,6 +24,7 @@ fn ask_owner(
         state.check_resource(
             CLIENT,
             &ResourceTarget {
+                owner: None,
                 id,
                 kind,
                 creation: None,
@@ -45,7 +46,7 @@ fn ask_owner(
     call.owner
 }
 
-fn resource_request(
+pub(super) fn resource_request(
     state: &mut ServerState,
     backend: &mut RecordingBackend,
     peer: &mut UnixStream,
@@ -99,7 +100,7 @@ fn resource_request_with_fd(
     read_all_available(peer)
 }
 
-fn words(words: &[u32]) -> Vec<u8> {
+pub(super) fn words(words: &[u32]) -> Vec<u8> {
     words
         .iter()
         .fold(
@@ -455,10 +456,10 @@ fn owner_resolver_answers_every_kind() {
         ResourceKind::RandrProvider,
     ];
     let calls = Arc::new(Mutex::new(Vec::new()));
-    state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-        decision: Decision::Allow,
-        calls: Arc::clone(&calls),
-    }));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        Decision::Allow,
+        Arc::clone(&calls),
+    )));
 
     for kind in expected_kinds {
         assert!(
@@ -523,10 +524,10 @@ fn owner_resolver_keeps_retained_owner() {
     assert!(state.zombie_clients.contains_key(&CLIENT.0));
 
     let calls = Arc::new(Mutex::new(Vec::new()));
-    state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-        decision: Decision::Allow,
-        calls: Arc::clone(&calls),
-    }));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        Decision::Allow,
+        Arc::clone(&calls),
+    )));
     assert_eq!(
         ask_owner(&state, pixmap, ResourceKind::Pixmap, &calls),
         Some(CLIENT)
@@ -542,10 +543,10 @@ fn kill_client_colormap_result(with_policy: bool) -> (Vec<u8>, Vec<RecordedExten
     let mut peer = install_client(&mut state, CLIENT.0);
     let calls = Arc::new(Mutex::new(Vec::new()));
     if with_policy {
-        state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-            decision: Decision::Allow,
-            calls: Arc::clone(&calls),
-        }));
+        state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+            Decision::Allow,
+            Arc::clone(&calls),
+        )));
     }
 
     let colormap = ResourceId(0x0052_0001);
@@ -590,18 +591,19 @@ fn server_owner_is_never_checked() {
     // Mutation: remove either SERVER_OWNER fast path; its matching Allow assertion must fail.
     let mut state = ServerState::new();
     let calls = Arc::new(Mutex::new(Vec::new()));
-    state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-        decision: Decision::Deny(DenyError {
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        Decision::Deny(DenyError {
             code: yserver_protocol::x11::error::BAD_VALUE,
             value: 0x55,
         }),
-        calls: Arc::clone(&calls),
-    }));
+        Arc::clone(&calls),
+    )));
     let server = crate::resources::SERVER_OWNER;
     assert_eq!(
         state.check_resource(
             server,
             &ResourceTarget {
+                owner: None,
                 id: ROOT_WINDOW,
                 kind: ResourceKind::Window,
                 creation: None,
@@ -633,6 +635,7 @@ fn empty_policy_list_checks_allow() {
         state.check_resource(
             CLIENT,
             &ResourceTarget {
+                owner: None,
                 id: ResourceId(0x0060_0001),
                 kind: ResourceKind::Pixmap,
                 creation: None,
@@ -678,6 +681,7 @@ impl AccessPolicy for DrawingResourcePolicy {
             peer: None,
             admission: None,
             owner: ctx.owner(target.id, target.kind),
+            target_owner: ctx.target_owner(target),
             target: Some(*target),
             property: None,
             mode: Some(mode),
@@ -1618,6 +1622,7 @@ impl AccessPolicy for RevocableDrawingPolicy {
             peer: None,
             admission: None,
             owner: ctx.owner(target.id, target.kind),
+            target_owner: ctx.target_owner(target),
             target: Some(*target),
             property: None,
             mode: Some(mode),
@@ -1724,6 +1729,7 @@ impl AccessPolicy for WindowResourcePolicy {
             peer: None,
             admission: None,
             owner: ctx.owner(target.id, target.kind),
+            target_owner: ctx.target_owner(target),
             target: Some(*target),
             property: None,
             mode: Some(mode),
@@ -2259,6 +2265,7 @@ fn window_resource_request_denials_match_modes_and_stop_before_effects() {
         assert_eq!(
             call.target,
             Some(ResourceTarget {
+                owner: None,
                 id: case.target,
                 kind: case.kind,
                 creation: case.creation,
@@ -2311,6 +2318,7 @@ struct ColormapAccessCase {
 
 fn colormap_target(id: ResourceId, creation: Option<Creation>) -> ResourceTarget {
     ResourceTarget {
+        owner: None,
         id,
         kind: ResourceKind::Colormap,
         creation,
@@ -2319,6 +2327,7 @@ fn colormap_target(id: ResourceId, creation: Option<Creation>) -> ResourceTarget
 
 fn colormap_access_cases() -> Vec<ColormapAccessCase> {
     let window = ResourceTarget {
+        owner: None,
         id: ROOT_WINDOW,
         kind: ResourceKind::Window,
         creation: None,
@@ -2740,10 +2749,10 @@ fn window_resource_requests_present_expected_checks() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     fixture
         .state
-        .install_access_policy(Arc::new(RecordingExtensionPolicy {
-            decision: Decision::Allow,
-            calls: Arc::clone(&calls),
-        }));
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+            Decision::Allow,
+            Arc::clone(&calls),
+        )));
     let created = ResourceId(0x0054_000c);
     let create_body = create_window_with_access_attributes(
         created,
@@ -3076,10 +3085,10 @@ fn destroy_subwindows_wire_bytes(child_count: usize, allow_policy: bool) -> (Vec
             .insert(child, 0x0002_0000);
     }
     if allow_policy {
-        state.install_access_policy(Arc::new(RecordingExtensionPolicy {
-            decision: Decision::Allow,
-            calls: Arc::new(Mutex::new(Vec::new())),
-        }));
+        state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+            Decision::Allow,
+            Arc::new(Mutex::new(Vec::new())),
+        )));
     }
     let request_bytes = resource_request(
         &mut state,
@@ -5420,10 +5429,10 @@ fn gc_pixmap_cursor_font_requests_ask_expected_targets() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     fixture
         .state
-        .install_access_policy(Arc::new(RecordingExtensionPolicy {
-            decision: Decision::Allow,
-            calls: Arc::clone(&calls),
-        }));
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+            Decision::Allow,
+            Arc::clone(&calls),
+        )));
 
     let mut expected = Vec::new();
     for (sequence, case) in (70u16..).zip(cases) {
@@ -5451,7 +5460,12 @@ fn gc_pixmap_cursor_font_requests_ask_expected_targets() {
             };
             expected.push((
                 CLIENT,
-                ResourceTarget { id, kind, creation },
+                ResourceTarget {
+                    owner: None,
+                    id,
+                    kind,
+                    creation,
+                },
                 mode,
                 Some(RequestOpcodes {
                     major: case.opcode,

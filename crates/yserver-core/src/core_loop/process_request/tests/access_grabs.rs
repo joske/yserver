@@ -20,6 +20,7 @@ struct ExpectedCheck {
 impl ExpectedCheck {
     fn target(self) -> ResourceTarget {
         ResourceTarget {
+            owner: None,
             id: self.id,
             kind: self.kind,
             creation: None,
@@ -660,6 +661,7 @@ fn kill_client_resource_check_precedes_kill() {
                 minor: 0,
             }),
             target: ResourceTarget {
+                owner: None,
                 id: fixture.foreign_window,
                 kind: ResourceKind::Window,
                 creation: None,

@@ -1,4 +1,5 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes},
     core_loop::process_request::{
         RequestOutcome, XI2_FIRST_ERROR, XI2_MAJOR_OPCODE, XI2_SERVER_MAJOR_VERSION,
         XI2_SERVER_MINOR_VERSION, emit_x11_error_with_minor,
@@ -14,7 +15,7 @@ use log::debug;
 use std::io;
 use yserver_protocol::{
     x11,
-    x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber},
+    x11::{ClientByteOrder, ClientId, RequestHeader, ResourceId, SequenceNumber},
 };
 
 pub(super) fn handle_xi1_get_extension_version(
@@ -62,9 +63,28 @@ pub(super) fn handle_xi1_get_extension_version(
 
 #[allow(clippy::needless_return)]
 pub(super) fn handle_xi_set_client_pointer(
+    state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    body: &[u8],
+    access_request: RequestOpcodes,
 ) -> io::Result<RequestOutcome> {
+    if body.len() >= 4 {
+        let id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+        crate::core_loop::process_request::return_on_access_denial!(
+            crate::core_loop::process_request::validate_core_resource_if_present(
+                state,
+                client_id,
+                id,
+                AccessMode::GET_ATTR,
+                access_request,
+            ),
+            state,
+            client_id,
+            sequence,
+            access_request,
+        );
+    }
     debug!("client {} #{} XISetClientPointer", client_id.0, sequence.0);
     return Ok(RequestOutcome::Handled);
 }
@@ -73,8 +93,26 @@ pub(super) fn handle_xi_get_client_pointer(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    body: &[u8],
     byte_order: ClientByteOrder,
+    access_request: RequestOpcodes,
 ) -> io::Result<RequestOutcome> {
+    if body.len() >= 4 {
+        let id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+        crate::core_loop::process_request::return_on_access_denial!(
+            crate::core_loop::process_request::validate_core_resource_if_present(
+                state,
+                client_id,
+                id,
+                AccessMode::GET_ATTR,
+                access_request,
+            ),
+            state,
+            client_id,
+            sequence,
+            access_request,
+        );
+    }
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     {
         // XIGetClientPointer reply layout (xXIGetClientPointerReply,
