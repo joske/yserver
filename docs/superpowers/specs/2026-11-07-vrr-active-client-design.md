@@ -1,6 +1,6 @@
 # VRR only while the client is drawing — design
 
-**Date:** 2026-11-07 · **Status:** revision 4 (option B after hardware run 1: yserver's own application exclusions, section *Application exclusions*); revision 2.1 (sol re-review: queued-frame test, EBUSY keeps its event wait); revision 2 (sol review 1: observation point, clear obligation, expiry order, episode identity, tests) · **Base:** `docs/superpowers/specs/2026-10-23-vrr-design.md`
+**Date:** 2026-11-07 · **Status:** revision 4.1 (sol review of revision 4: property-mode route, process-name contract, no-read gating, test matrix); revision 4 (option B after hardware run 1: yserver's own application exclusions, section *Application exclusions*); revision 2.1 (sol re-review: queued-frame test, EBUSY keeps its event wait); revision 2 (sol review 1: observation point, clear obligation, expiry order, episode identity, tests) · **Base:** `docs/superpowers/specs/2026-10-23-vrr-design.md`
 (revision 5.1, implemented by #294 and #298) · **Scope:** KMS backend, the *wanted* decision for a direct-scanout
 owner and what follows from it (cursor hold, standalone clear, logging).
 
@@ -166,39 +166,59 @@ panels; while the Steam UI is focused gamescope repeats the last frame every vbl
 It recognises the Steam UI by process name (`steamwebhelper`) and the `STEAM_BIGPICTURE` property. Its commit
 `c8fecc6c` (2026-08-16) is the same 30 fps cursor rule as here. KWin gives VRR to any active fullscreen window and
 excludes only through per-window rules the user writes, so it behaves as yserver did before this change. Sway and
-wlroots have a per-output switch and no policy. No compositor handles Discord; the user found it here.
+wlroots have a per-output switch and no policy. No dedicated Discord exclusion was found in the inspected sources
+(versions in Provenance); the user found it here.
 
 ### Decision
 
 yserver carries its own exclusion list, applied in both `--vrr` modes on every driver, before the activity rule: an
 excluded client never wants VRR. Names are matched exactly against the process name yserver already derives for the
-NVIDIA/Mesa lists (`read_process_name` in `vrr_exclusions.rs`: the executable's file name, else argv[0]'s):
+NVIDIA/Mesa lists, unchanged: `read_process_name` in `vrr_exclusions.rs` needs a readable UTF-8 `cmdline`; it takes
+the `exe` link's file name only when argv[0] starts with the full `exe` path, otherwise argv[0]'s file name; it does
+not read `comm`, look at ancestors or fold case. The pid is the peer credential of the connection that sends the
+Present, not the window's creator, `_NET_WM_PID` or a launcher:
 
 | Process name | Application |
 |---|---|
 | `steamwebhelper` | Steam UI: library, store, screenshot viewer, trailers, Big Picture |
-| `Discord` | Discord (official build; the Flatpak runs the same binary) |
+| `Discord` | Discord (official tarball binary `/opt/discord/Discord`; the Flathub launcher runs `/app/discord/Discord`) |
 | `DiscordPTB` | Discord PTB (coordinator's call: same client, another channel) |
 | `DiscordCanary` | Discord Canary (coordinator's call, as above) |
 
 Exclusion means no VRR, not a held refresh: yserver changes `VRR_ENABLED` without a modeset, so turning it off keeps
 the panel at its fixed refresh. gamescope repeats frames only because toggling VRR takes a modeset on its path.
+Coverage is conditional on the Present connection's peer resolving to one of these names. Chromium and Electron hold
+X connections in both the browser and the GPU process; which one presents, and its name under the Steam runtime,
+Flatpak Steam, Flatpak Discord or a distro launcher, was not captured. A launcher named `discord` that execs the
+binary with argv[0] `/usr/bin/discord` would not match. The hardware run records the `source=yserver` line per
+application as evidence; no aliases, case folding or ancestor walk are added without such evidence.
+
 Games launched by Steam are separate processes and are not affected; Steam's in-game overlay draws inside the game's
 process and is not affected either.
 
 ### Design
 
-- **One question, both modes.** The existing per-client exclusion decision (cached per client, logged once) gains a
-  yserver source. In `--vrr all` it sits next to the NVIDIA/Mesa lists. In `--vrr` it is the only exclusion consulted:
-  Mesa has already applied its list by not setting `_VARIABLE_REFRESH`, and the NVIDIA list keeps applying only to
-  `all`, as today.
-- **Opt back in.** The existing environment override keeps precedence: a client started with `adaptive_sync=true` or
-  `__GL_VRR_ALLOWED=1` is not excluded by this list, as for the NVIDIA/Mesa lists today. No new knob, no config file.
+- **One question, both modes.** One shared evaluator (environment, process name, then lists) answers through the
+  existing per-client cache in both modes. The NVIDIA/Mesa list data stay optional and are loaded and consulted only
+  in effective `All` (NVIDIA), as today; their absence (property mode, or `--vrr all` falling back on another driver)
+  must not skip the environment and built-in checks. In `--vrr` the built-in list is the only list consulted: Mesa has
+  already applied its own by not setting `_VARIABLE_REFRESH`. The Present activity gate and the frame *wanted*
+  predicate use the same policy, so neither can enable VRR for an excluded client. No second `/proc` reader or cache.
+- **Mode and capability first.** The lookup runs only after the mode check and the output capability check (missing
+  or zero `vrr_capable`, no `VRR_ENABLED`, rejection latch). An incapable output reads nothing and logs nothing new.
+  The existing `All` ordering, which evaluates before capability, is not changed by this revision.
+- **Opt back in.** The existing environment rule keeps precedence, unchanged: if either `adaptive_sync` or
+  `__GL_VRR_ALLOWED` is false the client is excluded (source `environment`); otherwise, if either is true, no list
+  applies, the built-in one included. Opting in does not set `_VARIABLE_REFRESH` or waive the activity rule or
+  capability. No new knob, no config file.
+- **Cached for the client's life.** The decision is per client and dropped on disconnect, so a client cannot become
+  excluded mid-episode; no new clear path.
 - **Downstream.** *wanted* is false for an excluded client; the activity episode, idle clear and cursor hold already
   follow *wanted*.
 - **Unknown pid.** A client without a pid (remote, no peer credentials) is not excluded, as today.
 - **Logging.** The existing once-per-client line: `kms: vrr excluded client=… pid=… process=… source=yserver`.
 - **No change without VRR.** With VRR off or an incapable output, nothing is read, logged or committed differently.
+  A client not on the list, and a client without a pid, behave exactly as with the activity rule alone.
 
 ## Testing
 
@@ -264,17 +284,24 @@ No change without VRR:
   today. The claim is about these observable effects only. Mutation: report the deadline in every mode.
 
 Application exclusions (revision 4), with a scripted `/proc` tree as the existing exclusion tests use:
-- `vrr_builtin_exclusion_steamwebhelper_property_mode`: `--vrr`, process `steamwebhelper` with `_VARIABLE_REFRESH` = 1
-  qualifies by rate and never commits `VRR_ENABLED` = 1; one `source=yserver` line. Mutation: skip the list in
-  property mode.
-- `vrr_builtin_exclusion_discord_all_mode`: `--vrr all` on nvidia-drm, process `Discord`, same result. Mutation: drop
-  `Discord` from the list.
-- `vrr_builtin_exclusion_environment_opt_in`: `steamwebhelper` with `adaptive_sync=true` in its environment qualifies
-  and enables VRR. Mutation: check the list before the environment.
-- `vrr_builtin_exclusion_exact_name`: processes `steam` (property mode) and `steamwebhelper2` are not excluded by this
-  list. Mutation: substring match.
-- `vrr_builtin_exclusion_off_reads_nothing`: VRR off: no `/proc` read, no log, commits as today. Mutation: evaluate
-  before the mode check.
+- `vrr_builtin_exclusion_steamwebhelper_property_mode`: `--vrr` on a non-NVIDIA driver and `--vrr all` falling back
+  to property mode; capable output, process `steamwebhelper`, `_VARIABLE_REFRESH` = 1, Presents fast enough that it
+  would qualify without the list: no `VRR_ENABLED` = 1, one `source=yserver` line. Mutation: bypass the shared policy
+  in property mode (at both the activity gate and *wanted*).
+- `vrr_builtin_exclusion_discord_all_mode`: `--vrr all` on nvidia-drm with empty NVIDIA/Mesa lists, rows `Discord`,
+  `DiscordPTB`, `DiscordCanary`: same result. Mutation: drop any one name.
+- `vrr_builtin_exclusion_environment_opt_in`: property mode, `steamwebhelper` with property 1; rows `adaptive_sync=true`
+  and `__GL_VRR_ALLOWED=1` qualify and enable VRR; `__GL_VRR_ALLOWED=1` with `adaptive_sync=0` stays excluded
+  (source `environment`); an opted-in client with property 0 stays off. Mutation: check the list before the
+  environment, or let true beat false.
+- `vrr_builtin_exclusion_exact_name`: property mode, processes `steam` and `steamwebhelper2` qualify and enable VRR.
+  Mutation: substring match.
+- `vrr_builtin_exclusion_no_pid_allowed`: property mode, property 1, no peer pid: qualifies and enables VRR, no
+  `source=yserver` line. Mutation: a missing pid denies in the new path.
+- `vrr_builtin_exclusion_off_or_incapable_reads_nothing`: rows VRR off, capability missing or 0, no `VRR_ENABLED`,
+  rejection latch; `steamwebhelper` with property 1: no process read (observed through a read counter or hook, not
+  through absent files, which the reader tolerates silently), no log, commits as today. Mutation: run the lookup
+  before the mode or capability check.
 - The existing exclusion tests pass unchanged.
 
 **Hardware (ask the user first; NVIDIA DP-3 and AMD DP-1):**
@@ -285,7 +312,8 @@ Application exclusions (revision 4), with a scripted `/proc` tree as the existin
 - Discord fullscreen video: observed in run 1 (VRR while playing at 34–42 fps); input for option B.
 - After option B (NVIDIA DP-3 `--vrr all`, AMD DP-1 `--vrr`): Steam screenshot viewer, trailer and library stay at the
   fixed refresh with no 48 Hz flashes; Discord video stays at the fixed refresh; mpv at 100 fps and a game launched
-  from Steam still enter VRR.
+  from Steam still enter VRR. Each excluded application's `source=yserver` line (client, pid, process) is recorded
+  next to the OSD result.
 
 ## Provenance
 
@@ -294,8 +322,9 @@ Application exclusions (revision 4), with a scripted `/proc` tree as the existin
 - The yserver log of the user's session, 2026-11-07, for the measurements in Why.
 - `/usr/share/nvidia/nvidia-application-profiles-620.70.06-rc`, read for which process names it excludes. Nothing
   is copied.
-- Revision 4: gamescope (BSD-2) commits `8e0a5bee` and `c8fecc6c`, KWin (GPL) `src/compositor.cpp`,
-  `src/core/renderloop.cpp`, `src/scene/surfaceitem.cpp`, Sway (MIT) `sway-output.5.scd`, Mesa
-  `src/util/00-mesa-defaults.conf` and its commit `a9c36dbf9c5`: read for behaviour only; nothing is copied.
+- Revision 4: gamescope (BSD-2) `e0ad8bed`, commits `8e0a5bee` and `c8fecc6c`; KWin (GPL) `0406762`,
+  `src/compositor.cpp`, `src/window.cpp`, `src/core/renderloop.cpp`, `src/scene/surfaceitem.cpp`; Sway (MIT)
+  `1652c54`, `sway/sway-output.5.scd`; Mesa `e2ab6687d5a`, `src/util/00-mesa-defaults.conf` and its commit
+  `a9c36dbf9c5`; Flathub `com.discordapp.Discord` `discord.sh`. Read for behaviour only; nothing is copied.
 
 This document describes behaviour in original prose; no third-party code was used.
