@@ -15,6 +15,9 @@ Measured on the user's session (NVIDIA, MSI 48–240 Hz on DP-3, `--vrr all`, 20
   waits for the client's next frame or the 33 ms deadline (base spec, The cursor while VRR is on). The user sees the
   cursor and the screen stutter.
 - Discord: a shared YouTube video in fullscreen also enters direct scanout and gets VRR.
+- AMD (Raphael, same monitor on DP-1, `--vrr`, 2026-11-08): Mesa sets `_VARIABLE_REFRESH` = 1 on `steamwebhelper`
+  and Discord windows (neither is in Mesa's `adaptive_sync` list) and both get VRR; Discord's fullscreen video shows
+  the same stall. The problem is not specific to NVIDIA.
 
 Neither process is in the NVIDIA or Mesa lists (`steam` is listed, `steamwebhelper` is not). The base spec accepted
 that a browser or player the lists do not name may get VRR "until a user reports a problem"; this is that report.
