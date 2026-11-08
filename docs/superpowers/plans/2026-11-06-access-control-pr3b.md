@@ -206,7 +206,8 @@ check runs only when it resolves.
 | 21 SetDeviceFocus, 49 XISetFocus | focus window `SET_ATTR` |
 | 41 XIWarpPointer | dst `GET_ATTR`, then src `GET_ATTR` |
 | 42 XIChangeCursor | window `SET_ATTR`; cursor `USE` |
-| 44 XISetClientPointer, 45 XIGetClientPointer | the named resource `GET_ATTR` (scope decision) |
+| 44 XISetClientPointer | named window `MANAGE` |
+| 45 XIGetClientPointer | named resource `GET_ATTR` |
 | 51 XIGrabDevice, 54 XIPassiveGrabDevice | grab window `SET_ATTR`; cursor `USE` |
 | 61 XIBarrierReleasePointer | each barrier `READ` in the existing loop (scope decision) |
 | 136/3 XKB Bell | window `GET_ATTR` |

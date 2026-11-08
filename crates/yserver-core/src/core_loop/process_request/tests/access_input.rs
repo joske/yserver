@@ -225,13 +225,7 @@ fn input_request_cases() -> Vec<InputRequestCase> {
     put_u16(&mut xi2_passive_ungrab, 0); // modifiers
     xi2_passive_ungrab.extend_from_slice(&[0, 0, 0, 0]);
 
-    let mut xi_warp = input_words(&[OTHER_WINDOW.0, WINDOW.0, 0, 0]);
-    put_u16(&mut xi_warp, 10);
-    put_u16(&mut xi_warp, 10);
-    put_u32(&mut xi_warp, 0);
-    put_u32(&mut xi_warp, 0);
-    put_u16(&mut xi_warp, 2);
-    put_u16(&mut xi_warp, 0);
+    let xi_warp = xi_warp_body(OTHER_WINDOW, WINDOW);
 
     let mut change_cur = input_words(&[WINDOW.0, CURSOR.0]);
     put_u16(&mut change_cur, 2);
@@ -259,6 +253,7 @@ fn input_request_cases() -> Vec<InputRequestCase> {
 
     let window_body = input_words(&[WINDOW.0]);
     let get_win = vec![check(WINDOW, Window, M::GET_ATTR)];
+    let manage_win = vec![check(WINDOW, Window, M::MANAGE)];
     let set_win = vec![check(WINDOW, Window, M::SET_ATTR)];
     let recv_win = vec![check(WINDOW, Window, M::RECEIVE)];
     let grab_checks = vec![
@@ -299,7 +294,7 @@ fn input_request_cases() -> Vec<InputRequestCase> {
         ic(R_XI2_WARP, xi_warp, warp_checks.clone()),
         ic(R_XI2_CHANGE_CUR, change_cur, cchecks.clone()),
         ic(R_XI2_FOCUS, xi2_set_focus, set_win.clone()),
-        ic(R_XI2_SET_CLIENT, set_client_ptr, get_win.clone()),
+        ic(R_XI2_SET_CLIENT, set_client_ptr, manage_win),
         ic(R_XI2_GET_CLIENT, window_body.clone(), get_win.clone()),
         ic(R_XI2_BARRIER, xi_barrier, bar_read.clone()),
         ic(R_XKB_BELL, xkb_bell, get_win.clone()),
@@ -333,6 +328,130 @@ fn assert_input_check(
         Some(RequestOpcodes { major, minor }),
         "{label}"
     );
+}
+
+fn xi_warp_body(source: ResourceId, destination: ResourceId) -> Vec<u8> {
+    let mut body = input_words(&[source.0, destination.0, 0, 0]);
+    put_u16(&mut body, 0);
+    put_u16(&mut body, 0);
+    put_u32(&mut body, 0);
+    put_u32(&mut body, 0);
+    put_u16(&mut body, 2);
+    put_u16(&mut body, 0);
+    body
+}
+
+fn invalid_later_input_cases() -> Vec<InputRequestCase> {
+    let invalid_cursor = ResourceId(0xDEAD_8101);
+    let invalid_source = ResourceId(0xDEAD_8102);
+    let window_check = vec![check(WINDOW, ResourceKind::Window, AccessMode::GET_ATTR)];
+    let compare = (
+        "CompareCursor denied window before BadCursor",
+        XTEST_MAJOR,
+        1,
+    );
+    let warp = (
+        "XIWarpPointer denied destination before BadWindow source",
+        XI_MAJOR,
+        41,
+    );
+    let compare_body = input_words(&[WINDOW.0, invalid_cursor.0]);
+    let warp_body = xi_warp_body(invalid_source, WINDOW);
+    vec![
+        ic(compare, compare_body, window_check.clone()),
+        ic(warp, warp_body, window_check),
+    ]
+}
+
+#[test]
+fn earlier_operand_denial_precedes_later_invalid_operand() {
+    // Mutations: move CompareCursor's window check after cursor lookup or XIWarpPointer's
+    // destination check after source lookup; each policy row must then lose to the later error.
+    let error = DenyError {
+        code: x11::error::BAD_ACCESS,
+        value: 0xA55A_1234,
+    };
+    for row in invalid_later_input_cases() {
+        let denied = row.checks[0];
+        let (no_policy_code, invalid_id) = if row.major == XTEST_MAJOR {
+            (
+                x11::error::BAD_CURSOR,
+                u32::from_le_bytes(row.body[4..8].try_into().unwrap()),
+            )
+        } else {
+            (
+                x11::error::BAD_WINDOW,
+                u32::from_le_bytes(row.body[0..4].try_into().unwrap()),
+            )
+        };
+        let no_policy_error = DenyError {
+            code: no_policy_code,
+            value: invalid_id,
+        };
+        let (mut state, mut peer, mut backend) = input_fixture();
+        let before = input_state_snapshot(&state);
+        let backend_before = backend.calls();
+        let bytes = input_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            row.major,
+            row.minor,
+            &row.body,
+        );
+        assert_policy_error(&bytes, row.major, row.minor, no_policy_error, row.label);
+        assert_eq!(
+            input_state_snapshot(&state),
+            before,
+            "{} changed state without policy",
+            row.label
+        );
+        assert_eq!(
+            backend.calls(),
+            backend_before,
+            "{} reached backend without policy",
+            row.label
+        );
+
+        let (mut state, mut peer, mut backend) = input_fixture();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+            Arc::clone(&calls),
+            denied.id,
+            Some(denied.mode),
+            error,
+        )));
+        let before = input_state_snapshot(&state);
+        let backend_before = backend.calls();
+        let bytes = input_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            row.major,
+            row.minor,
+            &row.body,
+        );
+        assert_policy_error(&bytes, row.major, row.minor, error, row.label);
+        assert_eq!(
+            input_state_snapshot(&state),
+            before,
+            "{} changed state",
+            row.label
+        );
+        assert_eq!(
+            backend.calls(),
+            backend_before,
+            "{} reached backend",
+            row.label
+        );
+        let calls = calls.lock().unwrap();
+        let resource_calls: Vec<_> = calls
+            .iter()
+            .filter(|call| call.hook == ExtensionHook::Resource)
+            .collect();
+        assert_eq!(resource_calls.len(), 1, "{}: check count", row.label);
+        assert_input_check(resource_calls[0], denied, row.major, row.minor, row.label);
+    }
 }
 
 #[test]
@@ -587,4 +706,21 @@ fn set_client_ptr_unresolved_id_is_not_asked() {
             .all(|call| call.hook != ExtensionHook::Resource),
         "unresolved id was asked for resource access"
     );
+}
+
+#[test]
+fn set_client_ptr_no_policy_remains_a_noop() {
+    // Mutation: emit an X error for a valid XISetClientPointer request; the empty-output assertion
+    // must fail.
+    let (mut state, mut peer, mut backend) = input_fixture();
+    let body = input_words(&[WINDOW.0, 2]);
+    let before = input_state_snapshot(&state);
+    let backend_before = backend.calls();
+    let bytes = input_request(&mut state, &mut backend, &mut peer, XI_MAJOR, 44, &body);
+    assert!(
+        bytes.is_empty(),
+        "XISetClientPointer reply/error: {bytes:02x?}"
+    );
+    assert_eq!(input_state_snapshot(&state), before);
+    assert_eq!(backend.calls(), backend_before);
 }

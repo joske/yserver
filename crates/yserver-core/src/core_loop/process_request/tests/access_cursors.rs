@@ -1472,6 +1472,140 @@ fn xfixes_resource_access_ask_table() {
     );
 }
 
+#[test]
+fn xfixes_selection_and_cursor_checks_precede_bad_event_masks() {
+    // Mutations: move either window check after its event-mask validation; the policy row must
+    // return the policy error, while its no-policy pair keeps the existing BadValue.
+    let rows = xfixes_invalid_mask_rows(0x8000_0000);
+    for (label, minor, bad_mask) in rows {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, B.0);
+        let window = ResourceId(B_BASE + 9);
+        state.resources.create_window(
+            B,
+            CreateWindowRequest {
+                depth: 24,
+                window,
+                parent: ROOT_WINDOW,
+                width: 40,
+                height: 30,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.xfixes_client_major.insert(B.0, 5);
+        let mut backend = RecordingBackend::new();
+        let body = if minor == x11xfixes::SELECT_SELECTION_INPUT {
+            words(&[window.0, 17, bad_mask])
+        } else {
+            words(&[window.0, bad_mask])
+        };
+        let before = (
+            state.xfixes_selection_masks.clone(),
+            state.xfixes_cursor_masks.clone(),
+        );
+        let backend_before = backend.calls();
+        let bytes = request(
+            &mut state,
+            &mut backend,
+            B,
+            &mut peer,
+            41,
+            140,
+            minor,
+            &body,
+        );
+        let no_policy_minor = if minor == x11xfixes::SELECT_SELECTION_INPUT {
+            0
+        } else {
+            minor
+        };
+        assert_error(
+            &bytes,
+            x11::error::BAD_VALUE,
+            bad_mask,
+            140,
+            no_policy_minor,
+            41,
+        );
+        assert_eq!(
+            (
+                state.xfixes_selection_masks.clone(),
+                state.xfixes_cursor_masks.clone()
+            ),
+            before,
+            "{label}: no-policy request changed subscriptions"
+        );
+        assert_eq!(
+            backend.calls(),
+            backend_before,
+            "{label}: no-policy backend call"
+        );
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let error = DenyError {
+            code: x11::error::BAD_ACCESS,
+            value: 0x61,
+        };
+        state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+            Arc::clone(&calls),
+            window,
+            Some(AccessMode::GET_ATTR),
+            error,
+        )));
+        let bytes = request(
+            &mut state,
+            &mut backend,
+            B,
+            &mut peer,
+            42,
+            140,
+            minor,
+            &body,
+        );
+        assert_error(&bytes, error.code, error.value, 140, minor, 42);
+        assert_eq!(
+            (
+                state.xfixes_selection_masks.clone(),
+                state.xfixes_cursor_masks.clone()
+            ),
+            before,
+            "{label}: denied request changed subscriptions"
+        );
+        assert_eq!(
+            backend.calls(),
+            backend_before,
+            "{label}: denied request reached backend"
+        );
+        let calls = calls.lock().unwrap();
+        let check = calls
+            .iter()
+            .find(|call| call.hook == ExtensionHook::Resource)
+            .expect("window check recorded before invalid mask");
+        let target = ResourceTarget {
+            owner: None,
+            id: window,
+            kind: ResourceKind::Window,
+            creation: None,
+        };
+        assert_eq!(check.client, B);
+        assert_eq!(check.target, Some(target));
+        assert_eq!(check.mode, Some(AccessMode::GET_ATTR));
+        assert_eq!(check.owner, Some(B));
+        assert_eq!(check.target_owner, Some(B));
+        assert_eq!(check.request, Some(RequestOpcodes { major: 140, minor }));
+    }
+}
+
+fn xfixes_invalid_mask_rows(mask: u32) -> [(&'static str, u8, u32); 2] {
+    const SELECT_SELECTION: u8 = x11xfixes::SELECT_SELECTION_INPUT;
+    [
+        ("SelectSelectionInput", SELECT_SELECTION, mask),
+        ("SelectCursorInput", x11xfixes::SELECT_CURSOR_INPUT, mask),
+    ]
+}
+
 #[derive(Clone, Copy, Debug)]
 enum XfixesDeniedSite {
     ChangeSaveSet,

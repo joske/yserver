@@ -1160,6 +1160,11 @@ fn xfixes_region_access_checks_ask_expected_targets_modes_and_order() {
                 .target
                 .and_then(|target| target.creation.is_none().then_some(ClientId(XFIXES_OWNER)));
             assert_eq!(call.owner, expected_owner, "{}: target owner", case.name);
+            assert_eq!(
+                call.target_owner, expected_owner,
+                "{}: target instance owner",
+                case.name
+            );
         }
     }
 }
@@ -1271,6 +1276,123 @@ fn xfixes_region_access_denials_stop_before_state_or_backend_effects() {
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected, "{}: checks before denial", case.name);
         }
+    }
+}
+
+#[test]
+fn expand_region_source_denial_precedes_missing_destination() {
+    // Mutation: validate the destination before checking the source; the policy row must then
+    // return BadAccess instead of the later BadRegion.
+    use super::extensions::{ExtensionHook, RecordedExtensionCheck, RecordingExtensionPolicy};
+    use crate::access::{AccessMode, DenyError, RequestOpcodes, ResourceKind};
+    use yserver_protocol::x11::xfixes as x;
+
+    let rows = [(x::EXPAND_REGION, XFIXES_ACCESS_REGION, 0xDEAD_4401)];
+    for (minor, source, missing) in rows {
+        let label = "ExpandRegion";
+        let mut body = xfixes_u32s(&[source.0, missing]);
+        for margin in [1u16, 2, 3, 4] {
+            body.extend_from_slice(&margin.to_le_bytes());
+        }
+        let snapshot = |state: &ServerState| {
+            state
+                .xfixes_regions
+                .iter()
+                .map(|(id, region)| (*id, region.owner, region.region.to_rects()))
+                .collect::<Vec<_>>()
+        };
+
+        let (mut state, mut backend, mut peer) = xfixes_region_access_fixture();
+        let before = snapshot(&state);
+        let backend_before = backend.calls();
+        xfixes_region_access_request(
+            &mut state,
+            &mut backend,
+            XFIXES_WRITER,
+            140,
+            minor,
+            &body,
+            1,
+        );
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32, "{label}: expected BadRegion");
+        assert_eq!(
+            bytes[1],
+            crate::nested::XFIXES_FIRST_ERROR,
+            "{label}: no-policy error"
+        );
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), missing);
+        assert_eq!(
+            u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+            u16::from(minor)
+        );
+        assert_eq!(bytes[10], 140);
+        assert_eq!(snapshot(&state), before, "{label}: no-policy state changed");
+        assert_eq!(
+            backend.calls(),
+            backend_before,
+            "{label}: no-policy backend call"
+        );
+
+        let (mut state, mut backend, mut peer) = xfixes_region_access_fixture();
+        let calls = Arc::new(Mutex::new(Vec::<RecordedExtensionCheck>::new()));
+        let error = DenyError {
+            code: x11::error::BAD_ACCESS,
+            value: XFIXES_ACCESS_ERROR_VALUE,
+        };
+        state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+            Arc::clone(&calls),
+            source,
+            Some(AccessMode::READ),
+            error,
+        )));
+        let before = snapshot(&state);
+        let backend_before = backend.calls();
+        xfixes_region_access_request(
+            &mut state,
+            &mut backend,
+            XFIXES_WRITER,
+            140,
+            minor,
+            &body,
+            1,
+        );
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32, "{label}: expected policy denial");
+        assert_eq!(bytes[1], error.code);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            error.value
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+            u16::from(minor)
+        );
+        assert_eq!(bytes[10], 140);
+        assert_eq!(snapshot(&state), before, "{label}: denied state changed");
+        assert_eq!(
+            backend.calls(),
+            backend_before,
+            "{label}: denied request reached backend"
+        );
+        let calls = calls.lock().unwrap();
+        let resource_calls: Vec<_> = calls
+            .iter()
+            .filter(|call| call.hook == ExtensionHook::Resource)
+            .collect();
+        assert_eq!(
+            resource_calls.len(),
+            1,
+            "{label}: later destination was checked"
+        );
+        let check = resource_calls[0];
+        let target = xfixes_existing_check(source, ResourceKind::Region, AccessMode::READ).target;
+        assert_eq!(check.client, ClientId(XFIXES_WRITER));
+        assert_eq!(check.target, Some(target));
+        assert_eq!(check.mode, Some(AccessMode::READ));
+        assert_eq!(check.owner, Some(ClientId(XFIXES_OWNER)));
+        assert_eq!(check.target_owner, Some(ClientId(XFIXES_OWNER)));
+        assert_eq!(check.request, Some(RequestOpcodes { major: 140, minor }));
     }
 }
 

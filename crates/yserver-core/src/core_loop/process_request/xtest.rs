@@ -104,6 +104,27 @@ pub(super) fn handle_xtest_request(
                     header.opcode,
                 );
             }
+            let access_request = RequestOpcodes::for_request(header);
+            if let Err((code, value)) =
+                crate::core_loop::process_request::validate_resource_if_present(
+                    state,
+                    client_id,
+                    window,
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR,
+                    access_request,
+                )
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
             let comparison = if cursor.0 == 0 {
                 None
             } else if cursor.0 == 1 {
@@ -121,33 +142,26 @@ pub(super) fn handle_xtest_request(
                     header.opcode,
                 );
             };
-            for (id, kind, mode) in [
-                (window, ResourceKind::Window, AccessMode::GET_ATTR),
-                (cursor, ResourceKind::Cursor, AccessMode::READ),
-            ] {
-                if kind == ResourceKind::Cursor && cursor.0 <= 1 {
-                    continue;
-                }
-                if let Err((code, value)) =
+            if cursor.0 > 1
+                && let Err((code, value)) =
                     crate::core_loop::process_request::validate_resource_if_present(
                         state,
                         client_id,
-                        id,
-                        kind,
-                        mode,
-                        RequestOpcodes::for_request(header),
+                        cursor,
+                        ResourceKind::Cursor,
+                        AccessMode::READ,
+                        access_request,
                     )
-                {
-                    return emit_x11_error_with_minor(
-                        state,
-                        client_id,
-                        sequence,
-                        code,
-                        value,
-                        u16::from(minor),
-                        header.opcode,
-                    );
-                }
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    header.opcode,
+                );
             }
             // Xorg compares cursor objects: after XFIXES ChangeCursor two
             // XIDs can name the same cursor, so compare their host handles.

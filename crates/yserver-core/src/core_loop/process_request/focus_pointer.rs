@@ -59,11 +59,18 @@ pub(super) fn handle_xi_warp_pointer(
         dst_x: fp1616_pixels(20),
         dst_y: fp1616_pixels(24),
     };
-    if let Some(bad) = warp_pointer_bad_window(state, &req) {
-        return xi1_error(state, client_id, sequence, x11::error::BAD_WINDOW, bad, 41);
-    }
     let access_request = RequestOpcodes::for_request(header);
     for window in [req.dst, req.src] {
+        if window.0 != 0 && state.resources.window(window).is_none() {
+            return xi1_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_WINDOW,
+                window.0,
+                41,
+            );
+        }
         if let Err((code, value)) = super::validate_resource_if_present(
             state,
             client_id,
@@ -592,16 +599,6 @@ struct WarpRequest {
     src_h: u16,
     dst_x: i32,
     dst_y: i32,
-}
-
-/// The first nonexistent window of a warp, in Xorg's lookup order: the
-/// destination is looked up before the source in both ProcWarpPointer
-/// and ProcXIWarpPointer.
-fn warp_pointer_bad_window(state: &ServerState, req: &WarpRequest) -> Option<u32> {
-    [req.dst, req.src]
-        .into_iter()
-        .find(|w| w.0 != 0 && state.resources.window(*w).is_none())
-        .map(|w| w.0)
 }
 
 /// Whether the pointer is inside the warp's source rectangle, so the

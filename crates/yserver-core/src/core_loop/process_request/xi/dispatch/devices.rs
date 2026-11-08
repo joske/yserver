@@ -76,7 +76,7 @@ pub(super) fn handle_xi_set_client_pointer(
                 state,
                 client_id,
                 id,
-                AccessMode::GET_ATTR,
+                AccessMode::MANAGE,
                 access_request,
             ),
             state,

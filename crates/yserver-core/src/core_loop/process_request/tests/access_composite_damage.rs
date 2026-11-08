@@ -354,6 +354,28 @@ fn composite_window_deny_row(minor: u8, id: ResourceId, mode: AccessMode) -> Den
     )
 }
 
+fn composite_invalid_update_deny_row(minor: u8, id: ResourceId) -> DenyRow {
+    deny_row(
+        ("Composite invalid update", 144, minor),
+        words(&[id.0, 2]),
+        (
+            cd_target(id, ResourceKind::Window, None),
+            AccessMode::SET_ATTR | AccessMode::MANAGE | AccessMode::BLEND,
+        ),
+    )
+}
+
+fn composite_order_no_policy_rows() -> Vec<DenyRow> {
+    use yserver_protocol::x11::composite as c;
+    composite_damage_deny_rows()
+        .into_iter()
+        .filter(|row| {
+            row.label == "Composite invalid update"
+                || (row.minor == c::REDIRECT_WINDOW && row.target.id == ROOT_WINDOW)
+        })
+        .collect()
+}
+
 fn composite_name_window_deny_row(minor: u8, id: ResourceId, mode: AccessMode) -> DenyRow {
     deny_row(
         ("NameWindowPixmap window", 144, minor),
@@ -433,6 +455,11 @@ fn composite_damage_deny_rows() -> Vec<CompositeDamageDenyRow> {
     let destroy_mode = AccessMode::DESTROY;
     let drawable_read_mode = AccessMode::GET_ATTR | AccessMode::READ;
     vec![
+        composite_invalid_update_deny_row(REDIRECT_WINDOW, CD_WINDOW),
+        composite_invalid_update_deny_row(REDIRECT_SUBWINDOWS, ROOT_WINDOW),
+        composite_invalid_update_deny_row(UNREDIRECT_WINDOW, CD_WINDOW),
+        composite_invalid_update_deny_row(UNREDIRECT_SUBWINDOWS, ROOT_WINDOW),
+        composite_window_deny_row(REDIRECT_WINDOW, ROOT_WINDOW, redirect_mode),
         composite_window_deny_row(REDIRECT_WINDOW, CD_WINDOW, redirect_mode),
         composite_window_deny_row(REDIRECT_SUBWINDOWS, ROOT_WINDOW, redirect_mode),
         composite_window_deny_row(UNREDIRECT_WINDOW, CD_WINDOW, redirect_mode),
@@ -454,6 +481,8 @@ fn composite_damage_deny_rows() -> Vec<CompositeDamageDenyRow> {
 
 #[test]
 fn composite_damage_resource_denials_match_the_site_table() {
+    // Mutations: move a redirect check after update BadValue or root BadMatch; the new Composite
+    // denial rows must fail with the policy error instead of the later validation error.
     let error = DenyError {
         code: x11::error::BAD_ACCESS,
         value: 0xA55A_1234,
@@ -519,9 +548,11 @@ fn assert_cd_resource_check(
 
 #[test]
 fn composite_damage_resource_asks_match_the_site_table() {
+    // Mutation: move RedirectWindow's root check after root BadMatch; this row must lose its check.
     use yserver_protocol::x11::{composite, damage};
     let redirect_mode = AccessMode::SET_ATTR | AccessMode::MANAGE | AccessMode::BLEND;
     let rows = [
+        composite_window_ask_row(composite::REDIRECT_WINDOW, ROOT_WINDOW, redirect_mode),
         composite_window_ask_row(composite::REDIRECT_WINDOW, CD_WINDOW, redirect_mode),
         composite_window_ask_row(composite::REDIRECT_SUBWINDOWS, ROOT_WINDOW, redirect_mode),
         composite_window_ask_row(composite::UNREDIRECT_WINDOW, CD_WINDOW, redirect_mode),
@@ -635,6 +666,52 @@ fn composite_damage_resource_asks_match_the_site_table() {
             .all(|call| call.hook != ExtensionHook::Resource),
         "an unresolved ignored window operand must not reach the resource policy"
     );
+}
+
+#[test]
+fn composite_no_policy_errors_remain_bad_value_and_bad_match() {
+    // Mutation: change the existing invalid-update or root-request error value; these paired
+    // no-policy rows pin the protocol result while the policy rows exercise precedence.
+    for row in composite_order_no_policy_rows() {
+        let update = u32::from_le_bytes(row.body[4..8].try_into().unwrap());
+        let code = if update == 2 {
+            x11::error::BAD_VALUE
+        } else {
+            x11::error::BAD_MATCH
+        };
+        let (mut state, mut peer, mut backend) = composite_damage_access_fixture();
+        let before = cd_snapshot(&state);
+        let backend_before = backend.calls();
+        let bytes = composite_damage_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            row.major,
+            row.minor,
+            &row.body,
+        );
+        assert_eq!(bytes.len(), 32, "{}: expected X error", row.label);
+        assert_eq!(bytes[0], 0, "{}: error packet", row.label);
+        assert_eq!(bytes[1], code, "{}: error code", row.label);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            row.target.id.0,
+            "{}: value",
+            row.label
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+            u16::from(row.minor)
+        );
+        assert_eq!(bytes[10], row.major);
+        assert_eq!(cd_snapshot(&state), before, "{}: state changed", row.label);
+        assert_eq!(
+            backend.calls(),
+            backend_before,
+            "{}: backend call",
+            row.label
+        );
+    }
 }
 
 #[test]

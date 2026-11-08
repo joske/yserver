@@ -283,6 +283,12 @@ pub(super) fn handle_render_request(
                 drawable_kind,
                 AccessMode::READ | AccessMode::ADD
             );
+            check_creation!(
+                req.picture,
+                ResourceKind::Picture,
+                AccessMode::CREATE | AccessMode::SET_ATTR,
+                Some(req.drawable),
+            );
             let damage_drawable = render_picture_damage_drawable(state, req.drawable);
             let values_in_request = req.value_mask.count_ones() as usize;
             let complete_values = values_in_request.min(req.values.len() / 4);
@@ -318,12 +324,6 @@ pub(super) fn handle_render_request(
                 }
             };
             translated_values.extend_from_slice(&req.values[translated_bytes..]);
-            check_creation!(
-                req.picture,
-                ResourceKind::Picture,
-                AccessMode::CREATE | AccessMode::SET_ATTR,
-                Some(req.drawable),
-            );
             let drawable_origin = state
                 .resources
                 .window(req.drawable)

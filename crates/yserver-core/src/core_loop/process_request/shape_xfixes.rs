@@ -973,6 +973,11 @@ pub(super) fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
+                check_resource!(
+                    ResourceId(req.window),
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR
+                );
                 if req.event_mask & !x11xfixes::SELECTION_ALL_EVENTS_MASK != 0 {
                     return emit_x11_error(
                         state,
@@ -983,11 +988,6 @@ pub(super) fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
-                check_resource!(
-                    ResourceId(req.window),
-                    ResourceKind::Window,
-                    AccessMode::GET_ATTR
-                );
                 let key = (
                     client_id.0,
                     ResourceId(req.window),
@@ -1015,6 +1015,11 @@ pub(super) fn handle_xfixes_request(
                         header.opcode,
                     );
                 }
+                check_resource!(
+                    ResourceId(req.window),
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR
+                );
                 if req.event_mask & !x11xfixes::CURSOR_ALL_EVENTS_MASK != 0 {
                     return emit_x11_error_with_minor(
                         state,
@@ -1026,11 +1031,6 @@ pub(super) fn handle_xfixes_request(
                         header.opcode,
                     );
                 }
-                check_resource!(
-                    ResourceId(req.window),
-                    ResourceKind::Window,
-                    AccessMode::GET_ATTR
-                );
                 let key = (client_id.0, ResourceId(req.window));
                 if req.event_mask == 0 {
                     state.xfixes_cursor_masks.remove(&key);
@@ -1931,26 +1931,34 @@ pub(super) fn handle_xfixes_request(
                     header.opcode,
                 );
             };
-            // VERIFY_REGION source then destination: XFixes BadRegion
-            // (error base + 0).
-            for region in [req.source, req.destination] {
-                if !state.xfixes_regions.contains_key(&region) {
-                    return emit_x11_error_with_minor(
-                        state,
-                        client_id,
-                        sequence,
-                        crate::nested::XFIXES_FIRST_ERROR,
-                        region,
-                        u16::from(minor),
-                        header.opcode,
-                    );
-                }
+            // XLibre `VERIFY_REGION` looks up and checks each operand in turn.
+            if !state.xfixes_regions.contains_key(&req.source) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    crate::nested::XFIXES_FIRST_ERROR,
+                    req.source,
+                    u16::from(minor),
+                    header.opcode,
+                );
             }
             check_resource!(
                 ResourceId(req.source),
                 ResourceKind::Region,
                 AccessMode::READ
             );
+            if !state.xfixes_regions.contains_key(&req.destination) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    crate::nested::XFIXES_FIRST_ERROR,
+                    req.destination,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
             check_resource!(
                 ResourceId(req.destination),
                 ResourceKind::Region,

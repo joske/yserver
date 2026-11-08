@@ -130,6 +130,8 @@ pub(super) fn handle_composite_request(
             let Some(parent) = state.resources.window(window).map(|w| w.parent) else {
                 return error(state, x11::error::BAD_WINDOW);
             };
+            let access_mode = AccessMode::SET_ATTR | AccessMode::MANAGE | AccessMode::BLEND;
+            check_resource!(window, ResourceKind::Window, access_mode);
             // compositeproto: update=0 → Automatic, update=1 → Manual. An
             // unredirect with any other value matches no record (BadValue
             // below, as Xorg).
@@ -138,21 +140,18 @@ pub(super) fn handle_composite_request(
                 1 => crate::server::CompositeRedirectMode::Manual,
                 _ => return error(state, x11::error::BAD_VALUE),
             };
-            let access_mode = AccessMode::SET_ATTR | AccessMode::MANAGE | AccessMode::BLEND;
             // Xorg compRedirectWindow (composite/compalloc.c:145-150): the
             // overlay window is never redirected and asking succeeds; the
             // root has no parent to redirect into (BadMatch). Unredirect has
             // no such checks: neither ever holds a record, so it BadValues.
             if redirect && !subwindows {
                 if window == COMPOSITE_OVERLAY_WINDOW {
-                    check_resource!(window, ResourceKind::Window, access_mode);
                     return Ok(RequestOutcome::Handled);
                 }
                 if parent == window {
                     return error(state, x11::error::BAD_MATCH);
                 }
             }
-            check_resource!(window, ResourceKind::Window, access_mode);
             let targets: Vec<ResourceId> = if subwindows {
                 crate::core_loop::process_request::subwindows_redirect_targets(state, window)
                     .into_iter()

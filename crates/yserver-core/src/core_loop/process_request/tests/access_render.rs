@@ -359,13 +359,13 @@ fn alpha_map_creation_checks() -> Vec<ExpectedCheck> {
             ResourceKind::Window,
             AccessMode::READ | AccessMode::ADD,
         ),
-        denied(existing(SRC, ResourceKind::Picture, AccessMode::READ)),
         created(
             NEW_PICTURE,
             ResourceKind::Picture,
             AccessMode::CREATE | AccessMode::SET_ATTR,
             Some(DRAWABLE),
         ),
+        denied(existing(SRC, ResourceKind::Picture, AccessMode::READ)),
     )
 }
 
@@ -376,13 +376,13 @@ fn clip_mask_creation_checks() -> Vec<ExpectedCheck> {
             ResourceKind::Window,
             AccessMode::READ | AccessMode::ADD,
         ),
-        denied(existing(PIXMAP, ResourceKind::Pixmap, AccessMode::READ)),
         created(
             NEW_PICTURE,
             ResourceKind::Picture,
             AccessMode::CREATE | AccessMode::SET_ATTR,
             Some(DRAWABLE),
         ),
+        denied(existing(PIXMAP, ResourceKind::Pixmap, AccessMode::READ)),
     )
 }
 
@@ -1389,15 +1389,102 @@ fn render_picture_requests_ask_expected_targets() {
             "{}: checked targets",
             case.name,
         );
-        for call in &recorded {
-            assert_eq!(
-                call.request,
-                Some(RequestOpcodes {
-                    major: 133,
-                    minor: case.minor
-                })
-            );
-        }
+        assert_resource_checks(&recorded, &case.expected, case.minor);
+    }
+}
+
+#[test]
+fn create_picture_creation_check_precedes_alpha_and_clip_checks() {
+    // Mutation: check CreatePicture's attributes before CREATE; the distinct policy error and
+    // recorded target order must then identify the earlier attribute denial.
+    for case in cases().into_iter().filter(|case| {
+        matches!(
+            case.name,
+            "CreatePicture alpha map" | "CreatePicture clip mask"
+        )
+    }) {
+        let attribute = case
+            .expected
+            .iter()
+            .find(|check| check.target.id != DRAWABLE && check.target.creation.is_none())
+            .expect("CreatePicture attribute row")
+            .target
+            .id;
+        let (mut state, mut backend, mut peer) = fixture();
+        let bytes = dispatch_with_peer(&mut state, &mut backend, &mut peer, case.minor, &case.body);
+        assert!(
+            bytes.is_empty(),
+            "{}: no-policy error: {bytes:02x?}",
+            case.name
+        );
+        assert!(
+            state.resources.picture(NEW_PICTURE).is_some(),
+            "{}: picture missing",
+            case.name
+        );
+
+        let (mut state, mut backend, mut peer) = fixture();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let creation_error = DenyError {
+            code: x11::error::BAD_ACCESS,
+            value: NEW_PICTURE.0,
+        };
+        let attribute_error = DenyError {
+            code: x11::error::BAD_ACCESS,
+            value: attribute.0,
+        };
+        state.install_access_policy(Arc::new(RecordingExtensionPolicy::custom(
+            Arc::clone(&calls),
+            "RENDER",
+            move |_, check| {
+                if check
+                    .target
+                    .is_some_and(|target| target.id == NEW_PICTURE && target.creation.is_some())
+                {
+                    Decision::Deny(creation_error)
+                } else if check.target.is_some_and(|target| target.id == attribute) {
+                    Decision::Deny(attribute_error)
+                } else {
+                    Decision::Allow
+                }
+            },
+        )));
+        let bytes = dispatch_with_peer(&mut state, &mut backend, &mut peer, case.minor, &case.body);
+        assert_request_error(
+            &bytes,
+            creation_error.code,
+            creation_error.value,
+            case.minor,
+            case.name,
+        );
+        assert!(
+            state.resources.picture(NEW_PICTURE).is_none(),
+            "{}: denied picture registered",
+            case.name
+        );
+        assert!(
+            backend.calls().is_empty(),
+            "{}: denied request reached backend",
+            case.name
+        );
+        let recorded = calls.lock().unwrap().clone();
+        assert_resource_checks(
+            &recorded,
+            &checks2(
+                existing(
+                    DRAWABLE,
+                    ResourceKind::Window,
+                    AccessMode::READ | AccessMode::ADD,
+                ),
+                created(
+                    NEW_PICTURE,
+                    ResourceKind::Picture,
+                    AccessMode::CREATE | AccessMode::SET_ATTR,
+                    Some(DRAWABLE),
+                ),
+            ),
+            case.minor,
+        );
     }
 }
 
