@@ -12,10 +12,13 @@ use serde_json::Value;
 
 const MAX_LIST_FILE_SIZE: u64 = 1_048_576;
 const MAX_USER_HOME_CACHE_ENTRIES: usize = 64; // Client HOME values must not grow this cache without bound.
+const YSERVER_EXCLUDED_PROCESSES: [&str; 4] =
+    ["steamwebhelper", "Discord", "DiscordPTB", "DiscordCanary"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VrrExclusionSource {
     Environment,
+    Yserver,
     NvidiaProfiles,
     MesaDriconf,
 }
@@ -135,6 +138,33 @@ impl VrrExclusions {
     }
 
     pub(crate) fn evaluate(&self, pid: u32, proc_root: &Path) -> VrrExclusionDecision {
+        Self::evaluate_with_lists(Some(self), pid, proc_root)
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn evaluate_with_lists(
+        external_lists: Option<&Self>,
+        pid: u32,
+        proc_root: &Path,
+    ) -> VrrExclusionDecision {
+        Self::evaluate_with_lists_inner(external_lists, pid, proc_root)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evaluate_with_lists(
+        external_lists: Option<&Self>,
+        pid: u32,
+        proc_root: &Path,
+    ) -> VrrExclusionDecision {
+        test_support::record_process_read(proc_root);
+        Self::evaluate_with_lists_inner(external_lists, pid, proc_root)
+    }
+
+    fn evaluate_with_lists_inner(
+        external_lists: Option<&Self>,
+        pid: u32,
+        proc_root: &Path,
+    ) -> VrrExclusionDecision {
         let process_dir = proc_root.join(pid.to_string());
         let environment = read_environment(&process_dir.join("environ"));
         let home = environment.get("HOME").map(PathBuf::from);
@@ -149,10 +179,15 @@ impl VrrExclusions {
             Some(VrrExclusionSource::Environment)
         } else if nvidia_environment == Some(true) || mesa_environment == Some(true) {
             None
+        } else if process_name
+            .as_deref()
+            .is_some_and(|name| YSERVER_EXCLUDED_PROCESSES.contains(&name))
+        {
+            Some(VrrExclusionSource::Yserver)
         } else {
-            process_name
-                .as_ref()
-                .and_then(|name| self.list_exclusion(name, home.as_deref()))
+            process_name.as_ref().and_then(|name| {
+                external_lists.and_then(|lists| lists.list_exclusion(name, home.as_deref()))
+            })
         };
         VrrExclusionDecision {
             process_name,
@@ -589,12 +624,18 @@ fn parse_driconf(contents: &str) -> Option<Vec<MesaDriconfEntry>> {
 pub(crate) mod test_support {
     use super::VrrListRoots;
     use std::{
+        cell::RefCell,
+        collections::HashMap,
         fs,
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
     };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    thread_local! {
+        static PROCESS_READ_COUNTS: RefCell<HashMap<PathBuf, usize>> = RefCell::new(HashMap::new());
+    }
 
     pub(crate) struct TempTree(PathBuf);
 
@@ -632,6 +673,19 @@ pub(crate) mod test_support {
         fs::create_dir_all(path.parent().expect("fixture path has parent"))
             .expect("create fixture parent");
         fs::write(path, contents).expect("write fixture file");
+    }
+
+    pub(crate) fn process_read_count(proc_root: &Path) -> usize {
+        PROCESS_READ_COUNTS.with(|counts| counts.borrow().get(proc_root).copied().unwrap_or(0))
+    }
+
+    pub(super) fn record_process_read(proc_root: &Path) {
+        PROCESS_READ_COUNTS.with(|counts| {
+            *counts
+                .borrow_mut()
+                .entry(proc_root.to_path_buf())
+                .or_default() += 1;
+        });
     }
 
     pub(crate) fn process(

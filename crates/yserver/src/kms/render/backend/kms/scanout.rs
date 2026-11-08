@@ -1469,9 +1469,13 @@ impl KmsBackend {
             return source.is_some();
         }
 
-        let decision = match (self.pstate.vrr_exclusions.as_ref(), candidate.client_pid) {
-            (Some(exclusions), Some(pid)) => exclusions.evaluate(pid, &self.pstate.vrr_proc_root),
-            (_, None) => {
+        let decision = match candidate.client_pid {
+            Some(pid) => crate::vrr_exclusions::VrrExclusions::evaluate_with_lists(
+                self.pstate.vrr_exclusions.as_ref(),
+                pid,
+                &self.pstate.vrr_proc_root,
+            ),
+            None => {
                 log::debug!(
                     "kms: vrr exclusion skipped client={} reason=no-pid",
                     candidate.client_id
@@ -1481,14 +1485,11 @@ impl KmsBackend {
                     source: None,
                 }
             }
-            _ => crate::vrr_exclusions::VrrExclusionDecision {
-                process_name: None,
-                source: None,
-            },
         };
         if let (Some(pid), Some(source)) = (candidate.client_pid, decision.source) {
             let source_name = match source {
                 crate::vrr_exclusions::VrrExclusionSource::Environment => "environment",
+                crate::vrr_exclusions::VrrExclusionSource::Yserver => "yserver",
                 crate::vrr_exclusions::VrrExclusionSource::NvidiaProfiles => "nvidia-profiles",
                 crate::vrr_exclusions::VrrExclusionSource::MesaDriconf => "mesa-driconf",
             };

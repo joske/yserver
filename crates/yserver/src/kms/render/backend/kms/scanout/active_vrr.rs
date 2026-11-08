@@ -132,7 +132,9 @@ impl KmsBackend {
         }
         let wants_by_policy = match self.pstate.vrr_mode {
             crate::launch::VrrMode::Off => false,
-            crate::launch::VrrMode::Property => candidate.variable_refresh,
+            crate::launch::VrrMode::Property => {
+                candidate.variable_refresh && !self.vrr_client_excluded(candidate)
+            }
             crate::launch::VrrMode::All => !self.vrr_client_excluded(candidate),
         };
         let Some(owner) = self.pstate.direct.get(scope) else {
@@ -253,7 +255,12 @@ impl KmsBackend {
         }
         let base_wanted = match self.pstate.vrr_mode {
             crate::launch::VrrMode::Off => false,
-            crate::launch::VrrMode::Property => frame.candidate.variable_refresh,
+            crate::launch::VrrMode::Property => {
+                if !self.direct_scope_vrr_capable(scope) || !frame.candidate.variable_refresh {
+                    return false;
+                }
+                !self.vrr_client_excluded(&frame.candidate)
+            }
             crate::launch::VrrMode::All => !self.vrr_client_excluded(&frame.candidate),
         };
         if !base_wanted

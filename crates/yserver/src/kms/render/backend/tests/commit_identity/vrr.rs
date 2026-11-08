@@ -38,6 +38,8 @@ const VRR_PROP_ID: u32 = 90;
 
 #[path = "vrr_active.rs"]
 mod active;
+#[path = "vrr_exclusions.rs"]
+mod exclusions;
 #[path = "vrr_per_output.rs"]
 mod per_output;
 
