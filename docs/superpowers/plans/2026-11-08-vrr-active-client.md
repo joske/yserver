@@ -114,8 +114,10 @@ What must hold (spec *Application exclusions* / Decision and Design):
   `vrr_builtin_exclusion_off_or_incapable_reads_nothing` (process reads observed through a counter or hook; reuse an
   existing seam if one exists, otherwise the smallest test-only seam, justified in the report). Each owner presents
   fast enough to qualify under the activity rule, with the controlled clock installed first.
-- [ ] **Step 2:** Run them; the exclusion tests fail on today's code (Property ignores exclusions; the names are not
-  listed).
+- [ ] **Step 2:** Run them. The rows that need the new exclusion (the four names in both modes, the environment
+  conflict row) fail on today's code; preservation rows (`steam`, `steamwebhelper2`, no pid, off/incapable, opt-in
+  enables) may already pass and must not be altered to go red. Every named mutation is run after Step 3 and must fail
+  its test.
 - [ ] **Step 3:** Implement.
 - [ ] **Step 4:** All VRR, exclusion, tearing, gamma, cursor and direct-scanout backend tests pass, the existing
   exclusion tests unchanged; run each named mutation.
