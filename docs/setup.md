@@ -265,12 +265,21 @@ arguments. `--vrr` is off by default. It enables VRR for windows that set
 output decides on its own: several monitors can run VRR at once, each with its
 own fullscreen client, while the others keep their fixed refresh. NVIDIA
 proprietary clients do not set `_VARIABLE_REFRESH`; on NVIDIA (`nvidia-drm`),
-`--vrr all` enables VRR for every directly scanned-out client window instead,
-except applications that the NVIDIA or Mesa application lists, or the
-client's environment, exclude.
-In either mode and on every driver, VRR starts after the directly scanned-out
-client presents three consecutive intervals of at most 1/30 second; it clears
-after 100 ms without a Present, which releases the cursor hold.
+`--vrr all` enables VRR for directly scanned-out client windows without that
+property, subject to the NVIDIA and Mesa application lists.
+In either mode and on every driver, yserver excludes `steamwebhelper`,
+`Discord`, `DiscordPTB`, and `DiscordCanary` by default. The Steam UI draws in
+bursts and its trailers play at 30 fps; Discord video runs at 34–42 fps. Those
+rates can look like a game to the VRR rule, which cannot distinguish them.
+Set `adaptive_sync=true` or `__GL_VRR_ALLOWED=1` in an application's
+environment to opt it back in; setting either variable to `false` excludes
+any client. Games launched from Steam run as separate processes and keep VRR.
+Opting in overrides the application exclusions only; the usual display and
+activity requirements still apply, and `--vrr` still requires the window
+property.
+VRR starts after the directly scanned-out client presents three consecutive
+intervals of at most 1/30 second; it clears after 100 ms without a Present,
+which releases the cursor hold.
 
 ### Direct scanout with a desktop compositor
 

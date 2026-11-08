@@ -253,7 +253,14 @@ that property on NVIDIA DRM and applies NVIDIA/Mesa application
 exclusions; on other drivers it behaves like `--vrr`. VRR starts after
 the directly scanned-out client presents three consecutive intervals
 of at most 1/30 second, and clears after 100 ms without a Present; the
-cursor hold ends then. This applies in both modes on every driver. Under a
+cursor hold ends then. This applies in both modes on every driver. Both modes
+also exclude `steamwebhelper`, `Discord`, `DiscordPTB`, and `DiscordCanary` by
+default on every driver because the Steam UI draws in bursts and its trailers
+play at 30 fps, while Discord video runs at 34–42 fps, rates the rule cannot
+distinguish from a game; setting `adaptive_sync=true` or
+`__GL_VRR_ALLOWED=1` in an application's environment opts it back in, either
+variable set to `false` excludes any client, and games launched from Steam
+remain eligible because they run as separate processes. Under a
 compositing desktop, direct scanout and therefore VRR require the
 compositor to unredirect fullscreen windows. On Cinnamon, enable
 `org.cinnamon.muffin unredirect-fullscreen-windows` (`true`) in System

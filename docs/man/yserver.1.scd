@@ -64,10 +64,20 @@ entries say so. *--version* reports what this binary was built with.
 
 *--vrr all*
 	Enable adaptive sync for direct-scanned client windows without requiring
-	*\_VARIABLE_REFRESH*. On *nvidia-drm*, NVIDIA application profiles,
-	Mesa driconf and the client's *\_\_GL_VRR_ALLOWED* or *adaptive_sync*
-	environment setting can exclude a process. On other drivers this behaves
-	like *--vrr* and uses the window property.
+	*\_VARIABLE_REFRESH*. On *nvidia-drm*, NVIDIA application profiles and
+	Mesa application settings can also exclude a process. On other drivers this
+	behaves like *--vrr* and uses the window property.
+
+	With either option, yserver excludes *steamwebhelper*, *Discord*,
+	*DiscordPTB* and *DiscordCanary* by default on every driver. The Steam UI
+	draws in bursts and its trailers play at 30 fps; Discord videos run at
+	34–42 fps. Those rates can match a game, so the rate rule cannot tell them
+	apart. Set *adaptive_sync=true* or *\_\_GL_VRR_ALLOWED=1* in an
+	application's environment to opt it back in; setting either variable to
+	*false* excludes any client. Games launched from Steam run as separate
+	processes and keep VRR. Opting in overrides the application exclusions
+	only; the usual display and activity requirements still apply, and *--vrr*
+	still requires the window property.
 
 *-listen* _protocol_, *-nolisten* _protocol_
 	Enable or disable a transport. Only *tcp* is understood; any other

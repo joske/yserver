@@ -45,13 +45,19 @@ See [`docs/extensions.txt`](docs/extensions.txt) for a list of all supported/imp
 - per-output direct scanout: a fullscreen client on one monitor is scanned out
   there whatever the other monitors' refresh rates, while they keep composing
   at their own (@ariel3259)
-- variable refresh rate per monitor (`--vrr`): each monitor a fullscreen client
-  is scanned out to runs VRR on its own, several at once, while the others keep
-  their fixed refresh; VRR starts once the client presents three consecutive
-  frames at 30 fps or faster and ends after 100 ms without a new frame
+- variable refresh rate per monitor (`--vrr`): eligible fullscreen clients can
+  run VRR independently on several monitors while others keep their fixed
+  refresh. VRR starts after three consecutive intervals at 30 fps or faster
+  and ends after 100 ms without a new frame. `steamwebhelper`, `Discord`,
+  `DiscordPTB`, and `DiscordCanary` are excluded by default in both modes on all
+  drivers: the Steam UI draws in bursts and its trailers play at 30 fps, while
+  Discord video runs at 34–42 fps, rates the rule cannot distinguish from a
+  game. Set `adaptive_sync=true` or `__GL_VRR_ALLOWED=1` in an application's
+  environment to opt it back in; setting either to `false` excludes any
+  client. Steam-launched games are separate processes and keep VRR.
   (@ariel3259)
-- `--vrr all`: VRR for NVIDIA clients too, honouring the NVIDIA and Mesa
-  application lists (@ariel3259)
+- `--vrr all`: VRR for NVIDIA clients without `_VARIABLE_REFRESH` too,
+  honouring the NVIDIA and Mesa application lists (@ariel3259)
 - tearing on demand: fullscreen clients that ask for async flips get uncapped
   direct scanout (@ariel3259)
 - hardware cursor on atomic KMS: a cursor plane per CRTC, and cursor changes no
