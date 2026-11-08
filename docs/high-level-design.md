@@ -230,7 +230,8 @@ screen.
 
 Per-output presentation scheduling is in place. Tear-free is the
 default. Direct scanout is per output: a client covering exactly one
-monitor can scan out there while the others compose at their own rates,
+monitor can scan out there, whatever the other monitors' refresh rates,
+while the others compose at their own rates,
 with no limit on the number of monitors. A whole-screen window keeps
 grouped direct scanout when all outputs share the primary device and
 their refresh rates are within 0.5%. A Present selecting another
@@ -239,6 +240,12 @@ belong to a fullscreen client on one monitor while other monitors are on. A
 second client asking to tear stays direct with synchronized flips until the
 current owner releases tearing. A paused owner keeps tearing. yserver advertises
 `PresentCapabilityAsync`, not `PresentCapabilityAsyncMayTear`.
+
+VRR is per output: each output whose monitor reports VRR support enables it
+while its own client window scans out directly, so several monitors can run
+VRR at once while the others keep their fixed refresh. Xorg's modesetting
+driver enables VRR only for a window covering the whole screen, and on every
+CRTC at once.
 
 VRR is off by default. `--vrr` honors `_VARIABLE_REFRESH` (format 32,
 one nonzero item) for client-owned direct scanout. `--vrr all` ignores

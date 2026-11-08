@@ -42,8 +42,12 @@ See [`docs/extensions.txt`](docs/extensions.txt) for a list of all supported/imp
   Dock icon and a Settings window; rootless mode gives every X window its own
   Mac window
 - OpenBSD support
-- variable refresh rate on the monitor a fullscreen client is scanned out to
-  (`--vrr`) (@ariel3259)
+- per-output direct scanout: a fullscreen client on one monitor is scanned out
+  there whatever the other monitors' refresh rates, while they keep composing
+  at their own (@ariel3259)
+- variable refresh rate per monitor (`--vrr`): each monitor a fullscreen client
+  is scanned out to runs VRR on its own, several at once, while the others keep
+  their fixed refresh (@ariel3259)
 - `--vrr all`: VRR for NVIDIA clients too, honouring the NVIDIA and Mesa
   application lists (@ariel3259)
 - tearing on demand: fullscreen clients that ask for async flips get uncapped
@@ -51,9 +55,10 @@ See [`docs/extensions.txt`](docs/extensions.txt) for a list of all supported/imp
 - hardware cursor on atomic KMS: a cursor plane per CRTC, and cursor changes no
   longer drop direct scanout (@ariel3259)
 - gamma through atomic GAMMA_LUT (@ariel3259)
-- multi-monitor: direct scanout across monitors whose refresh rates differ
-  slightly; switching off or unplugging one monitor no longer blanks the others;
-  `xrandr` changes to one output leave the others alone
+- multi-monitor: a window covering all monitors keeps direct scanout when their
+  refresh rates differ by less than 0.5%; switching off or unplugging one
+  monitor no longer blanks the others; `xrandr` changes to one output leave the
+  others alone
 - compositors: redirected windows keep their own and their subwindows' borders
   (@SetZero), and draw at the right offset when resized; no more blank windows
   after a workspace switch under picom; no more smudged decorations when

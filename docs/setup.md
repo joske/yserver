@@ -261,7 +261,9 @@ starty bspwm -- --vrr  # pass --vrr to yserver with bspwm
 
 Server arguments go after `--`; arguments before it remain the client and its
 arguments. `--vrr` is off by default. It enables VRR for windows that set
-`_VARIABLE_REFRESH`, on outputs whose monitor reports VRR support. NVIDIA
+`_VARIABLE_REFRESH`, on outputs whose monitor reports VRR support. Each
+output decides on its own: several monitors can run VRR at once, each with its
+own fullscreen client, while the others keep their fixed refresh. NVIDIA
 proprietary clients do not set `_VARIABLE_REFRESH`; on NVIDIA (`nvidia-drm`),
 `--vrr all` enables VRR for every directly scanned-out client window instead,
 except applications that the NVIDIA or Mesa application lists, or the
@@ -282,8 +284,9 @@ game is launched through Steam) creates an override-redirect window stacked
 above the fullscreen game. Muffin then does not unredirect the game, so VRR
 stays off ([upstream issue #12687](https://github.com/linuxmint/cinnamon/issues/12687)).
 A desktop without a compositor, such as i3, is unaffected. Direct scanout is
-per output, so a client covering exactly one monitor can scan out there while
-other monitors keep composing at their own rates. A Present selecting another
+per output, so a client covering exactly one monitor can scan out there,
+whatever the other monitors' refresh rates, while they keep composing at their
+own. A Present selecting another
 monitor's CRTC is composed. A whole-screen window can use grouped direct
 scanout when all outputs share the primary device and refresh rates within
 0.5%. Tearing has one direct owner at a time and may belong to a fullscreen
