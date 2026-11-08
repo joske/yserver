@@ -1,6 +1,6 @@
 # VRR only while the client is drawing — design
 
-**Date:** 2026-11-07 · **Status:** revision 3 (user 2026-11-09: the rule applies only where `--vrr all` is in effect, i.e. on `nvidia-drm`); revision 2.1 (sol re-review: queued-frame test, EBUSY keeps its event wait); revision 2 (sol review 1: observation point, clear obligation, expiry order, episode identity, tests) · **Base:** `docs/superpowers/specs/2026-10-23-vrr-design.md`
+**Date:** 2026-11-07 · **Status:** revision 2.1 (sol re-review: queued-frame test, EBUSY keeps its event wait); revision 2 (sol review 1: observation point, clear obligation, expiry order, episode identity, tests) · **Base:** `docs/superpowers/specs/2026-10-23-vrr-design.md`
 (revision 5.1, implemented by #294 and #298) · **Scope:** KMS backend, the *wanted* decision for a direct-scanout
 owner and what follows from it (cursor hold, standalone clear, logging).
 
@@ -27,9 +27,8 @@ nothing to protect.
 
 ## Goals
 
-1. **VRR needs a drawing client, in `--vrr all` on NVIDIA.** Where `--vrr all` is in effect (only on `nvidia-drm`;
-   on every other driver it already runs as `--vrr`, `kms/render/backend/kms/session.rs`, `resolve_vrr_startup`), an
-   eligible direct-scanout owner (as today: `Unredirected`, not excluded) wants VRR only while it is *active*:
+1. **VRR needs a drawing client.** An eligible direct-scanout owner (as today: `Unredirected`, not excluded, and in
+   `--vrr` mode with `_VARIABLE_REFRESH`) wants VRR only while it is *active*:
    - it becomes active after **three consecutive intervals of at most 1000/30 ms** between its Presents (four
      Presents; at least 30 fps);
    - it stops being active after **100 ms** without a Present;
@@ -55,9 +54,8 @@ nothing to protect.
 
 ## Anti-goals
 
-1. **No change outside `--vrr all` on NVIDIA.** With `--vrr` absent, in property mode (`--vrr`, or `--vrr all` on a
-   driver other than `nvidia-drm`), or on an output that is not capable, commits and cursor commits are exactly as
-   today. Tracking Present intervals must not add commits, wakeups or log lines in those cases.
+1. **No change without VRR.** With `--vrr` absent, or on an output that is not capable, commits and cursor commits are
+   exactly as today. Tracking Present intervals must not add commits, wakeups or log lines in that case.
 2. **No toggling while a game runs.** A client presenting steadily at 30 fps or more never sees VRR switch off and on.
 3. **No extra commits while active.** While the owner is active, VRR adds no commit that the base design does not
    already send.
@@ -86,11 +84,7 @@ nothing to protect.
   from direct entry until ownership teardown completes. A Present for another window on that scope, or the same
   window entering again after a teardown, starts a new episode: inactive, empty count. Frames do not carry activity;
   current, pending and queued frames are judged by their scope's episode at the moment *wanted* is evaluated.
-- **The rule applies only where `--vrr all` is in effect** (user, 2026-11-09), which `resolve_vrr_startup` already
-  limits to `nvidia-drm`; no new driver check. AMD and Intel take the property route: Mesa sets
-  `_VARIABLE_REFRESH` per application from its driconf list (browsers excluded) and yserver honours it as today.
-  Known limitation kept in property mode: a client that keeps `_VARIABLE_REFRESH` = 1 and stops drawing still holds
-  the cursor at the 33 ms cadence.
+- **The rule applies in both modes** (`--vrr` and `--vrr all`) and on every driver.
 - **Turning off reuses the base design's clear** (pending CRTC property, the standalone VRR-only commit with the live
   direct frame's primary framebuffer — on NVIDIA also the plane flip `VRR_ENABLED` = 0 needs —, the existing
   wait/retry fields, clear-before-gamma selection). Turning on rides the next direct frame after the owner becomes
@@ -130,8 +124,7 @@ nothing to protect.
   Expiry is serviced in the scheduling pass before the property-retry loop and before the held-direct early returns,
   so neither skips it. A `_VARIABLE_REFRESH` notification may cancel the retry fields only when the full *wanted*
   (including activity) is true.
-- **No change outside `--vrr all` on NVIDIA:** with VRR off on the command line, in property mode, or on an output
-  that is not capable (missing or zero
+- **No change without VRR:** with VRR off on the command line, or on an output that is not capable (missing or zero
   `vrr_capable`, no `VRR_ENABLED`, or latched off after a rejection), no idle deadline is reported and nothing new is
   logged; commits are as today.
 
@@ -206,14 +199,8 @@ No change without VRR:
 - `vrr_off_or_incapable_reports_nothing_new`: `--vrr` absent; capability missing or 0; no `VRR_ENABLED`; latched
   off: Presents fast enough to qualify produce no idle wakeup, no new log line and the same commit signatures as
   today. The claim is about these observable effects only. Mutation: report the deadline in every mode.
-- `vrr_property_mode_keeps_first_present_enable`: property mode (`--vrr`, and `--vrr all` resolved on a driver other
-  than `nvidia-drm`) with `_VARIABLE_REFRESH` = 1: the first direct Present carries `VRR_ENABLED` = 1 as today, and
-  no idle wakeup is reported after 200 ms without a Present. Mutation: apply the activity rule in every mode.
 
-Existing tests that run in property mode keep their assertions unchanged; only tests in `--vrr all` mode qualify
-their owner first.
-
-**Hardware (ask the user first; NVIDIA DP-3 with `--vrr all`; AMD DP-1 only to confirm property mode is unchanged):**
+**Hardware (ask the user first; NVIDIA DP-3 and AMD DP-1):**
 - Steam screenshot viewer: OSD stays at 240 Hz once the image is static; the cursor is smooth.
 - mpv at 100 fps: VRR on. mpv at 25 fps: VRR stays off, because entry needs 30 fps.
 - A game: VRR on, with no `client_idle` while playing. A pause menu that stops drawing turns it off, and it comes
