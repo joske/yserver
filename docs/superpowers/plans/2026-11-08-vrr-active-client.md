@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust; `yserver` KMS backend (`kms/render/backend/kms/{present,scanout,state}.rs`, `kms/render/platform/{cursor,gamma}.rs`); backend tests in `kms/render/backend/tests/commit_identity/` (lavapipe).
 
-**Spec:** `docs/superpowers/specs/2026-11-07-vrr-active-client-design.md` (revision 2.1, approved by the user 2026-11-08). Base: `docs/superpowers/specs/2026-10-23-vrr-design.md`.
+**Spec:** `docs/superpowers/specs/2026-11-07-vrr-active-client-design.md` (revision 2.1, approved by the user 2026-11-08; revision 4.1 with the application exclusions, approved 2026-11-08, for Tasks 4–6). Base: `docs/superpowers/specs/2026-10-23-vrr-design.md`.
 
 ## Global Constraints
 
@@ -71,6 +71,72 @@ What must hold (spec: Decisions; Design / State, Expiry first, *wanted*, Idle de
 ### Task 3: Hardware validation (coordinator; ask the user first)
 
 Per the spec's Hardware list, on NVIDIA DP-3 and AMD DP-1: Steam screenshot viewer (OSD back to 240 Hz when static, smooth cursor), mpv 100 fps (VRR on) and 25 fps (VRR stays off), a game (no `client_idle` while playing; pause menu off, resume on), Discord fullscreen video (observe; input for the option-B decision). Record logs under `~/Projects/claude-scratch/vrr/active/hw/`.
+
+### Task 4: yserver's own application exclusions (spec revision 4.1, section *Application exclusions*)
+
+Tasks 1–3 are done (Task 1 `6fb2cad7`, Task 2 `76a41331`, hardware run 1 recorded in the spec). This task implements
+option B; the spec section *Application exclusions* is binding, including its Design bullets and its revision-4
+tests.
+
+**Files:**
+- Modify: `crates/yserver/src/vrr_exclusions.rs` (the four names, a `VrrExclusionSource` variant logged as `yserver`;
+  the evaluator works with the NVIDIA/Mesa list data absent), `kms/render/backend/kms/scanout.rs`
+  (`vrr_client_excluded`, the log's source name), `kms/render/backend/kms/scanout/active_vrr.rs` (the Property arms of
+  the activity gate and of `direct_frame_wants_vrr_at`), `kms/render/backend/kms/session.rs` and `state.rs` only if
+  the evaluator's ownership needs it.
+- Test: a new `crates/yserver/src/kms/render/backend/tests/commit_identity/vrr_exclusions.rs`, a child of `vrr.rs` like
+  `vrr_active.rs` (`vrr.rs` is 5642 lines: it gains only the module line); unit rows in `vrr_exclusions.rs`'s own test
+  module where the spec's case is about the evaluator alone.
+
+**Interfaces:**
+- Consumes: `read_process_name`, `read_environment` and the environment rule in `VrrExclusions::evaluate`; the
+  per-client `vrr_exclusion_cache` and `vrr_proc_root`; `direct_scope_vrr_capable`; `Output::vrr_capable()`.
+- Produces: one evaluator answering "is this pid excluded, and by which source" in both modes, with optional list
+  data; `vrr_client_excluded` callable in Property mode; source name `yserver` in
+  `kms: vrr excluded client=… pid=… process=… source=yserver`.
+
+What must hold (spec *Application exclusions* / Decision and Design):
+- Exact, case-sensitive names: `steamwebhelper`, `Discord`, `DiscordPTB`, `DiscordCanary`. The process-name reader is
+  unchanged.
+- Environment first, unchanged: either variable false → excluded (`environment`); else either true → no list applies.
+- Effective `All` (NVIDIA): environment, then NVIDIA/Mesa lists and the built-in list. Property mode (including
+  `--vrr all` falling back on another driver): environment, then the built-in list only; the NVIDIA/Mesa data are
+  neither loaded nor consulted there (the existing tests at `tests/commit_identity/vrr.rs` ~5215 and ~5529, which
+  expect the list object to stay absent outside effective `All`, keep passing).
+- In Property mode the lookup runs only after the mode and output-capability checks, in both the activity gate and
+  *wanted*; the existing `All` ordering is unchanged.
+- A client without a pid is not excluded; the decision is cached per client and dropped on disconnect, as today.
+- With VRR off or an incapable output: no process read, no log, commits as today.
+
+- [ ] **Step 1: Failing tests**, the spec's revision-4 list with names, rows, assertions and mutations verbatim:
+  `vrr_builtin_exclusion_steamwebhelper_property_mode`, `vrr_builtin_exclusion_discord_all_mode`,
+  `vrr_builtin_exclusion_environment_opt_in`, `vrr_builtin_exclusion_exact_name`, `vrr_builtin_exclusion_no_pid_allowed`,
+  `vrr_builtin_exclusion_off_or_incapable_reads_nothing` (process reads observed through a counter or hook; reuse an
+  existing seam if one exists, otherwise the smallest test-only seam, justified in the report). Each owner presents
+  fast enough to qualify under the activity rule, with the controlled clock installed first.
+- [ ] **Step 2:** Run them; the exclusion tests fail on today's code (Property ignores exclusions; the names are not
+  listed).
+- [ ] **Step 3:** Implement.
+- [ ] **Step 4:** All VRR, exclusion, tearing, gamma, cursor and direct-scanout backend tests pass, the existing
+  exclusion tests unchanged; run each named mutation.
+- [ ] **Step 5:** Gate (Verification). Commit.
+
+### Task 5: Docs for the exclusions
+
+**Files:** `docs/status.md` (amend the 2026-11-08 entry: application lists are no longer unchanged; the four names,
+both modes, the environment opt-in), `docs/setup.md` (VRR section), `docs/man/yserver.1.scd` (`--vrr` text),
+`docs/high-level-design.md` VRR paragraph (one sentence).
+
+- [ ] **Step 1:** Write the text: which applications never get VRR and why (bursty UI and video), how to opt back in
+  (`adaptive_sync=true` or `__GL_VRR_ALLOWED=1` in the application's environment), and that games launched from Steam
+  are not affected.
+- [ ] **Step 2:** `just man` passes. Commit.
+
+### Task 6: Hardware validation (coordinator; ask the user first)
+
+Spec *Hardware*, the lines after option B, on NVIDIA DP-3 (`--vrr all`) and AMD DP-1 (`--vrr`), recording each
+excluded application's `source=yserver` line next to the OSD result. Logs under
+`~/Projects/claude-scratch/vrr/active/hw/`.
 
 ## Verification (each task, then the whole branch)
 
