@@ -721,7 +721,9 @@ pub(super) fn handle_free_cursor(
     let host_xid = state.resources.free_cursor(cursor);
     if let Some(host_xid) = host_xid {
         let _ = backend.free_cursor(origin, host_xid);
-        state.resources.cursor_host_released(host_xid);
+        state
+            .resources
+            .cursor_host_released(host_xid, |host| backend.cursor_alive(host));
     }
     debug!(
         "client {} #{} FreeCursor cursor=0x{:x} freed host_xid={host_xid:?}",

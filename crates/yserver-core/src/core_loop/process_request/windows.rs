@@ -453,7 +453,9 @@ pub(crate) fn release_dropped_cursors(
 ) {
     for host in state.resources.take_unreferenced_cursor_hosts() {
         let _ = backend.free_cursor(origin, host);
-        state.resources.cursor_host_released(host);
+        state
+            .resources
+            .cursor_host_released(host, |host| backend.cursor_alive(host));
     }
 }
 

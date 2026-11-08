@@ -307,6 +307,367 @@ fn freed_displayed_cursor_record_lives_until_release() {
     assert!(backend.calls().contains(&RecordedCall::FreeCursor(host)));
 }
 
+fn grab_pointer_with_cursor(
+    state: &mut ServerState,
+    backend: &mut RecordingBackend,
+    client: ClientId,
+    peer: &mut UnixStream,
+    sequence: u16,
+    cursor: ResourceId,
+) -> Vec<u8> {
+    let mut body = words(&[ROOT_WINDOW.0]);
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&[0, 0]);
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&cursor.0.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    request(state, backend, client, peer, sequence, 26, 0, &body)
+}
+
+fn retained_cursor_image_access_checks(root_cursor_reset: bool) {
+    let mut state = ServerState::new();
+    let mut a_peer = install_client(&mut state, A.0);
+    let mut b_peer = install_client(&mut state, B.0);
+    set_base(&mut state, A, A_BASE);
+    set_base(&mut state, B, B_BASE);
+    state.xfixes_client_major.insert(B.0, 5);
+    let mut backend = RecordingBackend::new();
+    let mut a_sequence = 1;
+    let mut b_sequence = 10;
+    let (cursor, host) = create_cursor(
+        &mut state,
+        &mut backend,
+        A,
+        &mut a_peer,
+        &mut a_sequence,
+        A_BASE,
+    );
+    backend.alive_cursors.insert(host);
+
+    if root_cursor_reset {
+        assert_no_error(
+            &request(
+                &mut state,
+                &mut backend,
+                A,
+                &mut a_peer,
+                a_sequence,
+                2,
+                0,
+                &words(&[ROOT_WINDOW.0, 0x4000, cursor.0]),
+            ),
+            "A defines the root cursor",
+        );
+        a_sequence += 1;
+        assert_no_error(
+            &request(
+                &mut state,
+                &mut backend,
+                A,
+                &mut a_peer,
+                a_sequence,
+                95,
+                0,
+                &cursor.0.to_le_bytes(),
+            ),
+            "A frees the root cursor XID",
+        );
+        a_sequence += 1;
+        assert_no_error(
+            &request(
+                &mut state,
+                &mut backend,
+                A,
+                &mut a_peer,
+                a_sequence,
+                2,
+                0,
+                &words(&[ROOT_WINDOW.0, 0x4000, 0]),
+            ),
+            "A resets the root cursor",
+        );
+    } else {
+        let reply =
+            grab_pointer_with_cursor(&mut state, &mut backend, A, &mut a_peer, a_sequence, cursor);
+        assert_no_error(&reply, "A grabs the pointer with C");
+        assert_eq!(reply[1], 0, "GrabPointer succeeds");
+        a_sequence += 1;
+        assert_no_error(
+            &request(
+                &mut state,
+                &mut backend,
+                A,
+                &mut a_peer,
+                a_sequence,
+                95,
+                0,
+                &cursor.0.to_le_bytes(),
+            ),
+            "A frees the grabbed cursor XID",
+        );
+    }
+    backend.active_cursor_image = Some(active_cursor_image(host));
+    let image_and_name_mode = AccessMode::READ | AccessMode::GET_ATTR;
+
+    for (minor, _) in [
+        (x11xfixes::GET_CURSOR_IMAGE, AccessMode::READ),
+        (x11xfixes::GET_CURSOR_IMAGE_AND_NAME, image_and_name_mode),
+    ] {
+        let bytes = request(
+            &mut state,
+            &mut backend,
+            B,
+            &mut b_peer,
+            b_sequence,
+            140,
+            minor,
+            &[],
+        );
+        assert_no_error(&bytes, "no-policy retained cursor image");
+        assert_eq!(bytes.first().copied(), Some(1), "cursor image reply");
+        b_sequence += 1;
+    }
+
+    let denied_error = DenyError {
+        code: yserver_protocol::x11::error::BAD_ACCESS,
+        value: 0x6b,
+    };
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let resource_checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let policy_checks = Arc::clone(&resource_checks);
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::custom(
+        Arc::clone(&calls),
+        "",
+        move |_, check| {
+            if check.hook == ExtensionHook::Resource
+                && policy_checks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    .is_multiple_of(2)
+            {
+                Decision::Deny(denied_error)
+            } else {
+                Decision::Allow
+            }
+        },
+    )));
+
+    for (minor, _) in [
+        (x11xfixes::GET_CURSOR_IMAGE, AccessMode::READ),
+        (x11xfixes::GET_CURSOR_IMAGE_AND_NAME, image_and_name_mode),
+    ] {
+        let origin_before = state.resources.cursor_host_origin(host);
+        let names_before = state.resources.cursor_name_for_host(host);
+        let backend_before = backend.calls();
+        let denied_sequence = b_sequence;
+        let denied = request(
+            &mut state,
+            &mut backend,
+            B,
+            &mut b_peer,
+            denied_sequence,
+            140,
+            minor,
+            &[],
+        );
+        assert_error(
+            &denied,
+            denied_error.code,
+            denied_error.value,
+            140,
+            minor,
+            denied_sequence,
+        );
+        assert_eq!(state.resources.cursor_host_origin(host), origin_before);
+        assert_eq!(state.resources.cursor_name_for_host(host), names_before);
+        assert_eq!(backend.calls(), backend_before, "denial reached backend");
+        b_sequence += 1;
+
+        let allowed_sequence = b_sequence;
+        let allowed = request(
+            &mut state,
+            &mut backend,
+            B,
+            &mut b_peer,
+            allowed_sequence,
+            140,
+            minor,
+            &[],
+        );
+        assert_no_error(&allowed, "ASK row allows the retained cursor image");
+        assert_eq!(allowed.first().copied(), Some(1), "cursor image reply");
+        b_sequence += 1;
+        assert_eq!(state.resources.cursor_host_origin(host), Some((cursor, A)));
+    }
+
+    let resource_checks = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|check| check.hook == ExtensionHook::Resource)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        resource_checks.len(),
+        4,
+        "one DENY and one ASK row per site"
+    );
+    for (check, (minor, mode)) in resource_checks.iter().zip([
+        (x11xfixes::GET_CURSOR_IMAGE, AccessMode::READ),
+        (x11xfixes::GET_CURSOR_IMAGE, AccessMode::READ),
+        (x11xfixes::GET_CURSOR_IMAGE_AND_NAME, image_and_name_mode),
+        (x11xfixes::GET_CURSOR_IMAGE_AND_NAME, image_and_name_mode),
+    ]) {
+        assert_eq!(
+            (
+                check.client,
+                check.target,
+                check.mode,
+                check.owner,
+                check.target_owner,
+                check.request,
+            ),
+            (
+                B,
+                Some(ResourceTarget {
+                    owner: Some(A),
+                    id: cursor,
+                    kind: ResourceKind::Cursor,
+                    creation: None,
+                }),
+                Some(mode),
+                None,
+                Some(A),
+                Some(RequestOpcodes { major: 140, minor }),
+            )
+        );
+    }
+}
+
+#[test]
+// Mutation: drop the retained origin at free time even while the backend keeps the cursor alive.
+fn xfixes_get_cursor_image_checks_grab_cursor_after_free() {
+    retained_cursor_image_access_checks(false);
+}
+
+#[test]
+// Mutation: drop the retained origin at reset time even while the backend keeps the cursor alive.
+fn xfixes_get_cursor_image_checks_root_cursor_after_reset() {
+    retained_cursor_image_access_checks(true);
+}
+
+#[test]
+fn cursor_record_dropped_once_backend_destroys_cursor() {
+    // Mutation: never sweep origins kept alive at an earlier release point.
+    let mut state = ServerState::new();
+    let mut a_peer = install_client(&mut state, A.0);
+    let mut b_peer = install_client(&mut state, B.0);
+    set_base(&mut state, A, A_BASE);
+    set_base(&mut state, B, B_BASE);
+    state.xfixes_client_major.insert(B.0, 5);
+    let mut backend = RecordingBackend::new();
+    let mut a_sequence = 1;
+    let mut b_sequence = 10;
+    let (cursor, host) = create_cursor(
+        &mut state,
+        &mut backend,
+        A,
+        &mut a_peer,
+        &mut a_sequence,
+        A_BASE,
+    );
+    backend.alive_cursors.insert(host);
+    backend.active_cursor_image = Some(active_cursor_image(host));
+    assert_no_error(
+        &grab_pointer_with_cursor(&mut state, &mut backend, A, &mut a_peer, a_sequence, cursor),
+        "A grabs the pointer with C",
+    );
+    a_sequence += 1;
+    assert_no_error(
+        &request(
+            &mut state,
+            &mut backend,
+            A,
+            &mut a_peer,
+            a_sequence,
+            95,
+            0,
+            &cursor.0.to_le_bytes(),
+        ),
+        "A frees C while the backend retains it",
+    );
+    assert_eq!(state.resources.cursor_host_origin(host), Some((cursor, A)));
+
+    assert_no_error(
+        &request(
+            &mut state,
+            &mut backend,
+            A,
+            &mut a_peer,
+            a_sequence + 1,
+            27,
+            0,
+            &0u32.to_le_bytes(),
+        ),
+        "A ends the grab",
+    );
+    backend.alive_cursors.remove(&host);
+    let (next_cursor, _) = create_cursor(
+        &mut state,
+        &mut backend,
+        B,
+        &mut b_peer,
+        &mut b_sequence,
+        B_BASE,
+    );
+    assert_no_error(
+        &request(
+            &mut state,
+            &mut backend,
+            B,
+            &mut b_peer,
+            b_sequence,
+            95,
+            0,
+            &next_cursor.0.to_le_bytes(),
+        ),
+        "B frees a cursor at the next release point",
+    );
+    assert_eq!(state.resources.cursor_host_origin(host), None);
+
+    backend.active_cursor_image = Some(active_cursor_image(host));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        Decision::Allow,
+        Arc::clone(&calls),
+    )));
+    for minor in [
+        x11xfixes::GET_CURSOR_IMAGE,
+        x11xfixes::GET_CURSOR_IMAGE_AND_NAME,
+    ] {
+        calls.lock().unwrap().clear();
+        let bytes = request(
+            &mut state,
+            &mut backend,
+            B,
+            &mut b_peer,
+            b_sequence + 1,
+            140,
+            minor,
+            &[],
+        );
+        assert_no_error(&bytes, "server cursor image has no retained owner");
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|check| check.hook != ExtensionHook::Resource),
+            "a host cursor without an origin is not a policy target"
+        );
+        b_sequence += 1;
+    }
+}
+
 fn check_cursor_owner(
     state: &ServerState,
     requester: ClientId,

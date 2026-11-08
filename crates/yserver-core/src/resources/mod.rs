@@ -93,7 +93,7 @@ pub struct ResourceTable {
     /// `ChangeCursorByName` must still see it.
     cursor_host_names: HashMap<u32, yserver_protocol::x11::AtomId>,
     /// The first client cursor XID and owner bound to each host cursor.
-    /// These entries survive XID removal while a window still holds the host.
+    /// These entries survive XID removal while the core or backend retains the host.
     cursor_host_origins: HashMap<u32, (ResourceId, ClientId)>,
     pub pictures: HashMap<u32, PictureState>,
     pub glyphsets: HashMap<u32, GlyphSetState>,

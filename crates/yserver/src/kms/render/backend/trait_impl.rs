@@ -986,6 +986,10 @@ impl<P: Platform> Backend for XBackend<P> {
         Self::backend_cursor_free_cursor(self, _origin, host_xid)
     }
 
+    fn cursor_alive(&self, host_xid: u32) -> bool {
+        Self::backend_cursor_alive(self, host_xid)
+    }
+
     fn define_cursor(
         &mut self,
         _origin: Option<OriginContext>,

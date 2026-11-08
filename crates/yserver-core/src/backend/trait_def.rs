@@ -1957,6 +1957,12 @@ pub trait Backend {
         Ok(())
     }
 
+    /// Whether the backend still retains a cursor after the core asked it to
+    /// free it. Backends that destroy cursors immediately keep the default.
+    fn cursor_alive(&self, _host_xid: u32) -> bool {
+        false
+    }
+
     /// Recolor a core monochrome cursor. RENDER/ARGB cursors ignore this
     /// operation, matching Xorg's hardware-cursor path.
     fn recolor_cursor(

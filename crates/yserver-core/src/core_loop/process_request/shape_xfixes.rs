@@ -728,7 +728,9 @@ fn xfixes_replace_cursor(
     let _ = backend.replace_cursor(origin, old_host, new_host);
     if !state.resources.cursor_host_referenced(old_host) {
         let _ = backend.free_cursor(origin, old_host);
-        state.resources.cursor_host_released(old_host);
+        state
+            .resources
+            .cursor_host_released(old_host, |host| backend.cursor_alive(host));
     }
 }
 

@@ -17,7 +17,11 @@
 //! `nested::handle_request`'s ChangeWindowAttributes path on
 //! ROOT_WINDOW pokes the container).
 
-use std::{collections::VecDeque, io, sync::Mutex};
+use std::{
+    collections::{HashSet, VecDeque},
+    io,
+    sync::Mutex,
+};
 
 use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, glx, xfixes};
 
@@ -368,6 +372,8 @@ pub struct RecordingBackend {
     /// Canned active cursor image returned by `get_active_cursor_image`.
     /// Defaults to `None`, matching backends without a sprite snapshot.
     pub active_cursor_image: Option<crate::backend::ActiveCursorImage>,
+    /// Cursor handles retained by a test backend after `free_cursor`.
+    pub alive_cursors: HashSet<u32>,
     next_handle: Mutex<u32>,
     fake_window_id: u32,
     fake_root_visual_xid: u32,
@@ -724,6 +730,7 @@ impl RecordingBackend {
             calls: Mutex::new(Vec::new()),
             displayed_cursor_change: None,
             active_cursor_image: None,
+            alive_cursors: HashSet::new(),
             next_handle: Mutex::new(0x0001_0000),
             fake_window_id: 0x0000_0100,
             fake_root_visual_xid: 0x0000_0021,
@@ -2117,6 +2124,10 @@ impl Backend for RecordingBackend {
     fn free_cursor(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
         self.record(RecordedCall::FreeCursor(host_xid));
         Ok(())
+    }
+
+    fn cursor_alive(&self, host_xid: u32) -> bool {
+        self.alive_cursors.contains(&host_xid)
     }
 
     fn define_cursor(

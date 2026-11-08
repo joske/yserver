@@ -233,6 +233,49 @@ fn freed_grab_cursor_lives_until_the_grab_ends() {
     assert!(!b.cursor_records.contains_key(&c));
 }
 
+#[test]
+fn cursor_alive_tracks_grab_and_animated_frame_retention() {
+    // Mutation: report false for a cursor after `free_cursor` even while retained.
+    use yserver_core::backend::{Backend, CursorHandle};
+
+    let mut b = KmsBackend::for_tests();
+    let grab_cursor = test_cursor(&mut b);
+    b.set_grab_cursor(None, Some(grab_cursor))
+        .expect("grab cursor");
+    b.free_cursor(None, grab_cursor)
+        .expect("free grabbed cursor");
+    assert!(Backend::cursor_alive(&b, grab_cursor));
+    b.set_grab_cursor(None, None).expect("clear grab cursor");
+    assert!(!Backend::cursor_alive(&b, grab_cursor));
+
+    let frame0 = test_cursor(&mut b);
+    let frame1 = test_cursor(&mut b);
+    let frame0_handle = CursorHandle::from_raw(frame0).expect("frame 0 handle");
+    let frame1_handle = CursorHandle::from_raw(frame1).expect("frame 1 handle");
+    let animation = b
+        .create_anim_cursor(None, &[(frame0_handle, 50), (frame1_handle, 50)])
+        .expect("create animation")
+        .expect("KMS animates")
+        .as_raw();
+    let replacement = test_cursor(&mut b);
+    b.define_cursor(None, b.core.window_id, animation)
+        .expect("show animation");
+    b.free_cursor(None, frame0).expect("free frame cursor");
+    assert!(
+        Backend::cursor_alive(&b, frame0),
+        "shown animation retains frame"
+    );
+
+    b.define_cursor(None, b.core.window_id, replacement)
+        .expect("replace shown animation");
+    b.free_cursor(None, animation)
+        .expect("free unshown animation");
+    assert!(
+        !Backend::cursor_alive(&b, frame0),
+        "released animation drops frame"
+    );
+}
+
 /// The root's cursor (our sticky default) holds it until replaced.
 #[test]
 fn freed_root_cursor_lives_until_the_root_cursor_changes() {

@@ -84,8 +84,9 @@ contract of plan 3a ("Denial test contract") applies to every row here. Rulings 
   table entry and keeps the host cursor (`resources/picture_font_cursor.rs`), and its name keeps matching
   (`d746bc3c`, `docs/status.md:720-723`: "a freed-but-displayed cursor still matches"). Such a cursor is still a
   client's object, so it keeps an identity: the `ResourceTable` records, for each host cursor, the XID and owner it
-  was first bound under (the XID whose creation produced it; a later `ChangeCursor` alias does not replace it), and
-  forgets it exactly when the host cursor is released on the backend. The owner belongs to that host-cursor
+  was first bound under (the XID whose creation produced it; a later `ChangeCursor` alias does not replace it). The
+  record remains while the core references the host or the backend reports it alive; existing release points sweep
+  stale records, with no periodic work. KMS host XIDs are monotonic and never reused. The owner belongs to that host-cursor
   instance, not to the number: after its owner disconnects, the XID base is recycled (`8677f535`, `d5609288`) and
   another client can create a live cursor with the same XID while the retained one is still displayed. So a check on
   a retained instance carries its recorded owner in the target: `ResourceTarget` gains `owner: Option<ClientId>`,
@@ -225,8 +226,9 @@ check runs only when it resolves.
 3. Derived targets (`RedirectSubwindows`, `DAMAGE Add`, `ChangeCursorByName`): a skipped one is exactly unchanged
    and the request still succeeds and acts on the rest.
 4. `XIBarrierReleasePointer`'s partial effects on denial match today's partial effects on a missing barrier.
-5. The retained cursor record's lifetime: created once, never by an alias, removed exactly at backend release on
-   every release path (XID free, window cursor change, ChangeCursor retarget, disconnect, reset).
+5. The retained cursor record's lifetime: created once, never by an alias, kept while the core references the host
+   or the backend reports it alive, then removed at a later existing release point (XID free, window cursor change,
+   ChangeCursor retarget, disconnect, reset).
 6. Stubs and ignored bodies (`GetOverlayWindow`'s window, `XISetClientPointer`): with no policy nothing they answer
    changes; with a policy, an id that does not resolve is not asked.
 
@@ -325,9 +327,9 @@ lookup boundary. One translation helper per value kind, shared by the sites that
 `AccessContext::target_owner(&ResourceTarget) -> Option<ClientId>`, as described in Scope decisions. Consumed by
 Task 6.
 
-**Invariants:** a host cursor has a record from the moment it is first bound to a client cursor XID until the moment
-it is released on the backend, and never otherwise; an alias (`retarget_cursor_host`) never creates or overwrites a
-record; `resource_owner` and `KillClient` are unchanged.
+**Invariants:** a host cursor has a record from the moment it is first bound to a client cursor XID while either the
+core references it or the backend reports it alive; existing release points remove it once neither does. An alias
+(`retarget_cursor_host`) never creates or overwrites a record; `resource_owner` and `KillClient` are unchanged.
 
 - [ ] **Step 1: Failing tests** (through `process_request`):
   - `freed_displayed_cursor_record_lives_until_release`: A creates cursor C, sets it on a window, frees C: the host

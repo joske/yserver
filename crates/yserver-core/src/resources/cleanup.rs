@@ -158,7 +158,9 @@ impl ResourceTable {
             }
         });
         // Host cursors shared with a surviving XID (XFIXES `ChangeCursor`
-        // aliases) stay alive; each shared handle is released once.
+        // aliases) stay alive; each shared handle is released once. The
+        // caller also checks backend liveness after asking it to free each
+        // candidate, since a grab or root default may retain the host cursor.
         freed_cursors.sort_unstable();
         freed_cursors.dedup();
         freed_cursors.retain(|host| !self.cursor_host_referenced(*host));

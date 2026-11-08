@@ -149,7 +149,7 @@ and they must not hold references into server state between calls.
 | Through the context | Source today |
 |---|---|
 | Owner of a checked object, including retained, colormap and extension resources | a resolver for this context, below |
-| Creator XID and owner of a retained displayed cursor | recorded for the host cursor until it is released |
+| Creator XID and owner of a retained displayed cursor | recorded for the host cursor until the backend destroys it |
 | Whether a window is a root window | screen state |
 | Atom name | atom table |
 | A client's peer identity | `ClientState.peer` (#321) |
@@ -161,7 +161,10 @@ Advertised descriptors such as RENDER `PictFormat`s are not checked. They are
 static server tables without an owner or `ResourceKind`, so a policy cannot
 distinguish one client's use from another's. A cursor can remain displayed
 after its XID is freed; its retained host cursor keeps the creator's XID and
-owner until that host cursor is released.
+owner until the backend destroys that cursor. KMS can retain a cursor through
+references the core does not track, including a grab cursor, the root default,
+or an animated cursor's frames. Existing cursor release points sweep records
+whose host cursor is neither core-referenced nor reported alive by the backend.
 
 The context is built only when the list is not empty. Handlers often hold a
 mutable borrow of their client when they reach a check, as `handle_list_hosts`

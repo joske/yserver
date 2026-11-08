@@ -999,6 +999,10 @@ impl<P: Platform> XBackend<P> {
         Ok(())
     }
 
+    pub(in crate::kms::render::backend) fn backend_cursor_alive(&self, host_xid: u32) -> bool {
+        self.cursor_records.contains_key(&host_xid)
+    }
+
     pub(in crate::kms::render::backend) fn backend_cursor_define_cursor(
         &mut self,
         _origin: Option<OriginContext>,
