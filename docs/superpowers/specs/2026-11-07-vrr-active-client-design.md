@@ -1,6 +1,6 @@
 # VRR only while the client is drawing — design
 
-**Date:** 2026-11-07 · **Status:** revision 2 (sol review 1: observation point, clear obligation, expiry order, episode identity, tests) · **Base:** `docs/superpowers/specs/2026-10-23-vrr-design.md`
+**Date:** 2026-11-07 · **Status:** revision 2.1 (sol re-review: queued-frame test, EBUSY keeps its event wait); revision 2 (sol review 1: observation point, clear obligation, expiry order, episode identity, tests) · **Base:** `docs/superpowers/specs/2026-10-23-vrr-design.md`
 (revision 5.1, implemented by #294 and #298) · **Scope:** KMS backend, the *wanted* decision for a direct-scanout
 owner and what follows from it (cursor hold, standalone clear, logging).
 
@@ -119,7 +119,8 @@ nothing to protect.
     **async** successor cannot (async requests carry no CRTC property), so the obligation stays and is serviced after
     it retires;
   - gamma pending: clear first (existing one-class selection), gamma in the next request;
-  - transient error (EBUSY, EIO): retry through the existing retry deadline.
+  - transient error: EBUSY waits for the flip event (the existing path); other errors except EINVAL retry through
+    the existing retry deadline.
   Expiry is serviced in the scheduling pass before the property-retry loop and before the held-direct early returns,
   so neither skips it. A `_VARIABLE_REFRESH` notification may cancel the retry fields only when the full *wanted*
   (including activity) is true.
@@ -170,8 +171,11 @@ Entry and idle:
   the hold ignores activity.
 
 Ownership and queued frames:
-- `vrr_queued_frame_cannot_reenable_after_idle`: a successor queued while active dispatches after an idle clear: it
-  does not carry 1. Mutation: cache activity on the frame, or renew activity at dispatch.
+- `vrr_queued_frame_cannot_reenable_after_idle`: through the existing event path — active with a flip pending and a
+  synchronous successor queued; no Present for 100 ms; the flip event dispatches the successor, which carries
+  `VRR_ENABLED` = 0 (it discharges the obligation). Then three genuine Presents 16 ms apart do not re-enable VRR;
+  the fourth does. Mutations: cache activity on the frame (the successor carries 1); renew `last` at dispatch (the
+  third genuine Present re-enables).
 - `vrr_continuous_with_replaced_successors_stays_active`: at 60 fps with successors replaced in the latest-wins slot,
   and with skipped parked requests: no clear. Mutation: count only submitted or retired frames.
 - `vrr_scheduled_msc_batch_stays_active`: frames sent in batches of distinct future MSCs every 200 ms, executing at
