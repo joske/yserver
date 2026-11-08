@@ -268,6 +268,9 @@ proprietary clients do not set `_VARIABLE_REFRESH`; on NVIDIA (`nvidia-drm`),
 `--vrr all` enables VRR for every directly scanned-out client window instead,
 except applications that the NVIDIA or Mesa application lists, or the
 client's environment, exclude.
+In either mode and on every driver, VRR starts after the directly scanned-out
+client presents three consecutive intervals of at most 1/30 second; it clears
+after 100 ms without a Present, which releases the cursor hold.
 
 ### Direct scanout with a desktop compositor
 
@@ -292,10 +295,9 @@ scanout when all outputs share the primary device and refresh rates within
 0.5%. Tearing has one direct owner at a time and may belong to a fullscreen
 client on one monitor while other monitors are on. A second client asking to
 tear stays direct with synchronized flips until the current owner releases
-tearing. A paused owner keeps tearing. VRR is per monitor: each output with a
-capable connector uses VRR while its own fullscreen client scans out directly
-and asks for it, so several monitors can use VRR at once; others keep their
-fixed refresh.
+tearing. A paused owner keeps tearing. VRR is per monitor: each capable output
+applies the activity rule above to its own direct-scanout client, so several
+monitors can use VRR at once; others keep their fixed refresh.
 
 It picks the lowest free display, mints a per-session
 MIT-MAGIC-COOKIE-1 (a server copy plus an entry in `~/.Xauthority`),

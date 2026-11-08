@@ -250,15 +250,18 @@ CRTC at once.
 VRR is off by default. `--vrr` honors `_VARIABLE_REFRESH` (format 32,
 one nonzero item) for client-owned direct scanout. `--vrr all` ignores
 that property on NVIDIA DRM and applies NVIDIA/Mesa application
-exclusions; on other drivers it behaves like `--vrr`. Under a
+exclusions; on other drivers it behaves like `--vrr`. VRR starts after
+the directly scanned-out client presents three consecutive intervals
+of at most 1/30 second, and clears after 100 ms without a Present; the
+cursor hold ends then. This applies in both modes on every driver. Under a
 compositing desktop, direct scanout and therefore VRR require the
 compositor to unredirect fullscreen windows. On Cinnamon, enable
 `org.cinnamon.muffin unredirect-fullscreen-windows` (`true`) in System
 Settings → General → “disable compositing for full-screen windows”; this
 is off by default. With it off, Muffin composites the game and the
 monitor stays at maximum refresh. VRR is per monitor: each capable output
-uses VRR while its own fullscreen client scans out directly and asks for
-it. Several monitors can use VRR at once; others keep their fixed refresh.
+applies this rule to its own direct-scanout client. Several monitors can
+use VRR at once; others keep their fixed refresh.
 Color management / HDR is a valid future direction but not yet
 implemented.
 

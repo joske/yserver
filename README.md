@@ -47,7 +47,9 @@ See [`docs/extensions.txt`](docs/extensions.txt) for a list of all supported/imp
   at their own (@ariel3259)
 - variable refresh rate per monitor (`--vrr`): each monitor a fullscreen client
   is scanned out to runs VRR on its own, several at once, while the others keep
-  their fixed refresh (@ariel3259)
+  their fixed refresh; VRR starts once the client presents three consecutive
+  frames at 30 fps or faster and ends after 100 ms without a new frame
+  (@ariel3259)
 - `--vrr all`: VRR for NVIDIA clients too, honouring the NVIDIA and Mesa
   application lists (@ariel3259)
 - tearing on demand: fullscreen clients that ask for async flips get uncapped
