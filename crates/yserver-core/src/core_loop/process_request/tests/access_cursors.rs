@@ -1493,7 +1493,8 @@ enum XfixesDeniedSite {
 
 #[test]
 fn xfixes_resource_access_deny_table() {
-    // Mutation: ignore a resource denial at any listed XFIXES site; its exact error or unchanged state assertion fails.
+    // Mutation: ignore a resource denial at any listed XFIXES site; its exact error or unchanged
+    // state assertion fails.
     let sites = [
         XfixesDeniedSite::ChangeSaveSet,
         XfixesDeniedSite::SelectSelectionInput,

@@ -1,7 +1,9 @@
-use super::*;
+use super::{
+    extensions::{ExtensionHook, RecordedExtensionCheck, RecordingExtensionPolicy},
+    *,
+};
 use crate::access::{
-    AccessContext, AccessMode, AccessPolicy, Decision, DenyError, RequestOpcodes, ResourceKind,
-    ResourceTarget,
+    AccessMode, Decision, DenyError, RequestOpcodes, ResourceKind, ResourceTarget,
 };
 
 const CLIENT: ClientId = ClientId(1);
@@ -28,50 +30,17 @@ impl ExpectedCheck {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RecordedCheck {
-    client: ClientId,
-    request: Option<RequestOpcodes>,
-    target: ResourceTarget,
-    mode: AccessMode,
-    owner: Option<ClientId>,
+fn expected_check(id: ResourceId, kind: ResourceKind, mode: AccessMode) -> ExpectedCheck {
+    ExpectedCheck { id, kind, mode }
 }
 
-struct ResourceRecorder {
-    calls: Arc<Mutex<Vec<RecordedCheck>>>,
-    deny: Option<ExpectedCheck>,
-}
-
-impl AccessPolicy for ResourceRecorder {
-    fn resource(
-        &self,
-        ctx: &AccessContext<'_>,
-        client: ClientId,
-        target: &ResourceTarget,
-        mode: AccessMode,
-    ) -> Decision {
-        self.calls.lock().unwrap().push(RecordedCheck {
-            client,
-            request: ctx.request(),
-            target: *target,
-            mode,
-            owner: ctx.owner(target.id, target.kind),
-        });
-        if self.deny
-            == Some(ExpectedCheck {
-                id: target.id,
-                kind: target.kind,
-                mode,
-            })
-        {
-            Decision::Deny(DenyError {
-                code: BAD_VALUE,
-                value: DENY_VALUE,
-            })
-        } else {
-            Decision::Allow
-        }
-    }
+fn access_row(
+    opcode: u8,
+    data: u8,
+    body: Vec<u8>,
+    checks: Vec<ExpectedCheck>,
+) -> (u8, u8, Vec<u8>, Vec<ExpectedCheck>) {
+    (opcode, data, body, checks)
 }
 
 struct Fixture {
@@ -203,11 +172,26 @@ impl Fixture {
 
     fn install_policy(
         &mut self,
-        calls: Arc<Mutex<Vec<RecordedCheck>>>,
+        calls: Arc<Mutex<Vec<RecordedExtensionCheck>>>,
         deny: Option<ExpectedCheck>,
     ) {
         self.state
-            .install_access_policy(Arc::new(ResourceRecorder { calls, deny }));
+            .install_access_policy(Arc::new(RecordingExtensionPolicy::custom(
+                calls,
+                "",
+                move |_, call| {
+                    if deny.is_some_and(|expected| {
+                        call.target == Some(expected.target()) && call.mode == Some(expected.mode)
+                    }) {
+                        Decision::Deny(DenyError {
+                            code: BAD_VALUE,
+                            value: DENY_VALUE,
+                        })
+                    } else {
+                        Decision::Allow
+                    }
+                },
+            )));
     }
 
     fn run(&mut self, sequence: u16, opcode: u8, data: u8, body: &[u8]) -> Vec<u8> {
@@ -270,6 +254,9 @@ fn assert_x11_error(bytes: &[u8], code: u8, value: u32, opcode: u8, sequence: u1
 }
 
 fn access_cases(fixture: &Fixture) -> Vec<(u8, u8, Vec<u8>, Vec<ExpectedCheck>)> {
+    use AccessMode as M;
+    use ResourceKind::{Cursor, Window};
+
     let mut grab_pointer = words(&[fixture.window.0]);
     append_u16(&mut grab_pointer, 0);
     grab_pointer.extend_from_slice(&[1, 1]);
@@ -301,153 +288,42 @@ fn access_cases(fixture: &Fixture) -> Vec<(u8, u8, Vec<u8>, Vec<ExpectedCheck>)>
     let set_focus = words(&[fixture.window.0, 0]);
     let set_selection_owner = words(&[fixture.other_window.0, 1, 0]);
     let convert_selection = words(&[fixture.window.0, 1, 31, 0, 0]);
+    let foreign_window_body = words(&[fixture.foreign_window.0]);
+    let root_window_body = words(&[ROOT_WINDOW.0]);
+    let foreign_window_check = vec![expected_check(fixture.foreign_window, Window, M::MANAGE)];
+    let selection_owner_check = vec![expected_check(fixture.other_window, Window, M::SET_ATTR)];
+    let convert_selection_check = vec![expected_check(fixture.window, Window, M::SET_ATTR)];
+    let grab_pointer_checks = vec![
+        expected_check(fixture.confine, Window, M::SET_ATTR),
+        expected_check(fixture.window, Window, M::SET_ATTR),
+        expected_check(fixture.cursor, Cursor, M::USE),
+    ];
+    let grab_button_checks = vec![
+        expected_check(fixture.window, Window, M::SET_ATTR),
+        expected_check(fixture.confine, Window, M::SET_ATTR),
+        expected_check(fixture.cursor, Cursor, M::USE),
+    ];
+    let ungrab_button_check = vec![expected_check(fixture.window, Window, M::READ)];
+    let change_pointer_grab_check = vec![expected_check(fixture.cursor, Cursor, M::USE)];
+    let set_window_check = vec![expected_check(fixture.window, Window, M::SET_ATTR)];
+    let get_window_check = vec![expected_check(fixture.window, Window, M::GET_ATTR)];
+    let root_window_check = vec![expected_check(ROOT_WINDOW, Window, M::GET_ATTR)];
 
-    vec![
-        (
-            6,
-            0,
-            words(&[fixture.foreign_window.0]),
-            vec![ExpectedCheck {
-                id: fixture.foreign_window,
-                kind: ResourceKind::Window,
-                mode: AccessMode::MANAGE,
-            }],
-        ),
-        (
-            22,
-            0,
-            set_selection_owner,
-            vec![ExpectedCheck {
-                id: fixture.other_window,
-                kind: ResourceKind::Window,
-                mode: AccessMode::SET_ATTR,
-            }],
-        ),
-        (
-            24,
-            0,
-            convert_selection,
-            vec![ExpectedCheck {
-                id: fixture.window,
-                kind: ResourceKind::Window,
-                mode: AccessMode::SET_ATTR,
-            }],
-        ),
-        (
-            26,
-            0,
-            grab_pointer,
-            vec![
-                ExpectedCheck {
-                    id: fixture.confine,
-                    kind: ResourceKind::Window,
-                    mode: AccessMode::SET_ATTR,
-                },
-                ExpectedCheck {
-                    id: fixture.window,
-                    kind: ResourceKind::Window,
-                    mode: AccessMode::SET_ATTR,
-                },
-                ExpectedCheck {
-                    id: fixture.cursor,
-                    kind: ResourceKind::Cursor,
-                    mode: AccessMode::USE,
-                },
-            ],
-        ),
-        (
-            28,
-            0,
-            grab_button,
-            vec![
-                ExpectedCheck {
-                    id: fixture.window,
-                    kind: ResourceKind::Window,
-                    mode: AccessMode::SET_ATTR,
-                },
-                ExpectedCheck {
-                    id: fixture.confine,
-                    kind: ResourceKind::Window,
-                    mode: AccessMode::SET_ATTR,
-                },
-                ExpectedCheck {
-                    id: fixture.cursor,
-                    kind: ResourceKind::Cursor,
-                    mode: AccessMode::USE,
-                },
-            ],
-        ),
-        (
-            29,
-            1,
-            ungrab_button,
-            vec![ExpectedCheck {
-                id: fixture.window,
-                kind: ResourceKind::Window,
-                mode: AccessMode::READ,
-            }],
-        ),
-        (
-            30,
-            0,
-            change_pointer_grab,
-            vec![ExpectedCheck {
-                id: fixture.cursor,
-                kind: ResourceKind::Cursor,
-                mode: AccessMode::USE,
-            }],
-        ),
-        (
-            31,
-            0,
-            grab_keyboard,
-            vec![ExpectedCheck {
-                id: fixture.window,
-                kind: ResourceKind::Window,
-                mode: AccessMode::SET_ATTR,
-            }],
-        ),
-        (
-            33,
-            0,
-            grab_key,
-            vec![ExpectedCheck {
-                id: fixture.window,
-                kind: ResourceKind::Window,
-                mode: AccessMode::SET_ATTR,
-            }],
-        ),
-        (
-            34,
-            24,
-            ungrab_key,
-            vec![ExpectedCheck {
-                id: fixture.window,
-                kind: ResourceKind::Window,
-                mode: AccessMode::GET_ATTR,
-            }],
-        ),
-        (
-            42,
-            0,
-            set_focus,
-            vec![ExpectedCheck {
-                id: fixture.window,
-                kind: ResourceKind::Window,
-                mode: AccessMode::SET_ATTR,
-            }],
-        ),
-        (
-            113,
-            0,
-            words(&[ROOT_WINDOW.0]),
-            vec![ExpectedCheck {
-                id: ROOT_WINDOW,
-                kind: ResourceKind::Window,
-                mode: AccessMode::GET_ATTR,
-            }],
-        ),
-    ]
+    let cases = vec![
+        access_row(6, 0, foreign_window_body, foreign_window_check),
+        access_row(22, 0, set_selection_owner, selection_owner_check),
+        access_row(24, 0, convert_selection, convert_selection_check),
+        access_row(26, 0, grab_pointer, grab_pointer_checks),
+        access_row(28, 0, grab_button, grab_button_checks),
+        access_row(29, 1, ungrab_button, ungrab_button_check),
+        access_row(30, 0, change_pointer_grab, change_pointer_grab_check),
+        access_row(31, 0, grab_keyboard, set_window_check.clone()),
+        access_row(33, 0, grab_key, set_window_check.clone()),
+        access_row(34, 24, ungrab_key, get_window_check),
+        access_row(42, 0, set_focus, set_window_check),
+        access_row(113, 0, root_window_body, root_window_check),
+    ];
+    cases
 }
 
 fn snapshot(state: &ServerState) -> String {
@@ -478,7 +354,8 @@ fn expected_owner(fixture: &Fixture, id: ResourceId) -> Option<ClientId> {
 
 #[test]
 fn task8_core_resource_requests_deny_before_effects() {
-    // Mutation: remove or move a listed access check past its first effect; that row's denial or snapshot assertion must fail.
+    // Mutation: remove or move a listed access check past its first effect; that row's denial or
+    // snapshot assertion must fail.
     for (opcode, data, body, checks) in access_cases(&Fixture::new()) {
         for (index, denied) in checks.iter().copied().enumerate() {
             let mut fixture = Fixture::new();
@@ -540,13 +417,18 @@ fn task8_core_resource_requests_deny_before_effects() {
                     }),
                     "opcode {opcode} request"
                 );
-                assert_eq!(actual.target, expected.target(), "opcode {opcode} target");
-                assert_eq!(actual.mode, expected.mode, "opcode {opcode} mode");
+                assert_eq!(
+                    actual.target,
+                    Some(expected.target()),
+                    "opcode {opcode} target"
+                );
+                assert_eq!(actual.mode, Some(expected.mode), "opcode {opcode} mode");
                 assert_eq!(
                     actual.owner,
                     expected_owner(&fixture, expected.id),
                     "opcode {opcode} owner"
                 );
+                assert_eq!(actual.target_owner, expected_owner(&fixture, expected.id));
             }
         }
     }
@@ -554,7 +436,8 @@ fn task8_core_resource_requests_deny_before_effects() {
 
 #[test]
 fn task8_core_resource_requests_ask_in_protocol_order() {
-    // Mutation: change a checked target, mode, request opcode, or operand order; the recorded call sequence must fail.
+    // Mutation: change a checked target, mode, request opcode, or operand order; the recorded call
+    // sequence must fail.
     for (index, (opcode, data, body, checks)) in
         access_cases(&Fixture::new()).into_iter().enumerate()
     {
@@ -578,20 +461,26 @@ fn task8_core_resource_requests_ask_in_protocol_order() {
                 }),
                 "opcode {opcode} request"
             );
-            assert_eq!(actual.target, expected.target(), "opcode {opcode} target");
-            assert_eq!(actual.mode, expected.mode, "opcode {opcode} mode");
+            assert_eq!(
+                actual.target,
+                Some(expected.target()),
+                "opcode {opcode} target"
+            );
+            assert_eq!(actual.mode, Some(expected.mode), "opcode {opcode} mode");
             assert_eq!(
                 actual.owner,
                 expected_owner(&fixture, expected.id),
                 "opcode {opcode} owner"
             );
+            assert_eq!(actual.target_owner, expected_owner(&fixture, expected.id));
         }
     }
 }
 
 #[test]
 fn change_save_set_denied_leaves_save_set_unchanged() {
-    // Mutation: bypass the ChangeSaveSet MANAGE check; the denial and unchanged save-set assertions must fail.
+    // Mutation: bypass the ChangeSaveSet MANAGE check; the denial and unchanged save-set assertions
+    // must fail.
     let mut fixture = Fixture::new();
     let calls = Arc::new(Mutex::new(Vec::new()));
     fixture.install_policy(
@@ -615,7 +504,8 @@ fn change_save_set_denied_leaves_save_set_unchanged() {
             .save_set
             .contains(&fixture.foreign_window)
     );
-    // Limitation: yserver does not consume save-set entries at disconnect today; this pre-existing behavior is out of scope.
+    // Limitation: yserver does not consume save-set entries at disconnect today; this pre-existing
+    // behavior is out of scope.
     crate::core_loop::process_disconnect::process_disconnect(
         &mut fixture.state,
         &mut fixture.backend,
@@ -632,7 +522,8 @@ fn change_save_set_denied_leaves_save_set_unchanged() {
 
 #[test]
 fn kill_client_resource_check_precedes_kill() {
-    // Mutation: bypass the KillClient resource check; the policy error and owner-connected assertions must fail.
+    // Mutation: bypass the KillClient resource check; the policy error and owner-connected
+    // assertions must fail.
     let mut fixture = Fixture::new();
     let calls = Arc::new(Mutex::new(Vec::new()));
     fixture.install_policy(
@@ -652,29 +543,36 @@ fn kill_client_resource_check_precedes_kill() {
         fixture.state.resources.window_owner(fixture.foreign_window),
         Some(OTHER_CLIENT)
     );
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let call = &calls[0];
+    assert_eq!(call.hook, ExtensionHook::Resource);
+    assert_eq!(call.client, CLIENT);
     assert_eq!(
-        calls.lock().unwrap().as_slice(),
-        &[RecordedCheck {
-            client: CLIENT,
-            request: Some(RequestOpcodes {
-                major: 113,
-                minor: 0,
-            }),
-            target: ResourceTarget {
-                owner: None,
-                id: fixture.foreign_window,
-                kind: ResourceKind::Window,
-                creation: None,
-            },
-            mode: AccessMode::GET_ATTR,
-            owner: Some(OTHER_CLIENT),
-        }]
+        call.request,
+        Some(RequestOpcodes {
+            major: 113,
+            minor: 0
+        })
     );
+    assert_eq!(
+        call.target,
+        Some(ResourceTarget {
+            owner: None,
+            id: fixture.foreign_window,
+            kind: ResourceKind::Window,
+            creation: None,
+        })
+    );
+    assert_eq!(call.mode, Some(AccessMode::GET_ATTR));
+    assert_eq!(call.owner, Some(OTHER_CLIENT));
+    assert_eq!(call.target_owner, Some(OTHER_CLIENT));
 }
 
 #[test]
 fn task8_set_selection_owner_access_check_precedes_invalid_atom() {
-    // Mutation: move SetSelectionOwner's SET_ATTR check below atom validation; the policy-error assertion must fail.
+    // Mutation: move SetSelectionOwner's SET_ATTR check below atom validation; the policy-error
+    // assertion must fail.
     let invalid_atom = u32::MAX;
     let mut denied = Fixture::new();
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -699,7 +597,8 @@ fn task8_set_selection_owner_access_check_precedes_invalid_atom() {
 
 #[test]
 fn task8_convert_selection_access_check_precedes_invalid_atom() {
-    // Mutation: move ConvertSelection's SET_ATTR check below atom validation; the policy-error assertion must fail.
+    // Mutation: move ConvertSelection's SET_ATTR check below atom validation; the policy-error
+    // assertion must fail.
     let invalid_atom = u32::MAX;
     let mut denied = Fixture::new();
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -724,7 +623,8 @@ fn task8_convert_selection_access_check_precedes_invalid_atom() {
 
 #[test]
 fn task8_stale_set_selection_owner_still_checks_window() {
-    // Mutation: keep the stale-time return before SetSelectionOwner's SET_ATTR check; the policy-error assertion must fail.
+    // Mutation: keep the stale-time return before SetSelectionOwner's SET_ATTR check; the
+    // policy-error assertion must fail.
     let mut denied = Fixture::new();
     denied.state.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(1);
     let selection = AtomId(1);

@@ -15,6 +15,32 @@ const BARRIER_TWO: ResourceId = ResourceId(0x00a0_8002);
 const XI_MAJOR: u8 = 137;
 const XKB_MAJOR: u8 = 136;
 const XTEST_MAJOR: u8 = 146;
+type InputRequestRow = (&'static str, u8, u8);
+const R_XI1_SELECT: InputRequestRow = ("XI1 SelectExtensionEvent", XI_MAJOR, 6);
+const R_XI1_GET_SEL: InputRequestRow = ("XI1 GetSelectedExtensionEvents", XI_MAJOR, 7);
+const R_XI1_CDP: InputRequestRow = ("XI1 ChangeDeviceDontPropagateList", XI_MAJOR, 8);
+const R_XI1_DGP: InputRequestRow = ("XI1 GetDeviceDontPropagateList", XI_MAJOR, 9);
+const R_XI1_GRAB: InputRequestRow = ("XI1 GrabDevice", XI_MAJOR, 13);
+const R_XI1_GRAB_KEY: InputRequestRow = ("XI1 GrabDeviceKey", XI_MAJOR, 15);
+const R_XI1_UNGRAB_KEY: InputRequestRow = ("XI1 UngrabDeviceKey", XI_MAJOR, 16);
+const R_XI1_GRAB_BTN: InputRequestRow = ("XI1 GrabDeviceButton", XI_MAJOR, 17);
+const R_XI1_UNGRAB_BTN: InputRequestRow = ("XI1 UngrabDeviceButton", XI_MAJOR, 18);
+const R_XI1_FOCUS: InputRequestRow = ("XI1 SetDeviceFocus", XI_MAJOR, 21);
+const R_XI2_SELECT: InputRequestRow = ("XI2 SelectEvents", XI_MAJOR, 46);
+const R_XI2_GET_SEL: InputRequestRow = ("XI2 GetSelectedEvents", XI_MAJOR, 60);
+const R_XI2_QUERY: InputRequestRow = ("XI2 QueryPointer", XI_MAJOR, 40);
+const R_XI2_GRAB: InputRequestRow = ("XI2 GrabDevice window and cursor", XI_MAJOR, 51);
+const R_XI2_PGRAB: InputRequestRow = ("XI2 PassiveGrabDevice window and cursor", XI_MAJOR, 54);
+const R_XI2_PUNGRAB: InputRequestRow = ("XI2 PassiveUngrabDevice", XI_MAJOR, 55);
+const R_XI2_WARP: InputRequestRow = ("XI2 WarpPointer destination then source", XI_MAJOR, 41);
+const R_XI2_CHANGE_CUR: InputRequestRow = ("XI2 ChangeCursor window and cursor", XI_MAJOR, 42);
+const R_XI2_FOCUS: InputRequestRow = ("XI2 SetFocus", XI_MAJOR, 49);
+const R_XI2_SET_CLIENT: InputRequestRow = ("XI2 SetClientPointer", XI_MAJOR, 44);
+const R_XI2_GET_CLIENT: InputRequestRow = ("XI2 GetClientPointer", XI_MAJOR, 45);
+const R_XI2_BARRIER: InputRequestRow = ("XI2 BarrierReleasePointer", XI_MAJOR, 61);
+const R_XKB_BELL: InputRequestRow = ("XKB Bell", XKB_MAJOR, 3);
+const R_XTEST_CMP: InputRequestRow = ("XTEST CompareCursor", XTEST_MAJOR, 1);
+const R_XTEST_FAKE: InputRequestRow = ("XTEST FakeInput root", XTEST_MAJOR, 2);
 
 #[derive(Clone, Copy, Debug)]
 struct ExpectedInputCheck {
@@ -29,6 +55,20 @@ struct InputRequestCase {
     minor: u8,
     body: Vec<u8>,
     checks: Vec<ExpectedInputCheck>,
+}
+
+fn ic(
+    (label, major, minor): InputRequestRow,
+    body: Vec<u8>,
+    checks: Vec<ExpectedInputCheck>,
+) -> InputRequestCase {
+    InputRequestCase {
+        label,
+        major,
+        minor,
+        body,
+        checks,
+    }
 }
 
 fn put_u16(body: &mut Vec<u8>, value: u16) {
@@ -113,6 +153,7 @@ fn check(id: ResourceId, kind: ResourceKind, mode: AccessMode) -> ExpectedInputC
 }
 
 fn input_request_cases() -> Vec<InputRequestCase> {
+    use AccessMode as M;
     use ResourceKind::{Cursor, PointerBarrier, Window};
 
     let class = ((crate::xinput::DEVICEID_XTEST_POINTER as u32) << 8) | 82;
@@ -121,10 +162,10 @@ fn input_request_cases() -> Vec<InputRequestCase> {
     put_u16(&mut xi1_select, 0);
     put_u32(&mut xi1_select, class);
 
-    let mut xi1_dont_propagate = input_words(&[WINDOW.0]);
-    put_u16(&mut xi1_dont_propagate, 1);
-    xi1_dont_propagate.extend_from_slice(&[0, 0]); // AddToList, pad
-    put_u32(&mut xi1_dont_propagate, class);
+    let mut dont_prop = input_words(&[WINDOW.0]);
+    put_u16(&mut dont_prop, 1);
+    dont_prop.extend_from_slice(&[0, 0]); // AddToList, pad
+    put_u32(&mut dont_prop, class);
 
     let mut xi1_grab_device = input_words(&[WINDOW.0, 0]);
     put_u16(&mut xi1_grab_device, 0); // class count
@@ -163,6 +204,10 @@ fn input_request_cases() -> Vec<InputRequestCase> {
     put_u16(&mut xi2_select, 1); // one mask word
     put_u32(&mut xi2_select, 1);
 
+    let mut xi2_query_pointer = input_words(&[WINDOW.0]);
+    put_u16(&mut xi2_query_pointer, 2);
+    put_u16(&mut xi2_query_pointer, 0);
+
     let mut xi2_grab = input_words(&[WINDOW.0, 0, CURSOR.0]);
     put_u16(&mut xi2_grab, 2); // master pointer
     xi2_grab.extend_from_slice(&[1, 1, 1, 0]);
@@ -188,13 +233,13 @@ fn input_request_cases() -> Vec<InputRequestCase> {
     put_u16(&mut xi_warp, 2);
     put_u16(&mut xi_warp, 0);
 
-    let mut xi_change_cursor = input_words(&[WINDOW.0, CURSOR.0]);
-    put_u16(&mut xi_change_cursor, 2);
-    put_u16(&mut xi_change_cursor, 0);
+    let mut change_cur = input_words(&[WINDOW.0, CURSOR.0]);
+    put_u16(&mut change_cur, 2);
+    put_u16(&mut change_cur, 0);
 
-    let mut xi_set_client_pointer = input_words(&[WINDOW.0]);
-    put_u16(&mut xi_set_client_pointer, 2);
-    put_u16(&mut xi_set_client_pointer, 0);
+    let mut set_client_ptr = input_words(&[WINDOW.0]);
+    put_u16(&mut set_client_ptr, 2);
+    put_u16(&mut set_client_ptr, 0);
 
     let mut xi_barrier = vec![0; 4];
     xi_barrier[..4].copy_from_slice(&1u32.to_le_bytes());
@@ -212,203 +257,56 @@ fn input_request_cases() -> Vec<InputRequestCase> {
     xtest_fake_input[0] = 6; // MotionNotify
     xtest_fake_input[8..12].copy_from_slice(&WINDOW.0.to_le_bytes());
 
-    vec![
-        InputRequestCase {
-            label: "XI1 SelectExtensionEvent",
-            major: XI_MAJOR,
-            minor: 6,
-            body: xi1_select,
-            checks: vec![check(WINDOW, Window, AccessMode::RECEIVE)],
-        },
-        InputRequestCase {
-            label: "XI1 GetSelectedExtensionEvents",
-            major: XI_MAJOR,
-            minor: 7,
-            body: input_words(&[WINDOW.0]),
-            checks: vec![check(WINDOW, Window, AccessMode::GET_ATTR)],
-        },
-        InputRequestCase {
-            label: "XI1 ChangeDeviceDontPropagateList",
-            major: XI_MAJOR,
-            minor: 8,
-            body: xi1_dont_propagate,
-            checks: vec![check(WINDOW, Window, AccessMode::SET_ATTR)],
-        },
-        InputRequestCase {
-            label: "XI1 GetDeviceDontPropagateList",
-            major: XI_MAJOR,
-            minor: 9,
-            body: input_words(&[WINDOW.0]),
-            checks: vec![check(WINDOW, Window, AccessMode::GET_ATTR)],
-        },
-        InputRequestCase {
-            label: "XI1 GrabDevice",
-            major: XI_MAJOR,
-            minor: 13,
-            body: xi1_grab_device,
-            checks: vec![check(WINDOW, Window, AccessMode::SET_ATTR)],
-        },
-        InputRequestCase {
-            label: "XI1 GrabDeviceKey",
-            major: XI_MAJOR,
-            minor: 15,
-            body: xi1_grab_key,
-            checks: vec![check(WINDOW, Window, AccessMode::SET_ATTR)],
-        },
-        InputRequestCase {
-            label: "XI1 UngrabDeviceKey",
-            major: XI_MAJOR,
-            minor: 16,
-            body: xi1_ungrab_key,
-            checks: vec![check(WINDOW, Window, AccessMode::SET_ATTR)],
-        },
-        InputRequestCase {
-            label: "XI1 GrabDeviceButton",
-            major: XI_MAJOR,
-            minor: 17,
-            body: xi1_grab_button,
-            checks: vec![check(WINDOW, Window, AccessMode::SET_ATTR)],
-        },
-        InputRequestCase {
-            label: "XI1 UngrabDeviceButton",
-            major: XI_MAJOR,
-            minor: 18,
-            body: xi1_ungrab_button,
-            checks: vec![check(WINDOW, Window, AccessMode::SET_ATTR)],
-        },
-        InputRequestCase {
-            label: "XI1 SetDeviceFocus",
-            major: XI_MAJOR,
-            minor: 21,
-            body: xi1_set_focus,
-            checks: vec![check(WINDOW, Window, AccessMode::SET_ATTR)],
-        },
-        InputRequestCase {
-            label: "XI2 SelectEvents",
-            major: XI_MAJOR,
-            minor: 46,
-            body: xi2_select,
-            checks: vec![check(WINDOW, Window, AccessMode::RECEIVE)],
-        },
-        InputRequestCase {
-            label: "XI2 GetSelectedEvents",
-            major: XI_MAJOR,
-            minor: 60,
-            body: input_words(&[WINDOW.0]),
-            checks: vec![check(WINDOW, Window, AccessMode::GET_ATTR)],
-        },
-        InputRequestCase {
-            label: "XI2 QueryPointer",
-            major: XI_MAJOR,
-            minor: 40,
-            body: {
-                let mut body = input_words(&[WINDOW.0]);
-                put_u16(&mut body, 2);
-                put_u16(&mut body, 0);
-                body
-            },
-            checks: vec![check(WINDOW, Window, AccessMode::GET_ATTR)],
-        },
-        InputRequestCase {
-            label: "XI2 GrabDevice window and cursor",
-            major: XI_MAJOR,
-            minor: 51,
-            body: xi2_grab,
-            checks: vec![
-                check(WINDOW, Window, AccessMode::SET_ATTR),
-                check(CURSOR, Cursor, AccessMode::USE),
-            ],
-        },
-        InputRequestCase {
-            label: "XI2 PassiveGrabDevice window and cursor",
-            major: XI_MAJOR,
-            minor: 54,
-            body: xi2_passive_grab,
-            checks: vec![
-                check(WINDOW, Window, AccessMode::SET_ATTR),
-                check(CURSOR, Cursor, AccessMode::USE),
-            ],
-        },
-        InputRequestCase {
-            label: "XI2 PassiveUngrabDevice",
-            major: XI_MAJOR,
-            minor: 55,
-            body: xi2_passive_ungrab,
-            checks: vec![check(WINDOW, Window, AccessMode::SET_ATTR)],
-        },
-        InputRequestCase {
-            label: "XI2 WarpPointer destination then source",
-            major: XI_MAJOR,
-            minor: 41,
-            body: xi_warp,
-            checks: vec![
-                check(WINDOW, Window, AccessMode::GET_ATTR),
-                check(OTHER_WINDOW, Window, AccessMode::GET_ATTR),
-            ],
-        },
-        InputRequestCase {
-            label: "XI2 ChangeCursor window and cursor",
-            major: XI_MAJOR,
-            minor: 42,
-            body: xi_change_cursor,
-            checks: vec![
-                check(WINDOW, Window, AccessMode::SET_ATTR),
-                check(CURSOR, Cursor, AccessMode::USE),
-            ],
-        },
-        InputRequestCase {
-            label: "XI2 SetFocus",
-            major: XI_MAJOR,
-            minor: 49,
-            body: xi2_set_focus,
-            checks: vec![check(WINDOW, Window, AccessMode::SET_ATTR)],
-        },
-        InputRequestCase {
-            label: "XI2 SetClientPointer",
-            major: XI_MAJOR,
-            minor: 44,
-            body: xi_set_client_pointer,
-            checks: vec![check(WINDOW, Window, AccessMode::GET_ATTR)],
-        },
-        InputRequestCase {
-            label: "XI2 GetClientPointer",
-            major: XI_MAJOR,
-            minor: 45,
-            body: input_words(&[WINDOW.0]),
-            checks: vec![check(WINDOW, Window, AccessMode::GET_ATTR)],
-        },
-        InputRequestCase {
-            label: "XI2 BarrierReleasePointer",
-            major: XI_MAJOR,
-            minor: 61,
-            body: xi_barrier,
-            checks: vec![check(BARRIER_ONE, PointerBarrier, AccessMode::READ)],
-        },
-        InputRequestCase {
-            label: "XKB Bell",
-            major: XKB_MAJOR,
-            minor: 3,
-            body: xkb_bell,
-            checks: vec![check(WINDOW, Window, AccessMode::GET_ATTR)],
-        },
-        InputRequestCase {
-            label: "XTEST CompareCursor",
-            major: XTEST_MAJOR,
-            minor: 1,
-            body: input_words(&[WINDOW.0, CURSOR.0]),
-            checks: vec![
-                check(WINDOW, Window, AccessMode::GET_ATTR),
-                check(CURSOR, Cursor, AccessMode::READ),
-            ],
-        },
-        InputRequestCase {
-            label: "XTEST FakeInput root",
-            major: XTEST_MAJOR,
-            minor: 2,
-            body: xtest_fake_input,
-            checks: vec![check(WINDOW, Window, AccessMode::GET_ATTR)],
-        },
-    ]
+    let window_body = input_words(&[WINDOW.0]);
+    let get_win = vec![check(WINDOW, Window, M::GET_ATTR)];
+    let set_win = vec![check(WINDOW, Window, M::SET_ATTR)];
+    let recv_win = vec![check(WINDOW, Window, M::RECEIVE)];
+    let grab_checks = vec![
+        check(WINDOW, Window, M::SET_ATTR),
+        check(CURSOR, Cursor, M::USE),
+    ];
+    let warp_checks = vec![
+        check(WINDOW, Window, M::GET_ATTR),
+        check(OTHER_WINDOW, Window, M::GET_ATTR),
+    ];
+    let cchecks = vec![
+        check(WINDOW, Window, M::SET_ATTR),
+        check(CURSOR, Cursor, M::USE),
+    ];
+    let bar_read = vec![check(BARRIER_ONE, PointerBarrier, M::READ)];
+    let cmp_checks = vec![
+        check(WINDOW, Window, M::GET_ATTR),
+        check(CURSOR, Cursor, M::READ),
+    ];
+    let cmp_body = input_words(&[WINDOW.0, CURSOR.0]);
+    let cases = vec![
+        ic(R_XI1_SELECT, xi1_select, recv_win.clone()),
+        ic(R_XI1_GET_SEL, window_body.clone(), get_win.clone()),
+        ic(R_XI1_CDP, dont_prop, set_win.clone()),
+        ic(R_XI1_DGP, window_body.clone(), get_win.clone()),
+        ic(R_XI1_GRAB, xi1_grab_device, set_win.clone()),
+        ic(R_XI1_GRAB_KEY, xi1_grab_key, set_win.clone()),
+        ic(R_XI1_UNGRAB_KEY, xi1_ungrab_key, set_win.clone()),
+        ic(R_XI1_GRAB_BTN, xi1_grab_button, set_win.clone()),
+        ic(R_XI1_UNGRAB_BTN, xi1_ungrab_button, set_win.clone()),
+        ic(R_XI1_FOCUS, xi1_set_focus, set_win.clone()),
+        ic(R_XI2_SELECT, xi2_select, recv_win.clone()),
+        ic(R_XI2_GET_SEL, window_body.clone(), get_win.clone()),
+        ic(R_XI2_QUERY, xi2_query_pointer, get_win.clone()),
+        ic(R_XI2_GRAB, xi2_grab, grab_checks.clone()),
+        ic(R_XI2_PGRAB, xi2_passive_grab, grab_checks.clone()),
+        ic(R_XI2_PUNGRAB, xi2_passive_ungrab, set_win.clone()),
+        ic(R_XI2_WARP, xi_warp, warp_checks.clone()),
+        ic(R_XI2_CHANGE_CUR, change_cur, cchecks.clone()),
+        ic(R_XI2_FOCUS, xi2_set_focus, set_win.clone()),
+        ic(R_XI2_SET_CLIENT, set_client_ptr, get_win.clone()),
+        ic(R_XI2_GET_CLIENT, window_body.clone(), get_win.clone()),
+        ic(R_XI2_BARRIER, xi_barrier, bar_read.clone()),
+        ic(R_XKB_BELL, xkb_bell, get_win.clone()),
+        ic(R_XTEST_CMP, cmp_body, cmp_checks.clone()),
+        ic(R_XTEST_FAKE, xtest_fake_input, get_win.clone()),
+    ];
+    cases
 }
 
 fn assert_input_check(
@@ -439,7 +337,8 @@ fn assert_input_check(
 
 #[test]
 fn input_operands_ask_every_site_in_table_order() {
-    // Mutation: omit any listed check or read XKB Bell's name atom as its window; the exact target table must fail.
+    // Mutation: omit any listed check or read XKB Bell's name atom as its window; the exact target
+    // table must fail.
     for case in input_request_cases() {
         let (mut state, mut peer, mut backend) = input_fixture();
         if case.major == XKB_MAJOR {
@@ -533,7 +432,8 @@ fn input_state_snapshot(state: &ServerState) -> String {
 
 #[test]
 fn input_operands_deny_each_site_without_state_or_backend_effects() {
-    // Mutation: ignore a resource-policy denial, or call XKB Bell's backend proxy before its check; these denial assertions must fail.
+    // Mutation: ignore a resource-policy denial, or call XKB Bell's backend proxy before its check;
+    // these denial assertions must fail.
     let error = DenyError {
         code: x11::error::BAD_ACCESS,
         value: 0xA55A_1234,
@@ -663,8 +563,9 @@ fn barrier_release_denied_second_entry_keeps_first_release() {
 }
 
 #[test]
-fn xi_set_client_pointer_unresolved_id_is_not_asked() {
-    // Mutation: ask the policy for an unresolved resource id; this must become an unexpected resource check.
+fn set_client_ptr_unresolved_id_is_not_asked() {
+    // Mutation: ask the policy for an unresolved resource id; this must become an unexpected
+    // resource check.
     let (mut state, mut peer, mut backend) = input_fixture();
     let calls = Arc::new(Mutex::new(Vec::new()));
     state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(

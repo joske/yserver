@@ -29,12 +29,19 @@ pub(super) struct RecordedExtensionCheck {
     pub(super) target_owner: Option<ClientId>,
 }
 
+type RecordedDecision<'a> = Option<&'a RecordedExtensionCheck>;
+type CustomDecision =
+    dyn for<'a> Fn(usize, RecordedDecision<'a>, ExtensionHook) -> Decision + Send + Sync;
+
 pub(super) struct RecordingExtensionPolicy {
     decision: Decision,
     calls: Arc<Mutex<Vec<RecordedExtensionCheck>>>,
     resource_denial: Option<(ResourceId, Option<AccessMode>, DenyError)>,
     deny_all_resources: Option<DenyError>,
     deny_resources_not_owned_by_requester: Option<DenyError>,
+    custom_decision: Option<Arc<CustomDecision>>,
+    resource_extension: Option<String>,
+    record_calls: bool,
 }
 
 impl RecordingExtensionPolicy {
@@ -45,6 +52,48 @@ impl RecordingExtensionPolicy {
             resource_denial: None,
             deny_all_resources: None,
             deny_resources_not_owned_by_requester: None,
+            custom_decision: None,
+            resource_extension: None,
+            record_calls: true,
+        }
+    }
+
+    pub(super) fn custom(
+        calls: Arc<Mutex<Vec<RecordedExtensionCheck>>>,
+        resource_extension: impl Into<String>,
+        decide: impl Fn(usize, &RecordedExtensionCheck) -> Decision + Send + Sync + 'static,
+    ) -> Self {
+        let custom_decision: Arc<CustomDecision> = Arc::new(move |index, recorded, _hook| {
+            decide(
+                index,
+                recorded.expect("recorded custom decision requires its check snapshot"),
+            )
+        });
+        Self {
+            decision: Decision::Allow,
+            calls,
+            resource_denial: None,
+            deny_all_resources: None,
+            deny_resources_not_owned_by_requester: None,
+            custom_decision: Some(custom_decision),
+            resource_extension: Some(resource_extension.into()),
+            record_calls: true,
+        }
+    }
+
+    /// Keeps the benchmark's policy counter out of recorder snapshot and bookkeeping costs.
+    pub(super) fn custom_unrecorded(
+        decide: impl Fn(usize, ExtensionHook) -> Decision + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            decision: Decision::Allow,
+            calls: Arc::new(Mutex::new(Vec::new())),
+            resource_denial: None,
+            deny_all_resources: None,
+            deny_resources_not_owned_by_requester: None,
+            custom_decision: Some(Arc::new(move |index, _recorded, hook| decide(index, hook))),
+            resource_extension: None,
+            record_calls: false,
         }
     }
 
@@ -60,6 +109,9 @@ impl RecordingExtensionPolicy {
             resource_denial: Some((id, mode, error)),
             deny_all_resources: None,
             deny_resources_not_owned_by_requester: None,
+            custom_decision: None,
+            resource_extension: None,
+            record_calls: true,
         }
     }
 
@@ -73,6 +125,9 @@ impl RecordingExtensionPolicy {
             resource_denial: None,
             deny_all_resources: Some(error),
             deny_resources_not_owned_by_requester: None,
+            custom_decision: None,
+            resource_extension: None,
+            record_calls: true,
         }
     }
 
@@ -86,6 +141,9 @@ impl RecordingExtensionPolicy {
             resource_denial: None,
             deny_all_resources: None,
             deny_resources_not_owned_by_requester: Some(error),
+            custom_decision: None,
+            resource_extension: None,
+            record_calls: true,
         }
     }
 
@@ -99,29 +157,23 @@ impl RecordingExtensionPolicy {
         property: Option<(ResourceId, AtomId)>,
         mode: Option<AccessMode>,
     ) -> Decision {
-        let decision = if hook == ExtensionHook::Resource {
-            if let Some(error) = self.deny_all_resources {
-                Decision::Deny(error)
-            } else if let Some((id, expected_mode, error)) = self.resource_denial
-                && target.is_some_and(|target| {
-                    target.id == id && expected_mode.is_none_or(|expected| mode == Some(expected))
-                })
-            {
-                Decision::Deny(error)
-            } else if let Some(error) = self.deny_resources_not_owned_by_requester
-                && target.is_some_and(|target| ctx.target_owner(&target) != Some(client))
-            {
-                Decision::Deny(error)
-            } else {
-                self.decision
-            }
-        } else {
-            self.decision
-        };
-        self.calls.lock().unwrap().push(RecordedExtensionCheck {
-            hook,
+        if !self.record_calls {
+            return self
+                .custom_decision
+                .as_ref()
+                .map_or(self.decision, |decide| decide(0, None, hook));
+        }
+
+        let recorded = RecordedExtensionCheck {
+            hook: hook.clone(),
             client,
-            extension: extension.to_owned(),
+            extension: if hook == ExtensionHook::Resource {
+                self.resource_extension
+                    .clone()
+                    .unwrap_or_else(|| extension.to_owned())
+            } else {
+                extension.to_owned()
+            },
             request: ctx.request(),
             peer: ctx.peer(client).copied(),
             admission: ctx.admission(client).cloned(),
@@ -130,7 +182,34 @@ impl RecordingExtensionPolicy {
             target,
             property,
             mode,
-        });
+        };
+        let decide = |index| {
+            if let Some(decide) = &self.custom_decision {
+                decide(index, Some(&recorded), hook.clone())
+            } else if hook == ExtensionHook::Resource {
+                if let Some(error) = self.deny_all_resources {
+                    Decision::Deny(error)
+                } else if let Some((id, expected_mode, error)) = self.resource_denial
+                    && target.is_some_and(|target| {
+                        target.id == id
+                            && expected_mode.is_none_or(|expected| mode == Some(expected))
+                    })
+                {
+                    Decision::Deny(error)
+                } else if let Some(error) = self.deny_resources_not_owned_by_requester
+                    && target.is_some_and(|target| ctx.target_owner(&target) != Some(client))
+                {
+                    Decision::Deny(error)
+                } else {
+                    self.decision
+                }
+            } else {
+                self.decision
+            }
+        };
+        let mut calls = self.calls.lock().unwrap();
+        let decision = decide(calls.len());
+        calls.push(recorded);
         decision
     }
 }
@@ -208,16 +287,13 @@ impl AccessPolicy for RecordingExtensionPolicy {
     }
 }
 
-struct NameSetDenier(HashSet<String>);
-
-impl AccessPolicy for NameSetDenier {
-    fn extension_access(
-        &self,
-        _ctx: &AccessContext<'_>,
-        _client: ClientId,
-        extension: &str,
-    ) -> Decision {
-        if self.0.contains(extension) {
+fn name_denier(names: &[&str]) -> RecordingExtensionPolicy {
+    let names = names
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<HashSet<_>>();
+    RecordingExtensionPolicy::custom(Arc::new(Mutex::new(Vec::new())), "", move |_, call| {
+        if call.hook == ExtensionHook::Access && names.contains(&call.extension) {
             Decision::Deny(DenyError {
                 code: x11::error::BAD_VALUE,
                 value: 0x55,
@@ -225,14 +301,15 @@ impl AccessPolicy for NameSetDenier {
         } else {
             Decision::Allow
         }
-    }
+    })
 }
 
-struct RevocableExtensionPolicy(Arc<AtomicBool>);
-
-impl RevocableExtensionPolicy {
-    fn decision(&self) -> Decision {
-        if self.0.load(Ordering::SeqCst) {
+fn revocable_extension_policy(
+    calls: Arc<Mutex<Vec<RecordedExtensionCheck>>>,
+    revoked: Arc<AtomicBool>,
+) -> RecordingExtensionPolicy {
+    RecordingExtensionPolicy::custom(calls, "", move |_, _| {
+        if revoked.load(Ordering::SeqCst) {
             Decision::Deny(DenyError {
                 code: x11::error::BAD_VALUE,
                 value: 0x55,
@@ -240,31 +317,7 @@ impl RevocableExtensionPolicy {
         } else {
             Decision::Allow
         }
-    }
-}
-
-impl AccessPolicy for RevocableExtensionPolicy {
-    fn extension_access(
-        &self,
-        _ctx: &AccessContext<'_>,
-        _client: ClientId,
-        _extension: &str,
-    ) -> Decision {
-        self.decision()
-    }
-
-    fn extension_dispatch(
-        &self,
-        _ctx: &AccessContext<'_>,
-        _client: ClientId,
-        _extension: &str,
-    ) -> Decision {
-        self.decision()
-    }
-}
-
-fn name_denier(names: &[&str]) -> NameSetDenier {
-    NameSetDenier(names.iter().map(|name| (*name).to_owned()).collect())
+    })
 }
 
 fn query_extension_body(name: &str) -> Vec<u8> {
@@ -378,7 +431,8 @@ fn request_reply_without_policy(opcode: u8, minor: u8, body: &[u8]) -> Vec<u8> {
 
 #[test]
 fn query_extension_denied_answers_like_an_unknown_name() {
-    // Mutation: drop the access check; XFIXES becomes present and differs from the unknown-name reply.
+    // Mutation: drop the access check; XFIXES becomes present and differs from the unknown-name
+    // reply.
     let mut unknown_state = ServerState::new();
     let mut unknown_backend = RecordingBackend::new();
     let unknown = query_extension(
@@ -635,7 +689,10 @@ fn extension_access_revocation_applies_to_the_next_request() {
     let mut state = ServerState::new();
     let mut peer = install_client(&mut state, 1);
     let revoked = Arc::new(AtomicBool::new(false));
-    state.install_access_policy(Arc::new(RevocableExtensionPolicy(Arc::clone(&revoked))));
+    state.install_access_policy(Arc::new(revocable_extension_policy(
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::clone(&revoked),
+    )));
     let mut backend = RecordingBackend::new();
 
     dispatch_extension_request(
@@ -767,7 +824,8 @@ fn every_extension_dispatch_denial_answers_bad_request() {
 
 #[test]
 fn extension_dispatch_preserves_nonzero_minor_in_check_and_error() {
-    // Mutations: hard-code minor 0 in RequestOpcodes or in the denial error; each assertion must fail.
+    // Mutations: hard-code minor 0 in RequestOpcodes or in the denial error; each assertion must
+    // fail.
     let major = crate::nested::EXTENSIONS
         .iter()
         .find(|extension| extension.name == "XFIXES")
@@ -807,7 +865,8 @@ fn extension_dispatch_preserves_nonzero_minor_in_check_and_error() {
 
 #[test]
 fn denied_big_requests_enable_releases_the_reader() {
-    // Mutation: return BadRequest without sending IgnoreBigRequests; the reader-control assertion fails.
+    // Mutation: return BadRequest without sending IgnoreBigRequests; the reader-control assertion
+    // fails.
     let mut state = ServerState::new();
     let mut peer = install_client(&mut state, 1);
     let (control_tx, control_rx) = crossbeam_channel::unbounded();
@@ -846,7 +905,8 @@ fn denied_big_requests_enable_releases_the_reader() {
 
 #[test]
 fn extension_dispatch_asks_with_client_name_and_opcodes() {
-    // Mutation: filter dispatch by discovery availability; unadvertised RENDER must still be checked.
+    // Mutation: filter dispatch by discovery availability; unadvertised RENDER must still be
+    // checked.
     let version_body = [5, 0, 0, 0, 0, 0, 0, 0];
     let xfixes_major = crate::nested::EXTENSIONS
         .iter()
@@ -947,7 +1007,8 @@ fn extension_dispatch_asks_with_client_name_and_opcodes() {
 
 #[test]
 fn transport_gate_and_max_length_answer_before_the_dispatch_check() {
-    // Mutation: move the dispatch check above the locality gate; DRI3 must keep BadMatch and make no policy call.
+    // Mutation: move the dispatch check above the locality gate; DRI3 must keep BadMatch and make
+    // no policy call.
     let dri3_major = crate::nested::EXTENSIONS
         .iter()
         .find(|extension| extension.name == "DRI3")
@@ -1047,7 +1108,8 @@ fn transport_gate_and_max_length_answer_before_the_dispatch_check() {
 
 #[test]
 fn extension_dispatch_first_denial_wins_and_revocation_applies() {
-    // Mutations: let a later Allow override Deny, or reuse a prior Allow after revocation; each request must re-check.
+    // Mutations: let a later Allow override Deny, or reuse a prior Allow after revocation; each
+    // request must re-check.
     let deny = Decision::Deny(DenyError {
         code: x11::error::BAD_VALUE,
         value: 0x55,
@@ -1098,7 +1160,10 @@ fn extension_dispatch_first_denial_wins_and_revocation_applies() {
     let mut state = ServerState::new();
     let mut peer = install_client(&mut state, 1);
     let revoked = Arc::new(AtomicBool::new(false));
-    state.install_access_policy(Arc::new(RevocableExtensionPolicy(Arc::clone(&revoked))));
+    state.install_access_policy(Arc::new(revocable_extension_policy(
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::clone(&revoked),
+    )));
     dispatch_extension_request(&mut state, &mut backend, ClientId(1), 1, major, 0, &body);
     assert_eq!(
         read_all_available(&mut peer)[0],

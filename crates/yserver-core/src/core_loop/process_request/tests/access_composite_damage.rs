@@ -138,8 +138,33 @@ fn cd_target(id: ResourceId, kind: ResourceKind, creation: Option<Creation>) -> 
     }
 }
 
+fn cd_created_target(id: ResourceId, kind: ResourceKind, parent: ResourceId) -> ResourceTarget {
+    let creation = Creation {
+        parent: Some(parent),
+        owner: CLIENT,
+    };
+    cd_target(id, kind, Some(creation))
+}
+
 fn cd_damage_body(id: ResourceId) -> Vec<u8> {
     words(&[id.0, CD_WINDOW.0, 0])
+}
+
+fn cd_window_request_body(minor: u8, id: ResourceId) -> Vec<u8> {
+    use yserver_protocol::x11::composite;
+
+    match minor {
+        composite::GET_OVERLAY_WINDOW | composite::RELEASE_OVERLAY_WINDOW => words(&[id.0]),
+        _ => words(&[id.0, 0]),
+    }
+}
+
+fn damage_subtract_body() -> Vec<u8> {
+    words(&[CD_DAMAGE.0, CD_REGION_REPAIR.0, CD_REGION_PARTS.0])
+}
+
+fn damage_add_body() -> Vec<u8> {
+    words(&[CD_WINDOW.0, CD_REGION_REPAIR.0])
 }
 
 type CompositeDamageSnapshot = (
@@ -196,7 +221,6 @@ fn assert_policy_x_error(bytes: &[u8], major: u8, minor: u8) {
     assert_eq!(bytes[10], major);
 }
 
-#[derive(Clone)]
 struct CompositeDamageDenyRow {
     label: &'static str,
     major: u8,
@@ -206,158 +230,230 @@ struct CompositeDamageDenyRow {
     mode: AccessMode,
 }
 
+type DenyRow = CompositeDamageDenyRow;
+type AskChecks = Vec<(ResourceTarget, AccessMode)>;
+type AskRow = (u8, u8, Vec<u8>, AskChecks);
+
+fn deny_row(
+    (label, major, minor): (&'static str, u8, u8),
+    body: Vec<u8>,
+    (target, mode): (ResourceTarget, AccessMode),
+) -> CompositeDamageDenyRow {
+    CompositeDamageDenyRow {
+        label,
+        major,
+        minor,
+        body,
+        target,
+        mode,
+    }
+}
+
+fn ask_row((major, minor): (u8, u8), body: Vec<u8>, expected: AskChecks) -> AskRow {
+    (major, minor, body, expected)
+}
+
+fn ask_check(id: ResourceId, kind: ResourceKind, mode: AccessMode) -> (ResourceTarget, AccessMode) {
+    (cd_target(id, kind, None), mode)
+}
+
+fn cd_expected_owner(state: &ServerState, target: ResourceTarget) -> Option<ClientId> {
+    target
+        .owner
+        .or_else(|| state.access_resource_owner(target.id, target.kind))
+}
+fn cd_expected_owners(state: &ServerState, checks: &AskChecks) -> Vec<Option<ClientId>> {
+    checks
+        .iter()
+        .map(|(target, _)| cd_expected_owner(state, *target))
+        .collect()
+}
+fn composite_window_ask_row(minor: u8, id: ResourceId, mode: AccessMode) -> AskRow {
+    ask_row(
+        (144, minor),
+        cd_window_request_body(minor, id),
+        vec![ask_check(id, ResourceKind::Window, mode)],
+    )
+}
+fn composite_name_pixmap_ask_row(minor: u8, window: ResourceId, pixmap: ResourceId) -> AskRow {
+    ask_row(
+        (144, minor),
+        words(&[CD_WINDOW.0, CD_NEW_PIXMAP.0]),
+        vec![
+            ask_check(window, ResourceKind::Window, AccessMode::GET_ATTR),
+            (
+                cd_created_target(pixmap, ResourceKind::Pixmap, window),
+                AccessMode::CREATE,
+            ),
+        ],
+    )
+}
+fn composite_overlay_ask_row(minor: u8, root: ResourceId) -> AskRow {
+    ask_row(
+        (144, minor),
+        words(&[ROOT_WINDOW.0]),
+        vec![ask_check(root, ResourceKind::Window, AccessMode::GET_ATTR)],
+    )
+}
+fn damage_create_ask_row(minor: u8, drawable: ResourceId, damage: ResourceId) -> AskRow {
+    ask_row(
+        (143, minor),
+        cd_damage_body(damage),
+        vec![
+            ask_check(
+                drawable,
+                ResourceKind::Window,
+                AccessMode::GET_ATTR | AccessMode::READ,
+            ),
+            (
+                cd_created_target(damage, ResourceKind::Damage, drawable),
+                AccessMode::CREATE,
+            ),
+        ],
+    )
+}
+
+fn damage_destroy_ask_row(minor: u8, id: ResourceId, mode: AccessMode) -> AskRow {
+    ask_row(
+        (143, minor),
+        words(&[id.0]),
+        vec![ask_check(id, ResourceKind::Damage, mode)],
+    )
+}
+
+fn subtract_write_ask_row(minor: u8, ids: [ResourceId; 3]) -> AskRow {
+    ask_row(
+        (143, minor),
+        damage_subtract_body(),
+        vec![
+            ask_check(ids[0], ResourceKind::Damage, AccessMode::WRITE),
+            ask_check(ids[1], ResourceKind::Region, AccessMode::WRITE),
+            ask_check(ids[2], ResourceKind::Region, AccessMode::WRITE),
+        ],
+    )
+}
+
+fn add_write_ask_row(minor: u8, ids: [ResourceId; 4]) -> AskRow {
+    ask_row(
+        (143, minor),
+        damage_add_body(),
+        vec![
+            ask_check(ids[0], ResourceKind::Window, AccessMode::WRITE),
+            ask_check(ids[1], ResourceKind::Region, AccessMode::WRITE),
+            ask_check(ids[2], ResourceKind::Damage, AccessMode::WRITE),
+            ask_check(ids[3], ResourceKind::Damage, AccessMode::WRITE),
+        ],
+    )
+}
+
+fn composite_window_deny_row(minor: u8, id: ResourceId, mode: AccessMode) -> DenyRow {
+    deny_row(
+        ("Composite window", 144, minor),
+        cd_window_request_body(minor, id),
+        (cd_target(id, ResourceKind::Window, None), mode),
+    )
+}
+
+fn composite_name_window_deny_row(minor: u8, id: ResourceId, mode: AccessMode) -> DenyRow {
+    deny_row(
+        ("NameWindowPixmap window", 144, minor),
+        words(&[CD_WINDOW.0, CD_NEW_PIXMAP.0]),
+        (cd_target(id, ResourceKind::Window, None), mode),
+    )
+}
+
+fn composite_pixmap_create_deny_row(minor: u8, id: ResourceId, mode: AccessMode) -> DenyRow {
+    deny_row(
+        ("NameWindowPixmap pixmap", 144, minor),
+        words(&[CD_WINDOW.0, CD_NEW_PIXMAP.0]),
+        (cd_created_target(id, ResourceKind::Pixmap, CD_WINDOW), mode),
+    )
+}
+
+fn damage_window_deny_row(minor: u8, id: ResourceId, mode: AccessMode) -> DenyRow {
+    let body = if minor == yserver_protocol::x11::damage::CREATE {
+        cd_damage_body(CD_DAMAGE_NEW)
+    } else {
+        damage_add_body()
+    };
+    deny_row(
+        ("DAMAGE window", 143, minor),
+        body,
+        (cd_target(id, ResourceKind::Window, None), mode),
+    )
+}
+
+fn damage_creation_deny_row(minor: u8, id: ResourceId, mode: AccessMode) -> DenyRow {
+    deny_row(
+        ("DAMAGE creation", 143, minor),
+        cd_damage_body(id),
+        (cd_created_target(id, ResourceKind::Damage, CD_WINDOW), mode),
+    )
+}
+
+fn damage_object_deny_row(minor: u8, id: ResourceId, mode: AccessMode) -> DenyRow {
+    let body = if minor == yserver_protocol::x11::damage::SUBTRACT {
+        damage_subtract_body()
+    } else {
+        words(&[id.0])
+    };
+    deny_row(
+        ("DAMAGE object", 143, minor),
+        body,
+        (cd_target(id, ResourceKind::Damage, None), mode),
+    )
+}
+
+fn damage_region_deny_row(label: &'static str, minor: u8, id: ResourceId) -> DenyRow {
+    let body = if minor == yserver_protocol::x11::damage::SUBTRACT {
+        damage_subtract_body()
+    } else {
+        damage_add_body()
+    };
+    deny_row(
+        (label, 143, minor),
+        body,
+        (cd_target(id, ResourceKind::Region, None), AccessMode::WRITE),
+    )
+}
+
 fn composite_damage_deny_rows() -> Vec<CompositeDamageDenyRow> {
-    use yserver_protocol::x11::{composite, damage};
+    use yserver_protocol::x11::{
+        composite::{
+            GET_OVERLAY_WINDOW, NAME_WINDOW_PIXMAP, REDIRECT_SUBWINDOWS, REDIRECT_WINDOW,
+            RELEASE_OVERLAY_WINDOW, UNREDIRECT_SUBWINDOWS, UNREDIRECT_WINDOW,
+        },
+        damage::{self, CREATE as DAMAGE_CREATE},
+    };
+
     let redirect_mode = AccessMode::SET_ATTR | AccessMode::MANAGE | AccessMode::BLEND;
+    let get_attr_mode = AccessMode::GET_ATTR;
+    let create_mode = AccessMode::CREATE;
+    let write_mode = AccessMode::WRITE;
+    let destroy_mode = AccessMode::DESTROY;
+    let drawable_read_mode = AccessMode::GET_ATTR | AccessMode::READ;
     vec![
-        CompositeDamageDenyRow {
-            label: "Composite RedirectWindow",
-            major: 144,
-            minor: composite::REDIRECT_WINDOW,
-            body: words(&[CD_WINDOW.0, 0]),
-            target: cd_target(CD_WINDOW, ResourceKind::Window, None),
-            mode: redirect_mode,
-        },
-        CompositeDamageDenyRow {
-            label: "Composite RedirectSubwindows parent",
-            major: 144,
-            minor: composite::REDIRECT_SUBWINDOWS,
-            body: words(&[ROOT_WINDOW.0, 0]),
-            target: cd_target(ROOT_WINDOW, ResourceKind::Window, None),
-            mode: redirect_mode,
-        },
-        CompositeDamageDenyRow {
-            label: "Composite UnredirectWindow",
-            major: 144,
-            minor: composite::UNREDIRECT_WINDOW,
-            body: words(&[CD_WINDOW.0, 0]),
-            target: cd_target(CD_WINDOW, ResourceKind::Window, None),
-            mode: redirect_mode,
-        },
-        CompositeDamageDenyRow {
-            label: "Composite UnredirectSubwindows parent",
-            major: 144,
-            minor: composite::UNREDIRECT_SUBWINDOWS,
-            body: words(&[ROOT_WINDOW.0, 0]),
-            target: cd_target(ROOT_WINDOW, ResourceKind::Window, None),
-            mode: redirect_mode,
-        },
-        CompositeDamageDenyRow {
-            label: "Composite NameWindowPixmap window",
-            major: 144,
-            minor: composite::NAME_WINDOW_PIXMAP,
-            body: words(&[CD_WINDOW.0, CD_NEW_PIXMAP.0]),
-            target: cd_target(CD_WINDOW, ResourceKind::Window, None),
-            mode: AccessMode::GET_ATTR,
-        },
-        CompositeDamageDenyRow {
-            label: "Composite NameWindowPixmap new pixmap",
-            major: 144,
-            minor: composite::NAME_WINDOW_PIXMAP,
-            body: words(&[CD_WINDOW.0, CD_NEW_PIXMAP.0]),
-            target: cd_target(
-                CD_NEW_PIXMAP,
-                ResourceKind::Pixmap,
-                Some(Creation {
-                    parent: Some(CD_WINDOW),
-                    owner: CLIENT,
-                }),
-            ),
-            mode: AccessMode::CREATE,
-        },
-        CompositeDamageDenyRow {
-            label: "Composite GetOverlayWindow operand",
-            major: 144,
-            minor: composite::GET_OVERLAY_WINDOW,
-            body: words(&[ROOT_WINDOW.0]),
-            target: cd_target(ROOT_WINDOW, ResourceKind::Window, None),
-            mode: AccessMode::GET_ATTR,
-        },
-        CompositeDamageDenyRow {
-            label: "Composite ReleaseOverlayWindow operand",
-            major: 144,
-            minor: composite::RELEASE_OVERLAY_WINDOW,
-            body: words(&[ROOT_WINDOW.0]),
-            target: cd_target(ROOT_WINDOW, ResourceKind::Window, None),
-            mode: AccessMode::GET_ATTR,
-        },
-        CompositeDamageDenyRow {
-            label: "DAMAGE Create drawable",
-            major: 143,
-            minor: damage::CREATE,
-            body: cd_damage_body(CD_DAMAGE_NEW),
-            target: cd_target(CD_WINDOW, ResourceKind::Window, None),
-            mode: AccessMode::GET_ATTR | AccessMode::READ,
-        },
-        CompositeDamageDenyRow {
-            label: "DAMAGE Create new damage",
-            major: 143,
-            minor: damage::CREATE,
-            body: cd_damage_body(CD_DAMAGE_NEW),
-            target: cd_target(
-                CD_DAMAGE_NEW,
-                ResourceKind::Damage,
-                Some(Creation {
-                    parent: Some(CD_WINDOW),
-                    owner: CLIENT,
-                }),
-            ),
-            mode: AccessMode::CREATE,
-        },
-        CompositeDamageDenyRow {
-            label: "DAMAGE Destroy",
-            major: 143,
-            minor: damage::DESTROY,
-            body: words(&[CD_DAMAGE.0]),
-            target: cd_target(CD_DAMAGE, ResourceKind::Damage, None),
-            mode: AccessMode::DESTROY,
-        },
-        CompositeDamageDenyRow {
-            label: "DAMAGE Subtract damage",
-            major: 143,
-            minor: damage::SUBTRACT,
-            body: words(&[CD_DAMAGE.0, CD_REGION_REPAIR.0, CD_REGION_PARTS.0]),
-            target: cd_target(CD_DAMAGE, ResourceKind::Damage, None),
-            mode: AccessMode::WRITE,
-        },
-        CompositeDamageDenyRow {
-            label: "DAMAGE Subtract repair region",
-            major: 143,
-            minor: damage::SUBTRACT,
-            body: words(&[CD_DAMAGE.0, CD_REGION_REPAIR.0, CD_REGION_PARTS.0]),
-            target: cd_target(CD_REGION_REPAIR, ResourceKind::Region, None),
-            mode: AccessMode::WRITE,
-        },
-        CompositeDamageDenyRow {
-            label: "DAMAGE Subtract parts region",
-            major: 143,
-            minor: damage::SUBTRACT,
-            body: words(&[CD_DAMAGE.0, CD_REGION_REPAIR.0, CD_REGION_PARTS.0]),
-            target: cd_target(CD_REGION_PARTS, ResourceKind::Region, None),
-            mode: AccessMode::WRITE,
-        },
-        CompositeDamageDenyRow {
-            label: "DAMAGE Add drawable",
-            major: 143,
-            minor: damage::ADD,
-            body: words(&[CD_WINDOW.0, CD_REGION_REPAIR.0]),
-            target: cd_target(CD_WINDOW, ResourceKind::Window, None),
-            mode: AccessMode::WRITE,
-        },
-        CompositeDamageDenyRow {
-            label: "DAMAGE Add region",
-            major: 143,
-            minor: damage::ADD,
-            body: words(&[CD_WINDOW.0, CD_REGION_REPAIR.0]),
-            target: cd_target(CD_REGION_REPAIR, ResourceKind::Region, None),
-            mode: AccessMode::WRITE,
-        },
+        composite_window_deny_row(REDIRECT_WINDOW, CD_WINDOW, redirect_mode),
+        composite_window_deny_row(REDIRECT_SUBWINDOWS, ROOT_WINDOW, redirect_mode),
+        composite_window_deny_row(UNREDIRECT_WINDOW, CD_WINDOW, redirect_mode),
+        composite_window_deny_row(UNREDIRECT_SUBWINDOWS, ROOT_WINDOW, redirect_mode),
+        composite_name_window_deny_row(NAME_WINDOW_PIXMAP, CD_WINDOW, get_attr_mode),
+        composite_pixmap_create_deny_row(NAME_WINDOW_PIXMAP, CD_NEW_PIXMAP, create_mode),
+        composite_window_deny_row(GET_OVERLAY_WINDOW, ROOT_WINDOW, get_attr_mode),
+        composite_window_deny_row(RELEASE_OVERLAY_WINDOW, ROOT_WINDOW, get_attr_mode),
+        damage_window_deny_row(DAMAGE_CREATE, CD_WINDOW, drawable_read_mode),
+        damage_creation_deny_row(DAMAGE_CREATE, CD_DAMAGE_NEW, create_mode),
+        damage_object_deny_row(damage::DESTROY, CD_DAMAGE, destroy_mode),
+        damage_object_deny_row(damage::SUBTRACT, CD_DAMAGE, write_mode),
+        damage_region_deny_row("Subtract repair region", damage::SUBTRACT, CD_REGION_REPAIR),
+        damage_region_deny_row("Subtract parts region", damage::SUBTRACT, CD_REGION_PARTS),
+        damage_window_deny_row(damage::ADD, CD_WINDOW, write_mode),
+        damage_region_deny_row("DAMAGE Add region", damage::ADD, CD_REGION_REPAIR),
     ]
 }
 
 #[test]
 fn composite_damage_resource_denials_match_the_site_table() {
-    // Mutation: omit the 144/1 Window check; this table's exact BadAccess value assertion must fail.
     let error = DenyError {
         code: x11::error::BAD_ACCESS,
         value: 0xA55A_1234,
@@ -411,9 +507,7 @@ fn assert_cd_resource_check(
     major: u8,
     minor: u8,
 ) {
-    let owner = target
-        .owner
-        .or_else(|| state_before.access_resource_owner(target.id, target.kind));
+    let owner = cd_expected_owner(state_before, target);
     assert_eq!(call.hook, ExtensionHook::Resource);
     assert_eq!(call.client, CLIENT);
     assert_eq!(call.request, Some(RequestOpcodes { major, minor }));
@@ -425,42 +519,28 @@ fn assert_cd_resource_check(
 
 #[test]
 fn composite_damage_resource_asks_match_the_site_table() {
-    // Mutation: omit the 144/6 pixmap CREATE check; this table's expected resource-check count must fail.
     use yserver_protocol::x11::{composite, damage};
+    let redirect_mode = AccessMode::SET_ATTR | AccessMode::MANAGE | AccessMode::BLEND;
     let rows = [
-        (144, composite::REDIRECT_WINDOW, words(&[CD_WINDOW.0, 0])),
-        (
-            144,
-            composite::REDIRECT_SUBWINDOWS,
-            words(&[ROOT_WINDOW.0, 0]),
-        ),
-        (144, composite::UNREDIRECT_WINDOW, words(&[CD_WINDOW.0, 0])),
-        (
-            144,
-            composite::UNREDIRECT_SUBWINDOWS,
-            words(&[ROOT_WINDOW.0, 0]),
-        ),
-        (
-            144,
-            composite::NAME_WINDOW_PIXMAP,
-            words(&[CD_WINDOW.0, CD_NEW_PIXMAP.0]),
-        ),
-        (144, composite::GET_OVERLAY_WINDOW, words(&[ROOT_WINDOW.0])),
-        (
-            144,
-            composite::RELEASE_OVERLAY_WINDOW,
-            words(&[ROOT_WINDOW.0]),
-        ),
-        (143, damage::CREATE, cd_damage_body(CD_DAMAGE_NEW)),
-        (143, damage::DESTROY, words(&[CD_DAMAGE.0])),
-        (
-            143,
+        composite_window_ask_row(composite::REDIRECT_WINDOW, CD_WINDOW, redirect_mode),
+        composite_window_ask_row(composite::REDIRECT_SUBWINDOWS, ROOT_WINDOW, redirect_mode),
+        composite_window_ask_row(composite::UNREDIRECT_WINDOW, CD_WINDOW, redirect_mode),
+        composite_window_ask_row(composite::UNREDIRECT_SUBWINDOWS, ROOT_WINDOW, redirect_mode),
+        composite_name_pixmap_ask_row(composite::NAME_WINDOW_PIXMAP, CD_WINDOW, CD_NEW_PIXMAP),
+        composite_overlay_ask_row(composite::GET_OVERLAY_WINDOW, ROOT_WINDOW),
+        composite_overlay_ask_row(composite::RELEASE_OVERLAY_WINDOW, ROOT_WINDOW),
+        damage_create_ask_row(damage::CREATE, CD_WINDOW, CD_DAMAGE_NEW),
+        damage_destroy_ask_row(damage::DESTROY, CD_DAMAGE, AccessMode::DESTROY),
+        subtract_write_ask_row(
             damage::SUBTRACT,
-            words(&[CD_DAMAGE.0, CD_REGION_REPAIR.0, CD_REGION_PARTS.0]),
+            [CD_DAMAGE, CD_REGION_REPAIR, CD_REGION_PARTS],
         ),
-        (143, damage::ADD, words(&[CD_WINDOW.0, CD_REGION_REPAIR.0])),
+        add_write_ask_row(
+            damage::ADD,
+            [CD_WINDOW, CD_REGION_REPAIR, CD_DAMAGE, CD_DAMAGE_OTHER],
+        ),
     ];
-    for (major, minor, body) in rows {
+    for (major, minor, body, mut expected) in rows {
         let (mut state, mut peer, mut backend) = composite_damage_access_fixture();
         if major == 144 && minor == composite::RELEASE_OVERLAY_WINDOW {
             state.cow_claims.push(CLIENT);
@@ -470,106 +550,24 @@ fn composite_damage_resource_asks_match_the_site_table() {
             Decision::Allow,
             Arc::clone(&calls),
         )));
-        let mut expected = Vec::<(ResourceTarget, AccessMode, Option<ClientId>)>::new();
-        macro_rules! expect {
-            ($id:expr, $kind:expr, $mode:expr, $creation:expr) => {{
-                let target = cd_target($id, $kind, $creation);
-                let owner = target
-                    .owner
-                    .or_else(|| state.access_resource_owner(target.id, target.kind));
-                expected.push((target, $mode, owner));
-            }};
-        }
-        let redirect_mode = AccessMode::SET_ATTR | AccessMode::MANAGE | AccessMode::BLEND;
-        match (major, minor) {
-            (144, composite::REDIRECT_WINDOW) | (144, composite::UNREDIRECT_WINDOW) => {
-                expect!(CD_WINDOW, ResourceKind::Window, redirect_mode, None);
-            }
-            (144, composite::REDIRECT_SUBWINDOWS) | (144, composite::UNREDIRECT_SUBWINDOWS) => {
-                expect!(ROOT_WINDOW, ResourceKind::Window, redirect_mode, None);
-                for child in state
+        if major == 144
+            && matches!(
+                minor,
+                composite::REDIRECT_SUBWINDOWS | composite::UNREDIRECT_SUBWINDOWS
+            )
+        {
+            let redirect_mode = expected[0].1;
+            expected.extend(
+                state
                     .resources
                     .children(ROOT_WINDOW)
                     .iter()
                     .copied()
                     .filter(|child| *child != crate::resources::COMPOSITE_OVERLAY_WINDOW)
-                {
-                    expect!(child, ResourceKind::Window, redirect_mode, None);
-                }
-            }
-            (144, composite::NAME_WINDOW_PIXMAP) => {
-                expect!(CD_WINDOW, ResourceKind::Window, AccessMode::GET_ATTR, None);
-                expect!(
-                    CD_NEW_PIXMAP,
-                    ResourceKind::Pixmap,
-                    AccessMode::CREATE,
-                    Some(Creation {
-                        parent: Some(CD_WINDOW),
-                        owner: CLIENT,
-                    })
-                );
-            }
-            (144, composite::GET_OVERLAY_WINDOW) | (144, composite::RELEASE_OVERLAY_WINDOW) => {
-                expect!(
-                    ROOT_WINDOW,
-                    ResourceKind::Window,
-                    AccessMode::GET_ATTR,
-                    None
-                );
-            }
-            (143, damage::CREATE) => {
-                expect!(
-                    CD_WINDOW,
-                    ResourceKind::Window,
-                    AccessMode::GET_ATTR | AccessMode::READ,
-                    None
-                );
-                expect!(
-                    CD_DAMAGE_NEW,
-                    ResourceKind::Damage,
-                    AccessMode::CREATE,
-                    Some(Creation {
-                        parent: Some(CD_WINDOW),
-                        owner: CLIENT,
-                    })
-                );
-            }
-            (143, damage::DESTROY) => {
-                expect!(CD_DAMAGE, ResourceKind::Damage, AccessMode::DESTROY, None);
-            }
-            (143, damage::SUBTRACT) => {
-                expect!(CD_DAMAGE, ResourceKind::Damage, AccessMode::WRITE, None);
-                expect!(
-                    CD_REGION_REPAIR,
-                    ResourceKind::Region,
-                    AccessMode::WRITE,
-                    None
-                );
-                expect!(
-                    CD_REGION_PARTS,
-                    ResourceKind::Region,
-                    AccessMode::WRITE,
-                    None
-                );
-            }
-            (143, damage::ADD) => {
-                expect!(CD_WINDOW, ResourceKind::Window, AccessMode::WRITE, None);
-                expect!(
-                    CD_REGION_REPAIR,
-                    ResourceKind::Region,
-                    AccessMode::WRITE,
-                    None
-                );
-                expect!(CD_DAMAGE, ResourceKind::Damage, AccessMode::WRITE, None);
-                expect!(
-                    CD_DAMAGE_OTHER,
-                    ResourceKind::Damage,
-                    AccessMode::WRITE,
-                    None
-                );
-            }
-            _ => unreachable!("site table row {major}/{minor}"),
+                    .map(|child| ask_check(child, ResourceKind::Window, redirect_mode)),
+            );
         }
+        let expected_owners = cd_expected_owners(&state, &expected);
         let _bytes =
             composite_damage_request(&mut state, &mut backend, &mut peer, major, minor, &body);
         let calls = calls.lock().unwrap();
@@ -578,7 +576,7 @@ fn composite_damage_resource_asks_match_the_site_table() {
             .filter(|call| call.hook == ExtensionHook::Resource)
             .collect();
         assert_eq!(resource_calls.len(), expected.len(), "{major}/{minor}");
-        for (target, mode, owner) in expected {
+        for ((target, mode), owner) in expected.into_iter().zip(expected_owners) {
             let call = resource_calls
                 .iter()
                 .find(|call| call.target == Some(target) && call.mode == Some(mode))
@@ -686,7 +684,7 @@ fn redirect_subwindows_skips_denied_child() {
     )));
     let body = words(&[ROOT_WINDOW.0, 1]);
 
-    // Mutation: remove the per-child filter (or redirect its denied child); this assertion must observe a backing on the denied child.
+    // Mutation: remove the child filter; the denied child must gain a backing.
     let bytes = composite_damage_request(
         &mut state,
         &mut backend,
@@ -771,7 +769,7 @@ fn damage_add_skips_denied_damage() {
     )));
     let body = words(&[CD_WINDOW.0, CD_REGION_REPAIR.0]);
 
-    // Mutation: let the denied Damage object accumulate; this assertion must find the denied object's rectangles changed.
+    // Mutation: let denied Damage accumulate; its rectangles must change.
     let bytes =
         composite_damage_request(&mut state, &mut backend, &mut peer, 143, damage::ADD, &body);
     assert!(
@@ -844,7 +842,7 @@ fn damage_subtract_denied_parts_writes_nothing() {
     let before = cd_snapshot(&state);
     let body = words(&[CD_DAMAGE.0, CD_REGION_REPAIR.0, CD_REGION_PARTS.0]);
 
-    // Mutation: omit the parts WRITE check; assert_policy_x_error must fail before the state snapshot assertion.
+    // Mutation: omit parts WRITE; BadAccess must precede the snapshot assertion.
     let bytes = composite_damage_request(
         &mut state,
         &mut backend,

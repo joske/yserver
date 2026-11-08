@@ -21,11 +21,26 @@ const FRAME_CURSOR: ResourceId = ResourceId(0x0020_0040);
 const SECOND_FRAME_CURSOR: ResourceId = ResourceId(0x0020_0041);
 const NEW_CURSOR: ResourceId = ResourceId(0x0020_0042);
 const ERROR_VALUE: u32 = 0x55aa;
+const CREATE_DRAWABLE_ROW: (&str, u8) = ("CreatePicture drawable", 4);
+const CREATE_ALPHA_MAP_ROW: (&str, u8) = ("CreatePicture alpha map", 4);
+const CREATE_CLIP_MASK_ROW: (&str, u8) = ("CreatePicture clip mask", 4);
+const CREATE_NEW_PICTURE_ROW: (&str, u8) = ("CreatePicture new picture", 4);
+const CHANGE_PICTURE_ROW: (&str, u8) = ("ChangePicture picture", 5);
+const CHANGE_ALPHA_MAP_ROW: (&str, u8) = ("ChangePicture alpha map", 5);
+const CHANGE_CLIP_MASK_ROW: (&str, u8) = ("ChangePicture clip mask", 5);
+const CLIP_RECTANGLES_ROW: (&str, u8) = ("SetPictureClipRectangles", 6);
+const TRANSFORM_ROW: (&str, u8) = ("SetPictureTransform", 28);
+const FILTER_ROW: (&str, u8) = ("SetPictureFilter", 30);
+const FREE_PICTURE_ROW: (&str, u8) = ("FreePicture", 7);
+const FILL_RECTANGLES_ROW: (&str, u8) = ("FillRectangles dst", 26);
+const QUERY_FILTERS_ROW: (&str, u8) = ("QueryFilters drawable", 29);
+const ADD_TRAPS_ROW: (&str, u8) = ("AddTraps picture", 32);
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct ExpectedCheck {
     target: ResourceTarget,
     mode: AccessMode,
+    denied: bool,
 }
 
 struct PictureRequestCase {
@@ -38,6 +53,8 @@ struct PictureRequestCase {
     expected: Vec<ExpectedCheck>,
     created_picture: Option<ResourceId>,
 }
+
+type PictureRequestData = (Vec<u8>, Vec<ExpectedCheck>);
 
 fn render_target(id: ResourceId, kind: ResourceKind, creation: Option<Creation>) -> ResourceTarget {
     ResourceTarget {
@@ -52,6 +69,7 @@ fn existing(id: ResourceId, kind: ResourceKind, mode: AccessMode) -> ExpectedChe
     ExpectedCheck {
         target: render_target(id, kind, None),
         mode,
+        denied: false,
     }
 }
 
@@ -71,7 +89,27 @@ fn created(
             }),
         ),
         mode,
+        denied: false,
     }
+}
+
+fn denied(check: ExpectedCheck) -> ExpectedCheck {
+    ExpectedCheck {
+        denied: true,
+        ..check
+    }
+}
+
+fn checks2(first: ExpectedCheck, second: ExpectedCheck) -> Vec<ExpectedCheck> {
+    vec![first, second]
+}
+
+fn checks3(
+    first: ExpectedCheck,
+    second: ExpectedCheck,
+    third: ExpectedCheck,
+) -> Vec<ExpectedCheck> {
+    vec![first, second, third]
 }
 
 fn words(values: &[u32]) -> Vec<u8> {
@@ -142,315 +180,341 @@ fn fill_rectangles_body() -> Vec<u8> {
     body
 }
 
-fn cases() -> Vec<PictureRequestCase> {
-    let mut cases = Vec::new();
-    let mut add =
-        |name, minor, body, denied_target, denied_kind, denied_mode, expected, created_picture| {
-            cases.push(PictureRequestCase {
-                name,
-                minor,
-                body,
-                denied_target,
-                denied_kind,
-                denied_mode,
-                expected,
-                created_picture,
-            });
-        };
+fn picture_attribute_request_body(picture: ResourceId, length: usize) -> Vec<u8> {
+    let mut body = words(&[picture.0]);
+    body.resize(length, 0);
+    body
+}
 
-    add(
-        "CreatePicture drawable",
-        4,
+fn query_filters_body() -> Vec<u8> {
+    DRAWABLE.0.to_le_bytes().to_vec()
+}
+
+fn add_traps_body() -> Vec<u8> {
+    words(&[DST.0])
+}
+
+fn free_picture_body() -> Vec<u8> {
+    words(&[SRC.0])
+}
+
+fn build_picture_request_case(
+    (name, minor): (&'static str, u8),
+    (body, expected): (Vec<u8>, Vec<ExpectedCheck>),
+) -> PictureRequestCase {
+    let denied = expected
+        .iter()
+        .find(|check| check.denied)
+        .expect("picture case has a denied access check");
+    let created_picture = expected
+        .iter()
+        .find(|check| check.target.kind == ResourceKind::Picture && check.target.creation.is_some())
+        .map(|check| check.target.id);
+    PictureRequestCase {
+        name,
+        minor,
+        body,
+        denied_target: denied.target.id,
+        denied_kind: denied.target.kind,
+        denied_mode: denied.mode,
+        expected,
+        created_picture,
+    }
+}
+
+fn denied_source_set_attr() -> ExpectedCheck {
+    denied_picture_check(SRC, AccessMode::SET_ATTR)
+}
+
+fn denied_source_destroy() -> ExpectedCheck {
+    denied_picture_check(SRC, AccessMode::DESTROY)
+}
+
+fn clip_rectangles_body() -> Vec<u8> {
+    picture_attribute_request_body(SRC, 8)
+}
+
+fn transform_body() -> Vec<u8> {
+    picture_attribute_request_body(SRC, 40)
+}
+
+fn filter_body() -> Vec<u8> {
+    picture_attribute_request_body(SRC, 8)
+}
+
+fn denied_picture_check(id: ResourceId, mode: AccessMode) -> ExpectedCheck {
+    denied(existing(id, ResourceKind::Picture, mode))
+}
+
+fn denied_destination_write() -> ExpectedCheck {
+    denied_picture_check(DST, AccessMode::WRITE)
+}
+
+fn denied_window_check(id: ResourceId, mode: AccessMode) -> ExpectedCheck {
+    denied(existing(id, ResourceKind::Window, mode))
+}
+
+fn denied_query_filters_drawable() -> ExpectedCheck {
+    denied_window_check(DRAWABLE, AccessMode::GET_ATTR)
+}
+
+fn denied_add_traps_picture() -> ExpectedCheck {
+    denied_picture_check(DST, AccessMode::WRITE)
+}
+
+fn create_drawable_data() -> PictureRequestData {
+    (
         picture_create_body(NEW_PICTURE, 0, &[]),
-        DRAWABLE,
-        ResourceKind::Window,
-        AccessMode::READ | AccessMode::ADD,
-        vec![
-            existing(
-                DRAWABLE,
-                ResourceKind::Window,
-                AccessMode::READ | AccessMode::ADD,
-            ),
-            created(
-                NEW_PICTURE,
-                ResourceKind::Picture,
-                AccessMode::CREATE | AccessMode::SET_ATTR,
-                Some(DRAWABLE),
-            ),
-        ],
-        Some(NEW_PICTURE),
-    );
-    add(
-        "CreatePicture alpha map",
-        4,
+        drawable_creation_checks(),
+    )
+}
+
+fn create_alpha_map_data() -> PictureRequestData {
+    (
         picture_create_body(NEW_PICTURE, 1 << 1, &[SRC.0]),
-        SRC,
-        ResourceKind::Picture,
-        AccessMode::READ,
-        vec![
-            existing(
-                DRAWABLE,
-                ResourceKind::Window,
-                AccessMode::READ | AccessMode::ADD,
-            ),
-            existing(SRC, ResourceKind::Picture, AccessMode::READ),
-            created(
-                NEW_PICTURE,
-                ResourceKind::Picture,
-                AccessMode::CREATE | AccessMode::SET_ATTR,
-                Some(DRAWABLE),
-            ),
-        ],
-        Some(NEW_PICTURE),
-    );
-    add(
-        "CreatePicture clip mask",
-        4,
+        alpha_map_creation_checks(),
+    )
+}
+
+fn create_clip_mask_data() -> PictureRequestData {
+    (
         picture_create_body(NEW_PICTURE, 1 << 6, &[PIXMAP.0]),
-        PIXMAP,
-        ResourceKind::Pixmap,
-        AccessMode::READ,
-        vec![
-            existing(
-                DRAWABLE,
-                ResourceKind::Window,
-                AccessMode::READ | AccessMode::ADD,
-            ),
-            existing(PIXMAP, ResourceKind::Pixmap, AccessMode::READ),
-            created(
-                NEW_PICTURE,
-                ResourceKind::Picture,
-                AccessMode::CREATE | AccessMode::SET_ATTR,
-                Some(DRAWABLE),
-            ),
-        ],
-        Some(NEW_PICTURE),
-    );
-    add(
-        "CreatePicture new picture",
-        4,
+        clip_mask_creation_checks(),
+    )
+}
+
+fn create_new_picture_data() -> PictureRequestData {
+    (
         picture_create_body(NEW_PICTURE, 0, &[]),
-        NEW_PICTURE,
-        ResourceKind::Picture,
-        AccessMode::CREATE | AccessMode::SET_ATTR,
-        vec![
-            existing(
-                DRAWABLE,
-                ResourceKind::Window,
-                AccessMode::READ | AccessMode::ADD,
-            ),
-            created(
-                NEW_PICTURE,
-                ResourceKind::Picture,
-                AccessMode::CREATE | AccessMode::SET_ATTR,
-                Some(DRAWABLE),
-            ),
-        ],
-        Some(NEW_PICTURE),
-    );
+        new_picture_creation_checks(),
+    )
+}
 
-    add(
-        "ChangePicture picture",
-        5,
-        change_picture_body(1, &[1]),
-        SRC,
-        ResourceKind::Picture,
-        AccessMode::SET_ATTR,
-        vec![existing(SRC, ResourceKind::Picture, AccessMode::SET_ATTR)],
-        None,
-    );
-    add(
-        "ChangePicture alpha map",
-        5,
+fn change_picture_data() -> PictureRequestData {
+    (change_picture_body(1, &[1]), vec![denied_source_set_attr()])
+}
+
+fn change_alpha_map_data() -> PictureRequestData {
+    (
         change_picture_body(1 << 1, &[DST.0]),
-        DST,
-        ResourceKind::Picture,
-        AccessMode::READ,
-        vec![
-            existing(SRC, ResourceKind::Picture, AccessMode::SET_ATTR),
-            existing(DST, ResourceKind::Picture, AccessMode::READ),
-        ],
-        None,
-    );
-    add(
-        "ChangePicture clip mask",
-        5,
+        alpha_map_change_checks(),
+    )
+}
+
+fn change_clip_mask_data() -> PictureRequestData {
+    (
         change_picture_body(1 << 6, &[PIXMAP.0]),
-        PIXMAP,
-        ResourceKind::Pixmap,
-        AccessMode::READ,
-        vec![
-            existing(SRC, ResourceKind::Picture, AccessMode::SET_ATTR),
-            existing(PIXMAP, ResourceKind::Pixmap, AccessMode::READ),
-        ],
-        None,
-    );
-    for (minor, name, mode) in [
-        (6, "SetPictureClipRectangles", AccessMode::SET_ATTR),
-        (28, "SetPictureTransform", AccessMode::SET_ATTR),
-        (30, "SetPictureFilter", AccessMode::SET_ATTR),
-    ] {
-        let mut body = words(&[SRC.0]);
-        body.resize(if minor == 28 { 40 } else { 8 }, 0);
-        add(
-            name,
-            minor,
-            body,
-            SRC,
-            ResourceKind::Picture,
-            mode,
-            vec![existing(SRC, ResourceKind::Picture, mode)],
-            None,
-        );
-    }
-    add(
-        "FreePicture",
-        7,
-        words(&[SRC.0]),
-        SRC,
-        ResourceKind::Picture,
-        AccessMode::DESTROY,
-        vec![existing(SRC, ResourceKind::Picture, AccessMode::DESTROY)],
-        None,
-    );
+        clip_mask_change_checks(),
+    )
+}
 
-    for (name, target, mode, expected) in [
-        (
-            "Composite dst",
-            DST,
-            AccessMode::WRITE,
-            vec![
-                existing(DST, ResourceKind::Picture, AccessMode::WRITE),
-                existing(SRC, ResourceKind::Picture, AccessMode::READ),
-                existing(MASK, ResourceKind::Picture, AccessMode::READ),
-            ],
-        ),
-        (
-            "Composite src",
-            SRC,
-            AccessMode::READ,
-            vec![
-                existing(DST, ResourceKind::Picture, AccessMode::WRITE),
-                existing(SRC, ResourceKind::Picture, AccessMode::READ),
-                existing(MASK, ResourceKind::Picture, AccessMode::READ),
-            ],
-        ),
-        (
-            "Composite mask",
-            MASK,
-            AccessMode::READ,
-            vec![
-                existing(DST, ResourceKind::Picture, AccessMode::WRITE),
-                existing(SRC, ResourceKind::Picture, AccessMode::READ),
-                existing(MASK, ResourceKind::Picture, AccessMode::READ),
-            ],
-        ),
-    ] {
-        add(
-            name,
-            8,
-            composite_body(),
-            target,
-            ResourceKind::Picture,
-            mode,
-            expected,
-            None,
-        );
-    }
+fn clip_rectangles_data() -> PictureRequestData {
+    (clip_rectangles_body(), vec![denied_source_set_attr()])
+}
 
-    for minor in 10..=13 {
-        for (name, target, mode, expected) in [
-            (
-                "vector src",
-                SRC,
-                AccessMode::READ,
-                vec![
-                    existing(SRC, ResourceKind::Picture, AccessMode::READ),
-                    existing(DST, ResourceKind::Picture, AccessMode::WRITE),
-                ],
-            ),
-            (
-                "vector dst",
-                DST,
-                AccessMode::WRITE,
-                vec![
-                    existing(SRC, ResourceKind::Picture, AccessMode::READ),
-                    existing(DST, ResourceKind::Picture, AccessMode::WRITE),
-                ],
-            ),
-        ] {
-            add(
-                name,
-                minor,
-                trapezoid_body(),
-                target,
-                ResourceKind::Picture,
-                mode,
-                expected,
-                None,
-            );
-        }
-    }
+fn transform_data() -> PictureRequestData {
+    (transform_body(), vec![denied_source_set_attr()])
+}
 
-    add(
-        "FillRectangles dst",
-        26,
-        fill_rectangles_body(),
-        DST,
-        ResourceKind::Picture,
-        AccessMode::WRITE,
-        vec![existing(DST, ResourceKind::Picture, AccessMode::WRITE)],
-        None,
-    );
-    add(
-        "QueryFilters drawable",
-        29,
-        DRAWABLE.0.to_le_bytes().to_vec(),
-        DRAWABLE,
-        ResourceKind::Window,
-        AccessMode::GET_ATTR,
-        vec![existing(
+fn filter_data() -> PictureRequestData {
+    (filter_body(), vec![denied_source_set_attr()])
+}
+
+fn free_picture_data() -> PictureRequestData {
+    (free_picture_body(), vec![denied_source_destroy()])
+}
+
+fn fill_rectangles_data() -> PictureRequestData {
+    (fill_rectangles_body(), vec![denied_destination_write()])
+}
+
+fn query_filters_data() -> PictureRequestData {
+    (query_filters_body(), vec![denied_query_filters_drawable()])
+}
+
+fn add_traps_data() -> PictureRequestData {
+    (add_traps_body(), vec![denied_add_traps_picture()])
+}
+
+fn drawable_creation_checks() -> Vec<ExpectedCheck> {
+    checks2(
+        denied(existing(
             DRAWABLE,
             ResourceKind::Window,
-            AccessMode::GET_ATTR,
-        )],
-        None,
-    );
-    add(
-        "AddTraps picture",
-        32,
-        words(&[DST.0]),
-        DST,
-        ResourceKind::Picture,
-        AccessMode::WRITE,
-        vec![existing(DST, ResourceKind::Picture, AccessMode::WRITE)],
-        None,
-    );
-
-    for (minor, name, body_len) in [
-        (33, "CreateSolidFill", 12),
-        (34, "CreateLinearGradient", 24),
-        (35, "CreateRadialGradient", 32),
-        (36, "CreateConicalGradient", 4),
-    ] {
-        let mut body = vec![0u8; body_len];
-        body[..4].copy_from_slice(&NEW_PICTURE.0.to_le_bytes());
-        add(
-            name,
-            minor,
-            body,
+            AccessMode::READ | AccessMode::ADD,
+        )),
+        created(
             NEW_PICTURE,
             ResourceKind::Picture,
-            AccessMode::CREATE,
-            vec![created(
+            AccessMode::CREATE | AccessMode::SET_ATTR,
+            Some(DRAWABLE),
+        ),
+    )
+}
+
+fn alpha_map_creation_checks() -> Vec<ExpectedCheck> {
+    checks3(
+        existing(
+            DRAWABLE,
+            ResourceKind::Window,
+            AccessMode::READ | AccessMode::ADD,
+        ),
+        denied(existing(SRC, ResourceKind::Picture, AccessMode::READ)),
+        created(
+            NEW_PICTURE,
+            ResourceKind::Picture,
+            AccessMode::CREATE | AccessMode::SET_ATTR,
+            Some(DRAWABLE),
+        ),
+    )
+}
+
+fn clip_mask_creation_checks() -> Vec<ExpectedCheck> {
+    checks3(
+        existing(
+            DRAWABLE,
+            ResourceKind::Window,
+            AccessMode::READ | AccessMode::ADD,
+        ),
+        denied(existing(PIXMAP, ResourceKind::Pixmap, AccessMode::READ)),
+        created(
+            NEW_PICTURE,
+            ResourceKind::Picture,
+            AccessMode::CREATE | AccessMode::SET_ATTR,
+            Some(DRAWABLE),
+        ),
+    )
+}
+
+fn new_picture_creation_checks() -> Vec<ExpectedCheck> {
+    checks2(
+        existing(
+            DRAWABLE,
+            ResourceKind::Window,
+            AccessMode::READ | AccessMode::ADD,
+        ),
+        denied(created(
+            NEW_PICTURE,
+            ResourceKind::Picture,
+            AccessMode::CREATE | AccessMode::SET_ATTR,
+            Some(DRAWABLE),
+        )),
+    )
+}
+
+fn alpha_map_change_checks() -> Vec<ExpectedCheck> {
+    checks2(
+        existing(SRC, ResourceKind::Picture, AccessMode::SET_ATTR),
+        denied(existing(DST, ResourceKind::Picture, AccessMode::READ)),
+    )
+}
+
+fn clip_mask_change_checks() -> Vec<ExpectedCheck> {
+    checks2(
+        existing(SRC, ResourceKind::Picture, AccessMode::SET_ATTR),
+        denied(existing(PIXMAP, ResourceKind::Pixmap, AccessMode::READ)),
+    )
+}
+
+fn composite_picture_request_case(
+    name: &'static str,
+    target: ResourceId,
+    mode: AccessMode,
+) -> PictureRequestCase {
+    let checks = checks3(
+        existing(DST, ResourceKind::Picture, AccessMode::WRITE),
+        existing(SRC, ResourceKind::Picture, AccessMode::READ),
+        existing(MASK, ResourceKind::Picture, AccessMode::READ),
+    );
+    let expected = checks
+        .into_iter()
+        .map(|check| {
+            if check.target.id == target && check.mode == mode {
+                denied(check)
+            } else {
+                check
+            }
+        })
+        .collect();
+    build_picture_request_case((name, 8), (composite_body(), expected))
+}
+
+fn vector_picture_request_case(
+    minor: u8,
+    target: ResourceId,
+    mode: AccessMode,
+) -> PictureRequestCase {
+    let name = if target == SRC {
+        "vector src"
+    } else {
+        "vector dst"
+    };
+    let checks = checks2(
+        existing(SRC, ResourceKind::Picture, AccessMode::READ),
+        existing(DST, ResourceKind::Picture, AccessMode::WRITE),
+    );
+    let expected = checks
+        .into_iter()
+        .map(|check| {
+            if check.target.id == target && check.mode == mode {
+                denied(check)
+            } else {
+                check
+            }
+        })
+        .collect();
+    build_picture_request_case((name, minor), (trapezoid_body(), expected))
+}
+
+fn gradient_case(name: &'static str, minor: u8, body_len: usize) -> PictureRequestCase {
+    let mut body = vec![0u8; body_len];
+    body[..4].copy_from_slice(&NEW_PICTURE.0.to_le_bytes());
+    build_picture_request_case(
+        (name, minor),
+        (
+            body,
+            vec![denied(created(
                 NEW_PICTURE,
                 ResourceKind::Picture,
                 AccessMode::CREATE,
                 None,
-            )],
-            Some(NEW_PICTURE),
-        );
+            ))],
+        ),
+    )
+}
+
+fn cases() -> Vec<PictureRequestCase> {
+    let mut cases: Vec<_> = [
+        build_picture_request_case(CREATE_DRAWABLE_ROW, create_drawable_data()),
+        build_picture_request_case(CREATE_ALPHA_MAP_ROW, create_alpha_map_data()),
+        build_picture_request_case(CREATE_CLIP_MASK_ROW, create_clip_mask_data()),
+        build_picture_request_case(CREATE_NEW_PICTURE_ROW, create_new_picture_data()),
+        build_picture_request_case(CHANGE_PICTURE_ROW, change_picture_data()),
+        build_picture_request_case(CHANGE_ALPHA_MAP_ROW, change_alpha_map_data()),
+        build_picture_request_case(CHANGE_CLIP_MASK_ROW, change_clip_mask_data()),
+        build_picture_request_case(CLIP_RECTANGLES_ROW, clip_rectangles_data()),
+        build_picture_request_case(TRANSFORM_ROW, transform_data()),
+        build_picture_request_case(FILTER_ROW, filter_data()),
+        build_picture_request_case(FREE_PICTURE_ROW, free_picture_data()),
+        composite_picture_request_case("Composite dst", DST, AccessMode::WRITE),
+        composite_picture_request_case("Composite src", SRC, AccessMode::READ),
+        composite_picture_request_case("Composite mask", MASK, AccessMode::READ),
+    ]
+    .into_iter()
+    .collect();
+    for minor in 10..=13 {
+        cases.push(vector_picture_request_case(minor, SRC, AccessMode::READ));
+        cases.push(vector_picture_request_case(minor, DST, AccessMode::WRITE));
     }
+    cases.extend([
+        build_picture_request_case(FILL_RECTANGLES_ROW, fill_rectangles_data()),
+        build_picture_request_case(QUERY_FILTERS_ROW, query_filters_data()),
+        build_picture_request_case(ADD_TRAPS_ROW, add_traps_data()),
+        gradient_case("CreateSolidFill", 33, 12),
+        gradient_case("CreateLinearGradient", 34, 24),
+        gradient_case("CreateRadialGradient", 35, 32),
+        gradient_case("CreateConicalGradient", 36, 4),
+    ]);
     cases
 }
 
@@ -648,116 +712,196 @@ struct GlyphCursorRequestCase {
     created_resource: Option<(ResourceId, ResourceKind)>,
 }
 
-fn glyph_cursor_cases() -> Vec<GlyphCursorRequestCase> {
-    use crate::access::ResourceKind::{Cursor, GlyphSet, Picture};
+const N_GS: &str = "CreateGlyphSet";
+const N_REF: &str = "ReferenceGlyphSet";
+const N_FREE_GS: &str = "FreeGlyphSet";
+const N_ADD_GLYPHS: &str = "AddGlyphs";
+const N_FREE_GLYPHS: &str = "FreeGlyphs";
+const N_CURSOR: &str = "CreateCursor";
+const N_ANIM_CURSOR: &str = "CreateAnimCursor";
 
-    let mut cases = vec![GlyphCursorRequestCase {
-        name: "CreateGlyphSet",
-        minor: 17,
-        body: words(&[NEW_GLYPHSET.0, yserver_protocol::x11::RENDER_FMT_XRGB32]),
-        seeded: vec![],
-        expected: vec![created(NEW_GLYPHSET, GlyphSet, AccessMode::CREATE, None)],
-        created_resource: Some((NEW_GLYPHSET, GlyphSet)),
-    }];
+struct GlyphPlan {
+    seeded: Vec<SeedResource>,
+    expected: Vec<ExpectedCheck>,
+}
 
-    cases.push(GlyphCursorRequestCase {
-        name: "ReferenceGlyphSet",
-        minor: 18,
-        body: words(&[NEW_GLYPHSET.0, GLYPHSET.0]),
-        seeded: vec![SeedResource::GlyphSet(GLYPHSET, 0xbb30)],
-        expected: vec![
-            existing(GLYPHSET, GlyphSet, AccessMode::GET_ATTR),
-            created(NEW_GLYPHSET, GlyphSet, AccessMode::CREATE, None),
-        ],
-        created_resource: Some((NEW_GLYPHSET, GlyphSet)),
-    });
-    cases.push(GlyphCursorRequestCase {
-        name: "FreeGlyphSet",
-        minor: 19,
-        body: words(&[GLYPHSET.0]),
-        seeded: vec![SeedResource::GlyphSet(GLYPHSET, 0xbb30)],
-        expected: vec![existing(GLYPHSET, GlyphSet, AccessMode::DESTROY)],
-        created_resource: None,
-    });
-    cases.push(GlyphCursorRequestCase {
-        name: "AddGlyphs",
-        minor: 20,
-        body: words(&[GLYPHSET.0, 0]),
-        seeded: vec![SeedResource::GlyphSet(GLYPHSET, 0xbb30)],
-        expected: vec![existing(GLYPHSET, GlyphSet, AccessMode::ADD)],
-        created_resource: None,
-    });
-    cases.push(GlyphCursorRequestCase {
-        name: "FreeGlyphs",
-        minor: 22,
-        body: words(&[GLYPHSET.0]),
-        seeded: vec![SeedResource::GlyphSet(GLYPHSET, 0xbb30)],
-        expected: vec![existing(GLYPHSET, GlyphSet, AccessMode::REMOVE)],
-        created_resource: None,
-    });
+fn plan(seeded: Vec<SeedResource>, expected: Vec<ExpectedCheck>) -> GlyphPlan {
+    GlyphPlan { seeded, expected }
+}
 
-    for minor in 23..=25 {
-        let items = glyph_items_with_switch(minor, SWITCH_GLYPHSET);
-        let mut body = vec![0u8; 24];
-        body[0] = 3;
-        body[4..8].copy_from_slice(&SRC.0.to_le_bytes());
-        body[8..12].copy_from_slice(&DST.0.to_le_bytes());
-        body[16..20].copy_from_slice(&GLYPHSET.0.to_le_bytes());
-        body.extend_from_slice(&items);
-        cases.push(GlyphCursorRequestCase {
-            name: match minor {
-                23 => "CompositeGlyphs8",
-                24 => "CompositeGlyphs16",
-                _ => "CompositeGlyphs32",
-            },
-            minor,
-            body,
-            seeded: vec![
-                SeedResource::GlyphSet(GLYPHSET, 0xbb30),
-                SeedResource::GlyphSet(SWITCH_GLYPHSET, 0xbb31),
-            ],
-            expected: vec![
-                existing(SRC, Picture, AccessMode::READ),
-                existing(DST, Picture, AccessMode::WRITE),
-                existing(GLYPHSET, GlyphSet, AccessMode::USE),
-                existing(SWITCH_GLYPHSET, GlyphSet, AccessMode::USE),
-            ],
-            created_resource: None,
-        });
+fn gc((name, minor): (&'static str, u8), body: Vec<u8>, plan: GlyphPlan) -> GlyphCursorRequestCase {
+    let created_resource = plan
+        .expected
+        .iter()
+        .find(|check| check.target.creation.is_some())
+        .map(|check| (check.target.id, check.target.kind));
+    GlyphCursorRequestCase {
+        name,
+        minor,
+        body,
+        seeded: plan.seeded,
+        expected: plan.expected,
+        created_resource,
     }
+}
 
-    let mut create_cursor = words(&[NEW_CURSOR.0, SRC.0]);
-    create_cursor.extend_from_slice(&words(&[1, 2]));
-    cases.push(GlyphCursorRequestCase {
-        name: "CreateCursor",
-        minor: 27,
-        body: create_cursor,
-        seeded: vec![],
-        expected: vec![
-            existing(SRC, Picture, AccessMode::READ),
-            created(NEW_CURSOR, Cursor, AccessMode::CREATE, None),
+fn gs_body() -> Vec<u8> {
+    words(&[NEW_GLYPHSET.0, yserver_protocol::x11::RENDER_FMT_XRGB32])
+}
+
+fn ref_body() -> Vec<u8> {
+    words(&[NEW_GLYPHSET.0, GLYPHSET.0])
+}
+
+fn free_gs_body() -> Vec<u8> {
+    words(&[GLYPHSET.0])
+}
+
+fn add_glyphs_body() -> Vec<u8> {
+    words(&[GLYPHSET.0, 0])
+}
+
+fn cg_name(minor: u8) -> &'static str {
+    match minor {
+        23 => "CompositeGlyphs8",
+        24 => "CompositeGlyphs16",
+        _ => "CompositeGlyphs32",
+    }
+}
+
+fn cg_body(minor: u8) -> Vec<u8> {
+    let items = glyph_items_with_switch(minor, SWITCH_GLYPHSET);
+    let mut body = vec![0u8; 24];
+    body[0] = 3;
+    body[4..8].copy_from_slice(&SRC.0.to_le_bytes());
+    body[8..12].copy_from_slice(&DST.0.to_le_bytes());
+    body[16..20].copy_from_slice(&GLYPHSET.0.to_le_bytes());
+    body.extend_from_slice(&items);
+    body
+}
+
+fn cursor_body() -> Vec<u8> {
+    let mut body = words(&[NEW_CURSOR.0, SRC.0]);
+    body.extend_from_slice(&words(&[1, 2]));
+    body
+}
+
+fn anim_body() -> Vec<u8> {
+    let mut body = words(&[NEW_CURSOR.0]);
+    body.extend_from_slice(&words(&[FRAME_CURSOR.0, 50, SECOND_FRAME_CURSOR.0, 75]));
+    body
+}
+
+fn gs_plan() -> GlyphPlan {
+    plan(
+        vec![],
+        vec![created(
+            NEW_GLYPHSET,
+            ResourceKind::GlyphSet,
+            AccessMode::CREATE,
+            None,
+        )],
+    )
+}
+
+fn ref_plan() -> GlyphPlan {
+    plan(
+        vec![SeedResource::GlyphSet(GLYPHSET, 0xbb30)],
+        vec![
+            existing(GLYPHSET, ResourceKind::GlyphSet, AccessMode::GET_ATTR),
+            created(
+                NEW_GLYPHSET,
+                ResourceKind::GlyphSet,
+                AccessMode::CREATE,
+                None,
+            ),
         ],
-        created_resource: Some((NEW_CURSOR, Cursor)),
-    });
+    )
+}
 
-    let mut anim_cursor = words(&[NEW_CURSOR.0]);
-    anim_cursor.extend_from_slice(&words(&[FRAME_CURSOR.0, 50, SECOND_FRAME_CURSOR.0, 75]));
-    cases.push(GlyphCursorRequestCase {
-        name: "CreateAnimCursor",
-        minor: 31,
-        body: anim_cursor,
-        seeded: vec![
+fn free_gs_plan() -> GlyphPlan {
+    plan(
+        vec![SeedResource::GlyphSet(GLYPHSET, 0xbb30)],
+        vec![existing(
+            GLYPHSET,
+            ResourceKind::GlyphSet,
+            AccessMode::DESTROY,
+        )],
+    )
+}
+
+fn add_glyphs_plan() -> GlyphPlan {
+    plan(
+        vec![SeedResource::GlyphSet(GLYPHSET, 0xbb30)],
+        vec![existing(GLYPHSET, ResourceKind::GlyphSet, AccessMode::ADD)],
+    )
+}
+
+fn free_glyphs_plan() -> GlyphPlan {
+    plan(
+        vec![SeedResource::GlyphSet(GLYPHSET, 0xbb30)],
+        vec![existing(
+            GLYPHSET,
+            ResourceKind::GlyphSet,
+            AccessMode::REMOVE,
+        )],
+    )
+}
+
+fn cg_plan() -> GlyphPlan {
+    plan(
+        vec![
+            SeedResource::GlyphSet(GLYPHSET, 0xbb30),
+            SeedResource::GlyphSet(SWITCH_GLYPHSET, 0xbb31),
+        ],
+        vec![
+            existing(SRC, ResourceKind::Picture, AccessMode::READ),
+            existing(DST, ResourceKind::Picture, AccessMode::WRITE),
+            existing(GLYPHSET, ResourceKind::GlyphSet, AccessMode::USE),
+            existing(SWITCH_GLYPHSET, ResourceKind::GlyphSet, AccessMode::USE),
+        ],
+    )
+}
+
+fn cursor_plan() -> GlyphPlan {
+    plan(
+        vec![],
+        vec![
+            existing(SRC, ResourceKind::Picture, AccessMode::READ),
+            created(NEW_CURSOR, ResourceKind::Cursor, AccessMode::CREATE, None),
+        ],
+    )
+}
+
+fn anim_plan() -> GlyphPlan {
+    plan(
+        vec![
             SeedResource::Cursor(FRAME_CURSOR, 0xcc40),
             SeedResource::Cursor(SECOND_FRAME_CURSOR, 0xcc41),
         ],
-        expected: vec![
-            existing(FRAME_CURSOR, Cursor, AccessMode::READ),
-            existing(SECOND_FRAME_CURSOR, Cursor, AccessMode::READ),
-            created(NEW_CURSOR, Cursor, AccessMode::CREATE, None),
+        vec![
+            existing(FRAME_CURSOR, ResourceKind::Cursor, AccessMode::READ),
+            existing(SECOND_FRAME_CURSOR, ResourceKind::Cursor, AccessMode::READ),
+            created(NEW_CURSOR, ResourceKind::Cursor, AccessMode::CREATE, None),
         ],
-        created_resource: Some((NEW_CURSOR, Cursor)),
-    });
+    )
+}
 
+fn glyph_cursor_cases() -> Vec<GlyphCursorRequestCase> {
+    let mut cases = vec![
+        gc((N_GS, 17), gs_body(), gs_plan()),
+        gc((N_REF, 18), ref_body(), ref_plan()),
+        gc((N_FREE_GS, 19), free_gs_body(), free_gs_plan()),
+        gc((N_ADD_GLYPHS, 20), add_glyphs_body(), add_glyphs_plan()),
+        gc((N_FREE_GLYPHS, 22), free_gs_body(), free_glyphs_plan()),
+    ];
+    for minor in 23..=25 {
+        cases.push(gc((cg_name(minor), minor), cg_body(minor), cg_plan()));
+    }
+    cases.extend([
+        gc((N_CURSOR, 27), cursor_body(), cursor_plan()),
+        gc((N_ANIM_CURSOR, 31), anim_body(), anim_plan()),
+    ]);
     cases
 }
 
