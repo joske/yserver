@@ -1,6 +1,6 @@
 # VRR: lift the cursor hold while the direct-scanout client is idle — design
 
-**Date:** 2026-11-08 · **Status:** revision 1 · **Base:** `docs/superpowers/specs/2026-10-23-vrr-design.md`
+**Date:** 2026-11-08 · **Status:** revision 1.1 (sol review: deterministic fixtures, three more mutation tests, both VRR callers exercised, explicit reset) · **Base:** `docs/superpowers/specs/2026-10-23-vrr-design.md`
 (implemented by #294 and #298, per-output since #307–#314) · **Replaces:** #351 (draft), at the maintainer's request
 · **Scope:** KMS backend, the VRR cursor hold only.
 
@@ -40,13 +40,21 @@ own. The next Present brings the hold back.
 ## Design
 
 - **The last Present.** The direct owner's slot (`ScanoutM2State`, one per direct scope) records when its last direct
-  Present was accepted. That is the point in `backend_present_try_present_direct` where a Present is taken as direct,
-  whether it is submitted at once or kept as the queued successor. The time comes from the backend's clock
+  Present was accepted in `backend_present_try_present_direct`:
+  - each branch that keeps it as the queued successor, including the replacement of an occupied successor;
+  - an immediate submission, only once it succeeds.
+
+  A Present rejected on the way, or one whose submission fails, leaves the time unchanged. The spike (87af70d6) stamped
+  too early and used a direct `Instant::now()`, so it is not the production implementation. The time comes from the backend's clock
   (`monotonic_now()`, the paired clock provider), never from a direct `Instant::now()`. Without that, controlled-clock
   tests and the cursor's own `now` would disagree.
-- **Not a Present.** Dispatching a queued successor, a retirement, and the cursor's own commits do not renew the time.
-- **Reset.** The time lives in the slot, so ownership teardown clears it. An owner that has not presented yet counts
-  as idle.
+- **Not a Present.** Dispatching a queued successor, a retirement, and the cursor's own commits and their retirement do
+  not renew the time.
+- **Reset.** Slots survive teardown, so the time is cleared explicitly wherever the slot's other fields are cleared:
+  - when the direct owner stops after its scanout is replaced;
+  - on the queued first-entry fallback.
+
+  An owner that has not presented yet counts as idle.
 - **Where it is read.** The hold decision gets one more condition. Only the cursor callers use it:
   - `scene_wants_compose`;
   - `backend_scanout_next_wakeup`;
@@ -56,11 +64,14 @@ own. The next Present brings the hold back.
   The VRR callers keep the live *wanted* exactly as today: the property retry after a flip, and the gamma path in
   `randr.rs`. So VRR and `VRR_ENABLED` commits do not change.
 - **Per output.** Each output reads its own scope's owner. An idle client on one monitor does not lift the hold on
-  another.
-- **No new deadline.** A move already held when the boundary passes goes out at its existing 33 ms deadline at the
-  latest. Moves after the boundary go out at once. No new timer, wakeup or commit kind.
+  another. A Root owner spans every output in its grouped scope, so they share one time, whichever output its Present
+  completes on.
+- **No new deadline.** A move already held when the boundary passes goes out by its existing 33 ms deadline. If
+  anything re-evaluates the scheduler after the boundary, it becomes eligible at once. This bounds the VRR hold only.
+  The existing waits stay in force: pending frames, queued successors, unflip, cursor commits in flight, EBUSY, cursor
+  recovery, VT and DPMS. No new timer, wakeup or commit kind.
 - **No change without VRR.** The hold only exists while VRR is wanted and committed on that output. With `--vrr`
-  absent, or on an output that is not capable, nothing new is read and commits are as today.
+  absent, or on an output that is not capable, holds and commits are exactly as today.
 
 ## Non-goals
 
@@ -74,7 +85,8 @@ own. The next Present brings the hold back.
 ## Testing
 
 Backend tests through the Backend/Present request paths, using the recording fixtures with the controlled paired clock
-installed before the first Present. No sleeps. Each test names the mutation that fails it.
+installed before the first Present. No sleeps. Each test names the mutation that fails it. Report which tests ran and
+which skipped, since the cursor fixtures need the Vulkan test environment.
 
 - `vrr_cursor_hold_lifts_after_idle`: VRR on, owner presents, then 100 ms with no Present; a cursor move is committed
   at once as a cursor-only commit, with no wait for the 33 ms deadline. Mutation: ignore idle in the hold.
@@ -84,13 +96,31 @@ installed before the first Present. No sleeps. Each test names the mutation that
   Mutation: `>` instead of `>=`.
 - `vrr_cursor_hold_returns_on_next_present`: after idle, one Present restores the hold for the next move. Mutation:
   record the time only once per owner.
-- `vrr_cursor_hold_queued_dispatch_does_not_renew`: a queued successor dispatched after the boundary does not restore
-  the hold. Mutation: stamp the time at dispatch.
-- `vrr_cursor_hold_idle_leaves_vrr_alone`: going idle commits no `VRR_ENABLED` change, and the VRR property path still
-  sees *wanted* true. Mutation: use the idle-aware hold in the VRR callers.
-- `vrr_cursor_hold_idle_is_per_output`: two outputs with independent owners; one goes idle and only its hold lifts.
-  Mutation: read one scope for every output.
-- The existing VRR, cursor and tearing backend tests pass unchanged.
+- `vrr_cursor_hold_queued_dispatch_does_not_renew`: accept a queued successor, advance past that acceptance's own
+  100 ms boundary, dispatch and retire it, then move. The move goes out at once. Mutation: stamp the time at dispatch.
+- `vrr_cursor_hold_queued_acceptance_renews`: accept A at 0, accept B as the successor at 90 ms, dispatch and retire B
+  at 120 ms. A move at 125 ms is held. Mutation: do not stamp queued acceptances.
+- `vrr_cursor_hold_cursor_commits_do_not_renew`: at 100 ms an idle move is committed; its event retires at 101 ms, and
+  a move at 102 ms is committed at once as well. Mutation: stamp on a cursor commit or its retirement.
+- `vrr_cursor_hold_pending_move_crosses_boundary`: last Present at 0, move at 90 ms (deadline 123 ms). The real
+  `Backend::next_wakeup` is honoured with no further motion or Present, and exactly one cursor-only commit carries the
+  latest position. Re-evaluating at 105 ms makes the wake immediate, not absent. Runs for a Root and an Output owner.
+  Mutation: lose the cursor wake when idle removes the held deadline.
+- `vrr_cursor_hold_idle_leaves_vrr_alone`: past 100 ms with VRR committed on, both VRR callers run with the idle state:
+  - a gamma ramp through Backend/RandR with no frame in flight gives a gamma-only request with no VRR clear;
+  - gamma queued behind an idle cursor-only commit, with its event retired, is submitted by the retry path with no VRR
+    clear.
+
+  Mutation, one per caller: feed the idle-aware value to the gamma path, or to the property retry.
+- `vrr_cursor_hold_idle_is_per_output`: two outputs with their own Output owners, both VRR-on; one stays fresh while
+  the other ages past 100 ms. The idle output commits and the fresh one holds. Mutation: read one scope for every
+  output.
+- `vrr_cursor_hold_reset_on_teardown`: after a Backend-driven unflip, and after the queued first-entry fallback, the
+  slot's time is `None`. Mutation: skip the reset on either path.
+- The existing VRR, cursor and tearing backend tests keep their behavioural assertions. Fixtures that enter direct
+  scanout before installing the controlled clock (the `vrr.rs` cursor harness and its callers, and the two-output
+  cursor fixture in `vrr_per_output.rs`) install the clock before direct entry instead, so wall time spent between
+  setup and the first move cannot make the owner look idle.
 
 **Hardware (ask the user first):** repeat the spike checks on the final build. On NVIDIA DP-3 (`--vrr all`) and AMD
 DP-1 (`--vrr`): a still Steam image, a paused Discord video and a paused fullscreen mpv. Check that the cursor is
