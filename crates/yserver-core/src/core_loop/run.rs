@@ -2433,6 +2433,16 @@ fn run_core_with_inventory(
                     BackendFdKind::ScanoutRenderCompletion => {
                         backend.on_scanout_render_completion(state);
                     }
+                    BackendFdKind::HostDisplay => {
+                        if !backend.on_host_display_ready(state) {
+                            log::info!("rootless host display closed; shutting down");
+                            cancel_all_pending_backend_requests(
+                                backend,
+                                &mut pending_backend_requests,
+                            );
+                            return Ok(());
+                        }
+                    }
                 }
                 continue;
             }

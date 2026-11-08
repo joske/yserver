@@ -1591,6 +1591,10 @@ pub struct KmsBackendState {
     /// `GLX_EXT_texture_from_pixmap`.
     pub(in crate::kms::render::backend) dmabuf_export_supported: bool,
 
+    /// The rootless host this card-less server shows its top-levels on
+    /// (`rootless.rs`); `None` on a card.
+    pub(in crate::kms::render::backend) rootless: Option<super::rootless::RootlessKms>,
+
     /// Last `export holders` report, for change detection.
     pub(in crate::kms::render::backend) export_holders:
         crate::kms::render::export_holders::ExportHoldersReporter,

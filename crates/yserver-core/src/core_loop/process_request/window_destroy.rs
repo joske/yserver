@@ -139,6 +139,7 @@ pub(crate) fn execute_destroy(
             client.save_set.remove(&window);
         }
         drop_selections_owned_by_windows(state, &[window], SELECTION_NOTIFY_WINDOW_DESTROY);
+        crate::rootless::selection::forget_window(state, window);
         // `DeleteWindowFromAnyEvents(w, TRUE)` (`dix/events.c:5905-6002`).
         if !unrealized.contains(&window) {
             delete_window_from_any_events(state, backend, origin, window, &windows, top);

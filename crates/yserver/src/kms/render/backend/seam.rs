@@ -330,6 +330,11 @@ pub trait Platform: OutputSink + Sized + 'static {
 
     fn finish_present_source_wait(_b: &mut XBackend<Self>, _wait_id: u64) {}
 
+    /// `Backend::present_supersedes_same_msc`.
+    fn present_supersedes_same_msc(_b: &XBackend<Self>) -> bool {
+        true
+    }
+
     fn present_flip_in_flight(_b: &XBackend<Self>, _crtc_id: u32) -> bool {
         false
     }
@@ -447,6 +452,12 @@ pub trait Platform: OutputSink + Sized + 'static {
 
     fn randr_limits(_b: &XBackend<Self>) -> yserver_core::randr::RandrLimits {
         yserver_core::randr::RandrLimits::default()
+    }
+
+    /// `Backend::on_host_display_ready`: a rootless host's display
+    /// connection is readable; `false` when it closed.
+    fn on_host_display_ready(_b: &mut XBackend<Self>, _state: &mut ServerState) -> bool {
+        true
     }
 
     fn poll_deferred_input(_b: &mut XBackend<Self>, _state: &mut ServerState) {}

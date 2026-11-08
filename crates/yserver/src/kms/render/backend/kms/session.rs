@@ -277,6 +277,7 @@ impl KmsBackend {
             vidmode_gamma: None,
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
+            rootless: None,
             export_holders: Default::default(),
         };
         let mut b = Self::assemble(core, platform, engine, scene, pstate, kms_outputs_active);

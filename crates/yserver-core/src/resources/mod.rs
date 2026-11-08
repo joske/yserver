@@ -53,6 +53,9 @@ pub const GLMARK_VISUAL: ResourceId = ResourceId(0x105);
 pub const SCREEN_SAVER_WINDOW: ResourceId = ResourceId(0x106);
 /// Rootless mode's `_NET_SUPPORTING_WM_CHECK` window (EWMH §3.13).
 pub const ROOTLESS_WM_CHECK_WINDOW: ResourceId = ResourceId(0x107);
+/// Rootless mode's selection window, which owns X selections for a host's
+/// clipboard (`rootless/selection.rs`).
+pub const ROOTLESS_SELECTION_WINDOW: ResourceId = ResourceId(0x108);
 /// The server's default font ("fixed"), which every new GC starts with
 /// (Xorg `SetDefaultFont`, `dix/dixfonts.c:132`; `dix/gc.c:507`).
 pub const DEFAULT_FONT: ResourceId = ResourceId(0x10a);

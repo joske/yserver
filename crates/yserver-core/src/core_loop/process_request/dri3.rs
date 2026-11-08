@@ -409,18 +409,19 @@ pub(super) fn handle_dri3_request(
             };
             return Ok(write_to_client(client, client_id, &reply));
         }
+        // Not gated on `caps.fence_fd`, which is the renderer's SYNC_FD
+        // semaphores (FDFromFence's export needs them): what a client
+        // sends here is Mesa's xshmfence, shared memory the backend maps
+        // without Vulkan, and Xorg takes it on every screen
+        // (`miSyncShmFenceFromFD`). Refused, every Vulkan swapchain on
+        // such a renderer (lavapipe) waited on its buffers for ever.
+        //
+        // The checks are Xorg's `proc_dri3_fence_from_fd`, in its order:
+        // the length, a new fence ID in the client's range
+        // (`LEGAL_NEW_RESOURCE`), the drawable, then the fd. A fd the
+        // backend can't take is BadValue and makes no fence, as
+        // `miSyncShmCreateFenceFromFd` when `xshmfence_map_shm` fails.
         x11dri3::FENCE_FROM_FD => {
-            if !caps.fence_fd {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_IMPLEMENTATION,
-                    0,
-                    u16::from(header.data),
-                    DRI3_MAJOR_OPCODE,
-                );
-            }
             let Some(req) = x11dri3::parse_fence_from_fd(body) else {
                 return emit_x11_error_with_minor(
                     state,
@@ -432,39 +433,61 @@ pub(super) fn handle_dri3_request(
                     DRI3_MAJOR_OPCODE,
                 );
             };
+            if xid_out_of_client_range(state, client_id, req.fence) || state.xid_occupied(req.fence)
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ID_CHOICE,
+                    req.fence,
+                    u16::from(header.data),
+                    DRI3_MAJOR_OPCODE,
+                );
+            }
+            let drawable_exists = state.resources.window(ResourceId(req.drawable)).is_some()
+                || state.resources.pixmap(ResourceId(req.drawable)).is_some();
+            if !drawable_exists {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_DRAWABLE,
+                    req.drawable,
+                    u16::from(header.data),
+                    DRI3_MAJOR_OPCODE,
+                );
+            }
             let Some(fd) = attached_fd else {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
-                    x11::error::BAD_ALLOC,
+                    x11::error::BAD_VALUE,
                     req.fence,
                     u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
                 );
             };
-            // Best-effort import: many clients (Mesa included) send an
-            // fd that doesn't import cleanly via SYNC_FD on Venus
-            // passthrough. Per design §3.4 the GPU-side semaphore is
-            // an optimisation; XSync trigger/await semantics still
-            // work server-side via the fence resource. Always mirror
-            // onto state.sync_fences so QueryFence / TriggerFence /
-            // ResetFence behave correctly.
-            match backend.dri3_fence_from_fd(req.fence, fd) {
-                Ok(()) => {
-                    debug!(
-                        "client {} #{} DRI3::FenceFromFD 0x{:x} initially_triggered={} -> imported (semaphore-backed)",
-                        client_id.0, sequence.0, req.fence, req.initially_triggered
-                    );
-                }
-                Err(e) => {
-                    log::warn!(
-                        "DRI3::FenceFromFD 0x{:x}: VkSemaphore import failed ({e}); \
-                         falling back to server-only fence (XSync trigger/await still works)",
-                        req.fence
-                    );
-                }
+            if let Err(e) = backend.dri3_fence_from_fd(req.fence, fd) {
+                debug!(
+                    "client {} #{} DRI3::FenceFromFD 0x{:x} -> BadValue ({e})",
+                    client_id.0, sequence.0, req.fence
+                );
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    req.fence,
+                    u16::from(header.data),
+                    DRI3_MAJOR_OPCODE,
+                );
             }
+            debug!(
+                "client {} #{} DRI3::FenceFromFD 0x{:x} initially_triggered={}",
+                client_id.0, sequence.0, req.fence, req.initially_triggered
+            );
             state.sync_fences.insert(
                 req.fence,
                 crate::server::SyncFence {

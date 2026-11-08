@@ -241,6 +241,11 @@ pub(crate) fn primary_device_key_from_fd(fd: BorrowedFd<'_>) -> io::Result<DrmDe
     device_key_from_fd(fd)
 }
 
+/// Every render node in `/dev/dri`.
+pub(crate) fn render_nodes() -> io::Result<Vec<DrmNode>> {
+    enumerate_nodes("renderD", DrmNodeKind::Render)
+}
+
 pub(crate) fn render_node_for_primary(primary: DrmDeviceKey) -> io::Result<Option<DrmNode>> {
     #[cfg(target_os = "linux")]
     if let Some(path) = super::drm_linux::render_node_path_for_primary(primary)? {

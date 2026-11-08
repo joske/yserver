@@ -277,6 +277,10 @@ impl<P: Platform> Backend for XBackend<P> {
         P::begin_ready_present_destination_write(self, wait_id)
     }
 
+    fn present_supersedes_same_msc(&self) -> bool {
+        P::present_supersedes_same_msc(self)
+    }
+
     fn finish_present_source_wait(&mut self, wait_id: u64) {
         P::finish_present_source_wait(self, wait_id)
     }
@@ -414,6 +418,10 @@ impl<P: Platform> Backend for XBackend<P> {
 
     fn set_logical_screen_size(&mut self, w: u16, h: u16) -> io::Result<()> {
         P::set_logical_screen_size(self, w, h)
+    }
+
+    fn on_host_display_ready(&mut self, state: &mut ServerState) -> bool {
+        P::on_host_display_ready(self, state)
     }
 
     fn on_libinput_ready(&mut self, _state: &mut ServerState) {
@@ -1926,6 +1934,10 @@ impl<P: Platform> Backend for XBackend<P> {
 
     fn set_cursor_hidden(&mut self, hidden: bool) {
         self.apply_cursor_hidden(hidden);
+    }
+
+    fn displayed_cursor_hidden(&self) -> bool {
+        self.effective_cursor_hidden()
     }
 
     fn take_displayed_cursor_change(&mut self) -> Option<yserver_core::backend::DisplayedCursor> {

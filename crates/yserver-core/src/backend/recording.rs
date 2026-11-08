@@ -374,6 +374,8 @@ pub struct RecordingBackend {
     pub active_cursor_image: Option<crate::backend::ActiveCursorImage>,
     /// Cursor handles retained by a test backend after `free_cursor`.
     pub alive_cursors: HashSet<u32>,
+    /// What `displayed_cursor_hidden` answers.
+    pub displayed_cursor_hidden: bool,
     next_handle: Mutex<u32>,
     fake_window_id: u32,
     fake_root_visual_xid: u32,
@@ -542,6 +544,8 @@ pub struct RecordingBackend {
     /// `(xid, triggered)` of each shared-memory fence `dri3_destroy_fence`
     /// unmapped, with its in-memory state at unmap time.
     pub destroyed_shm_fences: Vec<(u32, bool)>,
+    /// `dri3_fence_from_fd` fails, as for a fd that isn't an xshmfence.
+    pub refuse_fence_fds: bool,
     /// `(syncobj_xid, value)` passed to `dri3_signal_syncobj`, in call
     /// order — Task 8: lets a `PixmapSynced` supersession/copy-failure
     /// release be asserted the same way `triggered_dri3_fences` covers
@@ -731,6 +735,7 @@ impl RecordingBackend {
             displayed_cursor_change: None,
             active_cursor_image: None,
             alive_cursors: HashSet::new(),
+            displayed_cursor_hidden: false,
             next_handle: Mutex::new(0x0001_0000),
             fake_window_id: 0x0000_0100,
             fake_root_visual_xid: 0x0000_0021,
@@ -791,6 +796,7 @@ impl RecordingBackend {
             triggered_dri3_fences: Vec::new(),
             shm_fences: std::collections::HashMap::new(),
             destroyed_shm_fences: Vec::new(),
+            refuse_fence_fds: false,
             signalled_dri3_syncobjs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             dri3_syncobj_owners: std::collections::HashMap::new(),
             dri3_caps: crate::backend::Dri3Caps::unsupported(),
@@ -965,6 +971,10 @@ impl crate::backend::SyncobjHandle for RecordingSyncobjHandle {
 }
 
 impl Backend for RecordingBackend {
+    fn displayed_cursor_hidden(&self) -> bool {
+        self.displayed_cursor_hidden
+    }
+
     // State accessors — return fixed sentinels so the call sites that
     // need a real number get a real number; record nothing.
 
@@ -1075,6 +1085,17 @@ impl Backend for RecordingBackend {
 
     fn release_present_source(&mut self, pin_id: u64) {
         self.released_present_sources.push(pin_id);
+    }
+
+    fn dri3_fence_from_fd(
+        &mut self,
+        _fence_xid: u32,
+        _fd: crate::fd::OwnedFd,
+    ) -> std::io::Result<()> {
+        if self.refuse_fence_fds {
+            return Err(std::io::Error::other("not an xshmfence"));
+        }
+        Ok(())
     }
 
     fn dri3_trigger_fence(&mut self, fence_xid: u32) -> std::io::Result<()> {

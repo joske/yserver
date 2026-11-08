@@ -135,6 +135,42 @@ pub(crate) fn map_input(state: &mut ServerState, backend: &mut dyn Backend, inpu
             );
             motion(state, backend, origin, at, time);
         }
+        RootlessInput::PointerRelative {
+            origin,
+            delta,
+            unaccelerated,
+            time,
+        } => {
+            let Some(r) = state.rootless.as_mut().filter(|r| r.lock.held()) else {
+                log::debug!("rootless: relative motion without a lock dropped");
+                return;
+            };
+            let [across, down, raw_across, raw_down] = &mut r.lock.residue;
+            let (dx, dy) = (
+                super::lock::whole(across, delta.0),
+                super::lock::whole(down, delta.1),
+            );
+            let (raw_dx, raw_dy) = (
+                super::lock::whole(raw_across, unaccelerated.0),
+                super::lock::whole(raw_down, unaccelerated.1),
+            );
+            let x = i32::from(state.pointer_root.0) + dx;
+            let y = i32::from(state.pointer_root.1) + dy;
+            handle_host_input(
+                state,
+                backend,
+                HostInputEvent::PointerMotion {
+                    origin,
+                    x,
+                    y,
+                    time,
+                    relative: true,
+                    dx: raw_dx,
+                    dy: raw_dy,
+                    motion_delta: Some([delta.0, delta.1]),
+                },
+            );
+        }
     }
 }
 
@@ -175,6 +211,9 @@ pub(super) fn activate(state: &mut ServerState, backend: &mut dyn Backend, id: T
         return;
     }
     let (input, take_focus) = (t.info.input_hint, t.info.protocols.take_focus);
+    if let Some(r) = state.rootless.as_mut() {
+        r.active = Some(window);
+    }
     if input != Some(false) {
         set_input_focus_as_server(state, window, 1); // RevertToPointerRoot
     }
@@ -216,6 +255,9 @@ fn held_keys(state: &ServerState) -> Vec<(u8, InputOrigin)> {
 /// `Deactivated`: release every pressed key on the device that pressed it
 /// (XWin `winKeybdReleaseKeys`), focus None, `_NET_ACTIVE_WINDOW = None`.
 pub(super) fn deactivate(state: &mut ServerState, backend: &mut dyn Backend) {
+    if let Some(r) = state.rootless.as_mut() {
+        r.active = None;
+    }
     let time = state.timestamp_now();
     let (rx, ry) = state.pointer_root;
     for (keycode, origin) in held_keys(state) {

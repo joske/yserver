@@ -7,7 +7,9 @@
 mod acks;
 mod host;
 mod info;
+mod lock;
 mod seat;
+pub mod selection;
 mod topology;
 mod types;
 mod wm;
@@ -33,8 +35,10 @@ use yserver_protocol::x11::ResourceId;
 
 pub use acks::ConfigureSource;
 pub(crate) use acks::note_configure;
+pub(crate) use lock::note_warp;
 pub use seat::PointerScope;
 pub(crate) use seat::map_input;
+pub use selection::{SelectionError, SelectionEvent};
 pub(crate) use wm::{note_root_client_message, refuse_root_redirect};
 
 use crate::{
@@ -99,6 +103,15 @@ pub struct Rootless {
     written_stacking: Vec<u32>,
     /// Pointer scope for the hit test (spec §4.4).
     scope: PointerScope,
+    /// The Managed top-level the host last activated: where its keyboard is.
+    active: Option<ResourceId>,
+    /// The pointer lock (`lock.rs`).
+    lock: lock::LockState,
+    /// What was sent the server's selection window, and the windows the
+    /// host watches (`selection.rs`).
+    selection: selection::SelectionBridge,
+    /// The window manager's name (`name_window_manager`).
+    wm_name: Option<String>,
 }
 
 impl Rootless {
@@ -117,6 +130,10 @@ impl Rootless {
             written_client_list: Vec::new(),
             written_stacking: Vec::new(),
             scope: PointerScope::Anywhere,
+            active: None,
+            lock: lock::LockState::default(),
+            selection: selection::SelectionBridge::default(),
+            wm_name: None,
         }
     }
 
@@ -125,6 +142,7 @@ impl Rootless {
     pub(crate) fn for_next_generation(&self) -> Self {
         Self {
             next_id: self.next_id,
+            wm_name: self.wm_name.clone(),
             ..Self::new(self.policy)
         }
     }
@@ -183,6 +201,9 @@ pub(crate) fn resume(state: &mut ServerState, backend: &mut dyn Backend, rootles
     match redirect_root_children(state, backend) {
         Ok(()) => {
             wm::announce(state, backend);
+            if let Some(name) = rootless.wm_name.clone() {
+                wm::set_wm_name(state, backend, &name);
+            }
             state.rootless = Some(rootless);
         }
         Err(e) => log::error!("rootless: cannot resume after reset: {e}"),
@@ -225,6 +246,19 @@ fn redirect_root_children(
     Ok(())
 }
 
+/// Name the built-in window manager `name` rather than "yserver" in its
+/// `_NET_SUPPORTING_WM_CHECK` window's `_NET_WM_NAME` (EWMH §3.13): the host
+/// manages the windows, and a client that shows its window manager (Steam's
+/// "X Window Manager") names the host's. Kept across a server reset.
+/// No-op when rootless is off.
+pub fn name_window_manager(state: &mut ServerState, backend: &mut dyn Backend, name: &str) {
+    let Some(rootless) = state.rootless.as_mut() else {
+        return;
+    };
+    rootless.wm_name = Some(name.to_owned());
+    wm::set_wm_name(state, backend, name);
+}
+
 /// A property of `window` changed (the `props.rs` writers): re-parse its
 /// info at the next reconcile. No-op when rootless is off.
 pub(crate) fn note_property_changed(
@@ -257,7 +291,10 @@ pub fn reconcile_and_dispatch(state: &mut ServerState, backend: &mut dyn Backend
     let Some(mut rootless) = state.rootless.take() else {
         return;
     };
-    let events = rootless.reconcile(state);
+    let mut events = rootless.reconcile(state);
+    if let Some(event) = lock::reconcile(&mut rootless, state, backend.displayed_cursor_hidden()) {
+        events.push(event);
+    }
     wm::apply_policy(state, backend, &mut rootless, &events);
     state.rootless = Some(rootless);
     if !events.is_empty() {
