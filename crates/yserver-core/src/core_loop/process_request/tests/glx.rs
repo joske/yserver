@@ -557,6 +557,7 @@ fn get_geometry_checks_glx_drawable_without_backing_pixmap() {
         *calls.lock().unwrap(),
         [(
             ResourceTarget {
+                owner: None,
                 id: ResourceId(pbuffer),
                 kind: ResourceKind::GlxDrawable,
                 creation: None,

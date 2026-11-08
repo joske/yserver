@@ -31,6 +31,7 @@ pub(super) fn handle_composite_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    use crate::access::{AccessMode, Creation, RequestOpcodes, ResourceKind, ResourceTarget};
     use yserver_protocol::x11::{ClientByteOrder, composite as x11composite};
     const COMPOSITE_MAJOR_OPCODE: u8 = 144;
     let byte_order = state
@@ -38,6 +39,50 @@ pub(super) fn handle_composite_request(
         .get(&client_id.0)
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
+    let access_request = RequestOpcodes::for_request(header);
+    macro_rules! check_resource {
+        ($id:expr, $kind:expr, $mode:expr) => {
+            super::return_on_access_denial!(
+                super::validate_resource_if_present(
+                    state,
+                    client_id,
+                    $id,
+                    $kind,
+                    $mode,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
+        };
+    }
+    macro_rules! check_region_creation {
+        ($id:expr, $parent:expr $(,)?) => {
+            super::return_on_access_denial!(
+                super::validate_resource_access(
+                    state,
+                    client_id,
+                    ResourceTarget {
+                        owner: None,
+                        id: ResourceId($id),
+                        kind: ResourceKind::Region,
+                        creation: Some(Creation {
+                            parent: $parent,
+                            owner: client_id,
+                        }),
+                    },
+                    AccessMode::CREATE,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
+        };
+    }
     match minor {
         x11composite::QUERY_VERSION => {
             let _ = x11composite::parse_query_version(body);
@@ -85,6 +130,8 @@ pub(super) fn handle_composite_request(
             let Some(parent) = state.resources.window(window).map(|w| w.parent) else {
                 return error(state, x11::error::BAD_WINDOW);
             };
+            let access_mode = AccessMode::SET_ATTR | AccessMode::MANAGE | AccessMode::BLEND;
+            check_resource!(window, ResourceKind::Window, access_mode);
             // compositeproto: update=0 → Automatic, update=1 → Manual. An
             // unredirect with any other value matches no record (BadValue
             // below, as Xorg).
@@ -107,6 +154,19 @@ pub(super) fn handle_composite_request(
             }
             let targets: Vec<ResourceId> = if subwindows {
                 crate::core_loop::process_request::subwindows_redirect_targets(state, window)
+                    .into_iter()
+                    .filter(|target| {
+                        super::validate_resource_if_present(
+                            state,
+                            client_id,
+                            *target,
+                            ResourceKind::Window,
+                            access_mode,
+                            access_request,
+                        )
+                        .is_ok()
+                    })
+                    .collect()
             } else {
                 vec![window]
             };
@@ -186,6 +246,12 @@ pub(super) fn handle_composite_request(
         }
         x11composite::CREATE_REGION_FROM_BORDER_CLIP => {
             if let Some((region, window)) = x11composite::parse_u32_pair(body) {
+                check_resource!(
+                    ResourceId(window),
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR
+                );
+                check_region_creation!(region, Some(ResourceId(window)));
                 let rects = vec![drawable_full_rect_xfixes(state, ResourceId(window))];
                 state.xfixes_regions.insert(
                     region,
@@ -291,6 +357,28 @@ pub(super) fn handle_composite_request(
                     COMPOSITE_MAJOR_OPCODE,
                 );
             }
+            check_resource!(window, ResourceKind::Window, AccessMode::GET_ATTR);
+            super::return_on_access_denial!(
+                super::validate_resource_access(
+                    state,
+                    client_id,
+                    ResourceTarget {
+                        owner: None,
+                        id: pixmap,
+                        kind: ResourceKind::Pixmap,
+                        creation: Some(Creation {
+                            parent: Some(window),
+                            owner: client_id,
+                        }),
+                    },
+                    AccessMode::CREATE,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
             let host_pixmap_xid = match backend.name_window_pixmap(origin, host_window_xid) {
                 Ok(handle) => handle,
                 Err(err) => {
@@ -354,7 +442,15 @@ pub(super) fn handle_composite_request(
                     COMPOSITE_MAJOR_OPCODE,
                 );
             }
-            let _window = x11composite::parse_window(body).unwrap_or(ROOT_WINDOW.0);
+            let supplied_window = x11composite::parse_window(body);
+            if let Some(window) = supplied_window {
+                check_resource!(
+                    ResourceId(window),
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR
+                );
+            }
+            let _window = supplied_window.unwrap_or(ROOT_WINDOW.0);
             // Must return a distinct XID, not root. See COMPOSITE_OVERLAY_WINDOW
             // for why — marco's compositor immediately calls XSelectInput on
             // this XID and would otherwise wipe its own WM event mask on root.
@@ -430,6 +526,13 @@ pub(super) fn handle_composite_request(
                     COMPOSITE_MAJOR_OPCODE,
                 );
             };
+            if let Some(window) = x11composite::parse_window(body) {
+                check_resource!(
+                    ResourceId(window),
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR
+                );
+            }
             if state.cow_claims.len() == 1 {
                 // Final release: tear down FIRST and keep the claim unless
                 // it succeeds. The claim is what keeps the overlay alive,
@@ -479,8 +582,28 @@ pub(super) fn handle_damage_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    use crate::access::{AccessMode, Creation, RequestOpcodes, ResourceKind, ResourceTarget};
     use yserver_protocol::x11::damage as x11damage;
     let minor = header.data;
+    let access_request = RequestOpcodes::for_request(header);
+    macro_rules! check_resource {
+        ($id:expr, $kind:expr, $mode:expr) => {
+            super::return_on_access_denial!(
+                super::validate_resource_if_present(
+                    state,
+                    client_id,
+                    $id,
+                    $kind,
+                    $mode,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
+        };
+    }
     match minor {
         x11damage::QUERY_VERSION => {
             let (client_major, client_minor) = x11damage::parse_query_version(body)
@@ -506,6 +629,36 @@ pub(super) fn handle_damage_request(
         x11damage::CREATE => {
             if let Some((damage, drawable, level)) = x11damage::parse_create(body) {
                 let drawable_id = ResourceId(drawable);
+                let drawable_kind = match super::drawable_lookup(state, drawable_id) {
+                    super::DrawableLookup::InputOutputWindow { .. }
+                    | super::DrawableLookup::InputOnlyWindow => Some(ResourceKind::Window),
+                    super::DrawableLookup::Pixmap { .. } => Some(ResourceKind::Pixmap),
+                    super::DrawableLookup::Missing => None,
+                };
+                if let Some(kind) = drawable_kind {
+                    check_resource!(drawable_id, kind, AccessMode::GET_ATTR | AccessMode::READ);
+                }
+                super::return_on_access_denial!(
+                    super::validate_resource_access(
+                        state,
+                        client_id,
+                        ResourceTarget {
+                            owner: None,
+                            id: ResourceId(damage),
+                            kind: ResourceKind::Damage,
+                            creation: Some(Creation {
+                                parent: Some(drawable_id),
+                                owner: client_id,
+                            }),
+                        },
+                        AccessMode::CREATE,
+                        access_request,
+                    ),
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                );
                 // DamageRegister prepends to the drawable's list
                 // (`miext/damage/damage.c:1482`).
                 state.damage_list_clock += 1;
@@ -555,6 +708,11 @@ pub(super) fn handle_damage_request(
         }
         x11damage::DESTROY => {
             if let Some(damage) = x11damage::parse_resource(body) {
+                check_resource!(
+                    ResourceId(damage),
+                    ResourceKind::Damage,
+                    AccessMode::DESTROY
+                );
                 let drawable = state.damage_objects.remove(&damage).map(|d| d.drawable.0);
                 debug!(
                     "client {} #{} DAMAGE::Destroy damage=0x{damage:x} drawable=0x{:x}",
@@ -571,8 +729,39 @@ pub(super) fn handle_damage_request(
         }
         x11damage::ADD => {
             if let Some((drawable, region)) = x11damage::parse_add(body) {
+                let drawable_id = ResourceId(drawable);
+                let drawable_kind = match super::drawable_lookup(state, drawable_id) {
+                    super::DrawableLookup::InputOutputWindow { .. }
+                    | super::DrawableLookup::InputOnlyWindow => Some(ResourceKind::Window),
+                    super::DrawableLookup::Pixmap { .. } => Some(ResourceKind::Pixmap),
+                    super::DrawableLookup::Missing => None,
+                };
+                if let Some(kind) = drawable_kind {
+                    check_resource!(drawable_id, kind, AccessMode::WRITE);
+                }
+                check_resource!(ResourceId(region), ResourceKind::Region, AccessMode::WRITE);
+                let damage_ids: Vec<u32> = state
+                    .damage_objects
+                    .iter()
+                    .filter_map(|(id, damage)| (damage.drawable == drawable_id).then_some(*id))
+                    .collect();
+                let mut allowed_damage_ids = Vec::with_capacity(damage_ids.len());
+                for damage_id in damage_ids {
+                    if super::validate_resource_if_present(
+                        state,
+                        client_id,
+                        ResourceId(damage_id),
+                        ResourceKind::Damage,
+                        AccessMode::WRITE,
+                        access_request,
+                    )
+                    .is_ok()
+                    {
+                        allowed_damage_ids.push(damage_id);
+                    }
+                }
                 let rects = if region == 0 {
-                    vec![drawable_full_rect_xfixes(state, ResourceId(drawable))]
+                    vec![drawable_full_rect_xfixes(state, drawable_id)]
                 } else {
                     state
                         .xfixes_regions
@@ -580,8 +769,8 @@ pub(super) fn handle_damage_request(
                         .map(crate::server::XFixesRegion::rects)
                         .unwrap_or_default()
                 };
-                for damage in state.damage_objects.values_mut() {
-                    if damage.drawable == ResourceId(drawable) {
+                for damage_id in allowed_damage_ids {
+                    if let Some(damage) = state.damage_objects.get_mut(&damage_id) {
                         damage.rects.extend(rects.clone());
                         damage.rects = normalize_region_rects(std::mem::take(&mut damage.rects));
                     }
@@ -591,6 +780,13 @@ pub(super) fn handle_damage_request(
         }
         x11damage::SUBTRACT => {
             if let Some((damage_id, repair, parts)) = x11damage::parse_subtract(body) {
+                check_resource!(
+                    ResourceId(damage_id),
+                    ResourceKind::Damage,
+                    AccessMode::WRITE
+                );
+                check_resource!(ResourceId(repair), ResourceKind::Region, AccessMode::WRITE);
+                check_resource!(ResourceId(parts), ResourceKind::Region, AccessMode::WRITE);
                 // NonEmpty damage coalesces later paints without notifying
                 // again. Submit those writes before acknowledging/consuming
                 // the damage, not only before the initial DamageNotify.

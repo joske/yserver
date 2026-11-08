@@ -1,4 +1,5 @@
 use crate::resources::ResourceTable;
+use std::collections::HashSet;
 use yserver_protocol::x11::{ClientId, ResourceId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,13 +154,23 @@ impl ResourceTable {
     }
 
     pub fn set_cursor_host_xid(&mut self, id: ResourceId, handle: crate::backend::CursorHandle) {
-        if let Some(c) = self.cursors.get_mut(&id.0) {
-            c.host_xid = Some(handle);
-        }
+        let Some(cursor) = self.cursors.get_mut(&id.0) else {
+            return;
+        };
+        cursor.host_xid = Some(handle);
+        self.cursor_host_origins
+            .entry(handle.as_raw())
+            .or_insert((id, cursor.owner));
     }
 
     pub fn cursor_host_xid(&self, id: ResourceId) -> Option<u32> {
         self.cursors.get(&id.0)?.host_xid.map(|h| h.as_raw())
+    }
+
+    /// Original client cursor identity for a backend cursor handle.
+    #[must_use]
+    pub fn cursor_host_origin(&self, host: u32) -> Option<(ResourceId, ClientId)> {
+        self.cursor_host_origins.get(&host).copied()
     }
 
     /// True iff `id` is a live cursor in the resource table — the
@@ -276,19 +287,29 @@ impl ResourceTable {
     pub fn free_cursor(&mut self, id: ResourceId) -> Option<u32> {
         let host_xid = self.cursors.get(&id.0).and_then(|c| c.host_xid);
         self.cursors.remove(&id.0);
-        let freed = host_xid
+        host_xid
             .map(|h| h.as_raw())
-            .filter(|host| !self.cursor_host_referenced(*host));
-        if let Some(host) = freed {
-            self.cursor_host_released(host);
-        }
-        freed
+            .filter(|host| !self.cursor_host_referenced(*host))
     }
 
-    /// The caller frees host cursor `host` itself: no pending window drop
-    /// may free it again.
-    pub fn cursor_host_released(&mut self, host: u32) {
+    /// Sweep retained origins at a host-cursor release point. A record stays
+    /// while the core references the handle or the backend still owns it.
+    pub fn cursor_host_released(&mut self, host: u32, mut cursor_alive: impl FnMut(u32) -> bool) {
         self.dropped_cursor_hosts.retain(|&h| h != host);
+        let referenced: HashSet<_> = self
+            .cursors
+            .values()
+            .filter_map(|c| c.host_xid.map(|h| h.as_raw()))
+            .chain(
+                self.windows
+                    .values()
+                    .filter_map(|w| w.cursor_host.map(|h| h.as_raw())),
+            )
+            .collect();
+        // KMS host XIDs are monotonic and never reused, so a retained origin
+        // cannot identify a different cursor.
+        self.cursor_host_origins
+            .retain(|origin, _| referenced.contains(origin) || cursor_alive(*origin));
     }
 
     /// Mark a cursor as animated (RENDER CreateAnimCursor product).

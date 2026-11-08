@@ -1,4 +1,5 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind},
     backend::Backend,
     core_loop::process_request::{
         RequestOutcome, XI2_FIRST_ERROR, emit_x11_error_with_minor, write_to_client,
@@ -103,6 +104,27 @@ pub(super) fn handle_xtest_request(
                     header.opcode,
                 );
             }
+            let access_request = RequestOpcodes::for_request(header);
+            if let Err((code, value)) =
+                crate::core_loop::process_request::validate_resource_if_present(
+                    state,
+                    client_id,
+                    window,
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR,
+                    access_request,
+                )
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
             let comparison = if cursor.0 == 0 {
                 None
             } else if cursor.0 == 1 {
@@ -120,6 +142,27 @@ pub(super) fn handle_xtest_request(
                     header.opcode,
                 );
             };
+            if cursor.0 > 1
+                && let Err((code, value)) =
+                    crate::core_loop::process_request::validate_resource_if_present(
+                        state,
+                        client_id,
+                        cursor,
+                        ResourceKind::Cursor,
+                        AccessMode::READ,
+                        access_request,
+                    )
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
             // Xorg compares cursor objects: after XFIXES ChangeCursor two
             // XIDs can name the same cursor, so compare their host handles.
             let effective = effective_window_cursor(state, window);
@@ -148,6 +191,27 @@ pub(super) fn handle_xtest_request(
                 );
                 return Ok(RequestOutcome::Handled);
             };
+            if fi.root != 0
+                && let Err((code, value)) =
+                    crate::core_loop::process_request::validate_resource_if_present(
+                        state,
+                        client_id,
+                        ResourceId(fi.root),
+                        ResourceKind::Window,
+                        AccessMode::GET_ATTR,
+                        RequestOpcodes::for_request(header),
+                    )
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
             debug!(
                 "client {} #{} XTEST::FakeInput type={} detail={} root_xy=({},{})",
                 client_id.0, sequence.0, fi.event_type, fi.detail, fi.root_x, fi.root_y

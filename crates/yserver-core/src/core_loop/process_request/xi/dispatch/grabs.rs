@@ -1,4 +1,5 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind},
     backend::{Backend, OriginContext},
     core_loop::{
         fanout::fanout_event_to_clients,
@@ -62,6 +63,7 @@ pub(super) fn handle_xi_grab_device(
     sequence: SequenceNumber,
     body: &[u8],
     byte_order: ClientByteOrder,
+    access_request: RequestOpcodes,
 ) -> io::Result<RequestOutcome> {
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     {
@@ -114,6 +116,29 @@ pub(super) fn handle_xi_grab_device(
                 );
             }
         };
+        for (id, kind, mode) in [
+            (
+                ResourceId(grab_window),
+                ResourceKind::Window,
+                AccessMode::SET_ATTR,
+            ),
+            (ResourceId(cursor), ResourceKind::Cursor, AccessMode::USE),
+        ] {
+            crate::core_loop::process_request::return_on_access_denial!(
+                crate::core_loop::process_request::validate_resource_if_present(
+                    state,
+                    client_id,
+                    id,
+                    kind,
+                    mode,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
+        }
         let is_keyboard = matches!(
             role,
             crate::xinput::XiDeviceRole::MasterKeyboard
@@ -661,6 +686,7 @@ pub(super) fn handle_xi_passive_grab_device(
     sequence: SequenceNumber,
     body: &[u8],
     byte_order: ClientByteOrder,
+    access_request: RequestOpcodes,
 ) -> io::Result<RequestOutcome> {
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     {
@@ -731,6 +757,33 @@ pub(super) fn handle_xi_passive_grab_device(
                     XI2_MAJOR_OPCODE,
                 );
             }
+        }
+        for (id, kind, mode) in [
+            (
+                ResourceId(grab_window),
+                ResourceKind::Window,
+                AccessMode::SET_ATTR,
+            ),
+            (
+                ResourceId(u32::from_le_bytes([body[8], body[9], body[10], body[11]])),
+                ResourceKind::Cursor,
+                AccessMode::USE,
+            ),
+        ] {
+            crate::core_loop::process_request::return_on_access_denial!(
+                crate::core_loop::process_request::validate_resource_if_present(
+                    state,
+                    client_id,
+                    id,
+                    kind,
+                    mode,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
         }
         let deviceid = passive_grab_device(deviceid, grab_type);
         // Modifiers tail starts after the header (28) and the mask
@@ -849,6 +902,7 @@ pub(super) fn handle_xi_passive_ungrab_device(
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
+    access_request: RequestOpcodes,
 ) -> io::Result<RequestOutcome> {
     // XIPassiveUngrabDevice body: grab_window(4) + detail(4)
     // + deviceid(2) + num_modifiers(2) + grab_type(1) +
@@ -895,6 +949,20 @@ pub(super) fn handle_xi_passive_ungrab_device(
             );
         }
     }
+    crate::core_loop::process_request::return_on_access_denial!(
+        crate::core_loop::process_request::validate_resource_if_present(
+            state,
+            client_id,
+            ResourceId(grab_window),
+            ResourceKind::Window,
+            AccessMode::SET_ATTR,
+            access_request,
+        ),
+        state,
+        client_id,
+        sequence,
+        access_request,
+    );
     let device_id = passive_grab_device(device_id, grab_type);
     let mods_start = 16;
     let mut modifier_masks: Vec<u16> = Vec::with_capacity(num_modifiers.max(1).into());
@@ -961,6 +1029,7 @@ pub(super) fn handle_xi1_grab_device(
     body: &[u8],
     byte_order: ClientByteOrder,
     minor: u8,
+    access_request: RequestOpcodes,
 ) -> io::Result<RequestOutcome> {
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     {
@@ -1042,6 +1111,20 @@ pub(super) fn handle_xi1_grab_device(
                 );
             }
         }
+        crate::core_loop::process_request::return_on_access_denial!(
+            crate::core_loop::process_request::validate_resource_if_present(
+                state,
+                client_id,
+                ResourceId(win),
+                ResourceKind::Window,
+                AccessMode::SET_ATTR,
+                access_request,
+            ),
+            state,
+            client_id,
+            sequence,
+            access_request,
+        );
         // Establish the active device grab. Status values per X.h:
         // GrabSuccess 0, AlreadyGrabbed 1, GrabInvalidTime 2,
         // GrabNotViewable 3.
@@ -1165,6 +1248,7 @@ pub(super) fn handle_xi1_grab_device_key(
     sequence: SequenceNumber,
     body: &[u8],
     minor: u8,
+    access_request: RequestOpcodes,
 ) -> io::Result<RequestOutcome> {
     {
         if body.len() < 16 {
@@ -1261,6 +1345,20 @@ pub(super) fn handle_xi1_grab_device_key(
                 );
             }
         }
+        crate::core_loop::process_request::return_on_access_denial!(
+            crate::core_loop::process_request::validate_resource_if_present(
+                state,
+                client_id,
+                ResourceId(win),
+                ResourceKind::Window,
+                AccessMode::SET_ATTR,
+                access_request,
+            ),
+            state,
+            client_id,
+            sequence,
+            access_request,
+        );
         // Conflicting grab by another client → BadAccess (XTS
         // XGrabDeviceKey-16).
         if state.xi1_passive_grabs.iter().any(|g| {
@@ -1308,6 +1406,7 @@ pub(super) fn handle_xi1_ungrab_device_key(
     sequence: SequenceNumber,
     body: &[u8],
     minor: u8,
+    access_request: RequestOpcodes,
 ) -> io::Result<RequestOutcome> {
     {
         if body.len() < 9 {
@@ -1373,6 +1472,20 @@ pub(super) fn handle_xi1_ungrab_device_key(
                 minor,
             );
         }
+        crate::core_loop::process_request::return_on_access_denial!(
+            crate::core_loop::process_request::validate_resource_if_present(
+                state,
+                client_id,
+                ResourceId(win),
+                ResourceKind::Window,
+                AccessMode::SET_ATTR,
+                access_request,
+            ),
+            state,
+            client_id,
+            sequence,
+            access_request,
+        );
         state.xi1_passive_grabs.retain(|g| {
             !(g.is_key
                 && g.owner == client_id
@@ -1398,6 +1511,7 @@ pub(super) fn handle_xi1_grab_device_button(
     sequence: SequenceNumber,
     body: &[u8],
     minor: u8,
+    access_request: RequestOpcodes,
 ) -> io::Result<RequestOutcome> {
     {
         if body.len() < 16 {
@@ -1489,6 +1603,20 @@ pub(super) fn handle_xi1_grab_device_button(
                 );
             }
         }
+        crate::core_loop::process_request::return_on_access_denial!(
+            crate::core_loop::process_request::validate_resource_if_present(
+                state,
+                client_id,
+                ResourceId(win),
+                ResourceKind::Window,
+                AccessMode::SET_ATTR,
+                access_request,
+            ),
+            state,
+            client_id,
+            sequence,
+            access_request,
+        );
         if state.xi1_passive_grabs.iter().any(|g| {
             !g.is_key
                 && g.owner != client_id
@@ -1534,6 +1662,7 @@ pub(super) fn handle_xi1_ungrab_device_button(
     sequence: SequenceNumber,
     body: &[u8],
     minor: u8,
+    access_request: RequestOpcodes,
 ) -> io::Result<RequestOutcome> {
     {
         if body.len() < 9 {
@@ -1588,6 +1717,20 @@ pub(super) fn handle_xi1_ungrab_device_button(
                 minor,
             );
         }
+        crate::core_loop::process_request::return_on_access_denial!(
+            crate::core_loop::process_request::validate_resource_if_present(
+                state,
+                client_id,
+                ResourceId(win),
+                ResourceKind::Window,
+                AccessMode::SET_ATTR,
+                access_request,
+            ),
+            state,
+            client_id,
+            sequence,
+            access_request,
+        );
         let button = body[7];
         state.xi1_passive_grabs.retain(|g| {
             !(!g.is_key

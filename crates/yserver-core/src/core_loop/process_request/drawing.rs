@@ -458,6 +458,7 @@ pub(super) fn handle_get_image(
     if let Decision::Deny(error) = state.check_resource(
         client_id,
         &ResourceTarget {
+            owner: None,
             id: req.drawable,
             kind: drawable_kind,
             creation: None,
@@ -650,6 +651,7 @@ fn translate_poly_text_fonts(
             if let Decision::Deny(error) = state.check_resource(
                 client_id,
                 &ResourceTarget {
+                    owner: None,
                     id: ResourceId(client_xid),
                     kind: ResourceKind::Font,
                     creation: None,
@@ -1190,6 +1192,7 @@ pub(super) fn handle_clear_area(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: request.window,
                 kind: ResourceKind::Window,
                 creation: None,

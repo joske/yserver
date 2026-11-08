@@ -1,5 +1,466 @@
 use super::*;
 
+const SHAPE_ACCESS_CLIENT: u32 = 1;
+const SHAPE_ACCESS_DEST: ResourceId = ResourceId(0x0100_1001);
+const SHAPE_ACCESS_SOURCE: ResourceId = ResourceId(0x0100_1002);
+const SHAPE_ACCESS_PIXMAP: ResourceId = ResourceId(0x0100_1003);
+const SHAPE_ACCESS_ERROR_VALUE: u32 = 0x5a17;
+
+#[derive(Clone, Copy)]
+struct ShapeAccessCheck {
+    id: ResourceId,
+    kind: crate::access::ResourceKind,
+    mode: crate::access::AccessMode,
+}
+
+struct ShapeAccessCase {
+    name: &'static str,
+    minor: u8,
+    body: Vec<u8>,
+    expected: Vec<ShapeAccessCheck>,
+}
+
+fn shape_access_fixture(with_resources: bool) -> (ServerState, RecordingBackend, UnixStream) {
+    let mut state = ServerState::new();
+    let peer = install_client(&mut state, SHAPE_ACCESS_CLIENT);
+    if with_resources {
+        for id in [SHAPE_ACCESS_DEST, SHAPE_ACCESS_SOURCE] {
+            state.resources.create_window(
+                ClientId(SHAPE_ACCESS_CLIENT),
+                CreateWindowRequest {
+                    depth: 24,
+                    window: id,
+                    parent: ROOT_WINDOW,
+                    width: 20,
+                    height: 20,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            crate::nested::set_shape_region(
+                &mut state,
+                id,
+                yserver_protocol::x11::shape::KIND_INPUT,
+                crate::region::Region::rect(yserver_protocol::x11::xfixes::RegionRect {
+                    x: 1,
+                    y: 2,
+                    width: 3,
+                    height: 4,
+                }),
+            );
+        }
+        state.resources.create_pixmap(
+            ClientId(SHAPE_ACCESS_CLIENT),
+            CreatePixmapRequest {
+                depth: 1,
+                pixmap: SHAPE_ACCESS_PIXMAP,
+                drawable: SHAPE_ACCESS_DEST,
+                width: 4,
+                height: 4,
+            },
+        );
+    }
+    (state, RecordingBackend::new(), peer)
+}
+
+fn shape_access_cases(
+    dest: ResourceId,
+    source: ResourceId,
+    pixmap: ResourceId,
+) -> Vec<ShapeAccessCase> {
+    use crate::access::{AccessMode, ResourceKind};
+    use yserver_protocol::x11::shape as x11shape;
+
+    let rect = || {
+        let mut body = vec![
+            x11shape::OP_SET,
+            x11shape::KIND_INPUT,
+            x11shape::ORDERING_YX_BANDED,
+            0,
+        ];
+        body.extend_from_slice(&dest.0.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&[0, 0, 2, 0, 2, 0, 2, 0]);
+        body
+    };
+    let mut mask = vec![x11shape::OP_SET, x11shape::KIND_INPUT, 0, 0];
+    mask.extend_from_slice(&dest.0.to_le_bytes());
+    mask.extend_from_slice(&0i16.to_le_bytes());
+    mask.extend_from_slice(&0i16.to_le_bytes());
+    mask.extend_from_slice(&pixmap.0.to_le_bytes());
+    let mut combine = vec![
+        x11shape::OP_SET,
+        x11shape::KIND_INPUT,
+        x11shape::KIND_INPUT,
+        0,
+    ];
+    combine.extend_from_slice(&dest.0.to_le_bytes());
+    combine.extend_from_slice(&0i16.to_le_bytes());
+    combine.extend_from_slice(&0i16.to_le_bytes());
+    combine.extend_from_slice(&source.0.to_le_bytes());
+    let mut offset = vec![x11shape::KIND_INPUT, 0, 0, 0];
+    offset.extend_from_slice(&dest.0.to_le_bytes());
+    offset.extend_from_slice(&1i16.to_le_bytes());
+    offset.extend_from_slice(&1i16.to_le_bytes());
+    let mut select = dest.0.to_le_bytes().to_vec();
+    select.extend_from_slice(&[1, 0, 0, 0]);
+    let mut get_rectangles = dest.0.to_le_bytes().to_vec();
+    get_rectangles.extend_from_slice(&[x11shape::KIND_INPUT, 0, 0, 0]);
+
+    vec![
+        ShapeAccessCase {
+            name: "Rectangles destination",
+            minor: x11shape::RECTANGLES,
+            body: rect(),
+            expected: vec![ShapeAccessCheck {
+                id: dest,
+                kind: ResourceKind::Window,
+                mode: AccessMode::SET_ATTR,
+            }],
+        },
+        ShapeAccessCase {
+            name: "Mask destination then source pixmap",
+            minor: x11shape::MASK,
+            body: mask,
+            expected: vec![
+                ShapeAccessCheck {
+                    id: dest,
+                    kind: ResourceKind::Window,
+                    mode: AccessMode::SET_ATTR,
+                },
+                ShapeAccessCheck {
+                    id: pixmap,
+                    kind: ResourceKind::Pixmap,
+                    mode: AccessMode::READ,
+                },
+            ],
+        },
+        ShapeAccessCase {
+            name: "Combine source then destination",
+            minor: x11shape::COMBINE,
+            body: combine,
+            expected: vec![
+                ShapeAccessCheck {
+                    id: source,
+                    kind: ResourceKind::Window,
+                    mode: AccessMode::GET_ATTR,
+                },
+                ShapeAccessCheck {
+                    id: dest,
+                    kind: ResourceKind::Window,
+                    mode: AccessMode::SET_ATTR,
+                },
+            ],
+        },
+        ShapeAccessCase {
+            name: "Offset destination",
+            minor: x11shape::OFFSET,
+            body: offset,
+            expected: vec![ShapeAccessCheck {
+                id: dest,
+                kind: ResourceKind::Window,
+                mode: AccessMode::SET_ATTR,
+            }],
+        },
+        ShapeAccessCase {
+            name: "QueryExtents window",
+            minor: x11shape::QUERY_EXTENTS,
+            body: dest.0.to_le_bytes().to_vec(),
+            expected: vec![ShapeAccessCheck {
+                id: dest,
+                kind: ResourceKind::Window,
+                mode: AccessMode::GET_ATTR,
+            }],
+        },
+        ShapeAccessCase {
+            name: "SelectInput window",
+            minor: x11shape::SELECT_INPUT,
+            body: select,
+            expected: vec![ShapeAccessCheck {
+                id: dest,
+                kind: ResourceKind::Window,
+                mode: AccessMode::RECEIVE,
+            }],
+        },
+        ShapeAccessCase {
+            name: "InputSelected window",
+            minor: x11shape::INPUT_SELECTED,
+            body: dest.0.to_le_bytes().to_vec(),
+            expected: vec![ShapeAccessCheck {
+                id: dest,
+                kind: ResourceKind::Window,
+                mode: AccessMode::GET_ATTR,
+            }],
+        },
+        ShapeAccessCase {
+            name: "GetRectangles window",
+            minor: x11shape::GET_RECTANGLES,
+            body: get_rectangles,
+            expected: vec![ShapeAccessCheck {
+                id: dest,
+                kind: ResourceKind::Window,
+                mode: AccessMode::GET_ATTR,
+            }],
+        },
+    ]
+}
+
+fn shape_access_request(
+    state: &mut ServerState,
+    backend: &mut RecordingBackend,
+    body: &[u8],
+    minor: u8,
+    sequence: u16,
+) {
+    process_request(
+        state,
+        backend,
+        ClientId(SHAPE_ACCESS_CLIENT),
+        SequenceNumber(sequence),
+        RequestHeader {
+            opcode: 141,
+            data: minor,
+            length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+        },
+        body,
+        None,
+    )
+    .expect("SHAPE request");
+}
+
+fn shape_resource_checks(
+    calls: &[super::extensions::RecordedExtensionCheck],
+) -> Vec<(crate::access::ResourceTarget, crate::access::AccessMode)> {
+    calls
+        .iter()
+        .filter(|call| call.hook == super::extensions::ExtensionHook::Resource)
+        .map(|call| {
+            (
+                call.target.expect("resource hook target"),
+                call.mode.expect("resource hook mode"),
+            )
+        })
+        .collect()
+}
+
+fn shape_assert_policy_error(bytes: &[u8], minor: u8) {
+    assert_eq!(bytes.len(), 32, "policy denial is an X error packet");
+    assert_eq!(bytes[0], 0, "error packet type");
+    assert_eq!(bytes[1], yserver_protocol::x11::error::BAD_VALUE);
+    assert_eq!(
+        u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        SHAPE_ACCESS_ERROR_VALUE
+    );
+    assert_eq!(
+        u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+        u16::from(minor)
+    );
+    assert_eq!(bytes[10], 141, "error identifies the SHAPE major opcode");
+}
+
+#[test]
+fn shape_access_checks_ask_the_expected_targets_modes_and_order() {
+    // Mutation: remove the SHAPE::Rectangles destination SET_ATTR check.
+    use super::extensions::{ExtensionHook, RecordedExtensionCheck, RecordingExtensionPolicy};
+    use crate::access::{Decision, RequestOpcodes, ResourceTarget};
+
+    for case in shape_access_cases(SHAPE_ACCESS_DEST, SHAPE_ACCESS_SOURCE, SHAPE_ACCESS_PIXMAP) {
+        let (mut state, mut backend, _peer) = shape_access_fixture(true);
+        let calls = Arc::new(Mutex::new(Vec::<RecordedExtensionCheck>::new()));
+        state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+            Decision::Allow,
+            Arc::clone(&calls),
+        )));
+        shape_access_request(&mut state, &mut backend, &case.body, case.minor, 1);
+        let recorded = calls.lock().unwrap();
+        let checks = shape_resource_checks(&recorded);
+        let expected = case
+            .expected
+            .iter()
+            .map(|check| {
+                (
+                    ResourceTarget {
+                        owner: None,
+                        id: check.id,
+                        kind: check.kind,
+                        creation: None,
+                    },
+                    check.mode,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(checks, expected, "{}: resource checks", case.name);
+        assert!(recorded.iter().any(|call| {
+            call.hook == ExtensionHook::Dispatch
+                && call.request
+                    == Some(RequestOpcodes {
+                        major: 141,
+                        minor: case.minor,
+                    })
+        }));
+        for call in recorded
+            .iter()
+            .filter(|call| call.hook == ExtensionHook::Resource)
+        {
+            assert_eq!(
+                call.client,
+                ClientId(SHAPE_ACCESS_CLIENT),
+                "{}: client",
+                case.name
+            );
+            assert_eq!(
+                call.request,
+                Some(RequestOpcodes {
+                    major: 141,
+                    minor: case.minor,
+                }),
+                "{}: request context",
+                case.name,
+            );
+            assert_eq!(
+                call.owner,
+                Some(ClientId(SHAPE_ACCESS_CLIENT)),
+                "{}: owner",
+                case.name
+            );
+        }
+    }
+}
+
+#[test]
+fn shape_access_denials_stop_before_state_or_backend_effects() {
+    // Mutations: bypass SHAPE::Mask's source pixmap READ check, or insert a SelectInput
+    // selection before checking its window; each must fail its denial assertion.
+    use super::extensions::{RecordedExtensionCheck, RecordingExtensionPolicy};
+    use crate::access::DenyError;
+
+    for case in shape_access_cases(SHAPE_ACCESS_DEST, SHAPE_ACCESS_SOURCE, SHAPE_ACCESS_PIXMAP) {
+        for (denied_index, denied) in case.expected.iter().enumerate() {
+            let (mut state, mut backend, mut peer) = shape_access_fixture(true);
+            let previous_shapes = state.shape_windows.clone();
+            let previous_select_masks = state.shape_select_masks.clone();
+            let calls = Arc::new(Mutex::new(Vec::<RecordedExtensionCheck>::new()));
+            state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+                Arc::clone(&calls),
+                denied.id,
+                Some(denied.mode),
+                DenyError {
+                    code: yserver_protocol::x11::error::BAD_VALUE,
+                    value: SHAPE_ACCESS_ERROR_VALUE,
+                },
+            )));
+
+            shape_access_request(&mut state, &mut backend, &case.body, case.minor, 1);
+            let bytes = read_all_available(&mut peer);
+            shape_assert_policy_error(&bytes, case.minor);
+            assert_eq!(
+                state.shape_windows, previous_shapes,
+                "{}: state changed",
+                case.name
+            );
+            assert_eq!(
+                state.shape_select_masks, previous_select_masks,
+                "{}: SHAPE selection state changed",
+                case.name
+            );
+            assert!(
+                backend.calls().is_empty(),
+                "{}: backend was reached",
+                case.name
+            );
+            let recorded = calls.lock().unwrap();
+            let checks = shape_resource_checks(&recorded);
+            let expected = case.expected[..=denied_index]
+                .iter()
+                .map(|check| {
+                    (
+                        crate::access::ResourceTarget {
+                            owner: None,
+                            id: check.id,
+                            kind: check.kind,
+                            creation: None,
+                        },
+                        check.mode,
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(checks, expected, "{}: checks before denial", case.name);
+        }
+    }
+}
+
+#[test]
+fn shape_unresolved_operands_keep_no_policy_wire_bytes() {
+    // Mutation: reject an unresolved SHAPE operand on the empty-policy fast path.
+    use yserver_protocol::x11::{ClientByteOrder, shape as x11shape, xfixes::RegionRect};
+
+    const MISSING: ResourceId = ResourceId(0x7f00_1234);
+    const MISSING_SOURCE: ResourceId = ResourceId(0x7f00_1235);
+    for case in shape_access_cases(MISSING, MISSING_SOURCE, MISSING_SOURCE) {
+        let (mut state, mut backend, mut peer) = shape_access_fixture(false);
+        shape_access_request(&mut state, &mut backend, &case.body, case.minor, 1);
+        let expected_bytes = match case.minor {
+            x11shape::QUERY_EXTENTS => x11shape::encode_query_extents_reply(
+                ClientByteOrder::LittleEndian,
+                SequenceNumber(1),
+                false,
+                false,
+                RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+                RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+            ),
+            x11shape::INPUT_SELECTED => x11shape::encode_input_selected_reply(
+                ClientByteOrder::LittleEndian,
+                SequenceNumber(1),
+                false,
+            ),
+            x11shape::GET_RECTANGLES => x11shape::encode_get_rectangles_reply(
+                ClientByteOrder::LittleEndian,
+                SequenceNumber(1),
+                x11shape::ORDERING_YX_BANDED,
+                &[],
+            ),
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            read_all_available(&mut peer),
+            expected_bytes,
+            "{}: bytes without policy",
+            case.name,
+        );
+        assert!(
+            state
+                .clients
+                .get(&SHAPE_ACCESS_CLIENT)
+                .unwrap()
+                .outbound
+                .is_empty(),
+            "{}: no buffered extra bytes",
+            case.name,
+        );
+        if case.minor == x11shape::SELECT_INPUT {
+            assert_eq!(
+                state
+                    .shape_select_masks
+                    .get(&(SHAPE_ACCESS_CLIENT, MISSING)),
+                Some(&true),
+                "SelectInput's unresolved window keeps its historical selection entry",
+            );
+        }
+    }
+}
+
 /// XFixes `SetCursorName(cursor, "name")` interns the name as an
 /// atom and stores it on the cursor; the subsequent
 /// `GetCursorName(cursor)` returns the same atom + name bytes.
@@ -168,6 +629,889 @@ const XFIXES_WRITER: u32 = 2;
 const XFIXES_REGION: u32 = 0x0100_0001;
 const XFIXES_SOURCE: u32 = 0x0100_0002;
 const XFIXES_SOURCE2: u32 = 0x0100_0003;
+
+const XFIXES_ACCESS_WINDOW: ResourceId = ResourceId(0x0100_0010);
+const XFIXES_ACCESS_PIXMAP: ResourceId = ResourceId(0x0100_0011);
+const XFIXES_ACCESS_GC: ResourceId = ResourceId(0x0100_0012);
+const XFIXES_ACCESS_PICTURE: ResourceId = ResourceId(0x0100_0013);
+const XFIXES_ACCESS_REGION: ResourceId = ResourceId(0x0100_0004);
+const XFIXES_ACCESS_REGION2: ResourceId = ResourceId(0x0100_0005);
+const XFIXES_ACCESS_REGION3: ResourceId = ResourceId(0x0100_0006);
+const XFIXES_ACCESS_NEW_REGION: ResourceId = ResourceId(0x0200_0001);
+const XFIXES_ACCESS_ERROR_VALUE: u32 = 0x4f21;
+
+#[derive(Clone, Copy)]
+struct XfixesAccessCheck {
+    target: crate::access::ResourceTarget,
+    mode: crate::access::AccessMode,
+}
+
+struct XfixesAccessCase {
+    name: &'static str,
+    major: u8,
+    minor: u8,
+    body: Vec<u8>,
+    expected: Vec<XfixesAccessCheck>,
+}
+
+fn xfixes_existing_check(
+    id: ResourceId,
+    kind: crate::access::ResourceKind,
+    mode: crate::access::AccessMode,
+) -> XfixesAccessCheck {
+    XfixesAccessCheck {
+        target: crate::access::ResourceTarget {
+            owner: None,
+            id,
+            kind,
+            creation: None,
+        },
+        mode,
+    }
+}
+
+fn xfixes_creation_check(id: ResourceId, parent: Option<ResourceId>) -> XfixesAccessCheck {
+    XfixesAccessCheck {
+        target: crate::access::ResourceTarget {
+            owner: None,
+            id,
+            kind: crate::access::ResourceKind::Region,
+            creation: Some(crate::access::Creation {
+                parent,
+                owner: ClientId(XFIXES_WRITER),
+            }),
+        },
+        mode: crate::access::AccessMode::CREATE,
+    }
+}
+
+fn xfixes_region_access_fixture() -> (ServerState, RecordingBackend, UnixStream) {
+    use crate::{
+        backend::PictureHandle,
+        resources::{PictureKind, PictureState},
+    };
+
+    let mut state = ServerState::new();
+    let _owner_peer = install_client(&mut state, XFIXES_OWNER);
+    let writer_peer = install_client(&mut state, XFIXES_WRITER);
+    state
+        .xfixes_client_major
+        .insert(XFIXES_WRITER, yserver_protocol::x11::xfixes::MAJOR_VERSION);
+    state.resources.create_window(
+        ClientId(XFIXES_OWNER),
+        CreateWindowRequest {
+            depth: 24,
+            window: XFIXES_ACCESS_WINDOW,
+            parent: crate::resources::ROOT_WINDOW,
+            width: 20,
+            height: 20,
+            class: 1,
+            visual: crate::resources::ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    state.resources.create_pixmap(
+        ClientId(XFIXES_OWNER),
+        CreatePixmapRequest {
+            depth: 24,
+            pixmap: XFIXES_ACCESS_PIXMAP,
+            drawable: XFIXES_ACCESS_WINDOW,
+            width: 20,
+            height: 20,
+        },
+    );
+    state.resources.create_gc(
+        ClientId(XFIXES_OWNER),
+        CreateGcRequest {
+            gc: XFIXES_ACCESS_GC,
+            drawable: XFIXES_ACCESS_WINDOW,
+            function: None,
+            plane_mask: None,
+            foreground: None,
+            background: None,
+            line_width: None,
+            line_style: None,
+            cap_style: None,
+            join_style: None,
+            fill_style: None,
+            fill_rule: None,
+            tile: None,
+            stipple: None,
+            tile_x_origin: None,
+            tile_y_origin: None,
+            font: None,
+            subwindow_mode: None,
+            graphics_exposures: None,
+            clip_x_origin: None,
+            clip_y_origin: None,
+            clip_mask: None,
+            dash_offset: None,
+            dashes: None,
+            arc_mode: None,
+        },
+    );
+    state.resources.set_clip_rectangles(
+        ClientId(XFIXES_OWNER),
+        yserver_protocol::x11::SetClipRectanglesRequest {
+            gc: XFIXES_ACCESS_GC,
+            clip: yserver_protocol::x11::ClipRectangles {
+                ordering: 0,
+                x_origin: 0,
+                y_origin: 0,
+                rectangles: [
+                    0i16.to_le_bytes(),
+                    0i16.to_le_bytes(),
+                    4u16.to_le_bytes(),
+                    4u16.to_le_bytes(),
+                ]
+                .concat(),
+            },
+        },
+    );
+    state.resources.create_picture(
+        XFIXES_ACCESS_PICTURE,
+        PictureState {
+            client: ClientId(XFIXES_OWNER),
+            host_picture_xid: Some(PictureHandle::from_raw_for_test(0x4413)),
+            host_owned_pixmap: None,
+            kind: PictureKind::Drawable,
+            drawable: Some(XFIXES_ACCESS_WINDOW),
+            window: None,
+        },
+    );
+    let rects = [
+        yserver_protocol::x11::xfixes::RegionRect {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        },
+        yserver_protocol::x11::xfixes::RegionRect {
+            x: 10,
+            y: 2,
+            width: 3,
+            height: 4,
+        },
+        yserver_protocol::x11::xfixes::RegionRect {
+            x: 1,
+            y: 12,
+            width: 3,
+            height: 4,
+        },
+    ];
+    for (id, rect) in [
+        XFIXES_ACCESS_REGION,
+        XFIXES_ACCESS_REGION2,
+        XFIXES_ACCESS_REGION3,
+    ]
+    .into_iter()
+    .zip(rects)
+    {
+        state.xfixes_regions.insert(
+            id.0,
+            crate::server::XFixesRegion {
+                owner: ClientId(XFIXES_OWNER),
+                region: crate::region::Region::rect(rect),
+            },
+        );
+    }
+    let mut backend = RecordingBackend::new();
+    backend.picture_client_clip_rects_result = Some(Some(vec![rects[0]]));
+    (state, backend, writer_peer)
+}
+
+fn xfixes_region_access_cases() -> Vec<XfixesAccessCase> {
+    use crate::access::{AccessMode as M, ResourceKind as K};
+    use yserver_protocol::x11::{composite as c, xfixes as x};
+
+    let words = |values: &[u32]| {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    };
+    let rect_body = || {
+        xfixes_rect_body(
+            XFIXES_ACCESS_REGION.0,
+            yserver_protocol::x11::xfixes::RegionRect {
+                x: 4,
+                y: 5,
+                width: 6,
+                height: 7,
+            },
+        )
+    };
+    let new = XFIXES_ACCESS_NEW_REGION;
+    let region = XFIXES_ACCESS_REGION;
+    let region2 = XFIXES_ACCESS_REGION2;
+    let region3 = XFIXES_ACCESS_REGION3;
+    let window = XFIXES_ACCESS_WINDOW;
+    let pixmap = XFIXES_ACCESS_PIXMAP;
+    let gc = XFIXES_ACCESS_GC;
+    let picture = XFIXES_ACCESS_PICTURE;
+    let mut cases = Vec::new();
+    let mut add = |name, major, minor, body, expected| {
+        cases.push(XfixesAccessCase {
+            name,
+            major,
+            minor,
+            body,
+            expected,
+        });
+    };
+
+    let create_region_body = xfixes_rect_body(
+        new.0,
+        yserver_protocol::x11::xfixes::RegionRect {
+            x: 4,
+            y: 5,
+            width: 6,
+            height: 7,
+        },
+    );
+    add(
+        "CreateRegion",
+        140,
+        x::CREATE_REGION,
+        create_region_body,
+        vec![xfixes_creation_check(new, None)],
+    );
+    add(
+        "CreateRegionFromBitmap",
+        140,
+        x::CREATE_REGION_FROM_BITMAP,
+        words(&[new.0, pixmap.0]),
+        vec![
+            xfixes_existing_check(pixmap, K::Pixmap, M::READ),
+            xfixes_creation_check(new, Some(pixmap)),
+        ],
+    );
+    let mut from_window = words(&[new.0, window.0]);
+    from_window.extend_from_slice(&[0, 0, 0, 0]);
+    add(
+        "CreateRegionFromWindow",
+        140,
+        x::CREATE_REGION_FROM_WINDOW,
+        from_window,
+        vec![
+            xfixes_existing_check(window, K::Window, M::GET_ATTR),
+            xfixes_creation_check(new, Some(window)),
+        ],
+    );
+    add(
+        "CreateRegionFromGC",
+        140,
+        x::CREATE_REGION_FROM_GC,
+        words(&[new.0, gc.0]),
+        vec![
+            xfixes_existing_check(gc, K::Gc, M::GET_ATTR),
+            xfixes_creation_check(new, None),
+        ],
+    );
+    add(
+        "CreateRegionFromPicture",
+        140,
+        x::CREATE_REGION_FROM_PICTURE,
+        words(&[new.0, picture.0]),
+        vec![
+            xfixes_existing_check(picture, K::Picture, M::GET_ATTR),
+            xfixes_creation_check(new, None),
+        ],
+    );
+    add(
+        "DestroyRegion",
+        140,
+        x::DESTROY_REGION,
+        words(&[region.0, 0]),
+        vec![xfixes_existing_check(region, K::Region, M::WRITE)],
+    );
+    add(
+        "SetRegion",
+        140,
+        x::SET_REGION,
+        rect_body(),
+        vec![xfixes_existing_check(region, K::Region, M::WRITE)],
+    );
+    add(
+        "CopyRegion",
+        140,
+        x::COPY_REGION,
+        words(&[region.0, region2.0]),
+        vec![
+            xfixes_existing_check(region, K::Region, M::READ),
+            xfixes_existing_check(region2, K::Region, M::WRITE),
+        ],
+    );
+    for minor in [x::UNION_REGION, x::INTERSECT_REGION, x::SUBTRACT_REGION] {
+        add(
+            "two-source region op",
+            140,
+            minor,
+            words(&[region.0, region2.0, region3.0]),
+            vec![
+                xfixes_existing_check(region, K::Region, M::READ),
+                xfixes_existing_check(region2, K::Region, M::READ),
+                xfixes_existing_check(region3, K::Region, M::WRITE),
+            ],
+        );
+    }
+    let mut invert = words(&[region.0]);
+    invert.extend_from_slice(
+        &[
+            0i16.to_le_bytes(),
+            0i16.to_le_bytes(),
+            20u16.to_le_bytes(),
+            20u16.to_le_bytes(),
+        ]
+        .concat(),
+    );
+    invert.extend_from_slice(&region2.0.to_le_bytes());
+    add(
+        "InvertRegion",
+        140,
+        x::INVERT_REGION,
+        invert,
+        vec![
+            xfixes_existing_check(region, K::Region, M::READ),
+            xfixes_existing_check(region2, K::Region, M::WRITE),
+        ],
+    );
+    let mut translate = region.0.to_le_bytes().to_vec();
+    translate.extend_from_slice(&[1i16.to_le_bytes(), 2i16.to_le_bytes()].concat());
+    add(
+        "TranslateRegion",
+        140,
+        x::TRANSLATE_REGION,
+        translate,
+        vec![xfixes_existing_check(region, K::Region, M::WRITE)],
+    );
+    add(
+        "RegionExtents",
+        140,
+        x::REGION_EXTENTS,
+        words(&[region.0, region2.0]),
+        vec![
+            xfixes_existing_check(region, K::Region, M::READ),
+            xfixes_existing_check(region2, K::Region, M::WRITE),
+        ],
+    );
+    add(
+        "FetchRegion",
+        140,
+        x::FETCH_REGION,
+        words(&[region.0]),
+        vec![xfixes_existing_check(region, K::Region, M::READ)],
+    );
+    let mut set_gc_clip = words(&[gc.0, region.0]);
+    set_gc_clip.extend_from_slice(&[0i16.to_le_bytes(), 0i16.to_le_bytes()].concat());
+    add(
+        "SetGCClipRegion",
+        140,
+        x::SET_GC_CLIP_REGION,
+        set_gc_clip,
+        vec![
+            xfixes_existing_check(gc, K::Gc, M::SET_ATTR),
+            xfixes_existing_check(region, K::Region, M::READ),
+        ],
+    );
+    let mut set_shape = words(&[window.0]);
+    set_shape.extend_from_slice(&[0, 0, 0, 0]);
+    set_shape.extend_from_slice(&[0i16.to_le_bytes(), 0i16.to_le_bytes()].concat());
+    set_shape.extend_from_slice(&region.0.to_le_bytes());
+    add(
+        "SetWindowShapeRegion",
+        140,
+        x::SET_WINDOW_SHAPE_REGION,
+        set_shape,
+        vec![
+            xfixes_existing_check(window, K::Window, M::SET_ATTR),
+            xfixes_existing_check(region, K::Region, M::WRITE),
+        ],
+    );
+    let mut set_picture_clip = words(&[picture.0, region.0]);
+    set_picture_clip.extend_from_slice(&[0i16.to_le_bytes(), 0i16.to_le_bytes()].concat());
+    add(
+        "SetPictureClipRegion",
+        140,
+        x::SET_PICTURE_CLIP_REGION,
+        set_picture_clip,
+        vec![
+            xfixes_existing_check(picture, K::Picture, M::SET_ATTR),
+            xfixes_existing_check(region, K::Region, M::READ),
+        ],
+    );
+    let mut expand = words(&[region.0, region2.0]);
+    expand.extend_from_slice(
+        &[
+            1u16.to_le_bytes(),
+            2u16.to_le_bytes(),
+            3u16.to_le_bytes(),
+            4u16.to_le_bytes(),
+        ]
+        .concat(),
+    );
+    add(
+        "ExpandRegion",
+        140,
+        x::EXPAND_REGION,
+        expand,
+        vec![
+            xfixes_existing_check(region, K::Region, M::READ),
+            xfixes_existing_check(region2, K::Region, M::WRITE),
+        ],
+    );
+    add(
+        "CreateRegionFromBorderClip",
+        144,
+        c::CREATE_REGION_FROM_BORDER_CLIP,
+        words(&[new.0, window.0]),
+        vec![
+            xfixes_existing_check(window, K::Window, M::GET_ATTR),
+            xfixes_creation_check(new, Some(window)),
+        ],
+    );
+    cases
+}
+
+fn xfixes_region_access_request(
+    state: &mut ServerState,
+    backend: &mut RecordingBackend,
+    client: u32,
+    major: u8,
+    minor: u8,
+    body: &[u8],
+    sequence: u16,
+) {
+    process_request(
+        state,
+        backend,
+        ClientId(client),
+        SequenceNumber(sequence),
+        RequestHeader {
+            opcode: major,
+            data: minor,
+            length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+        },
+        body,
+        None,
+    )
+    .expect("region access request");
+}
+
+#[test]
+fn xfixes_region_access_checks_ask_expected_targets_modes_and_order() {
+    // Mutation: remove CopyRegion's source READ check; the recorded operand order must fail.
+    use super::extensions::{ExtensionHook, RecordedExtensionCheck, RecordingExtensionPolicy};
+    use crate::access::{Decision, RequestOpcodes};
+
+    for case in xfixes_region_access_cases() {
+        let (mut state, mut backend, _peer) = xfixes_region_access_fixture();
+        let calls = Arc::new(Mutex::new(Vec::<RecordedExtensionCheck>::new()));
+        state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+            Decision::Allow,
+            Arc::clone(&calls),
+        )));
+        xfixes_region_access_request(
+            &mut state,
+            &mut backend,
+            XFIXES_WRITER,
+            case.major,
+            case.minor,
+            &case.body,
+            1,
+        );
+        let recorded = calls.lock().unwrap();
+        let actual = recorded
+            .iter()
+            .filter(|call| call.hook == ExtensionHook::Resource)
+            .map(|call| {
+                (
+                    call.target.expect("resource target"),
+                    call.mode.expect("resource mode"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = case
+            .expected
+            .iter()
+            .map(|check| (check.target, check.mode))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "{}: resource checks", case.name);
+        for call in recorded
+            .iter()
+            .filter(|call| call.hook == ExtensionHook::Resource)
+        {
+            assert_eq!(
+                call.client,
+                ClientId(XFIXES_WRITER),
+                "{}: client",
+                case.name
+            );
+            assert_eq!(
+                call.request,
+                Some(RequestOpcodes {
+                    major: case.major,
+                    minor: case.minor,
+                }),
+                "{}: request opcodes",
+                case.name,
+            );
+            let expected_owner = call
+                .target
+                .and_then(|target| target.creation.is_none().then_some(ClientId(XFIXES_OWNER)));
+            assert_eq!(call.owner, expected_owner, "{}: target owner", case.name);
+            assert_eq!(
+                call.target_owner, expected_owner,
+                "{}: target instance owner",
+                case.name
+            );
+        }
+    }
+}
+
+#[test]
+fn xfixes_region_access_denials_stop_before_state_or_backend_effects() {
+    // Mutation: move CopyRegion's and UnionRegion's destination WRITE checks after their stores; retained-state assertions must fail.
+    use super::extensions::{ExtensionHook, RecordedExtensionCheck, RecordingExtensionPolicy};
+    use crate::access::DenyError;
+
+    for case in xfixes_region_access_cases() {
+        for (denied_index, denied) in case.expected.iter().enumerate() {
+            let (mut state, mut backend, mut peer) = xfixes_region_access_fixture();
+            let regions_before = state
+                .xfixes_regions
+                .iter()
+                .map(|(id, region)| (*id, region.owner, region.region.to_rects()))
+                .collect::<Vec<_>>();
+            let shapes_before = state.shape_windows.clone();
+            let gc_clip_before = state
+                .resources
+                .gc(XFIXES_ACCESS_GC)
+                .and_then(|gc| gc.clip_rectangles.clone());
+            let calls = Arc::new(Mutex::new(Vec::<RecordedExtensionCheck>::new()));
+            state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+                Arc::clone(&calls),
+                denied.target.id,
+                Some(denied.mode),
+                DenyError {
+                    code: yserver_protocol::x11::error::BAD_VALUE,
+                    value: XFIXES_ACCESS_ERROR_VALUE,
+                },
+            )));
+            xfixes_region_access_request(
+                &mut state,
+                &mut backend,
+                XFIXES_WRITER,
+                case.major,
+                case.minor,
+                &case.body,
+                1,
+            );
+            let bytes = read_all_available(&mut peer);
+            assert_eq!(bytes.len(), 32, "{}: policy denial packet", case.name);
+            assert_eq!(bytes[0], 0, "{}: packet type", case.name);
+            assert_eq!(
+                bytes[1],
+                yserver_protocol::x11::error::BAD_VALUE,
+                "{}: policy error code",
+                case.name
+            );
+            assert_eq!(
+                u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                XFIXES_ACCESS_ERROR_VALUE,
+                "{}: policy error value",
+                case.name
+            );
+            assert_eq!(
+                u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+                u16::from(case.minor),
+                "{}: error minor opcode",
+                case.name
+            );
+            assert_eq!(bytes[10], case.major, "{}: error major opcode", case.name);
+            assert_eq!(
+                state
+                    .xfixes_regions
+                    .iter()
+                    .map(|(id, region)| (*id, region.owner, region.region.to_rects()))
+                    .collect::<Vec<_>>(),
+                regions_before,
+                "{}: region state changed",
+                case.name,
+            );
+            assert_eq!(
+                state.shape_windows, shapes_before,
+                "{}: shape state changed",
+                case.name
+            );
+            assert_eq!(
+                state
+                    .resources
+                    .gc(XFIXES_ACCESS_GC)
+                    .and_then(|gc| gc.clip_rectangles.clone()),
+                gc_clip_before,
+                "{}: GC clip changed",
+                case.name,
+            );
+            assert!(
+                backend.calls().is_empty(),
+                "{}: backend was reached",
+                case.name
+            );
+            let expected = case.expected[..=denied_index]
+                .iter()
+                .map(|check| (check.target, check.mode))
+                .collect::<Vec<_>>();
+            let actual = calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.hook == ExtensionHook::Resource)
+                .map(|call| {
+                    (
+                        call.target.expect("resource target"),
+                        call.mode.expect("resource mode"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{}: checks before denial", case.name);
+        }
+    }
+}
+
+#[test]
+fn expand_region_source_denial_precedes_missing_destination() {
+    // Mutation: validate the destination before checking the source; the policy row must then
+    // return BadAccess instead of the later BadRegion.
+    use super::extensions::{ExtensionHook, RecordedExtensionCheck, RecordingExtensionPolicy};
+    use crate::access::{AccessMode, DenyError, RequestOpcodes, ResourceKind};
+    use yserver_protocol::x11::xfixes as x;
+
+    let rows = [(x::EXPAND_REGION, XFIXES_ACCESS_REGION, 0xDEAD_4401)];
+    for (minor, source, missing) in rows {
+        let label = "ExpandRegion";
+        let mut body = xfixes_u32s(&[source.0, missing]);
+        for margin in [1u16, 2, 3, 4] {
+            body.extend_from_slice(&margin.to_le_bytes());
+        }
+        let snapshot = |state: &ServerState| {
+            state
+                .xfixes_regions
+                .iter()
+                .map(|(id, region)| (*id, region.owner, region.region.to_rects()))
+                .collect::<Vec<_>>()
+        };
+
+        let (mut state, mut backend, mut peer) = xfixes_region_access_fixture();
+        let before = snapshot(&state);
+        let backend_before = backend.calls();
+        xfixes_region_access_request(
+            &mut state,
+            &mut backend,
+            XFIXES_WRITER,
+            140,
+            minor,
+            &body,
+            1,
+        );
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32, "{label}: expected BadRegion");
+        assert_eq!(
+            bytes[1],
+            crate::nested::XFIXES_FIRST_ERROR,
+            "{label}: no-policy error"
+        );
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), missing);
+        assert_eq!(
+            u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+            u16::from(minor)
+        );
+        assert_eq!(bytes[10], 140);
+        assert_eq!(snapshot(&state), before, "{label}: no-policy state changed");
+        assert_eq!(
+            backend.calls(),
+            backend_before,
+            "{label}: no-policy backend call"
+        );
+
+        let (mut state, mut backend, mut peer) = xfixes_region_access_fixture();
+        let calls = Arc::new(Mutex::new(Vec::<RecordedExtensionCheck>::new()));
+        let error = DenyError {
+            code: x11::error::BAD_ACCESS,
+            value: XFIXES_ACCESS_ERROR_VALUE,
+        };
+        state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+            Arc::clone(&calls),
+            source,
+            Some(AccessMode::READ),
+            error,
+        )));
+        let before = snapshot(&state);
+        let backend_before = backend.calls();
+        xfixes_region_access_request(
+            &mut state,
+            &mut backend,
+            XFIXES_WRITER,
+            140,
+            minor,
+            &body,
+            1,
+        );
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32, "{label}: expected policy denial");
+        assert_eq!(bytes[1], error.code);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            error.value
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+            u16::from(minor)
+        );
+        assert_eq!(bytes[10], 140);
+        assert_eq!(snapshot(&state), before, "{label}: denied state changed");
+        assert_eq!(
+            backend.calls(),
+            backend_before,
+            "{label}: denied request reached backend"
+        );
+        let calls = calls.lock().unwrap();
+        let resource_calls: Vec<_> = calls
+            .iter()
+            .filter(|call| call.hook == ExtensionHook::Resource)
+            .collect();
+        assert_eq!(
+            resource_calls.len(),
+            1,
+            "{label}: later destination was checked"
+        );
+        let check = resource_calls[0];
+        let target = xfixes_existing_check(source, ResourceKind::Region, AccessMode::READ).target;
+        assert_eq!(check.client, ClientId(XFIXES_WRITER));
+        assert_eq!(check.target, Some(target));
+        assert_eq!(check.mode, Some(AccessMode::READ));
+        assert_eq!(check.owner, Some(ClientId(XFIXES_OWNER)));
+        assert_eq!(check.target_owner, Some(ClientId(XFIXES_OWNER)));
+        assert_eq!(check.request, Some(RequestOpcodes { major: 140, minor }));
+    }
+}
+
+#[test]
+fn region_write_into_other_clients_region_denied_keeps_it() {
+    // Mutation: move CopyRegion's destination WRITE check after its store; the rectangle assertion must fail.
+    use super::extensions::{RecordedExtensionCheck, RecordingExtensionPolicy};
+    use crate::access::{AccessMode, DenyError};
+    use yserver_protocol::x11::xfixes as x;
+
+    let (mut state, mut backend, mut writer_peer) = xfixes_region_access_fixture();
+    let source = XFIXES_ACCESS_REGION2;
+    let destination = XFIXES_ACCESS_REGION;
+    let before = state.xfixes_regions[&destination.0].region.to_rects();
+    let calls = Arc::new(Mutex::new(Vec::<RecordedExtensionCheck>::new()));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+        Arc::clone(&calls),
+        destination,
+        Some(AccessMode::WRITE),
+        DenyError {
+            code: yserver_protocol::x11::error::BAD_VALUE,
+            value: XFIXES_ACCESS_ERROR_VALUE,
+        },
+    )));
+    xfixes_region_access_request(
+        &mut state,
+        &mut backend,
+        XFIXES_WRITER,
+        140,
+        x::COPY_REGION,
+        &xfixes_u32s(&[source.0, destination.0]),
+        1,
+    );
+    let bytes = read_all_available(&mut writer_peer);
+    assert_eq!(bytes.len(), 32, "policy denial returns one error packet");
+    assert_eq!(bytes[0], 0, "error packet type");
+    assert_eq!(bytes[1], yserver_protocol::x11::error::BAD_VALUE);
+    assert_eq!(
+        u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        XFIXES_ACCESS_ERROR_VALUE
+    );
+    assert_eq!(
+        u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+        u16::from(x::COPY_REGION)
+    );
+    assert_eq!(bytes[10], 140);
+    let after = &state.xfixes_regions[&destination.0];
+    assert_eq!(
+        after.owner,
+        ClientId(XFIXES_OWNER),
+        "destination owner is retained"
+    );
+    assert_eq!(
+        after.region.to_rects(),
+        before,
+        "destination rectangles are retained"
+    );
+    let checked = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|call| call.hook == super::extensions::ExtensionHook::Resource)
+        .filter_map(|call| call.target.map(|target| (target.id, call.mode.unwrap())))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        checked,
+        vec![(source, AccessMode::READ), (destination, AccessMode::WRITE),],
+        "CopyRegion checks source then destination before denial",
+    );
+}
+
+#[test]
+fn missing_destination_region_is_not_asked() {
+    // Mutation: ask the policy about unresolved CopyRegion destinations; this deny-all policy must then fail the request.
+    use super::extensions::{ExtensionHook, RecordedExtensionCheck, RecordingExtensionPolicy};
+    use crate::access::DenyError;
+    use yserver_protocol::x11::xfixes as x;
+
+    const MISSING_SOURCE: ResourceId = ResourceId(0x7f00_1122);
+    const MISSING_DESTINATION: ResourceId = ResourceId(0x7f00_3344);
+    let (mut state, mut backend, mut writer_peer) = xfixes_region_access_fixture();
+    let calls = Arc::new(Mutex::new(Vec::<RecordedExtensionCheck>::new()));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_all_resources(
+        Arc::clone(&calls),
+        DenyError {
+            code: yserver_protocol::x11::error::BAD_VALUE,
+            value: XFIXES_ACCESS_ERROR_VALUE,
+        },
+    )));
+    xfixes_region_access_request(
+        &mut state,
+        &mut backend,
+        XFIXES_WRITER,
+        140,
+        x::COPY_REGION,
+        &xfixes_u32s(&[MISSING_SOURCE.0, MISSING_DESTINATION.0]),
+        1,
+    );
+    assert!(
+        read_all_available(&mut writer_peer).is_empty(),
+        "no-policy wire outcome is unchanged"
+    );
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.hook == ExtensionHook::Resource)
+            .count(),
+        0,
+        "unresolved source and destination are not checked",
+    );
+    let created = state
+        .xfixes_regions
+        .get(&MISSING_DESTINATION.0)
+        .expect("CopyRegion creates the unresolved destination");
+    assert_eq!(created.owner, ClientId(XFIXES_WRITER));
+    assert!(created.region.to_rects().is_empty());
+}
 
 fn xfixes_rect_body(id: u32, rect: yserver_protocol::x11::xfixes::RegionRect) -> Vec<u8> {
     let mut body = id.to_le_bytes().to_vec();
@@ -773,6 +2117,107 @@ fn xfixes_change_cursor_retargets_cursor_and_backend() {
     assert_eq!(
         state.resources.free_cursor(ResourceId(D)),
         Some(0x0001_0020)
+    );
+}
+
+#[test]
+fn xfixes_change_cursor_checks_source_before_resolving_destination() {
+    // Mutation: resolve the ChangeCursor destination before checking its source.
+    use super::extensions::{ExtensionHook, RecordingExtensionPolicy};
+    use crate::access::{AccessMode, DenyError, RequestOpcodes, ResourceKind};
+    use yserver_protocol::x11::xfixes as x11xfixes;
+    const SOURCE: ResourceId = ResourceId(0x0040_0030);
+    const MISSING: u32 = 0x0bad_bad0;
+    const ERROR_VALUE: u32 = 0x5a17;
+
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    state.xfixes_client_major.insert(1, 5);
+    state.resources.create_cursor(ClientId(1), SOURCE);
+    let mut backend = RecordingBackend::new();
+    let source_host_before = state.resources.cursor_host_xid(SOURCE);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+        Arc::clone(&calls),
+        SOURCE,
+        Some(AccessMode::READ | AccessMode::GET_ATTR),
+        DenyError {
+            code: x11::error::BAD_VALUE,
+            value: ERROR_VALUE,
+        },
+    )));
+
+    xfixes_req(
+        &mut state,
+        &mut backend,
+        1,
+        x11xfixes::CHANGE_CURSOR,
+        &xfixes_u32s(&[SOURCE.0, MISSING]),
+    );
+    let packets = wire_packets(&mut peer);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(
+        error_fields(&packets[0]),
+        (
+            x11::error::BAD_VALUE,
+            ERROR_VALUE,
+            u16::from(x11xfixes::CHANGE_CURSOR),
+            XFIXES_MAJOR_OPCODE,
+        )
+    );
+    let recorded = calls.lock().unwrap();
+    let checks = recorded
+        .iter()
+        .filter(|call| call.hook == ExtensionHook::Resource)
+        .collect::<Vec<_>>();
+    assert_eq!(checks.len(), 1);
+    let source = checks[0];
+    assert_eq!(source.client, ClientId(1));
+    assert_eq!(
+        source.target,
+        Some(crate::access::ResourceTarget {
+            owner: None,
+            id: SOURCE,
+            kind: ResourceKind::Cursor,
+            creation: None,
+        })
+    );
+    assert_eq!(source.mode, Some(AccessMode::READ | AccessMode::GET_ATTR));
+    assert_eq!(source.owner, Some(ClientId(1)));
+    assert_eq!(source.target_owner, Some(ClientId(1)));
+    assert_eq!(
+        source.request,
+        Some(RequestOpcodes {
+            major: XFIXES_MAJOR_OPCODE,
+            minor: x11xfixes::CHANGE_CURSOR,
+        })
+    );
+    drop(recorded);
+    assert!(backend.calls().is_empty());
+    assert!(state.resources.cursor_exists(SOURCE));
+    assert!(!state.resources.cursor_exists(ResourceId(MISSING)));
+    assert_eq!(state.resources.cursor_host_xid(SOURCE), source_host_before);
+
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    state.xfixes_client_major.insert(1, 5);
+    state.resources.create_cursor(ClientId(1), SOURCE);
+    let mut backend = RecordingBackend::new();
+    xfixes_req(
+        &mut state,
+        &mut backend,
+        1,
+        x11xfixes::CHANGE_CURSOR,
+        &xfixes_u32s(&[SOURCE.0, MISSING]),
+    );
+    assert_eq!(
+        error_fields(&wire_packets(&mut peer)[0]),
+        (
+            x11::error::BAD_CURSOR,
+            MISSING,
+            u16::from(x11xfixes::CHANGE_CURSOR),
+            XFIXES_MAJOR_OPCODE,
+        )
     );
 }
 

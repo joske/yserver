@@ -38,6 +38,7 @@ pub(super) fn handle_recolor_cursor(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: cursor,
             kind: ResourceKind::Cursor,
             creation: None,
@@ -110,6 +111,7 @@ pub(super) fn handle_set_dashes(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: gc,
             kind: ResourceKind::Gc,
             creation: None,
@@ -182,6 +184,7 @@ pub(super) fn handle_create_cursor(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: cursor_id,
                 kind: ResourceKind::Cursor,
                 creation: Some(crate::access::Creation {
@@ -282,6 +285,7 @@ pub(super) fn handle_create_glyph_cursor(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: cursor,
                 kind: ResourceKind::Cursor,
                 creation: Some(crate::access::Creation {
@@ -398,6 +402,7 @@ pub(super) fn handle_create_gc(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: request.gc,
                 kind: ResourceKind::Gc,
                 creation: Some(crate::access::Creation {
@@ -637,6 +642,7 @@ pub(super) fn handle_free_gc(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: gc,
             kind: ResourceKind::Gc,
             creation: None,
@@ -695,6 +701,7 @@ pub(super) fn handle_free_cursor(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: cursor,
             kind: ResourceKind::Cursor,
             creation: None,
@@ -714,6 +721,9 @@ pub(super) fn handle_free_cursor(
     let host_xid = state.resources.free_cursor(cursor);
     if let Some(host_xid) = host_xid {
         let _ = backend.free_cursor(origin, host_xid);
+        state
+            .resources
+            .cursor_host_released(host_xid, |host| backend.cursor_alive(host));
     }
     debug!(
         "client {} #{} FreeCursor cursor=0x{:x} freed host_xid={host_xid:?}",
@@ -796,6 +806,7 @@ pub(super) fn handle_create_pixmap(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: request.drawable,
             kind: drawable_kind,
             creation: None,
@@ -819,6 +830,7 @@ pub(super) fn handle_create_pixmap(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: request.pixmap,
             kind: ResourceKind::Pixmap,
             creation: Some(crate::access::Creation {
@@ -895,6 +907,7 @@ pub(super) fn handle_free_pixmap(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: pixmap,
             kind: ResourceKind::Pixmap,
             creation: None,
@@ -990,6 +1003,7 @@ pub(super) fn handle_query_best_size(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: drawable,
                     kind,
                     creation: None,

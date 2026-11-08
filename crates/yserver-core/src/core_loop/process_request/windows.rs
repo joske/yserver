@@ -453,6 +453,9 @@ pub(crate) fn release_dropped_cursors(
 ) {
     for host in state.resources.take_unreferenced_cursor_hosts() {
         let _ = backend.free_cursor(origin, host);
+        state
+            .resources
+            .cursor_host_released(host, |host| backend.cursor_alive(host));
     }
 }
 
@@ -473,6 +476,7 @@ pub(super) fn handle_reparent_window(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: request.window,
                 kind: ResourceKind::Window,
                 creation: None,
@@ -487,6 +491,7 @@ pub(super) fn handle_reparent_window(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: request.parent,
                     kind: ResourceKind::Window,
                     creation: None,
@@ -515,6 +520,7 @@ pub(super) fn handle_reparent_window(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: request.window,
                 kind: ResourceKind::Window,
                 creation: None,
@@ -849,6 +855,7 @@ pub(super) fn handle_create_window(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: parent,
             kind: ResourceKind::Window,
             creation: None,
@@ -960,6 +967,7 @@ pub(super) fn handle_create_window(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: bg_pixmap,
                 kind: ResourceKind::Pixmap,
                 creation: None,
@@ -985,6 +993,7 @@ pub(super) fn handle_create_window(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: colormap,
                 kind: ResourceKind::Colormap,
                 creation: None,
@@ -1012,6 +1021,7 @@ pub(super) fn handle_create_window(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: cursor,
                 kind: ResourceKind::Cursor,
                 creation: None,
@@ -1077,6 +1087,7 @@ pub(super) fn handle_create_window(
                         state,
                         client_id,
                         ResourceTarget {
+                            owner: None,
                             id: border_pixmap,
                             kind: ResourceKind::Pixmap,
                             creation: None,
@@ -1104,6 +1115,7 @@ pub(super) fn handle_create_window(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: window_id,
             kind: ResourceKind::Window,
             creation: Some(Creation {
@@ -1302,6 +1314,7 @@ pub(super) fn handle_change_window_attributes(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: request.window,
                 kind: ResourceKind::Window,
                 creation: None,
@@ -1360,6 +1373,7 @@ pub(super) fn handle_change_window_attributes(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: bg_pixmap,
                 kind: ResourceKind::Pixmap,
                 creation: None,
@@ -1385,6 +1399,7 @@ pub(super) fn handle_change_window_attributes(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: colormap,
                 kind: ResourceKind::Colormap,
                 creation: None,
@@ -1412,6 +1427,7 @@ pub(super) fn handle_change_window_attributes(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: cursor,
                 kind: ResourceKind::Cursor,
                 creation: None,
@@ -1464,6 +1480,7 @@ pub(super) fn handle_change_window_attributes(
                         state,
                         client_id,
                         ResourceTarget {
+                            owner: None,
                             id: border_pixmap,
                             kind: ResourceKind::Pixmap,
                             creation: None,
@@ -1816,6 +1833,7 @@ pub(crate) fn configure_window_apply(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: request.window,
                     kind: ResourceKind::Window,
                     creation: None,
@@ -1854,6 +1872,7 @@ pub(crate) fn configure_window_apply(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: request.window,
                 kind: ResourceKind::Window,
                 creation: None,
@@ -1924,6 +1943,7 @@ pub(crate) fn configure_window_apply(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: sibling,
                     kind: ResourceKind::Window,
                     creation: None,
@@ -2363,6 +2383,7 @@ pub(super) fn handle_destroy_window(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: window,
                 kind: ResourceKind::Window,
                 creation: None,
@@ -2382,6 +2403,7 @@ pub(super) fn handle_destroy_window(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: parent,
                     kind: ResourceKind::Window,
                     creation: None,
@@ -2433,6 +2455,7 @@ pub(super) fn handle_destroy_subwindows(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: parent,
                 kind: ResourceKind::Window,
                 creation: None,
@@ -2463,6 +2486,7 @@ pub(super) fn handle_destroy_subwindows(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: child,
                     kind: ResourceKind::Window,
                     creation: None,
@@ -2511,6 +2535,7 @@ pub(super) fn handle_get_geometry(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: drawable,
             kind,
             creation: None,
@@ -2568,6 +2593,7 @@ pub(super) fn handle_query_tree(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: window,
             kind: ResourceKind::Window,
             creation: None,
@@ -2654,6 +2680,7 @@ pub(super) fn handle_map_window(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: window,
             kind: ResourceKind::Window,
             creation: None,
@@ -2854,6 +2881,7 @@ pub(super) fn map_subwindows_with_delta(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: parent,
             kind: ResourceKind::Window,
             creation: None,
@@ -2879,6 +2907,7 @@ pub(super) fn map_subwindows_with_delta(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: child,
                 kind: ResourceKind::Window,
                 creation: None,
@@ -2969,6 +2998,7 @@ pub(super) fn handle_unmap_window(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: window,
                 kind: ResourceKind::Window,
                 creation: None,
@@ -3126,6 +3156,7 @@ pub(super) fn handle_unmap_subwindows(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: parent,
             kind: ResourceKind::Window,
             creation: None,
@@ -3142,6 +3173,7 @@ pub(super) fn handle_unmap_subwindows(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: *child,
                     kind: ResourceKind::Window,
                     creation: None,
@@ -3270,6 +3302,7 @@ pub(super) fn handle_get_window_attributes(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id,
             kind: ResourceKind::Window,
             creation: None,
@@ -3375,6 +3408,7 @@ pub(super) fn handle_circulate_window(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: container,
             kind: ResourceKind::Window,
             creation: None,
@@ -3391,6 +3425,7 @@ pub(super) fn handle_circulate_window(
         state,
         client_id,
         ResourceTarget {
+            owner: None,
             id: child,
             kind: ResourceKind::Window,
             creation: None,
@@ -3468,6 +3503,7 @@ pub(super) fn handle_change_save_set(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: win,
                     kind: ResourceKind::Window,
                     creation: None,
@@ -3558,6 +3594,7 @@ pub(super) fn handle_translate_coordinates(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: src_window,
                     kind: ResourceKind::Window,
                     creation: None,
@@ -3573,6 +3610,7 @@ pub(super) fn handle_translate_coordinates(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: dst_window,
                     kind: ResourceKind::Window,
                     creation: None,

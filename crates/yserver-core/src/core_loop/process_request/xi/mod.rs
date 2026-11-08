@@ -1,6 +1,7 @@
 mod dispatch;
 
 use crate::{
+    access::{AccessMode, ResourceKind},
     backend::{Backend, OriginContext},
     core_loop::process_request::{
         RequestOutcome, XI2_MAJOR_OPCODE, emit_x11_error_with_minor,
@@ -242,6 +243,7 @@ fn handle_xi_set_focus(
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
+    access_request: crate::access::RequestOpcodes,
 ) -> io::Result<RequestOutcome> {
     use crate::core_loop::xi1_focus;
     const MINOR: u8 = 49;
@@ -274,6 +276,22 @@ fn handle_xi_set_focus(
         if let Some((code, value)) = core_focus_window_error(state, ResourceId(focus)) {
             return xi1_error(state, client_id, sequence, code, value, MINOR);
         }
+        if !matches!(focus, 0 | 1 | 3) {
+            crate::core_loop::process_request::return_on_access_denial!(
+                crate::core_loop::process_request::validate_resource_if_present(
+                    state,
+                    client_id,
+                    ResourceId(focus),
+                    ResourceKind::Window,
+                    AccessMode::SET_ATTR,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
+        }
         apply_core_input_focus(
             state,
             client_id,
@@ -288,6 +306,22 @@ fn handle_xi_set_focus(
         && let Some((code, value)) = core_focus_window_error(state, ResourceId(focus))
     {
         return xi1_error(state, client_id, sequence, code, value, MINOR);
+    }
+    if !matches!(focus, 0 | 1 | 3) {
+        crate::core_loop::process_request::return_on_access_denial!(
+            crate::core_loop::process_request::validate_resource_if_present(
+                state,
+                client_id,
+                ResourceId(focus),
+                ResourceKind::Window,
+                AccessMode::SET_ATTR,
+                access_request,
+            ),
+            state,
+            client_id,
+            sequence,
+            access_request,
+        );
     }
     // Timestamp gate (dix/events.c:4920-4922), as XI1 SetDeviceFocus.
     let now = state.timestamp_now();

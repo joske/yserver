@@ -108,6 +108,9 @@ pub struct ResourceTarget {
     pub id: ResourceId,
     pub kind: ResourceKind,
     pub creation: Option<Creation>,
+    /// Original owner of a retained resource instance whose XID may have
+    /// been reused by another live resource.
+    pub owner: Option<ClientId>,
 }
 
 /// The request opcodes active at an access check.
@@ -191,6 +194,14 @@ impl<'a> AccessContext<'a> {
     #[must_use]
     pub fn owner(&self, id: ResourceId, kind: ResourceKind) -> Option<ClientId> {
         self.state.access_resource_owner(id, kind)
+    }
+
+    /// Resolve the owner associated with this particular target instance.
+    /// Retained resources can outlive their XID, which may now name a
+    /// different live object.
+    #[must_use]
+    pub fn target_owner(&self, target: &ResourceTarget) -> Option<ClientId> {
+        target.owner.or_else(|| self.owner(target.id, target.kind))
     }
 
     /// Whether `window` is this screen's root window.

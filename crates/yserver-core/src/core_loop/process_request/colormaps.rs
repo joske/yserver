@@ -28,6 +28,7 @@ fn check_colormap_access(
     match state.check_resource(
         client_id,
         &ResourceTarget {
+            owner: None,
             id: cmap,
             kind: ResourceKind::Colormap,
             creation: None,
@@ -155,6 +156,7 @@ pub(super) fn handle_create_colormap(
         && let Decision::Deny(error) = state.check_resource(
             client_id,
             &ResourceTarget {
+                owner: None,
                 id: window,
                 kind: ResourceKind::Window,
                 creation: None,
@@ -168,6 +170,7 @@ pub(super) fn handle_create_colormap(
     if let Decision::Deny(error) = state.check_resource(
         client_id,
         &ResourceTarget {
+            owner: None,
             id: mid,
             kind: ResourceKind::Colormap,
             creation: Some(Creation {
@@ -225,6 +228,7 @@ pub(super) fn handle_copy_colormap_and_free(
     if let Decision::Deny(error) = state.check_resource(
         client_id,
         &ResourceTarget {
+            owner: None,
             id: mid,
             kind: ResourceKind::Colormap,
             creation: Some(Creation {
@@ -454,6 +458,7 @@ pub(super) fn handle_list_installed_colormaps(
     if let Decision::Deny(error) = state.check_resource(
         client_id,
         &ResourceTarget {
+            owner: None,
             id: window,
             kind: ResourceKind::Window,
             creation: None,

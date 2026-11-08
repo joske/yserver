@@ -4,7 +4,8 @@ use crate::{
     core_loop::{
         fanout::{emit_window_event_to_state, emit_xi2_focus_event_to_state},
         process_request::{
-            FOCUS_CHANGE_MASK, RequestOutcome, XI2_MAJOR_OPCODE, emit_x11_error, write_to_client,
+            FOCUS_CHANGE_MASK, RequestOutcome, XI2_MAJOR_OPCODE, emit_x11_error,
+            emit_x11_error_with_minor, write_to_client,
             xi::{XI1_ERROR_BAD_DEVICE, xi1_error},
         },
     },
@@ -30,6 +31,7 @@ pub(super) fn handle_xi_warp_pointer(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     // Length is gated to exactly 9 units above, so the body is 32 bytes.
@@ -57,8 +59,36 @@ pub(super) fn handle_xi_warp_pointer(
         dst_x: fp1616_pixels(20),
         dst_y: fp1616_pixels(24),
     };
-    if let Some(bad) = warp_pointer_bad_window(state, &req) {
-        return xi1_error(state, client_id, sequence, x11::error::BAD_WINDOW, bad, 41);
+    let access_request = RequestOpcodes::for_request(header);
+    for window in [req.dst, req.src] {
+        if window.0 != 0 && state.resources.window(window).is_none() {
+            return xi1_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_WINDOW,
+                window.0,
+                41,
+            );
+        }
+        if let Err((code, value)) = super::validate_resource_if_present(
+            state,
+            client_id,
+            window,
+            ResourceKind::Window,
+            AccessMode::GET_ATTR,
+            access_request,
+        ) {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                code,
+                value,
+                41,
+                header.opcode,
+            );
+        }
     }
     if warp_pointer_src_allows(state, &req, WarpSrcRule::XInput2) {
         apply_pointer_warp(state, backend, origin, &req);
@@ -123,6 +153,7 @@ pub(super) fn handle_set_input_focus(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: window,
                     kind: ResourceKind::Window,
                     creation: None,
@@ -408,6 +439,7 @@ pub(super) fn handle_query_pointer(
             state,
             client_id,
             ResourceTarget {
+                owner: None,
                 id: queried_window,
                 kind: ResourceKind::Window,
                 creation: None,
@@ -520,6 +552,7 @@ pub(super) fn handle_warp_pointer(
                 state,
                 client_id,
                 ResourceTarget {
+                    owner: None,
                     id: window,
                     kind: ResourceKind::Window,
                     creation: None,
@@ -566,16 +599,6 @@ struct WarpRequest {
     src_h: u16,
     dst_x: i32,
     dst_y: i32,
-}
-
-/// The first nonexistent window of a warp, in Xorg's lookup order: the
-/// destination is looked up before the source in both ProcWarpPointer
-/// and ProcXIWarpPointer.
-fn warp_pointer_bad_window(state: &ServerState, req: &WarpRequest) -> Option<u32> {
-    [req.dst, req.src]
-        .into_iter()
-        .find(|w| w.0 != 0 && state.resources.window(*w).is_none())
-        .map(|w| w.0)
 }
 
 /// Whether the pointer is inside the warp's source rectangle, so the

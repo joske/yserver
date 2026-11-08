@@ -315,12 +315,32 @@ fn handle_shape_request_ops(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    use crate::access::{AccessMode, RequestOpcodes, ResourceKind};
     use yserver_protocol::x11::{ClientByteOrder, shape as x11shape};
     let byte_order = state
         .clients
         .get(&client_id.0)
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
+    let access_request = RequestOpcodes::for_request(header);
+    macro_rules! check_resource {
+        ($id:expr, $kind:expr, $mode:expr) => {
+            super::return_on_access_denial!(
+                super::validate_resource_if_present(
+                    state,
+                    client_id,
+                    $id,
+                    $kind,
+                    $mode,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
+        };
+    }
     debug!(
         "client {} #{} SHAPE::minor={} body_len={}",
         client_id.0,
@@ -364,6 +384,7 @@ fn handle_shape_request_ops(
                         header.opcode,
                     );
                 }
+                check_resource!(window, ResourceKind::Window, AccessMode::SET_ATTR);
                 debug!(
                     "client {} SHAPE::Rectangles dest=0x{:x} kind={} op={} off=({},{}) nrects={}",
                     client_id.0,
@@ -394,6 +415,7 @@ fn handle_shape_request_ops(
         x11shape::MASK => {
             if let Some(req) = x11shape::parse_mask_request(body) {
                 let window = ResourceId(req.dest);
+                check_resource!(window, ResourceKind::Window, AccessMode::SET_ATTR);
                 debug!(
                     "client {} SHAPE::Mask dest=0x{:x} kind={} op={} src=0x{:x} off=({},{})",
                     client_id.0, req.dest, req.dest_kind, req.op, req.src, req.x_off, req.y_off,
@@ -413,6 +435,7 @@ fn handle_shape_request_ops(
                 // (host-X11 proxy mode), preserving the previous
                 // best-effort behaviour for that path.
                 let src_id = ResourceId(req.src);
+                check_resource!(src_id, ResourceKind::Pixmap, AccessMode::READ);
                 let host_xid = state.resources.pixmap(src_id).and_then(|p| p.host_xid);
                 let banded = if let Some(host) = host_xid {
                     match backend.read_depth1_pixmap(origin, host.as_raw()) {
@@ -476,6 +499,8 @@ fn handle_shape_request_ops(
             if let Some(req) = x11shape::parse_combine_request(body) {
                 let dest = ResourceId(req.dest);
                 let src = ResourceId(req.src);
+                check_resource!(src, ResourceKind::Window, AccessMode::GET_ATTR);
+                check_resource!(dest, ResourceKind::Window, AccessMode::SET_ATTR);
                 debug!(
                     "client {} SHAPE::Combine dest=0x{:x} dest_kind={} src=0x{:x} src_kind={} op={} off=({},{})",
                     client_id.0,
@@ -513,6 +538,7 @@ fn handle_shape_request_ops(
         x11shape::OFFSET => {
             if let Some(req) = x11shape::parse_offset_request(body) {
                 let dest = ResourceId(req.dest);
+                check_resource!(dest, ResourceKind::Window, AccessMode::SET_ATTR);
                 if let Some(region) = crate::nested::shape_region(state, dest, req.dest_kind) {
                     let region = region
                         .clone()
@@ -526,6 +552,7 @@ fn handle_shape_request_ops(
         }
         x11shape::QUERY_EXTENTS => {
             let window = ResourceId(x11shape::parse_window(body).unwrap_or(ROOT_WINDOW.0));
+            check_resource!(window, ResourceKind::Window, AccessMode::GET_ATTR);
             let extents =
                 |kind| crate::nested::shape_region_or_default(state, window, kind).extents_rect();
             let bounding = extents(x11shape::KIND_BOUNDING);
@@ -549,7 +576,9 @@ fn handle_shape_request_ops(
         }
         x11shape::SELECT_INPUT => {
             if let Some(req) = x11shape::parse_select_input_request(body) {
-                let key = (client_id.0, ResourceId(req.window));
+                let window = ResourceId(req.window);
+                check_resource!(window, ResourceKind::Window, AccessMode::RECEIVE);
+                let key = (client_id.0, window);
                 if req.enable {
                     state.shape_select_masks.insert(key, true);
                 } else {
@@ -559,6 +588,7 @@ fn handle_shape_request_ops(
         }
         x11shape::INPUT_SELECTED => {
             let window = ResourceId(x11shape::parse_window(body).unwrap_or(ROOT_WINDOW.0));
+            check_resource!(window, ResourceKind::Window, AccessMode::GET_ATTR);
             let enabled = state
                 .shape_select_masks
                 .get(&(client_id.0, window))
@@ -575,6 +605,7 @@ fn handle_shape_request_ops(
             let (window, kind) = x11shape::parse_get_rectangles_request(body)
                 .map(|(w, k)| (ResourceId(w), k))
                 .unwrap_or((ROOT_WINDOW, x11shape::KIND_BOUNDING));
+            check_resource!(window, ResourceKind::Window, AccessMode::GET_ATTR);
             let rects = get_rectangles_rects(state, window, kind);
             let reply = x11shape::encode_get_rectangles_reply(
                 byte_order,
@@ -659,6 +690,23 @@ fn xfixes_verify_cursor(
     ))
 }
 
+/// Build the cursor target for a displayed backend cursor. A record is used
+/// as an explicit target owner only after its original XID no longer resolves
+/// to that same owner (including when the XID has been recycled).
+fn xfixes_cursor_host_target(
+    state: &ServerState,
+    host: u32,
+) -> Option<crate::access::ResourceTarget> {
+    let (id, owner) = state.resources.cursor_host_origin(host)?;
+    let live_owner = state.access_resource_owner(id, crate::access::ResourceKind::Cursor);
+    Some(crate::access::ResourceTarget {
+        owner: (live_owner != Some(owner)).then_some(owner),
+        id,
+        kind: crate::access::ResourceKind::Cursor,
+        creation: None,
+    })
+}
+
 /// Xorg `ReplaceCursor` for XFIXES `ChangeCursor` / `ChangeCursorByName`:
 /// every cursor XID and every displayed use of host cursor `old_host`
 /// switches to `source`'s cursor. Replacing a cursor with itself is a
@@ -679,8 +727,10 @@ fn xfixes_replace_cursor(
     state.resources.retarget_cursor_host(old_host, source);
     let _ = backend.replace_cursor(origin, old_host, new_host);
     if !state.resources.cursor_host_referenced(old_host) {
-        state.resources.cursor_host_released(old_host);
         let _ = backend.free_cursor(origin, old_host);
+        state
+            .resources
+            .cursor_host_released(old_host, |host| backend.cursor_alive(host));
     }
 }
 
@@ -818,12 +868,57 @@ pub(super) fn handle_xfixes_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    use crate::access::{AccessMode, Creation, RequestOpcodes, ResourceKind, ResourceTarget};
     use yserver_protocol::x11::{ClientByteOrder, xfixes as x11xfixes};
     let byte_order = state
         .clients
         .get(&client_id.0)
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
+    let access_request = RequestOpcodes::for_request(header);
+    macro_rules! check_resource {
+        ($id:expr, $kind:expr, $mode:expr) => {
+            super::return_on_access_denial!(
+                super::validate_resource_if_present(
+                    state,
+                    client_id,
+                    $id,
+                    $kind,
+                    $mode,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
+        };
+    }
+    macro_rules! check_region_creation {
+        ($id:expr, $parent:expr $(,)?) => {
+            super::return_on_access_denial!(
+                super::validate_resource_access(
+                    state,
+                    client_id,
+                    ResourceTarget {
+                        owner: None,
+                        id: ResourceId($id),
+                        kind: ResourceKind::Region,
+                        creation: Some(Creation {
+                            parent: $parent,
+                            owner: client_id,
+                        }),
+                    },
+                    AccessMode::CREATE,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
+        };
+    }
     match minor {
         x11xfixes::QUERY_VERSION => {
             // Xorg `ProcXFixesQueryVersion`: REQUEST_SIZE_MATCH, then the
@@ -880,6 +975,11 @@ pub(super) fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
+                check_resource!(
+                    ResourceId(req.window),
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR
+                );
                 if req.event_mask & !x11xfixes::SELECTION_ALL_EVENTS_MASK != 0 {
                     return emit_x11_error(
                         state,
@@ -917,6 +1017,11 @@ pub(super) fn handle_xfixes_request(
                         header.opcode,
                     );
                 }
+                check_resource!(
+                    ResourceId(req.window),
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR
+                );
                 if req.event_mask & !x11xfixes::CURSOR_ALL_EVENTS_MASK != 0 {
                     return emit_x11_error_with_minor(
                         state,
@@ -943,7 +1048,25 @@ pub(super) fn handle_xfixes_request(
             // back to the empty reply so existing client behaviour
             // doesn't regress (a 0×0 reply is still a valid X11
             // GetCursorImage response).
-            let reply = match backend.get_active_cursor_image() {
+            let active_image = backend.get_active_cursor_image();
+            if let Some(img) = &active_image
+                && let Some(target) = xfixes_cursor_host_target(state, img.host_xid)
+            {
+                super::return_on_access_denial!(
+                    super::validate_resource_access(
+                        state,
+                        client_id,
+                        target,
+                        AccessMode::READ,
+                        access_request,
+                    ),
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                );
+            }
+            let reply = match active_image {
                 Some(img) => x11xfixes::encode_get_cursor_image_reply(
                     byte_order,
                     sequence,
@@ -970,7 +1093,25 @@ pub(super) fn handle_xfixes_request(
             // cursor; with no reply they block forever in poll(). The
             // name is the displayed cursor's XFIXES name (Xorg
             // `pCursor->name`), empty when it was never named.
-            let reply = match backend.get_active_cursor_image() {
+            let active_image = backend.get_active_cursor_image();
+            if let Some(img) = &active_image
+                && let Some(target) = xfixes_cursor_host_target(state, img.host_xid)
+            {
+                super::return_on_access_denial!(
+                    super::validate_resource_access(
+                        state,
+                        client_id,
+                        target,
+                        AccessMode::READ | AccessMode::GET_ATTR,
+                        access_request,
+                    ),
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                );
+            }
+            let reply = match active_image {
                 Some(img) => {
                     let atom = state
                         .resources
@@ -1015,6 +1156,7 @@ pub(super) fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
+                check_region_creation!(region, None);
                 state.xfixes_regions.insert(
                     region,
                     crate::server::XFixesRegion {
@@ -1062,6 +1204,11 @@ pub(super) fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
+                check_resource!(
+                    ResourceId(req.window),
+                    ResourceKind::Window,
+                    AccessMode::READ
+                );
                 for &d in &req.devices {
                     if !(d == 0 || d == 1 || d == 2) {
                         return emit_x11_error_with_minor(
@@ -1095,6 +1242,27 @@ pub(super) fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
+                super::return_on_access_denial!(
+                    super::validate_resource_access(
+                        state,
+                        client_id,
+                        ResourceTarget {
+                            owner: None,
+                            id: ResourceId(req.barrier),
+                            kind: ResourceKind::PointerBarrier,
+                            creation: Some(Creation {
+                                parent: Some(ResourceId(req.window)),
+                                owner: client_id,
+                            }),
+                        },
+                        AccessMode::CREATE,
+                        access_request,
+                    ),
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                );
                 let (mut x1, mut x2) = (req.x1, req.x2);
                 let (mut y1, mut y2) = (req.y1, req.y2);
                 if x1 >= 0 && x2 >= 0 && x1 > x2 {
@@ -1137,6 +1305,13 @@ pub(super) fn handle_xfixes_request(
         }
         x11xfixes::DELETE_POINTER_BARRIER => {
             if let Some(bid) = x11xfixes::parse_delete_pointer_barrier(body) {
+                if state.pointer_barriers.contains_key(&bid) {
+                    check_resource!(
+                        ResourceId(bid),
+                        ResourceKind::PointerBarrier,
+                        AccessMode::DESTROY
+                    );
+                }
                 match state.pointer_barriers.get(&bid) {
                     None => {
                         return emit_x11_error(
@@ -1226,6 +1401,8 @@ pub(super) fn handle_xfixes_request(
                             XFIXES_MAJOR_OPCODE,
                         );
                     };
+                    check_resource!(gc, ResourceKind::Gc, AccessMode::GET_ATTR);
+                    check_region_creation!(region, None);
                     // Audit #7 (docs/protocol-audit-2026-05-19.md):
                     // copy the GC's clip rects RAW — Xorg's
                     // `ProcXFixesCreateRegionFromGC`
@@ -1245,6 +1422,8 @@ pub(super) fn handle_xfixes_request(
                         },
                     );
                 } else {
+                    check_resource!(ResourceId(source), ResourceKind::Pixmap, AccessMode::READ);
+                    check_region_creation!(region, Some(ResourceId(source)));
                     state.xfixes_regions.insert(
                         region,
                         crate::server::XFixesRegion {
@@ -1295,6 +1474,11 @@ pub(super) fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
+                check_resource!(
+                    ResourceId(window),
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR
+                );
                 let shape = crate::nested::shape_region_or_default(state, ResourceId(window), kind);
                 trace!(
                     target: "yserver::xfixes::region",
@@ -1302,6 +1486,7 @@ pub(super) fn handle_xfixes_request(
                     kind,
                     format_region_rects(&shape.to_rects()),
                 );
+                check_region_creation!(region, Some(ResourceId(window)));
                 state.xfixes_regions.insert(
                     region,
                     crate::server::XFixesRegion {
@@ -1356,6 +1541,11 @@ pub(super) fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
+                check_resource!(
+                    ResourceId(picture),
+                    ResourceKind::Picture,
+                    AccessMode::GET_ATTR
+                );
                 // An unbacked Picture has no clip set, like a fresh one.
                 let client_clip = match picture_state.host_picture_xid {
                     Some(hp) => backend.picture_client_clip_rects(hp.as_raw()),
@@ -1381,6 +1571,7 @@ pub(super) fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 };
+                check_region_creation!(region, None);
                 state.xfixes_regions.insert(
                     region,
                     crate::server::XFixesRegion {
@@ -1392,19 +1583,24 @@ pub(super) fn handle_xfixes_request(
         }
         x11xfixes::DESTROY_REGION => {
             if let Some((region, _)) = x11xfixes::parse_u32_pair(body) {
+                check_resource!(ResourceId(region), ResourceKind::Region, AccessMode::WRITE);
                 state.xfixes_regions.remove(&region);
             } else if body.len() >= 4 {
                 let region = u32::from_le_bytes(body[0..4].try_into().unwrap());
+                check_resource!(ResourceId(region), ResourceKind::Region, AccessMode::WRITE);
                 state.xfixes_regions.remove(&region);
             }
         }
         x11xfixes::SET_REGION => {
             if let Some((region, rects)) = x11xfixes::parse_create_region(body) {
+                check_resource!(ResourceId(region), ResourceKind::Region, AccessMode::WRITE);
                 store_xfixes_region(state, region, client_id, Region::from_wire_rects(&rects));
             }
         }
         x11xfixes::COPY_REGION => {
             if let Some((source, dest)) = x11xfixes::parse_u32_pair(body) {
+                check_resource!(ResourceId(source), ResourceKind::Region, AccessMode::READ);
+                check_resource!(ResourceId(dest), ResourceKind::Region, AccessMode::WRITE);
                 let region = xfixes_region(state, source);
                 trace!(
                     target: "yserver::xfixes::region",
@@ -1416,6 +1612,9 @@ pub(super) fn handle_xfixes_request(
         }
         x11xfixes::UNION_REGION | x11xfixes::INTERSECT_REGION | x11xfixes::SUBTRACT_REGION => {
             if let Some((source1, source2, dest)) = x11xfixes::parse_u32_triplet(body) {
+                check_resource!(ResourceId(source1), ResourceKind::Region, AccessMode::READ);
+                check_resource!(ResourceId(source2), ResourceKind::Region, AccessMode::READ);
+                check_resource!(ResourceId(dest), ResourceKind::Region, AccessMode::WRITE);
                 let empty = Region::default();
                 let a = state
                     .xfixes_regions
@@ -1449,6 +1648,8 @@ pub(super) fn handle_xfixes_request(
         }
         x11xfixes::INVERT_REGION => {
             if let Some((source, bounds, dest)) = x11xfixes::parse_invert_region(body) {
+                check_resource!(ResourceId(source), ResourceKind::Region, AccessMode::READ);
+                check_resource!(ResourceId(dest), ResourceKind::Region, AccessMode::WRITE);
                 let region = state
                     .xfixes_regions
                     .get(&source)
@@ -1457,20 +1658,27 @@ pub(super) fn handle_xfixes_request(
             }
         }
         x11xfixes::TRANSLATE_REGION => {
-            if let Some((region_id, dx, dy)) = x11xfixes::parse_translate_region(body)
-                && let Some(region) = state.xfixes_regions.get_mut(&region_id)
-            {
-                region.region = std::mem::take(&mut region.region)
-                    .translate_clipped(i32::from(dx), i32::from(dy));
-                trace!(
-                    target: "yserver::xfixes::region",
-                    "TranslateRegion region=0x{region_id:08x} delta=({dx}, {dy}) after{}",
-                    format_region_rects(&region.rects()),
+            if let Some((region_id, dx, dy)) = x11xfixes::parse_translate_region(body) {
+                check_resource!(
+                    ResourceId(region_id),
+                    ResourceKind::Region,
+                    AccessMode::WRITE
                 );
+                if let Some(region) = state.xfixes_regions.get_mut(&region_id) {
+                    region.region = std::mem::take(&mut region.region)
+                        .translate_clipped(i32::from(dx), i32::from(dy));
+                    trace!(
+                        target: "yserver::xfixes::region",
+                        "TranslateRegion region=0x{region_id:08x} delta=({dx}, {dy}) after{}",
+                        format_region_rects(&region.rects()),
+                    );
+                }
             }
         }
         x11xfixes::REGION_EXTENTS => {
             if let Some((source, dest)) = x11xfixes::parse_u32_pair(body) {
+                check_resource!(ResourceId(source), ResourceKind::Region, AccessMode::READ);
+                check_resource!(ResourceId(dest), ResourceKind::Region, AccessMode::WRITE);
                 let rect = xfixes_region(state, source).extents_rect();
                 store_xfixes_region(state, dest, client_id, Region::rect(rect));
             }
@@ -1480,6 +1688,7 @@ pub(super) fn handle_xfixes_request(
                 .get(0..4)
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                 .unwrap_or(0);
+            check_resource!(ResourceId(region), ResourceKind::Region, AccessMode::READ);
             // A fetched damage region can include coalesced paint that did
             // not generate another DamageNotify. Submit it before the reply
             // lets an external compositor sample the corresponding pixels.
@@ -1496,10 +1705,12 @@ pub(super) fn handle_xfixes_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11xfixes::CHANGE_SAVE_SET => {
-            if let Some(req) = x11xfixes::parse_change_save_set(body)
-                && let Some(c) = state.clients.get_mut(&client_id.0)
-            {
+            if let Some(req) = x11xfixes::parse_change_save_set(body) {
                 let win = ResourceId(req.window);
+                check_resource!(win, ResourceKind::Window, AccessMode::MANAGE);
+                let Some(c) = state.clients.get_mut(&client_id.0) else {
+                    return Ok(RequestOutcome::Handled);
+                };
                 match req.mode {
                     0 => {
                         c.save_set.insert(win);
@@ -1517,6 +1728,12 @@ pub(super) fn handle_xfixes_request(
         x11xfixes::SET_GC_CLIP_REGION => {
             if let Some(req) = x11xfixes::parse_set_gc_clip_region(body) {
                 let gc_id = ResourceId(req.gc);
+                check_resource!(gc_id, ResourceKind::Gc, AccessMode::SET_ATTR);
+                check_resource!(
+                    ResourceId(req.region),
+                    ResourceKind::Region,
+                    AccessMode::READ
+                );
                 // A clip-mask pixmap this displaces is released as by
                 // SetClipRectangles (`ChangeClip`, `dix/gc.c`).
                 let displaced = if req.region == 0 {
@@ -1553,6 +1770,12 @@ pub(super) fn handle_xfixes_request(
         x11xfixes::SET_WINDOW_SHAPE_REGION => {
             if let Some(req) = x11xfixes::parse_set_window_shape_region(body) {
                 let window = ResourceId(req.dest);
+                check_resource!(window, ResourceKind::Window, AccessMode::SET_ATTR);
+                check_resource!(
+                    ResourceId(req.region),
+                    ResourceKind::Region,
+                    AccessMode::WRITE
+                );
                 if req.region == 0 {
                     crate::nested::clear_shape_rects(state, window, req.dest_kind);
                 } else {
@@ -1568,6 +1791,12 @@ pub(super) fn handle_xfixes_request(
         x11xfixes::SET_PICTURE_CLIP_REGION => {
             if let Some(req) = x11xfixes::parse_set_picture_clip_region(body) {
                 let pic_id = ResourceId(req.picture);
+                check_resource!(pic_id, ResourceKind::Picture, AccessMode::SET_ATTR);
+                check_resource!(
+                    ResourceId(req.region),
+                    ResourceKind::Region,
+                    AccessMode::READ
+                );
                 let host_pic = state
                     .resources
                     .picture(pic_id)
@@ -1629,11 +1858,21 @@ pub(super) fn handle_xfixes_request(
             if let Err(outcome) = xfixes_verify_cursor(state, client_id, sequence, header, source) {
                 return outcome;
             }
+            check_resource!(
+                ResourceId(source),
+                ResourceKind::Cursor,
+                AccessMode::READ | AccessMode::GET_ATTR
+            );
             let dest_host =
                 match xfixes_verify_cursor(state, client_id, sequence, header, destination) {
                     Ok(host) => host,
                     Err(outcome) => return outcome,
                 };
+            check_resource!(
+                ResourceId(destination),
+                ResourceKind::Cursor,
+                AccessMode::WRITE | AccessMode::SET_ATTR
+            );
             if let Some(dest_host) = dest_host {
                 xfixes_replace_cursor(state, backend, origin, dest_host, ResourceId(source));
             }
@@ -1648,11 +1887,36 @@ pub(super) fn handle_xfixes_request(
                 {
                     return outcome;
                 }
+                check_resource!(
+                    ResourceId(cursor_xid),
+                    ResourceKind::Cursor,
+                    AccessMode::READ | AccessMode::GET_ATTR
+                );
                 let name = std::str::from_utf8(name_bytes).unwrap_or("");
                 let atom = state.atoms.intern(name, true);
                 if atom.0 != 0 {
                     for host in state.resources.cursor_hosts_named(atom) {
-                        xfixes_replace_cursor(state, backend, origin, host, ResourceId(cursor_xid));
+                        let allowed = if let Some(target) = xfixes_cursor_host_target(state, host) {
+                            super::validate_resource_access(
+                                state,
+                                client_id,
+                                target,
+                                AccessMode::WRITE | AccessMode::SET_ATTR,
+                                access_request,
+                            )
+                            .is_ok()
+                        } else {
+                            true
+                        };
+                        if allowed {
+                            xfixes_replace_cursor(
+                                state,
+                                backend,
+                                origin,
+                                host,
+                                ResourceId(cursor_xid),
+                            );
+                        }
                     }
                 }
             }
@@ -1669,21 +1933,39 @@ pub(super) fn handle_xfixes_request(
                     header.opcode,
                 );
             };
-            // VERIFY_REGION source then destination: XFixes BadRegion
-            // (error base + 0).
-            for region in [req.source, req.destination] {
-                if !state.xfixes_regions.contains_key(&region) {
-                    return emit_x11_error_with_minor(
-                        state,
-                        client_id,
-                        sequence,
-                        crate::nested::XFIXES_FIRST_ERROR,
-                        region,
-                        u16::from(minor),
-                        header.opcode,
-                    );
-                }
+            // XLibre `VERIFY_REGION` looks up and checks each operand in turn.
+            if !state.xfixes_regions.contains_key(&req.source) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    crate::nested::XFIXES_FIRST_ERROR,
+                    req.source,
+                    u16::from(minor),
+                    header.opcode,
+                );
             }
+            check_resource!(
+                ResourceId(req.source),
+                ResourceKind::Region,
+                AccessMode::READ
+            );
+            if !state.xfixes_regions.contains_key(&req.destination) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    crate::nested::XFIXES_FIRST_ERROR,
+                    req.destination,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
+            check_resource!(
+                ResourceId(req.destination),
+                ResourceKind::Region,
+                AccessMode::WRITE
+            );
             let source = state.xfixes_regions[&req.source].rects();
             // An empty source leaves the destination untouched (Xorg only
             // rewrites it inside `if (nBoxes)`; confirmed on Xvfb).
@@ -1718,6 +2000,11 @@ pub(super) fn handle_xfixes_request(
                 {
                     return outcome;
                 }
+                check_resource!(
+                    ResourceId(cursor_xid),
+                    ResourceKind::Cursor,
+                    AccessMode::SET_ATTR
+                );
                 let name = std::str::from_utf8(name_bytes).unwrap_or("");
                 let atom = state.atoms.intern(name, false);
                 state
@@ -1748,6 +2035,11 @@ pub(super) fn handle_xfixes_request(
             {
                 return outcome;
             }
+            check_resource!(
+                ResourceId(cursor_xid),
+                ResourceKind::Cursor,
+                AccessMode::GET_ATTR
+            );
             let atom = state
                 .resources
                 .cursor_name_atom(ResourceId(cursor_xid))
@@ -1795,6 +2087,11 @@ pub(super) fn handle_xfixes_request(
                     header.opcode,
                 );
             }
+            check_resource!(
+                ResourceId(window),
+                ResourceKind::Window,
+                AccessMode::GET_ATTR
+            );
             if minor == x11xfixes::HIDE_CURSOR {
                 let was_visible = state.xfixes_cursor_hide_counts.is_empty();
                 *state
