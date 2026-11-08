@@ -169,6 +169,10 @@ impl PlatformBackend {
                     .vrr_clear_retry_deadline
                     .get()
                     .is_some_and(|deadline| now >= deadline));
+        if !output.vrr_committed.get() {
+            output.vrr_clear_retry_deadline.set(None);
+            output.vrr_clear_waiting_for_flip.set(false);
+        }
         if !gamma_due && !vrr_clear_due {
             return;
         }

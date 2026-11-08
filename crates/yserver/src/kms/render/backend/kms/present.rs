@@ -1230,8 +1230,7 @@ impl KmsBackend {
         candidate: PresentScanoutCandidate,
         event: yserver_core::backend::CompletedPresentEvent,
     ) -> io::Result<bool> {
-        let present_received_at = std::time::Instant::now();
-        let present_received_monotonic = crate::drm::atomic::monotonic_timestamp();
+        let (present_received_at, present_received_monotonic) = (self.pstate.monotonic_clock)();
         let source_id = self.store.lookup(candidate.src_host_xid);
         let leaf_id = self.store.lookup(candidate.paint_dst_host_xid);
         let paint_target = self.resolve_paint_target(candidate.paint_dst_host_xid);
@@ -1492,6 +1491,11 @@ impl KmsBackend {
             fence_tally,
         };
 
+        // Count the Present at the backend observation point, before it can
+        // enter the latest-wins successor slot. Dispatching that successor
+        // later must not create another activity observation.
+        self.note_direct_vrr_present(scope, &frame.candidate, frame.target, present_received_at);
+
         if self.pstate.direct.get(scope).is_some_and(|owner| {
             owner.pending.is_some()
                 || (matches!(scope, DirectScope::Output(_)) && owner.queued_successor.is_some())
@@ -1560,7 +1564,8 @@ impl KmsBackend {
         } else {
             crate::drm::async_flip::FlipTiming::Vsync
         };
-        if let Err(error) = self.submit_direct_frame(&mut frame, scope, timing) {
+        if let Err(error) = self.submit_direct_frame(&mut frame, scope, timing, present_received_at)
+        {
             self.request_direct_unflip_for(scope, "eligible_direct_successor_submit_failed");
             <Self as Backend>::release_present_source(self, source_pin);
             <Self as Backend>::release_present_source(self, fallback_target_pin);
@@ -1580,7 +1585,9 @@ impl KmsBackend {
         owner.hold_direct = true;
         owner.unflip_requested = false;
         owner.unflip_reason = None;
-        owner.unflip_last_reason = None;
+        if owner.unflip_last_reason.get() != Some("client_idle") {
+            owner.unflip_last_reason.set(None);
+        }
         owner.unflip_fallback_source = None;
         owner.unflip_shadow_ready = false;
         log::debug!(

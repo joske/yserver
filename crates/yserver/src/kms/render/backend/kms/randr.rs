@@ -1654,13 +1654,21 @@ impl KmsBackend {
                     .page_flip_commit_in_flight(&device.device, crtc)
             {
                 output.pending_gamma_deadline.set(None);
+                let vrr_wanted = self
+                    .live_direct_vrr_wanted_by_output_at(now)
+                    .get(output_idx)
+                    .copied()
+                    .unwrap_or(false);
+                let off_reason = self
+                    .pstate
+                    .direct
+                    .scope_for_output(output_idx)
+                    .and_then(|scope| self.pstate.direct.get(scope))
+                    .and_then(|owner| owner.unflip_last_reason.get())
+                    .filter(|reason| *reason == "client_idle")
+                    .unwrap_or("property");
                 self.submit_pending_crtc_property_for_output(
-                    output_idx,
-                    self.live_direct_vrr_wanted_by_output()
-                        .get(output_idx)
-                        .copied()
-                        .unwrap_or(false),
-                    now,
+                    output_idx, vrr_wanted, now, off_reason,
                 )?;
             } else if output.pending_gamma_deadline.get().is_none() {
                 output

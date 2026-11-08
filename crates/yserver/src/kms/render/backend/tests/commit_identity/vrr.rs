@@ -36,6 +36,8 @@ use yserver_core::backend::{Backend, ModeSpec};
 
 const VRR_PROP_ID: u32 = 90;
 
+#[path = "vrr_active.rs"]
+mod active;
 #[path = "vrr_per_output.rs"]
 mod per_output;
 
@@ -634,7 +636,7 @@ fn vrr_clear_rejected_release_completes() {
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: leave vrr_committed true after an accepted DPMS clear; the output end-state assertion must fail.
 fn vrr_dpms_off_clears_and_direct_frame_reenables() {
-    let Some((fixture, direct)) = direct_fixture(18_010, 0) else {
+    let Some((fixture, mut direct)) = direct_fixture(18_010, 0) else {
         eprintln!(
             "SKIP vrr_dpms_off_clears_and_direct_frame_reenables: no Vulkan scene fixture available"
         );
@@ -648,13 +650,13 @@ fn vrr_dpms_off_clears_and_direct_frame_reenables() {
     let events = Rc::new(RefCell::new(Vec::new()));
     install_recording_power(&mut fixture.events.backend, Rc::clone(&recorder), 0, events);
 
-    let initial = accepted_direct_record(&mut fixture, &direct, fd);
+    let initial = qualified_direct_record(&mut fixture, &mut direct, fd);
     let initial_id = super::support::accepted_event_id(&initial).expect("initial direct event ID");
     super::direct_unflip::complete_direct_initial(&mut fixture, &initial, initial_id, fd);
     super::direct_unflip::drain_present_notifications(
         &mut fixture,
         &[direct.candidate.present_id],
-        &[],
+        &[direct.candidate.present_id - 1],
     );
 
     let dpms_offset = recorder.records().len();
@@ -680,7 +682,8 @@ fn vrr_dpms_off_clears_and_direct_frame_reenables() {
 
     Backend::set_dpms_power(&mut fixture.events.backend, 0).expect("DPMS on through Backend");
     let resumed_direct = fixture.install_direct_present(18_011, 0);
-    let direct_frame = accepted_direct_record(&mut fixture, &resumed_direct, fd);
+    let mut resumed_direct = resumed_direct;
+    let direct_frame = qualified_direct_record(&mut fixture, &mut resumed_direct, fd);
     assert!(contains_vrr_property(&direct_frame, crtc, 1));
     assert!(
         fixture.events.backend.platform.outputs[0]
@@ -695,7 +698,7 @@ fn vrr_dpms_off_clears_and_direct_frame_reenables() {
     super::direct_unflip::drain_present_notifications(
         &mut fixture,
         &[resumed_direct.candidate.present_id],
-        &[],
+        &[resumed_direct.candidate.present_id - 1],
     );
     finish_direct_scanout(&mut fixture, &resumed_direct, fd);
     fixture.finish_after_normal_drain();
@@ -782,6 +785,36 @@ fn accepted_direct_record(
         .into_iter()
         .find(|record| super::support::accepted_event_id(record).is_some())
         .expect("Backend accepts the direct frame")
+}
+
+pub(super) fn qualified_direct_record(
+    fixture: &mut super::recording_scene::RecordingSceneFixture,
+    direct: &mut super::recording_scene::DirectPresentSetup,
+    fd: std::os::fd::RawFd,
+) -> AtomicCommitRecord {
+    let (_, elapsed_ns) = super::support::install_controlled_clock(&mut fixture.events.backend);
+    let mut previous_present_id = direct.candidate.present_id;
+    let mut record = accepted_direct_record(fixture, direct, fd);
+    let id = super::support::accepted_event_id(&record).expect("initial direct event ID");
+    super::direct_unflip::complete_direct_initial(fixture, &record, id, fd);
+    super::direct_unflip::drain_present_notifications(fixture, &[previous_present_id], &[]);
+    for interval in 0..3 {
+        elapsed_ns.fetch_add(16_000_000, std::sync::atomic::Ordering::SeqCst);
+        record = submit_direct_successor(fixture, direct, fd);
+        if interval == 2 {
+            break;
+        }
+        let present_id = direct.candidate.present_id;
+        let id = super::support::accepted_event_id(&record).expect("qualifying event ID");
+        super::direct_unflip::complete_direct_initial(fixture, &record, id, fd);
+        super::direct_unflip::drain_present_notifications(
+            fixture,
+            &[present_id],
+            &[previous_present_id],
+        );
+        previous_present_id = present_id;
+    }
+    record
 }
 
 fn submit_direct_successor(
@@ -1184,7 +1217,14 @@ fn start_property_direct(
     fixture: &mut super::recording_scene::RecordingSceneFixture,
     direct: &super::recording_scene::DirectPresentSetup,
     variable_refresh: bool,
-) -> (yserver_core::server::ServerState, u32, AtomicCommitRecord) {
+) -> (
+    yserver_core::server::ServerState,
+    u32,
+    AtomicCommitRecord,
+    std::time::Instant,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    let (base, elapsed_ns) = super::support::install_controlled_clock(&mut fixture.events.backend);
     let fd = super::direct_unflip::fd(fixture);
     let mut state = present_request_state(direct);
     let window = direct.target_xid;
@@ -1223,7 +1263,45 @@ fn start_property_direct(
         .into_iter()
         .find(|record| super::support::accepted_event_id(record).is_some())
         .expect("property-controlled initial Present is accepted");
-    (state, property, initial)
+    (state, property, initial, base, elapsed_ns)
+}
+
+fn qualify_property_direct_owner(
+    fixture: &mut super::recording_scene::RecordingSceneFixture,
+    state: &mut yserver_core::server::ServerState,
+    direct: &super::recording_scene::DirectPresentSetup,
+    elapsed_ns: &AtomicU64,
+    first_present_id: u64,
+) -> AtomicCommitRecord {
+    let fd = super::direct_unflip::fd(fixture);
+    let mut previous_present_id = first_present_id;
+    let mut last = None;
+    for interval in 1..=3_u64 {
+        elapsed_ns.fetch_add(16_000_000, Ordering::SeqCst);
+        let records = submit_property_present(
+            fixture,
+            state,
+            direct,
+            u32::try_from(direct.candidate.present_id + interval).expect("qualifying serial fits"),
+            u16::try_from(2 + interval).expect("qualifying sequence fits"),
+        );
+        let record = records
+            .into_iter()
+            .find(|record| super::support::accepted_event_id(record).is_some())
+            .expect("qualifying Present is accepted through Backend");
+        let present_id = previous_present_id + 1;
+        let event_id =
+            super::support::accepted_event_id(&record).expect("qualifying direct frame event ID");
+        super::direct_unflip::complete_direct_initial(fixture, &record, event_id, fd);
+        super::direct_unflip::drain_present_notifications(
+            fixture,
+            &[present_id],
+            &[previous_present_id],
+        );
+        previous_present_id = present_id;
+        last = Some(record);
+    }
+    last.expect("three qualifying Present intervals")
 }
 
 fn submit_property_present(
@@ -1352,7 +1430,8 @@ fn vrr_standalone_clear_carries_current_primary_fb() {
     let crtc = output.crtc;
     let plane = output.plane;
     let fb_id_property = output.plane_fb_id_prop;
-    let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, true);
+    let (mut state, property, initial, _, elapsed_ns) =
+        start_property_direct(&mut fixture, &direct, true);
     let direct_framebuffer = initial
         .properties
         .iter()
@@ -1360,6 +1439,7 @@ fn vrr_standalone_clear_carries_current_primary_fb() {
         .map(|update| update.value)
         .expect("accepted direct frame sets the primary FB_ID");
     complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
+    let _active = qualify_property_direct_owner(&mut fixture, &mut state, &direct, &elapsed_ns, 1);
 
     let offset = super::direct_unflip::record_count(&fixture, fd);
     delete_vrr_property(
@@ -1367,7 +1447,7 @@ fn vrr_standalone_clear_carries_current_primary_fb() {
         &mut fixture.events.backend,
         direct.target_xid,
         property,
-        4,
+        6,
     );
     Backend::maybe_composite(&mut fixture.events.backend)
         .expect("idle property clear scheduling pass");
@@ -1411,190 +1491,6 @@ fn vrr_standalone_clear_carries_current_primary_fb() {
 
     let clear_id = super::support::accepted_event_id(&clear).expect("clear event ID");
     super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &clear, clear_id, 90);
-    finish_property_direct_scanout(&mut fixture, fd);
-    fixture.finish_after_normal_drain();
-}
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: route the standalone clear's event through direct-frame retirement.
-fn vrr_standalone_clear_event_retires_nothing() {
-    let Some((mut fixture, direct)) =
-        direct_fixture_with_vrr_mode(18_048, 0, crate::launch::VrrMode::Property)
-    else {
-        eprintln!(
-            "SKIP vrr_standalone_clear_event_retires_nothing: no Vulkan scene fixture available"
-        );
-        return;
-    };
-    set_vrr_capable(&mut fixture);
-    let mut fixture = fixture.cleanup_guard();
-    let fd = super::direct_unflip::fd(&fixture);
-    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, true);
-    let direct_id = super::support::accepted_event_id(&initial).expect("direct event ID");
-    super::direct_unflip::complete_direct_initial(&mut fixture, &initial, direct_id, fd);
-
-    let current_before = fixture
-        .events
-        .backend
-        .pstate
-        .direct
-        .root()
-        .current
-        .as_ref()
-        .map(|frame| {
-            (
-                frame.candidate.present_id,
-                frame.source_id,
-                frame.source_pin,
-                frame.fallback_target_pin,
-                frame.accepted_event_id,
-            )
-        })
-        .expect("the direct frame remains current after its own flip event");
-    let direct_framebuffer_before = fixture
-        .events
-        .backend
-        .pstate
-        .scanout_m1
-        .entries
-        .get(&(
-            current_before.1,
-            crate::kms::render::backend::DirectScope::Root,
-        ))
-        .and_then(crate::kms::render::backend::ScanoutM1ProbeEntry::framebuffer)
-        .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
-        .expect("current direct frame retains its framebuffer");
-    let pins_before = fixture.events.backend.present_source_pins.clone();
-    let completed_before: Vec<_> = fixture
-        .events
-        .backend
-        .pstate
-        .direct
-        .root()
-        .completed
-        .iter()
-        .map(|event| event.present_id)
-        .collect();
-    let idled_before: Vec<_> = fixture
-        .events
-        .backend
-        .pstate
-        .direct
-        .root()
-        .idled
-        .iter()
-        .map(|event| event.present_id)
-        .collect();
-    let expected_present_id = fixture
-        .events
-        .backend
-        .pstate
-        .direct
-        .root()
-        .current
-        .as_ref()
-        .expect("current direct frame is retained")
-        .event
-        .present_id;
-    assert_eq!(completed_before, vec![expected_present_id]);
-
-    let offset = super::direct_unflip::record_count(&fixture, fd);
-    delete_vrr_property(
-        &mut state,
-        &mut fixture.events.backend,
-        direct.target_xid,
-        property,
-        4,
-    );
-    Backend::maybe_composite(&mut fixture.events.backend)
-        .expect("idle property clear scheduling pass");
-    let clear = super::direct_unflip::records_since(&fixture, fd, offset)
-        .into_iter()
-        .find(|record| super::support::accepted_event_id(record).is_some())
-        .expect("idle deletion submits one standalone clear");
-    assert_eq!(clear.kind, AtomicCommitKind::VrrOnly);
-    assert!(contains_vrr_property(&clear, crtc, 0));
-
-    let clear_id = super::support::accepted_event_id(&clear).expect("clear event ID");
-    super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &clear, clear_id, 91);
-    let current_after = fixture
-        .events
-        .backend
-        .pstate
-        .direct
-        .root()
-        .current
-        .as_ref()
-        .map(|frame| {
-            (
-                frame.candidate.present_id,
-                frame.source_id,
-                frame.source_pin,
-                frame.fallback_target_pin,
-                frame.accepted_event_id,
-            )
-        })
-        .expect("standalone clear event leaves the direct frame current");
-    assert_eq!(current_after, current_before);
-    let direct_framebuffer_after = fixture
-        .events
-        .backend
-        .pstate
-        .scanout_m1
-        .entries
-        .get(&(
-            current_after.1,
-            crate::kms::render::backend::DirectScope::Root,
-        ))
-        .and_then(crate::kms::render::backend::ScanoutM1ProbeEntry::framebuffer)
-        .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
-        .expect("standalone clear event retains the direct framebuffer");
-    assert_eq!(direct_framebuffer_after, direct_framebuffer_before);
-    assert_eq!(
-        fixture.events.backend.present_source_pins, pins_before,
-        "standalone clear event releases none of the direct frame's buffer pins"
-    );
-    assert_eq!(
-        fixture
-            .events
-            .backend
-            .pstate
-            .direct
-            .root()
-            .completed
-            .iter()
-            .map(|event| event.present_id)
-            .collect::<Vec<_>>(),
-        completed_before,
-        "standalone clear event neither adds nor consumes a Present completion"
-    );
-    assert_eq!(
-        fixture
-            .events
-            .backend
-            .pstate
-            .direct
-            .root()
-            .idled
-            .iter()
-            .map(|event| event.present_id)
-            .collect::<Vec<_>>(),
-        idled_before,
-        "standalone clear event does not retire a Present buffer"
-    );
-    let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
-    assert_eq!(
-        completed
-            .iter()
-            .map(|event| event.present_id)
-            .collect::<Vec<_>>(),
-        vec![expected_present_id],
-        "only the direct frame's original completion is pending"
-    );
-    assert!(Backend::drain_retired_present_idle_events(&mut fixture.events.backend).is_empty());
-
     finish_property_direct_scanout(&mut fixture, fd);
     fixture.finish_after_normal_drain();
 }
@@ -1815,10 +1711,17 @@ fn vrr_off_log_names_the_output_owner_reason() {
         .key
         .connector_name
         .clone();
+    let (_, elapsed_ns) = super::support::install_controlled_clock(&mut fixture.events.backend);
     let direct_record =
         super::direct_unflip::submit_output_present_via_backend(&mut fixture, &direct, 1);
-    let direct_id = super::support::accepted_event_id(&direct_record)
+    super::support::accepted_event_id(&direct_record)
         .expect("Output(1) direct commit has an accepted event ID");
+    per_output::retire_output_direct(&mut fixture, &direct, &direct_record, 92);
+    let mut direct = direct;
+    let direct_record =
+        active::qualify_output_successors(&mut fixture, &mut direct, 1, &elapsed_ns, 93);
+    super::support::accepted_event_id(&direct_record)
+        .expect("qualified Output(1) direct commit has an accepted event ID");
     assert!(contains_vrr_property(&direct_record, output1_crtc, 1));
     assert!(!has_vrr_property(&direct_record, output0_crtc));
     assert!(
@@ -1833,24 +1736,22 @@ fn vrr_off_log_names_the_output_owner_reason() {
         Some(DirectScope::Output(1)),
         "the direct frame is owned by Output(1)"
     );
-    super::atomic_events::complete_recorded_attempt(
-        &mut fixture,
-        fd,
-        &direct_record,
-        direct_id,
-        92,
-    );
-    super::direct_unflip::drain_present_notifications(
-        &mut fixture,
-        &[direct.candidate.present_id],
-        &[],
+    let idled = Backend::drain_retired_present_idle_events(&mut fixture.events.backend);
+    assert_eq!(
+        idled
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        (direct.candidate.present_id - 3..direct.candidate.present_id).collect::<Vec<_>>()
     );
 
     super::recording_scene::clear_vrr_test_logs();
     Backend::destroy_subwindow(&mut fixture.events.backend, None, direct.target_xid)
         .expect("destroy Output(1)'s direct window through Backend");
     assert_eq!(
-        fixture.events.backend.pstate.direct.outputs[1].unflip_last_reason,
+        fixture.events.backend.pstate.direct.outputs[1]
+            .unflip_last_reason
+            .get(),
         Some("destroy_direct_frame_drawable"),
         "the affected owner records the window-destroy reason"
     );
@@ -1878,6 +1779,7 @@ fn vrr_off_log_names_the_output_owner_reason() {
     );
     let output_owner_reason = fixture.events.backend.pstate.direct.outputs[1]
         .unflip_last_reason
+        .get()
         .expect("Output(1) retains its latest unflip reason through replacement submission");
     let expected_output_reason = format!(
         "kms: vrr off output={output_name} crtc={} reason={output_owner_reason}",
@@ -1913,7 +1815,7 @@ fn vrr_off_log_names_the_output_owner_reason() {
     );
     fixture.finish_after_normal_drain();
 
-    let Some((fixture, direct)) = direct_fixture(18_202, 0) else {
+    let Some((fixture, mut direct)) = direct_fixture(18_202, 0) else {
         eprintln!(
             "SKIP vrr_off_log_names_the_output_owner_reason: Root Vulkan fixture unavailable"
         );
@@ -1928,7 +1830,7 @@ fn vrr_off_log_names_the_output_owner_reason() {
         .key
         .connector_name
         .clone();
-    let direct_record = accepted_direct_record(&mut fixture, &direct, fd);
+    let direct_record = qualified_direct_record(&mut fixture, &mut direct, fd);
     let direct_id = super::support::accepted_event_id(&direct_record)
         .expect("Root direct commit has an accepted event ID");
     assert!(contains_vrr_property(&direct_record, crtc, 1));
@@ -1936,7 +1838,7 @@ fn vrr_off_log_names_the_output_owner_reason() {
     super::direct_unflip::drain_present_notifications(
         &mut fixture,
         &[direct.candidate.present_id],
-        &[],
+        &[direct.candidate.present_id - 1],
     );
     assert_eq!(
         fixture.events.backend.pstate.direct.scope_for_output(0),
@@ -1954,7 +1856,8 @@ fn vrr_off_log_names_the_output_owner_reason() {
             .pstate
             .direct
             .root()
-            .unflip_last_reason,
+            .unflip_last_reason
+            .get(),
         Some("destroy_direct_frame_drawable"),
         "Root records the window-destroy reason"
     );
@@ -1984,6 +1887,7 @@ fn vrr_off_log_names_the_output_owner_reason() {
         .direct
         .root()
         .unflip_last_reason
+        .get()
         .expect("Root retains its latest unflip reason through replacement submission");
     let expected_root_reason = format!(
         "kms: vrr off output={output_name} crtc={} reason={root_owner_reason}",
@@ -2077,10 +1981,11 @@ fn vrr_property_mode_reads_like_xorg() {
         &[1],
         1,
     );
+    let (_, elapsed_ns) = super::support::install_controlled_clock(&mut fixture.events.backend);
 
     // The permission comes from the same ChangeProperty -> Present request
-    // path used by clients. The first direct frame accepted after the
-    // existing probation must carry VRR_ENABLED=1.
+    // path used by clients. The first frame starts the cadence; the fourth
+    // qualifying Present carries VRR_ENABLED=1.
     let first_request_serial = u32::try_from(direct.candidate.present_id).unwrap();
     fixture
         .events
@@ -2098,14 +2003,19 @@ fn vrr_property_mode_reads_like_xorg() {
         first_request_serial,
         2,
     );
-    let enabled = super::direct_unflip::records_since(&fixture, fd, start)
+    let initial = super::direct_unflip::records_since(&fixture, fd, start)
         .into_iter()
         .find(|record| super::support::accepted_event_id(record).is_some())
         .expect("first direct Present request is accepted through Backend");
     assert!(
-        contains_vrr_property(&enabled, crtc, 1),
-        "the first direct commit from an INTEGER/32 value 1 Present enables VRR"
+        !contains_vrr_property(&initial, crtc, 1),
+        "the first direct Present starts qualification without enabling VRR"
     );
+    let initial_id = super::support::accepted_event_id(&initial).expect("initial direct event ID");
+    super::direct_unflip::complete_direct_initial(&mut fixture, &initial, initial_id, fd);
+    super::direct_unflip::drain_present_notifications(&mut fixture, &[1], &[]);
+    let enabled = qualify_property_direct_owner(&mut fixture, &mut state, &direct, &elapsed_ns, 1);
+    assert!(contains_vrr_property(&enabled, crtc, 1));
     let fb_id_property = fixture.events.backend.platform.outputs[0]
         .output
         .plane_fb_id_prop;
@@ -2122,18 +2032,14 @@ fn vrr_property_mode_reads_like_xorg() {
             .get(),
         "the accepted request records VRR as committed"
     );
-    let id = super::support::accepted_event_id(&enabled).expect("enabled direct event ID");
-    super::direct_unflip::complete_direct_initial(&mut fixture, &enabled, id, fd);
-    super::direct_unflip::drain_present_notifications(&mut fixture, &[1], &[]);
-
     let property_cases = [
         (yserver_core::xinput::XA_CARDINAL.0, 32, vec![0], false),
         (yserver_core::xinput::XA_CARDINAL.0, 32, vec![2], true),
         (yserver_core::xinput::XA_CARDINAL.0, 8, vec![1], false),
         (yserver_core::xinput::XA_CARDINAL.0, 32, vec![1, 2], false),
     ];
-    let mut previous_present_id = 1_u64;
-    let mut previous_request_serial = first_request_serial;
+    let mut previous_present_id = 4_u64;
+    let mut previous_request_serial = first_request_serial + 3;
     let mut sequence = 10_u16;
     for (property_type, format, values, expected_enabled) in property_cases {
         let was_committed = fixture.events.backend.platform.outputs[0]
@@ -2269,7 +2175,7 @@ fn vrr_property_mode_reads_like_xorg() {
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: never append VRR_ENABLED to an eligible direct frame.
 fn vrr_direct_unredirected_enables() {
-    let Some((fixture, direct)) = direct_fixture(18_001, 0) else {
+    let Some((fixture, mut direct)) = direct_fixture(18_001, 0) else {
         eprintln!("skip: no Vulkan scene fixture available");
         return;
     };
@@ -2277,7 +2183,7 @@ fn vrr_direct_unredirected_enables() {
     set_vrr_capable(&mut fixture);
     let fd = super::direct_unflip::fd(&fixture);
     let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let record = accepted_direct_record(&mut fixture, &direct, fd);
+    let record = qualified_direct_record(&mut fixture, &mut direct, fd);
 
     assert!(contains_vrr_property(&record, crtc, 1));
     assert!(
@@ -2304,7 +2210,7 @@ fn vrr_direct_unredirected_enables() {
     super::direct_unflip::drain_present_notifications(
         &mut fixture,
         &[direct.candidate.present_id],
-        &[],
+        &[direct.candidate.present_id - 1],
     );
     assert!(
         fixture
@@ -2324,7 +2230,7 @@ fn vrr_direct_unredirected_enables() {
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: omit VRR_ENABLED = 0 from the composed replacement after unflip.
 fn vrr_unflip_clears() {
-    let Some((fixture, direct)) = direct_fixture(18_002, 0) else {
+    let Some((fixture, mut direct)) = direct_fixture(18_002, 0) else {
         eprintln!("skip: no Vulkan scene fixture available");
         return;
     };
@@ -2332,13 +2238,13 @@ fn vrr_unflip_clears() {
     set_vrr_capable(&mut fixture);
     let fd = super::direct_unflip::fd(&fixture);
     let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let direct_record = accepted_direct_record(&mut fixture, &direct, fd);
+    let direct_record = qualified_direct_record(&mut fixture, &mut direct, fd);
     let id = super::support::accepted_event_id(&direct_record).expect("direct event ID");
     super::direct_unflip::complete_direct_initial(&mut fixture, &direct_record, id, fd);
     super::direct_unflip::drain_present_notifications(
         &mut fixture,
         &[direct.candidate.present_id],
-        &[],
+        &[direct.candidate.present_id - 1],
     );
 
     super::direct_unflip::request_unflip(&mut fixture, &direct);
@@ -2624,7 +2530,7 @@ fn vrr_async_flip_defers_to_next_vsync_commit() {
     let fd = super::direct_unflip::fd(&fixture);
     super::direct_unflip::enter_async_tearing(&mut fixture, &direct);
     let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let async_record = accepted_direct_record(&mut fixture, &direct, fd);
+    let async_record = qualified_direct_record(&mut fixture, &mut direct, fd);
     assert_eq!(async_record.kind, AtomicCommitKind::Async);
     assert!(!has_vrr_property(&async_record, crtc));
     let async_id = super::support::accepted_event_id(&async_record).expect("async event ID");
@@ -2632,7 +2538,7 @@ fn vrr_async_flip_defers_to_next_vsync_commit() {
     super::direct_unflip::drain_present_notifications(
         &mut fixture,
         &[direct.candidate.present_id],
-        &[],
+        &[direct.candidate.present_id - 1],
     );
 
     direct.candidate.options = 0;
@@ -2667,16 +2573,35 @@ fn vrr_einval_latches_and_frame_goes_out() {
     let mut fixture = fixture.cleanup_guard();
     let fd = super::direct_unflip::fd(&fixture);
     let recorder = fixture.events.recorders[&fd].clone();
+    let (_, elapsed_ns) = super::support::install_controlled_clock(&mut fixture.events.backend);
     let first = accepted_direct_record(&mut fixture, &direct, fd);
     let first_id = super::support::accepted_event_id(&first).expect("initial frame event ID");
     let first_present_id = direct.candidate.present_id;
     super::direct_unflip::complete_direct_initial(&mut fixture, &first, first_id, fd);
     super::direct_unflip::drain_present_notifications(&mut fixture, &[first_present_id], &[]);
     set_vrr_capable(&mut fixture);
+    for interval in 0..3 {
+        elapsed_ns.fetch_add(16_000_000, Ordering::SeqCst);
+        let frame = submit_direct_successor(&mut fixture, &mut direct, fd);
+        assert!(!has_vrr_property(
+            &frame,
+            fixture.events.backend.platform.outputs[0].output.crtc
+        ));
+        let frame_id = super::support::accepted_event_id(&frame).expect("qualifying frame ID");
+        super::direct_unflip::complete_direct_initial(&mut fixture, &frame, frame_id, fd);
+        let present_id = direct.candidate.present_id;
+        super::direct_unflip::drain_present_notifications(
+            &mut fixture,
+            &[present_id],
+            &[present_id - 1],
+        );
+        let _ = interval;
+    }
     let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
     recorder.clear_records();
     let offset = super::direct_unflip::record_count(&fixture, fd);
     recorder.script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+    elapsed_ns.fetch_add(16_000_000, Ordering::SeqCst);
     let retry_record = submit_direct_successor(&mut fixture, &mut direct, fd);
     assert!(!has_vrr_property(&retry_record, crtc));
     let records = super::direct_unflip::records_since(&fixture, fd, offset);
@@ -2719,7 +2644,7 @@ fn vrr_einval_latches_and_frame_goes_out() {
     super::direct_unflip::drain_present_notifications(
         &mut fixture,
         &[direct.candidate.present_id],
-        &[first_present_id],
+        &[direct.candidate.present_id - 1],
     );
 
     let second_present_id = direct.candidate.present_id;
@@ -2758,13 +2683,13 @@ fn vrr_rejected_clear_is_bounded() {
     set_vrr_capable(&mut fixture);
     let fd = super::direct_unflip::fd(&fixture);
     let recorder = fixture.events.recorders[&fd].clone();
-    let initial = accepted_direct_record(&mut fixture, &direct, fd);
+    let initial = qualified_direct_record(&mut fixture, &mut direct, fd);
     let initial_id = super::support::accepted_event_id(&initial).expect("direct event ID");
     super::direct_unflip::complete_direct_initial(&mut fixture, &initial, initial_id, fd);
     super::direct_unflip::drain_present_notifications(
         &mut fixture,
         &[direct.candidate.present_id],
-        &[],
+        &[direct.candidate.present_id - 1],
     );
     let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
 
@@ -2871,7 +2796,7 @@ fn vrr_rejected_clear_is_bounded() {
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: keep gamma first when a VRR clear is due in the same request.
 fn vrr_clear_goes_before_pending_gamma() {
-    let Some((fixture, direct)) = direct_fixture(18_009, 0) else {
+    let Some((fixture, mut direct)) = direct_fixture(18_009, 0) else {
         eprintln!("skip: no Vulkan scene fixture available");
         return;
     };
@@ -2880,15 +2805,14 @@ fn vrr_clear_goes_before_pending_gamma() {
     let fd = super::direct_unflip::fd(&fixture);
     let recorder = fixture.events.recorders[&fd].clone();
     recorder.set_gamma_size_for_tests(4);
-    let initial = accepted_direct_record(&mut fixture, &direct, fd);
+    let initial = qualified_direct_record(&mut fixture, &mut direct, fd);
     let initial_id = super::support::accepted_event_id(&initial).expect("direct event ID");
     super::direct_unflip::complete_direct_initial(&mut fixture, &initial, initial_id, fd);
     super::direct_unflip::drain_present_notifications(
         &mut fixture,
         &[direct.candidate.present_id],
-        &[],
+        &[direct.candidate.present_id - 1],
     );
-    let _ = super::support::install_controlled_clock(&mut fixture.events.backend);
     super::recording_scene::clear_vrr_test_logs();
     let output_name = "vrr-deferred-exit-test";
     fixture.events.backend.platform.outputs[0]
@@ -3052,124 +2976,6 @@ fn vrr_clear_goes_before_pending_gamma() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: append VRR_ENABLED in the same request that carries GAMMA_LUT.
-fn vrr_enable_waits_behind_pending_gamma() {
-    let Some((fixture, mut direct)) = direct_fixture(18_007, 0) else {
-        eprintln!("skip: no Vulkan scene fixture available");
-        return;
-    };
-    let mut fixture = fixture.cleanup_guard();
-    let fd = super::direct_unflip::fd(&fixture);
-    let recorder = fixture.events.recorders[&fd].clone();
-    {
-        let output = &mut fixture.events.backend.platform.outputs[0].output;
-        output.crtc_gamma_lut_prop = Some(handle(70));
-        output.crtc_degamma_lut_prop = Some(handle(71));
-        output.crtc_ctm_prop = Some(handle(72));
-        output.crtc_gamma_lut_size = Some(4);
-    }
-    let output_key = fixture.events.backend.platform.outputs[0].key.clone();
-    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    fixture
-        .events
-        .backend
-        .pstate
-        .crtc_key_by_id
-        .insert(u32::from(crtc), output_key);
-    recorder.set_gamma_size_for_tests(4);
-    let first = accepted_direct_record(&mut fixture, &direct, fd);
-    let first_id = super::support::accepted_event_id(&first).expect("direct event ID");
-    super::direct_unflip::complete_direct_initial(&mut fixture, &first, first_id, fd);
-    let first_present_id = direct.candidate.present_id;
-    super::direct_unflip::drain_present_notifications(&mut fixture, &[first_present_id], &[]);
-    let _ = super::support::install_controlled_clock(&mut fixture.events.backend);
-
-    let vrr_output = &mut fixture.events.backend.platform.outputs[0].output;
-    vrr_output.crtc_vrr_enabled_prop = Some(handle(VRR_PROP_ID));
-    vrr_output.connector_vrr_capable = true;
-    vrr_output.vrr_committed.set(false);
-    let crtc_xid = u32::from(vrr_output.crtc);
-    Backend::set_crtc_gamma(
-        &mut fixture.events.backend,
-        crtc_xid,
-        &[0x1111; 4],
-        &[0x2222; 4],
-        &[0x3333; 4],
-    )
-    .expect("queue gamma through RandR while direct scanout is active");
-    assert!(
-        fixture.events.backend.platform.outputs[0]
-            .output
-            .pending_gamma_lut
-            .borrow()
-            .is_some()
-    );
-    let gamma_and_vrr_due = submit_direct_successor(&mut fixture, &mut direct, fd);
-    assert!(
-        gamma_and_vrr_due
-            .properties
-            .iter()
-            .any(|update| { update.object == crtc.into() && update.property == handle(70) }),
-        "the due LUT rides the first eligible direct vsync frame"
-    );
-    assert!(!has_vrr_property(&gamma_and_vrr_due, crtc));
-    assert!(
-        !fixture.events.backend.platform.outputs[0]
-            .output
-            .vrr_committed
-            .get()
-    );
-    let gamma_frame_id =
-        super::support::accepted_event_id(&gamma_and_vrr_due).expect("gamma frame event ID");
-    super::direct_unflip::complete_direct_initial(
-        &mut fixture,
-        &gamma_and_vrr_due,
-        gamma_frame_id,
-        fd,
-    );
-    let gamma_present_id = direct.candidate.present_id;
-    super::direct_unflip::drain_present_notifications(
-        &mut fixture,
-        &[gamma_present_id],
-        &[first_present_id],
-    );
-
-    let vrr_frame = submit_direct_successor(&mut fixture, &mut direct, fd);
-    assert!(contains_vrr_property(&vrr_frame, crtc, 1));
-    assert!(
-        !vrr_frame
-            .properties
-            .iter()
-            .any(|update| { update.object == crtc.into() && update.property == handle(70) }),
-        "VRR follows the gamma frame"
-    );
-    assert!(
-        fixture.events.backend.platform.outputs[0]
-            .output
-            .vrr_committed
-            .get()
-    );
-    assert!(
-        fixture.events.backend.platform.outputs[0]
-            .output
-            .pending_gamma_lut
-            .borrow()
-            .is_none(),
-        "the gamma frame consumes its pending LUT"
-    );
-    let vrr_id = super::support::accepted_event_id(&vrr_frame).expect("VRR frame event ID");
-    super::direct_unflip::complete_direct_initial(&mut fixture, &vrr_frame, vrr_id, fd);
-    super::direct_unflip::drain_present_notifications(
-        &mut fixture,
-        &[direct.candidate.present_id],
-        &[gamma_present_id],
-    );
-    finish_direct_scanout(&mut fixture, &direct, fd);
-    fixture.finish_after_normal_drain();
-}
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: omit the inherited VRR_ENABLED = 0 clear from the next scene commit.
 fn vrr_inherited_on_is_cleared() {
     let Some(mut fixture) = super::recording_scene::RecordingSceneFixture::new(1)
@@ -3207,6 +3013,8 @@ struct VrrCursorHarness {
     direct: Option<super::recording_scene::DirectPresentSetup>,
     delivered: HashSet<super::super::cursor_sprites::support::CompletionKey>,
     device_fd: std::os::fd::RawFd,
+    clock_base: std::time::Instant,
+    elapsed_ns: Arc<AtomicU64>,
 }
 
 impl std::ops::Deref for VrrCursorHarness {
@@ -3340,6 +3148,8 @@ fn vrr_composed_cursor_harness() -> Option<VrrCursorHarness> {
         direct: None,
         delivered: HashSet::new(),
         device_fd,
+        clock_base: std::time::Instant::now(),
+        elapsed_ns: Arc::new(AtomicU64::new(0)),
     };
     let cursor = create_argb_cursor(
         &mut harness.scene.events.backend,
@@ -3383,6 +3193,8 @@ fn vrr_cursor_harness(present_id: u64, capable: bool) -> Option<VrrCursorHarness
         direct: None,
         delivered: HashSet::new(),
         device_fd,
+        clock_base: std::time::Instant::now(),
+        elapsed_ns: Arc::new(AtomicU64::new(0)),
     };
     let cursor = create_argb_cursor(
         &mut harness.scene.events.backend,
@@ -3410,6 +3222,10 @@ fn vrr_cursor_harness(present_id: u64, capable: bool) -> Option<VrrCursorHarness
         output.vrr_disabled.set(false);
         output.vrr_clear_retry_used.set(false);
     }
+    let (clock_base, elapsed_ns) =
+        super::support::install_controlled_clock(&mut harness.scene.events.backend);
+    harness.clock_base = clock_base;
+    harness.elapsed_ns = elapsed_ns;
     let direct = enter_held_direct(
         harness.fixture.as_mut().expect("cursor fixture is live"),
         &mut harness.delivered,
@@ -3417,18 +3233,42 @@ fn vrr_cursor_harness(present_id: u64, capable: bool) -> Option<VrrCursorHarness
         None,
     )
     .expect("enter held direct scanout through Backend");
+    super::direct_unflip::drain_present_notifications(
+        &mut harness.scene,
+        &[direct.candidate.present_id],
+        &[],
+    );
+    let mut direct = direct;
+    if capable {
+        let crtc = harness.scene.events.backend.platform.outputs[0].output.crtc;
+        for frame_number in 0..3 {
+            advance_vrr_cursor_clock(&harness.elapsed_ns, Duration::from_millis(16));
+            let previous = direct.candidate.present_id;
+            let record = submit_direct_successor(&mut harness.scene, &mut direct, device_fd);
+            let id = super::support::accepted_event_id(&record).expect("qualifying frame ID");
+            super::direct_unflip::complete_direct_initial(
+                &mut harness.scene,
+                &record,
+                id,
+                device_fd,
+            );
+            harness.note_direct_frame_retired(crtc, id);
+            super::direct_unflip::drain_present_notifications(
+                &mut harness.scene,
+                &[direct.candidate.present_id],
+                &[previous],
+            );
+            let _ = frame_number;
+        }
+    }
+    harness.clock_base += Duration::from_nanos(harness.elapsed_ns.load(Ordering::SeqCst));
     assert_eq!(
         harness.scene.events.backend.platform.outputs[0]
             .output
             .vrr_committed
             .get(),
         capable,
-        "direct frame establishes the requested VRR state"
-    );
-    super::direct_unflip::drain_present_notifications(
-        &mut harness.scene,
-        &[direct.candidate.present_id],
-        &[],
+        "the direct owner qualifies before cursor hold checks"
     );
     harness.direct = Some(direct);
     Some(harness)
@@ -3509,8 +3349,8 @@ fn vrr_cursor_motion_rides_direct_frame() {
         eprintln!("SKIP vrr_cursor_motion_rides_direct_frame: no Vulkan scene fixture available");
         return;
     };
-    let (base, elapsed_ns) =
-        super::support::install_controlled_clock(&mut harness.scene.events.backend);
+    let base = harness.clock_base;
+    let elapsed_ns = Arc::clone(&harness.elapsed_ns);
     let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     let mut direct = harness.direct.take().expect("direct scanout is active");
     harness.warp_pointer(180, 130);
@@ -3565,8 +3405,8 @@ fn vrr_cursor_motion_without_frame_commits_once_at_deadline() {
         );
         return;
     };
-    let (base, elapsed_ns) =
-        super::support::install_controlled_clock(&mut harness.scene.events.backend);
+    let base = harness.clock_base;
+    let elapsed_ns = Arc::clone(&harness.elapsed_ns);
     let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     harness.warp_pointer(180, 130);
     Backend::maybe_composite(&mut harness.scene.events.backend)
@@ -3613,8 +3453,8 @@ fn vrr_cursor_later_motion_keeps_deadline() {
         eprintln!("SKIP vrr_cursor_later_motion_keeps_deadline: no Vulkan scene fixture available");
         return;
     };
-    let (base, elapsed_ns) =
-        super::support::install_controlled_clock(&mut harness.scene.events.backend);
+    let base = harness.clock_base;
+    let elapsed_ns = Arc::clone(&harness.elapsed_ns);
     let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     harness.warp_pointer(180, 130);
     Backend::maybe_composite(&mut harness.scene.events.backend)
@@ -3843,7 +3683,7 @@ fn vrr_cursor_not_held_after_rejected_clear() {
         });
 
     super::recording_scene::clear_vrr_test_logs();
-    let (base, _) = super::support::install_controlled_clock(&mut harness.scene.events.backend);
+    let base = harness.clock_base;
     let cursor_offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     harness.warp_pointer(180, 130);
     Backend::maybe_composite(&mut harness.scene.events.backend)
@@ -3941,8 +3781,8 @@ fn vrr_cursor_new_move_after_carried_move_gets_fresh_deadline() {
         );
         return;
     };
-    let (base, elapsed_ns) =
-        super::support::install_controlled_clock(&mut harness.scene.events.backend);
+    let base = harness.clock_base;
+    let elapsed_ns = Arc::clone(&harness.elapsed_ns);
     let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     let mut direct = harness.direct.take().expect("direct scanout is active");
     harness.warp_pointer(180, 130);
@@ -4008,8 +3848,8 @@ fn vrr_cursor_deadline_ebusy_waits_for_flip() {
         );
         return;
     };
-    let (base, elapsed_ns) =
-        super::support::install_controlled_clock(&mut harness.scene.events.backend);
+    let base = harness.clock_base;
+    let elapsed_ns = Arc::clone(&harness.elapsed_ns);
     let recorder = Rc::clone(&harness.scene.events.recorders[&harness.device_fd]);
     let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     let crtc = harness.scene.events.backend.platform.outputs[0].output.crtc;
@@ -4082,7 +3922,6 @@ fn vrr_cursor_image_change_commits_immediately() {
         );
         return;
     };
-    let _ = super::support::install_controlled_clock(&mut harness.scene.events.backend);
     let position_offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     harness.warp_pointer(180, 130);
     Backend::maybe_composite(&mut harness.scene.events.backend)
@@ -4139,7 +3978,7 @@ fn vrr_off_cursor_only_unchanged() {
         eprintln!("SKIP vrr_off_cursor_only_unchanged: no Vulkan scene fixture available");
         return;
     };
-    let (base, _) = super::support::install_controlled_clock(&mut harness.scene.events.backend);
+    let base = harness.clock_base;
     let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     harness.warp_pointer(180, 130);
     Backend::maybe_composite(&mut harness.scene.events.backend)
@@ -4187,276 +4026,6 @@ fn vrr_off_cursor_only_unchanged() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: use completion_at_monotonic for VRR intervals; both 2-second offsets must still count.
-fn vrr_summary_intervals_use_raw_ust() {
-    for (ust_start, received_start, expected_max_us, offset_name) in [
-        (
-            Duration::from_micros(10_001),
-            Duration::from_micros(2_010_001),
-            10_000,
-            "2 seconds behind receipt",
-        ),
-        (
-            Duration::from_micros(2_010_001),
-            Duration::from_micros(10_001),
-            2_010_000,
-            "2 seconds ahead of receipt",
-        ),
-    ] {
-        let Some(mut harness) = vrr_cursor_harness(18_032, true) else {
-            eprintln!("SKIP vrr_summary_intervals_use_raw_ust: no Vulkan scene fixture available");
-            return;
-        };
-        let output_crtc = harness.scene.events.backend.platform.outputs[0].output.crtc;
-        let device_fd = harness.device_fd;
-        let sink = Rc::clone(&harness.scene.events.backend.platform.devices[0].atomic_commit_sink);
-        let mut direct = harness.direct.take().expect("direct scanout is active");
-
-        for (frame, ust_step_us, received_step_ms) in [
-            (10_u32, 0_u64, 0_u64),
-            (20, 10_000, 10),
-            (30, 5_000, 20),
-            (40, 20_000, 30),
-        ] {
-            let previous_present = direct.candidate.present_id;
-            let record = submit_direct_successor(&mut harness.scene, &mut direct, device_fd);
-            assert_eq!(record.events.len(), 1, "direct frame targets the VRR CRTC");
-            let commit_id = super::support::accepted_event_id(&record)
-                .expect("direct frame has an accepted commit ID");
-            let ust = ust_start + Duration::from_micros(ust_step_us);
-            let received = received_start + Duration::from_millis(received_step_ms);
-            {
-                let fixture = &mut harness.scene;
-                fixture.events.wait_for_submitted_gpu_work();
-                fixture.events.queue_commit_completion_at(
-                    device_fd,
-                    output_crtc,
-                    commit_id,
-                    frame,
-                    ust,
-                    received,
-                );
-                Backend::on_page_flip_ready(
-                    &mut fixture.events.backend,
-                    &mut fixture.events.state,
-                    device_fd,
-                );
-            }
-            harness.note_direct_frame_retired(output_crtc, commit_id);
-            super::direct_unflip::drain_present_notifications(
-                &mut harness.scene,
-                &[direct.candidate.present_id],
-                &[previous_present],
-            );
-        }
-        harness.direct = Some(direct);
-
-        assert_eq!(
-            sink.for_tests_take_vrr_summary_snapshot(),
-            Some((u32::from(output_crtc), 10_000, 10_000, expected_max_us, 0,)),
-            "the VRR summary uses raw UST for completions {offset_name}; the fixture's initial flip contributes its expected interval"
-        );
-        harness.finish();
-    }
-}
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: record intervals for every CRTC, including CRTCs whose vrr_committed is false.
-fn vrr_summary_reports_intervals_and_deadline_commits() {
-    let Some(mut harness) = vrr_cursor_harness(18_030, true) else {
-        eprintln!(
-            "SKIP vrr_summary_reports_intervals_and_deadline_commits: no Vulkan scene fixture available"
-        );
-        return;
-    };
-    let output_crtc = harness.scene.events.backend.platform.outputs[0].output.crtc;
-    assert!(
-        harness.scene.events.backend.platform.outputs[0]
-            .output
-            .vrr_committed
-            .get()
-    );
-    super::recording_scene::clear_vrr_test_logs();
-
-    let mut direct = harness.direct.take().expect("direct scanout is active");
-    for (frame, time_ms) in [(10_u32, 10_u64), (25, 25), (45, 45)] {
-        let previous_present = direct.candidate.present_id;
-        let record = submit_direct_successor(
-            &mut harness
-                .fixture
-                .as_mut()
-                .expect("cursor fixture is live")
-                .scene,
-            &mut direct,
-            harness.device_fd,
-        );
-        assert_eq!(record.events.len(), 1, "direct frame targets the VRR CRTC");
-        let commit_id = super::support::accepted_event_id(&record)
-            .expect("direct frame has an accepted commit ID");
-        let retired_crtcs: Vec<_> = record.events.iter().map(|event| event.crtc).collect();
-        let ust = Duration::from_millis(time_ms);
-        let received = Duration::from_millis(time_ms + 1);
-        {
-            let fixture = harness.fixture.as_mut().expect("cursor fixture is live");
-            fixture.scene.events.wait_for_submitted_gpu_work();
-            for event in &record.events {
-                fixture.scene.events.queue_commit_completion_at(
-                    harness.device_fd,
-                    event.crtc,
-                    commit_id,
-                    frame,
-                    ust,
-                    received,
-                );
-            }
-            Backend::on_page_flip_ready(
-                &mut fixture.scene.events.backend,
-                &mut fixture.scene.events.state,
-                harness.device_fd,
-            );
-        }
-        for crtc in retired_crtcs {
-            harness.note_direct_frame_retired(crtc, commit_id);
-        }
-        super::direct_unflip::drain_present_notifications(
-            &mut harness
-                .fixture
-                .as_mut()
-                .expect("cursor fixture is live")
-                .scene,
-            &[direct.candidate.present_id],
-            &[previous_present],
-        );
-    }
-    harness.direct = Some(direct);
-
-    let (base, elapsed_ns) =
-        super::support::install_controlled_clock(&mut harness.scene.events.backend);
-    advance_vrr_cursor_clock(&elapsed_ns, Duration::from_millis(45));
-    let cursor_offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
-    harness.warp_pointer(180, 130);
-    Backend::maybe_composite(&mut harness.scene.events.backend)
-        .expect("hold VRR cursor motion until its deadline");
-    assert_eq!(
-        Backend::next_wakeup(&harness.scene.events.backend),
-        Some(base + Duration::from_millis(78)),
-        "the cursor move gets a fresh 33 ms deadline after the 45 ms flip"
-    );
-    advance_vrr_cursor_clock(&elapsed_ns, Duration::from_millis(33));
-    Backend::maybe_composite(&mut harness.scene.events.backend)
-        .expect("submit the deadline-expired cursor move");
-    let deadline_commits: Vec<_> = vrr_cursor_records_since(&harness, cursor_offset)
-        .into_iter()
-        .filter(|record| {
-            record.kind == AtomicCommitKind::CursorOnly
-                && record.events.iter().any(|event| event.crtc == output_crtc)
-        })
-        .collect();
-    assert_eq!(
-        deadline_commits.len(),
-        1,
-        "the VRR output sends exactly one cursor-only commit at the deadline"
-    );
-    assert_eq!(deadline_commits[0].result, ScriptedResult::Ok);
-    assert!(
-        super::support::accepted_event_id(&deadline_commits[0]).is_some(),
-        "the deadline cursor request was accepted"
-    );
-
-    let summary_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let vrr_summary = loop {
-        Backend::before_block(&mut harness.scene.events.backend);
-        if let Some(line) = super::recording_scene::vrr_test_logs()
-            .lines()
-            .find(|line| line.starts_with("present_latency_summary "))
-        {
-            break line.to_owned();
-        }
-        assert!(
-            std::time::Instant::now() < summary_deadline,
-            "present latency summary did not become due"
-        );
-        std::thread::yield_now();
-    };
-    // The setup direct flip retires at UST 1 us before these 10/25/45 ms samples.
-    let expected_vrr_section = format!(
-        "vrr crtc={} flip_interval_us_min/p50/max=9999/15000/20000 cursor_deadline_commits=1",
-        u32::from(output_crtc)
-    );
-    assert!(
-        vrr_summary.contains(&expected_vrr_section),
-        "the VRR summary reports exact retired-flip intervals and one deadline commit; line={vrr_summary}"
-    );
-    assert_eq!(
-        vrr_summary.matches(" vrr crtc=").count(),
-        1,
-        "the VRR summary omits the fixed-refresh CRTC"
-    );
-    harness.finish();
-
-    let Some((off_fixture, off_direct)) = super::direct_unflip::direct_fixture(
-        1,
-        super::recording_scene::P1SceneRoute::Shared,
-        18_031,
-        0,
-    ) else {
-        eprintln!(
-            "SKIP vrr_summary_reports_intervals_and_deadline_commits: no VRR-off Vulkan fixture available"
-        );
-        return;
-    };
-    let mut off_fixture = off_fixture.cleanup_guard();
-    super::recording_scene::clear_vrr_test_logs();
-    let off_fd = super::direct_unflip::fd(&off_fixture);
-    let off_record = accepted_direct_record(&mut off_fixture, &off_direct, off_fd);
-    let off_id = super::support::accepted_event_id(&off_record)
-        .expect("VRR-off direct frame has an accepted event ID");
-    off_fixture.events.wait_for_submitted_gpu_work();
-    for event in &off_record.events {
-        off_fixture.events.queue_commit_completion_at(
-            off_fd,
-            event.crtc,
-            off_id,
-            60,
-            Duration::from_millis(60),
-            Duration::from_millis(61),
-        );
-    }
-    {
-        let events = &mut off_fixture.events;
-        Backend::on_page_flip_ready(&mut events.backend, &mut events.state, off_fd);
-    }
-    super::direct_unflip::drain_present_notifications(
-        &mut off_fixture,
-        &[off_direct.candidate.present_id],
-        &[],
-    );
-    let off_summary_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let off_summary = loop {
-        Backend::before_block(&mut off_fixture.events.backend);
-        if let Some(line) = super::recording_scene::vrr_test_logs()
-            .lines()
-            .find(|line| line.starts_with("present_latency_summary "))
-        {
-            break line.to_owned();
-        }
-        assert!(
-            std::time::Instant::now() < off_summary_deadline,
-            "VRR-off present latency summary did not become due"
-        );
-        std::thread::yield_now();
-    };
-    assert!(
-        !off_summary.contains(" vrr crtc="),
-        "the VRR-off snapshot has no VRR section; line={off_summary}"
-    );
-    finish_direct_scanout(&mut off_fixture, &off_direct, off_fd);
-    off_fixture.finish_after_normal_drain();
-}
-
-#[test]
-#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutations: compare the RANDR candidate CRTC XID to output.crtc, or report inherited instead of property.
 fn vrr_property_deleted_clears_without_frame_distinct_crtc_ids() {
     let Some((mut fixture, mut direct)) =
@@ -4496,8 +4065,8 @@ fn vrr_property_deleted_clears_without_frame_distinct_crtc_ids() {
         .key
         .connector_name
         .clone();
-    let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, true);
-    assert!(contains_vrr_property(&initial, crtc, 1));
+    let (mut state, property, initial, _, elapsed_ns) =
+        start_property_direct(&mut fixture, &direct, true);
     let fb_id_property = fixture.events.backend.platform.outputs[output_idx]
         .output
         .plane_fb_id_prop;
@@ -4508,6 +4077,8 @@ fn vrr_property_deleted_clears_without_frame_distinct_crtc_ids() {
         .map(|update| update.value)
         .expect("accepted direct frame sets the primary FB_ID");
     complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
+    let active = qualify_property_direct_owner(&mut fixture, &mut state, &direct, &elapsed_ns, 1);
+    assert!(contains_vrr_property(&active, crtc, 1));
     assert!(
         fixture
             .events
@@ -4545,7 +4116,7 @@ fn vrr_property_deleted_clears_without_frame_distinct_crtc_ids() {
         &mut fixture.events.backend,
         direct.target_xid,
         property,
-        3,
+        6,
     );
     Backend::maybe_composite(&mut fixture.events.backend)
         .expect("idle property clear scheduling pass");
@@ -4603,7 +4174,23 @@ fn vrr_property_deleted_clears_without_frame_distinct_crtc_ids() {
         !has_vrr_property(&later, crtc),
         "a fresh Present without the property does not write VRR_ENABLED"
     );
-    complete_direct_and_drain_present(&mut fixture, &later, 2, Some(1));
+    let later_present_id = fixture
+        .events
+        .backend
+        .pstate
+        .direct
+        .root()
+        .pending
+        .as_ref()
+        .expect("later direct frame is pending")
+        .event
+        .present_id;
+    complete_direct_and_drain_present(
+        &mut fixture,
+        &later,
+        later_present_id,
+        Some(later_present_id - 1),
+    );
     finish_property_direct_scanout(&mut fixture, fd);
     fixture.finish_after_normal_drain();
 }
@@ -4628,12 +4215,26 @@ fn vrr_property_deleted_during_flip_clears_at_event() {
         .key
         .connector_name
         .clone();
-    let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, true);
+    let (mut state, property, initial, _, elapsed_ns) =
+        start_property_direct(&mut fixture, &direct, true);
     complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
-    let pending = submit_property_present(&mut fixture, &mut state, &direct, 18_043, 3)
+    let _active = qualify_property_direct_owner(&mut fixture, &mut state, &direct, &elapsed_ns, 1);
+    let pending = submit_property_present(&mut fixture, &mut state, &direct, 18_046, 6)
         .into_iter()
         .find(|record| super::support::accepted_event_id(record).is_some())
         .expect("direct successor flip is in flight");
+    let pending_present_id = fixture
+        .events
+        .backend
+        .pstate
+        .direct
+        .root()
+        .pending
+        .as_ref()
+        .expect("successor direct frame is pending")
+        .event
+        .present_id;
+    let previous_present_id = pending_present_id - 1;
     let fb_id_property = fixture.events.backend.platform.outputs[0]
         .output
         .plane_fb_id_prop;
@@ -4651,7 +4252,7 @@ fn vrr_property_deleted_during_flip_clears_at_event() {
         &mut fixture.events.backend,
         direct.target_xid,
         property,
-        4,
+        7,
     );
     assert!(
         super::direct_unflip::records_since(&fixture, fd, offset)
@@ -4673,7 +4274,11 @@ fn vrr_property_deleted_during_flip_clears_at_event() {
         super::support::accepted_event_id(&pending).expect("pending event ID"),
         85,
     );
-    super::direct_unflip::drain_present_notifications(&mut fixture, &[2], &[1]);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[pending_present_id],
+        &[previous_present_id],
+    );
     let clear = super::direct_unflip::records_since(&fixture, fd, offset)
         .into_iter()
         .find(|record| super::support::accepted_event_id(record).is_some())
@@ -4748,9 +4353,14 @@ fn vrr_queued_property_delete_clear_logs_property_reason() {
         1,
     );
     direct.candidate.variable_refresh = true;
-    let initial = accepted_direct_record(&mut fixture, &direct, fd);
+    let initial = qualified_direct_record(&mut fixture, &mut direct, fd);
     assert!(contains_vrr_property(&initial, crtc, 1));
-    complete_direct_and_drain_present(&mut fixture, &initial, direct.candidate.present_id, None);
+    complete_direct_and_drain_present(
+        &mut fixture,
+        &initial,
+        direct.candidate.present_id,
+        Some(direct.candidate.present_id - 1),
+    );
 
     let pending = submit_direct_successor(&mut fixture, &mut direct, fd);
     let pending_present_id = direct.candidate.present_id;
@@ -4836,7 +4446,8 @@ fn vrr_property_set_enables_on_next_frame() {
     let mut fixture = fixture.cleanup_guard();
     let fd = super::direct_unflip::fd(&fixture);
     let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, false);
+    let (mut state, property, initial, _, elapsed_ns) =
+        start_property_direct(&mut fixture, &direct, false);
     assert!(!has_vrr_property(&initial, crtc));
     complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
     let offset = super::direct_unflip::record_count(&fixture, fd);
@@ -4864,18 +4475,42 @@ fn vrr_property_set_enables_on_next_frame() {
             .get()
     );
 
-    let next = submit_property_present(&mut fixture, &mut state, &direct, 18_045, 4)
+    let mut last = None;
+    for interval in 1..=4_u64 {
+        elapsed_ns.fetch_add(16_000_000, Ordering::SeqCst);
+        let record = submit_property_present(
+            &mut fixture,
+            &mut state,
+            &direct,
+            18_044 + u32::try_from(interval).expect("serial fits"),
+            3 + u16::try_from(interval).expect("sequence fits"),
+        )
         .into_iter()
         .find(|record| super::support::accepted_event_id(record).is_some())
-        .expect("next Present reaches direct scanout");
-    assert!(contains_vrr_property(&next, crtc, 1));
+        .expect("qualifying Present reaches direct scanout");
+        if interval < 4 {
+            assert!(!contains_vrr_property(&record, crtc, 1));
+        } else {
+            assert!(contains_vrr_property(&record, crtc, 1));
+        }
+        let present_id = interval + 1;
+        let event_id =
+            super::support::accepted_event_id(&record).expect("qualifying direct frame event ID");
+        super::direct_unflip::complete_direct_initial(&mut fixture, &record, event_id, fd);
+        super::direct_unflip::drain_present_notifications(
+            &mut fixture,
+            &[present_id],
+            &[present_id - 1],
+        );
+        last = Some(record);
+    }
+    let _next = last.expect("four qualifying Presents");
     assert!(
         fixture.events.backend.platform.outputs[0]
             .output
             .vrr_committed
             .get()
     );
-    complete_direct_and_drain_present(&mut fixture, &next, 2, Some(1));
     finish_property_direct_scanout(&mut fixture, fd);
     fixture.finish_after_normal_drain();
 }
@@ -4895,8 +4530,10 @@ fn vrr_property_change_other_window_ignored() {
     set_vrr_capable(&mut fixture);
     let mut fixture = fixture.cleanup_guard();
     let fd = super::direct_unflip::fd(&fixture);
-    let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, true);
+    let (mut state, property, initial, _, elapsed_ns) =
+        start_property_direct(&mut fixture, &direct, true);
     complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
+    let _active = qualify_property_direct_owner(&mut fixture, &mut state, &direct, &elapsed_ns, 1);
     let other_window = direct.target_xid.wrapping_add(0x100);
     add_property_window(&mut state, other_window, other_window.wrapping_add(0x1000));
     let recorder = fixture.events.recorders[&fd].clone();
@@ -4910,7 +4547,7 @@ fn vrr_property_change_other_window_ignored() {
         yserver_core::xinput::XA_CARDINAL.0,
         32,
         &[0],
-        3,
+        6,
     );
     Backend::maybe_composite(&mut fixture.events.backend)
         .expect("unrelated property notification is ignored");
@@ -4972,14 +4609,27 @@ fn queued_property_change_case(initial: bool, changed: bool, present_id: u64) {
         );
     }
     direct.candidate.variable_refresh = initial;
-    let first = accepted_direct_record(&mut fixture, &direct, fd);
+    let (elapsed_ns, first) = if initial {
+        (None, qualified_direct_record(&mut fixture, &mut direct, fd))
+    } else {
+        let (_, elapsed_ns) = super::support::install_controlled_clock(&mut fixture.events.backend);
+        (
+            Some(elapsed_ns),
+            accepted_direct_record(&mut fixture, &direct, fd),
+        )
+    };
     assert_eq!(has_vrr_property(&first, crtc), initial);
-    complete_direct_and_drain_present(&mut fixture, &first, direct.candidate.present_id, None);
+    complete_direct_and_drain_present(
+        &mut fixture,
+        &first,
+        direct.candidate.present_id,
+        (initial).then_some(direct.candidate.present_id - 1),
+    );
 
     let pending = submit_direct_successor(&mut fixture, &mut direct, fd);
     let pending_present_id = direct.candidate.present_id;
     queue_direct_successor(&mut fixture, &mut direct);
-    let queued_present_id = direct.candidate.present_id;
+    let mut queued_present_id = direct.candidate.present_id;
     assert!(
         fixture
             .events
@@ -5011,6 +4661,17 @@ fn queued_property_change_case(initial: bool, changed: bool, present_id: u64) {
             change_sequence,
         );
     }
+    if changed && !initial {
+        direct.candidate.variable_refresh = true;
+        let elapsed_ns = elapsed_ns
+            .as_ref()
+            .expect("clock installed before first Present");
+        for _ in 0..4 {
+            elapsed_ns.fetch_add(16_000_000, Ordering::SeqCst);
+            queue_direct_successor(&mut fixture, &mut direct);
+        }
+        queued_present_id = direct.candidate.present_id;
+    }
     for frame in [
         fixture.events.backend.pstate.direct.root().current.as_ref(),
         fixture.events.backend.pstate.direct.root().pending.as_ref(),
@@ -5041,11 +4702,19 @@ fn queued_property_change_case(initial: bool, changed: bool, present_id: u64) {
         super::support::accepted_event_id(&pending).expect("pending event ID"),
         87,
     );
-    super::direct_unflip::drain_present_notifications(
-        &mut fixture,
-        &[pending_present_id],
-        &[pending_present_id - 1],
-    );
+    let mut completed = vec![pending_present_id];
+    if changed && !initial {
+        completed.extend(pending_present_id + 1..=pending_present_id + 4);
+    }
+    super::direct_unflip::drain_present_notifications(&mut fixture, &completed, &{
+        let mut idled = if changed && !initial {
+            (pending_present_id + 1..=pending_present_id + 4).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        idled.push(pending_present_id - 1);
+        idled
+    });
     let successor = super::direct_unflip::records_since(&fixture, fd, offset)
         .into_iter()
         .find(|record| super::support::accepted_event_id(record).is_some())
@@ -5097,7 +4766,8 @@ fn vrr_standalone_clear_retried_after_error() {
         .key
         .connector_name
         .clone();
-    let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, true);
+    let (mut state, property, initial, _, elapsed_ns) =
+        start_property_direct(&mut fixture, &direct, true);
     let fb_id_property = fixture.events.backend.platform.outputs[0]
         .output
         .plane_fb_id_prop;
@@ -5108,6 +4778,7 @@ fn vrr_standalone_clear_retried_after_error() {
         .map(|update| update.value)
         .expect("accepted direct frame sets the primary FB_ID");
     complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
+    let _active = qualify_property_direct_owner(&mut fixture, &mut state, &direct, &elapsed_ns, 1);
     fixture.events.backend.platform.clear_direct_cursor_retry(0);
     fixture
         .events
@@ -5131,7 +4802,7 @@ fn vrr_standalone_clear_retried_after_error() {
         &mut fixture.events.backend,
         direct.target_xid,
         property,
-        3,
+        6,
     );
     let failed = super::direct_unflip::records_since(&fixture, fd, offset);
     assert_eq!(failed.len(), 1, "the standalone clear is attempted once");
@@ -5239,8 +4910,10 @@ fn vrr_property_change_reaches_every_owner_of_the_window() {
             layout.output.connector_vrr_capable = true;
         }
 
-        let output0 = fixture.install_direct_output_present(0, 18_060, 0);
-        let output1 = fixture.install_direct_output_present(1, 18_061, 0);
+        let mut output0 = fixture.install_direct_output_present(0, 18_060, 0);
+        let mut output1 = fixture.install_direct_output_present(1, 18_061, 0);
+        output0.candidate.variable_refresh = true;
+        output1.candidate.variable_refresh = true;
         let fd = super::direct_unflip::fd(&fixture);
         let mut state = present_request_state(&output0);
         let shared_host_xid = 0x7b20;
@@ -5262,41 +4935,49 @@ fn vrr_property_change_reaches_every_owner_of_the_window() {
             1,
         );
 
-        let direct0 =
+        let (_, elapsed_ns) = super::support::install_controlled_clock(&mut fixture.events.backend);
+        let first0 =
             super::direct_unflip::submit_output_present_via_backend(&mut fixture, &output0, 0);
-        let direct1 =
+        let first1 =
             super::direct_unflip::submit_output_present_via_backend(&mut fixture, &output1, 1);
-        let direct_ids = [
-            super::support::accepted_event_id(&direct0).expect("Output(0) direct ID"),
-            super::support::accepted_event_id(&direct1).expect("Output(1) direct ID"),
-        ];
+        per_output::retire_output_direct(&mut fixture, &output0, &first0, 92);
+        per_output::retire_output_direct(&mut fixture, &output1, &first1, 93);
+        let output1_seed = active::submit_output_successor(&mut fixture, &mut output1, 1);
+        per_output::retire_output_direct(&mut fixture, &output1, &output1_seed, 94);
+        let _ = Backend::drain_retired_present_idle_events(&mut fixture.events.backend);
+        let direct0 =
+            active::qualify_output_successors(&mut fixture, &mut output0, 0, &elapsed_ns, 95);
+        let mut direct1 =
+            active::qualify_output_successors(&mut fixture, &mut output1, 1, &elapsed_ns, 98);
+        // This shared-window fixture records the second owner's first activity
+        // observation on its first successor, so it needs one extra interval
+        // after the common qualification helper to reach active state.
+        if !contains_vrr_property(
+            &direct1,
+            fixture.events.backend.platform.outputs[1].output.crtc,
+            1,
+        ) {
+            elapsed_ns.fetch_add(16_000_000, Ordering::SeqCst);
+            direct1 = active::submit_output_successor(&mut fixture, &mut output1, 1);
+            per_output::retire_output_direct(&mut fixture, &output1, &direct1, 99);
+        }
         let crtcs = [
             fixture.events.backend.platform.outputs[0].output.crtc,
             fixture.events.backend.platform.outputs[1].output.crtc,
         ];
         assert!(contains_vrr_property(&direct0, crtcs[0], 1));
-        assert!(contains_vrr_property(&direct1, crtcs[1], 1));
-        super::atomic_events::complete_recorded_attempt(
-            &mut fixture,
-            fd,
-            &direct0,
-            direct_ids[0],
-            92,
+        assert!(
+            contains_vrr_property(&direct1, crtcs[1], 1),
+            "second output failed to enable (candidate={}, active={:?}, committed={}, direct1={:?})",
+            output1.candidate.variable_refresh,
+            fixture.events.backend.pstate.direct.outputs[1].vrr_activity,
+            fixture.events.backend.platform.outputs[1]
+                .output
+                .vrr_committed
+                .get(),
+            direct1.properties,
         );
-        super::atomic_events::complete_recorded_attempt(
-            &mut fixture,
-            fd,
-            &direct1,
-            direct_ids[1],
-            93,
-        );
-        assert_eq!(
-            Backend::drain_completed_present_events(&mut fixture.events.backend)
-                .into_iter()
-                .map(|event| event.present_id)
-                .collect::<Vec<_>>(),
-            [output0.candidate.present_id, output1.candidate.present_id]
-        );
+        let _ = Backend::drain_retired_present_idle_events(&mut fixture.events.backend);
         let before_pins = fixture.events.backend.present_source_pins.len();
 
         let retiring = if retiring_idx == 0 {
@@ -5438,8 +5119,10 @@ fn vrr_standalone_clear_einval_latches_without_empty_retry() {
     let mut fixture = fixture.cleanup_guard();
     let fd = super::direct_unflip::fd(&fixture);
     let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let (mut state, property, initial) = start_property_direct(&mut fixture, &direct, true);
+    let (mut state, property, initial, _, elapsed_ns) =
+        start_property_direct(&mut fixture, &direct, true);
     complete_direct_and_drain_present(&mut fixture, &initial, 1, None);
+    let _active = qualify_property_direct_owner(&mut fixture, &mut state, &direct, &elapsed_ns, 1);
     let recorder = fixture.events.recorders[&fd].clone();
     let offset = super::direct_unflip::record_count(&fixture, fd);
     recorder.script_result(Err(io::Error::from_raw_os_error(libc::EINVAL)));
@@ -5449,7 +5132,7 @@ fn vrr_standalone_clear_einval_latches_without_empty_retry() {
         &mut fixture.events.backend,
         direct.target_xid,
         property,
-        3,
+        6,
     );
     let attempts = super::direct_unflip::records_since(&fixture, fd, offset);
     assert_eq!(
@@ -5494,13 +5177,10 @@ fn write_fake_process(proc_root: &Path, pid: u32, name: &str) {
 
 fn accepted_vrr_direct(
     fixture: &mut super::recording_scene::RecordingSceneFixtureGuard,
-    direct: &super::recording_scene::DirectPresentSetup,
+    direct: &mut super::recording_scene::DirectPresentSetup,
 ) -> AtomicCommitRecord {
     let fd = super::direct_unflip::fd(fixture);
-    super::direct_unflip::submit_direct(fixture, direct, fd)
-        .into_iter()
-        .find(|record| super::support::accepted_event_id(record).is_some())
-        .expect("Backend accepts the Present direct frame")
+    accepted_direct_record(fixture, direct, fd)
 }
 
 #[test]
@@ -5527,7 +5207,7 @@ fn vrr_all_mode_is_property_mode_outside_nvidia() {
     set_vrr_capable(&mut fixture);
     let mut fixture = fixture.cleanup_guard();
     let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let without_property = accepted_vrr_direct(&mut fixture, &direct);
+    let without_property = accepted_vrr_direct(&mut fixture, &mut direct);
     assert!(
         !contains_vrr_property(&without_property, crtc, 1),
         "outside NVIDIA, a direct window without _VARIABLE_REFRESH remains off"
@@ -5562,7 +5242,8 @@ fn vrr_all_mode_is_property_mode_outside_nvidia() {
     set_vrr_capable(&mut fixture);
     let mut fixture = fixture.cleanup_guard();
     let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let with_property = accepted_vrr_direct(&mut fixture, &direct);
+    let fd = super::direct_unflip::fd(&fixture);
+    let with_property = qualified_direct_record(&mut fixture, &mut direct, fd);
     assert!(
         contains_vrr_property(&with_property, crtc, 1),
         "outside NVIDIA, a direct window with _VARIABLE_REFRESH enables VRR"
@@ -5571,7 +5252,7 @@ fn vrr_all_mode_is_property_mode_outside_nvidia() {
         &mut fixture,
         &with_property,
         direct.candidate.present_id,
-        None,
+        Some(direct.candidate.present_id - 1),
     );
     let fd = super::direct_unflip::fd(&fixture);
     finish_direct_scanout(&mut fixture, &direct, fd);
@@ -5593,7 +5274,8 @@ fn vrr_all_mode_is_property_mode_outside_nvidia() {
     set_vrr_capable(&mut fixture);
     let mut fixture = fixture.cleanup_guard();
     let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let nvidia_without_property = accepted_vrr_direct(&mut fixture, &direct);
+    let fd = super::direct_unflip::fd(&fixture);
+    let nvidia_without_property = qualified_direct_record(&mut fixture, &mut direct, fd);
     assert!(
         contains_vrr_property(&nvidia_without_property, crtc, 1),
         "NVIDIA All mode ignores _VARIABLE_REFRESH"
@@ -5602,7 +5284,7 @@ fn vrr_all_mode_is_property_mode_outside_nvidia() {
         &mut fixture,
         &nvidia_without_property,
         direct.candidate.present_id,
-        None,
+        Some(direct.candidate.present_id - 1),
     );
     let fd = super::direct_unflip::fd(&fixture);
     finish_direct_scanout(&mut fixture, &direct, fd);
@@ -5642,7 +5324,7 @@ fn vrr_exclusions_without_mesa_files_warns() {
     set_vrr_capable(&mut fixture);
     let mut fixture = fixture.cleanup_guard();
     let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let record = accepted_vrr_direct(&mut fixture, &direct);
+    let record = accepted_vrr_direct(&mut fixture, &mut direct);
     assert!(
         !contains_vrr_property(&record, crtc, 1),
         "the NVIDIA list continues to exclude its listed process without Mesa files"
@@ -5703,7 +5385,7 @@ fn vrr_all_mode_excluded_client_never_enables() {
     let mut fixture = fixture.cleanup_guard();
     let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
     direct.candidate.client_pid = Some(61);
-    let excluded = accepted_vrr_direct(&mut fixture, &direct);
+    let excluded = accepted_vrr_direct(&mut fixture, &mut direct);
     assert!(
         !contains_vrr_property(&excluded, crtc, 1),
         "a client whose process is in the NVIDIA list never enables VRR"
@@ -5713,12 +5395,13 @@ fn vrr_all_mode_excluded_client_never_enables() {
     unlisted.candidate.client_id = 2;
     unlisted.candidate.client_pid = Some(62);
     unlisted.event.client_id = yserver_protocol::x11::ClientId(2);
+    let (_, elapsed_ns) = super::support::install_controlled_clock(&mut fixture.events.backend);
     let fd = super::direct_unflip::fd(&fixture);
     let previous_present_id = unlisted.candidate.present_id;
     let allowed = submit_direct_successor(&mut fixture, &mut unlisted, fd);
     assert!(
-        contains_vrr_property(&allowed, crtc, 1),
-        "an unlisted client's direct frame enables VRR"
+        !contains_vrr_property(&allowed, crtc, 1),
+        "the first unlisted Present starts a fresh activity episode"
     );
     complete_direct_and_drain_present(
         &mut fixture,
@@ -5726,6 +5409,24 @@ fn vrr_all_mode_excluded_client_never_enables() {
         unlisted.candidate.present_id,
         Some(previous_present_id),
     );
+    let mut qualified = None;
+    for _ in 0..3 {
+        elapsed_ns.fetch_add(16_000_000, Ordering::SeqCst);
+        let record = submit_direct_successor(&mut fixture, &mut unlisted, fd);
+        qualified = Some(record);
+        let record = qualified.as_ref().expect("latest qualifying Present");
+        complete_direct_and_drain_present(
+            &mut fixture,
+            record,
+            unlisted.candidate.present_id,
+            Some(unlisted.candidate.present_id - 1),
+        );
+    }
+    assert!(contains_vrr_property(
+        &qualified.expect("four unlisted Presents qualify"),
+        crtc,
+        1
+    ));
     finish_direct_scanout(&mut fixture, &unlisted, fd);
     fixture.finish_after_normal_drain();
 }
@@ -5753,14 +5454,19 @@ fn vrr_all_mode_client_without_pid_enables() {
     set_vrr_capable(&mut fixture);
     let mut fixture = fixture.cleanup_guard();
     let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let record = accepted_vrr_direct(&mut fixture, &direct);
+    let fd = super::direct_unflip::fd(&fixture);
+    let record = qualified_direct_record(&mut fixture, &mut direct, fd);
     assert!(
         contains_vrr_property(&record, crtc, 1),
         "a connection without a peer PID is not excluded"
     );
-    complete_direct_and_drain_present(&mut fixture, &record, direct.candidate.present_id, None);
+    complete_direct_and_drain_present(
+        &mut fixture,
+        &record,
+        direct.candidate.present_id,
+        Some(direct.candidate.present_id - 1),
+    );
 
-    let fd = super::direct_unflip::fd(&fixture);
     let previous_present_id = direct.candidate.present_id;
     let successor = submit_direct_successor(&mut fixture, &mut direct, fd);
     assert!(
@@ -5814,7 +5520,8 @@ fn vrr_property_mode_ignores_lists() {
     set_vrr_capable(&mut fixture);
     let mut fixture = fixture.cleanup_guard();
     let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
-    let record = accepted_vrr_direct(&mut fixture, &direct);
+    let fd = super::direct_unflip::fd(&fixture);
+    let record = qualified_direct_record(&mut fixture, &mut direct, fd);
     assert!(
         contains_vrr_property(&record, crtc, 1),
         "Property mode follows _VARIABLE_REFRESH despite a listed process name"
@@ -5823,7 +5530,12 @@ fn vrr_property_mode_ignores_lists() {
         fixture.events.backend.pstate.vrr_exclusions.is_none(),
         "Property mode does not load NVIDIA or Mesa lists"
     );
-    complete_direct_and_drain_present(&mut fixture, &record, direct.candidate.present_id, None);
+    complete_direct_and_drain_present(
+        &mut fixture,
+        &record,
+        direct.candidate.present_id,
+        Some(direct.candidate.present_id - 1),
+    );
     let fd = super::direct_unflip::fd(&fixture);
     finish_direct_scanout(&mut fixture, &direct, fd);
     fixture.finish_after_normal_drain();
@@ -5860,7 +5572,7 @@ fn vrr_exclusion_computed_once_per_client() {
     let mut fixture = fixture.cleanup_guard();
     let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
     direct.candidate.client_pid = Some(81);
-    let first = accepted_vrr_direct(&mut fixture, &direct);
+    let first = accepted_vrr_direct(&mut fixture, &mut direct);
     assert!(
         !contains_vrr_property(&first, crtc, 1),
         "the first excluded Present carries no VRR enable"
@@ -5894,11 +5606,12 @@ fn vrr_exclusion_computed_once_per_client() {
         &mut fixture.events.backend,
         yserver_protocol::x11::ClientId(1),
     );
+    let (_, elapsed_ns) = super::support::install_controlled_clock(&mut fixture.events.backend);
     let previous_present_id = direct.candidate.present_id;
     let third = submit_direct_successor(&mut fixture, &mut direct, fd);
     assert!(
-        contains_vrr_property(&third, crtc, 1),
-        "disconnect clears the decision so a later connection with the same id is read again"
+        !contains_vrr_property(&third, crtc, 1),
+        "a new client decision starts with one unqualified Present"
     );
     complete_direct_and_drain_present(
         &mut fixture,
@@ -5906,6 +5619,24 @@ fn vrr_exclusion_computed_once_per_client() {
         direct.candidate.present_id,
         Some(previous_present_id),
     );
+    let mut qualified = None;
+    for _ in 0..3 {
+        elapsed_ns.fetch_add(16_000_000, Ordering::SeqCst);
+        let record = submit_direct_successor(&mut fixture, &mut direct, fd);
+        qualified = Some(record);
+        let record = qualified.as_ref().expect("latest qualifying Present");
+        complete_direct_and_drain_present(
+            &mut fixture,
+            record,
+            direct.candidate.present_id,
+            Some(direct.candidate.present_id - 1),
+        );
+    }
+    assert!(contains_vrr_property(
+        &qualified.expect("four Presents after disconnect qualify"),
+        crtc,
+        1,
+    ));
     finish_direct_scanout(&mut fixture, &direct, fd);
     fixture.finish_after_normal_drain();
 }

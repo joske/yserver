@@ -743,6 +743,7 @@ fn vrr_clear_and_gamma_never_share_a_request() {
     };
     let mut fixture = fixture.cleanup_guard();
     let fd = super::direct_unflip::fd(&fixture);
+    let mut direct = direct;
     let recorder = fixture.events.recorders[&fd].clone();
     let (crtc_a_xid, crtc_a) = enable_gamma(&mut fixture.events.backend, &recorder, 0, 4);
     let crtc_b = fixture.events.backend.platform.outputs[1].output.crtc;
@@ -753,10 +754,7 @@ fn vrr_clear_and_gamma_never_share_a_request() {
         output.vrr_committed.set(false);
     }
 
-    let initial = super::direct_unflip::submit_direct(&mut fixture, &direct, fd)
-        .into_iter()
-        .find(|record| accepted_event_id(record).is_some())
-        .expect("initial grouped direct Backend frame is accepted");
+    let initial = super::vrr::qualified_direct_record(&mut fixture, &mut direct, fd);
     assert!(contains_crtc_property(&initial, crtc_b, handle(90)));
     super::direct_unflip::complete_direct_initial(
         &mut fixture,
@@ -767,9 +765,8 @@ fn vrr_clear_and_gamma_never_share_a_request() {
     super::direct_unflip::drain_present_notifications(
         &mut fixture,
         &[direct.candidate.present_id],
-        &[],
+        &[direct.candidate.present_id - 1],
     );
-    let _ = install_controlled_clock(&mut fixture.events.backend);
 
     set_test_gamma(&mut fixture.events.backend, crtc_a_xid, 0x4567);
     assert!(

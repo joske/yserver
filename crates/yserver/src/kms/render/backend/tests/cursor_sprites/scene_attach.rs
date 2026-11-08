@@ -4405,7 +4405,9 @@ fn cursor_rejection_isolation() {
                 "{row}: deferred rejection retains Output(1)'s unflip request"
             );
             assert_eq!(
-                fixture.scene.events.backend.pstate.direct.outputs[1].unflip_last_reason,
+                fixture.scene.events.backend.pstate.direct.outputs[1]
+                    .unflip_last_reason
+                    .get(),
                 Some("cursor_move_fallback_or_retry"),
                 "{row}: deferred rejection reaches Output(1)'s cursor callback; records={:?}",
                 recorder

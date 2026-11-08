@@ -3715,7 +3715,7 @@ fn hidden_cow_stage_present_keeps_unredirected_direct_frame() {
     );
     assert!(!b.pstate.direct.root().unflip_requested);
     assert_ne!(
-        b.pstate.direct.root().unflip_last_reason,
+        b.pstate.direct.root().unflip_last_reason.get(),
         Some("ineligible_authoritative_root_present")
     );
     assert_eq!(
@@ -3785,7 +3785,7 @@ fn stage_present_is_authoritative_again_after_cow_shape_removed() {
         );
         assert!(!b.pstate.direct.root().unflip_requested);
         assert_ne!(
-            b.pstate.direct.root().unflip_last_reason,
+            b.pstate.direct.root().unflip_last_reason.get(),
             Some("ineligible_authoritative_root_present")
         );
         assert_eq!(

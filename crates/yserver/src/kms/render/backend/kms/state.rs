@@ -637,6 +637,7 @@ pub(in crate::kms::render::backend) type DirectFrameSubmitter =
         &mut DirectPresentFrame,
         DirectScope,
         crate::drm::async_flip::FlipTiming,
+        Instant,
     ) -> io::Result<crate::drm::async_flip::AsyncOutcome>;
 
 pub(in crate::kms::render::backend) type ScanoutM1Prober = fn(
@@ -675,6 +676,92 @@ impl TearingProbation {
     }
 }
 
+pub(in crate::kms::render::backend) const DIRECT_VRR_ENTRY_INTERVAL: Duration =
+    Duration::from_nanos(33_333_333);
+pub(in crate::kms::render::backend) const DIRECT_VRR_IDLE_TIMEOUT: Duration =
+    Duration::from_millis(100);
+pub(in crate::kms::render::backend) const DIRECT_VRR_ACTIVE_INTERVALS: u8 = 3;
+
+/// Cadence for the current window episode on one direct-scanout scope.
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::kms::render::backend) struct DirectVrrActivity {
+    pub(in crate::kms::render::backend) window: Option<u32>,
+    pub(in crate::kms::render::backend) last_present_at: Option<Instant>,
+    pub(in crate::kms::render::backend) qualifying_intervals: u8,
+}
+
+impl DirectVrrActivity {
+    /// Expiry is applied before the new observation. The previous window is
+    /// returned only when it had reached active state.
+    pub(in crate::kms::render::backend) fn note_present(
+        &mut self,
+        window: u32,
+        now: Instant,
+    ) -> (Option<u32>, Option<Duration>) {
+        let expired_window = self.expire_at(now);
+        if self.window != Some(window) {
+            *self = Self {
+                window: Some(window),
+                last_present_at: Some(now),
+                qualifying_intervals: 0,
+            };
+            return (expired_window, None);
+        }
+
+        let was_active = self.qualifying_intervals >= DIRECT_VRR_ACTIVE_INTERVALS;
+        let interval = self
+            .last_present_at
+            .map(|last| now.saturating_duration_since(last));
+        if was_active {
+            // Entry qualification never becomes an exit-rate threshold.
+            self.qualifying_intervals = DIRECT_VRR_ACTIVE_INTERVALS;
+        } else if interval.is_some_and(|elapsed| elapsed <= DIRECT_VRR_ENTRY_INTERVAL) {
+            self.qualifying_intervals = self
+                .qualifying_intervals
+                .saturating_add(1)
+                .min(DIRECT_VRR_ACTIVE_INTERVALS);
+        } else {
+            self.qualifying_intervals = 0;
+        }
+        self.last_present_at = Some(now);
+        let activated_interval = (!was_active
+            && self.qualifying_intervals >= DIRECT_VRR_ACTIVE_INTERVALS)
+            .then_some(interval)
+            .flatten();
+        (expired_window, activated_interval)
+    }
+
+    /// Return whether this window is active after applying the 100 ms expiry.
+    pub(in crate::kms::render::backend) fn is_active_at(
+        &mut self,
+        window: u32,
+        now: Instant,
+    ) -> (bool, Option<u32>) {
+        let expired_window = self.expire_at(now);
+        (
+            self.window == Some(window) && self.qualifying_intervals >= DIRECT_VRR_ACTIVE_INTERVALS,
+            expired_window,
+        )
+    }
+
+    pub(in crate::kms::render::backend) fn idle_deadline(&self) -> Option<Instant> {
+        self.last_present_at
+            .and_then(|last| last.checked_add(DIRECT_VRR_IDLE_TIMEOUT))
+    }
+
+    pub(in crate::kms::render::backend) fn expire_at(&mut self, now: Instant) -> Option<u32> {
+        let expired = self.idle_deadline().is_some_and(|deadline| now >= deadline);
+        if !expired {
+            return None;
+        }
+        // Return the expiry transition once for logging. The clear obligation
+        // remains latched separately until the output accepts a clear.
+        let was_active = self.qualifying_intervals >= DIRECT_VRR_ACTIVE_INTERVALS;
+        self.qualifying_intervals = 0;
+        was_active.then_some(self.window).flatten()
+    }
+}
+
 pub(in crate::kms::render::backend) struct ScanoutM2State {
     pub(in crate::kms::render::backend) pending: Option<DirectPresentFrame>,
     /// One eligible direct successor, retained while `pending` owns the
@@ -704,7 +791,7 @@ pub(in crate::kms::render::backend) struct ScanoutM2State {
     pub(in crate::kms::render::backend) unflip_reason: Option<&'static str>,
     /// Most recent request before submission, useful for distinguishing the
     /// initiating event from the gate that finally drove the atomic unflip.
-    pub(in crate::kms::render::backend) unflip_last_reason: Option<&'static str>,
+    pub(in crate::kms::render::backend) unflip_last_reason: Cell<Option<&'static str>>,
     /// Outputs still showing a direct framebuffer until an accepted
     /// replacement completes. This remains populated before a degraded
     /// replacement has been accepted.
@@ -713,6 +800,7 @@ pub(in crate::kms::render::backend) struct ScanoutM2State {
     pub(in crate::kms::render::backend) unflip_awaiting_outputs: HashMap<usize, u64>,
     pub(in crate::kms::render::backend) reentry_blocked_until_composed: bool,
     pub(in crate::kms::render::backend) eligible_streak: u8,
+    pub(in crate::kms::render::backend) vrr_activity: Cell<DirectVrrActivity>,
     pub(in crate::kms::render::backend) tearing_probation: TearingProbation,
     pub(in crate::kms::render::backend) unflip_fallback_source: Option<DrawableId>,
     pub(in crate::kms::render::backend) unflip_shadow_ready: bool,
@@ -740,11 +828,12 @@ impl ScanoutM2State {
             direct_cursor_refresh_successor_deferrals: HashMap::new(),
             unflip_requested: false,
             unflip_reason: None,
-            unflip_last_reason: None,
+            unflip_last_reason: Cell::new(None),
             unflip_outputs_to_replace: HashSet::new(),
             unflip_awaiting_outputs: HashMap::new(),
             reentry_blocked_until_composed: false,
             eligible_streak: 0,
+            vrr_activity: Cell::new(DirectVrrActivity::default()),
             tearing_probation: TearingProbation::default(),
             unflip_fallback_source: None,
             unflip_shadow_ready: false,
@@ -755,6 +844,10 @@ impl ScanoutM2State {
 
     pub(in crate::kms::render::backend) fn active(&self) -> bool {
         self.pending.is_some() || self.queued_successor.is_some() || self.current.is_some()
+    }
+
+    pub(in crate::kms::render::backend) fn reset_vrr_activity(&self) {
+        self.vrr_activity.set(DirectVrrActivity::default());
     }
 
     pub(in crate::kms::render::backend) fn mark_direct_cursor_refresh_pending(

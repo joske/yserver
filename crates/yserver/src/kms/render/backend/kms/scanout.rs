@@ -1,3 +1,5 @@
+mod active_vrr;
+
 use crate::kms::render::{
     backend::{
         DirectFrameSlot, DirectPresentFrame, DirectScope, KmsBackend, ScanoutM0Coverage,
@@ -1259,6 +1261,7 @@ impl KmsBackend {
         frame: &mut DirectPresentFrame,
         scope: DirectScope,
         timing: crate::drm::async_flip::FlipTiming,
+        now: std::time::Instant,
     ) -> io::Result<crate::drm::async_flip::AsyncOutcome> {
         if matches!(
             self.pstate.server_scanout.sources.get(&frame.source_id),
@@ -1267,7 +1270,7 @@ impl KmsBackend {
             return Err(io::Error::other("direct source was exported"));
         }
         let submitter = self.pstate.direct_frame_submitter;
-        let outcome = submitter(self, frame, scope, timing)?;
+        let outcome = submitter(self, frame, scope, timing, now)?;
         if let Some(tally) = frame.fence_tally.take() {
             self.count_server_fence(tally);
         }
@@ -1279,6 +1282,7 @@ impl KmsBackend {
         frame: &mut DirectPresentFrame,
         scope: DirectScope,
         timing: crate::drm::async_flip::FlipTiming,
+        now: std::time::Instant,
     ) -> io::Result<crate::drm::async_flip::AsyncOutcome> {
         let dest_id = self.store.lookup(frame.candidate.paint_dst_host_xid);
         if !self.direct_source_ready(frame.source_id, dest_id, scope) {
@@ -1315,7 +1319,7 @@ impl KmsBackend {
         let cursor_positions = self
             .platform
             .cursor_plane_atomic_positions_for_outputs(&output_indices);
-        let vrr_wanted = self.direct_frame_wants_vrr(frame);
+        let vrr_wanted = self.direct_frame_wants_vrr_at(frame, scope, now);
         let vrr_before = self.vrr_committed_snapshot();
         let async_shape = if timing == crate::drm::async_flip::FlipTiming::Async {
             Some(
@@ -1404,20 +1408,31 @@ impl KmsBackend {
             self.handle_cursor_move_outcome(outcome);
         }
         let accepted_event_id = result?;
-        let vrr_off_reason = if frame.target == ScanoutM0Target::Unredirected
-            && self.pstate.vrr_mode == crate::launch::VrrMode::Property
-            && !frame.candidate.variable_refresh
-        {
-            "property"
-        } else {
-            "inherited"
-        };
+        let vrr_off_reason = self
+            .pstate
+            .direct
+            .get(scope)
+            .and_then(|owner| owner.unflip_last_reason.get())
+            .filter(|reason| *reason == "client_idle")
+            .unwrap_or_else(|| {
+                if frame.target == ScanoutM0Target::Unredirected
+                    && self.pstate.vrr_mode == crate::launch::VrrMode::Property
+                    && !frame.candidate.variable_refresh
+                {
+                    "property"
+                } else {
+                    "inherited"
+                }
+            });
         self.log_vrr_committed_changes(
             &vrr_before,
             (frame.target == ScanoutM0Target::Unredirected)
                 .then_some(frame.candidate.dst_window_xid),
             vrr_off_reason,
         );
+        if vrr_wanted && let Some(owner) = self.pstate.direct.get_mut(scope) {
+            owner.unflip_last_reason.set(None);
+        }
         if attempt_timing == crate::drm::async_flip::FlipTiming::Vsync
             || matches!(
                 async_outcome,
@@ -1439,17 +1454,6 @@ impl KmsBackend {
             .iter()
             .map(|output| output.output.vrr_committed.get())
             .collect()
-    }
-
-    fn direct_frame_wants_vrr(&self, frame: &DirectPresentFrame) -> bool {
-        if frame.target != ScanoutM0Target::Unredirected {
-            return false;
-        }
-        match self.pstate.vrr_mode {
-            crate::launch::VrrMode::Off => false,
-            crate::launch::VrrMode::Property => frame.candidate.variable_refresh,
-            crate::launch::VrrMode::All => !self.vrr_client_excluded(&frame.candidate),
-        }
     }
 
     fn vrr_client_excluded(
@@ -1500,28 +1504,6 @@ impl KmsBackend {
             .borrow_mut()
             .insert(candidate.client_id, decision.source);
         decision.source.is_some()
-    }
-
-    pub(in crate::kms::render::backend) fn live_direct_vrr_wanted_by_output(&self) -> Vec<bool> {
-        (0..self.platform.outputs.len())
-            .map(|output_idx| {
-                let Some(output_frame) = self.direct_scanout_frame_for_output(output_idx) else {
-                    return false;
-                };
-                let Some(scope) = self.pstate.direct.scope_for_output(output_idx) else {
-                    return false;
-                };
-                let Some(owner) = self.pstate.direct.get(scope) else {
-                    return false;
-                };
-                let frame = owner
-                    .queued_successor
-                    .as_ref()
-                    .or(owner.pending.as_ref())
-                    .unwrap_or(output_frame);
-                self.direct_frame_wants_vrr(frame)
-            })
-            .collect()
     }
 
     pub(in crate::kms::render::backend) fn backend_scanout_on_window_property_changed(
@@ -1578,6 +1560,7 @@ impl KmsBackend {
                 .window_property(yserver_protocol::x11::ResourceId(window), vrr_atom)
         };
         let allowed = yserver_core::properties::variable_refresh_property_enabled(allowed);
+        let now = self.monotonic_now();
         for (scope, _, _) in &changed_owners {
             let scanout = self
                 .pstate
@@ -1604,10 +1587,20 @@ impl KmsBackend {
                 continue;
             };
 
-            if allowed {
+            let wanted = self
+                .live_direct_vrr_wanted_by_output_at(now)
+                .get(direct_output_idx)
+                .copied()
+                .unwrap_or(false);
+            if wanted {
                 let output = &self.platform.outputs[direct_output_idx].output;
                 output.vrr_clear_retry_deadline.set(None);
                 output.vrr_clear_waiting_for_flip.set(false);
+                if let Some(owner) = self.pstate.direct.get_mut(scope)
+                    && owner.unflip_last_reason.get() == Some("client_idle")
+                {
+                    owner.unflip_last_reason.set(None);
+                }
                 continue;
             }
             let Some(owner) = self.pstate.direct.get(scope) else {
@@ -1619,14 +1612,13 @@ impl KmsBackend {
                     .as_ref()
                     .or(owner.pending.as_ref())
                     .or(owner.current.as_ref())
-                    .is_some_and(|frame| self.direct_frame_wants_vrr(frame))
+                    .is_some_and(|frame| self.direct_frame_wants_vrr_at(frame, scope, now))
                 || !self.scanout_allowed()
                 || !self.kms_outputs_active
             {
                 continue;
             }
 
-            let now = self.monotonic_now();
             let output = &self.platform.outputs[direct_output_idx].output;
             if !output.vrr_committed.get() {
                 continue;
@@ -1644,9 +1636,23 @@ impl KmsBackend {
                 output.vrr_clear_waiting_for_flip.set(true);
                 continue;
             }
-            if let Err(error) =
-                self.submit_pending_crtc_property_for_output(direct_output_idx, false, now)
+            let off_reason = if allowed
+                && self
+                    .pstate
+                    .direct
+                    .get(scope)
+                    .is_some_and(|owner| owner.unflip_last_reason.get() == Some("client_idle"))
             {
+                "client_idle"
+            } else {
+                "property"
+            };
+            if let Err(error) = self.submit_pending_crtc_property_for_output(
+                direct_output_idx,
+                false,
+                now,
+                off_reason,
+            ) {
                 log::warn!(
                     "kms: standalone VRR clear for CRTC {:?} failed: {error}",
                     output.crtc
@@ -1676,16 +1682,17 @@ impl KmsBackend {
                     );
                 }
             } else {
-                let off_reason = if fallback_off_reason == "property" {
-                    fallback_off_reason
-                } else {
-                    self.pstate
-                        .direct
-                        .scope_for_output(index)
-                        .and_then(|scope| self.pstate.direct.get(scope))
-                        .and_then(|owner| owner.unflip_last_reason)
-                        .unwrap_or(fallback_off_reason)
-                };
+                let off_reason =
+                    if fallback_off_reason == "property" || fallback_off_reason == "client_idle" {
+                        fallback_off_reason
+                    } else {
+                        self.pstate
+                            .direct
+                            .scope_for_output(index)
+                            .and_then(|scope| self.pstate.direct.get(scope))
+                            .and_then(|owner| owner.unflip_last_reason.get())
+                            .unwrap_or(fallback_off_reason)
+                    };
                 log::info!(
                     "kms: vrr off output={} crtc={} reason={off_reason}",
                     layout.key.connector_name,
@@ -1702,6 +1709,7 @@ impl KmsBackend {
         output_idx: usize,
         vrr_wanted: bool,
         now: std::time::Instant,
+        off_reason: &'static str,
     ) -> io::Result<()> {
         let before = self.vrr_committed_snapshot();
         let current_primary_framebuffer = self.current_primary_framebuffer_for_output(output_idx);
@@ -1711,7 +1719,7 @@ impl KmsBackend {
             now,
             current_primary_framebuffer,
         );
-        self.log_vrr_committed_changes(&before, None, "property");
+        self.log_vrr_committed_changes(&before, None, off_reason);
         result
     }
 
@@ -1722,7 +1730,7 @@ impl KmsBackend {
     ) {
         let before = self.vrr_committed_snapshot();
         let vrr_wanted = self
-            .live_direct_vrr_wanted_by_output()
+            .live_direct_vrr_wanted_by_output_at(now)
             .get(output_idx)
             .copied()
             .unwrap_or(false);
@@ -1733,7 +1741,26 @@ impl KmsBackend {
             vrr_wanted,
             current_primary_framebuffer,
         );
-        self.log_vrr_committed_changes(&before, None, "property");
+        let off_reason = self
+            .pstate
+            .direct
+            .scope_for_output(output_idx)
+            .and_then(|scope| self.pstate.direct.get(scope))
+            .and_then(|owner| owner.unflip_last_reason.get())
+            .filter(|reason| *reason == "client_idle")
+            .unwrap_or("property");
+        self.log_vrr_committed_changes(&before, None, off_reason);
+        if !self.platform.outputs[output_idx].output.vrr_committed.get()
+            && let Some(scope) = self.pstate.direct.scope_for_output(output_idx)
+            && self
+                .direct_scope_outputs(scope)
+                .iter()
+                .all(|&idx| !self.platform.outputs[idx].output.vrr_committed.get())
+            && let Some(owner) = self.pstate.direct.get(scope)
+            && owner.unflip_last_reason.get() == Some("client_idle")
+        {
+            owner.unflip_last_reason.set(None);
+        }
     }
 
     fn current_primary_framebuffer_for_output(
@@ -1759,6 +1786,7 @@ impl KmsBackend {
         frame: &mut DirectPresentFrame,
         scope: DirectScope,
         _timing: crate::drm::async_flip::FlipTiming,
+        _now: std::time::Instant,
     ) -> io::Result<crate::drm::async_flip::AsyncOutcome> {
         frame.awaiting_outputs = backend.direct_scope_outputs(scope).into_iter().collect();
         frame.async_outcome = crate::drm::async_flip::AsyncOutcome::NotRequested;
@@ -1865,7 +1893,7 @@ impl KmsBackend {
             return;
         };
         let timing = self.direct_frame_flip_timing(&successor, scope);
-        match self.submit_direct_frame(&mut successor, scope, timing) {
+        match self.submit_direct_frame(&mut successor, scope, timing, self.monotonic_now()) {
             Ok(_) => {
                 log::debug!(
                     "scanout_m2: submitted queued direct successor source_id={} present_id={} outputs={}",
@@ -1942,7 +1970,7 @@ impl KmsBackend {
             owner.hold_direct = false;
             owner.unflip_requested = false;
             owner.unflip_reason = None;
-            owner.unflip_last_reason = None;
+            owner.unflip_last_reason.set(None);
             owner.unflip_outputs_to_replace.clear();
             owner.unflip_awaiting_outputs.clear();
             owner.unflip_fallback_source = None;
@@ -2114,11 +2142,13 @@ impl KmsBackend {
                 outputs.contains(&output_idx) && output.output.vrr_committed.get()
             });
         if vrr_committed {
-            if let Some(owner) = self.pstate.direct.get_mut(scope) {
-                owner.unflip_last_reason.get_or_insert(reason);
+            if let Some(owner) = self.pstate.direct.get_mut(scope)
+                && owner.unflip_last_reason.get().is_none()
+            {
+                owner.unflip_last_reason.set(Some(reason));
             }
         } else if let Some(owner) = self.pstate.direct.get_mut(scope) {
-            owner.unflip_last_reason = None;
+            owner.unflip_last_reason.set(None);
         }
         if let Some(mut pending) = self
             .pstate
@@ -2162,6 +2192,7 @@ impl KmsBackend {
             owner.unflip_awaiting_outputs.clear();
             owner.reentry_blocked_until_composed = false;
             owner.reset_eligible_direct_probation();
+            owner.reset_vrr_activity();
             owner.unflip_fallback_source = None;
             owner.unflip_shadow_ready = false;
             owner.degraded_composed_unflip = false;
@@ -2462,6 +2493,7 @@ impl KmsBackend {
                 .get(scope)
                 .expect("unflip owner exists")
                 .unflip_last_reason
+                .get()
                 .unwrap_or("unknown"),
             self.pstate
                 .direct
@@ -4132,8 +4164,17 @@ impl KmsBackend {
             let direct_successor_owns_next_frame = scope
                 .and_then(|scope| self.pstate.direct.get(scope))
                 .is_some_and(|owner| owner.pending.is_some() || owner.queued_successor.is_some());
+            let client_idle_clear_retired = scope
+                .and_then(|scope| self.pstate.direct.get(scope))
+                .is_some_and(|owner| {
+                    owner.unflip_last_reason.get() == Some("client_idle")
+                        && owner.pending.is_none()
+                        && owner.queued_successor.is_none()
+                        && !self.platform.outputs[output_idx].output.vrr_committed.get()
+                });
             if !self.gamma_output_has_queued_scanout(output_idx)
                 || (vrr_clear_waiting_for_flip && !direct_successor_owns_next_frame)
+                || client_idle_clear_retired
             {
                 self.retry_pending_crtc_property_after_flip(output_idx, self.monotonic_now());
             }
@@ -4238,8 +4279,31 @@ impl KmsBackend {
         &self,
     ) -> Option<std::time::Instant> {
         let now = self.monotonic_now();
-        let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
+        let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output_at(now);
         let allow_kms_timers = self.scanout_allowed() && self.kms_outputs_active;
+        let direct_vrr_idle_deadline = allow_kms_timers
+            .then(|| {
+                (0..self.platform.outputs.len())
+                    .filter(|&output_idx| self.direct_output_vrr_capable(output_idx))
+                    .filter_map(|output_idx| {
+                        let scope = self.pstate.direct.scope_for_output(output_idx)?;
+                        let owner = self.pstate.direct.get(scope)?;
+                        let frame = owner
+                            .queued_successor
+                            .as_ref()
+                            .or(owner.pending.as_ref())
+                            .or(owner.current.as_ref())?;
+                        self.direct_vrr_activity_active_at(
+                            scope,
+                            frame.candidate.dst_window_xid,
+                            now,
+                        )
+                        .then(|| owner.vrr_activity.get().idle_deadline())
+                        .flatten()
+                    })
+                    .min()
+            })
+            .flatten();
         let direct_cursor_retry_deadline = if allow_kms_timers {
             self.pstate
                 .direct
@@ -4327,6 +4391,7 @@ impl KmsBackend {
             .chain(direct_cursor_retry_deadline)
             .chain(gamma_deadline)
             .chain(vrr_clear_deadline)
+            .chain(direct_vrr_idle_deadline)
             .chain(vrr_cursor_deadline)
             .chain(source_wait_deadline)
             .chain(rescan_deadline)
@@ -4416,6 +4481,7 @@ impl KmsBackend {
             return Ok(());
         }
         let now = self.monotonic_now();
+        self.service_idle_direct_vrr_clears(now);
         for output_idx in 0..self.platform.outputs.len() {
             let property_retry_due = {
                 let output = &self.platform.outputs[output_idx].output;

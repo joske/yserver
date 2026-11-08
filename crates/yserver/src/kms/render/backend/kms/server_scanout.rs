@@ -35,7 +35,7 @@ impl KmsBackendState {
                 .or_default() += 1;
         }
         owner.unflip_requested = true;
-        owner.unflip_last_reason = Some(reason);
+        owner.unflip_last_reason.set(Some(reason));
         owner.hold_direct = false;
     }
 

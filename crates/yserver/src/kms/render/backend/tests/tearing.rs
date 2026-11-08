@@ -3730,7 +3730,7 @@ fn hidden_cow_stage_present_does_not_exit_tearing() {
     assert!(backend.pstate.tearing.is_on());
     assert!(!backend.pstate.direct.root().unflip_requested);
     assert_ne!(
-        backend.pstate.direct.root().unflip_last_reason,
+        backend.pstate.direct.root().unflip_last_reason.get(),
         Some("ineligible_authoritative_root_present")
     );
     assert!(recorder.records().is_empty());
@@ -3769,7 +3769,7 @@ fn cursor_only_ineligibility_does_not_reset_direct_probation_while_on() {
         before_m2_probation
     );
     assert_ne!(
-        backend.pstate.direct.root().unflip_last_reason,
+        backend.pstate.direct.root().unflip_last_reason.get(),
         Some("ineligible_authoritative_root_present")
     );
     assert!(recorder.records().is_empty());

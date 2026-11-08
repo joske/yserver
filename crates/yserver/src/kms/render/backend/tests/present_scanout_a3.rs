@@ -2961,7 +2961,8 @@ fn root_owner_triggers_unchanged() {
             .pstate
             .direct
             .root()
-            .unflip_last_reason,
+            .unflip_last_reason
+            .get(),
         Some("shape_clips_direct_frame")
     );
     assert!(

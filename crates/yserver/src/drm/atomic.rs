@@ -1082,6 +1082,22 @@ impl AtomicCommitSink {
             vrr.cursor_deadline_commits,
         ))
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_reset_vrr_summary(&self, initial_flip_ust: Duration) {
+        let mut metrics = self.metrics.borrow_mut();
+        for vrr in metrics.vrr_crtcs.values_mut() {
+            vrr.last_retired_flip_ust = Some(initial_flip_ust);
+            vrr.observed_this_window = false;
+            vrr.flip_intervals_us.clear();
+            vrr.cursor_deadline_commits = 0;
+        }
+        metrics.present_latency_direct_presents = 0;
+        metrics.present_latency_direct_flips = 0;
+        metrics.present_latency_skip_completions = 0;
+        metrics.present_latency_present_to_submit_us.clear();
+        metrics.present_latency_present_to_flip_event_us.clear();
+    }
 }
 
 #[cfg(test)]

@@ -1464,11 +1464,12 @@ fn recording_submitter(
     frame: &mut crate::kms::render::backend::DirectPresentFrame,
     scope: DirectScope,
     timing: crate::drm::async_flip::FlipTiming,
+    now: std::time::Instant,
 ) -> std::io::Result<crate::drm::async_flip::AsyncOutcome> {
     SUBMITTED.with_borrow_mut(|submitted| {
         submitted.push((frame.source_id, frame.in_fence.is_some()));
     });
-    KmsBackend::submit_direct_frame_for_tests(b, frame, scope, timing)
+    KmsBackend::submit_direct_frame_for_tests(b, frame, scope, timing, now)
 }
 
 fn submitted() -> Vec<(DrawableId, bool)> {
