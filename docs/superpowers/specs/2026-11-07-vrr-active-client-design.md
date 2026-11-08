@@ -1,6 +1,6 @@
 # VRR only while the client is drawing — design
 
-**Date:** 2026-11-07 · **Status:** revision 2.1 (sol re-review: queued-frame test, EBUSY keeps its event wait); revision 2 (sol review 1: observation point, clear obligation, expiry order, episode identity, tests) · **Base:** `docs/superpowers/specs/2026-10-23-vrr-design.md`
+**Date:** 2026-11-07 · **Status:** revision 4 (option B after hardware run 1: yserver's own application exclusions, section *Application exclusions*); revision 2.1 (sol re-review: queued-frame test, EBUSY keeps its event wait); revision 2 (sol review 1: observation point, clear obligation, expiry order, episode identity, tests) · **Base:** `docs/superpowers/specs/2026-10-23-vrr-design.md`
 (revision 5.1, implemented by #294 and #298) · **Scope:** KMS backend, the *wanted* decision for a direct-scanout
 owner and what follows from it (cursor hold, standalone clear, logging).
 
@@ -47,11 +47,11 @@ nothing to protect.
 
 ## Non-goals
 
-- Application lists (option B in the conversation: adding `steamwebhelper`, Electron, Chromium). Decided after the
-  hardware run of this change, only if it is not enough. A video that keeps playing at 30 fps or more still qualifies
-  (expected; the user decides on B with that observed).
+- Application lists beyond the four process names of *Application exclusions* (revision 4): no Electron or Chromium
+  in general, no user-editable yserver list.
+- Entry on a sustained rate instead of three intervals, for bursty UIs not on the list. Not decided here.
 - Reading the panel's real range (EDID monitor range descriptor). The thresholds are fixed values.
-- Changing what makes a window eligible, the exclusions, the cursor deadline, tearing, or the transport of
+- Changing what makes a window eligible, the NVIDIA/Mesa exclusions, the cursor deadline, tearing, or the transport of
   `VRR_ENABLED` (pending CRTC property, one feature class per request, EINVAL latch).
 - Image batching for animated cursors (base spec's known limitation).
 
@@ -140,6 +140,66 @@ nothing to protect.
 - One debug line when an episode becomes active: scope, window and the last interval.
 - The per-second summary keeps its fields.
 
+## Application exclusions (option B, revision 4)
+
+### Why, measured
+
+Hardware run 1 of the activity rule (2026-11-08; NVIDIA RTX 5060 Ti, DP-3, 48–240 Hz panel, `--vrr all`; logs in
+`~/Projects/claude-scratch/vrr/active/hw/run1-nv/`):
+
+- mpv at 100 fps entered VRR and left with `reason=client_idle` when it closed; mpv at 25 fps never entered. The
+  activity rule works as designed.
+- The Steam UI (`steamwebhelper`) draws in bursts of 3–5 frames 3–5 ms apart. Three fast intervals qualify and the
+  episode expires 100 ms later: VRR went on and off 16 times in five minutes, and the user saw one or two frames at
+  48 Hz each time. In the screenshot viewer it also presented at a steady 240/s with a static image.
+- A Steam trailer presents at a steady 30 fps and a Discord video at 34–42 fps. Both qualify; no rate rule tells them
+  from a game.
+
+Neither list yserver honors names these processes: Mesa's `00-mesa-defaults.conf` excludes browsers, compositors and
+video players but not `steamwebhelper` or Discord; NVIDIA's "No VRR/OSD" profile (620.70.06) has `steam` and
+`steamcompmgr`, not `steamwebhelper`, and Discord only under a CUDA profile. The user decided against waiting for a
+Mesa merge request, and to keep option B in this spec and this PR: A and B fix one problem.
+
+Prior art, behaviour only. gamescope (Valve, BSD-2), commit `8e0a5bee` (2026-09-24): with adaptive sync the Steam UI
+makes the panel swing between its minimum and maximum refresh, which shows as brightness flicker on OLED and VA
+panels; while the Steam UI is focused gamescope repeats the last frame every vblank, holding the panel at its maximum.
+It recognises the Steam UI by process name (`steamwebhelper`) and the `STEAM_BIGPICTURE` property. Its commit
+`c8fecc6c` (2026-08-16) is the same 30 fps cursor rule as here. KWin gives VRR to any active fullscreen window and
+excludes only through per-window rules the user writes, so it behaves as yserver did before this change. Sway and
+wlroots have a per-output switch and no policy. No compositor handles Discord; the user found it here.
+
+### Decision
+
+yserver carries its own exclusion list, applied in both `--vrr` modes on every driver, before the activity rule: an
+excluded client never wants VRR. Names are matched exactly against the process name yserver already derives for the
+NVIDIA/Mesa lists (`read_process_name` in `vrr_exclusions.rs`: the executable's file name, else argv[0]'s):
+
+| Process name | Application |
+|---|---|
+| `steamwebhelper` | Steam UI: library, store, screenshot viewer, trailers, Big Picture |
+| `Discord` | Discord (official build; the Flatpak runs the same binary) |
+| `DiscordPTB` | Discord PTB (coordinator's call: same client, another channel) |
+| `DiscordCanary` | Discord Canary (coordinator's call, as above) |
+
+Exclusion means no VRR, not a held refresh: yserver changes `VRR_ENABLED` without a modeset, so turning it off keeps
+the panel at its fixed refresh. gamescope repeats frames only because toggling VRR takes a modeset on its path.
+Games launched by Steam are separate processes and are not affected; Steam's in-game overlay draws inside the game's
+process and is not affected either.
+
+### Design
+
+- **One question, both modes.** The existing per-client exclusion decision (cached per client, logged once) gains a
+  yserver source. In `--vrr all` it sits next to the NVIDIA/Mesa lists. In `--vrr` it is the only exclusion consulted:
+  Mesa has already applied its list by not setting `_VARIABLE_REFRESH`, and the NVIDIA list keeps applying only to
+  `all`, as today.
+- **Opt back in.** The existing environment override keeps precedence: a client started with `adaptive_sync=true` or
+  `__GL_VRR_ALLOWED=1` is not excluded by this list, as for the NVIDIA/Mesa lists today. No new knob, no config file.
+- **Downstream.** *wanted* is false for an excluded client; the activity episode, idle clear and cursor hold already
+  follow *wanted*.
+- **Unknown pid.** A client without a pid (remote, no peer credentials) is not excluded, as today.
+- **Logging.** The existing once-per-client line: `kms: vrr excluded client=… pid=… process=… source=yserver`.
+- **No change without VRR.** With VRR off or an incapable output, nothing is read, logged or committed differently.
+
 ## Testing
 
 Backend tests through the Backend/Present request paths (the recording scene/direct fixtures and request helper in
@@ -203,13 +263,29 @@ No change without VRR:
   off: Presents fast enough to qualify produce no idle wakeup, no new log line and the same commit signatures as
   today. The claim is about these observable effects only. Mutation: report the deadline in every mode.
 
+Application exclusions (revision 4), with a scripted `/proc` tree as the existing exclusion tests use:
+- `vrr_builtin_exclusion_steamwebhelper_property_mode`: `--vrr`, process `steamwebhelper` with `_VARIABLE_REFRESH` = 1
+  qualifies by rate and never commits `VRR_ENABLED` = 1; one `source=yserver` line. Mutation: skip the list in
+  property mode.
+- `vrr_builtin_exclusion_discord_all_mode`: `--vrr all` on nvidia-drm, process `Discord`, same result. Mutation: drop
+  `Discord` from the list.
+- `vrr_builtin_exclusion_environment_opt_in`: `steamwebhelper` with `adaptive_sync=true` in its environment qualifies
+  and enables VRR. Mutation: check the list before the environment.
+- `vrr_builtin_exclusion_exact_name`: processes `steam` (property mode) and `steamwebhelper2` are not excluded by this
+  list. Mutation: substring match.
+- `vrr_builtin_exclusion_off_reads_nothing`: VRR off: no `/proc` read, no log, commits as today. Mutation: evaluate
+  before the mode check.
+- The existing exclusion tests pass unchanged.
+
 **Hardware (ask the user first; NVIDIA DP-3 and AMD DP-1):**
 - Steam screenshot viewer: OSD stays at 240 Hz once the image is static; the cursor is smooth.
 - mpv at 100 fps: VRR on. mpv at 25 fps: VRR stays off, because entry needs 30 fps.
 - A game: VRR on, with no `client_idle` while playing. A pause menu that stops drawing turns it off, and it comes
   back on resume.
-- Discord fullscreen video: observe and report. It is expected to get VRR while the video plays at 30 fps or more;
-  this is the input for the option-B decision.
+- Discord fullscreen video: observed in run 1 (VRR while playing at 34–42 fps); input for option B.
+- After option B (NVIDIA DP-3 `--vrr all`, AMD DP-1 `--vrr`): Steam screenshot viewer, trailer and library stay at the
+  fixed refresh with no 48 Hz flashes; Discord video stays at the fixed refresh; mpv at 100 fps and a game launched
+  from Steam still enter VRR.
 
 ## Provenance
 
@@ -218,5 +294,8 @@ No change without VRR:
 - The yserver log of the user's session, 2026-11-07, for the measurements in Why.
 - `/usr/share/nvidia/nvidia-application-profiles-620.70.06-rc`, read for which process names it excludes. Nothing
   is copied.
+- Revision 4: gamescope (BSD-2) commits `8e0a5bee` and `c8fecc6c`, KWin (GPL) `src/compositor.cpp`,
+  `src/core/renderloop.cpp`, `src/scene/surfaceitem.cpp`, Sway (MIT) `sway-output.5.scd`, Mesa
+  `src/util/00-mesa-defaults.conf` and its commit `a9c36dbf9c5`: read for behaviour only; nothing is copied.
 
 This document describes behaviour in original prose; no third-party code was used.
