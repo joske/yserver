@@ -101,8 +101,9 @@ contract of plan 3a ("Denial test contract") applies to every row here. Rulings 
 - **`ChangeCursorByName`'s derived cursors** are today's match set unchanged: every host cursor with that name,
   retained ones included. Each one with a record is checked against its recorded XID; one without a record is not.
 - **XInput `XISetClientPointer` / `XIGetClientPointer`** name an arbitrary resource whose owner is the target
-  client; yserver ignores the body today. The resource part is checked with `GET_ATTR` only when the id resolves
-  through `resource_owner`'s stores, exactly as 3a's `KillClient` row; the client and device parts are PR 5.
+  client; yserver ignores the body today. The resource part is checked only when the id resolves through
+  `resource_owner`'s stores, exactly as 3a's `KillClient` row: `XISetClientPointer` with `MANAGE`,
+  `XIGetClientPointer` with `GET_ATTR` (XLibre); the client and device parts are PR 5.
 - **`XIBarrierReleasePointer`** keeps XLibre's sequential shape: each entry's barrier is checked (`READ`) when the
   loop reaches it, and a denial reports the policy's error after the earlier entries took effect, as XLibre
   preserves earlier releases (`Xi/xibarriers.c:921-945`). This is a whole-request denial with partial effects, the
@@ -207,7 +208,7 @@ check runs only when it resolves.
 | 21 SetDeviceFocus, 49 XISetFocus | focus window `SET_ATTR` |
 | 41 XIWarpPointer | dst `GET_ATTR`, then src `GET_ATTR` |
 | 42 XIChangeCursor | window `SET_ATTR`; cursor `USE` |
-| 44 XISetClientPointer | named window `MANAGE` |
+| 44 XISetClientPointer | named resource `MANAGE` |
 | 45 XIGetClientPointer | named resource `GET_ATTR` |
 | 51 XIGrabDevice, 54 XIPassiveGrabDevice | grab window `SET_ATTR`; cursor `USE` |
 | 61 XIBarrierReleasePointer | each barrier `READ` in the existing loop (scope decision) |
