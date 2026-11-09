@@ -49,6 +49,15 @@ same KeyRelease+KeyPress pair every ~40 ms. Probe: `~/Projects/claude-scratch/is
   carries it. XI2 raw events stay as today.
 - `PerClientFlags`: reply supported mask stays `0x1f`; flags are stored per client under `change`, persist across
   requests, are reported as stored, and go away with the client. Only DetectableAutoRepeat changes behaviour.
+- `PerClientFlags` validates before any mutation, in Xorg's order (`xkb/xkb.c` `ProcXkbPerClientFlags`, and the
+  `CHK_MASK_LEGAL` / `CHK_MASK_MATCH` macros): exact request size (`BadLength`); the client's XKB initialization
+  (`UseExtension`) guard, as yserver already applies it to XKB requests; the keyboard `deviceSpec` (the existing XKB
+  device-spec check, `BadKeyboard`); `change` within `0x1f` (`BadValue`, value `_XkbErrCode2(0x01, illegal bits)`);
+  `value` within `change` (`BadMatch`, `_XkbErrCode2(0x02, value & !change)`); and, only when AutoResetControls is
+  being set, `ctrlsToChange` within the boolean controls (`BadValue`, code 0x03), `autoCtrls` within `ctrlsToChange`
+  (`BadMatch`, 0x04) and `autoCtrlValues` within `autoCtrls` (`BadMatch`, 0x05). A rejected request changes no stored
+  flag. These errors are new client-visible behaviour (today the backend answers any request with a reply); they
+  follow Xorg.
 - Nested host-X11 backend (`host_x11`): out of scope, unchanged.
 - No `YSERVER_*` variable, no option to restore the old behaviour, no `cfg(test)` in production bodies.
 - Reuse first: the repeat path (`fire_pending_repeats_at`, `HostInputEvent::KeyRepeat`, `handle_host_key(.., repeat,
@@ -89,6 +98,9 @@ per-client accessor for the stored XKB flags.
   - `per_client_flags_are_stored_and_reported` (process_request): enable, a second request with `change` 0 still
     reports it set, `change`=1 `value`=0 clears it, another client is unaffected, other byte order. Mutation: answer
     `value & change` of the request only.
+  - `per_client_flags_rejects_before_mutation` (process_request): `change`=1 `value`=3 → `BadMatch` with Xorg's
+    error value, then a query reports the flag still clear; also `change` outside `0x1f` (`BadValue`), a wrong size
+    (`BadLength`) and a non-keyboard `deviceSpec`. Mutation: store before validating.
   - `held_key_unflagged_core_gets_todays_pairs`: wire bytes per repeat equal today's (release then press, same fields),
     also for a KeyPress-only and a KeyRelease-only selector. Mutation: drop the synthetic release for everyone.
   - `held_key_flagged_core_gets_presses_only`: per repeat only KeyPress; one KeyRelease when the key goes up.
