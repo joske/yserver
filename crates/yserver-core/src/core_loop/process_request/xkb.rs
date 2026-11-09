@@ -430,16 +430,29 @@ fn handle_per_client_flags(
     let auto_ctrls = u32_at(16);
     let auto_ctrl_values = u32_at(20);
 
-    // yserver serves the core/default keyboard. Xorg's keyboard lookup
-    // reports BadClass for the core pointer sentinel and BadDevice for other
-    // IDs; _XkbErrCode2 carries the reason and original device spec in the
-    // error value.
-    if !matches!(device_spec, XKB_USE_CORE_KEYBOARD | XKB_DEFAULT_XI_ID) {
-        let reason = if device_spec == XKB_USE_CORE_POINTER {
-            2 // XkbErr_BadClass
-        } else {
-            1 // XkbErr_BadDevice
-        };
+    // XKB's existing core-keyboard replies report device ID 1. Other numeric
+    // IDs resolve through the same live XI registry used by device requests,
+    // whose role comes from the device's classes. Keep the XKB sentinels as
+    // aliases; distinguish a present pointer from a missing device so the
+    // error value matches Xorg's BadClass/BadDevice lookup results.
+    let device_error_reason = match device_spec {
+        XKB_USE_CORE_KEYBOARD | XKB_DEFAULT_XI_ID => None,
+        XKB_USE_CORE_POINTER => Some(2), // XkbErr_BadClass
+        id if id == u16::from(crate::core_loop::xkb_layout::XKB_DEVICE_ID) => None,
+        id => match state.xi_devices.device(id) {
+            None => Some(1), // XkbErr_BadDevice
+            Some(_)
+                if !crate::core_loop::process_request::xi1_device_has_keys(
+                    &state.xi_devices,
+                    id,
+                ) =>
+            {
+                Some(2)
+            } // XkbErr_BadClass
+            Some(_) => None,
+        },
+    };
+    if let Some(reason) = device_error_reason {
         let error_base = backend
             .xkb_info()
             .map_or(0, |(_, _, first_error)| first_error);

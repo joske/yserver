@@ -19,6 +19,7 @@ const DETECTABLE_AUTO_REPEAT: u32 = 1;
 const CORE_KEY_PRESS_MASK: u32 = 1;
 const CORE_KEY_RELEASE_MASK: u32 = 2;
 const KEYCODE_A: u8 = 38;
+const KEYCODE_LEFT_SHIFT: u8 = 50;
 const XI_FIRST_EVENT: u8 = 66;
 
 fn request(
@@ -58,12 +59,24 @@ fn set_detectable_repeat(
     peer: &mut UnixStream,
     enabled: bool,
 ) {
+    set_detectable_repeat_for_device(state, backend, client, peer, XKB_USE_CORE_KBD, 2, enabled);
+}
+
+fn set_detectable_repeat_for_device(
+    state: &mut ServerState,
+    backend: &mut KmsBackend,
+    client: u32,
+    peer: &mut UnixStream,
+    device_spec: u16,
+    sequence: u16,
+    enabled: bool,
+) {
     let mut body = [0u8; 24];
-    body[0..2].copy_from_slice(&XKB_USE_CORE_KBD.to_le_bytes());
+    body[0..2].copy_from_slice(&device_spec.to_le_bytes());
     body[4..8].copy_from_slice(&DETECTABLE_AUTO_REPEAT.to_le_bytes());
     let value = if enabled { 1u32 } else { 0 };
     body[8..12].copy_from_slice(&value.to_le_bytes());
-    request(state, backend, client, 2, XKB_OPCODE, 21, &body);
+    request(state, backend, client, sequence, XKB_OPCODE, 21, &body);
     let reply = kbd_map_drain(peer);
     assert_eq!(
         reply.len(),
@@ -93,20 +106,96 @@ fn per_client_flags_rejects_non_keyboard_device() {
     assert_eq!((error[0], error[1]), (0, 162)); // XKB BadKeyboard
     assert_eq!(&error[4..8], &0x0200_0200u32.to_le_bytes());
 
+    for (sequence, device_spec, error_value) in [
+        (
+            3,
+            yserver_core::xinput::DEVICEID_MASTER_POINTER,
+            0x0200_0002u32,
+        ),
+        (4, 127, 0x0100_007fu32),
+    ] {
+        body[0..2].copy_from_slice(&device_spec.to_le_bytes());
+        request(
+            &mut state,
+            &mut backend,
+            61,
+            sequence,
+            XKB_OPCODE,
+            21,
+            &body,
+        );
+        let error = kbd_map_drain(&mut peer);
+        assert_eq!(error.len(), 32);
+        assert_eq!((error[0], error[1]), (0, 162)); // XKB BadKeyboard
+        assert_eq!(&error[4..8], &error_value.to_le_bytes());
+    }
+
     let mut query = [0u8; 24];
     query[0..2].copy_from_slice(&XKB_USE_CORE_KBD.to_le_bytes());
-    request(&mut state, &mut backend, 61, 3, XKB_OPCODE, 21, &query);
+    request(&mut state, &mut backend, 61, 5, XKB_OPCODE, 21, &query);
     let reply = kbd_map_drain(&mut peer);
     assert_eq!(reply.len(), 32);
     assert_eq!(&reply[12..16], &0u32.to_le_bytes());
 }
 
+/// Mutation: restore the device-spec whitelist. The XKB GetDeviceInfo reply
+/// advertises keyboard device 1, and that reported keyboard must enable
+/// detectable repeat for this client's real KMS key stream.
+#[test]
+fn per_client_flags_accepts_reported_keyboard_device() {
+    let mut backend = KmsBackend::for_tests();
+    let mut state = ServerState::new();
+    let mut peer = client(&mut state, 62);
+    use_xkb(&mut state, &mut backend, 62, &mut peer);
+
+    request(&mut state, &mut backend, 62, 2, XKB_OPCODE, 24, &[]);
+    let device_info = kbd_map_drain(&mut peer);
+    assert_eq!(device_info.len(), 36, "GetDeviceInfo reply");
+    assert_eq!(device_info[0], 1, "GetDeviceInfo reply type");
+    let keyboard_device = u16::from(device_info[1]);
+    assert_eq!(keyboard_device, 1, "server-reported XKB keyboard id");
+
+    set_detectable_repeat_for_device(
+        &mut state,
+        &mut backend,
+        62,
+        &mut peer,
+        keyboard_device,
+        3,
+        true,
+    );
+    select_core_at(
+        &mut state,
+        &mut backend,
+        62,
+        4,
+        CORE_KEY_PRESS_MASK | CORE_KEY_RELEASE_MASK,
+    );
+    key_input(&mut backend, &mut state, true);
+    let _ = kbd_map_drain(&mut peer);
+
+    repeat_pair(&mut backend, &mut state);
+    assert_eq!(event_types(&kbd_map_drain(&mut peer)), [2]);
+    key_input(&mut backend, &mut state, false);
+    assert_eq!(event_types(&kbd_map_drain(&mut peer)), [3]);
+}
+
 fn select_core(state: &mut ServerState, backend: &mut KmsBackend, client: u32, mask: u32) {
+    select_core_at(state, backend, client, 3, mask);
+}
+
+fn select_core_at(
+    state: &mut ServerState,
+    backend: &mut KmsBackend,
+    client: u32,
+    sequence: u16,
+    mask: u32,
+) {
     let mut body = Vec::with_capacity(12);
     body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
     body.extend_from_slice(&(1u32 << 11).to_le_bytes()); // CWEventMask
     body.extend_from_slice(&mask.to_le_bytes());
-    request(state, backend, client, 3, 2, 0, &body); // ChangeWindowAttributes
+    request(state, backend, client, sequence, 2, 0, &body); // ChangeWindowAttributes
 }
 
 fn select_xi1_keys(
@@ -138,21 +227,44 @@ fn event_types(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn key_event(pressed: bool) -> HostKeyEvent {
+    key_event_for_keycode(KEYCODE_A, pressed)
+}
+
+fn key_event_for_keycode(keycode: u8, pressed: bool) -> HostKeyEvent {
     HostKeyEvent {
         origin: InputOrigin::NestedHost,
         pressed,
-        keycode: KEYCODE_A,
-        time: 0,
-        root_x: 0,
-        root_y: 0,
-        event_x: 0,
-        event_y: 0,
-        state: 0,
+        keycode,
+        time: 0x1122_3344,
+        root_x: 0x1234,
+        root_y: -2,
+        event_x: 0x2345,
+        event_y: -0x3456,
+        state: 0x05a5,
     }
 }
 
 fn key_input(backend: &mut KmsBackend, state: &mut ServerState, pressed: bool) {
     backend.on_host_input(state, HostInputEvent::Key(key_event(pressed)));
+}
+
+fn key_input_for_keycode(
+    backend: &mut KmsBackend,
+    state: &mut ServerState,
+    keycode: u8,
+    pressed: bool,
+) {
+    backend.on_host_input(
+        state,
+        HostInputEvent::Key(key_event_for_keycode(keycode, pressed)),
+    );
+}
+
+fn repeat_event(backend: &mut KmsBackend, state: &mut ServerState, pressed: bool) -> (u32, u32) {
+    let before = crate::clock::server_time_ms();
+    backend.on_host_input(state, HostInputEvent::KeyRepeat(key_event(pressed)));
+    let after = crate::clock::server_time_ms();
+    (before, after)
 }
 
 fn repeat_pair(backend: &mut KmsBackend, state: &mut ServerState) {
@@ -171,6 +283,9 @@ fn held_key_unflagged_core_gets_todays_pairs() {
     let mut backend = KmsBackend::for_tests();
     let mut state = ServerState::new();
     state.core_focus.raw = ROOT_WINDOW.0;
+    backend.core.cursor_x = 123.0;
+    backend.core.cursor_y = 45.0;
+    state.pointer_root = (123, 45);
     let mut both = client(&mut state, 51);
     let mut press_only = client(&mut state, 52);
     let mut release_only = client(&mut state, 53);
@@ -183,22 +298,69 @@ fn held_key_unflagged_core_gets_todays_pairs() {
     select_core(&mut state, &mut backend, 52, CORE_KEY_PRESS_MASK);
     select_core(&mut state, &mut backend, 53, CORE_KEY_RELEASE_MASK);
 
+    key_input_for_keycode(&mut backend, &mut state, KEYCODE_LEFT_SHIFT, true);
+    let _ = kbd_map_drain(&mut both);
+    let _ = kbd_map_drain(&mut press_only);
+    let _ = kbd_map_drain(&mut release_only);
     key_input(&mut backend, &mut state, true);
     let _ = kbd_map_drain(&mut both);
     let _ = kbd_map_drain(&mut press_only);
     let _ = kbd_map_drain(&mut release_only);
-    repeat_pair(&mut backend, &mut state);
+    let release_clock = repeat_event(&mut backend, &mut state, false);
+    let press_clock = repeat_event(&mut backend, &mut state, true);
 
     let both_bytes = kbd_map_drain(&mut both);
     let press_bytes = kbd_map_drain(&mut press_only);
     let release_bytes = kbd_map_drain(&mut release_only);
-    assert_eq!(event_types(&both_bytes), [3, 2]);
-    assert_eq!(event_types(&press_bytes), [2]);
-    assert_eq!(event_types(&release_bytes), [3]);
-    let mut normalized_release = both_bytes[..32].to_vec();
-    normalized_release[0] = 2;
-    assert_eq!(&normalized_release[1..4], &both_bytes[33..36]);
-    assert_eq!(&normalized_release[8..32], &both_bytes[40..64]);
+    assert_eq!(
+        both_bytes.len(),
+        64,
+        "both-mask repeat is release then press"
+    );
+    assert_eq!(
+        press_bytes.len(),
+        32,
+        "KeyPress-only selector gets the press"
+    );
+    assert_eq!(
+        release_bytes.len(),
+        32,
+        "KeyRelease-only selector gets the release"
+    );
+    let release_time = checked_event_time(&both_bytes[..32], release_clock);
+    let press_time = checked_event_time(&both_bytes[32..64], press_clock);
+    let expected_release = expected_core_key_packet(3, release_time);
+    let expected_press = expected_core_key_packet(2, press_time);
+    let mut expected_pair = expected_release.to_vec();
+    expected_pair.extend_from_slice(&expected_press);
+    assert_eq!(both_bytes, expected_pair);
+    assert_eq!(press_bytes.as_slice(), expected_press);
+    assert_eq!(release_bytes.as_slice(), expected_release);
+
+    key_input(&mut backend, &mut state, false);
+    let _ = kbd_map_drain(&mut both);
+    let _ = kbd_map_drain(&mut press_only);
+    let _ = kbd_map_drain(&mut release_only);
+    key_input_for_keycode(&mut backend, &mut state, KEYCODE_LEFT_SHIFT, false);
+}
+
+fn checked_event_time(packet: &[u8], (before, after): (u32, u32)) -> u32 {
+    let time = u32::from_le_bytes(packet[4..8].try_into().unwrap());
+    let elapsed = after.wrapping_sub(before);
+    assert!(
+        time.wrapping_sub(before) <= elapsed,
+        "event time {time} is outside the server-clock sample [{before}, {after}]"
+    );
+    time
+}
+
+fn expected_core_key_packet(event_type: u8, time: u32) -> [u8; 32] {
+    let mut packet = [
+        event_type, KEYCODE_A, 3, 0, 0, 0, 0, 0, 0x00, 0x01, 0, 0, 0x00, 0x01, 0, 0, 0, 0, 0, 0,
+        0x7b, 0, 0x2d, 0, 0x7b, 0, 0x2d, 0, 1, 0, 1, 0,
+    ];
+    packet[4..8].copy_from_slice(&time.to_le_bytes());
+    packet
 }
 
 /// Mutation: ignore the stored DetectableAutoRepeat flag. A flagged client
