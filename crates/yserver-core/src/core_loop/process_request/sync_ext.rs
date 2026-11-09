@@ -866,14 +866,16 @@ fn change_alarm_attributes(
                 counter,
             ));
         }
-        validate_resource_if_present(
-            state,
-            client,
-            ResourceId(counter),
-            ResourceKind::SyncCounter,
-            AccessMode::READ,
-            request,
-        )?;
+        if counter != 0 {
+            validate_resource_if_present(
+                state,
+                client,
+                ResourceId(counter),
+                ResourceKind::SyncCounter,
+                AccessMode::READ,
+                request,
+            )?;
+        }
         new_counter = counter;
     }
     let current = if new_counter == 0 {
