@@ -361,8 +361,8 @@ impl RenderEngine {
                 {
                     log::warn!(
                         target: "yserver::kms::render::fbtrace",
-                        "fbtrace frame_seq={} op#{} FillRect dst={} rects={} color={:?} old_layout={:?}",
-                        frame_seq, idx, fr.dst_id.as_u64(), fr.rects.len(), fr.color, fr.dst_old_layout,
+                        "fbtrace frame_seq={} op#{} FillRect dst={} instances={} color={:?} old_layout={:?}",
+                        frame_seq, idx, fr.dst_id.as_u64(), fr.instance_count, fr.color, fr.dst_old_layout,
                     )
                 }
                 RecordedOp::LogicFill(lf)
@@ -732,9 +732,19 @@ impl RenderEngine {
                         )
                     }
                     SessionStep::OpenNew | SessionStep::FlushThenOpenNew => {
-                        emit_session_open_and_draws(inner, store, &vk, cb, op, &mut session)
+                        emit_session_open_and_draws(
+                            inner,
+                            store,
+                            &vk,
+                            cb,
+                            op,
+                            &open_frame.pins,
+                            &mut session,
+                        )
                     }
-                    SessionStep::Continue => emit_session_continue_draws(inner, cb, op),
+                    SessionStep::Continue => {
+                        emit_session_continue_draws(inner, cb, op, &open_frame.pins)
+                    }
                 };
                 if let Err(e) = step_result {
                     acc = Err(e);

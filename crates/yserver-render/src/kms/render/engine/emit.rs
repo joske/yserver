@@ -113,7 +113,7 @@ pub(super) fn emit_recorded_op_into_cb(
         // Phase B.3 — CopyArea implemented in Task 2; stubs for later tasks.
         Op::CopyArea(ca) => emit_recorded_copy_area_into_cb(inner, cb, ca),
         Op::PutImage(pi) => emit_recorded_put_image_into_cb(inner, cb, pins, pi),
-        Op::FillRect(fr) => emit_recorded_fill_rect_into_cb(inner, store, cb, fr),
+        Op::FillRect(fr) => emit_recorded_fill_rect_into_cb(inner, store, cb, pins, fr),
         Op::LogicFill(lf) => emit_recorded_logic_fill_into_cb(inner, store, cb, lf),
         Op::ImageText(it) => emit_recorded_image_text_into_cb(inner, store, cb, pins, it),
         Op::RenderTrapsOrTris(rt) => {
@@ -1040,10 +1040,8 @@ pub(super) fn close_dst_color_pass(vk: &VkContext, cb: vk::CommandBuffer, dst_im
     );
 }
 
-/// Phase B.3 Task 8: replay a deferred `RecordedFillRect` into the
-/// frame's command buffer. Uses `cmd_clear_attachments` directly —
-/// NO composite pipeline, NO descriptor (codex round-7 catch —
-/// earlier drafts erroneously routed through composite).
+/// Replay a deferred `RecordedFillRect` into the frame's command buffer with
+/// the instanced solid-fill pipeline and the frame's pinned instance slice.
 ///
 /// `load_op = LOAD` is LOAD-BEARING per N4: outside-rect pixels must
 /// be preserved. `DONT_CARE` would invalidate the entire render area.
@@ -1057,6 +1055,7 @@ fn emit_recorded_fill_rect_into_cb(
     inner: &mut RenderEngineInner,
     store: &DrawableStore,
     cb: vk::CommandBuffer,
+    pins: &crate::kms::render::frame_builder::FramePinSet,
     fr: &crate::kms::render::frame_builder::RecordedFillRect,
 ) -> Result<(), RenderError> {
     // Clone the Vk handle owner so the helper calls don't alias
@@ -1084,8 +1083,8 @@ fn emit_recorded_fill_rect_into_cb(
         fr.dst_old_layout,
         SESSION_SRC_ACCESS,
     );
-    // Draws half (UNCHANGED): scissor to render_area + clear_attachments.
-    emit_fill_draws(&vk, cb, fr);
+    // Draws half: restore all fill state and draw its pinned instances.
+    emit_fill_draws(inner, cb, pins, fr)?;
     // end_rendering + post-barrier (→ SHADER_READ_ONLY_OPTIMAL) via the
     // shared close helper.
     close_dst_color_pass(&vk, cb, dst_image);
@@ -1107,41 +1106,52 @@ const SESSION_SRC_ACCESS: vk::AccessFlags2 = vk::AccessFlags2::from_raw(
 );
 
 /// FILL draws-half: assumes a pass is OPEN (via `open_dst_color_pass`).
-/// Sets the scissor to the full render area, then `cmd_clear_attachments`
-/// for every recorded rect. NO open/close — the session (or the standalone
-/// wrapper) owns those. Re-set scissor on every call so a session
-/// `Continue` is correct after a prior op left a different scissor bound.
+/// Binds the per-format instanced pipeline, full-area scissor, the shared
+/// logic-fill push ABI, and the frame-pinned instance slice. NO open/close —
+/// the session (or standalone wrapper) owns those. State is restored on every
+/// fill because a continued predecessor may have changed it.
 fn emit_fill_draws(
-    vk: &VkContext,
+    inner: &mut RenderEngineInner,
     cb: vk::CommandBuffer,
+    pins: &crate::kms::render::frame_builder::FramePinSet,
     fr: &crate::kms::render::frame_builder::RecordedFillRect,
-) {
+) -> Result<(), RenderError> {
+    let vk = inner.vk.clone();
+    let Some(cache) = inner.solid_fill_caches.get(&fr.dst_format) else {
+        return Err(RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED));
+    };
+    let pipeline = cache.pipeline();
+    let pipeline_layout = cache.pipeline_layout();
+    let instance = pins.upload_slices[fr.instance_pin.0 as usize];
     let render_area = vk::Rect2D {
         offset: vk::Offset2D::default(),
         extent: fr.dst_extent,
     };
-    let attachments = [vk::ClearAttachment::default()
-        .aspect_mask(vk::ImageAspectFlags::COLOR)
-        .color_attachment(0)
-        .clear_value(vk::ClearValue {
-            color: vk::ClearColorValue { float32: fr.color },
-        })];
-    let clear_rects: Vec<vk::ClearRect> = fr
-        .rects
-        .iter()
-        .map(|r| {
-            vk::ClearRect::default()
-                .rect(*r)
-                .base_array_layer(0)
-                .layer_count(1)
-        })
-        .collect();
+    let scissor = [render_area];
+    let buffers = [instance.buffer];
+    let offsets = [instance.offset];
+    let push = crate::kms::vk::logic_fill_pipeline::LogicFillPushConsts {
+        dst_origin: [0.0; 2],
+        dst_size: [0.0; 2],
+        viewport: [fr.dst_extent.width as f32, fr.dst_extent.height as f32],
+        _pad: [0.0; 2],
+        fg_color: fr.color,
+    };
     unsafe {
-        let scissor = [render_area];
         vk.device.cmd_set_scissor(cb, 0, &scissor);
         vk.device
-            .cmd_clear_attachments(cb, &attachments, &clear_rects);
+            .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
+        vk.device.cmd_push_constants(
+            cb,
+            pipeline_layout,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            0,
+            push.as_bytes(),
+        );
+        vk.device.cmd_bind_vertex_buffers(cb, 0, &buffers, &offsets);
+        vk.device.cmd_draw(cb, 4, fr.instance_count, 0, 0);
     }
+    Ok(())
 }
 
 /// Phase B.3 Task 10: replay a `RecordedLogicFill` into the frame CB.
@@ -1357,6 +1367,7 @@ pub(super) fn emit_session_open_and_draws(
     vk: &VkContext,
     cb: vk::CommandBuffer,
     op: &crate::kms::render::frame_builder::RecordedOp,
+    pins: &crate::kms::render::frame_builder::FramePinSet,
     session: &mut Option<DstPassSession>,
 ) -> Result<(), RenderError> {
     use crate::kms::render::frame_builder::RecordedOp as Op;
@@ -1376,7 +1387,7 @@ pub(super) fn emit_session_open_and_draws(
                 fr.dst_old_layout,
                 SESSION_SRC_ACCESS,
             );
-            emit_fill_draws(vk, cb, fr);
+            emit_fill_draws(inner, cb, pins, fr)?;
             *session = Some(DstPassSession {
                 dst_id: fr.dst_id,
                 dst_image,
@@ -1459,6 +1470,7 @@ pub(super) fn emit_session_continue_draws(
     inner: &mut RenderEngineInner,
     cb: vk::CommandBuffer,
     op: &crate::kms::render::frame_builder::RecordedOp,
+    pins: &crate::kms::render::frame_builder::FramePinSet,
 ) -> Result<(), RenderError> {
     use crate::kms::render::frame_builder::RecordedOp as Op;
     // Clone the Vk handle owner so the draws call doesn't alias `&inner.vk`
@@ -1466,7 +1478,7 @@ pub(super) fn emit_session_continue_draws(
     let vk = inner.vk.clone();
     match op {
         Op::FillRect(fr) => {
-            emit_fill_draws(&vk, cb, fr);
+            emit_fill_draws(inner, cb, pins, fr)?;
             Ok(())
         }
         Op::LogicFill(lf) => {

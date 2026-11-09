@@ -110,6 +110,10 @@ impl RenderEngine {
             return Ok(());
         }
 
+        let _ = inner;
+        self.ensure_solid_fill_cache(gpu, format)?;
+        let inner = self.inner.as_mut().expect("solid-fill cache ensured");
+
         // Open the frame if not already open (mirror copy_area / put_image
         // pattern at engine.rs:5278-5287).
         if !inner.frame_builder.is_open() {
@@ -129,6 +133,29 @@ impl RenderEngine {
             .ticket
             .clone();
 
+        // Solid-fill instances are two vec2s in pixel coordinates. Upload
+        // them once into the owning frame's arena, which already provides
+        // VERTEX_BUFFER usage and pins both the buffer and its suballocation
+        // offset until replay retires.
+        let instance_count =
+            u32::try_from(clamped.len()).expect("fill instance count fits vkCmdDraw");
+        let mut instance_bytes = Vec::with_capacity(
+            clamped.len()
+                * std::mem::size_of::<crate::kms::vk::solid_fill_pipeline::SolidFillInstance>(),
+        );
+        for rect in &clamped {
+            let instance = crate::kms::vk::solid_fill_pipeline::SolidFillInstance {
+                origin: [rect.offset.x as f32, rect.offset.y as f32],
+                size: [rect.extent.width as f32, rect.extent.height as f32],
+            };
+            instance_bytes.extend_from_slice(instance.as_bytes());
+        }
+        let instance_pin = inner.upload_to_frame(
+            &instance_bytes,
+            super::staging::UPLOAD_VERTEX_ALIGN,
+            crate::kms::vk::mem_accounting::ChurnClass::StagingOther,
+        )?;
+
         // Prelude: first_touch + ticket-touch + damage.
         {
             let open = inner.frame_builder.open.as_mut().expect("open");
@@ -140,8 +167,8 @@ impl RenderEngine {
             store.damage(target, *r);
         }
 
-        // Phase B.3 (N4): ONE RecordedFillRect per call carrying the entire
-        // clamped rect slice. Splitting per-rect would be new behavior.
+        // One recorded op carries the pin and instance count; clamped
+        // geometry is no longer retained after upload and damage recording.
         let payload = Box::new(crate::kms::render::frame_builder::RecordedFillRect {
             dst_id: target,
             dst_image_view: image_view,
@@ -149,7 +176,8 @@ impl RenderEngine {
             dst_format: format,
             dst_old_layout: dst_pre_layout,
             color,
-            rects: clamped,
+            instance_pin,
+            instance_count,
         });
         {
             let open = inner.frame_builder.open.as_mut().expect("open");
@@ -159,6 +187,33 @@ impl RenderEngine {
             );
         }
         store.mark_contents_modified(target);
+        Ok(())
+    }
+
+    /// Lazily build the instanced GXcopy pipeline for `color_format`.
+    fn ensure_solid_fill_cache(
+        &mut self,
+        gpu: &GpuCore,
+        color_format: vk::Format,
+    ) -> Result<(), RenderError> {
+        use crate::kms::vk::solid_fill_pipeline::SolidFillPipelineCache;
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(RenderError::NoVk);
+        };
+        if gpu.renderer_failed {
+            return Err(RenderError::RendererFailed);
+        }
+        if inner.solid_fill_caches.contains_key(&color_format) {
+            return Ok(());
+        }
+        let cache =
+            SolidFillPipelineCache::new(Arc::clone(&inner.vk), color_format).map_err(|e| {
+                log::error!(
+                    "render ensure_solid_fill_cache: SolidFillPipelineCache::new failed: {e:?}"
+                );
+                RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+            })?;
+        inner.solid_fill_caches.insert(color_format, cache);
         Ok(())
     }
 

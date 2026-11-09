@@ -740,6 +740,11 @@ struct RenderEngineInner {
     /// rendercheck's `copy_plane` corner.
     logic_fill_caches:
         HashMap<vk::Format, crate::kms::vk::logic_fill_pipeline::LogicFillPipelineCache>,
+    /// Per-format, lazily-built pipeline for the `RecordedFillRect` instanced
+    /// GXcopy path. It shares logic fill's fragment shader and push ABI, but
+    /// uses instance attributes, no logic op and RGBA writes.
+    solid_fill_caches:
+        HashMap<vk::Format, crate::kms::vk::solid_fill_pipeline::SolidFillPipelineCache>,
     /// Stage 5 Task 4 layer 1: long-lived descriptor pool ring used
     /// by `try_vk_render_composite` + `try_vk_render_traps_or_tris`.
     /// Replaces per-call descriptor-pool instantiation. Spec
