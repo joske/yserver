@@ -3,6 +3,7 @@ mod export;
 mod glyph_atlas;
 mod glyph_runs;
 mod handoff;
+mod instanced_fill;
 mod memory_frame;
 mod pixel_clamp;
 mod put_image_arena;

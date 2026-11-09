@@ -192,6 +192,11 @@ impl RenderEngine {
                 mask_scratch: None,
                 drawable_view_cache: HashMap::new(),
                 logic_fill_caches: HashMap::new(),
+                solid_fill_caches: HashMap::new(),
+                #[cfg(test)]
+                fill_command_observations: Vec::new(),
+                #[cfg(test)]
+                fill_session_steps: Vec::new(),
                 descriptor_pool_ring,
                 acquire_generation: 0,
                 pending_render_batch: None,

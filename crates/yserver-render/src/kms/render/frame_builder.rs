@@ -897,18 +897,10 @@ pub(crate) enum PutImageSrc {
     Upload(PinnedUploadIdx),
 }
 
-/// Phase B.3 (FILL family — N4). One variant covers both `fill_rect`
-/// (N=1) and `fill_rect_batch` (N≥1). Emit uses `cmd_clear_attachments`
-/// directly — NO composite pipeline, NO descriptor (codex round-7 catch
-/// rewrote the spec). `load_op = LOAD` is LOAD-BEARING per the FILL
-/// pseudocode in the spec — outside-rect pixels must be preserved.
+/// Solid fill recorded as one instanced quad draw. The instance data is
+/// owned by the replaying frame's upload pins; keeping only its pin and
+/// count avoids retaining the clamped rectangle vector until replay.
 #[derive(Debug)]
-#[allow(
-    dead_code,
-    reason = "Phase B.3 Task 8 (fill_rect / fill_rect_batch body rewrite) populates \
-              these fields; the payload lands in Task 1 so the emit dispatch can \
-              match exhaustively."
-)]
 pub(crate) struct RecordedFillRect {
     pub(crate) dst_id: DrawableId,
     pub(crate) dst_image_view: vk::ImageView,
@@ -916,7 +908,8 @@ pub(crate) struct RecordedFillRect {
     pub(crate) dst_format: vk::Format,
     pub(crate) dst_old_layout: vk::ImageLayout,
     pub(crate) color: [f32; 4],
-    pub(crate) rects: Vec<vk::Rect2D>, // pre-clamped at append, non-empty
+    pub(crate) instance_pin: PinnedUploadIdx,
+    pub(crate) instance_count: u32,
 }
 
 /// Phase B.3 (FILL family — N6). Distinct from `RecordedFillRect`:
@@ -1566,7 +1559,8 @@ mod op_tests {
             dst_format: vk::Format::B8G8R8A8_UNORM,
             dst_old_layout: vk::ImageLayout::UNDEFINED,
             color: [0.0; 4],
-            rects: Vec::new(),
+            instance_pin: PinnedUploadIdx(0),
+            instance_count: 0,
         }));
         assert_eq!(fill_rect.dst_id(), Some(id7));
         assert_eq!(fill_rect.written_drawable(), Some(id7));
@@ -1732,7 +1726,8 @@ mod op_tests {
                 dst_format: vk::Format::B8G8R8A8_UNORM,
                 dst_old_layout: vk::ImageLayout::UNDEFINED,
                 color: [0.0; 4],
-                rects: Vec::new(),
+                instance_pin: PinnedUploadIdx(0),
+                instance_count: 0,
             })),
             RecordedOp::ImageText(Box::new(RecordedImageText {
                 dst_id: id7,

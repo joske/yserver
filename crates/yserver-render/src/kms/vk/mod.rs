@@ -30,6 +30,7 @@ pub mod probe_digest;
 pub mod probe_pattern;
 pub mod render_pipeline;
 pub mod scale_pipeline;
+pub mod solid_fill_pipeline;
 pub mod submit_stats;
 pub mod sync;
 pub mod target;
