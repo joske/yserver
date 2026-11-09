@@ -265,7 +265,7 @@ struct DstPassSession {
 }
 
 /// What the replay loop must do for one op given the open-session state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum SessionStep {
     /// No session open, op is eligible: open a new pass + emit draws.
     OpenNew,
@@ -278,25 +278,6 @@ enum SessionStep {
     FlushThenStandalone,
     /// No session open, op is INELIGIBLE: run the op standalone.
     Standalone,
-}
-
-/// Vulkan commands observed while emitting one `RecordedFillRect`.
-/// Appended at command sites by `emit_fill_draws`, not inferred from the
-/// recorded payload or process-global call counters.
-#[cfg(test)]
-#[derive(Debug, Default)]
-struct FillCommandObservation {
-    attachment_clear_calls: u32,
-    draws: Vec<FillDrawObservation>,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FillDrawObservation {
-    vertex_count: u32,
-    instance_count: u32,
-    first_vertex: u32,
-    first_instance: u32,
 }
 
 /// Pending RENDER composite batch: long-lived CB across N appends,
@@ -764,14 +745,6 @@ struct RenderEngineInner {
     /// uses instance attributes, no logic op and RGBA writes.
     solid_fill_caches:
         HashMap<vk::Format, crate::kms::vk::solid_fill_pipeline::SolidFillPipelineCache>,
-    /// Command-site observations for the instanced-fill acceptance tests.
-    /// These belong to one engine and are absent from production builds.
-    #[cfg(test)]
-    fill_command_observations: Vec<FillCommandObservation>,
-    /// Actual replay decisions for fill ops, so the session fixture can
-    /// assert that it exercised the `Continue` branch.
-    #[cfg(test)]
-    fill_session_steps: Vec<SessionStep>,
     /// Stage 5 Task 4 layer 1: long-lived descriptor pool ring used
     /// by `try_vk_render_composite` + `try_vk_render_traps_or_tris`.
     /// Replaces per-call descriptor-pool instantiation. Spec

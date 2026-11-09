@@ -1137,9 +1137,6 @@ fn emit_fill_draws(
         _pad: [0.0; 2],
         fg_color: fr.color,
     };
-    let draw_instance_count = fr.instance_count;
-    #[cfg(test)]
-    let mut observation = super::FillCommandObservation::default();
     unsafe {
         vk.device.cmd_set_scissor(cb, 0, &scissor);
         vk.device
@@ -1152,36 +1149,9 @@ fn emit_fill_draws(
             push.as_bytes(),
         );
         vk.device.cmd_bind_vertex_buffers(cb, 0, &buffers, &offsets);
-        vk.device.cmd_draw(cb, 4, draw_instance_count, 0, 0);
-        #[cfg(test)]
-        observation.draws.push(super::FillDrawObservation {
-            vertex_count: 4,
-            instance_count: draw_instance_count,
-            first_vertex: 0,
-            first_instance: 0,
-        });
+        vk.device.cmd_draw(cb, 4, fr.instance_count, 0, 0);
     }
-    #[cfg(test)]
-    inner.fill_command_observations.push(observation);
     Ok(())
-}
-
-/// Command-site wrapper for the old attachment-clear mutation. It exists only
-/// in test builds so that restoring a clear records the actual issued call in
-/// the engine-scoped observer, with no production counter or telemetry.
-#[cfg(test)]
-#[allow(dead_code, reason = "used by the clear-kept mutation oracle")]
-unsafe fn observed_fill_clear_attachments(
-    vk: &VkContext,
-    cb: vk::CommandBuffer,
-    attachments: &[vk::ClearAttachment],
-    rects: &[vk::ClearRect],
-    observation: &mut super::FillCommandObservation,
-) {
-    observation.attachment_clear_calls += 1;
-    unsafe {
-        vk.device.cmd_clear_attachments(cb, attachments, rects);
-    }
 }
 
 /// Phase B.3 Task 10: replay a `RecordedLogicFill` into the frame CB.

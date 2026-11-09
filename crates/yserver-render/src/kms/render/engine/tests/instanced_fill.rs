@@ -1,4 +1,4 @@
-//! Exactness and command-shape tests for the `RecordedFillRect` draw path.
+//! Recording and pixel tests for the `RecordedFillRect` instanced draw path.
 
 use super::*;
 use crate::kms::render::{
@@ -55,29 +55,22 @@ fn readback(
         .expect("get_image")
 }
 
-fn clear_fill_observation(engine: &mut RenderEngine) {
-    let inner = engine.inner.as_mut().expect("live engine");
-    inner.fill_command_observations.clear();
-    inner.fill_session_steps.clear();
-}
-
-fn assert_one_instanced_draw(engine: &RenderEngine, instance_count: u32) {
+/// The open frame's recorded fills, as `(dst, instance_count)`. Read at the
+/// test boundary, before the readback submits the frame.
+fn recorded_fills(engine: &RenderEngine) -> Vec<(DrawableId, u32)> {
     let inner = engine.inner.as_ref().expect("live engine");
-    assert_eq!(
-        inner.fill_command_observations.len(),
-        1,
-        "one observation per emitted RecordedFillRect"
-    );
-    let observation = &inner.fill_command_observations[0];
-    assert_eq!(
-        observation.attachment_clear_calls, 0,
-        "fill must issue no attachment clears"
-    );
-    assert_eq!(observation.draws.len(), 1, "one draw per RecordedFillRect");
-    assert_eq!(observation.draws[0].vertex_count, 4, "quad vertex count");
-    assert_eq!(observation.draws[0].instance_count, instance_count);
-    assert_eq!(observation.draws[0].first_vertex, 0);
-    assert_eq!(observation.draws[0].first_instance, 0);
+    let open = inner
+        .frame_builder
+        .open
+        .as_ref()
+        .expect("frame remains open");
+    open.ops
+        .iter()
+        .filter_map(|op| match op {
+            RecordedOp::FillRect(fr) => Some((fr.dst_id, fr.instance_count)),
+            _ => None,
+        })
+        .collect()
 }
 
 fn expected_bgra_pixel(bytes: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
@@ -103,7 +96,7 @@ fn rect_contains_pixel(rect: vk::Rect2D, x: i32, y: i32) -> bool {
     x >= x0 && y >= y0 && x < x1 && y < y1
 }
 
-// Mutations that must fail this test: one draw per rect; clear kept; instance count 1.
+// Mutations that must fail this test: one recorded fill per rect; instance count 1 at emit.
 #[test]
 #[ignore = "needs a live lavapipe Vulkan ICD"]
 fn instanced_fill_one_draw_per_fill() {
@@ -112,7 +105,6 @@ fn instanced_fill_one_draw_per_fill() {
     let mut engine = RenderEngine::new(&gpu).expect("engine");
     let id = target(&mut gpu, &mut store, 0x501, 64, 64, 32);
     let color = crate::kms::render::engine::pixels::decode_x11_pixel_bgra(0xFF_3A_7C_B1);
-    clear_fill_observation(&mut engine);
     engine
         .fill_rect_batch(
             &mut store,
@@ -122,13 +114,16 @@ fn instanced_fill_one_draw_per_fill() {
             &[rect(4, 5, 1, 1)],
         )
         .expect("one-rect fill");
-    let _ = readback(&mut engine, &mut store, &mut gpu, id, 64, 64, 32);
-    assert_one_instanced_draw(&engine, 1);
+    assert_eq!(recorded_fills(&engine), [(id, 1)]);
+    let bytes = readback(&mut engine, &mut store, &mut gpu, id, 64, 64, 32);
+    assert_eq!(
+        expected_bgra_pixel(&bytes, 64, 4, 5),
+        [0xB1, 0x7C, 0x3A, 0xFF]
+    );
 
     let rects: Vec<vk::Rect2D> = (0..1000)
         .map(|i| rect(i % 64, (i / 64) % 64, 1, 1))
         .collect();
-    clear_fill_observation(&mut engine);
     engine
         .fill_rect_batch(
             &mut store,
@@ -138,8 +133,16 @@ fn instanced_fill_one_draw_per_fill() {
             &rects,
         )
         .expect("1000-rect fill");
-    let _ = readback(&mut engine, &mut store, &mut gpu, id, 64, 64, 32);
-    assert_one_instanced_draw(&engine, 1000);
+    assert_eq!(recorded_fills(&engine), [(id, 1000)]);
+    let bytes = readback(&mut engine, &mut store, &mut gpu, id, 64, 64, 32);
+    for i in [0, 1, 63, 64, 500, 999] {
+        let (x, y) = ((i % 64) as usize, ((i / 64) % 64) as usize);
+        assert_eq!(
+            expected_bgra_pixel(&bytes, 64, x, y),
+            [0xB1, 0x7C, 0x3A, 0xFF],
+            "instance {i} must be drawn"
+        );
+    }
 
     engine.drain_all(&mut gpu);
 }
@@ -179,7 +182,6 @@ fn instanced_fill_pixels_exact() {
         )
         .expect("initialize BGRA background");
     let _ = readback(&mut engine, &mut store, &mut gpu, bgra, width, height, 32);
-    clear_fill_observation(&mut engine);
     engine
         .fill_rect_batch(
             &mut store,
@@ -229,7 +231,6 @@ fn instanced_fill_pixels_exact() {
         )
         .expect("initialize R8 background");
     let _ = readback(&mut engine, &mut store, &mut gpu, r8, width, height, 8);
-    clear_fill_observation(&mut engine);
     engine
         .fill_rect_batch(
             &mut store,
@@ -337,6 +338,24 @@ fn instanced_fill_in_session() {
         .open
         .as_ref()
         .expect("frame remains open");
+    // A same-dst logic fill followed by two same-dst fills, with nothing in
+    // between: replay opens the pass on the logic fill and both fills take
+    // `SessionStep::Continue` (the classification is unit-tested in
+    // `engine/tests/mod.rs`).
+    let shape: Vec<(&str, Option<DrawableId>)> = open
+        .ops
+        .iter()
+        .map(|op| match op {
+            RecordedOp::LogicFill(_) => ("logic", op.dst_id()),
+            RecordedOp::FillRect(_) => ("fill", op.dst_id()),
+            _ => ("other", op.dst_id()),
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [("logic", Some(id)), ("fill", Some(id)), ("fill", Some(id))],
+        "both fills must continue the logic fill's pass"
+    );
     let fill_pins: Vec<PinnedUploadIdx> = open
         .ops
         .iter()
@@ -352,23 +371,7 @@ fn instanced_fill_in_session() {
     assert_ne!(b.offset, 0, "B's slice begins at a nonzero arena offset");
     let _ = inner;
 
-    clear_fill_observation(&mut engine);
     let bytes = readback(&mut engine, &mut store, &mut gpu, id, width, height, 32);
-    let inner = engine.inner.as_ref().expect("live engine");
-    assert_eq!(
-        inner.fill_session_steps,
-        [
-            super::super::SessionStep::Continue,
-            super::super::SessionStep::Continue
-        ],
-        "both fills must take the replay Continue branch"
-    );
-    assert_eq!(inner.fill_command_observations.len(), 2);
-    for (index, observation) in inner.fill_command_observations.iter().enumerate() {
-        assert_eq!(observation.attachment_clear_calls, 0, "fill {index}");
-        assert_eq!(observation.draws.len(), 1, "fill {index}");
-        assert_eq!(observation.draws[0].instance_count, 1, "fill {index}");
-    }
 
     let predecessor = [0x85, 0x74, 0x63, 0xFF];
     let expected_a = [0x31, 0x2B, 0xA1, 0xFF];
@@ -431,7 +434,6 @@ fn instanced_fill_large() {
             rect(x as i32, y as i32, 1 + i % 3, 1 + (i / 7) % 3)
         })
         .collect();
-    clear_fill_observation(&mut engine);
     engine
         .fill_rect_batch(
             &mut store,
@@ -467,7 +469,6 @@ fn instanced_fill_large() {
     let _ = inner;
 
     let bytes = readback(&mut engine, &mut store, &mut gpu, id, width, height, 32);
-    assert_one_instanced_draw(&engine, 200_000);
     let expected = [0x27, 0x86, 0xD5, 0xFF];
     let background = [0x34, 0x23, 0x12, 0xFF];
     assert_eq!(expected_bgra_pixel(&bytes, width as usize, 0, 0), expected);
