@@ -137,7 +137,7 @@ are XLibre's (`include/dixaccess.h`), joined with `+`.
 
 | Request | Checks, in order |
 |---|---|
-| 1 Pixmap | window `WRITE`; pixmap `READ`; then in the common helper, each after its own validation and skipping zero sentinels: valid region `READ`, update region `READ`, CRTC `READ`, wait fence `READ`, idle fence `WRITE`; then each notify window `GET_ATTR`, if present, in array order, before the present is queued |
+| 1 Pixmap | window `WRITE`; pixmap `READ`; then in the common helper, each after its own validation and skipping zero sentinels: valid region `READ`, update region `READ`, CRTC `READ`, wait fence `READ`, idle fence `WRITE`; then each notify window `GET_ATTR`, if present, in array order, after the common helper and before the MSC domain is selected (the selection writes `present_window_msc`) |
 | 2 NotifyMSC | window `READ` |
 | 3 SelectInput | window `GET_ATTR`, if present, before the event-id processing; an existing event selection `WRITE`, before its owner/window `BadMatch`; a new one `CREATE`, `Creation { parent: window }`, before the insert |
 | 4 QueryCapabilities | target `GET_ATTR` as Window, else as RANDR CRTC, if present |
@@ -248,7 +248,12 @@ in `tests/mod.rs`.
 
 - [ ] **Step 1: Failing tests:** DENY and ASK rows, the common-helper operands each with a zero-sentinel row that
   asks nothing; `present_pixmap_denied_notify_window_presents_nothing` (no queued present, no backend copy, no
-  completion; mutation: check notifies after queueing); `present_select_input_window_checked_before_bad_match`;
+  completion, and the window's remembered MSC domain (`present_window_msc`) unchanged; mutation: check notifies after
+  the domain selection); mixed-failure rows for both Pixmap and PixmapSynced (review r2 M-2), each paired with its
+  no-policy result: a denied earlier operand with an invalid later one (denied valid region + missing update region;
+  denied window + missing pixmap; PixmapSynced: denied acquire syncobj + invalid release syncobj), and a denied last
+  resource with invalid options or remainder (denied CRTC, and for Pixmap denied idle fence, + invalid options); the
+  policy's error answers each. Mutation: run every check after the complete validity pass; `present_select_input_window_checked_before_bad_match`;
   `query_capabilities_crtc_target_is_asked_with_server_owner`.
 - [ ] **Steps 2–5.** Commit `… Task 4: Present`.
 
