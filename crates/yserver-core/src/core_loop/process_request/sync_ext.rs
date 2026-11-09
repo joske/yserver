@@ -166,6 +166,9 @@ pub(super) fn handle_sync_request(
     }
     macro_rules! check_creation {
         ($id:expr, $kind:expr) => {
+            check_creation!($id, $kind, None)
+        };
+        ($id:expr, $kind:expr, $parent:expr $(,)?) => {
             crate::core_loop::process_request::return_on_access_denial!(
                 validate_resource_access(
                     state,
@@ -175,7 +178,7 @@ pub(super) fn handle_sync_request(
                         id: ResourceId($id),
                         kind: $kind,
                         creation: Some(Creation {
-                            parent: None,
+                            parent: $parent,
                             owner: client_id,
                         }),
                     },
@@ -604,6 +607,21 @@ pub(super) fn handle_sync_request(
         }
         x11sync::CREATE_FENCE => {
             if let Some(req) = x11sync::parse_create_fence(body) {
+                let drawable = ResourceId(req.drawable);
+                let drawable_kind = match super::drawable_lookup(state, drawable) {
+                    super::DrawableLookup::InputOutputWindow { .. }
+                    | super::DrawableLookup::InputOnlyWindow => Some(ResourceKind::Window),
+                    super::DrawableLookup::Pixmap { .. } => Some(ResourceKind::Pixmap),
+                    super::DrawableLookup::Missing => None,
+                };
+                if let Some(kind) = drawable_kind {
+                    check_resource!(req.drawable, kind, AccessMode::GET_ATTR);
+                }
+                check_creation!(
+                    req.fence,
+                    ResourceKind::SyncFence,
+                    drawable_kind.map(|_| drawable),
+                );
                 state.sync_fences.insert(
                     req.fence,
                     crate::server::SyncFence {
@@ -622,6 +640,7 @@ pub(super) fn handle_sync_request(
                 if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
                     return outcome;
                 }
+                check_resource!(fence, ResourceKind::SyncFence, AccessMode::DESTROY);
                 crate::core_loop::sync_await::fence_destroyed(state, fence);
                 state.sync_fences.remove(&fence);
                 backend.dri3_destroy_fence(fence);
@@ -636,6 +655,7 @@ pub(super) fn handle_sync_request(
                 if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
                     return outcome;
                 }
+                check_resource!(fence, ResourceKind::SyncFence, AccessMode::WRITE);
                 // For DRI3-imported xshmfence-backed fences, the
                 // server-side triggered bit is invisible to Mesa's local
                 // `xshmfence_await`. Forward the trigger to the backend so
@@ -658,6 +678,7 @@ pub(super) fn handle_sync_request(
                 if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
                     return outcome;
                 }
+                check_resource!(fence, ResourceKind::SyncFence, AccessMode::WRITE);
                 // Xorg `ProcSyncResetFence`: only a triggered fence can be
                 // reset (Xvfb: BadMatch naming the fence); a shared-memory
                 // fence is tested, and reset, in that memory.
@@ -682,6 +703,7 @@ pub(super) fn handle_sync_request(
             if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
                 return outcome;
             }
+            check_resource!(fence, ResourceKind::SyncFence, AccessMode::READ);
             // Xorg `ProcSyncQueryFence` → `CheckTriggered`: shared memory
             // for a DRI3 xshmfence, the server's bit otherwise.
             let triggered =
@@ -720,6 +742,7 @@ pub(super) fn handle_sync_request(
                         fence,
                     );
                 }
+                check_resource!(fence, ResourceKind::SyncFence, AccessMode::READ);
             }
             debug!(
                 "client {} #{} SYNC::AwaitFence n={}",

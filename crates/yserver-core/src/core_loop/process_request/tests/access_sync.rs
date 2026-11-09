@@ -14,6 +14,10 @@ const CLIENT: ClientId = ClientId(1);
 const COUNTER: ResourceId = ResourceId(0x0010_8001);
 const NEW_COUNTER: ResourceId = ResourceId(0x0010_8002);
 const PRIORITY_WINDOW: ResourceId = ResourceId(0x0010_8003);
+const PRIORITY_PIXMAP: ResourceId = ResourceId(0x0010_8006);
+const FENCE: ResourceId = ResourceId(0x0010_8004);
+const SECOND_FENCE: ResourceId = ResourceId(0x0010_8005);
+const THIRD_FENCE: ResourceId = ResourceId(0x0010_8007);
 const DENY_ERROR: DenyError = DenyError {
     code: x11::error::BAD_ACCESS,
     value: 0xA55A_1234,
@@ -70,6 +74,13 @@ fn counter_body(id: ResourceId, value: i64) -> Vec<u8> {
     body
 }
 
+fn fence_body(drawable: ResourceId, fence: ResourceId, initially_triggered: bool) -> Vec<u8> {
+    let mut body = drawable.0.to_le_bytes().to_vec();
+    body.extend_from_slice(&fence.0.to_le_bytes());
+    body.extend_from_slice(&[u8::from(initially_triggered), 0, 0, 0]);
+    body
+}
+
 fn resource_body(id: ResourceId) -> Vec<u8> {
     id.0.to_le_bytes().to_vec()
 }
@@ -89,6 +100,15 @@ fn counter_target(id: ResourceId, creation: Option<Creation>) -> ResourceTarget 
     }
 }
 
+fn fence_target(id: ResourceId, creation: Option<Creation>) -> ResourceTarget {
+    ResourceTarget {
+        id,
+        kind: ResourceKind::SyncFence,
+        creation,
+        owner: None,
+    }
+}
+
 fn create_priority_window(state: &mut ServerState) {
     state.resources.create_window(
         CLIENT,
@@ -101,6 +121,19 @@ fn create_priority_window(state: &mut ServerState) {
             class: 1,
             visual: crate::resources::ROOT_VISUAL,
             ..Default::default()
+        },
+    );
+}
+
+fn create_priority_pixmap(state: &mut ServerState) {
+    state.resources.create_pixmap(
+        CLIENT,
+        CreatePixmapRequest {
+            depth: 24,
+            pixmap: PRIORITY_PIXMAP,
+            drawable: ROOT_WINDOW,
+            width: 16,
+            height: 16,
         },
     );
 }
@@ -1319,4 +1352,456 @@ fn alarm_none_counter_zero_is_not_asked() {
             .iter()
             .all(|call| { call.target.is_none_or(|target| target.id != COUNTER_ZERO) })
     );
+}
+
+#[test]
+fn create_fence_denials_create_nothing() {
+    // Mutation: move CreateFence CREATE past insertion; denial must leave no fence registered.
+    use yserver_protocol::x11::sync;
+
+    let cases = [
+        (
+            "drawable",
+            PRIORITY_WINDOW,
+            FENCE,
+            ResourceTarget {
+                id: PRIORITY_WINDOW,
+                kind: ResourceKind::Window,
+                creation: None,
+                owner: None,
+            },
+            AccessMode::GET_ATTR,
+            Some(CLIENT),
+            Some(CLIENT),
+            Some(Creation {
+                parent: Some(PRIORITY_WINDOW),
+                owner: CLIENT,
+            }),
+        ),
+        (
+            "pixmap",
+            PRIORITY_PIXMAP,
+            SECOND_FENCE,
+            ResourceTarget {
+                id: PRIORITY_PIXMAP,
+                kind: ResourceKind::Pixmap,
+                creation: None,
+                owner: None,
+            },
+            AccessMode::GET_ATTR,
+            Some(CLIENT),
+            Some(CLIENT),
+            Some(Creation {
+                parent: Some(PRIORITY_PIXMAP),
+                owner: CLIENT,
+            }),
+        ),
+        (
+            "creation",
+            ResourceId(0x0010_8fff),
+            SECOND_FENCE,
+            fence_target(
+                SECOND_FENCE,
+                Some(Creation {
+                    parent: None,
+                    owner: CLIENT,
+                }),
+            ),
+            AccessMode::CREATE,
+            None,
+            None,
+            Some(Creation {
+                parent: None,
+                owner: CLIENT,
+            }),
+        ),
+    ];
+
+    for (label, drawable, fence, denied_target, mode, owner, target_owner, expected_creation) in
+        cases
+    {
+        let mut fixture = sync_access_fixture();
+        if label == "drawable" {
+            create_priority_window(&mut fixture.state);
+        } else if label == "pixmap" {
+            create_priority_pixmap(&mut fixture.state);
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        fixture
+            .state
+            .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+                Arc::clone(&calls),
+                denied_target.id,
+                Some(mode),
+                DENY_ERROR,
+            )));
+        let backend_before = fixture.backend.calls();
+
+        let bytes = sync_access_request(
+            &mut fixture,
+            sync::CREATE_FENCE,
+            &fence_body(drawable, fence, false),
+        );
+
+        assert_policy_error(&bytes, sync::CREATE_FENCE);
+        assert!(
+            !fixture.state.sync_fences.contains_key(&fence.0),
+            "{label} denial must leave the fence absent"
+        );
+        assert_eq!(fixture.backend.calls(), backend_before);
+        let calls = calls.lock().unwrap();
+        let resource_calls = calls
+            .iter()
+            .filter(|call| call.hook == ExtensionHook::Resource)
+            .collect::<Vec<_>>();
+        assert_eq!(resource_calls.len(), 1, "{label} denial checks");
+        assert_recorded_resource(
+            resource_calls[0],
+            denied_target,
+            mode,
+            sync::CREATE_FENCE,
+            owner,
+            target_owner,
+        );
+        if mode == AccessMode::CREATE {
+            assert_eq!(
+                resource_calls[0].target.unwrap().creation,
+                expected_creation,
+                "{label} creation metadata"
+            );
+        }
+    }
+}
+
+#[test]
+fn sync_fence_resource_denials_match_modes_and_stop_before_effects() {
+    // Mutation: move ResetFence WRITE after BadMatch; policy denial must keep precedence.
+    use yserver_protocol::x11::sync;
+
+    let cases = [
+        (sync::TRIGGER_FENCE, false),
+        (sync::RESET_FENCE, false),
+        (sync::DESTROY_FENCE, true),
+        (sync::QUERY_FENCE, false),
+    ];
+    for (minor, initially_triggered) in cases {
+        let mut fixture = sync_access_fixture();
+        fixture.state.sync_fences.insert(
+            FENCE.0,
+            crate::server::SyncFence {
+                owner: CLIENT,
+                triggered: initially_triggered,
+            },
+        );
+        if matches!(minor, sync::TRIGGER_FENCE | sync::DESTROY_FENCE) {
+            fixture.state.sync_awaits.insert(
+                2,
+                crate::server::SyncAwait {
+                    conditions: vec![crate::server::SyncAwaitCondition::Fence { fence: FENCE.0 }],
+                },
+            );
+        }
+        fixture
+            .backend
+            .shm_fences
+            .insert(FENCE.0, initially_triggered);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        fixture
+            .state
+            .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+                Arc::clone(&calls),
+                FENCE,
+                Some(if minor == sync::DESTROY_FENCE {
+                    AccessMode::DESTROY
+                } else if minor == sync::QUERY_FENCE {
+                    AccessMode::READ
+                } else {
+                    AccessMode::WRITE
+                }),
+                DENY_ERROR,
+            )));
+        let before_fence = fixture.state.sync_fences[&FENCE.0].clone();
+        let awaits_before = fixture.state.sync_awaits.clone();
+        let backend_calls_before = fixture.backend.calls();
+        let triggered_before = fixture.backend.triggered_dri3_fences.clone();
+        let destroyed_before = fixture.backend.destroyed_shm_fences.clone();
+
+        let bytes = sync_access_request(&mut fixture, minor, &resource_body(FENCE));
+
+        assert_policy_error(&bytes, minor);
+        assert_eq!(fixture.state.sync_fences[&FENCE.0], before_fence);
+        assert_eq!(fixture.state.sync_awaits, awaits_before);
+        assert_eq!(fixture.backend.calls(), backend_calls_before);
+        assert_eq!(fixture.backend.triggered_dri3_fences, triggered_before);
+        assert_eq!(fixture.backend.destroyed_shm_fences, destroyed_before);
+        assert_eq!(
+            fixture.backend.shm_fences.get(&FENCE.0),
+            Some(&initially_triggered),
+            "denied {minor} must not change or unmap the shared fence"
+        );
+        let calls = calls.lock().unwrap();
+        let resource_calls = calls
+            .iter()
+            .filter(|call| call.hook == ExtensionHook::Resource)
+            .collect::<Vec<_>>();
+        assert_eq!(resource_calls.len(), 1, "SYNC minor {minor}");
+        let mode = match minor {
+            sync::TRIGGER_FENCE | sync::RESET_FENCE => AccessMode::WRITE,
+            sync::DESTROY_FENCE => AccessMode::DESTROY,
+            sync::QUERY_FENCE => AccessMode::READ,
+            _ => unreachable!(),
+        };
+        assert_recorded_resource(
+            resource_calls[0],
+            fence_target(FENCE, None),
+            mode,
+            minor,
+            Some(CLIENT),
+            Some(CLIENT),
+        );
+    }
+}
+
+#[test]
+fn await_fence_denied_entry_installs_nothing() {
+    // Mutation: move AwaitFence READ checks after begin_await; denial must install no await.
+    use yserver_protocol::x11::sync;
+
+    let mut fixture = sync_access_fixture();
+    for fence in [FENCE, SECOND_FENCE] {
+        fixture.state.sync_fences.insert(
+            fence.0,
+            crate::server::SyncFence {
+                owner: CLIENT,
+                triggered: false,
+            },
+        );
+    }
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+            Arc::clone(&calls),
+            SECOND_FENCE,
+            Some(AccessMode::READ),
+            DENY_ERROR,
+        )));
+    let mut body = resource_body(FENCE);
+    body.extend_from_slice(&SECOND_FENCE.0.to_le_bytes());
+    let backend_before = fixture.backend.calls();
+
+    let bytes = sync_access_request(&mut fixture, sync::AWAIT_FENCE, &body);
+
+    assert_policy_error(&bytes, sync::AWAIT_FENCE);
+    assert!(
+        fixture.state.sync_awaits.is_empty(),
+        "a denied AwaitFence entry must install no await"
+    );
+    assert_eq!(fixture.backend.calls(), backend_before);
+    let calls = calls.lock().unwrap();
+    let resource_calls = calls
+        .iter()
+        .filter(|call| call.hook == ExtensionHook::Resource)
+        .collect::<Vec<_>>();
+    assert_eq!(resource_calls.len(), 2);
+    assert_recorded_resource(
+        resource_calls[0],
+        fence_target(FENCE, None),
+        AccessMode::READ,
+        sync::AWAIT_FENCE,
+        Some(CLIENT),
+        Some(CLIENT),
+    );
+    assert_recorded_resource(
+        resource_calls[1],
+        fence_target(SECOND_FENCE, None),
+        AccessMode::READ,
+        sync::AWAIT_FENCE,
+        Some(CLIENT),
+        Some(CLIENT),
+    );
+}
+
+#[test]
+fn create_fence_unresolved_drawable_creates_with_no_parent() {
+    // Mutation: pass the unresolved drawable as Creation.parent; the recorded parent must remain None.
+    use yserver_protocol::x11::sync;
+
+    const UNRESOLVED_DRAWABLE: ResourceId = ResourceId(0x0010_8fff);
+    let body = fence_body(UNRESOLVED_DRAWABLE, FENCE, false);
+    let mut no_policy = sync_access_fixture();
+    let no_policy_bytes = sync_access_request(&mut no_policy, sync::CREATE_FENCE, &body);
+    assert!(
+        no_policy_bytes.is_empty(),
+        "CreateFence remains a no-reply request"
+    );
+    assert!(no_policy.state.sync_fences.contains_key(&FENCE.0));
+
+    let mut fixture = sync_access_fixture();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+            Decision::Allow,
+            Arc::clone(&calls),
+        )));
+
+    let bytes = sync_access_request(&mut fixture, sync::CREATE_FENCE, &body);
+
+    assert_eq!(
+        bytes, no_policy_bytes,
+        "no-policy bytes changed with policy installed"
+    );
+    assert!(fixture.state.sync_fences.contains_key(&FENCE.0));
+    let calls = calls.lock().unwrap();
+    let resource_calls = calls
+        .iter()
+        .filter(|call| call.hook == ExtensionHook::Resource)
+        .collect::<Vec<_>>();
+    assert_eq!(resource_calls.len(), 1, "unresolved drawable is not asked");
+    assert_recorded_resource(
+        resource_calls[0],
+        fence_target(
+            FENCE,
+            Some(Creation {
+                parent: None,
+                owner: CLIENT,
+            }),
+        ),
+        AccessMode::CREATE,
+        sync::CREATE_FENCE,
+        None,
+        None,
+    );
+}
+
+#[test]
+fn sync_fence_resource_asks_match_the_site_table() {
+    // Mutation: resolve a pixmap drawable as Window; the ASK table must record Pixmap GET_ATTR.
+    use yserver_protocol::x11::sync;
+
+    let mut fixture = sync_access_fixture();
+    create_priority_window(&mut fixture.state);
+    create_priority_pixmap(&mut fixture.state);
+    fixture.state.sync_fences.insert(
+        SECOND_FENCE.0,
+        crate::server::SyncFence {
+            owner: CLIENT,
+            triggered: false,
+        },
+    );
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+            Decision::Allow,
+            Arc::clone(&calls),
+        )));
+
+    let create_bytes = sync_access_request(
+        &mut fixture,
+        sync::CREATE_FENCE,
+        &fence_body(PRIORITY_WINDOW, FENCE, false),
+    );
+    assert_no_error(&create_bytes, "allowed CreateFence");
+    let pixmap_create_bytes = sync_access_request(
+        &mut fixture,
+        sync::CREATE_FENCE,
+        &fence_body(PRIORITY_PIXMAP, THIRD_FENCE, false),
+    );
+    assert_no_error(
+        &pixmap_create_bytes,
+        "allowed CreateFence with pixmap drawable",
+    );
+    let trigger = sync_access_request(&mut fixture, sync::TRIGGER_FENCE, &resource_body(FENCE));
+    assert_no_error(&trigger, "allowed TriggerFence");
+    let reset = sync_access_request(&mut fixture, sync::RESET_FENCE, &resource_body(FENCE));
+    assert_no_error(&reset, "allowed ResetFence");
+    let query = sync_access_request(&mut fixture, sync::QUERY_FENCE, &resource_body(FENCE));
+    assert_eq!(query.first(), Some(&1), "allowed QueryFence reply");
+    let destroy = sync_access_request(&mut fixture, sync::DESTROY_FENCE, &resource_body(FENCE));
+    assert_no_error(&destroy, "allowed DestroyFence");
+    let await_fence = sync_access_request(
+        &mut fixture,
+        sync::AWAIT_FENCE,
+        &resource_body(SECOND_FENCE),
+    );
+    assert_no_error(&await_fence, "allowed AwaitFence");
+
+    let recorded = calls.lock().unwrap();
+    let resource_calls = recorded
+        .iter()
+        .filter(|call| call.hook == ExtensionHook::Resource)
+        .collect::<Vec<_>>();
+    assert_eq!(resource_calls.len(), 9, "SYNC fence ASK row count");
+    assert_recorded_resource(
+        resource_calls[0],
+        ResourceTarget {
+            id: PRIORITY_WINDOW,
+            kind: ResourceKind::Window,
+            creation: None,
+            owner: None,
+        },
+        AccessMode::GET_ATTR,
+        sync::CREATE_FENCE,
+        Some(CLIENT),
+        Some(CLIENT),
+    );
+    assert_recorded_resource(
+        resource_calls[1],
+        fence_target(
+            FENCE,
+            Some(Creation {
+                parent: Some(PRIORITY_WINDOW),
+                owner: CLIENT,
+            }),
+        ),
+        AccessMode::CREATE,
+        sync::CREATE_FENCE,
+        None,
+        None,
+    );
+    assert_recorded_resource(
+        resource_calls[2],
+        ResourceTarget {
+            id: PRIORITY_PIXMAP,
+            kind: ResourceKind::Pixmap,
+            creation: None,
+            owner: None,
+        },
+        AccessMode::GET_ATTR,
+        sync::CREATE_FENCE,
+        Some(CLIENT),
+        Some(CLIENT),
+    );
+    assert_recorded_resource(
+        resource_calls[3],
+        fence_target(
+            THIRD_FENCE,
+            Some(Creation {
+                parent: Some(PRIORITY_PIXMAP),
+                owner: CLIENT,
+            }),
+        ),
+        AccessMode::CREATE,
+        sync::CREATE_FENCE,
+        None,
+        None,
+    );
+    for (index, minor, mode, fence) in [
+        (4, sync::TRIGGER_FENCE, AccessMode::WRITE, FENCE),
+        (5, sync::RESET_FENCE, AccessMode::WRITE, FENCE),
+        (6, sync::QUERY_FENCE, AccessMode::READ, FENCE),
+        (7, sync::DESTROY_FENCE, AccessMode::DESTROY, FENCE),
+        (8, sync::AWAIT_FENCE, AccessMode::READ, SECOND_FENCE),
+    ] {
+        assert_recorded_resource(
+            resource_calls[index],
+            fence_target(fence, None),
+            mode,
+            minor,
+            Some(CLIENT),
+            Some(CLIENT),
+        );
+    }
 }
