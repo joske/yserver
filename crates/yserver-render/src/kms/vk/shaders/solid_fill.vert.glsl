@@ -20,8 +20,10 @@ void main() {
     // integer-aligned rectangles: the left edge stays left of x + 1/2 at
     // every row, so no pixel centre enters or leaves the rectangle. The
     // shape is no longer an axis-aligned rectangle, which keeps llvmpipe
-    // (lavapipe) off its linear rectangle fast path; that path wrote zero
-    // instead of the colour for a full 1x1 destination.
+    // (lavapipe) off its linear rasterizer path. That path reads a push
+    // constant at a nonzero offset wrongly and wrote the wrong colour for a
+    // full 1x1 destination (Mesa 26.2.5):
+    // https://gitlab.freedesktop.org/mesa/mesa/-/work_items/16828
     dst_pixel.x += quad.y * (1.0 - quad.x) * (1.0 / 16.0);
     vec2 ndc = dst_pixel / pc.viewport * 2.0 - 1.0;
     gl_Position = vec4(ndc, 0.0, 1.0);
