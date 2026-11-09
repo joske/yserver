@@ -166,6 +166,11 @@ references the core does not track, including a grab cursor, the root default,
 or an animated cursor's frames. Existing cursor release points sweep records
 whose host cursor is neither core-referenced nor reported alive by the backend.
 
+Server objects are still policy-visible targets: system SYNC counters and
+RANDR CRTCs and providers are asked with owner `SERVER_OWNER`, so a real
+client's request on one is checked. GLX context tags, screens, visuals and
+FBConfigs are not resources and are not checked.
+
 The context is built only when the list is not empty. Handlers often hold a
 mutable borrow of their client when they reach a check, as `handle_list_hosts`
 does, so the plan must show that each site can lend server state read-only; a
@@ -240,6 +245,9 @@ Xnamespace tells apart requests that share a mode:
 | A Damage object targeted by `DAMAGE Add` | the object is skipped; it does not accumulate the added region, and the request succeeds |
 | A matching cursor targeted by `ChangeCursorByName` | the cursor is skipped; its image stays unchanged, and the request succeeds |
 | An entry in `XIBarrierReleasePointer` | the policy's error is returned; earlier entries have already taken effect |
+| A `ChangeAlarm` counter | the policy's error; fields applied before the counter remain applied, as they do when the counter is missing |
+| A Present `Pixmap` / `PixmapSynced` notify window | the policy's error; nothing is presented |
+| The same-XID core pixmap `DestroyPbuffer` frees | the pixmap is skipped and stays; the request succeeds |
 
 A check authorizes either a whole request or one entry of a list, and the plan
 records which for each site. Rewriting is out of scope, but because sites own
