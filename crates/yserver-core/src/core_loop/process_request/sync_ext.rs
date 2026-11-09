@@ -1,13 +1,17 @@
 use crate::{
+    access::{AccessMode, Creation, RequestOpcodes, ResourceKind, ResourceTarget},
     backend::Backend,
-    core_loop::process_request::{RequestOutcome, emit_x11_error_with_minor, write_to_client},
+    core_loop::process_request::{
+        RequestOutcome, emit_x11_error_with_minor, validate_core_resource_if_present,
+        validate_resource_access, validate_resource_if_present, write_to_client,
+    },
     server::ServerState,
 };
 use log::debug;
 use std::io;
 use yserver_protocol::{
     x11,
-    x11::{ClientId, RequestHeader, SequenceNumber},
+    x11::{ClientId, RequestHeader, ResourceId, SequenceNumber},
 };
 
 /// A SYNC protocol error: `code` is either a core error or
@@ -124,6 +128,67 @@ pub(super) fn handle_sync_request(
         .get(&client_id.0)
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
+    let access_request = RequestOpcodes::for_request(header);
+    macro_rules! check_resource {
+        ($id:expr, $kind:expr, $mode:expr) => {
+            crate::core_loop::process_request::return_on_access_denial!(
+                validate_resource_if_present(
+                    state,
+                    client_id,
+                    ResourceId($id),
+                    $kind,
+                    $mode,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
+        };
+    }
+    macro_rules! check_core_resource {
+        ($id:expr, $mode:expr) => {
+            crate::core_loop::process_request::return_on_access_denial!(
+                validate_core_resource_if_present(
+                    state,
+                    client_id,
+                    ResourceId($id),
+                    $mode,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
+        };
+    }
+    macro_rules! check_creation {
+        ($id:expr, $kind:expr) => {
+            crate::core_loop::process_request::return_on_access_denial!(
+                validate_resource_access(
+                    state,
+                    client_id,
+                    ResourceTarget {
+                        owner: None,
+                        id: ResourceId($id),
+                        kind: $kind,
+                        creation: Some(Creation {
+                            parent: None,
+                            owner: client_id,
+                        }),
+                    },
+                    AccessMode::CREATE,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
+        };
+    }
     match minor {
         x11sync::INITIALIZE => {
             // Xorg `ProcSyncInitialize` always answers its own version
@@ -149,6 +214,7 @@ pub(super) fn handle_sync_request(
         }
         x11sync::CREATE_COUNTER => {
             if let Some((counter, value)) = x11sync::parse_counter_value(body) {
+                check_creation!(counter, ResourceKind::SyncCounter);
                 state.sync_counters.insert(
                     counter,
                     crate::server::SyncCounter {
@@ -164,6 +230,7 @@ pub(super) fn handle_sync_request(
                     Ok(old) => old,
                     Err(outcome) => return outcome,
                 };
+                check_resource!(counter, ResourceKind::SyncCounter, AccessMode::WRITE);
                 if let Some(c) = state.sync_counters.get_mut(&counter) {
                     c.value = value;
                 }
@@ -176,6 +243,7 @@ pub(super) fn handle_sync_request(
                     Ok(old) => old,
                     Err(outcome) => return outcome,
                 };
+                check_resource!(counter, ResourceKind::SyncCounter, AccessMode::WRITE);
                 // Xorg: an INT64 overflow is BadValue naming the high half
                 // of the delta (Xvfb: value 0x7fffffff for i64::MAX).
                 let Some(new) = old.checked_add(delta) else {
@@ -210,6 +278,7 @@ pub(super) fn handle_sync_request(
                     counter,
                 );
             };
+            check_resource!(counter, ResourceKind::SyncCounter, AccessMode::READ);
             let reply = x11sync::encode_query_counter_reply(byte_order, sequence, value);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
@@ -224,6 +293,7 @@ pub(super) fn handle_sync_request(
                     Ok(last) => last,
                     Err(outcome) => return outcome,
                 };
+                check_resource!(counter, ResourceKind::SyncCounter, AccessMode::DESTROY);
                 state.sync_counters.remove(&counter);
                 crate::core_loop::sync_await::counter_destroyed(state, counter, last);
             }
@@ -645,9 +715,18 @@ pub(super) fn handle_sync_request(
             crate::core_loop::sync_await::begin_await(state, &*backend, client_id, waits);
         }
         x11sync::SET_PRIORITY => {
-            // Stub.
+            if let Some(resource) = x11sync::parse_resource(body)
+                && resource != 0
+            {
+                check_core_resource!(resource, AccessMode::GET_ATTR);
+            }
         }
         x11sync::GET_PRIORITY => {
+            if let Some(resource) = x11sync::parse_resource(body)
+                && resource != 0
+            {
+                check_core_resource!(resource, AccessMode::GET_ATTR);
+            }
             let reply = x11sync::encode_get_priority_reply(byte_order, sequence, 0);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);

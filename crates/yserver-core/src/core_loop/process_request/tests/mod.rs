@@ -7,6 +7,7 @@ mod access_input;
 mod access_properties;
 mod access_render;
 mod access_resources;
+mod access_sync;
 mod composite;
 mod core_misc;
 mod damage_ext;
