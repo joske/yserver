@@ -127,10 +127,6 @@ fn seed_share_context(state: &mut ServerState) {
     seed_context(state, SHARE_CONTEXT);
 }
 
-fn seed_drawable_only(state: &mut ServerState) {
-    seed_glx_drawable(state, DRAWABLE, WINDOW);
-}
-
 fn seed_context_and_drawable(state: &mut ServerState) {
     seed_context(state, CONTEXT);
     seed_glx_drawable(state, DRAWABLE, WINDOW);
@@ -348,8 +344,9 @@ fn unsupported_vendor_body(code: u32) -> Vec<u8> {
     }
 }
 
-// Mutation: omit or reorder a context, share-list, GLX drawable, core-drawable,
-// or second-drawable check; the literal ordered targets, modes, owners, and opcodes fail.
+// Mutation: parse SwapBuffers' contextTag at body[0..4] as the drawable instead of its
+// drawable at body[4..8]; the resource-valued contextTag row must then miss the drawable check.
+// Omitting or reordering the other context, share-list, drawable, or fallback checks also fails.
 #[test]
 fn glx_access_ask_table_records_each_target_and_opcode() {
     let mut rows: Vec<AskRow> = Vec::new();
@@ -418,13 +415,13 @@ fn glx_access_ask_table_records_each_target_and_opcode() {
         ),
         (
             x11glx::SWAP_BUFFERS,
-            words(&[DRAWABLE.0]),
+            words(&[CONTEXT.0, DRAWABLE.0]),
             vec![existing(
                 DRAWABLE,
                 ResourceKind::GlxDrawable,
                 AccessMode::WRITE,
             )],
-            seed_drawable_only as fn(&mut ServerState),
+            seed_context_and_drawable as fn(&mut ServerState),
         ),
         (
             x11glx::QUERY_CONTEXT,
@@ -529,8 +526,12 @@ fn make_current_unresolved_ids_are_not_asked() {
             words(&[WINDOW.0]),
             seed_window_only,
         ),
-        (x11glx::SWAP_BUFFERS, words(&[MISSING.0]), seed_nothing),
-        (x11glx::SWAP_BUFFERS, words(&[CONTEXT.0]), seed_context_only),
+        (x11glx::SWAP_BUFFERS, words(&[0, MISSING.0]), seed_nothing),
+        (
+            x11glx::SWAP_BUFFERS,
+            words(&[0, CONTEXT.0]),
+            seed_context_only,
+        ),
         (
             x11glx::MAKE_CURRENT,
             current_body(x11glx::MAKE_CURRENT, MISSING, ResourceId(0), WINDOW),
@@ -583,6 +584,24 @@ fn make_current_unresolved_ids_are_not_asked() {
     }
 }
 
+// Mutation: parse a one-word SwapBuffers contextTag as the drawable; without the second wire
+// word, even a contextTag matching a core Window must not trigger a resource check.
+#[test]
+fn swap_buffers_short_body_keeps_no_op_without_access_check() {
+    let mut no_policy = fixture();
+    seed_window(&mut no_policy.state, WINDOW);
+    let no_policy_bytes = dispatch(&mut no_policy, x11glx::SWAP_BUFFERS, &words(&[WINDOW.0]));
+
+    let mut fixture = fixture();
+    seed_window(&mut fixture.state, WINDOW);
+    let calls = allow_policy(&mut fixture);
+    let bytes = dispatch(&mut fixture, x11glx::SWAP_BUFFERS, &words(&[WINDOW.0]));
+
+    assert_eq!(bytes, no_policy_bytes);
+    assert!(bytes.is_empty());
+    assert_recorded(&calls.lock().unwrap(), &[], x11glx::SWAP_BUFFERS);
+}
+
 // Mutation: run the create check before the share READ, or keep the new record after share denial.
 #[test]
 fn create_context_denied_share_creates_nothing() {
@@ -608,8 +627,9 @@ fn create_context_denied_share_creates_nothing() {
     assert!(fixture.backend.calls().is_empty());
 }
 
-// Mutation: ignore a creation denial, remove a destroyed context, advance the current tag,
-// answer a query, or use the wrong mode/target in one of the GLX context sites.
+// Mutation: parse SwapBuffers' contextTag at body[0..4] as its drawable; the drawable denial
+// row then fails the policy-error and exact-target assertions. Removing any other GLX denial
+// check also fails its row below.
 #[test]
 fn glx_access_deny_table_returns_error_and_preserves_state() {
     struct DenyRow {
@@ -737,7 +757,7 @@ fn glx_access_deny_table_returns_error_and_preserves_state() {
         },
         DenyRow {
             minor: x11glx::SWAP_BUFFERS,
-            body: words(&[DRAWABLE.0]),
+            body: words(&[CONTEXT.0, DRAWABLE.0]),
             target: DRAWABLE,
             mode: AccessMode::WRITE,
             expected: vec![existing(
@@ -745,7 +765,10 @@ fn glx_access_deny_table_returns_error_and_preserves_state() {
                 ResourceKind::GlxDrawable,
                 AccessMode::WRITE,
             )],
-            seed: |state| seed_glx_drawable(state, DRAWABLE, WINDOW),
+            seed: |state| {
+                seed_context(state, CONTEXT);
+                seed_glx_drawable(state, DRAWABLE, WINDOW);
+            },
             absent_after: None,
         },
         DenyRow {
@@ -790,7 +813,7 @@ fn glx_access_deny_table_returns_error_and_preserves_state() {
         },
         DenyRow {
             minor: x11glx::SWAP_BUFFERS,
-            body: words(&[WINDOW.0]),
+            body: words(&[CONTEXT.0, WINDOW.0]),
             target: WINDOW,
             mode: AccessMode::GET_ATTR,
             expected: vec![existing(WINDOW, ResourceKind::Window, AccessMode::GET_ATTR)],

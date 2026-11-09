@@ -1029,8 +1029,8 @@ pub(super) fn handle_glx_request(
             // clients hitting this path can't be served (no server-side
             // GL), but a no-op (rather than an error) keeps silly
             // clients limping along.
-            let xid = if body.len() >= 4 {
-                ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]))
+            let xid = if body.len() >= 8 {
+                ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]))
             } else {
                 ResourceId(0)
             };
