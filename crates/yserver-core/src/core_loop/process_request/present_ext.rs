@@ -1811,7 +1811,7 @@ pub(super) fn handle_present_request(
                         id: ResourceId(req.eid),
                         kind: ResourceKind::PresentEventSelection,
                         creation: Some(Creation {
-                            parent: Some(window),
+                            parent: state.resources.window(window).map(|_| window),
                             owner: client_id,
                         }),
                         owner: None,

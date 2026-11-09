@@ -1534,11 +1534,21 @@ fn present_unvalidated_wrong_kind_targets_keep_their_existing_behavior() {
         "unresolved QueryCapabilities target was checked"
     );
 
+    // Mutation: restore SelectInput's unconditional Some(window) creation parent; the wrong-kind and unresolved parent rows must fail.
     let select_body = select_input_body(NEW_EVENT_ID, PIXMAP, 1);
-    let select_without_policy = {
-        let mut fixture = present_access_fixture();
-        dispatch_present(&mut fixture, present::SELECT_INPUT, &select_body)
-    };
+    let mut select_no_policy = present_access_fixture();
+    let select_without_policy =
+        dispatch_present(&mut select_no_policy, present::SELECT_INPUT, &select_body);
+    assert!(
+        select_without_policy.is_empty(),
+        "wrong-kind window was rejected without policy"
+    );
+    assert!(
+        select_no_policy
+            .state
+            .present_event_selections
+            .contains_key(&NEW_EVENT_ID.0)
+    );
     let mut select_with_policy = present_access_fixture();
     let select_calls = Arc::new(Mutex::new(Vec::new()));
     select_with_policy
@@ -1557,7 +1567,56 @@ fn present_unvalidated_wrong_kind_targets_keep_their_existing_behavior() {
                 NEW_EVENT_ID,
                 ResourceKind::PresentEventSelection,
                 Some(Creation {
-                    parent: Some(PIXMAP),
+                    parent: None,
+                    owner: CLIENT,
+                }),
+            ),
+            AccessMode::CREATE,
+            None,
+            None,
+        )],
+        present::SELECT_INPUT,
+    );
+
+    let unresolved_select_body = select_input_body(NEW_EVENT_ID, MISSING_REGION, 1);
+    let mut unresolved_select_no_policy = present_access_fixture();
+    let unresolved_select_without_policy = dispatch_present(
+        &mut unresolved_select_no_policy,
+        present::SELECT_INPUT,
+        &unresolved_select_body,
+    );
+    assert!(
+        unresolved_select_without_policy.is_empty(),
+        "unresolved window was rejected without policy"
+    );
+    assert!(
+        unresolved_select_no_policy
+            .state
+            .present_event_selections
+            .contains_key(&NEW_EVENT_ID.0)
+    );
+    let mut unresolved_select_with_policy = present_access_fixture();
+    let unresolved_select_calls = Arc::new(Mutex::new(Vec::new()));
+    unresolved_select_with_policy
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+            Decision::Allow,
+            Arc::clone(&unresolved_select_calls),
+        )));
+    let unresolved_select_bytes = dispatch_present(
+        &mut unresolved_select_with_policy,
+        present::SELECT_INPUT,
+        &unresolved_select_body,
+    );
+    assert_eq!(unresolved_select_bytes, unresolved_select_without_policy);
+    assert_resource_calls(
+        &resource_calls(&unresolved_select_calls.lock().unwrap()),
+        &[(
+            resource_target(
+                NEW_EVENT_ID,
+                ResourceKind::PresentEventSelection,
+                Some(Creation {
+                    parent: None,
                     owner: CLIENT,
                 }),
             ),
