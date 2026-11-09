@@ -36,7 +36,7 @@
 
 **Files:**
 - Create: `crates/yserver-render/src/kms/vk/shaders/solid_fill.vert.glsl`; the pipeline cache (a new `vk/solid_fill_pipeline.rs`, or a variant inside `vk/logic_fill_pipeline.rs` if that reuses more; justify the choice).
-- Modify: `render/frame_builder.rs` (`RecordedFillRect` ~912: pin + instance count instead of `rects`), `render/engine/fill_copy.rs` (`fill_rect_batch` ~104–152: upload with `upload_to_frame`, `UPLOAD_VERTEX_ALIGN`), `render/engine.rs` (cache field next to `logic_fill_caches` ~741), `render/engine/emit.rs` (`emit_fill_draws` ~1114 and its callers ~1056/1088, `emit_session_open_and_draws` ~1354/1379, `emit_session_continue_draws` ~1458/1469: pass the replay `FramePinSet`), `render/engine/frame.rs` (~365 trace; replay call sites ~729), plus any test that constructs `RecordedFillRect` directly (e.g. `frame_builder.rs` ~1562, ~1728).
+- Modify: `render/frame_builder.rs` (`RecordedFillRect` ~912: pin + instance count instead of `rects`), `render/engine/fill_copy.rs` (`fill_rect_batch` ~104–152: upload with `upload_to_frame`, `UPLOAD_VERTEX_ALIGN`), `render/engine.rs` (cache field next to `logic_fill_caches` ~741) and its initializer in `render/engine/lifecycle.rs` (~174–195), following the existing cache's ownership/Drop pattern; `vk/mod.rs` (~20) if a new pipeline module is added; lazy-cache pattern at `engine/fill_copy.rs` ~174, instance-input pattern at `vk/text_pipeline.rs` ~380–418; `render/engine/emit.rs` (`emit_fill_draws` ~1114 and its callers ~1056/1088, `emit_session_open_and_draws` ~1354/1379, `emit_session_continue_draws` ~1458/1469: pass the replay `FramePinSet`), `render/engine/frame.rs` (~365 trace; replay call sites ~729), plus any test that constructs `RecordedFillRect` directly (e.g. `frame_builder.rs` ~1562, ~1728).
 - Test: new `crates/yserver-render/src/kms/render/engine/tests/instanced_fill.rs`, registered in `engine/tests/mod.rs`.
 
 **Interfaces:**
@@ -45,9 +45,9 @@
 - [ ] **Step 1: Failing tests** (spec *Testing*, names fixed here):
   - `instanced_fill_one_draw_per_fill`: N = 1 and N = 1000 post-clamp non-empty rects → 0 clears, 1 draw, instance count N. Mutations: one draw per rect; clear kept; instance count 1.
   - `instanced_fill_pixels_exact`: odd-sized destination; one-pixel rects and spans, adjacent, overlapping, edge-clipped; sentinels outside. Depth-32 colour with alpha ∉ {0, 255} over a different known colour, all four BGRA bytes compared; R8 with red ∉ {0, 255} and ≠ alpha. Mutations: quad size − 1; premultiplied source-over blending.
-  - `instanced_fill_in_session`: fold-clean textured composite or logic-fill predecessor leaving a narrow scissor, then two fills with different colours and instance slices; both take `Continue`; pixels outside the predecessor's scissor correct. Mutations (each alone): skip pipeline bind; skip scissor; bind the vertex buffer at offset 0; skip the colour push.
+  - `instanced_fill_in_session`: fold-clean textured composite or logic-fill predecessor leaving a narrow scissor, then two fills with different colours and instance slices; both take `Continue` (observed at replay, `engine/frame.rs` ~714–737, through test-only engine state); pixels outside the predecessor's scissor correct. A and B are small uploads in the same arena block: assert the same buffer handle and B's nonzero offset, and give A and B distinguishable coverage that survives to readback. Mutations (each alone): skip pipeline bind; skip scissor; bind the vertex buffer at offset 0; skip the colour push.
   - `instanced_fill_large`: 200 000 varied rects (dedicated arena block) → 1 draw, instance count 200 000, early and late instances read back. Mutation: instance count 1.
-- [ ] **Step 2:** Run them on lavapipe (`--ignored`, software-device opt-in, ICD pinned) and record each result. The draw-count rows fail on the observer (clears present); pixel rows may already pass and must not be weakened.
+- [ ] **Step 2:** Run them on lavapipe (`--ignored`, software-device opt-in, ICD pinned, `--nocapture` so early-return diagnostics are visible; the new fixtures fail, not return, without a device) and record each result. The draw-count rows fail on the observer (clears present); pixel rows may already pass and must not be weakened.
 - [ ] **Step 3:** Implement per the spec *Design*.
 - [ ] **Step 4:** All `yserver-render` engine tests, the existing fill/span/core-text pixel tests and `render_acceptance` pass unchanged; run every named mutation and record its failing assertion.
 - [ ] **Step 5:** Task 1 gate (Verification). Commit.
@@ -65,7 +65,7 @@ x11perf `-rect1 -rect10 -rect100 -ftext -fitext` (`-repeat 2 -time 3`) on master
 
 ## Verification
 
-All `cargo test` runs source `/home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh` and report executed vs skipped tests.
+All `cargo test` runs source `/home/ariel_santangelo/Projects/claude-scratch/atomic-cursor-split/sdd-p1/lvp-env.sh`, use `--nocapture` (or `--show-output`) for the runs that feed the report, and report executed vs early-skipped tests (existing hardware-dependent skips stay visible, not fixed here).
 
 - **Task 1 gate:** `cargo +nightly fmt --all`; `cargo build --bin yserver`; `cargo test --workspace --locked --features xdmcp`; the whole ignored suite `--workspace --locked --features xdmcp -- --ignored` (includes `render_acceptance`); the `yserver-render` engine tests and the new module with `--include-ignored` 5× under 16 busy loops, reaping every loop; `cargo clippy --all-targets -- -D warnings` and `--workspace --all-targets --locked --features xdmcp -- -D warnings`; FreeBSD clippy (`source ~/Projects/claude-scratch/freebsd-sysroot/env.sh`, `--target x86_64-unknown-freebsd --all-targets`); `tools/check-layout.sh`.
 - **Task 2 gate:** `git diff --check`.
