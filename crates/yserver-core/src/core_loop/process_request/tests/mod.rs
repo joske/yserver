@@ -4,6 +4,7 @@ mod access_cursors;
 mod access_gc_font;
 mod access_grabs;
 mod access_input;
+mod access_present;
 mod access_properties;
 mod access_render;
 mod access_resources;
