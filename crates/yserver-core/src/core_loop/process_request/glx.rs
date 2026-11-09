@@ -1,4 +1,5 @@
 use crate::{
+    access::{AccessMode, Creation, RequestOpcodes, ResourceKind, ResourceTarget},
     backend::{Backend, OriginContext},
     core_loop::process_request::{
         RequestOutcome, emit_x11_error_with_minor, redirect::retarget_glx_pixmap_export,
@@ -299,11 +300,69 @@ pub(super) fn handle_glx_request(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     use yserver_protocol::x11::{ClientByteOrder, glx as x11glx};
+    let access_request = RequestOpcodes::for_request(header);
     let byte_order = state
         .clients
         .get(&client_id.0)
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
+    macro_rules! check_resource {
+        ($id:expr, $kind:expr, $mode:expr) => {
+            crate::core_loop::process_request::return_on_access_denial!(
+                super::validate_resource_if_present(
+                    state,
+                    client_id,
+                    $id,
+                    $kind,
+                    $mode,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
+        };
+    }
+    macro_rules! check_creation {
+        ($id:expr) => {
+            crate::core_loop::process_request::return_on_access_denial!(
+                super::validate_resource_access(
+                    state,
+                    client_id,
+                    ResourceTarget {
+                        id: $id,
+                        kind: ResourceKind::GlxContext,
+                        creation: Some(Creation {
+                            parent: None,
+                            owner: client_id,
+                        }),
+                        owner: None,
+                    },
+                    AccessMode::CREATE,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
+        };
+    }
+    macro_rules! check_current_drawable {
+        ($id:expr) => {{
+            let id: ResourceId = $id;
+            if id.0 != 0 {
+                if state.glx_drawables.contains_key(&id.0) {
+                    check_resource!(id, ResourceKind::GlxDrawable, AccessMode::WRITE);
+                } else if state.resources.window(id).is_some() {
+                    check_resource!(id, ResourceKind::Window, AccessMode::GET_ATTR);
+                } else if state.resources.pixmap(id).is_some() {
+                    check_resource!(id, ResourceKind::Pixmap, AccessMode::GET_ATTR);
+                }
+            }
+        }};
+    }
     match minor {
         x11glx::QUERY_VERSION => {
             let (cmaj, cmin) = x11glx::parse_query_version(body).unwrap_or((0, 0));
@@ -396,6 +455,11 @@ pub(super) fn handle_glx_request(
                     );
                 }
             };
+            check_resource!(
+                ResourceId(context),
+                ResourceKind::GlxContext,
+                AccessMode::READ
+            );
             let is_direct = state.glx_contexts[&context].is_direct;
             let reply = x11glx::encode_is_direct_reply(byte_order, sequence, is_direct);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -469,6 +533,14 @@ pub(super) fn handle_glx_request(
                     (glx_fbconfig_visual(fbconfig), fbconfig)
                 }
             };
+            if req.share_list != 0 {
+                check_resource!(
+                    ResourceId(req.share_list),
+                    ResourceKind::GlxContext,
+                    AccessMode::READ
+                );
+            }
+            check_creation!(ResourceId(req.context));
             state.glx_contexts.insert(
                 req.context,
                 crate::server::GlxContext {
@@ -493,6 +565,11 @@ pub(super) fn handle_glx_request(
             } else {
                 0
             };
+            check_resource!(
+                ResourceId(xid),
+                ResourceKind::GlxContext,
+                AccessMode::DESTROY
+            );
             state.glx_contexts.remove(&xid);
             debug!(
                 "client {} #{} GLX::DestroyContext xid=0x{:x}",
@@ -519,6 +596,33 @@ pub(super) fn handle_glx_request(
             }
             .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .unwrap_or(0);
+            let draw = if minor == x11glx::MAKE_CURRENT {
+                body.get(0..4)
+            } else {
+                body.get(4..8)
+            }
+            .map(|bytes| ResourceId(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])))
+            .unwrap_or(ResourceId(0));
+            let read = if minor == x11glx::MAKE_CONTEXT_CURRENT {
+                body.get(8..12)
+                    .map(|bytes| {
+                        ResourceId(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                    })
+                    .unwrap_or(ResourceId(0))
+            } else {
+                ResourceId(0)
+            };
+            if context != 0 {
+                check_resource!(
+                    ResourceId(context),
+                    ResourceKind::GlxContext,
+                    AccessMode::USE
+                );
+            }
+            check_current_drawable!(draw);
+            if minor == x11glx::MAKE_CONTEXT_CURRENT {
+                check_current_drawable!(read);
+            }
             // The release form (context == None) returns contextTag = 0 —
             // tag 0 is reserved by the protocol to mean "no context
             // current" (server.rs documents this; Xorg vndcmds.c:232-234,
@@ -925,6 +1029,12 @@ pub(super) fn handle_glx_request(
             // clients hitting this path can't be served (no server-side
             // GL), but a no-op (rather than an error) keeps silly
             // clients limping along.
+            let xid = if body.len() >= 4 {
+                ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]))
+            } else {
+                ResourceId(0)
+            };
+            check_current_drawable!(xid);
             debug!(
                 "client {} #{} GLX::SwapBuffers (no-op)",
                 client_id.0, sequence.0
@@ -951,6 +1061,11 @@ pub(super) fn handle_glx_request(
                     );
                 }
             };
+            check_resource!(
+                ResourceId(context),
+                ResourceKind::GlxContext,
+                AccessMode::READ
+            );
             let ctx = &state.glx_contexts[&context];
             let attribs = [
                 (x11glx::GLX_SHARE_CONTEXT_EXT, ctx.share_list),
@@ -1129,6 +1244,14 @@ pub(super) fn handle_glx_request(
                     //   [28]    isDirect
                     //   [29..32] reserved
                     if let Some(req) = x11glx::parse_create_context_with_config_sgix(body) {
+                        if req.share_list != 0 {
+                            check_resource!(
+                                ResourceId(req.share_list),
+                                ResourceKind::GlxContext,
+                                AccessMode::READ
+                            );
+                        }
+                        check_creation!(ResourceId(req.context));
                         state.glx_contexts.insert(
                             req.context,
                             crate::server::GlxContext {

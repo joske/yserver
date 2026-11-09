@@ -3,6 +3,7 @@ mod access_composite_damage;
 mod access_cursors;
 mod access_dri3;
 mod access_gc_font;
+mod access_glx;
 mod access_grabs;
 mod access_input;
 mod access_present;
