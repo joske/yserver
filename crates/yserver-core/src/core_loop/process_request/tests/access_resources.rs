@@ -956,6 +956,16 @@ pub(super) fn assert_policy_error(bytes: &[u8], opcode: u8, sequence: u16) {
     assert_x11_error(bytes, x11::error::BAD_ACCESS, 0x55, opcode, sequence);
 }
 
+fn assert_sync_error(bytes: &[u8], code: u8, value: u32, minor: u8, sequence: u16) {
+    let mut expected = vec![0, code];
+    expected.extend_from_slice(&sequence.to_le_bytes());
+    expected.extend_from_slice(&value.to_le_bytes());
+    expected.extend_from_slice(&u16::from(minor).to_le_bytes());
+    expected.push(142);
+    expected.extend_from_slice(&[0; 21]);
+    assert_eq!(bytes, expected, "SYNC request {minor} error packet");
+}
+
 #[test]
 fn get_image_checks_read_before_bounds_validation() {
     // Mutation: move GetImage's READ check after rectangle/viewability validation; the denial must
@@ -1037,6 +1047,30 @@ pub(super) fn expected_resource_checks(
             )
         })
         .collect()
+}
+
+fn expected_sync_resource_checks(
+    calls: &[RecordedExtensionCheck],
+) -> Vec<RecordedResourceExpectation> {
+    let resources = calls
+        .iter()
+        .filter(|call| call.hook == ExtensionHook::Resource)
+        .cloned()
+        .collect::<Vec<_>>();
+    expected_resource_checks(&resources)
+}
+
+fn expected_sync_resource_checks_after(
+    calls: &[RecordedExtensionCheck],
+    start: usize,
+) -> Vec<RecordedResourceExpectation> {
+    let resources = calls
+        .iter()
+        .filter(|call| call.hook == ExtensionHook::Resource)
+        .skip(start)
+        .cloned()
+        .collect::<Vec<_>>();
+    expected_resource_checks(&resources)
 }
 
 fn core_check(
@@ -3084,6 +3118,688 @@ fn window_tree_resource_request_denials_match_modes_and_stop_before_effects() {
             case.label
         );
     }
+}
+
+#[test]
+fn await_denied_second_counter_installs_nothing() {
+    // Mutation: install an Await after each entry; denial of the second counter must leave no await.
+    use yserver_protocol::x11::sync;
+    const FIRST: ResourceId = ResourceId(0x0056_0001);
+    const SECOND: ResourceId = ResourceId(0x0056_0002);
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, CLIENT.0);
+    let mut backend = RecordingBackend::new();
+    for counter in [FIRST, SECOND] {
+        let bytes = resource_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            142,
+            sync::CREATE_COUNTER,
+            &words(&[counter.0, 0, 0]),
+        );
+        assert_no_error(&bytes, "Await counter fixture");
+    }
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+        Arc::clone(&calls),
+        SECOND,
+        Some(AccessMode::READ),
+        DenyError {
+            code: x11::error::BAD_VALUE,
+            value: 0x55,
+        },
+    )));
+    let await_body = words(&[
+        FIRST.0,
+        sync::VALUE_TYPE_ABSOLUTE,
+        0,
+        100,
+        sync::TEST_POSITIVE_COMPARISON,
+        0,
+        0,
+        SECOND.0,
+        sync::VALUE_TYPE_ABSOLUTE,
+        0,
+        100,
+        sync::TEST_POSITIVE_COMPARISON,
+        0,
+        0,
+    ]);
+    let backend_before = backend.calls();
+    let bytes = resource_request(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        2,
+        142,
+        sync::AWAIT,
+        &await_body,
+    );
+
+    assert_sync_error(&bytes, x11::error::BAD_VALUE, 0x55, sync::AWAIT, 2);
+    assert!(
+        state.sync_awaits.is_empty(),
+        "denied Await installed nothing"
+    );
+    assert_eq!(backend.calls(), backend_before);
+    assert_eq!(
+        expected_sync_resource_checks(&calls.lock().unwrap()),
+        [
+            (
+                CLIENT,
+                FIRST,
+                ResourceKind::SyncCounter,
+                AccessMode::READ,
+                Some(RequestOpcodes {
+                    major: 142,
+                    minor: sync::AWAIT
+                })
+            ),
+            (
+                CLIENT,
+                SECOND,
+                ResourceKind::SyncCounter,
+                AccessMode::READ,
+                Some(RequestOpcodes {
+                    major: 142,
+                    minor: sync::AWAIT
+                })
+            ),
+        ]
+    );
+}
+
+#[test]
+fn create_alarm_denied_creation_creates_nothing() {
+    // Mutation: move or omit CreateAlarm's CREATE check after insertion; the denied alarm must remain absent.
+    use yserver_protocol::x11::sync;
+    const ALARM: ResourceId = ResourceId(0x0056_0010);
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, CLIENT.0);
+    let mut backend = RecordingBackend::new();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+        Arc::clone(&calls),
+        ALARM,
+        Some(AccessMode::CREATE),
+        DenyError {
+            code: x11::error::BAD_VALUE,
+            value: 0x55,
+        },
+    )));
+    let backend_before = backend.calls();
+    let bytes = resource_request(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        1,
+        142,
+        sync::CREATE_ALARM,
+        &words(&[ALARM.0, 0]),
+    );
+
+    assert_sync_error(&bytes, x11::error::BAD_VALUE, 0x55, sync::CREATE_ALARM, 1);
+    assert!(!state.sync_alarms.contains_key(&ALARM.0));
+    assert_eq!(backend.calls(), backend_before);
+    let recorded = calls.lock().unwrap();
+    assert_eq!(
+        expected_sync_resource_checks(&recorded),
+        [(
+            CLIENT,
+            ALARM,
+            ResourceKind::SyncAlarm,
+            AccessMode::CREATE,
+            Some(RequestOpcodes {
+                major: 142,
+                minor: sync::CREATE_ALARM
+            })
+        )]
+    );
+    let creation_check = recorded
+        .iter()
+        .find(|call| call.hook == ExtensionHook::Resource)
+        .expect("CreateAlarm resource check");
+    let target = creation_check.target.expect("CreateAlarm target");
+    assert_eq!(
+        target.creation,
+        Some(Creation {
+            parent: None,
+            owner: CLIENT,
+        })
+    );
+    assert_eq!(creation_check.target_owner, None);
+}
+
+#[test]
+fn change_alarm_denied_counter_keeps_todays_partial_effects() {
+    // Mutation: check the counter before earlier fields are applied; the state must match BadCounter's partial effect.
+    use yserver_protocol::x11::sync;
+    const COUNTER: ResourceId = ResourceId(0x0056_0020);
+    const BASELINE_ALARM: ResourceId = ResourceId(0x0056_0021);
+    const DENIED_ALARM: ResourceId = ResourceId(0x0056_0022);
+    const OTHER_CLIENT: ClientId = ClientId(2);
+    let mut state = ServerState::new();
+    let mut owner_peer = install_client(&mut state, CLIENT.0);
+    let mut requester_peer = install_client(&mut state, OTHER_CLIENT.0);
+    let mut backend = RecordingBackend::new();
+    for (sequence, opcode, body) in [
+        (1, sync::CREATE_COUNTER, words(&[COUNTER.0, 0, 0])),
+        (2, sync::CREATE_ALARM, words(&[BASELINE_ALARM.0, 0])),
+        (3, sync::CREATE_ALARM, words(&[DENIED_ALARM.0, 0])),
+    ] {
+        let bytes = resource_request(
+            &mut state,
+            &mut backend,
+            &mut owner_peer,
+            sequence,
+            142,
+            opcode,
+            &body,
+        );
+        assert_no_error(&bytes, "ChangeAlarm partial-effect fixture");
+    }
+
+    let change_body = |alarm: ResourceId, counter: ResourceId| {
+        words(&[alarm.0, sync::CA_COUNTER | sync::CA_EVENTS, counter.0, 1])
+    };
+    let baseline_counter = ResourceId(0x0056_00ff);
+    let baseline = change_body(BASELINE_ALARM, baseline_counter);
+    process_request(
+        &mut state,
+        &mut backend,
+        OTHER_CLIENT,
+        SequenceNumber(4),
+        RequestHeader {
+            opcode: 142,
+            data: sync::CHANGE_ALARM,
+            length_units: 1 + u32::try_from(baseline.len().div_ceil(4)).unwrap(),
+        },
+        &baseline,
+        None,
+    )
+    .unwrap();
+    let baseline_error = read_all_available(&mut requester_peer);
+    assert_sync_error(
+        &baseline_error,
+        crate::nested::SYNC_FIRST_ERROR + sync::BAD_COUNTER,
+        baseline_counter.0,
+        sync::CHANGE_ALARM,
+        4,
+    );
+    let baseline_state = state.sync_alarms[&BASELINE_ALARM.0].clone();
+    assert!(baseline_state.event_clients.contains(&OTHER_CLIENT));
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+        Arc::clone(&calls),
+        COUNTER,
+        Some(AccessMode::READ),
+        DenyError {
+            code: x11::error::BAD_VALUE,
+            value: 0x55,
+        },
+    )));
+    let backend_before = backend.calls();
+    let denied_body = change_body(DENIED_ALARM, COUNTER);
+    process_request(
+        &mut state,
+        &mut backend,
+        OTHER_CLIENT,
+        SequenceNumber(5),
+        RequestHeader {
+            opcode: 142,
+            data: sync::CHANGE_ALARM,
+            length_units: 1 + u32::try_from(denied_body.len().div_ceil(4)).unwrap(),
+        },
+        &denied_body,
+        None,
+    )
+    .unwrap();
+    let denied = read_all_available(&mut requester_peer);
+
+    assert_sync_error(&denied, x11::error::BAD_VALUE, 0x55, sync::CHANGE_ALARM, 5);
+    assert_eq!(state.sync_alarms[&DENIED_ALARM.0], baseline_state);
+    assert_eq!(backend.calls(), backend_before);
+    assert_eq!(
+        expected_sync_resource_checks(&calls.lock().unwrap()),
+        [
+            (
+                OTHER_CLIENT,
+                DENIED_ALARM,
+                ResourceKind::SyncAlarm,
+                AccessMode::WRITE,
+                Some(RequestOpcodes {
+                    major: 142,
+                    minor: sync::CHANGE_ALARM
+                })
+            ),
+            (
+                OTHER_CLIENT,
+                COUNTER,
+                ResourceKind::SyncCounter,
+                AccessMode::READ,
+                Some(RequestOpcodes {
+                    major: 142,
+                    minor: sync::CHANGE_ALARM
+                })
+            ),
+        ]
+    );
+}
+
+#[test]
+fn sync_alarm_resource_denials_match_modes_and_stop_before_effects() {
+    // Mutation: remove or change the mode of any alarm/counter check; that row must stop returning the policy error.
+    use yserver_protocol::x11::sync;
+    const COUNTER: ResourceId = ResourceId(0x0056_0030);
+    const ALARM: ResourceId = ResourceId(0x0056_0031);
+    const CREATE_COUNTER_ALARM: ResourceId = ResourceId(0x0056_0032);
+    const CREATE_COUNTER_MISSING: ResourceId = ResourceId(0x0056_00ff);
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, CLIENT.0);
+    let mut backend = RecordingBackend::new();
+    for (sequence, opcode, body) in [
+        (1, sync::CREATE_COUNTER, words(&[COUNTER.0, 0, 5])),
+        (2, sync::CREATE_ALARM, words(&[ALARM.0, 0])),
+    ] {
+        let bytes = resource_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            sequence,
+            142,
+            opcode,
+            &body,
+        );
+        assert_no_error(&bytes, "SYNC alarm denial fixture");
+    }
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let denied_id = Arc::new(AtomicU32::new(0));
+    let denied_id_for_policy = Arc::clone(&denied_id);
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::custom(
+        Arc::clone(&calls),
+        "SYNC",
+        move |_, call| {
+            if call.hook == ExtensionHook::Resource
+                && call.target.is_some_and(|target| {
+                    target.id.0 == denied_id_for_policy.load(Ordering::SeqCst)
+                })
+            {
+                Decision::Deny(DenyError {
+                    code: x11::error::BAD_VALUE,
+                    value: 0x55,
+                })
+            } else {
+                Decision::Allow
+            }
+        },
+    )));
+    let backend_before = backend.calls();
+
+    denied_id.store(CREATE_COUNTER_MISSING.0, Ordering::SeqCst);
+    let calls_before = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|call| call.hook == ExtensionHook::Resource)
+        .count();
+    let missing_counter_alarm = resource_request(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        10,
+        142,
+        sync::CREATE_ALARM,
+        &words(&[
+            CREATE_COUNTER_ALARM.0,
+            sync::CA_COUNTER,
+            CREATE_COUNTER_MISSING.0,
+        ]),
+    );
+    assert_sync_error(
+        &missing_counter_alarm,
+        crate::nested::SYNC_FIRST_ERROR + sync::BAD_COUNTER,
+        CREATE_COUNTER_MISSING.0,
+        sync::CREATE_ALARM,
+        10,
+    );
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.hook == ExtensionHook::Resource)
+            .count(),
+        calls_before,
+        "BadCounter precedes the counter check"
+    );
+    assert!(!state.sync_alarms.contains_key(&CREATE_COUNTER_ALARM.0));
+
+    denied_id.store(COUNTER.0, Ordering::SeqCst);
+    let denied_counter_alarm = resource_request(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        11,
+        142,
+        sync::CREATE_ALARM,
+        &words(&[CREATE_COUNTER_ALARM.0, sync::CA_COUNTER, COUNTER.0]),
+    );
+    assert_sync_error(
+        &denied_counter_alarm,
+        x11::error::BAD_VALUE,
+        0x55,
+        sync::CREATE_ALARM,
+        11,
+    );
+    assert!(!state.sync_alarms.contains_key(&CREATE_COUNTER_ALARM.0));
+    assert_eq!(
+        expected_sync_resource_checks_after(&calls.lock().unwrap(), calls_before),
+        [(
+            CLIENT,
+            COUNTER,
+            ResourceKind::SyncCounter,
+            AccessMode::READ,
+            Some(RequestOpcodes {
+                major: 142,
+                minor: sync::CREATE_ALARM
+            })
+        )]
+    );
+
+    denied_id.store(ALARM.0, Ordering::SeqCst);
+    let before_alarm = state.sync_alarms[&ALARM.0].clone();
+    let denied_change = resource_request(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        12,
+        142,
+        sync::CHANGE_ALARM,
+        &words(&[ALARM.0, sync::CA_EVENTS, 0]),
+    );
+    assert_sync_error(
+        &denied_change,
+        x11::error::BAD_VALUE,
+        0x55,
+        sync::CHANGE_ALARM,
+        12,
+    );
+    assert_eq!(state.sync_alarms[&ALARM.0], before_alarm);
+    assert_eq!(
+        expected_sync_resource_checks_after(&calls.lock().unwrap(), calls_before + 1),
+        [(
+            CLIENT,
+            ALARM,
+            ResourceKind::SyncAlarm,
+            AccessMode::WRITE,
+            Some(RequestOpcodes {
+                major: 142,
+                minor: sync::CHANGE_ALARM
+            })
+        )]
+    );
+
+    let denied_query = resource_request(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        13,
+        142,
+        sync::QUERY_ALARM,
+        &ALARM.0.to_le_bytes(),
+    );
+    assert_sync_error(
+        &denied_query,
+        x11::error::BAD_VALUE,
+        0x55,
+        sync::QUERY_ALARM,
+        13,
+    );
+    assert_eq!(state.sync_alarms[&ALARM.0], before_alarm);
+    assert_eq!(
+        expected_sync_resource_checks_after(&calls.lock().unwrap(), calls_before + 2),
+        [(
+            CLIENT,
+            ALARM,
+            ResourceKind::SyncAlarm,
+            AccessMode::READ,
+            Some(RequestOpcodes {
+                major: 142,
+                minor: sync::QUERY_ALARM
+            })
+        )]
+    );
+
+    let denied_destroy = resource_request(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        14,
+        142,
+        sync::DESTROY_ALARM,
+        &ALARM.0.to_le_bytes(),
+    );
+    assert_sync_error(
+        &denied_destroy,
+        x11::error::BAD_VALUE,
+        0x55,
+        sync::DESTROY_ALARM,
+        14,
+    );
+    assert_eq!(state.sync_alarms[&ALARM.0], before_alarm);
+    assert_eq!(backend.calls(), backend_before);
+    assert_eq!(
+        expected_sync_resource_checks_after(&calls.lock().unwrap(), calls_before + 3),
+        [(
+            CLIENT,
+            ALARM,
+            ResourceKind::SyncAlarm,
+            AccessMode::DESTROY,
+            Some(RequestOpcodes {
+                major: 142,
+                minor: sync::DESTROY_ALARM
+            })
+        )]
+    );
+}
+
+#[test]
+fn sync_alarm_resource_requests_present_expected_checks() {
+    // Mutation: omit/reorder a check or erase the creation record; this exact ASK table must fail.
+    use yserver_protocol::x11::sync;
+    const FIRST: ResourceId = ResourceId(0x0056_0040);
+    const SECOND: ResourceId = ResourceId(0x0056_0041);
+    const ALARM: ResourceId = ResourceId(0x0056_0042);
+    const CREATED_ALARM: ResourceId = ResourceId(0x0056_0043);
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, CLIENT.0);
+    let mut backend = RecordingBackend::new();
+    for (sequence, opcode, body) in [
+        (1, sync::CREATE_COUNTER, words(&[FIRST.0, 0, 0])),
+        (2, sync::CREATE_COUNTER, words(&[SECOND.0, 0, 0])),
+        (3, sync::CREATE_ALARM, words(&[ALARM.0, 0])),
+    ] {
+        let bytes = resource_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            sequence,
+            142,
+            opcode,
+            &body,
+        );
+        assert_no_error(&bytes, "SYNC alarm ASK fixture");
+    }
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        Decision::Allow,
+        Arc::clone(&calls),
+    )));
+    let backend_before = backend.calls();
+
+    let await_body = words(&[
+        FIRST.0,
+        sync::VALUE_TYPE_ABSOLUTE,
+        0,
+        0,
+        sync::TEST_POSITIVE_COMPARISON,
+        0,
+        0,
+        SECOND.0,
+        sync::VALUE_TYPE_ABSOLUTE,
+        0,
+        0,
+        sync::TEST_POSITIVE_COMPARISON,
+        0,
+        0,
+    ]);
+    assert_no_error(
+        &resource_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            10,
+            142,
+            sync::AWAIT,
+            &await_body,
+        ),
+        "allowed SYNC Await",
+    );
+    assert!(
+        state.sync_awaits.is_empty(),
+        "already satisfied Await completes inline"
+    );
+    assert!(read_all_available(&mut peer).is_empty());
+
+    assert_no_error(
+        &resource_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            11,
+            142,
+            sync::CREATE_ALARM,
+            &words(&[CREATED_ALARM.0, sync::CA_COUNTER, FIRST.0]),
+        ),
+        "allowed SYNC CreateAlarm",
+    );
+    assert_no_error(
+        &resource_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            12,
+            142,
+            sync::CHANGE_ALARM,
+            &words(&[ALARM.0, sync::CA_COUNTER, FIRST.0]),
+        ),
+        "allowed SYNC ChangeAlarm",
+    );
+    let query = resource_request(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        13,
+        142,
+        sync::QUERY_ALARM,
+        &ALARM.0.to_le_bytes(),
+    );
+    assert_eq!(query.first(), Some(&1), "allowed QueryAlarm reply");
+    assert_no_error(
+        &resource_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            14,
+            142,
+            sync::DESTROY_ALARM,
+            &ALARM.0.to_le_bytes(),
+        ),
+        "allowed SYNC DestroyAlarm",
+    );
+
+    let request = |minor| Some(RequestOpcodes { major: 142, minor });
+    assert_eq!(
+        expected_sync_resource_checks(&calls.lock().unwrap()),
+        [
+            (
+                CLIENT,
+                FIRST,
+                ResourceKind::SyncCounter,
+                AccessMode::READ,
+                request(sync::AWAIT)
+            ),
+            (
+                CLIENT,
+                SECOND,
+                ResourceKind::SyncCounter,
+                AccessMode::READ,
+                request(sync::AWAIT)
+            ),
+            (
+                CLIENT,
+                FIRST,
+                ResourceKind::SyncCounter,
+                AccessMode::READ,
+                request(sync::CREATE_ALARM)
+            ),
+            (
+                CLIENT,
+                CREATED_ALARM,
+                ResourceKind::SyncAlarm,
+                AccessMode::CREATE,
+                request(sync::CREATE_ALARM)
+            ),
+            (
+                CLIENT,
+                ALARM,
+                ResourceKind::SyncAlarm,
+                AccessMode::WRITE,
+                request(sync::CHANGE_ALARM)
+            ),
+            (
+                CLIENT,
+                FIRST,
+                ResourceKind::SyncCounter,
+                AccessMode::READ,
+                request(sync::CHANGE_ALARM)
+            ),
+            (
+                CLIENT,
+                ALARM,
+                ResourceKind::SyncAlarm,
+                AccessMode::READ,
+                request(sync::QUERY_ALARM)
+            ),
+            (
+                CLIENT,
+                ALARM,
+                ResourceKind::SyncAlarm,
+                AccessMode::DESTROY,
+                request(sync::DESTROY_ALARM)
+            ),
+        ]
+    );
+    let recorded = calls.lock().unwrap();
+    let creation = recorded
+        .iter()
+        .find(|call| call.target.is_some_and(|target| target.id == CREATED_ALARM))
+        .expect("CreateAlarm creation check");
+    assert_eq!(creation.client, CLIENT);
+    assert_eq!(creation.target_owner, None);
+    assert_eq!(
+        creation.target.unwrap().creation,
+        Some(Creation {
+            parent: None,
+            owner: CLIENT,
+        })
+    );
+    assert_eq!(backend.calls(), backend_before);
 }
 
 fn three_child_window_access_fixture(map_children: bool) -> DestroySubwindowsFixture {

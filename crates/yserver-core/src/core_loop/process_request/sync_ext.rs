@@ -336,6 +336,7 @@ pub(super) fn handle_sync_request(
                         c.counter,
                     );
                 };
+                check_resource!(c.counter, ResourceKind::SyncCounter, AccessMode::READ);
                 let test_value = match c.value_type {
                     x11sync::VALUE_TYPE_ABSOLUTE => c.wait_value,
                     x11sync::VALUE_TYPE_RELATIVE => {
@@ -424,9 +425,15 @@ pub(super) fn handle_sync_request(
                 ..crate::server::SyncAlarm::default()
             };
             let values = alarm_value_words(body);
-            if let Err((code, value)) =
-                change_alarm_attributes(state, alarm, &mut a, client_id, mask, &values)
-            {
+            if let Err((code, value)) = change_alarm_attributes(
+                state,
+                alarm,
+                &mut a,
+                client_id,
+                access_request,
+                mask,
+                &values,
+            ) {
                 return sync_error(state, client_id, sequence, header, code, value);
             }
             let counter = a.counter;
@@ -446,6 +453,7 @@ pub(super) fn handle_sync_request(
                 delta = a.delta,
                 events = a.events,
             );
+            check_creation!(alarm, ResourceKind::SyncAlarm);
             if counter == 0 {
                 // "NULL counter will not trigger in CreateAlarm and sets
                 // alarm state to Inactive" (Xorg).
@@ -476,6 +484,7 @@ pub(super) fn handle_sync_request(
             if let Err(outcome) = sync_known_alarm(state, client_id, sequence, header, alarm) {
                 return outcome;
             }
+            check_resource!(alarm, ResourceKind::SyncAlarm, AccessMode::WRITE);
             if body.len() != x11sync::alarm_request_len(mask) {
                 return sync_error(
                     state,
@@ -495,7 +504,15 @@ pub(super) fn handle_sync_request(
                 return Ok(RequestOutcome::Handled);
             };
             let values = alarm_value_words(body);
-            let outcome = change_alarm_attributes(state, alarm, &mut a, client_id, mask, &values);
+            let outcome = change_alarm_attributes(
+                state,
+                alarm,
+                &mut a,
+                client_id,
+                access_request,
+                mask,
+                &values,
+            );
             if let Err((code, value)) = outcome {
                 state.sync_alarms.insert(alarm, a);
                 return sync_error(state, client_id, sequence, header, code, value);
@@ -542,6 +559,7 @@ pub(super) fn handle_sync_request(
             if let Err(outcome) = sync_known_alarm(state, client_id, sequence, header, alarm_id) {
                 return outcome;
             }
+            check_resource!(alarm_id, ResourceKind::SyncAlarm, AccessMode::READ);
             let alarm = state
                 .sync_alarms
                 .get(&alarm_id)
@@ -579,6 +597,7 @@ pub(super) fn handle_sync_request(
             if let Err(outcome) = sync_known_alarm(state, client_id, sequence, header, alarm) {
                 return outcome;
             }
+            check_resource!(alarm, ResourceKind::SyncAlarm, AccessMode::DESTROY);
             // Xorg `FreeAlarm`: any client may destroy it; a Destroyed
             // AlarmNotify goes to the owner and the selecting clients.
             crate::core_loop::sync_await::destroy_alarm(state, alarm);
@@ -779,6 +798,7 @@ fn change_alarm_attributes(
     alarm_id: u32,
     alarm: &mut crate::server::SyncAlarm,
     client: ClientId,
+    request: RequestOpcodes,
     mask: u32,
     values: &[u32],
 ) -> Result<(), (u8, u32)> {
@@ -846,6 +866,14 @@ fn change_alarm_attributes(
                 counter,
             ));
         }
+        validate_resource_if_present(
+            state,
+            client,
+            ResourceId(counter),
+            ResourceKind::SyncCounter,
+            AccessMode::READ,
+            request,
+        )?;
         new_counter = counter;
     }
     let current = if new_counter == 0 {
