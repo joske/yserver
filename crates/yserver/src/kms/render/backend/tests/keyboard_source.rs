@@ -2516,7 +2516,9 @@ fn key_repeat_emits_no_raw_key_events() {
         .iter()
         .map(|e| e.0)
         .collect();
-    assert_eq!(kinds, vec![13, 2, 3, 2, 14, 3]);
+    // The repeat emits a device press with no XI2 synthetic release; its raw
+    // pair and the real key-up remain unchanged.
+    assert_eq!(kinds, vec![13, 2, 2, 14, 3]);
 }
 
 /// RECORD records an autorepeat as Xorg generates it: a press flagged

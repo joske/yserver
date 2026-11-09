@@ -18,6 +18,11 @@ const XKB_USE_CORE_PTR: u16 = 0x0200;
 const DETECTABLE_AUTO_REPEAT: u32 = 1;
 const CORE_KEY_PRESS_MASK: u32 = 1;
 const CORE_KEY_RELEASE_MASK: u32 = 2;
+const XI2_KEY_PRESS: u16 = 2;
+const XI2_KEY_RELEASE: u16 = 3;
+const XI2_KEY_REPEAT_FLAG: u32 = 1 << 16;
+const XI2_ALL_MASTER_DEVICES: u16 = 1;
+const XI2_KEY_MASK: u32 = (1 << XI2_KEY_PRESS) | (1 << XI2_KEY_RELEASE);
 const KEYCODE_A: u8 = 38;
 const KEYCODE_LEFT_SHIFT: u8 = 50;
 const XI_FIRST_EVENT: u8 = 66;
@@ -416,6 +421,182 @@ fn mixed_core_clients_get_their_own_form() {
     repeat_pair(&mut backend, &mut state);
     assert_eq!(event_types(&kbd_map_drain(&mut flagged)), [2]);
     assert_eq!(event_types(&kbd_map_drain(&mut unflagged)), [3, 2]);
+}
+
+fn query_xi2_version(
+    state: &mut ServerState,
+    backend: &mut KmsBackend,
+    client: u32,
+    peer: &mut UnixStream,
+) {
+    request(state, backend, client, 1, XINPUT_OPCODE, 47, &[2, 0, 3, 0]);
+    let reply = kbd_map_drain(peer);
+    assert_eq!(reply.len(), 32, "XIQueryVersion reply");
+    assert_eq!(reply[0], 1, "XIQueryVersion reply type");
+}
+
+fn select_xi2_key_events(
+    state: &mut ServerState,
+    backend: &mut KmsBackend,
+    client: u32,
+    peer: &mut UnixStream,
+    sequence: u16,
+) {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&[0; 2]);
+    body.extend_from_slice(&XI2_ALL_MASTER_DEVICES.to_le_bytes());
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&XI2_KEY_MASK.to_le_bytes());
+    request(state, backend, client, sequence, XINPUT_OPCODE, 46, &body);
+    assert!(
+        kbd_map_drain(peer).is_empty(),
+        "XISelectEvents has no reply"
+    );
+}
+
+fn xi2_key_events(bytes: &[u8]) -> Vec<(u16, u32)> {
+    let read_u16 = |offset| u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+    let read_u32 = |offset| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+    let mut events = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        assert!(bytes.len() - offset >= 32, "truncated XI2 event");
+        assert_eq!(bytes[offset] & 0x7f, 35, "expected an XI2 GenericEvent");
+        assert_eq!(bytes[offset + 1], XINPUT_OPCODE, "XI2 extension opcode");
+        let event_length = 32 + 4 * usize::try_from(read_u32(offset + 4)).unwrap();
+        assert!(event_length >= 60, "XI2 key event includes the flags field");
+        assert!(offset + event_length <= bytes.len(), "complete XI2 event");
+        let event_type = read_u16(offset + 8);
+        if matches!(event_type, XI2_KEY_PRESS | XI2_KEY_RELEASE) {
+            events.push((event_type, read_u32(offset + 56)));
+        }
+        offset += event_length;
+    }
+    events
+}
+
+/// Mutation: leave repeat flags at zero or keep the XI2 synthetic release;
+/// the repeated press flag or one-event repeat assertion must fail.
+#[test]
+fn xi2_repeat_has_flag_and_no_release() {
+    let mut backend = KmsBackend::for_tests();
+    let mut state = ServerState::new();
+    state.core_focus.raw = ROOT_WINDOW.0;
+    let mut peer = client(&mut state, 63);
+    query_xi2_version(&mut state, &mut backend, 63, &mut peer);
+    select_xi2_key_events(&mut state, &mut backend, 63, &mut peer, 2);
+
+    key_input(&mut backend, &mut state, true);
+    assert_eq!(
+        xi2_key_events(&kbd_map_drain(&mut peer)),
+        [(XI2_KEY_PRESS, 0)]
+    );
+
+    repeat_pair(&mut backend, &mut state);
+    assert_eq!(
+        xi2_key_events(&kbd_map_drain(&mut peer)),
+        [(XI2_KEY_PRESS, XI2_KEY_REPEAT_FLAG)]
+    );
+
+    key_input(&mut backend, &mut state, false);
+    assert_eq!(
+        xi2_key_events(&kbd_map_drain(&mut peer)),
+        [(XI2_KEY_RELEASE, 0)]
+    );
+}
+
+/// Mutation: omit an XI2 release selector from the repeat shadow set, leaking
+/// the synthetic release through the same client's core selection.
+#[test]
+fn xi2_shadows_core_for_repeat() {
+    let mut backend = KmsBackend::for_tests();
+    let mut state = ServerState::new();
+    state.core_focus.raw = ROOT_WINDOW.0;
+    let mut peer = client(&mut state, 64);
+    query_xi2_version(&mut state, &mut backend, 64, &mut peer);
+    select_core(
+        &mut state,
+        &mut backend,
+        64,
+        CORE_KEY_PRESS_MASK | CORE_KEY_RELEASE_MASK,
+    );
+    select_xi2_key_events(&mut state, &mut backend, 64, &mut peer, 3);
+
+    key_input(&mut backend, &mut state, true);
+    let initial = kbd_map_drain(&mut peer);
+    assert_eq!(
+        xi2_key_events(&initial),
+        [(XI2_KEY_PRESS, 0)],
+        "XI2 shadows the core event"
+    );
+
+    repeat_pair(&mut backend, &mut state);
+    let repeated = kbd_map_drain(&mut peer);
+    assert_eq!(
+        repeated.len(),
+        120,
+        "no core event accompanies the XI2 form"
+    );
+    assert_eq!(
+        xi2_key_events(&repeated),
+        [(XI2_KEY_PRESS, XI2_KEY_REPEAT_FLAG)],
+        "XI2 repeat shadows the core synthetic release"
+    );
+}
+
+fn grab_xi2_keyboard(
+    state: &mut ServerState,
+    backend: &mut KmsBackend,
+    client: u32,
+    peer: &mut UnixStream,
+) {
+    let mut body = Vec::with_capacity(24);
+    body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    body.extend_from_slice(&0u32.to_le_bytes()); // no cursor
+    body.extend_from_slice(&yserver_core::xinput::DEVICEID_MASTER_KEYBOARD.to_le_bytes());
+    body.extend_from_slice(&[1, 1, 0, 0]); // asynchronous modes, owner_events=false
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&XI2_KEY_MASK.to_le_bytes());
+    request(state, backend, client, 2, XINPUT_OPCODE, 51, &body);
+    let _ = kbd_map_drain(peer); // XI_FocusIn and the XIGrabDevice reply
+    assert!(
+        state
+            .active_keyboard_grab
+            .is_some_and(|grab| { grab.owner == ClientId(client) && grab.via_xi2 })
+    );
+}
+
+/// Mutation: remove XI2 grab-owner synthetic-release suppression; a repeat
+/// then serializes a release to the XI2 grab owner.
+#[test]
+fn xi2_grab_owner_repeat() {
+    let mut backend = KmsBackend::for_tests();
+    let mut state = ServerState::new();
+    state.core_focus.raw = ROOT_WINDOW.0;
+    let mut peer = client(&mut state, 65);
+    query_xi2_version(&mut state, &mut backend, 65, &mut peer);
+    grab_xi2_keyboard(&mut state, &mut backend, 65, &mut peer);
+
+    key_input(&mut backend, &mut state, true);
+    assert_eq!(
+        xi2_key_events(&kbd_map_drain(&mut peer)),
+        [(XI2_KEY_PRESS, 0)]
+    );
+
+    repeat_pair(&mut backend, &mut state);
+    assert_eq!(
+        xi2_key_events(&kbd_map_drain(&mut peer)),
+        [(XI2_KEY_PRESS, XI2_KEY_REPEAT_FLAG)]
+    );
+
+    key_input(&mut backend, &mut state, false);
+    assert_eq!(
+        xi2_key_events(&kbd_map_drain(&mut peer)),
+        [(XI2_KEY_RELEASE, 0)]
+    );
 }
 
 fn add_physical_keyboard(

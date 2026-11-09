@@ -26,6 +26,8 @@ const KEY_RELEASE_MASK: u32 = 0x0000_0002;
 const XI2_MAJOR_OPCODE: u8 = 137;
 const XI2_KEYPRESS_EVTYPE: u16 = 2;
 const XI2_KEYRELEASE_EVTYPE: u16 = 3;
+/// XIKeyRepeat is bit 16 in the XI2 device-event flags word for key presses.
+const XI2_KEY_REPEAT_FLAG: u32 = 0x0001_0000;
 const XI2_MASTER_KEYBOARD_DEVICE_ID: u16 = 3;
 const XI2_RAW_KEY_PRESS_EVTYPE: u16 = 13;
 const XI2_RAW_KEY_RELEASE_EVTYPE: u16 = 14;
@@ -761,6 +763,13 @@ fn deliver_key_to_window(
         })
     };
 
+    // Keep XI2-selected clients in `xi2_targets` above while suppressing the
+    // synthetic XI2 release here: XI2 still shadows the core form for that
+    // client, even though it receives no release form.
+    if synthetic_repeat && !event.pressed {
+        return dropped;
+    }
+
     for (device_id, source_id) in forms {
         let targets: Vec<ClientId> = state
             .clients
@@ -774,7 +783,16 @@ fn deliver_key_to_window(
             continue;
         }
         let xi2_dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
-            encode_key_xi2_for_device(buf, order, seq, event, fields, device_id, source_id);
+            encode_key_xi2_for_device(
+                buf,
+                order,
+                seq,
+                event,
+                fields,
+                device_id,
+                source_id,
+                synthetic_repeat,
+            );
         });
         merge_dropped(&mut dropped, xi2_dropped);
     }
@@ -815,10 +833,22 @@ fn deliver_key_to_grab_owner(
 ) -> Vec<ClientId> {
     let fields = key_window_fields(state, event, grab_window);
     if via_xi2 {
+        if synthetic_repeat && !event.pressed {
+            return Vec::new();
+        }
         let source_id =
             resolve_key_xi_source(state, event.origin).map_or(device_id, |source| source.sourceid);
         fanout_event_to_clients(state, &[owner], |buf, seq, order| {
-            encode_key_xi2_for_device(buf, order, seq, event, fields, device_id, source_id);
+            encode_key_xi2_for_device(
+                buf,
+                order,
+                seq,
+                event,
+                fields,
+                device_id,
+                source_id,
+                synthetic_repeat,
+            );
         })
     } else {
         if synthetic_repeat
@@ -947,6 +977,7 @@ fn encode_key_xi2_for_device(
     fields: KeyWindowFields,
     device_id: u16,
     source_id: u16,
+    synthetic_repeat: bool,
 ) {
     x11::encode_xi2_device_event(
         buf,
@@ -966,7 +997,11 @@ fn encode_key_xi2_for_device(
         event.state,
         u32::from(event.keycode),
         source_id,
-        0, // flags: no XIPointerEmulated on key events
+        if synthetic_repeat && event.pressed {
+            XI2_KEY_REPEAT_FLAG
+        } else {
+            0
+        },
     );
 }
 
