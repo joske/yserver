@@ -387,6 +387,9 @@ type GammaTriplet = (Vec<u16>, Vec<u16>, Vec<u16>);
 /// counter so create-then-destroy round trips read back the same xid.
 pub struct RecordingBackend {
     pub calls: Mutex<Vec<RecordedCall>>,
+    /// Number of `get_image` calls, kept separate from the general call log
+    /// so tests can assert denied readbacks without changing existing log snapshots.
+    pub get_image_calls: usize,
     /// Queued "the sprite now shows this cursor" report handed out by
     /// `take_displayed_cursor_change`. Tests set it to stand in for a KMS
     /// sprite change.
@@ -754,6 +757,7 @@ impl RecordingBackend {
     pub fn new() -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
+            get_image_calls: 0,
             displayed_cursor_change: None,
             active_cursor_image: None,
             alive_cursors: HashSet::new(),
@@ -2421,6 +2425,7 @@ impl Backend for RecordingBackend {
         _height: u16,
         _plane_mask: u32,
     ) -> io::Result<Option<Vec<u8>>> {
+        self.get_image_calls += 1;
         Ok(None)
     }
 
