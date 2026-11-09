@@ -1571,12 +1571,14 @@ impl KmsBackend {
         }
 
         self.retain_direct_present_wake(&frame.event);
+        let accepted_at = self.monotonic_now();
         let owner = self
             .pstate
             .direct
             .get_mut(scope)
             .expect("candidate direct scope has an owner slot");
         owner.pending = Some(frame);
+        owner.last_direct_present_at = Some(accepted_at);
         owner.hold_direct = true;
         owner.unflip_requested = false;
         owner.unflip_reason = None;

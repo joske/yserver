@@ -23,6 +23,7 @@ use yserver_protocol::x11::xfixes;
 
 const DIRECT_CURSOR_RETRY_AFTER_SUCCESSOR_EVENTS: u8 = 2;
 const DIRECT_CURSOR_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+const DIRECT_VRR_CURSOR_IDLE_AFTER: std::time::Duration = std::time::Duration::from_millis(100);
 
 pub(in crate::kms::render::backend) fn scanout_m2_is_authoritative_root(
     target: ScanoutM0Target,
@@ -1524,6 +1525,26 @@ impl KmsBackend {
             .collect()
     }
 
+    fn direct_vrr_cursor_hold_by_output(&self, now: std::time::Instant) -> Vec<bool> {
+        self.live_direct_vrr_wanted_by_output()
+            .into_iter()
+            .enumerate()
+            .map(|(output_idx, wanted)| {
+                if !wanted {
+                    return false;
+                }
+                let Some(scope) = self.pstate.direct.scope_for_output(output_idx) else {
+                    return false;
+                };
+                self.pstate
+                    .direct
+                    .get(scope)
+                    .and_then(|owner| owner.last_direct_present_at)
+                    .is_some_and(|last_present| now < last_present + DIRECT_VRR_CURSOR_IDLE_AFTER)
+            })
+            .collect()
+    }
+
     pub(in crate::kms::render::backend) fn backend_scanout_on_window_property_changed(
         &mut self,
         state: &yserver_core::server::ServerState,
@@ -1940,6 +1961,7 @@ impl KmsBackend {
         }
         if let Some(owner) = self.pstate.direct.get_mut(scope) {
             owner.hold_direct = false;
+            owner.last_direct_present_at = None;
             owner.unflip_requested = false;
             owner.unflip_reason = None;
             owner.unflip_last_reason = None;
@@ -2066,6 +2088,7 @@ impl KmsBackend {
         scope: DirectScope,
         frame: DirectPresentFrame,
     ) {
+        let accepted_at = self.monotonic_now();
         let has_predecessor = self
             .pstate
             .direct
@@ -2081,6 +2104,7 @@ impl KmsBackend {
         }
         if let Some(owner) = self.pstate.direct.get_mut(scope) {
             owner.hold_direct = has_predecessor;
+            owner.last_direct_present_at = Some(accepted_at);
             if !has_predecessor {
                 owner.completed.append(&mut owner.deferred_successor_skips);
             }
@@ -2156,6 +2180,7 @@ impl KmsBackend {
         if let Some(owner) = self.pstate.direct.get_mut(scope) {
             owner.hold_direct = false;
             owner.cursor_bound_all = false;
+            owner.last_direct_present_at = None;
             owner.unflip_requested = false;
             owner.unflip_reason = None;
             owner.unflip_outputs_to_replace.clear();
@@ -3938,12 +3963,12 @@ impl KmsBackend {
 
     pub(super) fn scene_wants_compose(&self) -> bool {
         let now = self.monotonic_now();
-        let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
+        let direct_vrr_cursor_hold = self.direct_vrr_cursor_hold_by_output(now);
         let cursor_eligible_outputs = self.scene_cursor_eligible_outputs();
         self.scene_has_ready_scheduled_output()
             || self.platform.has_eligible_atomic_cursor_move_for_outputs(
                 now,
-                &live_direct_vrr_wanted,
+                &direct_vrr_cursor_hold,
                 &cursor_eligible_outputs,
             )
     }
@@ -4238,7 +4263,7 @@ impl KmsBackend {
         &self,
     ) -> Option<std::time::Instant> {
         let now = self.monotonic_now();
-        let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
+        let direct_vrr_cursor_hold = self.direct_vrr_cursor_hold_by_output(now);
         let allow_kms_timers = self.scanout_allowed() && self.kms_outputs_active;
         let direct_cursor_retry_deadline = if allow_kms_timers {
             self.pstate
@@ -4263,7 +4288,7 @@ impl KmsBackend {
                 if self.scene_has_ready_scheduled_output()
                     || self.platform.has_eligible_atomic_cursor_move_for_outputs(
                         now,
-                        &live_direct_vrr_wanted,
+                        &direct_vrr_cursor_hold,
                         &cursor_eligible_outputs,
                     )
                 {
@@ -4305,7 +4330,7 @@ impl KmsBackend {
             })
             .flatten();
         let vrr_cursor_deadline = allow_kms_timers
-            .then(|| self.platform.vrr_cursor_deadline(&live_direct_vrr_wanted))
+            .then(|| self.platform.vrr_cursor_deadline(&direct_vrr_cursor_hold))
             .flatten();
         let needs_source_wait_poll =
             self.pstate
@@ -4524,12 +4549,13 @@ impl KmsBackend {
                 }
                 if owner.hold_direct && !owner.unflip_requested {
                     if owner.current.is_some() && owner.queued_successor.is_none() {
-                        let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
+                        let direct_vrr_cursor_hold =
+                            self.direct_vrr_cursor_hold_by_output(self.monotonic_now());
                         for output_idx in self.direct_scope_outputs(scope) {
                             match self.platform.submit_atomic_cursor_move_for_output(
                                 output_idx,
                                 self.monotonic_now(),
-                                live_direct_vrr_wanted
+                                direct_vrr_cursor_hold
                                     .get(output_idx)
                                     .copied()
                                     .unwrap_or(false),
@@ -4644,7 +4670,7 @@ impl KmsBackend {
             composed_outputs.into_iter().flatten().collect();
         let cursor_outcome = self.platform.take_deferred_cursor_move_outcome();
         self.handle_cursor_move_outcome(cursor_outcome);
-        let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
+        let direct_vrr_cursor_hold = self.direct_vrr_cursor_hold_by_output(self.monotonic_now());
         for output_idx in 0..self.platform.outputs.len() {
             if self.output_is_direct(output_idx)
                 || scene_submitted_outputs.contains(&output_idx)
@@ -4660,7 +4686,7 @@ impl KmsBackend {
             match self.platform.submit_atomic_cursor_move_for_output(
                 output_idx,
                 self.monotonic_now(),
-                live_direct_vrr_wanted
+                direct_vrr_cursor_hold
                     .get(output_idx)
                     .copied()
                     .unwrap_or(false),

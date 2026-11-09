@@ -36,6 +36,8 @@ use yserver_core::backend::{Backend, ModeSpec};
 
 const VRR_PROP_ID: u32 = 90;
 
+#[path = "vrr_cursor_idle.rs"]
+mod cursor_idle;
 #[path = "vrr_per_output.rs"]
 mod per_output;
 
@@ -3207,6 +3209,7 @@ struct VrrCursorHarness {
     direct: Option<super::recording_scene::DirectPresentSetup>,
     delivered: HashSet<super::super::cursor_sprites::support::CompletionKey>,
     device_fd: std::os::fd::RawFd,
+    clock: Option<(std::time::Instant, Arc<AtomicU64>)>,
 }
 
 impl std::ops::Deref for VrrCursorHarness {
@@ -3224,6 +3227,14 @@ impl std::ops::DerefMut for VrrCursorHarness {
 }
 
 impl VrrCursorHarness {
+    fn controlled_clock(&self) -> (std::time::Instant, Arc<AtomicU64>) {
+        let (base, elapsed_ns) = self
+            .clock
+            .as_ref()
+            .expect("direct cursor harness has a controlled clock");
+        (*base, Arc::clone(elapsed_ns))
+    }
+
     fn warp_pointer(&mut self, x: i32, y: i32) {
         let events = &mut self
             .fixture
@@ -3340,6 +3351,7 @@ fn vrr_composed_cursor_harness() -> Option<VrrCursorHarness> {
         direct: None,
         delivered: HashSet::new(),
         device_fd,
+        clock: None,
     };
     let cursor = create_argb_cursor(
         &mut harness.scene.events.backend,
@@ -3375,14 +3387,16 @@ fn vrr_cursor_harness(present_id: u64, capable: bool) -> Option<VrrCursorHarness
         enter_held_direct, establish_hardware_cursor,
     };
 
-    let fixture = AtomicPathFixture::new(PathKind::Physical)
+    let mut fixture = AtomicPathFixture::new(PathKind::Physical)
         .expect("VRR cursor scene fixture construction")?;
     let device_fd = super::direct_unflip::fd(&fixture.scene);
+    let clock = super::support::install_controlled_clock(&mut fixture.scene.events.backend);
     let mut harness = VrrCursorHarness {
         fixture: Some(fixture),
         direct: None,
         delivered: HashSet::new(),
         device_fd,
+        clock: Some(clock),
     };
     let cursor = create_argb_cursor(
         &mut harness.scene.events.backend,
@@ -3509,8 +3523,7 @@ fn vrr_cursor_motion_rides_direct_frame() {
         eprintln!("SKIP vrr_cursor_motion_rides_direct_frame: no Vulkan scene fixture available");
         return;
     };
-    let (base, elapsed_ns) =
-        super::support::install_controlled_clock(&mut harness.scene.events.backend);
+    let (base, elapsed_ns) = harness.controlled_clock();
     let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     let mut direct = harness.direct.take().expect("direct scanout is active");
     harness.warp_pointer(180, 130);
@@ -3565,8 +3578,7 @@ fn vrr_cursor_motion_without_frame_commits_once_at_deadline() {
         );
         return;
     };
-    let (base, elapsed_ns) =
-        super::support::install_controlled_clock(&mut harness.scene.events.backend);
+    let (base, elapsed_ns) = harness.controlled_clock();
     let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     harness.warp_pointer(180, 130);
     Backend::maybe_composite(&mut harness.scene.events.backend)
@@ -3613,8 +3625,7 @@ fn vrr_cursor_later_motion_keeps_deadline() {
         eprintln!("SKIP vrr_cursor_later_motion_keeps_deadline: no Vulkan scene fixture available");
         return;
     };
-    let (base, elapsed_ns) =
-        super::support::install_controlled_clock(&mut harness.scene.events.backend);
+    let (base, elapsed_ns) = harness.controlled_clock();
     let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     harness.warp_pointer(180, 130);
     Backend::maybe_composite(&mut harness.scene.events.backend)
@@ -3941,8 +3952,7 @@ fn vrr_cursor_new_move_after_carried_move_gets_fresh_deadline() {
         );
         return;
     };
-    let (base, elapsed_ns) =
-        super::support::install_controlled_clock(&mut harness.scene.events.backend);
+    let (base, elapsed_ns) = harness.controlled_clock();
     let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     let mut direct = harness.direct.take().expect("direct scanout is active");
     harness.warp_pointer(180, 130);
@@ -4008,8 +4018,7 @@ fn vrr_cursor_deadline_ebusy_waits_for_flip() {
         );
         return;
     };
-    let (base, elapsed_ns) =
-        super::support::install_controlled_clock(&mut harness.scene.events.backend);
+    let (base, elapsed_ns) = harness.controlled_clock();
     let recorder = Rc::clone(&harness.scene.events.recorders[&harness.device_fd]);
     let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     let crtc = harness.scene.events.backend.platform.outputs[0].output.crtc;
@@ -4082,7 +4091,6 @@ fn vrr_cursor_image_change_commits_immediately() {
         );
         return;
     };
-    let _ = super::support::install_controlled_clock(&mut harness.scene.events.backend);
     let position_offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     harness.warp_pointer(180, 130);
     Backend::maybe_composite(&mut harness.scene.events.backend)
@@ -4139,7 +4147,7 @@ fn vrr_off_cursor_only_unchanged() {
         eprintln!("SKIP vrr_off_cursor_only_unchanged: no Vulkan scene fixture available");
         return;
     };
-    let (base, _) = super::support::install_controlled_clock(&mut harness.scene.events.backend);
+    let (base, _) = harness.controlled_clock();
     let offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     harness.warp_pointer(180, 130);
     Backend::maybe_composite(&mut harness.scene.events.backend)
@@ -4331,8 +4339,7 @@ fn vrr_summary_reports_intervals_and_deadline_commits() {
     }
     harness.direct = Some(direct);
 
-    let (base, elapsed_ns) =
-        super::support::install_controlled_clock(&mut harness.scene.events.backend);
+    let (base, elapsed_ns) = harness.controlled_clock();
     advance_vrr_cursor_clock(&elapsed_ns, Duration::from_millis(45));
     let cursor_offset = super::direct_unflip::record_count(&harness.scene, harness.device_fd);
     harness.warp_pointer(180, 130);

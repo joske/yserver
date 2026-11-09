@@ -691,6 +691,8 @@ pub(in crate::kms::render::backend) struct ScanoutM2State {
         Vec<yserver_core::backend::CompletedPresentEvent>,
     pub(in crate::kms::render::backend) idled: Vec<yserver_core::backend::CompletedPresentEvent>,
     pub(in crate::kms::render::backend) hold_direct: bool,
+    /// Backend-clock time of the last direct Present accepted for this owner.
+    pub(in crate::kms::render::backend) last_direct_present_at: Option<Instant>,
     pub(in crate::kms::render::backend) cursor_bound_all: bool,
     /// Output indices whose direct cursor image/show must be retried after
     /// that CRTC releases its current cursor commit.
@@ -735,6 +737,7 @@ impl ScanoutM2State {
             deferred_successor_skips: Vec::new(),
             idled: Vec::new(),
             hold_direct: false,
+            last_direct_present_at: None,
             cursor_bound_all: false,
             direct_cursor_refresh_pending: HashSet::new(),
             direct_cursor_refresh_successor_deferrals: HashMap::new(),

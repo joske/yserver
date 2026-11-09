@@ -1,6 +1,6 @@
 use super::*;
 
-fn set_output_vrr_capable(
+pub(super) fn set_output_vrr_capable(
     fixture: &mut super::super::recording_scene::RecordingSceneFixture,
     output_idx: usize,
     capable: bool,
@@ -13,7 +13,8 @@ fn set_output_vrr_capable(
     output.vrr_clear_retry_used.set(false);
 }
 
-fn two_output_vrr_fixture() -> Option<super::super::recording_scene::RecordingSceneFixture> {
+pub(super) fn two_output_vrr_fixture()
+-> Option<super::super::recording_scene::RecordingSceneFixture> {
     let mut fixture = super::super::recording_scene::RecordingSceneFixture::with_route(
         2,
         super::super::recording_scene::P1SceneRoute::Shared,
@@ -23,7 +24,7 @@ fn two_output_vrr_fixture() -> Option<super::super::recording_scene::RecordingSc
     Some(fixture)
 }
 
-fn set_present_client(
+pub(super) fn set_present_client(
     direct: &mut super::super::recording_scene::DirectPresentSetup,
     client_id: u32,
 ) {
@@ -31,7 +32,7 @@ fn set_present_client(
     direct.event.client_id = yserver_protocol::x11::ClientId(client_id);
 }
 
-fn retire_output_direct(
+pub(super) fn retire_output_direct(
     fixture: &mut super::super::recording_scene::RecordingSceneFixture,
     direct: &super::super::recording_scene::DirectPresentSetup,
     record: &AtomicCommitRecord,
@@ -56,7 +57,7 @@ fn retire_output_direct(
     );
 }
 
-fn complete_output_records(
+pub(super) fn complete_output_records(
     fixture: &mut super::super::recording_scene::RecordingSceneFixture,
     records: &[AtomicCommitRecord],
     first_frame: u32,
@@ -107,7 +108,7 @@ fn unmap_output_direct(
     records
 }
 
-fn settle_vrr_cursor_output(
+pub(super) fn settle_vrr_cursor_output(
     fixture: &mut super::super::super::cursor_sprites::support::AtomicPathFixture,
     delivered: &mut HashSet<super::super::super::cursor_sprites::support::CompletionKey>,
     output_idx: usize,
@@ -145,7 +146,7 @@ fn settle_vrr_cursor_output(
     ));
 }
 
-fn remember_retired_cursor_records(
+pub(super) fn remember_retired_cursor_records(
     records: &[AtomicCommitRecord],
     delivered: &mut HashSet<super::super::super::cursor_sprites::support::CompletionKey>,
 ) {
@@ -519,6 +520,8 @@ fn vrr_cursor_deadline_is_independent_per_output_crtc() {
     let crtc0 = fixture.scene.events.backend.platform.outputs[0].output.crtc;
     let crtc1 = fixture.scene.events.backend.platform.outputs[1].output.crtc;
     let device_fd = fixture.scene.kms_fd(1);
+    let (base, elapsed_ns) =
+        super::super::support::install_controlled_clock(&mut fixture.scene.events.backend);
 
     let output0 = fixture.scene.install_direct_output_present(0, 20_140, 0);
     Backend::set_cursor_hidden(&mut fixture.scene.events.backend, false);
@@ -570,8 +573,6 @@ fn vrr_cursor_deadline_is_independent_per_output_crtc() {
             .get()
     );
 
-    let (base, elapsed_ns) =
-        super::super::support::install_controlled_clock(&mut fixture.scene.events.backend);
     let start = super::super::direct_unflip::record_count(&fixture.scene, device_fd);
     Backend::warp_pointer_root(
         &mut fixture.scene.events.backend,
