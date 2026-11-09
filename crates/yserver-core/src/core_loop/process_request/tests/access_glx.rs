@@ -39,34 +39,17 @@ fn fixture() -> GlxAccessFixture {
     }
 }
 
-fn dispatch(fixture: &mut GlxAccessFixture, minor: u8, body: &[u8]) -> Vec<u8> {
-    process_request(
-        &mut fixture.state,
-        &mut fixture.backend,
-        CLIENT,
-        SequenceNumber(1),
-        RequestHeader {
-            opcode: crate::nested::GLX_MAJOR_OPCODE,
-            data: minor,
-            length_units: u32::try_from((4 + body.len()).div_ceil(4)).unwrap(),
-        },
-        body,
-        None,
-    )
-    .expect("GLX request through process_request");
-    read_all_or_buffered(&mut fixture.state, CLIENT.0, &mut fixture.peer)
-}
-
-fn dispatch_as(
-    fixture: &mut GlxAccessFixture,
+fn dispatch(
+    state: &mut ServerState,
+    backend: &mut RecordingBackend,
     client: ClientId,
     peer: &mut UnixStream,
     minor: u8,
     body: &[u8],
 ) -> Vec<u8> {
     process_request(
-        &mut fixture.state,
-        &mut fixture.backend,
+        state,
+        backend,
         client,
         SequenceNumber(1),
         RequestHeader {
@@ -78,7 +61,7 @@ fn dispatch_as(
         None,
     )
     .expect("GLX request through process_request");
-    read_all_or_buffered(&mut fixture.state, client.0, peer)
+    read_all_or_buffered(state, client.0, peer)
 }
 
 fn words(values: &[u32]) -> Vec<u8> {
@@ -356,7 +339,12 @@ fn deny_kind_policy(
     calls
 }
 
-fn assert_recorded(actual: &[RecordedExtensionCheck], expected: &[ExpectedCheck], minor: u8) {
+fn assert_recorded(
+    actual: &[RecordedExtensionCheck],
+    expected: &[ExpectedCheck],
+    client: ClientId,
+    minor: u8,
+) {
     let resources = actual
         .iter()
         .filter(|call| call.hook == ExtensionHook::Resource)
@@ -368,7 +356,7 @@ fn assert_recorded(actual: &[RecordedExtensionCheck], expected: &[ExpectedCheck]
     );
     for (call, expected) in resources.into_iter().zip(expected) {
         assert_eq!(call.hook, ExtensionHook::Resource);
-        assert_eq!(call.client, CLIENT);
+        assert_eq!(call.client, client);
         assert_eq!(call.target, Some(expected.target));
         assert_eq!(call.mode, Some(expected.mode));
         assert_eq!(call.owner, expected.owner);
@@ -572,14 +560,21 @@ fn glx_access_ask_table_records_each_target_and_opcode() {
         let mut fixture = fixture();
         seed(&mut fixture.state);
         let calls = allow_policy(&mut fixture);
-        let _bytes = dispatch(&mut fixture, minor, &body);
+        let _bytes = dispatch(
+            &mut fixture.state,
+            &mut fixture.backend,
+            CLIENT,
+            &mut fixture.peer,
+            minor,
+            &body,
+        );
         let calls = calls.lock().unwrap();
         let resources = calls
             .iter()
             .filter(|call| call.hook == ExtensionHook::Resource)
             .cloned()
             .collect::<Vec<_>>();
-        assert_recorded(&resources, &expected, minor);
+        assert_recorded(&resources, &expected, CLIENT, minor);
     }
 }
 
@@ -591,7 +586,10 @@ fn make_current_draw_falls_back_to_core_window() {
     seed_window(&mut fixture.state, WINDOW);
     let calls = allow_policy(&mut fixture);
     let _bytes = dispatch(
-        &mut fixture,
+        &mut fixture.state,
+        &mut fixture.backend,
+        CLIENT,
+        &mut fixture.peer,
         x11glx::MAKE_CURRENT,
         &current_body(x11glx::MAKE_CURRENT, WINDOW, ResourceId(0), CONTEXT),
     );
@@ -601,6 +599,7 @@ fn make_current_draw_falls_back_to_core_window() {
             existing(CONTEXT, ResourceKind::GlxContext, AccessMode::USE),
             existing(WINDOW, ResourceKind::Window, AccessMode::GET_ATTR),
         ],
+        CLIENT,
         x11glx::MAKE_CURRENT,
     );
 }
@@ -614,7 +613,10 @@ fn make_context_current_read_falls_back_to_core_pixmap() {
     seed_pixmap(&mut fixture.state, PIXMAP);
     let calls = allow_policy(&mut fixture);
     let _bytes = dispatch(
-        &mut fixture,
+        &mut fixture.state,
+        &mut fixture.backend,
+        CLIENT,
+        &mut fixture.peer,
         x11glx::MAKE_CONTEXT_CURRENT,
         &current_body(x11glx::MAKE_CONTEXT_CURRENT, WINDOW, PIXMAP, CONTEXT),
     );
@@ -625,6 +627,7 @@ fn make_context_current_read_falls_back_to_core_pixmap() {
             existing(WINDOW, ResourceKind::Window, AccessMode::GET_ATTR),
             existing(PIXMAP, ResourceKind::Pixmap, AccessMode::GET_ATTR),
         ],
+        CLIENT,
         x11glx::MAKE_CONTEXT_CURRENT,
     );
 }
@@ -664,12 +667,26 @@ fn make_current_unresolved_ids_are_not_asked() {
     for (minor, body, seed) in rows {
         let mut no_policy = fixture();
         seed(&mut no_policy.state);
-        let no_policy_bytes = dispatch(&mut no_policy, minor, &body);
+        let no_policy_bytes = dispatch(
+            &mut no_policy.state,
+            &mut no_policy.backend,
+            CLIENT,
+            &mut no_policy.peer,
+            minor,
+            &body,
+        );
 
         let mut fixture = fixture();
         seed(&mut fixture.state);
         let calls = allow_policy(&mut fixture);
-        let bytes = dispatch(&mut fixture, minor, &body);
+        let bytes = dispatch(
+            &mut fixture.state,
+            &mut fixture.backend,
+            CLIENT,
+            &mut fixture.peer,
+            minor,
+            &body,
+        );
         assert_eq!(bytes, no_policy_bytes, "policy changed minor {minor}");
         assert!(
             calls
@@ -684,11 +701,25 @@ fn make_current_unresolved_ids_are_not_asked() {
     for minor in [x11glx::IS_DIRECT, x11glx::QUERY_CONTEXT] {
         let body = words(&[MISSING.0]);
         let mut no_policy = fixture();
-        let no_policy_bytes = dispatch(&mut no_policy, minor, &body);
+        let no_policy_bytes = dispatch(
+            &mut no_policy.state,
+            &mut no_policy.backend,
+            CLIENT,
+            &mut no_policy.peer,
+            minor,
+            &body,
+        );
 
         let mut fixture = fixture();
         let calls = allow_policy(&mut fixture);
-        let bytes = dispatch(&mut fixture, minor, &body);
+        let bytes = dispatch(
+            &mut fixture.state,
+            &mut fixture.backend,
+            CLIENT,
+            &mut fixture.peer,
+            minor,
+            &body,
+        );
         assert_eq!(bytes, no_policy_bytes, "policy changed minor {minor}");
         assert_error(
             &bytes,
@@ -713,16 +744,30 @@ fn make_current_unresolved_ids_are_not_asked() {
 fn swap_buffers_short_body_keeps_no_op_without_access_check() {
     let mut no_policy = fixture();
     seed_window(&mut no_policy.state, WINDOW);
-    let no_policy_bytes = dispatch(&mut no_policy, x11glx::SWAP_BUFFERS, &words(&[WINDOW.0]));
+    let no_policy_bytes = dispatch(
+        &mut no_policy.state,
+        &mut no_policy.backend,
+        CLIENT,
+        &mut no_policy.peer,
+        x11glx::SWAP_BUFFERS,
+        &words(&[WINDOW.0]),
+    );
 
     let mut fixture = fixture();
     seed_window(&mut fixture.state, WINDOW);
     let calls = allow_policy(&mut fixture);
-    let bytes = dispatch(&mut fixture, x11glx::SWAP_BUFFERS, &words(&[WINDOW.0]));
+    let bytes = dispatch(
+        &mut fixture.state,
+        &mut fixture.backend,
+        CLIENT,
+        &mut fixture.peer,
+        x11glx::SWAP_BUFFERS,
+        &words(&[WINDOW.0]),
+    );
 
     assert_eq!(bytes, no_policy_bytes);
     assert!(bytes.is_empty());
-    assert_recorded(&calls.lock().unwrap(), &[], x11glx::SWAP_BUFFERS);
+    assert_recorded(&calls.lock().unwrap(), &[], CLIENT, x11glx::SWAP_BUFFERS);
 }
 
 // Mutation: run the create check before the share READ, or keep the new record after share denial.
@@ -732,7 +777,10 @@ fn create_context_denied_share_creates_nothing() {
     seed_context(&mut fixture.state, SHARE_CONTEXT);
     let calls = deny_policy(&mut fixture, SHARE_CONTEXT, AccessMode::READ);
     let bytes = dispatch(
-        &mut fixture,
+        &mut fixture.state,
+        &mut fixture.backend,
+        CLIENT,
+        &mut fixture.peer,
         x11glx::CREATE_CONTEXT,
         &create_context_body(x11glx::CREATE_CONTEXT, NEW_CONTEXT, SHARE_CONTEXT),
     );
@@ -745,16 +793,19 @@ fn create_context_denied_share_creates_nothing() {
             ResourceKind::GlxContext,
             AccessMode::READ,
         )],
+        CLIENT,
         x11glx::CREATE_CONTEXT,
     );
     assert!(fixture.backend.calls().is_empty());
 }
 
 // Mutation: parse SwapBuffers' contextTag at body[0..4] as its drawable; the drawable denial
-// row then fails the policy-error and exact-target assertions. Removing any other GLX denial
-// check also fails its row below.
+// row then fails the policy-error and exact-target assertions. Releasing a GLX pixmap export
+// before its DESTROY check fails the backend-call assertion in the export-backed destroy rows.
 #[test]
 fn glx_access_deny_table_returns_error_and_preserves_state() {
+    use crate::backend::{Backend, recording::RecordedCall};
+
     struct DenyRow {
         minor: u8,
         body: Vec<u8>,
@@ -1139,6 +1190,25 @@ fn glx_access_deny_table_returns_error_and_preserves_state() {
     for row in rows {
         let mut fixture = fixture();
         (row.seed)(&mut fixture.state);
+        if matches!(
+            row.minor,
+            x11glx::DESTROY_GLX_PIXMAP | x11glx::DESTROY_PIXMAP
+        ) {
+            let host = fixture
+                .backend
+                .create_pixmap(None, 24, 8, 8)
+                .expect("seed exported GLX pixmap host");
+            let host_xid = host.as_raw();
+            fixture
+                .state
+                .glx_drawables
+                .get_mut(&DRAWABLE.0)
+                .expect("seeded GLX pixmap")
+                .glx_export_host_xid = Some(host_xid);
+            fixture.backend.acquire_glx_pixmap_export(host_xid);
+            assert!(fixture.backend.glx_pixmap_exports.contains_key(&host_xid));
+        }
+        let backend_before = fixture.backend.calls();
         let before = format!(
             "contexts={:?};drawables={:?};tag={};pbuffer_pixmap={:?}",
             fixture.state.glx_contexts,
@@ -1147,7 +1217,14 @@ fn glx_access_deny_table_returns_error_and_preserves_state() {
             fixture.state.resources.pixmap(PBUFFER)
         );
         let calls = deny_policy(&mut fixture, row.target, row.mode);
-        let bytes = dispatch(&mut fixture, row.minor, &row.body);
+        let bytes = dispatch(
+            &mut fixture.state,
+            &mut fixture.backend,
+            CLIENT,
+            &mut fixture.peer,
+            row.minor,
+            &row.body,
+        );
         assert_policy_error(&bytes, row.minor);
         if let Some(id) = row.absent_after {
             assert!(!fixture.state.glx_contexts.contains_key(&id.0));
@@ -1164,8 +1241,19 @@ fn glx_access_deny_table_returns_error_and_preserves_state() {
             "GLX state changed on denial for minor {}",
             row.minor
         );
-        assert!(fixture.backend.calls().is_empty());
-        assert_recorded(&calls.lock().unwrap(), &row.expected, row.minor);
+        let backend_after = fixture.backend.calls();
+        assert_eq!(
+            backend_after, backend_before,
+            "backend calls changed on denied GLX destroy minor {}",
+            row.minor
+        );
+        assert!(
+            !backend_after
+                .iter()
+                .skip(backend_before.len())
+                .any(|call| matches!(call, RecordedCall::ReleaseGlxPixmapExport(_)))
+        );
+        assert_recorded(&calls.lock().unwrap(), &row.expected, CLIENT, row.minor);
     }
 }
 
@@ -1214,13 +1302,27 @@ fn unsupported_glx_requests_keep_their_reply_and_error_without_checks() {
         seed_context_and_drawable(&mut no_policy.state);
         seed_window(&mut no_policy.state, WINDOW);
         seed_pixmap(&mut no_policy.state, PIXMAP);
-        let no_policy_bytes = dispatch(&mut no_policy, minor, &body);
+        let no_policy_bytes = dispatch(
+            &mut no_policy.state,
+            &mut no_policy.backend,
+            CLIENT,
+            &mut no_policy.peer,
+            minor,
+            &body,
+        );
         let mut fixture = fixture();
         seed_context_and_drawable(&mut fixture.state);
         seed_window(&mut fixture.state, WINDOW);
         seed_pixmap(&mut fixture.state, PIXMAP);
         let calls = deny_all_policy(&mut fixture);
-        let bytes = dispatch(&mut fixture, minor, &body);
+        let bytes = dispatch(
+            &mut fixture.state,
+            &mut fixture.backend,
+            CLIENT,
+            &mut fixture.peer,
+            minor,
+            &body,
+        );
         assert_eq!(bytes, no_policy_bytes, "deny-all changed minor {minor}");
         if let Some(code) = error {
             assert_error(&bytes, code, 0, minor);
@@ -1391,8 +1493,15 @@ fn glx_drawable_access_ask_table_records_all_targets() {
         let mut fixture = fixture();
         seed(&mut fixture.state);
         let calls = allow_policy(&mut fixture);
-        let _bytes = dispatch(&mut fixture, minor, &body);
-        assert_recorded(&calls.lock().unwrap(), &expected, minor);
+        let _bytes = dispatch(
+            &mut fixture.state,
+            &mut fixture.backend,
+            CLIENT,
+            &mut fixture.peer,
+            minor,
+            &body,
+        );
+        assert_recorded(&calls.lock().unwrap(), &expected, CLIENT, minor);
     }
 }
 
@@ -1404,7 +1513,10 @@ fn create_pbuffer_denied_creates_no_record_and_no_backing() {
         let mut fixture = fixture();
         let calls = deny_kind_policy(&mut fixture, PBUFFER, kind, AccessMode::CREATE);
         let bytes = dispatch(
-            &mut fixture,
+            &mut fixture.state,
+            &mut fixture.backend,
+            CLIENT,
+            &mut fixture.peer,
             x11glx::CREATE_PBUFFER,
             &create_pbuffer_body(PBUFFER),
         );
@@ -1420,7 +1532,12 @@ fn create_pbuffer_denied_creates_no_record_and_no_backing() {
                 creation_target(PBUFFER, ResourceKind::Pixmap, None),
             ]
         };
-        assert_recorded(&calls.lock().unwrap(), &expected, x11glx::CREATE_PBUFFER);
+        assert_recorded(
+            &calls.lock().unwrap(),
+            &expected,
+            CLIENT,
+            x11glx::CREATE_PBUFFER,
+        );
     }
 }
 
@@ -1454,8 +1571,9 @@ fn destroy_pbuffer_denied_core_pixmap_is_kept() {
         ResourceKind::Pixmap,
         AccessMode::DESTROY,
     );
-    let bytes = dispatch_as(
-        &mut denied,
+    let bytes = dispatch(
+        &mut denied.state,
+        &mut denied.backend,
         ClientId(2),
         &mut other_peer,
         x11glx::DESTROY_PBUFFER,
@@ -1472,28 +1590,11 @@ fn destroy_pbuffer_denied_core_pixmap_is_kept() {
             .iter()
             .any(|call| matches!(call, RecordedCall::FreePixmap(_)))
     );
-    let calls = calls.lock().unwrap();
-    let resources = calls
-        .iter()
-        .filter(|call| call.hook == ExtensionHook::Resource)
-        .collect::<Vec<_>>();
-    assert_eq!(resources.len(), 1);
-    let call = resources[0];
-    assert_eq!(call.hook, ExtensionHook::Resource);
-    assert_eq!(call.client, ClientId(2));
-    assert_eq!(
-        call.target,
-        Some(existing(PBUFFER, ResourceKind::Pixmap, AccessMode::DESTROY).target)
-    );
-    assert_eq!(call.mode, Some(AccessMode::DESTROY));
-    assert_eq!(call.owner, Some(CLIENT));
-    assert_eq!(call.target_owner, Some(CLIENT));
-    assert_eq!(
-        call.request,
-        Some(RequestOpcodes {
-            major: crate::nested::GLX_MAJOR_OPCODE,
-            minor: x11glx::DESTROY_PBUFFER,
-        })
+    assert_recorded(
+        &calls.lock().unwrap(),
+        &[existing(PBUFFER, ResourceKind::Pixmap, AccessMode::DESTROY)],
+        ClientId(2),
+        x11glx::DESTROY_PBUFFER,
     );
 
     let mut no_policy = fixture();
@@ -1518,8 +1619,9 @@ fn destroy_pbuffer_denied_core_pixmap_is_kept() {
             .resources
             .set_pixmap_host_xid(PBUFFER, no_policy_host)
     );
-    let bytes = dispatch_as(
-        &mut no_policy,
+    let bytes = dispatch(
+        &mut no_policy.state,
+        &mut no_policy.backend,
         ClientId(2),
         &mut no_policy_peer,
         x11glx::DESTROY_PBUFFER,
@@ -1554,8 +1656,9 @@ fn destroy_pbuffer_denied_core_pixmap_is_kept() {
         ResourceKind::Pixmap,
         AccessMode::DESTROY,
     );
-    let bytes = dispatch_as(
-        &mut with_glx_record,
+    let bytes = dispatch(
+        &mut with_glx_record.state,
+        &mut with_glx_record.backend,
         ClientId(2),
         &mut other_peer,
         x11glx::DESTROY_PBUFFER,
@@ -1565,36 +1668,15 @@ fn destroy_pbuffer_denied_core_pixmap_is_kept() {
     assert!(!with_glx_record.state.glx_drawables.contains_key(&PBUFFER.0));
     assert!(with_glx_record.state.resources.pixmap(PBUFFER).is_some());
     assert_eq!(with_glx_record.backend.calls(), backend_before);
-    let calls = calls.lock().unwrap();
-    let resources = calls
-        .iter()
-        .filter(|call| call.hook == ExtensionHook::Resource)
-        .collect::<Vec<_>>();
-    assert_eq!(resources.len(), 2);
-    assert_eq!(resources[0].client, ClientId(2));
-    assert_eq!(
-        resources[0].target,
-        Some(existing(PBUFFER, ResourceKind::GlxDrawable, AccessMode::DESTROY,).target)
+    assert_recorded(
+        &calls.lock().unwrap(),
+        &[
+            existing(PBUFFER, ResourceKind::GlxDrawable, AccessMode::DESTROY),
+            existing(PBUFFER, ResourceKind::Pixmap, AccessMode::DESTROY),
+        ],
+        ClientId(2),
+        x11glx::DESTROY_PBUFFER,
     );
-    assert_eq!(resources[0].mode, Some(AccessMode::DESTROY));
-    assert_eq!(resources[1].client, ClientId(2));
-    assert_eq!(
-        resources[1].target,
-        Some(existing(PBUFFER, ResourceKind::Pixmap, AccessMode::DESTROY).target)
-    );
-    assert_eq!(resources[1].mode, Some(AccessMode::DESTROY));
-    assert!(
-        resources
-            .iter()
-            .all(|call| call.owner == Some(CLIENT) && call.target_owner == Some(CLIENT))
-    );
-    assert!(resources.iter().all(|call| {
-        call.request
-            == Some(RequestOpcodes {
-                major: crate::nested::GLX_MAJOR_OPCODE,
-                minor: x11glx::DESTROY_PBUFFER,
-            })
-    }));
 }
 
 // Mutation: check SET_ATTR only after applying GLX_EVENT_MASK; the denied update must leave the
@@ -1612,7 +1694,10 @@ fn change_drawable_attributes_denied_keeps_event_mask() {
     let before = fixture.state.glx_drawables[&DRAWABLE.0].clone();
     let calls = deny_policy(&mut fixture, DRAWABLE, AccessMode::SET_ATTR);
     let bytes = dispatch(
-        &mut fixture,
+        &mut fixture.state,
+        &mut fixture.backend,
+        CLIENT,
+        &mut fixture.peer,
         x11glx::CHANGE_DRAWABLE_ATTRIBUTES,
         &words(&[DRAWABLE.0, 1, x11glx::GLX_EVENT_MASK, 0x22]),
     );
@@ -1625,6 +1710,7 @@ fn change_drawable_attributes_denied_keeps_event_mask() {
             ResourceKind::GlxDrawable,
             AccessMode::SET_ATTR,
         )],
+        CLIENT,
         x11glx::CHANGE_DRAWABLE_ATTRIBUTES,
     );
 }
@@ -1663,7 +1749,10 @@ fn bind_tex_image_denied_does_not_retarget() {
         let backend_before = fixture.backend.calls();
         let calls = deny_policy(&mut fixture, DRAWABLE, AccessMode::READ);
         let bytes = dispatch(
-            &mut fixture,
+            &mut fixture.state,
+            &mut fixture.backend,
+            CLIENT,
+            &mut fixture.peer,
             minor,
             &tex_image_body(x11glx::VENDOR_CODE_BIND_TEX_IMAGE, DRAWABLE),
         );
@@ -1677,6 +1766,7 @@ fn bind_tex_image_denied_does_not_retarget() {
                 ResourceKind::GlxDrawable,
                 AccessMode::READ,
             )],
+            CLIENT,
             minor,
         );
     }
@@ -1753,26 +1843,43 @@ fn glx_drawable_destroy_unresolved_ids_keep_existing_behavior() {
     for (minor, body, seed, expected, error) in rows {
         let mut no_policy = fixture();
         seed(&mut no_policy.state);
-        let no_policy_bytes = dispatch(&mut no_policy, minor, &body);
+        let no_policy_bytes = dispatch(
+            &mut no_policy.state,
+            &mut no_policy.backend,
+            CLIENT,
+            &mut no_policy.peer,
+            minor,
+            &body,
+        );
 
         let mut fixture = fixture();
         seed(&mut fixture.state);
         let calls = allow_policy(&mut fixture);
-        let bytes = dispatch(&mut fixture, minor, &body);
+        let bytes = dispatch(
+            &mut fixture.state,
+            &mut fixture.backend,
+            CLIENT,
+            &mut fixture.peer,
+            minor,
+            &body,
+        );
         assert_eq!(bytes, no_policy_bytes, "minor {minor} changed with policy");
         if let Some((code, value)) = error {
             assert_error(&bytes, code, value, minor);
         } else {
             assert!(bytes.is_empty(), "minor {minor} should keep its success");
         }
-        assert_recorded(&calls.lock().unwrap(), &expected, minor);
+        assert_recorded(&calls.lock().unwrap(), &expected, CLIENT, minor);
     }
 
     let mut with_pixmap = fixture();
     seed_pixmap(&mut with_pixmap.state, PIXMAP);
     let calls = allow_policy(&mut with_pixmap);
     let bytes = dispatch(
-        &mut with_pixmap,
+        &mut with_pixmap.state,
+        &mut with_pixmap.backend,
+        CLIENT,
+        &mut with_pixmap.peer,
         x11glx::DESTROY_PBUFFER,
         &words(&[PIXMAP.0]),
     );
@@ -1781,6 +1888,7 @@ fn glx_drawable_destroy_unresolved_ids_keep_existing_behavior() {
     assert_recorded(
         &calls.lock().unwrap(),
         &[existing(PIXMAP, ResourceKind::Pixmap, AccessMode::DESTROY)],
+        CLIENT,
         x11glx::DESTROY_PBUFFER,
     );
 }
