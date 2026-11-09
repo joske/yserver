@@ -543,6 +543,7 @@ fn dispatch_fake_input_with_body(
                         evcode: crate::server::XI_FIRST_EVENT
                             + crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET,
                         detail: 0,
+                        synthetic_repeat: false,
                         time: fi.time,
                         root_x,
                         root_y,

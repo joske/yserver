@@ -19,6 +19,14 @@ use yserver_protocol::{
     x11::{ClientId, RequestHeader, SequenceNumber},
 };
 
+const X_KB_PER_CLIENT_FLAGS: u8 = 21;
+const XKB_PCF_ALL_FLAGS_MASK: u32 = 0x1f;
+const XKB_PCF_AUTO_RESET_CONTROLS_MASK: u32 = 1 << 2;
+const XKB_ALL_BOOLEAN_CONTROLS_MASK: u32 = 0x1fff;
+const XKB_USE_CORE_KEYBOARD: u16 = 0x0100;
+const XKB_USE_CORE_POINTER: u16 = 0x0200;
+const XKB_DEFAULT_XI_ID: u16 = 0x0400;
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_xkb_request(
     state: &mut ServerState,
@@ -40,6 +48,13 @@ pub(super) fn handle_xkb_request(
             u16::from(minor),
             header.opcode,
         );
+    }
+    // KMS owns the core keyboard and its client-specific detectable-repeat
+    // setting. Leave nested host-X11 requests on their existing proxy path.
+    if minor == X_KB_PER_CLIENT_FLAGS
+        && (origin.is_none() || backend.xkb_per_client_flags_in_core())
+    {
+        return handle_per_client_flags(state, backend, client_id, sequence, header, body);
     }
     debug!(
         "client {} #{} XkbProxy minor={}",
@@ -351,6 +366,200 @@ pub(super) fn handle_xkb_request(
         return Ok(write_to_client(client, client_id, &bytes));
     }
     Ok(RequestOutcome::Handled)
+}
+
+fn handle_per_client_flags(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    // xkbPerClientFlagsReq is 28 bytes on the wire: a 4-byte extension
+    // header followed by this exact 24-byte body.
+    if body.len() != 24 {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_LENGTH,
+            0,
+            u16::from(X_KB_PER_CLIENT_FLAGS),
+            header.opcode,
+        );
+    }
+    if !crate::core_loop::xkb_select::xkb_initialized(state, client_id) {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_ACCESS,
+            0,
+            u16::from(X_KB_PER_CLIENT_FLAGS),
+            header.opcode,
+        );
+    }
+
+    let Some(client) = state.clients.get(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    let order = client.byte_order;
+    let u16_at = |offset: usize| {
+        let bytes: [u8; 2] = body[offset..offset + 2]
+            .try_into()
+            .expect("PerClientFlags field is in the exact-size body");
+        match order {
+            x11::ClientByteOrder::LittleEndian => u16::from_le_bytes(bytes),
+            x11::ClientByteOrder::BigEndian => u16::from_be_bytes(bytes),
+        }
+    };
+    let u32_at = |offset: usize| {
+        let bytes: [u8; 4] = body[offset..offset + 4]
+            .try_into()
+            .expect("PerClientFlags field is in the exact-size body");
+        match order {
+            x11::ClientByteOrder::LittleEndian => u32::from_le_bytes(bytes),
+            x11::ClientByteOrder::BigEndian => u32::from_be_bytes(bytes),
+        }
+    };
+    let device_spec = u16_at(0);
+    let change = u32_at(4);
+    let value = u32_at(8);
+    let ctrls_to_change = u32_at(12);
+    let auto_ctrls = u32_at(16);
+    let auto_ctrl_values = u32_at(20);
+
+    // yserver serves the core/default keyboard. Xorg's keyboard lookup
+    // reports BadClass for the core pointer sentinel and BadDevice for other
+    // IDs; _XkbErrCode2 carries the reason and original device spec in the
+    // error value.
+    if !matches!(device_spec, XKB_USE_CORE_KEYBOARD | XKB_DEFAULT_XI_ID) {
+        let reason = if device_spec == XKB_USE_CORE_POINTER {
+            2 // XkbErr_BadClass
+        } else {
+            1 // XkbErr_BadDevice
+        };
+        let error_base = backend
+            .xkb_info()
+            .map_or(0, |(_, _, first_error)| first_error);
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            error_base,
+            crate::core_loop::xkb_select::err_code2(reason, u32::from(device_spec)),
+            u16::from(X_KB_PER_CLIENT_FLAGS),
+            header.opcode,
+        );
+    }
+    if change & !XKB_PCF_ALL_FLAGS_MASK != 0 {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            crate::core_loop::xkb_select::err_code2(0x01, change & !XKB_PCF_ALL_FLAGS_MASK),
+            u16::from(X_KB_PER_CLIENT_FLAGS),
+            header.opcode,
+        );
+    }
+    if value & !change != 0 {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_MATCH,
+            crate::core_loop::xkb_select::err_code2(0x02, value & !change),
+            u16::from(X_KB_PER_CLIENT_FLAGS),
+            header.opcode,
+        );
+    }
+    if change & XKB_PCF_AUTO_RESET_CONTROLS_MASK != 0
+        && value & XKB_PCF_AUTO_RESET_CONTROLS_MASK != 0
+    {
+        if ctrls_to_change & !XKB_ALL_BOOLEAN_CONTROLS_MASK != 0 {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                crate::core_loop::xkb_select::err_code2(
+                    0x03,
+                    ctrls_to_change & !XKB_ALL_BOOLEAN_CONTROLS_MASK,
+                ),
+                u16::from(X_KB_PER_CLIENT_FLAGS),
+                header.opcode,
+            );
+        }
+        if auto_ctrls & !ctrls_to_change != 0 {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_MATCH,
+                crate::core_loop::xkb_select::err_code2(0x04, auto_ctrls & !ctrls_to_change),
+                u16::from(X_KB_PER_CLIENT_FLAGS),
+                header.opcode,
+            );
+        }
+        if auto_ctrl_values & !auto_ctrls != 0 {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_MATCH,
+                crate::core_loop::xkb_select::err_code2(0x05, auto_ctrl_values & !auto_ctrls),
+                u16::from(X_KB_PER_CLIENT_FLAGS),
+                header.opcode,
+            );
+        }
+    }
+
+    // All checks precede mutation. Preserve other PerClientFlags bits, and
+    // maintain AutoResetControls only because its values are part of this
+    // request's reply; only DetectableAutoRepeat affects event delivery.
+    let xkb = state.xkb_clients.entry(client_id.0).or_default();
+    xkb.per_client_flags = (xkb.per_client_flags & !change) | value;
+    if change & XKB_PCF_AUTO_RESET_CONTROLS_MASK != 0 {
+        if value & XKB_PCF_AUTO_RESET_CONTROLS_MASK == 0 {
+            xkb.auto_reset_ctrls = 0;
+            xkb.auto_reset_ctrl_values = 0;
+        } else {
+            xkb.auto_reset_ctrls =
+                (xkb.auto_reset_ctrls & !ctrls_to_change) | (auto_ctrls & ctrls_to_change);
+            xkb.auto_reset_ctrl_values = (xkb.auto_reset_ctrl_values & !ctrls_to_change)
+                | (auto_ctrl_values & ctrls_to_change);
+        }
+    }
+    let flags = *xkb;
+    let mut reply = [0u8; 32];
+    reply[0] = 1;
+    reply[1] = 1;
+    let put_u16 = |out: &mut [u8], value: u16| {
+        out.copy_from_slice(&match order {
+            x11::ClientByteOrder::LittleEndian => value.to_le_bytes(),
+            x11::ClientByteOrder::BigEndian => value.to_be_bytes(),
+        });
+    };
+    let put_u32 = |out: &mut [u8], value: u32| {
+        out.copy_from_slice(&match order {
+            x11::ClientByteOrder::LittleEndian => value.to_le_bytes(),
+            x11::ClientByteOrder::BigEndian => value.to_be_bytes(),
+        });
+    };
+    put_u16(&mut reply[2..4], sequence.0);
+    put_u32(&mut reply[8..12], XKB_PCF_ALL_FLAGS_MASK);
+    put_u32(
+        &mut reply[12..16],
+        flags.per_client_flags & XKB_PCF_ALL_FLAGS_MASK,
+    );
+    put_u32(&mut reply[16..20], flags.auto_reset_ctrls);
+    put_u32(&mut reply[20..24], flags.auto_reset_ctrl_values);
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    Ok(write_to_client(client, client_id, &reply))
 }
 
 /// Write `sequence` into bytes 2..4 of a reply a backend built, in the

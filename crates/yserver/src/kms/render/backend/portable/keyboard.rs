@@ -890,7 +890,6 @@ impl<P: Platform> XBackend<P> {
                 intern_atom,
             )),
             17 => Some(or_error(reply::reply_get_names(desc, body, intern_atom))),
-            21 => Some(xkb_replies::reply_per_client_flags(body)),
             22 => Some(xkb_replies::reply_minimal(22)),
             24 => Some(xkb_replies::reply_get_device_info()),
             19 | 23 | 101 => Some(xkb_replies::reply_minimal(minor)),

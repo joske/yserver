@@ -1111,7 +1111,7 @@ fn xi_dynamic_grabs_slave_keyboard_replay_reattaches_and_replays_to_focus() {
             .and_then(|freeze| freeze.stored.as_ref()),
         Some(
             crate::server::QueuedInputEvent::HostKey(_)
-                | crate::server::QueuedInputEvent::HostKeyTransition(_, _)
+                | crate::server::QueuedInputEvent::HostKeyTransition(_, _, _)
         )
     ));
     assert!(

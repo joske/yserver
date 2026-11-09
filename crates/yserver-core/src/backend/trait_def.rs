@@ -694,6 +694,11 @@ pub trait Backend {
     fn render_opcode(&self) -> Option<u8>;
     fn xkb_opcode(&self) -> Option<u8>;
     fn xkb_info(&self) -> Option<(u8, u8, u8)>;
+    /// Whether this backend serves XKB `PerClientFlags` from the core's
+    /// per-client state. The nested host-X11 backend keeps proxying it.
+    fn xkb_per_client_flags_in_core(&self) -> bool {
+        false
+    }
     /// Set the authoritative locked keyboard group (read by
     /// `serialize_modifiers` into key-event group bits). Default no-op for
     /// backends without an XKB keymap.

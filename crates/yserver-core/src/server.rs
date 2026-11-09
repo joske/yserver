@@ -116,9 +116,9 @@ impl Default for IdAllocator {
     }
 }
 
-/// Xorg's per-client XKB state (`ClientRec`, xkb/xkb.c): whether the
-/// client called XkbUseExtension, and the two XkbSelectEvents detail masks
-/// Xorg keeps per client rather than per device.
+/// Xorg's per-client XKB state (`ClientRec`, xkb/xkb.c): XKB initialization,
+/// `PerClientFlags`, and the event detail masks Xorg keeps per client rather
+/// than per device.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct XkbClientState {
     /// `_XkbClientInitialized`: a successful XkbUseExtension. Every other
@@ -130,6 +130,22 @@ pub struct XkbClientState {
     pub map_notify_mask: u16,
     /// `newKeyboardNotifyMask`: the XkbNewKeyboardNotify details selected.
     pub new_keyboard_notify_mask: u16,
+    /// XKB `PerClientFlags` value (`XkbPCF_AllFlagsMask` subset).
+    /// Kept with the existing client-owned XKB state so it is removed with
+    /// the client and cannot leak between connections.
+    pub per_client_flags: u32,
+    /// `PerClientFlags` AutoResetControls state, reported in its reply.
+    pub auto_reset_ctrls: u32,
+    pub auto_reset_ctrl_values: u32,
+}
+
+impl XkbClientState {
+    /// Whether this client requested XKB DetectableAutoRepeat.
+    #[must_use]
+    pub(crate) fn wants_detectable_auto_repeat(self) -> bool {
+        // XkbPCF_DetectableAutoRepeatMask.
+        self.per_client_flags & 1 != 0
+    }
 }
 
 /// One client's interest in one XKB device (`XkbInterestRec`): the
@@ -437,8 +453,8 @@ pub enum QueuedInputEvent {
     HostKey(crate::host_x11::HostKeyEvent),
     /// A key already processed through the per-device/master guards. Keep the
     /// accepted master edge with frozen delivery so thaw cannot infer a new
-    /// transition from later held state.
-    HostKeyTransition(crate::host_x11::HostKeyEvent, bool),
+    /// transition from later held state, and retain the synthetic-repeat marker.
+    HostKeyTransition(crate::host_x11::HostKeyEvent, bool, bool),
     Xi1Routed(Xi1QueuedEvent),
     /// The master-keyboard form of an XI2 raw key event, queued behind a
     /// frozen keyboard in input order (Xorg enqueues the master's
@@ -586,6 +602,9 @@ pub struct Xi1QueuedEvent {
     /// Absolute XI1 wire event code (XI_FIRST_EVENT + offset).
     pub evcode: u8,
     pub detail: u8,
+    /// This key event belongs to the synthetic software auto-repeat pair.
+    /// Pointer events and ordinary device keys keep false.
+    pub synthetic_repeat: bool,
     pub time: u32,
     pub root_x: i16,
     pub root_y: i16,
