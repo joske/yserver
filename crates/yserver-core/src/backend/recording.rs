@@ -680,6 +680,8 @@ pub struct RecordingBackend {
     pub fail_fill_rectangle: bool,
     /// Failure injection for GLX pbuffer backing allocation tests.
     pub create_pixmap_fails: bool,
+    /// Failure injection for the rollback path of MIT-SHM CreatePixmap.
+    pub free_pixmap_fails: bool,
     /// The next `open_font` records its call and returns this error kind.
     /// Used to drive reset's fatal default-font reinstall boundary.
     pub fail_open_font: Option<io::ErrorKind>,
@@ -854,6 +856,7 @@ impl RecordingBackend {
             fail_copy_area: false,
             fail_fill_rectangle: false,
             create_pixmap_fails: false,
+            free_pixmap_fails: false,
             fail_open_font: None,
             present_direct_result: false,
             reallocate_fails: false,
@@ -2134,6 +2137,10 @@ impl Backend for RecordingBackend {
     }
 
     fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        if self.free_pixmap_fails {
+            self.record(RecordedCall::FreePixmap(host_xid));
+            return Err(io::Error::other("free_pixmap failure injected"));
+        }
         self.live_pixmaps.remove(&host_xid);
         self.record(RecordedCall::FreePixmap(host_xid));
         Ok(())

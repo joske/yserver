@@ -9,8 +9,12 @@ use crate::{
     backend::PixmapHandle,
 };
 use std::{
-    os::fd::{AsRawFd, IntoRawFd, OwnedFd},
-    sync::{Arc, Mutex},
+    io::Read,
+    os::{
+        fd::{AsRawFd, IntoRawFd, OwnedFd},
+        unix::net::UnixStream,
+    },
+    sync::{Arc, Mutex, OnceLock},
 };
 use yserver_protocol::x11::{
     CreateGcRequest, CreatePixmapRequest, ResourceId,
@@ -30,6 +34,37 @@ const DENY_ERROR: DenyError = DenyError {
     code: x11::error::BAD_ACCESS,
     value: 0xA55A_1234,
 };
+
+struct WarningCapture;
+
+static WARNING_CAPTURE: WarningCapture = WarningCapture;
+static WARNING_MESSAGES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static WARNING_CAPTURE_INIT: OnceLock<()> = OnceLock::new();
+
+impl log::Log for WarningCapture {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Warn
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            WARNING_MESSAGES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(record.args().to_string());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn warning_messages() -> &'static Mutex<Vec<String>> {
+    WARNING_CAPTURE_INIT.get_or_init(|| {
+        log::set_logger(&WARNING_CAPTURE).expect("install MIT-SHM warning capture");
+        log::set_max_level(log::LevelFilter::Warn);
+    });
+    &WARNING_MESSAGES
+}
 
 struct ShmFixture {
     state: ServerState,
@@ -96,6 +131,11 @@ fn test_shm_fd() -> OwnedFd {
     let fd = crate::anon_shm::create_anon_shm(c"access-shm-test").expect("create test shm fd");
     assert_eq!(unsafe { libc::ftruncate(fd.as_raw_fd(), 4096) }, 0);
     fd
+}
+
+fn test_shm_socket_fd() -> (OwnedFd, UnixStream) {
+    let (fd, peer) = UnixStream::pair().expect("create test socket pair");
+    (OwnedFd::from(fd), peer)
 }
 
 fn install_segment(state: &mut ServerState, id: ResourceId, read_only: bool) {
@@ -792,6 +832,61 @@ fn shm_create_pixmap_denied_segment_frees_allocation() {
 }
 
 #[test]
+fn shm_create_pixmap_keeps_policy_error_when_rollback_fails() {
+    // Mutation: omit the cleanup-error warn!; this must fail at the captured-warning assertion.
+    let warnings = warning_messages();
+    warnings
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    let mut fixture = shm_fixture();
+    install_segment(&mut fixture.state, SEGMENT, false);
+    fixture.backend.free_pixmap_fails = true;
+    let calls = install_deny_policy(&mut fixture, SEGMENT, AccessMode::READ);
+    let bytes = dispatch(
+        &mut fixture,
+        shm::CREATE_PIXMAP,
+        &create_pixmap_body(NEW_PIXMAP, SEGMENT),
+        None,
+        1,
+    );
+
+    assert_policy_error(&bytes, shm::CREATE_PIXMAP);
+    assert_resource_calls(
+        &calls.lock().unwrap(),
+        &[
+            existing(DRAWABLE, ResourceKind::Pixmap, AccessMode::GET_ATTR),
+            pixmap_creation(NEW_PIXMAP),
+            existing(SEGMENT, ResourceKind::ShmSegment, AccessMode::READ),
+        ],
+        shm::CREATE_PIXMAP,
+    );
+    assert!(fixture.state.resources.pixmap(NEW_PIXMAP).is_none());
+    assert_eq!(
+        fixture.backend.calls(),
+        vec![
+            crate::backend::recording::RecordedCall::CreatePixmap {
+                depth: 24,
+                width: 4,
+                height: 4,
+            },
+            crate::backend::recording::RecordedCall::FreePixmap(0x0001_0000),
+        ]
+    );
+    assert!(fixture.backend.live_pixmaps.contains(&0x0001_0000));
+    assert!(
+        warnings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|message| message.contains(
+                "MIT-SHM::CreatePixmap could not free host pixmap 0x10000 after segment access denial: free_pixmap failure injected"
+            )),
+        "rollback failure should be logged"
+    );
+}
+
+#[test]
 fn shm_get_image_denied_drawable_reads_back_nothing() {
     // Mutation: move the drawable READ check after backend.get_image; this test must observe its readback counter increase.
     let mut fixture = shm_fixture();
@@ -856,8 +951,9 @@ fn denied_shm_segment_creations_leave_no_mapping_or_fd() {
 
     let mut attach_fd = shm_fixture();
     let calls = install_deny_policy(&mut attach_fd, ATTACH_FD_SEGMENT, AccessMode::CREATE);
-    let fd = test_shm_fd();
-    let raw_fd = fd.as_raw_fd();
+    // Mutation: leak the denied AttachFd descriptor; the retained peer must no longer see EOF.
+    let (fd, mut peer) = test_shm_socket_fd();
+    peer.set_nonblocking(true).expect("set peer nonblocking");
     let attach_fd_error = dispatch(
         &mut attach_fd,
         shm::ATTACH_FD,
@@ -872,15 +968,11 @@ fn denied_shm_segment_creations_leave_no_mapping_or_fd() {
             .mit_shm_segments
             .contains_key(&ATTACH_FD_SEGMENT.0)
     );
+    let mut byte = [0u8; 1];
     assert_eq!(
-        unsafe { libc::fcntl(raw_fd, libc::F_GETFD) },
-        -1,
+        peer.read(&mut byte).expect("read denied AttachFd peer"),
+        0,
         "denied AttachFd closes the unconsumed descriptor"
-    );
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::EBADF),
-        "descriptor was closed"
     );
     assert_resource_calls(
         &calls.lock().unwrap(),

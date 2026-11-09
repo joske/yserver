@@ -23,6 +23,32 @@ use yserver_protocol::{
     x11::{ClientId, RequestHeader, ResourceId, SequenceNumber},
 };
 
+macro_rules! check_shm_segment_creation {
+    ($state:ident, $client_id:ident, $sequence:ident, $id:expr, $request:ident $(,)?) => {
+        crate::core_loop::process_request::return_on_access_denial!(
+            validate_resource_access(
+                $state,
+                $client_id,
+                ResourceTarget {
+                    owner: None,
+                    id: ResourceId($id),
+                    kind: ResourceKind::ShmSegment,
+                    creation: Some(Creation {
+                        parent: None,
+                        owner: $client_id,
+                    }),
+                },
+                AccessMode::CREATE,
+                $request,
+            ),
+            $state,
+            $client_id,
+            $sequence,
+            $request,
+        );
+    };
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_mit_shm_request(
     state: &mut ServerState,
@@ -37,6 +63,10 @@ pub(super) fn handle_mit_shm_request(
     use yserver_protocol::x11::mit_shm as shm;
     const MIT_SHM_MAJOR_OPCODE: u8 = 130;
     let minor = header.data;
+    let access_request = RequestOpcodes {
+        major: MIT_SHM_MAJOR_OPCODE,
+        minor,
+    };
     debug!(
         "client {} #{} MIT-SHM dispatch minor={minor} body_len={}",
         client_id.0,
@@ -75,34 +105,7 @@ pub(super) fn handle_mit_shm_request(
                     MIT_SHM_MAJOR_OPCODE,
                 );
             };
-            if let Err((code, value)) = validate_resource_access(
-                state,
-                client_id,
-                ResourceTarget {
-                    owner: None,
-                    id: ResourceId(req.shmseg),
-                    kind: ResourceKind::ShmSegment,
-                    creation: Some(Creation {
-                        parent: None,
-                        owner: client_id,
-                    }),
-                },
-                AccessMode::CREATE,
-                RequestOpcodes {
-                    major: MIT_SHM_MAJOR_OPCODE,
-                    minor,
-                },
-            ) {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    code,
-                    value,
-                    u16::from(minor),
-                    MIT_SHM_MAJOR_OPCODE,
-                );
-            }
+            check_shm_segment_creation!(state, client_id, sequence, req.shmseg, access_request,);
             match crate::server::MitShmSegment::from_shmid(client_id, req.shmid, req.read_only) {
                 Ok(segment) => {
                     state.mit_shm_segments.insert(req.shmseg, segment);
@@ -147,34 +150,7 @@ pub(super) fn handle_mit_shm_request(
                     MIT_SHM_MAJOR_OPCODE,
                 );
             };
-            if let Err((code, value)) = validate_resource_access(
-                state,
-                client_id,
-                ResourceTarget {
-                    owner: None,
-                    id: ResourceId(req.shmseg),
-                    kind: ResourceKind::ShmSegment,
-                    creation: Some(Creation {
-                        parent: None,
-                        owner: client_id,
-                    }),
-                },
-                AccessMode::CREATE,
-                RequestOpcodes {
-                    major: MIT_SHM_MAJOR_OPCODE,
-                    minor,
-                },
-            ) {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    code,
-                    value,
-                    u16::from(minor),
-                    MIT_SHM_MAJOR_OPCODE,
-                );
-            }
+            check_shm_segment_creation!(state, client_id, sequence, req.shmseg, access_request,);
             // OwnedFd carries an automatic close-on-drop; from_fd takes
             // raw and assumes ownership transfer.
             let raw = std::os::fd::IntoRawFd::into_raw_fd(fd);
@@ -449,8 +425,14 @@ fn handle_mit_shm_create_pixmap(
             minor: shm::CREATE_PIXMAP,
         },
     ) {
-        if let Some(host_xid) = host_xid {
-            let _ = backend.free_pixmap(origin, host_xid.as_raw());
+        if let Some(host_xid) = host_xid
+            && let Err(err) = backend.free_pixmap(origin, host_xid.as_raw())
+        {
+            log::warn!(
+                "client {} MIT-SHM::CreatePixmap could not free host pixmap 0x{:x} after segment access denial: {err}",
+                client_id.0,
+                host_xid.as_raw(),
+            );
         }
         return emit_x11_error_with_minor(
             state,
@@ -907,34 +889,11 @@ fn handle_mit_shm_create_segment(
             MIT_SHM_MAJOR_OPCODE,
         );
     }
-    if let Err((code, value)) = validate_resource_access(
-        state,
-        client_id,
-        ResourceTarget {
-            owner: None,
-            id: ResourceId(req.shmseg),
-            kind: ResourceKind::ShmSegment,
-            creation: Some(Creation {
-                parent: None,
-                owner: client_id,
-            }),
-        },
-        AccessMode::CREATE,
-        RequestOpcodes {
-            major: MIT_SHM_MAJOR_OPCODE,
-            minor: shm::CREATE_SEGMENT,
-        },
-    ) {
-        return emit_x11_error_with_minor(
-            state,
-            client_id,
-            sequence,
-            code,
-            value,
-            u16::from(shm::CREATE_SEGMENT),
-            MIT_SHM_MAJOR_OPCODE,
-        );
-    }
+    let access_request = RequestOpcodes {
+        major: MIT_SHM_MAJOR_OPCODE,
+        minor: shm::CREATE_SEGMENT,
+    };
+    check_shm_segment_creation!(state, client_id, sequence, req.shmseg, access_request);
     let Ok(fd) = crate::anon_shm::create_anon_shm(c"yserver-shm").map(IntoRawFd::into_raw_fd)
     else {
         return emit_x11_error_with_minor(
