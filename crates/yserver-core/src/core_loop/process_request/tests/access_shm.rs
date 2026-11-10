@@ -327,16 +327,7 @@ fn assert_resource_calls(actual: &[RecordedExtensionCheck], expected: &[Expected
 }
 
 fn assert_policy_error(bytes: &[u8], minor: u8) {
-    let mut expected = vec![0, DENY_ERROR.code];
-    expected.extend_from_slice(&1u16.to_le_bytes());
-    expected.extend_from_slice(&DENY_ERROR.value.to_le_bytes());
-    expected.extend_from_slice(&u16::from(minor).to_le_bytes());
-    expected.push(130);
-    expected.extend_from_slice(&[0; 21]);
-    assert_eq!(
-        bytes, expected,
-        "MIT-SHM policy error is forwarded verbatim"
-    );
+    assert_x_error(bytes, DENY_ERROR.code, DENY_ERROR.value, minor);
 }
 
 fn assert_x_error(bytes: &[u8], code: u8, value: u32, minor: u8) {
@@ -845,7 +836,7 @@ fn shm_create_pixmap_undersized_segment_allocates_nothing() {
 
 #[test]
 fn shm_create_pixmap_valid_segment_allocates_exactly_once() {
-    // Mutation: skip backend.create_pixmap after all segment checks pass; the exact call count must catch it.
+    // Mutation: skip backend.create_pixmap or the upload; their exact call records must catch it.
     let mut fixture = shm_fixture();
     install_segment(&mut fixture.state, SEGMENT, false);
     let bytes = dispatch(
@@ -877,6 +868,24 @@ fn shm_create_pixmap_valid_segment_allocates_exactly_once() {
     let host = pixmap.host_xid.expect("backend pixmap handle").as_raw();
     assert_eq!(fixture.backend.live_pixmaps.len(), 1);
     assert!(fixture.backend.live_pixmaps.contains(&host));
+    let uploads: Vec<_> = calls
+        .iter()
+        .filter_map(|call| match call {
+            crate::backend::recording::RecordedCall::PutImage {
+                host_xid,
+                depth,
+                width,
+                height,
+                ..
+            } => Some((*host_xid, *depth, *width, *height)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        uploads,
+        vec![(host, pixmap.depth, pixmap.width, pixmap.height)],
+        "valid segment uploads once to the registered pixmap with its requested dimensions"
+    );
 }
 
 #[test]
