@@ -47,18 +47,19 @@ fn a_selection_the_server_owns_is_asked_of_the_host() {
 }
 
 /// The server's ConvertSelection of a selection nothing owns is refused to
-/// the host; an owner's SelectionNotify for the server's window is the
-/// host's.
+/// the host, at the request's time; an owner's SelectionNotify for the
+/// server's window is the host's, with the time the owner gave it.
 #[test]
 fn the_server_hears_the_answer_to_its_own_convert_selection() {
     let mut host = RecordingHost::new();
     let primary = AtomId(host.atom("PRIMARY"));
     let utf8 = AtomId(host.atom("UTF8_STRING"));
     let property = AtomId(host.atom("_YSERVER_SELECTION"));
-    selection::convert_selection(&mut host.state, primary, utf8, property).expect("convert");
+    selection::convert_selection(&mut host.state, primary, utf8, property, 77).expect("convert");
     assert_eq!(
         selection::take_selection_events(&mut host.state),
         [SelectionEvent::Notify {
+            time: 77,
             selection: primary,
             target: utf8,
             property: AtomId(0),
@@ -67,6 +68,7 @@ fn the_server_hears_the_answer_to_its_own_convert_selection() {
     // SendEvent (25) of a SelectionNotify to the server's window.
     let mut event = [0u8; 32];
     event[0] = 31;
+    event[4..8].copy_from_slice(&0x1234_u32.to_le_bytes());
     event[8..12].copy_from_slice(&ROOTLESS_SELECTION_WINDOW.0.to_le_bytes());
     event[12..16].copy_from_slice(&primary.0.to_le_bytes());
     event[16..20].copy_from_slice(&utf8.0.to_le_bytes());
@@ -78,11 +80,38 @@ fn the_server_hears_the_answer_to_its_own_convert_selection() {
     assert_eq!(
         selection::take_selection_events(&mut host.state),
         [SelectionEvent::Notify {
+            time: 0x1234,
             selection: primary,
             target: utf8,
             property,
         }]
     );
+}
+
+/// The owner of a selection the server asks for is sent the
+/// SelectionRequest at the server's request's time, which it answers with.
+#[test]
+fn the_owner_is_asked_at_the_servers_requests_time() {
+    let mut host = RecordingHost::new();
+    host.create_window(1, WINDOW, ROOT_WINDOW.0, (0, 0), (10, 10), 0, false);
+    let clipboard = AtomId(host.atom("CLIPBOARD"));
+    let utf8 = AtomId(host.atom("UTF8_STRING"));
+    let property = AtomId(host.atom("_YSERVER_SELECTION"));
+    let out = host.request(1, 22, 0, &words(&[WINDOW, clipboard.0, 0]));
+    assert_no_error(&out, "SetSelectionOwner");
+    host.read(1);
+    for time in [5000, 5001] {
+        selection::convert_selection(&mut host.state, clipboard, utf8, property, time)
+            .expect("convert");
+    }
+    let out = host.read(1);
+    let requests: Vec<&[u8]> = out.chunks(32).filter(|e| e[0] == 30).collect();
+    let word = |event: &[u8], at: usize| u32::from_le_bytes(event[at..at + 4].try_into().unwrap());
+    assert_eq!(requests.len(), 2, "{out:?}");
+    assert_eq!(word(requests[0], 4), 5000);
+    assert_eq!(word(requests[1], 4), 5001);
+    assert_eq!(word(requests[1], 12), ROOTLESS_SELECTION_WINDOW.0);
+    assert!(selection::take_selection_events(&mut host.state).is_empty());
 }
 
 /// The server's SetSelectionOwner takes the selection from a client as
@@ -121,7 +150,7 @@ fn the_server_names_no_atom_or_window_that_is_not_there() {
     );
     assert!(!host.state.selections.contains_key(&missing));
     assert_eq!(
-        selection::convert_selection(&mut host.state, utf8, missing, utf8),
+        selection::convert_selection(&mut host.state, utf8, missing, utf8, 0),
         Err(SelectionError::BadAtom(missing))
     );
     assert_eq!(
