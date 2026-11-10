@@ -92,22 +92,23 @@ every row. Rulings new to this plan:
   are Xorg's original-operand checks. A denial answers the policy's error and leaves the stored attributes as they
   were. Xorg's PanoramiX wrappers have no counterpart (yserver has no multi-screen wrapper), and the separate saver
   hooks are excluded by the spec.
-- **ScreenSaver derived operands (sol r1 B-1).** Activation does not create the window from the original values: it
-  adds override-redirect and replays Xorg's 64-bit `unsigned long` → `XID *` shift (`create_screen_saver_window`), so
-  a scalar the client sent (a pixel) can reach `CreateWindow`, run as `SERVER_OWNER`, as a background pixmap, border
-  pixmap, colormap or cursor. Those effective operands are derived targets of `SetAttributes` (spec, "Operands are
-  not the only targets"): right after the original-operand checks, the request computes the values activation will
-  pass to `CreateWindow`, through the same function activation uses (the materialization is moved out of
-  `create_screen_saver_window` into one function both call; no second copy), and asks each effective background
-  pixmap, border pixmap, colormap and cursor that resolves, with the same modes and sentinels as above, under the
-  requesting client, skipping an effective operand identical in role and id to an original one already asked. A
-  denial answers the policy's error and stores nothing: the stored attributes are the request's only effect, so
-  there is nothing to skip. Activation itself stays unchecked server work. Xorg has the same unchecked path; this is
-  the derived-target rule, not a parity change, and with no policy nothing changes.
-- **Stored saver XIDs are bound by owner, not instance.** yserver stores raw XIDs and activation resolves them later
-  (Xorg holds references). An XID freed and reused before activation can only be reused inside its owner's id range,
-  so the instance activation consumes has the owner that was authorized; a different kind under that id fails
-  `CreateWindow`'s own lookup as today. Recorded as an accepted difference; not changed here.
+- **ScreenSaver effective operands are checked at activation, for the installing client (sol r1 B-1, r2 B-2;
+  option A, chosen by the user 2026-11-10).** Activation does not create the window from the original values: it adds
+  override-redirect and replays Xorg's 64-bit `unsigned long` → `XID *` shift (`create_screen_saver_window`), so a
+  scalar the client sent (a pixel) can reach `CreateWindow`, run as `SERVER_OWNER`, as a background pixmap, border
+  pixmap, colormap or cursor; and yserver stores raw XIDs, so an id that resolved to nothing at `SetAttributes` can
+  resolve to a resource created later. The stored attributes are deferred work of the client that installed them
+  (`SaverAttributes::client`). So, when policies are installed, `create_screen_saver_window` asks, after it has
+  computed the values it passes to `CreateWindow` and before that call, each effective background pixmap `READ`
+  (not `None` / `ParentRelative`), border pixmap `READ` (not `CopyFromParent`), colormap `USE` and cursor `USE` (not
+  `None`) that resolves, as `attrs.client`, with the request opcodes of `SetAttributes` (MIT-SCREEN-SAVER major,
+  minor 3). These are derived targets: a denied one is replaced by its role's neutral value (`None` for a background
+  pixmap and a cursor, `CopyFromParent` for a border pixmap and a colormap) and the window is created with the rest;
+  no error goes anywhere (there is no request to answer). If the replacement makes `CreateWindow` fail, no saver
+  window is shown, as today when `CreateWindow` fails. With no policy the activation path is byte-identical (no
+  check, no replacement). Everything else in activation stays unchecked server work. The `SetAttributes` checks of
+  the original operands (previous ruling) stay as they are; the r1 install-time check of effective operands and the
+  shared materialization function are dropped, since this check covers both cases in one place.
 - **XRes has no site in this PR:** QueryClients, QueryClientResources, QueryClientPixmapBytes and QueryClientIds
   check clients (PR 5); QueryResourceBytes has no resource hook in Xorg. Listed so a reviewer sees it was
   considered.
@@ -160,7 +161,8 @@ not zero. Modes are Xorg's (`include/dixaccess.h`), joined with `|`.
 | Request | Checks, in order |
 |---|---|
 | 1 QueryInfo, 2 SelectInput | drawable `GET_ATTR`, if present (window first, then pixmap, as 3c-i's drawable ruling) |
-| 3 SetAttributes | drawable `GET_ATTR`, after `BadDrawable`; then the value resources, then the derived operands, per the two ScreenSaver rulings |
+| 3 SetAttributes | drawable `GET_ATTR`, after `BadDrawable`; then the original value resources per the first ScreenSaver ruling |
+| (activation) | the effective value operands, as the installing client, per the second ScreenSaver ruling |
 | 4 UnsetAttributes | drawable `GET_ATTR`, after `BadDrawable`, before the owner-specific unset |
 
 ## Review Focus
@@ -177,7 +179,8 @@ not zero. Modes are Xorg's (`include/dixaccess.h`), joined with `|`.
    context's lists; CreateContext inserts nothing.
 4. Borrows: checks run before the mutable property stores in output.rs and before RECORD's mutable context.
 5. Server work stays unchecked: RANDR emitters and deferred CRTC completion, RECORD stream delivery and
-   FutureClients expansion, ScreenSaver activation and the server-created saver window.
+   FutureClients expansion, ScreenSaver activation apart from its effective value operands (the saver window's
+   creation, mapping, cycle and destruction).
 
 ---
 
@@ -270,19 +273,24 @@ registered in `tests/mod.rs`.
   (the client's earlier attributes stay stored and are the ones activation uses; mutation: store before the
   checks); `saver_owner_conflict_precedes_value_checks` (another client's attributes
   stored + denied pixmap: today's `BadAccess`); `saver_query_info_unresolved_drawable_is_not_asked`;
-  `saver_shifted_pixel_becomes_border_pixmap_is_asked` (sol r1 B-1: mask `0x7`, values `[0, P, 0]` with `P` a
-  root-depth pixmap the policy denies `READ`: the policy's error, nothing stored, and with an allow-all policy the
-  ASK row records `P` as `Pixmap` `READ`; no-policy row stores and activates exactly as today; mutation: check only
-  the original operands); `saver_activation_and_check_share_materialization` (the effective values the check asks
-  are the ones activation passes to `CreateWindow`, observed through the created saver window's border; mutation:
-  a check-side copy of the transformation without the 64-bit shift).
+  `saver_activation_denied_shifted_border_pixmap_is_dropped` (sol r1 B-1: mask `0x7`, values `[0, P, 0]` with `P`
+  a root-depth pixmap of another client the policy denies `READ` to the installing client: `SetAttributes` succeeds,
+  activation asks `P` as `Pixmap` `READ` for the installing client with `SetAttributes`' opcodes, and the saver
+  window is created with the border from its parent instead of `P`; mutation: check only the original operands);
+  `saver_activation_resource_created_after_install_is_asked` (sol r2 B-2: the same values with `P` unused at
+  `SetAttributes`, then the other client creates `P`, then activation: `P` is asked and dropped on denial;
+  mutation: check at `SetAttributes` only); `saver_activation_no_policy_is_unchanged` (no policy: the saver window
+  has `P` as its border, exactly as today); `saver_activation_unresolved_effective_operand_is_not_asked`.
 - [ ] **Steps 2–5.** Commit `… Task 6: MIT-SCREEN-SAVER`.
 
 ### Task 7: Spec rows, status and gate
 
 - [ ] **Step 1:** spec, "What a policy can see": RANDR outputs and modes join CRTCs and providers as server objects
   asked with owner `SERVER_OWNER`; "Property": RANDR property reads that delete ask the output or provider
-  `READ | WRITE`; series row 3 marked complete with XRes and RECORD client specifiers deferred to PR 5.
+  `READ | WRITE`; "Who is checked": the ScreenSaver's stored attributes are deferred work of the client that
+  installed them, and activation checks their effective value operands for that client as derived targets (a
+  denied one is replaced by its neutral value; no error); "A denial is interpreted by its site": a row for it;
+  series row 3 marked complete with XRes and RECORD client specifiers deferred to PR 5.
 - [ ] **Step 2:** `docs/status.md`: one entry at the top for PR 3c-ii.
 - [ ] **Step 3: Gate:** `cargo +nightly fmt -- --check`; `cargo clippy --all-targets -- -D warnings`, also with
   `--features tcp-transport` and `--features xdmcp`; FreeBSD clippy; `cargo check -p yserver-core --target
