@@ -23,6 +23,100 @@ use yserver_protocol::{
     x11::{ClientId, RequestHeader, ResourceId, SequenceNumber},
 };
 
+/// MIT-SHM's one error, `BadShmSeg`: the extension's first error code.
+const BAD_SHM_SEG: u8 = crate::nested::MIT_SHM_FIRST_ERROR;
+
+/// Xorg's `VERIFY_SHMPTR` (`Xext/shm.c:129-148`) for a request that reads
+/// (`needwrite` false) or writes the segment at `offset`: the segment must
+/// exist (`BadShmSeg`), pass the policy's READ check (Xorg's lookup asks
+/// `DixReadAccess`), start 4-byte aligned no further than its end
+/// (`BadValue`, the offset), and be writable if written (`BadAccess`, the
+/// segment: the value the lookup left in `errorValue`). Returns its size.
+fn verify_shm_ptr(
+    state: &ServerState,
+    client_id: ClientId,
+    shmseg: u32,
+    offset: u32,
+    needwrite: bool,
+    minor: u8,
+) -> Result<usize, (u8, u32)> {
+    const MIT_SHM_MAJOR_OPCODE: u8 = 130;
+    let Some(segment) = state.mit_shm_segments.get(&shmseg) else {
+        return Err((BAD_SHM_SEG, shmseg));
+    };
+    let (size, read_only) = (segment.size, segment.read_only);
+    validate_resource_if_present(
+        state,
+        client_id,
+        ResourceId(shmseg),
+        ResourceKind::ShmSegment,
+        AccessMode::READ,
+        RequestOpcodes {
+            major: MIT_SHM_MAJOR_OPCODE,
+            minor,
+        },
+    )?;
+    if offset & 3 != 0 || usize::try_from(offset).map_or(true, |offset| offset > size) {
+        return Err((x11::error::BAD_VALUE, offset));
+    }
+    if needwrite && read_only {
+        return Err((x11::error::BAD_ACCESS, shmseg));
+    }
+    Ok(size)
+}
+
+/// Xorg's `VERIFY_SHMSIZE` (`Xext/shm.c:150-156`): `len` bytes from
+/// `offset` must fit in the segment, else `BadAccess` with the segment id.
+fn verify_shm_size(shmseg: u32, offset: u32, len: usize, size: usize) -> Result<(), (u8, u32)> {
+    let end = usize::try_from(offset)
+        .ok()
+        .and_then(|offset| offset.checked_add(len));
+    if end.is_some_and(|end| end <= size) {
+        Ok(())
+    } else {
+        Err((x11::error::BAD_ACCESS, shmseg))
+    }
+}
+
+/// ProcShmPutImage's extent checks (`Xext/shm.c:552-582`), in its order,
+/// with the value Xorg reports for each. One scanline of the total image is
+/// `PixmapBytePad(totalWidth, depth)` for `ZPixmap` and one bit per pixel
+/// otherwise; the source fields are `CARD16`.
+fn put_image_extent_error(
+    req: &yserver_protocol::x11::mit_shm::PutImageRequest,
+    size: usize,
+) -> Result<(), (u8, u32)> {
+    use yserver_protocol::x11::mit_shm as shm;
+    let bad = |value: u16| Err((x11::error::BAD_VALUE, u32::from(value)));
+    let depth = if req.format == shm::PIXMAP_FORMAT_Z_PIXMAP {
+        req.depth
+    } else {
+        1
+    };
+    let room = size - req.offset as usize;
+    if req.total_height != 0
+        && zpixmap_row_stride(req.total_width, depth)
+            .is_some_and(|length| length > room / usize::from(req.total_height))
+    {
+        return bad(req.total_width);
+    }
+    #[allow(clippy::cast_sign_loss)]
+    let (src_x, src_y) = (req.src_x as u16, req.src_y as u16);
+    if src_x > req.total_width {
+        return bad(src_x);
+    }
+    if src_y > req.total_height {
+        return bad(src_y);
+    }
+    if u32::from(src_x) + u32::from(req.src_width) > u32::from(req.total_width) {
+        return bad(req.src_width);
+    }
+    if u32::from(src_y) + u32::from(req.src_height) > u32::from(req.total_height) {
+        return bad(req.src_height);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_mit_shm_request(
     state: &mut ServerState,
@@ -163,6 +257,17 @@ pub(super) fn handle_mit_shm_request(
         }
         shm::DETACH => {
             if let Some(shmseg) = shm::parse_detach(body) {
+                if !state.mit_shm_segments.contains_key(&shmseg) {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        BAD_SHM_SEG,
+                        shmseg,
+                        u16::from(minor),
+                        MIT_SHM_MAJOR_OPCODE,
+                    );
+                }
                 if let Err((code, value)) = validate_resource_if_present(
                     state,
                     client_id,
@@ -333,28 +438,45 @@ fn handle_mit_shm_create_pixmap(
             MIT_SHM_MAJOR_OPCODE,
         );
     }
-    if !supported_pixmap_depth(req.depth) {
-        return emit_x11_error_with_minor(
+    // Xorg's order from here (ProcShmCreatePixmap, Xext/shm.c:1053-1129):
+    // the segment, the size and depth, the byte range, then the creation.
+    let emit = |state: &mut ServerState, code: u8, value: u32| {
+        emit_x11_error_with_minor(
             state,
             client_id,
             sequence,
-            x11::error::BAD_VALUE,
-            u32::from(req.depth),
+            code,
+            value,
             u16::from(shm::CREATE_PIXMAP),
             MIT_SHM_MAJOR_OPCODE,
-        );
+        )
+    };
+    let size = match verify_shm_ptr(
+        state,
+        client_id,
+        req.shmseg,
+        req.offset,
+        true,
+        shm::CREATE_PIXMAP,
+    ) {
+        Ok(size) => size,
+        Err((code, value)) => return emit(state, code, value),
+    };
+    if req.width == 0 || req.height == 0 || req.depth == 0 {
+        return emit(state, x11::error::BAD_VALUE, 0);
+    }
+    if req.width > 32767 || req.height > 32767 {
+        return emit(state, x11::error::BAD_ALLOC, req.shmseg);
+    }
+    if !supported_pixmap_depth(req.depth) {
+        return emit(state, x11::error::BAD_VALUE, u32::from(req.depth));
     }
     let Some(expected_len) = zpixmap_expected_len(req.width, req.height, req.depth) else {
-        return emit_x11_error_with_minor(
-            state,
-            client_id,
-            sequence,
-            x11::error::BAD_VALUE,
-            req.shmseg,
-            u16::from(shm::CREATE_PIXMAP),
-            MIT_SHM_MAJOR_OPCODE,
-        );
+        return emit(state, x11::error::BAD_ALLOC, req.shmseg);
     };
+    if let Err((code, value)) = verify_shm_size(req.shmseg, req.offset, expected_len, size) {
+        return emit(state, code, value);
+    }
     if let Err((code, value)) = validate_resource_access(
         state,
         client_id,
@@ -383,58 +505,13 @@ fn handle_mit_shm_create_pixmap(
             MIT_SHM_MAJOR_OPCODE,
         );
     }
-    if !state.mit_shm_segments.contains_key(&req.shmseg) {
-        return emit_x11_error_with_minor(
-            state,
-            client_id,
-            sequence,
-            x11::error::BAD_VALUE,
-            req.shmseg,
-            u16::from(shm::CREATE_PIXMAP),
-            MIT_SHM_MAJOR_OPCODE,
-        );
-    }
-    if let Err((code, value)) = validate_resource_if_present(
-        state,
-        client_id,
-        ResourceId(req.shmseg),
-        ResourceKind::ShmSegment,
-        AccessMode::READ,
-        RequestOpcodes {
-            major: MIT_SHM_MAJOR_OPCODE,
-            minor: shm::CREATE_PIXMAP,
-        },
-    ) {
-        return emit_x11_error_with_minor(
-            state,
-            client_id,
-            sequence,
-            code,
-            value,
-            u16::from(shm::CREATE_PIXMAP),
-            MIT_SHM_MAJOR_OPCODE,
-        );
-    }
     let snapshot: Vec<u8> = {
         let segment = state
             .mit_shm_segments
             .get(&req.shmseg)
             .expect("segment was checked above");
-        let bytes = segment.as_slice();
         let start = req.offset as usize;
-        let end = start.saturating_add(expected_len);
-        if end > bytes.len() {
-            return emit_x11_error_with_minor(
-                state,
-                client_id,
-                sequence,
-                x11::error::BAD_VALUE,
-                req.offset,
-                u16::from(shm::CREATE_PIXMAP),
-                MIT_SHM_MAJOR_OPCODE,
-            );
-        }
-        bytes[start..end].to_vec()
+        segment.as_slice()[start..start + expected_len].to_vec()
     };
     let host_xid = match backend.create_pixmap(origin, req.depth, req.width, req.height) {
         Ok(handle) => Some(handle),
@@ -537,28 +614,30 @@ pub(super) fn handle_mit_shm_put_image(
     let Some(target) = target else {
         return Ok(RequestOutcome::Handled);
     };
-    let Some(segment) = state.mit_shm_segments.get(&req.shmseg) else {
-        return emit_x11_error_with_minor(
-            state,
-            client_id,
-            sequence,
-            x11::error::BAD_VALUE,
-            req.shmseg,
-            u16::from(shm::PUT_IMAGE),
-            MIT_SHM_MAJOR_OPCODE,
-        );
-    };
-    if let Err((code, value)) = validate_resource_if_present(
+    // ProcShmPutImage (Xext/shm.c:517-582): the segment, then the image's
+    // rows against it and the source rectangle against the image.
+    let size = match verify_shm_ptr(
         state,
         client_id,
-        ResourceId(req.shmseg),
-        ResourceKind::ShmSegment,
-        AccessMode::READ,
-        RequestOpcodes {
-            major: MIT_SHM_MAJOR_OPCODE,
-            minor: shm::PUT_IMAGE,
-        },
+        req.shmseg,
+        req.offset,
+        false,
+        shm::PUT_IMAGE,
     ) {
+        Ok(size) => size,
+        Err((code, value)) => {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                code,
+                value,
+                u16::from(shm::PUT_IMAGE),
+                MIT_SHM_MAJOR_OPCODE,
+            );
+        }
+    };
+    if let Err((code, value)) = put_image_extent_error(&req, size) {
         return emit_x11_error_with_minor(
             state,
             client_id,
@@ -569,6 +648,10 @@ pub(super) fn handle_mit_shm_put_image(
             MIT_SHM_MAJOR_OPCODE,
         );
     }
+    let segment = state
+        .mit_shm_segments
+        .get(&req.shmseg)
+        .expect("segment was checked above");
     let Some(snapshot) = extract_shm_zpixmap_region(
         segment.as_slice(),
         req.offset,
@@ -690,51 +773,6 @@ fn handle_mit_shm_get_image(
 ) -> io::Result<RequestOutcome> {
     use yserver_protocol::x11::mit_shm as shm;
     const MIT_SHM_MAJOR_OPCODE: u8 = 130;
-    {
-        let Some(segment) = state.mit_shm_segments.get(&req.shmseg) else {
-            return emit_x11_error_with_minor(
-                state,
-                client_id,
-                sequence,
-                x11::error::BAD_VALUE,
-                req.shmseg,
-                u16::from(shm::GET_IMAGE),
-                MIT_SHM_MAJOR_OPCODE,
-            );
-        };
-        if let Err((code, value)) = validate_resource_if_present(
-            state,
-            client_id,
-            ResourceId(req.shmseg),
-            ResourceKind::ShmSegment,
-            AccessMode::READ,
-            RequestOpcodes {
-                major: MIT_SHM_MAJOR_OPCODE,
-                minor: shm::GET_IMAGE,
-            },
-        ) {
-            return emit_x11_error_with_minor(
-                state,
-                client_id,
-                sequence,
-                code,
-                value,
-                u16::from(shm::GET_IMAGE),
-                MIT_SHM_MAJOR_OPCODE,
-            );
-        }
-        if segment.read_only {
-            return emit_x11_error_with_minor(
-                state,
-                client_id,
-                sequence,
-                x11::error::BAD_ACCESS,
-                req.shmseg,
-                u16::from(shm::GET_IMAGE),
-                MIT_SHM_MAJOR_OPCODE,
-            );
-        }
-    }
     let target = state
         .resources
         .host_drawable_target(ResourceId(req.drawable));
@@ -776,6 +814,29 @@ fn handle_mit_shm_get_image(
             MIT_SHM_MAJOR_OPCODE,
         );
     }
+    // ProcShmGetImage (Xext/shm.c:616-702) checks the segment after the
+    // drawable, and the image's size against it before writing.
+    let size = match verify_shm_ptr(
+        state,
+        client_id,
+        req.shmseg,
+        req.offset,
+        true,
+        shm::GET_IMAGE,
+    ) {
+        Ok(size) => size,
+        Err((code, value)) => {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                code,
+                value,
+                u16::from(shm::GET_IMAGE),
+                MIT_SHM_MAJOR_OPCODE,
+            );
+        }
+    };
     let host_bytes = backend
         .get_image(
             origin,
@@ -824,20 +885,20 @@ fn handle_mit_shm_get_image(
                 MIT_SHM_MAJOR_OPCODE,
             );
         };
-        let start = req.offset as usize;
-        let end = start.saturating_add(pixel_data.len());
-        if end > buf.len() {
+        if let Err((code, value)) = verify_shm_size(req.shmseg, req.offset, pixel_data.len(), size)
+        {
             return emit_x11_error_with_minor(
                 state,
                 client_id,
                 sequence,
-                x11::error::BAD_VALUE,
-                req.offset,
+                code,
+                value,
                 u16::from(shm::GET_IMAGE),
                 MIT_SHM_MAJOR_OPCODE,
             );
         }
-        buf[start..end].copy_from_slice(&pixel_data);
+        let start = req.offset as usize;
+        buf[start..start + pixel_data.len()].copy_from_slice(&pixel_data);
     }
     let depth = host_reply_bytes.first().copied().unwrap_or(24);
     let visual = crate::resources::ROOT_VISUAL.0;

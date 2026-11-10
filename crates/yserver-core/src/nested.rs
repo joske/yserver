@@ -100,7 +100,7 @@ pub(crate) const MIT_SCREEN_SAVER_FIRST_EVENT: u8 = 92;
 
 const MIT_SHM_MAJOR_OPCODE: u8 = 130;
 const MIT_SHM_FIRST_EVENT: u8 = 65; // matches Xorg: ShmCompletion=65
-const MIT_SHM_FIRST_ERROR: u8 = 168;
+pub(crate) const MIT_SHM_FIRST_ERROR: u8 = 168;
 
 const XTEST_MAJOR_OPCODE: u8 = 146;
 
