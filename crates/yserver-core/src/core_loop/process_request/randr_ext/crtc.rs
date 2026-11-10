@@ -1,12 +1,13 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind},
     backend::{Backend, CrtcConfigApply, ModeSpec},
     core_loop::process_request::{
-        RANDR_BAD_CRTC, RequestOutcome, emit_x11_error_with_minor,
+        RANDR_BAD_CRTC, RequestOutcome, check_resource, emit_x11_error_with_minor,
         randr_ext::{
             CrtcConfigCompletion, CrtcConfigReply, PendingCrtcConfig, RANDR_MAJOR_OPCODE,
             request_xid, screen::x11randr_encode_set_screen_config, warn_randr_unsupported_once,
         },
-        write_to_client,
+        validate_resource_if_present, write_to_client,
     },
     server::ServerState,
 };
@@ -60,6 +61,21 @@ pub(super) fn handle_randr_get_crtc_info(
             RANDR_MAJOR_OPCODE,
         );
     };
+    if req.crtc != 0 {
+        let request = RequestOpcodes {
+            major: RANDR_MAJOR_OPCODE,
+            minor: header.data,
+        };
+        check_resource!(
+            state,
+            client_id,
+            sequence,
+            request,
+            yserver_protocol::x11::ResourceId(req.crtc),
+            ResourceKind::RandrCrtc,
+            AccessMode::READ
+        );
+    }
     let buf = x11randr::encode_get_crtc_info_reply(
         byte_order,
         sequence,
@@ -109,6 +125,21 @@ pub(super) fn handle_randr_set_crtc_transform(
     };
     if !crtc_exists(state, req.crtc) {
         return error(state, RANDR_BAD_CRTC, req.crtc);
+    }
+    if req.crtc != 0 {
+        let request = RequestOpcodes {
+            major: RANDR_MAJOR_OPCODE,
+            minor,
+        };
+        check_resource!(
+            state,
+            client_id,
+            sequence,
+            request,
+            yserver_protocol::x11::ResourceId(req.crtc),
+            ResourceKind::RandrCrtc,
+            AccessMode::READ
+        );
     }
     if crtc_is_leased(state, req.crtc) {
         return error(state, x11::error::BAD_ACCESS, 0);
@@ -192,6 +223,21 @@ pub(super) fn handle_randr_get_crtc_transform(
             RANDR_MAJOR_OPCODE,
         );
     }
+    if crtc != 0 {
+        let request = RequestOpcodes {
+            major: RANDR_MAJOR_OPCODE,
+            minor,
+        };
+        check_resource!(
+            state,
+            client_id,
+            sequence,
+            request,
+            yserver_protocol::x11::ResourceId(crtc),
+            ResourceKind::RandrCrtc,
+            AccessMode::READ
+        );
+    }
     let Some(output) = state.randr.outputs.iter().find(|o| o.crtc_id == crtc) else {
         return Ok(RequestOutcome::Handled);
     };
@@ -238,6 +284,21 @@ pub(super) fn handle_randr_get_panning(
             RANDR_MAJOR_OPCODE,
         );
     }
+    if crtc != 0 {
+        let request = RequestOpcodes {
+            major: RANDR_MAJOR_OPCODE,
+            minor,
+        };
+        check_resource!(
+            state,
+            client_id,
+            sequence,
+            request,
+            yserver_protocol::x11::ResourceId(crtc),
+            ResourceKind::RandrCrtc,
+            AccessMode::READ
+        );
+    }
     let timestamp = state.randr.timestamp;
     let buf = x11randr::encode_get_panning_reply(byte_order, sequence, timestamp);
     let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -276,6 +337,21 @@ pub(super) fn handle_randr_set_panning(
             req.crtc,
             u16::from(minor),
             RANDR_MAJOR_OPCODE,
+        );
+    }
+    if req.crtc != 0 {
+        let request = RequestOpcodes {
+            major: RANDR_MAJOR_OPCODE,
+            minor,
+        };
+        check_resource!(
+            state,
+            client_id,
+            sequence,
+            request,
+            yserver_protocol::x11::ResourceId(req.crtc),
+            ResourceKind::RandrCrtc,
+            AccessMode::READ
         );
     }
     let status = if req.is_disabled() {
@@ -334,6 +410,21 @@ pub(super) fn handle_randr_get_crtc_gamma_size(
             RANDR_MAJOR_OPCODE,
         );
     }
+    if req.crtc != 0 {
+        let request = RequestOpcodes {
+            major: RANDR_MAJOR_OPCODE,
+            minor: header.data,
+        };
+        check_resource!(
+            state,
+            client_id,
+            sequence,
+            request,
+            yserver_protocol::x11::ResourceId(req.crtc),
+            ResourceKind::RandrCrtc,
+            AccessMode::READ
+        );
+    }
     let buf = x11randr::encode_get_crtc_gamma_size_reply(
         byte_order,
         sequence,
@@ -378,6 +469,21 @@ pub(super) fn handle_randr_get_crtc_gamma(
             RANDR_MAJOR_OPCODE,
         );
     }
+    if req.crtc != 0 {
+        let request = RequestOpcodes {
+            major: RANDR_MAJOR_OPCODE,
+            minor: header.data,
+        };
+        check_resource!(
+            state,
+            client_id,
+            sequence,
+            request,
+            yserver_protocol::x11::ResourceId(req.crtc),
+            ResourceKind::RandrCrtc,
+            AccessMode::READ
+        );
+    }
     let (red, green, blue) = backend.get_crtc_gamma(req.crtc);
     let buf = x11randr::encode_get_crtc_gamma_reply(byte_order, sequence, &red, &green, &blue);
     let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -417,6 +523,21 @@ pub(super) fn handle_randr_set_crtc_gamma(
             crtc,
             u16::from(header.data),
             RANDR_MAJOR_OPCODE,
+        );
+    }
+    if crtc != 0 {
+        let request = RequestOpcodes {
+            major: RANDR_MAJOR_OPCODE,
+            minor: header.data,
+        };
+        check_resource!(
+            state,
+            client_id,
+            sequence,
+            request,
+            yserver_protocol::x11::ResourceId(crtc),
+            ResourceKind::RandrCrtc,
+            AccessMode::READ
         );
     }
     if crtc_is_leased(state, crtc) {
@@ -539,8 +660,37 @@ pub(super) fn handle_randr_set_crtc_config(
         })
         .unwrap_or_default();
 
+    let request = RequestOpcodes {
+        major: RANDR_MAJOR_OPCODE,
+        minor: header.data,
+    };
+    if crtc != 0 {
+        check_resource!(
+            state,
+            client_id,
+            sequence,
+            request,
+            yserver_protocol::x11::ResourceId(crtc),
+            ResourceKind::RandrCrtc,
+            AccessMode::SET_ATTR
+        );
+    }
     // (1) arity + output + mode resolution FIRST (Xorg rrcrtc.c order).
-    let resolved = match state.randr.validate_set_crtc_config(crtc, mode, &outputs) {
+    let resolved = match state
+        .randr
+        .validate_set_crtc_config(crtc, mode, &outputs, |id, kind| {
+            if id == 0 {
+                return Ok(());
+            }
+            validate_resource_if_present(
+                state,
+                client_id,
+                yserver_protocol::x11::ResourceId(id),
+                kind,
+                AccessMode::SET_ATTR,
+                request,
+            )
+        }) {
         Err((code, error_value)) => {
             return emit_x11_error_with_minor(
                 state,

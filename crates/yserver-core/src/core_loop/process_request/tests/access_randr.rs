@@ -218,6 +218,119 @@ fn access_rows() -> Vec<AccessRow> {
 
 type OutputAccessRow = (AccessRow, Vec<(ResourceTarget, AccessMode)>);
 
+fn set_crtc_config_body(crtc: ResourceId, mode: ResourceId, outputs: &[ResourceId]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(24 + outputs.len() * 4);
+    body.extend_from_slice(&crtc.0.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&0i16.to_le_bytes());
+    body.extend_from_slice(&0i16.to_le_bytes());
+    body.extend_from_slice(&mode.0.to_le_bytes());
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&[0; 2]);
+    for output in outputs {
+        body.extend_from_slice(&output.0.to_le_bytes());
+    }
+    body
+}
+
+fn set_crtc_transform_body(crtc: ResourceId, matrix: [i32; 9]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(44);
+    body.extend_from_slice(&crtc.0.to_le_bytes());
+    for cell in matrix {
+        body.extend_from_slice(&cell.to_le_bytes());
+    }
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&[0; 2]);
+    body
+}
+
+fn set_panning_body(crtc: ResourceId, width: u16, height: u16) -> Vec<u8> {
+    let mut body = vec![0; 32];
+    body[..4].copy_from_slice(&crtc.0.to_le_bytes());
+    body[12..14].copy_from_slice(&width.to_le_bytes());
+    body[14..16].copy_from_slice(&height.to_le_bytes());
+    body
+}
+
+fn crtc_read_rows(crtc: ResourceId) -> Vec<(&'static str, u8, Vec<u8>)> {
+    use yserver_protocol::x11::randr as rr;
+
+    vec![
+        ("GetCrtcInfo", rr::RR_GET_CRTC_INFO, words(&[crtc.0, 0])),
+        (
+            "GetCrtcGammaSize",
+            rr::RR_GET_CRTC_GAMMA_SIZE,
+            words(&[crtc.0]),
+        ),
+        ("GetCrtcGamma", rr::RR_GET_CRTC_GAMMA, words(&[crtc.0])),
+        (
+            "SetCrtcTransform",
+            rr::RR_SET_CRTC_TRANSFORM,
+            set_crtc_transform_body(
+                crtc,
+                [
+                    crate::randr::FIXED_ONE,
+                    0,
+                    0,
+                    0,
+                    crate::randr::FIXED_ONE,
+                    0,
+                    0,
+                    0,
+                    crate::randr::FIXED_ONE,
+                ],
+            ),
+        ),
+        (
+            "GetCrtcTransform",
+            rr::RR_GET_CRTC_TRANSFORM,
+            words(&[crtc.0]),
+        ),
+        ("GetPanning", rr::RR_GET_PANNING, words(&[crtc.0])),
+        (
+            "SetPanning",
+            rr::RR_SET_PANNING,
+            set_panning_body(crtc, 0, 0),
+        ),
+    ]
+}
+
+fn crtc_config_access_rows(fixture: &RandrAccessFixture) -> Vec<OutputAccessRow> {
+    use yserver_protocol::x11::randr as rr;
+
+    let output = ResourceId(fixture.state.randr.outputs[0].output_id);
+    let crtc = ResourceId(fixture.state.randr.outputs[0].crtc_id);
+    let mode = ResourceId(fixture.state.randr.mode_table[0].mode_id);
+    let body = set_crtc_config_body(crtc, mode, &[output]);
+    let crtc_target = resource_target(crtc, ResourceKind::RandrCrtc);
+    let output_target = resource_target(output, ResourceKind::RandrOutput);
+    let mode_target = resource_target(mode, ResourceKind::RandrMode);
+    let row = |label, target| AccessRow {
+        label,
+        major: 128,
+        minor: rr::RR_SET_CRTC_CONFIG,
+        body: body.clone(),
+        target,
+        mode: AccessMode::SET_ATTR,
+    };
+
+    vec![
+        (row("RANDR SetCrtcConfig CRTC", crtc_target), Vec::new()),
+        (
+            row("RANDR SetCrtcConfig output", output_target),
+            vec![(crtc_target, AccessMode::SET_ATTR)],
+        ),
+        (
+            row("RANDR SetCrtcConfig mode", mode_target),
+            vec![
+                (crtc_target, AccessMode::SET_ATTR),
+                (output_target, AccessMode::SET_ATTR),
+            ],
+        ),
+    ]
+}
+
 fn output_access_rows(fixture: &mut RandrAccessFixture) -> Vec<OutputAccessRow> {
     let output = ResourceId(fixture.state.randr.outputs[0].output_id);
     let mode = ResourceId(fixture.state.randr.mode_table[0].mode_id);
@@ -1344,4 +1457,487 @@ fn set_output_primary_none_output_is_not_asked() {
         128,
         rr::RR_SET_OUTPUT_PRIMARY,
     );
+}
+
+#[test]
+fn randr_crtc_deny_rows_match_site_table() {
+    // Mutation: remove the SetCrtcConfig output check; denying that row must stop returning the policy error.
+    for row_index in 0..3 {
+        let mut fixture = randr_access_fixture();
+        let (row, before) = crtc_config_access_rows(&fixture).remove(row_index);
+        let randr_before = format!("{:?}", fixture.state.randr);
+        let backend_calls_before = fixture.backend.calls();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        fixture
+            .state
+            .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+                Arc::clone(&calls),
+                row.target.id,
+                Some(row.mode),
+                DENY_ERROR,
+            )));
+
+        let bytes = run_request(&mut fixture, row.major, row.minor, &row.body);
+        assert_policy_error(&bytes, row.major, row.minor);
+        assert_eq!(format!("{:?}", fixture.state.randr), randr_before);
+        assert_eq!(fixture.backend.calls(), backend_calls_before);
+        let calls = calls.lock().unwrap();
+        let resources = resource_calls(&calls);
+        assert_eq!(resources.len(), before.len() + 1, "{} checks", row.label);
+        for (index, (target, mode)) in before.iter().enumerate() {
+            assert_resource_check(resources[index], *target, *mode, row.major, row.minor);
+        }
+        assert_resource_check(
+            resources[before.len()],
+            row.target,
+            row.mode,
+            row.major,
+            row.minor,
+        );
+    }
+}
+
+#[test]
+fn randr_crtc_read_ask_rows_match_site_table() {
+    // Mutation: remove any new CRTC READ check; its site's recorded-check assertion must fail.
+    for (label, minor, _) in crtc_read_rows(ResourceId(0)) {
+        let mut fixture = randr_access_fixture();
+        let crtc = ResourceId(fixture.state.randr.outputs[0].crtc_id);
+        let body = crtc_read_rows(crtc)
+            .into_iter()
+            .find(|(row, _, _)| *row == label)
+            .expect("site row")
+            .2;
+        let calls = install_allow_policy(&mut fixture);
+        let bytes = run_request(&mut fixture, 128, minor, &body);
+        if minor == yserver_protocol::x11::randr::RR_SET_CRTC_TRANSFORM {
+            assert!(bytes.is_empty(), "{label} has no reply");
+        } else {
+            assert!(!bytes.is_empty(), "{label} reply");
+            assert_eq!(bytes[0], 1, "{label} successful reply marker");
+        }
+        let calls = calls.lock().unwrap();
+        let resources = resource_calls(&calls);
+        assert_eq!(resources.len(), 1, "{label} check count");
+        assert_resource_check(
+            resources[0],
+            resource_target(crtc, ResourceKind::RandrCrtc),
+            AccessMode::READ,
+            128,
+            minor,
+        );
+    }
+}
+
+#[test]
+fn randr_crtc_read_deny_rows_precede_later_work() {
+    // Mutation: move any new CRTC READ check below later validation or backend work; its denial row must fail.
+    use yserver_protocol::x11::randr as rr;
+
+    for (label, minor, mut body) in crtc_read_rows(ResourceId(0x0020_0001)) {
+        let mut fixture = randr_access_fixture();
+        let crtc = ResourceId(fixture.state.randr.outputs[0].crtc_id);
+        body[..4].copy_from_slice(&crtc.0.to_le_bytes());
+        if minor == rr::RR_SET_CRTC_TRANSFORM {
+            body[4..40].fill(0);
+        } else if minor == rr::RR_SET_PANNING {
+            body[12..14].copy_from_slice(&1920u16.to_le_bytes());
+            body[14..16].copy_from_slice(&1080u16.to_le_bytes());
+        }
+        let randr_before = format!("{:?}", fixture.state.randr);
+        let backend_calls_before = fixture.backend.calls();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        fixture
+            .state
+            .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+                Arc::clone(&calls),
+                crtc,
+                Some(AccessMode::READ),
+                DENY_ERROR,
+            )));
+
+        let bytes = run_request(&mut fixture, 128, minor, &body);
+        assert_policy_error(&bytes, 128, minor);
+        assert_eq!(
+            format!("{:?}", fixture.state.randr),
+            randr_before,
+            "{label} state"
+        );
+        assert_eq!(
+            fixture.backend.calls(),
+            backend_calls_before,
+            "{label} backend calls"
+        );
+        assert!(
+            fixture.backend.calls().is_empty(),
+            "{label} must not call backend"
+        );
+        let calls = calls.lock().unwrap();
+        let resources = resource_calls(&calls);
+        assert_eq!(resources.len(), 1, "{label} check count");
+        assert_resource_check(
+            resources[0],
+            resource_target(crtc, ResourceKind::RandrCrtc),
+            AccessMode::READ,
+            128,
+            minor,
+        );
+    }
+}
+
+#[test]
+fn randr_crtc_ask_rows_match_site_table() {
+    // Mutation: skip the SetCrtcConfig mode check; the ordered three-operand assertion must fail.
+    // Mutation: encode an X error marker on success; the reply-marker assertion must fail.
+    // Mutation: return RRSetConfigFailed on success; the successful-status assertion must fail.
+    use yserver_protocol::x11::randr as rr;
+
+    let mut fixture = randr_access_fixture();
+    let first_output = fixture.state.randr.outputs[0].clone();
+    let mut second_output = first_output.clone();
+    second_output.output_id = first_output.output_id.wrapping_add(1000);
+    second_output.name.push_str("-second");
+    fixture.state.randr.outputs.push(second_output);
+    let crtc = ResourceId(first_output.crtc_id);
+    let first_output_id = ResourceId(first_output.output_id);
+    let second_output_id = ResourceId(fixture.state.randr.outputs[1].output_id);
+    let mode = ResourceId(fixture.state.randr.mode_table[0].mode_id);
+    let expected = [
+        (
+            resource_target(crtc, ResourceKind::RandrCrtc),
+            AccessMode::SET_ATTR,
+        ),
+        (
+            resource_target(first_output_id, ResourceKind::RandrOutput),
+            AccessMode::SET_ATTR,
+        ),
+        (
+            resource_target(second_output_id, ResourceKind::RandrOutput),
+            AccessMode::SET_ATTR,
+        ),
+        (
+            resource_target(mode, ResourceKind::RandrMode),
+            AccessMode::SET_ATTR,
+        ),
+    ];
+    let body = set_crtc_config_body(crtc, mode, &[first_output_id, second_output_id]);
+    let calls = install_allow_policy(&mut fixture);
+    let bytes = run_request(&mut fixture, 128, rr::RR_SET_CRTC_CONFIG, &body);
+    assert_eq!(bytes.len(), 32, "successful SetCrtcConfig reply");
+    assert_eq!(bytes[0], 1, "successful X reply marker");
+    assert_eq!(bytes[1], rr::SET_CONFIG_SUCCESS, "successful RANDR status");
+    let calls = calls.lock().unwrap();
+    let resources = resource_calls(&calls);
+    assert_eq!(resources.len(), expected.len());
+    for (call, (target, mode)) in resources.iter().zip(expected) {
+        assert_resource_check(call, target, mode, 128, rr::RR_SET_CRTC_CONFIG);
+    }
+}
+
+#[test]
+fn set_crtc_config_denied_output_before_bad_mode() {
+    // Mutation: run the whole validation helper before checking outputs; the denied output must win over BadMatch(mode).
+    use yserver_protocol::x11::randr as rr;
+
+    let mut fixture = randr_access_fixture();
+    let output = ResourceId(fixture.state.randr.outputs[0].output_id);
+    let crtc = ResourceId(fixture.state.randr.outputs[0].crtc_id);
+    let bad_mode = ResourceId(0xDEAD_BEEF);
+    let randr_before = format!("{:?}", fixture.state.randr);
+    let backend_calls_before = fixture.backend.calls();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+            Arc::clone(&calls),
+            output,
+            Some(AccessMode::SET_ATTR),
+            DENY_ERROR,
+        )));
+
+    let bytes = run_request(
+        &mut fixture,
+        128,
+        rr::RR_SET_CRTC_CONFIG,
+        &set_crtc_config_body(crtc, bad_mode, &[output]),
+    );
+    assert_eq!(format!("{:?}", fixture.state.randr), randr_before);
+    assert_eq!(fixture.backend.calls(), backend_calls_before);
+    assert_policy_error(&bytes, 128, rr::RR_SET_CRTC_CONFIG);
+    let calls = calls.lock().unwrap();
+    let resources = resource_calls(&calls);
+    assert_eq!(resources.len(), 2);
+    assert_resource_check(
+        resources[0],
+        resource_target(crtc, ResourceKind::RandrCrtc),
+        AccessMode::SET_ATTR,
+        128,
+        rr::RR_SET_CRTC_CONFIG,
+    );
+    assert_resource_check(
+        resources[1],
+        resource_target(output, ResourceKind::RandrOutput),
+        AccessMode::SET_ATTR,
+        128,
+        rr::RR_SET_CRTC_CONFIG,
+    );
+
+    let mut no_policy = randr_access_fixture();
+    let no_policy_output = ResourceId(no_policy.state.randr.outputs[0].output_id);
+    let no_policy_crtc = ResourceId(no_policy.state.randr.outputs[0].crtc_id);
+    let bytes = run_request(
+        &mut no_policy,
+        128,
+        rr::RR_SET_CRTC_CONFIG,
+        &set_crtc_config_body(no_policy_crtc, bad_mode, &[no_policy_output]),
+    );
+    assert_eq!(bytes.len(), 32);
+    assert_eq!(bytes[0], 0);
+    assert_eq!(bytes[1], x11::error::BAD_MATCH);
+    assert_eq!(
+        u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        bad_mode.0
+    );
+    assert_eq!(
+        u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+        u16::from(rr::RR_SET_CRTC_CONFIG)
+    );
+    assert_eq!(bytes[10], 128);
+}
+
+#[test]
+fn set_crtc_config_denied_crtc_before_arity() {
+    // Mutation: check the CRTC after the validation helper; mode=0 plus an output must return BadMatch first.
+    use yserver_protocol::x11::randr as rr;
+
+    let mut fixture = randr_access_fixture();
+    let output = ResourceId(fixture.state.randr.outputs[0].output_id);
+    let crtc = ResourceId(fixture.state.randr.outputs[0].crtc_id);
+    let randr_before = format!("{:?}", fixture.state.randr);
+    let backend_calls_before = fixture.backend.calls();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+            Arc::clone(&calls),
+            crtc,
+            Some(AccessMode::SET_ATTR),
+            DENY_ERROR,
+        )));
+
+    let bytes = run_request(
+        &mut fixture,
+        128,
+        rr::RR_SET_CRTC_CONFIG,
+        &set_crtc_config_body(crtc, ResourceId(0), &[output]),
+    );
+    assert_eq!(format!("{:?}", fixture.state.randr), randr_before);
+    assert_eq!(fixture.backend.calls(), backend_calls_before);
+    assert_policy_error(&bytes, 128, rr::RR_SET_CRTC_CONFIG);
+    let calls = calls.lock().unwrap();
+    let resources = resource_calls(&calls);
+    assert_eq!(resources.len(), 1);
+    assert_resource_check(
+        resources[0],
+        resource_target(crtc, ResourceKind::RandrCrtc),
+        AccessMode::SET_ATTR,
+        128,
+        rr::RR_SET_CRTC_CONFIG,
+    );
+}
+
+#[test]
+fn set_crtc_config_denied_makes_no_backend_call() {
+    // Mutation: move the mode check below start_crtc_config; no ApplyCrtcConfig call may follow denial.
+    use yserver_protocol::x11::randr as rr;
+
+    let mut fixture = randr_access_fixture();
+    let output = ResourceId(fixture.state.randr.outputs[0].output_id);
+    let crtc = ResourceId(fixture.state.randr.outputs[0].crtc_id);
+    let mode = ResourceId(fixture.state.randr.mode_table[0].mode_id);
+    let randr_before = format!("{:?}", fixture.state.randr);
+    let backend_calls_before = fixture.backend.calls();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+            Arc::clone(&calls),
+            mode,
+            Some(AccessMode::SET_ATTR),
+            DENY_ERROR,
+        )));
+
+    let bytes = run_request(
+        &mut fixture,
+        128,
+        rr::RR_SET_CRTC_CONFIG,
+        &set_crtc_config_body(crtc, mode, &[output]),
+    );
+    assert_eq!(format!("{:?}", fixture.state.randr), randr_before);
+    assert_eq!(fixture.backend.calls(), backend_calls_before);
+    assert!(
+        fixture.backend.calls().is_empty(),
+        "denial must not call backend"
+    );
+    assert_policy_error(&bytes, 128, rr::RR_SET_CRTC_CONFIG);
+}
+
+#[test]
+fn set_crtc_config_disable_asks_crtc_only() {
+    // Mutation: skip the pre-helper CRTC check; a valid disable must still record exactly its CRTC.
+    // Mutation: encode an X error marker on success; the reply-marker assertion must fail.
+    // Mutation: return RRSetConfigFailed on success; the successful-status assertion must fail.
+    use yserver_protocol::x11::randr as rr;
+
+    let mut fixture = randr_access_fixture();
+    let crtc = ResourceId(fixture.state.randr.outputs[0].crtc_id);
+    let calls = install_allow_policy(&mut fixture);
+    let bytes = run_request(
+        &mut fixture,
+        128,
+        rr::RR_SET_CRTC_CONFIG,
+        &set_crtc_config_body(crtc, ResourceId(0), &[]),
+    );
+    assert_eq!(bytes.len(), 32, "successful disable reply");
+    assert_eq!(bytes[0], 1, "successful X reply marker");
+    assert_eq!(bytes[1], rr::SET_CONFIG_SUCCESS, "successful RANDR status");
+    let calls = calls.lock().unwrap();
+    let resources = resource_calls(&calls);
+    assert_eq!(resources.len(), 1);
+    assert_resource_check(
+        resources[0],
+        resource_target(crtc, ResourceKind::RandrCrtc),
+        AccessMode::SET_ATTR,
+        128,
+        rr::RR_SET_CRTC_CONFIG,
+    );
+}
+
+#[test]
+fn set_crtc_config_zero_ids_are_not_asked() {
+    // Mutation: remove any RANDR CRTC zero-id guard; the matching resolver must not create a policy check.
+    use yserver_protocol::x11::randr as rr;
+
+    let mut fixture = randr_access_fixture();
+    fixture.state.randr.outputs[0].output_id = 0;
+    let crtc = ResourceId(fixture.state.randr.outputs[0].crtc_id);
+    let mode = ResourceId(fixture.state.randr.mode_table[0].mode_id);
+    let calls = install_allow_policy(&mut fixture);
+    let bytes = run_request(
+        &mut fixture,
+        128,
+        rr::RR_SET_CRTC_CONFIG,
+        &set_crtc_config_body(crtc, mode, &[ResourceId(0)]),
+    );
+    assert_eq!(bytes.len(), 32);
+    let calls = calls.lock().unwrap();
+    let resources = resource_calls(&calls);
+    assert_eq!(resources.len(), 2);
+    assert_resource_check(
+        resources[0],
+        resource_target(crtc, ResourceKind::RandrCrtc),
+        AccessMode::SET_ATTR,
+        128,
+        rr::RR_SET_CRTC_CONFIG,
+    );
+    assert_resource_check(
+        resources[1],
+        resource_target(mode, ResourceKind::RandrMode),
+        AccessMode::SET_ATTR,
+        128,
+        rr::RR_SET_CRTC_CONFIG,
+    );
+    drop(calls);
+
+    let mut zero_crtc = randr_access_fixture();
+    zero_crtc.state.randr.outputs[0].crtc_id = 0;
+    let calls = install_allow_policy(&mut zero_crtc);
+    let bytes = run_request(
+        &mut zero_crtc,
+        128,
+        rr::RR_SET_CRTC_CONFIG,
+        &set_crtc_config_body(ResourceId(0), ResourceId(0), &[]),
+    );
+    assert_eq!(bytes.len(), 32);
+    assert!(resource_calls(&calls.lock().unwrap()).is_empty());
+
+    let mut zero_gamma_crtc = randr_access_fixture();
+    zero_gamma_crtc.state.randr.outputs[0].crtc_id = 0;
+    let calls = install_allow_policy(&mut zero_gamma_crtc);
+    let mut gamma_body = vec![0; 14];
+    gamma_body[4..6].copy_from_slice(&1u16.to_le_bytes());
+    let bytes = run_request(
+        &mut zero_gamma_crtc,
+        128,
+        rr::RR_SET_CRTC_GAMMA,
+        &gamma_body,
+    );
+    assert_eq!(bytes[1], x11::error::BAD_MATCH);
+    assert!(resource_calls(&calls.lock().unwrap()).is_empty());
+
+    for (label, minor, body) in crtc_read_rows(ResourceId(0)) {
+        let mut zero_crtc = randr_access_fixture();
+        zero_crtc.state.randr.outputs[0].crtc_id = 0;
+        let calls = install_allow_policy(&mut zero_crtc);
+        let bytes = run_request(&mut zero_crtc, 128, minor, &body);
+        assert!(resource_calls(&calls.lock().unwrap()).is_empty(), "{label}");
+        if minor == yserver_protocol::x11::randr::RR_SET_CRTC_TRANSFORM {
+            assert!(bytes.is_empty(), "{label} no-reply request");
+        } else {
+            assert!(!bytes.is_empty(), "{label} reply");
+        }
+    }
+}
+
+#[test]
+fn set_crtc_gamma_denied_before_size_check() {
+    // Mutation: move SetCrtcGamma's access check below its size validation; the policy error must beat BadMatch.
+    // Mutation: request SET_ATTR instead of READ; a READ-only denial must prevent the backend size query.
+    use yserver_protocol::x11::randr as rr;
+
+    let mut fixture = randr_access_fixture();
+    let crtc = ResourceId(fixture.state.randr.outputs[0].crtc_id);
+    let mut body = vec![0; 14];
+    body[..4].copy_from_slice(&crtc.0.to_le_bytes());
+    body[4..6].copy_from_slice(&1u16.to_le_bytes());
+    let randr_before = format!("{:?}", fixture.state.randr);
+    let backend_calls_before = fixture.backend.calls();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+            Arc::clone(&calls),
+            crtc,
+            Some(AccessMode::READ),
+            DENY_ERROR,
+        )));
+
+    let bytes = run_request(&mut fixture, 128, rr::RR_SET_CRTC_GAMMA, &body);
+    assert_eq!(format!("{:?}", fixture.state.randr), randr_before);
+    assert_eq!(fixture.backend.calls(), backend_calls_before);
+    assert_policy_error(&bytes, 128, rr::RR_SET_CRTC_GAMMA);
+    let calls = calls.lock().unwrap();
+    let resources = resource_calls(&calls);
+    assert_eq!(resources.len(), 1);
+    assert_resource_check(
+        resources[0],
+        resource_target(crtc, ResourceKind::RandrCrtc),
+        AccessMode::READ,
+        128,
+        rr::RR_SET_CRTC_GAMMA,
+    );
+
+    let mut allowed = randr_access_fixture();
+    let allowed_crtc = ResourceId(allowed.state.randr.outputs[0].crtc_id);
+    let mut valid_body = vec![0; 8 + 256 * 6];
+    valid_body[..4].copy_from_slice(&allowed_crtc.0.to_le_bytes());
+    valid_body[4..6].copy_from_slice(&256u16.to_le_bytes());
+    install_allow_policy(&mut allowed);
+    let bytes = run_request(&mut allowed, 128, rr::RR_SET_CRTC_GAMMA, &valid_body);
+    assert!(bytes.is_empty());
+    assert!(allowed.backend.calls().contains(
+        &crate::backend::recording::RecordedCall::CrtcGammaSize {
+            crtc: allowed_crtc.0,
+        }
+    ));
 }

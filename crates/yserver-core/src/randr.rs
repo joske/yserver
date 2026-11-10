@@ -769,7 +769,8 @@ impl RandrState {
 
     /// Validate arity + output/mode resolution for `SetCrtcConfig` (Xorg
     /// `rrcrtc.c` order, EXCLUDING rotation — the handler does that
-    /// after). `Ok(None)` = disable; `Ok(Some(mode))` = enable with this
+    /// after). `check_resource` runs immediately after each output or mode
+    /// resolves. `Ok(None)` = disable; `Ok(Some(mode))` = enable with this
     /// resolved mode;
     /// `Err((code, error_value))` = protocol error + field-specific
     /// `errorValue`.
@@ -778,6 +779,7 @@ impl RandrState {
         crtc_id: u32,
         mode_id: u32,
         outputs: &[u32],
+        mut check_resource: impl FnMut(u32, crate::access::ResourceKind) -> Result<(), (u8, u32)>,
     ) -> Result<Option<RandrMode>, (u8, u32)> {
         use yserver_protocol::x11::error;
         // 1. mode/outputs arity. errorValue = the addressed crtc.
@@ -795,6 +797,7 @@ impl RandrState {
             let Some(out) = self.outputs.iter().find(|o| o.output_id == oid) else {
                 return Err((error::BAD_MATCH, oid)); // unknown output
             };
+            check_resource(oid, crate::access::ResourceKind::RandrOutput)?;
             if out.crtc_id != crtc_id {
                 return Err((error::BAD_MATCH, crtc_id)); // output doesn't drive crtc
             }
@@ -815,6 +818,7 @@ impl RandrState {
             .find(|m| m.mode_id == mode_id)
             .copied()
             .ok_or((error::BAD_MATCH, mode_id))?;
+        check_resource(mode_id, crate::access::ResourceKind::RandrMode)?;
         Ok(Some(mode))
     }
 
@@ -2421,7 +2425,7 @@ mod tests {
     fn set_crtc_config_mode_none_with_outputs_is_badmatch() {
         let st = one_output_state();
         assert_eq!(
-            st.validate_set_crtc_config(2, 0, &[1]),
+            st.validate_set_crtc_config(2, 0, &[1], |_, _| Ok(())),
             Err((x11_err::BAD_MATCH, 2))
         );
     }
@@ -2430,7 +2434,7 @@ mod tests {
     fn set_crtc_config_mode_set_with_no_outputs_is_badmatch() {
         let st = one_output_state();
         assert_eq!(
-            st.validate_set_crtc_config(2, 7, &[]),
+            st.validate_set_crtc_config(2, 7, &[], |_, _| Ok(())),
             Err((x11_err::BAD_MATCH, 2))
         );
     }
@@ -2440,7 +2444,7 @@ mod tests {
         let st = one_output_state();
         // crtc 999 isn't this output's crtc → errorValue = the bad crtc.
         assert_eq!(
-            st.validate_set_crtc_config(999, 7, &[1]),
+            st.validate_set_crtc_config(999, 7, &[1], |_, _| Ok(())),
             Err((x11_err::BAD_MATCH, 999))
         );
     }
@@ -2450,7 +2454,7 @@ mod tests {
         let st = one_output_state();
         // bad mode → errorValue = the bad mode id.
         assert_eq!(
-            st.validate_set_crtc_config(2, 555, &[1]),
+            st.validate_set_crtc_config(2, 555, &[1], |_, _| Ok(())),
             Err((x11_err::BAD_MATCH, 555))
         );
     }
@@ -2459,7 +2463,7 @@ mod tests {
     fn set_crtc_config_valid_enable_resolves_mode() {
         let st = one_output_state();
         let mode = st
-            .validate_set_crtc_config(2, 8, &[1])
+            .validate_set_crtc_config(2, 8, &[1], |_, _| Ok(()))
             .expect("valid")
             .expect("enable");
         assert_eq!((mode.width, mode.height), (1280, 720));
@@ -2468,7 +2472,10 @@ mod tests {
     #[test]
     fn set_crtc_config_valid_disable() {
         let st = one_output_state();
-        assert_eq!(st.validate_set_crtc_config(2, 0, &[]), Ok(None));
+        assert_eq!(
+            st.validate_set_crtc_config(2, 0, &[], |_, _| Ok(())),
+            Ok(None)
+        );
     }
 
     fn scale_transform(word: i32) -> CrtcTransform {

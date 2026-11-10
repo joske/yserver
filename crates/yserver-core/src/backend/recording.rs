@@ -318,6 +318,12 @@ pub enum RecordedCall {
         x: i32,
         y: i32,
     },
+    CrtcGammaSize {
+        crtc: u32,
+    },
+    GetCrtcGamma {
+        crtc: u32,
+    },
     /// GLX-TFP Task 3.4: `acquire_glx_pixmap_export(host_xid)` called.
     AcquireGlxPixmapExport(u32),
     /// GLX-TFP Task 3.4: `release_glx_pixmap_export(host_xid)` called.
@@ -1611,7 +1617,8 @@ impl Backend for RecordingBackend {
         Ok(self.provider_output_source_changed)
     }
 
-    fn crtc_gamma_size(&self, _crtc: u32) -> u16 {
+    fn crtc_gamma_size(&self, crtc: u32) -> u16 {
+        self.record(RecordedCall::CrtcGammaSize { crtc });
         256
     }
 
@@ -1778,6 +1785,7 @@ impl Backend for RecordingBackend {
     }
 
     fn get_crtc_gamma(&self, crtc: u32) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+        self.record(RecordedCall::GetCrtcGamma { crtc });
         if let Some(lut) = self.gamma.borrow().get(&crtc) {
             return lut.clone();
         }
