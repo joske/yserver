@@ -978,12 +978,23 @@ pub trait Backend {
     fn on_libinput_ready(&mut self, _state: &mut ServerState) {}
 
     /// The rootless host's display connection is readable
-    /// ([`BackendFdKind::HostDisplay`]): read its events and act on them
-    /// with `state` in hand. `false` when the window system closed the
+    /// ([`BackendFdKind::HostDisplay`]), or writable while
+    /// [`Backend::host_display_wants_writable`]: send what is queued, read
+    /// its events and act on them with `state` in hand. `false` when the window system closed the
     /// connection, which ends the server as the loss of its only display
     /// would. Default: `true`; only a host that registers the fd sees this.
     fn on_host_display_ready(&mut self, _state: &mut ServerState) -> bool {
         true
+    }
+
+    /// The rootless host's display connection holds output its last flush
+    /// could not send, the socket being full. Asked each loop iteration
+    /// after [`Backend::before_block`]: while it is true the loop watches the
+    /// [`BackendFdKind::HostDisplay`] fd for writable as well as readable,
+    /// and its readiness comes as [`Backend::on_host_display_ready`], which
+    /// flushes. A client's output is watched the same way. Default: `false`.
+    fn host_display_wants_writable(&self) -> bool {
+        false
     }
 
     /// Called once per core-loop iteration (with `state`) so a backend can

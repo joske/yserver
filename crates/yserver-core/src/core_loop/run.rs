@@ -2194,6 +2194,8 @@ fn run_core_with_inventory(
         poll.registry()
             .register(&mut SourceFd(&source.fd), token, Interest::READABLE)?;
     }
+    #[cfg(unix)]
+    let mut backend_writable = vec![false; backend_poll_sources.len()];
 
     // Probe input devices at startup, Xorg-style: drain libinput's
     // initial device enumeration and seed `state.xi_devices` BEFORE the
@@ -2316,6 +2318,15 @@ fn run_core_with_inventory(
         // (project_reclamation_starvation_leak). No-op for backends without
         // GPU resources to reap.
         backend.before_block();
+        // A host display connection whose flush left output queued is
+        // watched for writable too, as a client's output is.
+        #[cfg(unix)]
+        watch_backend_writable(
+            poll.registry(),
+            &backend_poll_sources,
+            &mut backend_writable,
+            backend.host_display_wants_writable(),
+        );
         // Retry on EINTR. A signal delivered while we're blocked in poll()
         // surfaces as `ErrorKind::Interrupted` — notably SIGCONT and the
         // VT/seat signals on resume-from-suspend. That is NOT fatal: re-poll.
@@ -4328,6 +4339,41 @@ fn reconcile_client_writable_interest(
         }
     }
     to_disconnect
+}
+
+/// Watch the host display sources for WRITABLE as well as READABLE while
+/// `host_display` (`Backend::host_display_wants_writable`), and for
+/// READABLE alone otherwise. `watching` is what each source is watched for
+/// now. A source made writable that already is reports at once: the poller
+/// is edge-triggered, and re-registering raises the edge again.
+#[cfg(unix)]
+fn watch_backend_writable(
+    registry: &mio::Registry,
+    sources: &[BackendPollSource],
+    watching: &mut [bool],
+    host_display: bool,
+) {
+    for (index, (source, watched)) in sources.iter().zip(watching.iter_mut()).enumerate() {
+        let want = host_display && source.kind == BackendFdKind::HostDisplay;
+        if want == *watched {
+            continue;
+        }
+        let Some(token) = super::poll_tokens::backend_token(index) else {
+            continue;
+        };
+        let interest = if want {
+            Interest::READABLE | Interest::WRITABLE
+        } else {
+            Interest::READABLE
+        };
+        match registry.reregister(&mut SourceFd(&source.fd), token, interest) {
+            Ok(()) => *watched = want,
+            Err(err) => warn!(
+                "reregister backend fd {} writable interest: {err}",
+                source.fd
+            ),
+        }
+    }
 }
 
 /// Add the client's writer to the poller for WRITABLE, or take it out.

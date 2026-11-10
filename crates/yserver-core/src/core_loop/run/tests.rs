@@ -5571,3 +5571,101 @@ fn internal_client_admits_as_internal() {
     assert!(client.internal);
     assert_eq!(client.admission, crate::access::Admission::Internal);
 }
+
+/// A host display connection whose flush left output queued gets it out
+/// once its socket drains, with nothing else for the loop to do: the loop
+/// watches the fd for writable while output is queued. Watched for
+/// readable alone, the queued output waited for the host's next work, and
+/// with none the host stalled. Once it is out the loop goes back to sleep.
+#[test]
+fn a_host_display_flush_left_queued_goes_out_when_the_socket_drains() {
+    use crate::backend::{
+        BackendFdKind,
+        recording::{HostDisplayOut, RecordingBackend},
+    };
+    use std::{
+        io::{Read, Write},
+        os::fd::AsRawFd,
+        sync::{Arc, atomic::AtomicU32},
+    };
+
+    let (poll, sender, rx) = channel().unwrap();
+    let sender_for_core = sender.clone_handle();
+    let (host, mut compositor) = UnixStream::pair().unwrap();
+    host.set_nonblocking(true).unwrap();
+    // The compositor is not reading: fill the socket.
+    let mut filled = 0usize;
+    loop {
+        match (&host).write(&[0x11; 4096]) {
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("{error}"),
+        }
+    }
+    const QUEUED: usize = 64 << 10;
+    let flushes = Arc::new(AtomicU32::new(0));
+    let (ready_tx, _ready_rx) = crossbeam_channel::unbounded();
+    let mut backend = RecordingBackend::new().with_poll_sources(
+        vec![(host.as_raw_fd(), BackendFdKind::HostDisplay)],
+        ready_tx,
+    );
+    backend.host_display_out = Some(HostDisplayOut {
+        stream: host,
+        pending: vec![0x22; QUEUED],
+        flushes: flushes.clone(),
+    });
+    let handle = std::thread::spawn(move || {
+        let mut state = ServerState::new();
+        let alloc = ClientIdAllocator::new();
+        let result = run_core(
+            poll,
+            rx,
+            sender_for_core,
+            &mut state,
+            &mut backend,
+            None,
+            &alloc,
+            AuthState::new(None),
+            ResetPolicy::NoReset,
+            None,
+        );
+        (result, backend)
+    });
+
+    // The loop has flushed what it could and blocked; now the compositor
+    // reads everything, what filled the socket and what was queued.
+    std::thread::sleep(Duration::from_millis(100));
+    compositor
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut got = 0usize;
+    let mut queued = 0usize;
+    let mut buf = vec![0u8; 64 << 10];
+    while got < filled + QUEUED {
+        let n = compositor
+            .read(&mut buf)
+            .expect("the queued output never went out");
+        queued += buf[..n].iter().filter(|b| **b == 0x22).count();
+        got += n;
+    }
+    assert_eq!(queued, QUEUED);
+    // All of it out, the loop sleeps: no flush without a reason.
+    std::thread::sleep(Duration::from_millis(50));
+    let settled = flushes.load(std::sync::atomic::Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        flushes.load(std::sync::atomic::Ordering::Relaxed),
+        settled,
+        "the loop kept waking with nothing queued"
+    );
+
+    sender.send(Message::Shutdown).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(handle.is_finished(), "run_core did not return");
+    let (result, backend) = handle.join().unwrap();
+    result.unwrap();
+    assert!(backend.host_display_out.unwrap().pending.is_empty());
+}

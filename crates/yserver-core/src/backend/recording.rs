@@ -419,6 +419,8 @@ pub struct RecordingBackend {
     pub scanout_render_completion_count: std::sync::atomic::AtomicU32,
     /// Stable test-owned fd inventory returned by `poll_fds`.
     poll_sources: Vec<(std::os::fd::RawFd, crate::backend::BackendFdKind)>,
+    /// A host display connection's output, flushed as a rootless host's is.
+    pub host_display_out: Option<HostDisplayOut>,
     /// Optional test notification sent after a DRM fd is dispatched,
     /// allowing a test thread to wait without timing-dependent sleeps.
     page_flip_ready_tx: Option<crossbeam_channel::Sender<std::os::fd::RawFd>>,
@@ -772,6 +774,7 @@ impl RecordingBackend {
             page_flip_fds: Mutex::new(Vec::new()),
             scanout_render_completion_count: std::sync::atomic::AtomicU32::new(0),
             poll_sources: Vec::new(),
+            host_display_out: None,
             page_flip_ready_tx: None,
             scanout_render_completion_tx: None,
             before_block_count: std::sync::atomic::AtomicU32::new(0),
@@ -1574,6 +1577,22 @@ impl Backend for RecordingBackend {
     fn before_block(&mut self) {
         self.before_block_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(out) = self.host_display_out.as_mut() {
+            out.flush();
+        }
+    }
+
+    fn on_host_display_ready(&mut self, _state: &mut crate::server::ServerState) -> bool {
+        if let Some(out) = self.host_display_out.as_mut() {
+            out.flush();
+        }
+        true
+    }
+
+    fn host_display_wants_writable(&self) -> bool {
+        self.host_display_out
+            .as_ref()
+            .is_some_and(|out| !out.pending.is_empty())
     }
 
     fn set_provider_output_source(
@@ -3114,6 +3133,34 @@ impl Backend for RecordingBackend {
         // RecordingBackend has no real GPU storage; report not-exportable.
         // Tests assert on the recorded call, not the return value.
         false
+    }
+}
+
+/// A rootless host's display connection, for loop tests: what is `pending`
+/// goes to `stream` (non-blocking) as far as it takes at each flush, before
+/// the loop blocks and when the connection is ready, as a host's flush does.
+#[derive(Debug)]
+pub struct HostDisplayOut {
+    pub stream: std::os::unix::net::UnixStream,
+    pub pending: Vec<u8>,
+    /// Flushes so far.
+    pub flushes: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl HostDisplayOut {
+    fn flush(&mut self) {
+        use std::io::Write as _;
+        self.flushes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        while !self.pending.is_empty() {
+            match self.stream.write(&self.pending) {
+                Ok(n) => {
+                    self.pending.drain(..n);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
     }
 }
 
