@@ -1,6 +1,7 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind},
     core_loop::process_request::{
-        RequestOutcome, emit_x11_error_with_minor,
+        RequestOutcome, check_resource, emit_x11_error_with_minor,
         randr_ext::{RANDR_MAJOR_OPCODE, active_monitors, request_xid, send_root_config_notify},
         write_to_client,
     },
@@ -33,6 +34,19 @@ pub(super) fn handle_randr_get_monitors(
             RANDR_MAJOR_OPCODE,
         );
     }
+    let request = RequestOpcodes {
+        major: RANDR_MAJOR_OPCODE,
+        minor,
+    };
+    check_resource!(
+        state,
+        client_id,
+        sequence,
+        request,
+        ResourceId(window),
+        ResourceKind::Window,
+        AccessMode::GET_ATTR
+    );
     // RRMonitorTimestamp: lastConfigTime, which Set/DeleteMonitor
     // leave alone ("XXX should take client monitor changes into
     // account", rrmonitor.c).
@@ -122,6 +136,19 @@ pub(super) fn handle_randr_set_monitor(
     if state.resources.window(ResourceId(req.window)).is_none() {
         return error(state, x11::error::BAD_WINDOW, req.window);
     }
+    let request = RequestOpcodes {
+        major: RANDR_MAJOR_OPCODE,
+        minor,
+    };
+    check_resource!(
+        state,
+        client_id,
+        sequence,
+        request,
+        ResourceId(req.window),
+        ResourceKind::Window,
+        AccessMode::GET_ATTR
+    );
     // !ValidAtom: Xorg sets no errorValue here, so the wire carries
     // the window id the successful lookup just left in it.
     if req.name == 0 || state.atoms.name(AtomId(req.name)).is_none() {
@@ -187,6 +214,19 @@ pub(super) fn handle_randr_delete_monitor(
     if state.resources.window(ResourceId(window)).is_none() {
         return error(state, x11::error::BAD_WINDOW, window);
     }
+    let request = RequestOpcodes {
+        major: RANDR_MAJOR_OPCODE,
+        minor,
+    };
+    check_resource!(
+        state,
+        client_id,
+        sequence,
+        request,
+        ResourceId(window),
+        ResourceKind::Window,
+        AccessMode::GET_ATTR
+    );
     if name == 0 || state.atoms.name(AtomId(name)).is_none() {
         return error(state, x11::error::BAD_ATOM, name);
     }

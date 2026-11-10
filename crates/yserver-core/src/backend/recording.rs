@@ -123,6 +123,11 @@ pub enum RecordedCall {
     ReleaseRedirectedBacking(u32),
     RetainBackingStorage(u32),
     DropBackingStorage(u32),
+    ReprobeConnectors,
+    SetLogicalScreenSize {
+        width: u16,
+        height: u16,
+    },
     PaintWindowBorderRects {
         host_xid: u32,
         rects: Vec<yserver_protocol::x11::xfixes::RegionRect>,
@@ -1443,6 +1448,16 @@ impl Backend for RecordingBackend {
         &mut self,
     ) -> (Vec<crate::randr::RandrOutput>, Vec<crate::randr::RandrMode>) {
         (self.randr_outputs.clone(), self.randr_modes.clone())
+    }
+
+    fn reprobe_connectors(&mut self, _state: &mut crate::server::ServerState) -> io::Result<()> {
+        self.record(RecordedCall::ReprobeConnectors);
+        Ok(())
+    }
+
+    fn set_logical_screen_size(&mut self, width: u16, height: u16) -> io::Result<()> {
+        self.record(RecordedCall::SetLogicalScreenSize { width, height });
+        Ok(())
     }
 
     fn randr_providers(&mut self) -> Vec<crate::randr::RandrProvider> {

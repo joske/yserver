@@ -1,7 +1,8 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind},
     backend::Backend,
     core_loop::process_request::{
-        RANDR_BAD_OUTPUT, RequestOutcome, emit_x11_error_with_minor,
+        RANDR_BAD_OUTPUT, RequestOutcome, check_resource, emit_x11_error_with_minor,
         randr_ext::{RANDR_MAJOR_OPCODE, request_xid},
         write_to_client,
     },
@@ -643,6 +644,19 @@ pub(super) fn handle_randr_get_output_primary(
             RANDR_MAJOR_OPCODE,
         );
     }
+    let request = RequestOpcodes {
+        major: RANDR_MAJOR_OPCODE,
+        minor,
+    };
+    check_resource!(
+        state,
+        client_id,
+        sequence,
+        request,
+        ResourceId(window),
+        ResourceKind::Window,
+        AccessMode::GET_ATTR
+    );
     let primary = state.randr.primary_output;
     let buf = x11randr::encode_get_output_primary_reply(byte_order, sequence, primary);
     let Some(client) = state.clients.get_mut(&client_id.0) else {

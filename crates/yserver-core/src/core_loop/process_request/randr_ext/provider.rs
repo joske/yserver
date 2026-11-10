@@ -1,7 +1,8 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind},
     backend::Backend,
     core_loop::process_request::{
-        RANDR_BAD_PROVIDER, RequestOutcome, emit_x11_error_with_minor,
+        RANDR_BAD_PROVIDER, RequestOutcome, check_resource, emit_x11_error_with_minor,
         randr_ext::{RANDR_MAJOR_OPCODE, request_xid, warn_randr_unsupported_once},
         write_to_client,
     },
@@ -62,6 +63,19 @@ pub(super) fn handle_randr_get_providers(
             RANDR_MAJOR_OPCODE,
         );
     }
+    let request = RequestOpcodes {
+        major: RANDR_MAJOR_OPCODE,
+        minor,
+    };
+    check_resource!(
+        state,
+        client_id,
+        sequence,
+        request,
+        ResourceId(window),
+        ResourceKind::Window,
+        AccessMode::GET_ATTR
+    );
     let timestamp = state.randr.timestamp;
     let providers: Vec<u32> = state
         .randr

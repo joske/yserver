@@ -1,7 +1,8 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind},
     backend::{Backend, CrtcConfigApply, ModeSpec},
     core_loop::process_request::{
-        RequestOutcome, emit_x11_error_with_minor,
+        RequestOutcome, check_resource, emit_x11_error_with_minor,
         randr_ext::{
             CrtcConfigCompletion, CrtcConfigReply, RANDR_MAJOR_OPCODE, crtc::start_crtc_config,
             request_xid,
@@ -72,6 +73,19 @@ pub(super) fn handle_randr_get_screen_size_range(
             RANDR_MAJOR_OPCODE,
         );
     }
+    let request = RequestOpcodes {
+        major: RANDR_MAJOR_OPCODE,
+        minor,
+    };
+    check_resource!(
+        state,
+        client_id,
+        sequence,
+        request,
+        ResourceId(window),
+        ResourceKind::Window,
+        AccessMode::GET_ATTR
+    );
     let (min_w, min_h, max_w, max_h) = state.randr.screen_size_range();
     let buf = x11randr::encode_get_screen_size_range_reply(
         byte_order, sequence, min_w, min_h, max_w, max_h,
@@ -106,6 +120,19 @@ pub(super) fn handle_randr_get_screen_resources(
             RANDR_MAJOR_OPCODE,
         );
     }
+    let request = RequestOpcodes {
+        major: RANDR_MAJOR_OPCODE,
+        minor,
+    };
+    check_resource!(
+        state,
+        client_id,
+        sequence,
+        request,
+        ResourceId(window),
+        ResourceKind::Window,
+        AccessMode::GET_ATTR
+    );
     // Force a connector re-probe before replying (Xorg
     // RRGetInfo force_query=TRUE). A probe failure surfaces as
     // BadAlloc, matching Xorg. GetScreenResourcesCurrent below
@@ -152,6 +179,19 @@ pub(super) fn handle_randr_get_screen_resources_current(
             RANDR_MAJOR_OPCODE,
         );
     }
+    let request = RequestOpcodes {
+        major: RANDR_MAJOR_OPCODE,
+        minor,
+    };
+    check_resource!(
+        state,
+        client_id,
+        sequence,
+        request,
+        ResourceId(window),
+        ResourceKind::Window,
+        AccessMode::GET_ATTR
+    );
     let resources = state.randr.screen_resources_current();
     let buf = x11randr::encode_get_screen_resources_current_reply(byte_order, sequence, &resources);
     let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -181,6 +221,19 @@ pub(super) fn handle_randr_select_input(
                     RANDR_MAJOR_OPCODE,
                 );
             }
+            let request = RequestOpcodes {
+                major: RANDR_MAJOR_OPCODE,
+                minor,
+            };
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                ResourceId(req.window),
+                ResourceKind::Window,
+                AccessMode::RECEIVE
+            );
             if req.enable == 0 {
                 state
                     .randr_select_masks
@@ -216,6 +269,19 @@ pub(super) fn handle_randr_get_screen_info(
             RANDR_MAJOR_OPCODE,
         );
     }
+    let request = RequestOpcodes {
+        major: RANDR_MAJOR_OPCODE,
+        minor,
+    };
+    check_resource!(
+        state,
+        client_id,
+        sequence,
+        request,
+        ResourceId(window),
+        ResourceKind::Window,
+        AccessMode::GET_ATTR
+    );
     // ProcRRGetScreenInfo (rrscreen.c:760-898) over RR10GetData.
     let has_rate = randr_client_knows_rates(state, client_id);
     let data = state.randr.rr10_data();
@@ -309,6 +375,19 @@ pub(super) fn handle_randr_set_screen_size(
             RANDR_MAJOR_OPCODE,
         );
     }
+    let request = RequestOpcodes {
+        major: RANDR_MAJOR_OPCODE,
+        minor,
+    };
+    check_resource!(
+        state,
+        client_id,
+        sequence,
+        request,
+        ResourceId(req.window),
+        ResourceKind::Window,
+        AccessMode::GET_ATTR
+    );
     // Validation order matches rrscreen.c: width range →
     // height range → crop → zero-mm. errorValue is the
     // offending dimension (width vs height reported
@@ -449,6 +528,24 @@ pub(super) fn set_screen_config(
     if state.resources.window(id).is_none() && state.resources.pixmap(id).is_none() {
         return error(state, x11::error::BAD_DRAWABLE, drawable);
     }
+    let request = RequestOpcodes {
+        major: RANDR_MAJOR_OPCODE,
+        minor: x11randr::RR_SET_SCREEN_CONFIG,
+    };
+    let kind = if state.resources.window(id).is_some() {
+        ResourceKind::Window
+    } else {
+        ResourceKind::Pixmap
+    };
+    check_resource!(
+        state,
+        client_id,
+        sequence,
+        request,
+        id,
+        kind,
+        AccessMode::WRITE
+    );
     let u16_at = |o: usize| u16::from_le_bytes([body[o], body[o + 1]]);
     let u32_at = |o: usize| u32::from_le_bytes(body[o..o + 4].try_into().unwrap());
     let (timestamp, config_timestamp) = (u32_at(4), u32_at(8));
