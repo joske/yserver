@@ -18,6 +18,9 @@ and every `AccessMode` bit used below.
 round, 3c-i (`2026-11-09-access-control-pr3c-i.md`) and its review round (`2026-11-10-access-control-pr3c-i-review1.md`)
 are the earlier parts of the same row.
 
+**Reference:** Xorg (MIT) at `/data/Projects/xorg-drivers/xserver` (`eae2c21`); file paths below are relative to it.
+The source inventory cites XLibre lines; the access modes in these files are the same in Xorg (compared per file). Where the plan states an order, the reviewer checks it against Xorg.
+
 **Source inventory:** `~/Projects/claude-scratch/access-control/pr3c/inventory.md` (taken at `f83615a4`; the RANDR,
 RECORD, ScreenSaver, Xinerama and XRes sources are unchanged since, so its line numbers hold), §2 (RECORD, RANDR,
 XRes, Xinerama, MIT-SCREEN-SAVER), §3, §4, §5, §6. The implementer locates sites by function name.
@@ -31,8 +34,8 @@ XRes, Xinerama, MIT-SCREEN-SAVER), §3, §4, §5, §6. The implementer locates s
   behaviour exactly. Zero (`None`) is never asked for a RANDR, RECORD or ScreenSaver operand, even where a resolver
   could match it (a RANDR output can report CRTC 0).
 - Each check runs immediately after its operand's own existing validation, before any later validation of other
-  fields. The order in which yserver validates operands is kept, even where XLibre's differs. An operand with no
-  validation today is checked at the position XLibre looks it up relative to the request's other operands.
+  fields. The order in which yserver validates operands is kept, even where Xorg's differs. An operand with no
+  validation today is checked at the position Xorg looks it up relative to the request's other operands.
 - Where one pure helper validates several operands (`RandrState::validate_set_crtc_config`,
   `validate_provider_output_source`, `validate_provider_offload_sink`, RECORD `check_client_specs`), each operand's
   check still runs right after that operand's own lookup inside the helper's order, not after the whole helper. The
@@ -54,24 +57,24 @@ XRes, Xinerama, MIT-SCREEN-SAVER), §3, §4, §5, §6. The implementer locates s
 
 The scope decisions of 3a, 3b and 3c-i apply unchanged: the policy's error goes out verbatim; `SERVER_OWNER` work is
 not checked; server objects are checked like any other target (a real client's request on a RANDR output, CRTC, mode
-or provider is asked, with owner `SERVER_OWNER`); modes are XLibre's at each site; policies see an extension request's
+or provider is asked, with owner `SERVER_OWNER`); modes are Xorg's at each site (the reference is Xorg; XLibre's modes are identical in every file this plan touches, checked at `eae2c21`); policies see an extension request's
 minor opcode from the data byte. The denial test contract of plan 3a and the row form of the 3b review round apply to
 every row. Rulings new to this plan:
 
 - **RANDR property reads that delete** (`GetOutputProperty`, and `GetProviderProperty` up to its
   `BadImplementation`) ask the Output (Provider) `READ | WRITE` in one check when the raw `delete` byte is nonzero,
-  and `READ` otherwise. XLibre asks `WRITE` alone; the spec's rule "requests that read and delete ask for both modes"
-  binds. The raw byte decides, before yserver's BOOL validation of it, as XLibre's `stuff->delete`.
+  and `READ` otherwise. Xorg asks `WRITE` alone (`randr/rrproperty.c:626`, `randr/rrproviderproperty.c:599`); the spec's rule "requests that read and delete ask for both modes"
+  binds. The raw byte decides, before yserver's BOOL validation of it, as Xorg's `stuff->delete`. This is the one mode in this plan that differs from Xorg, and only under a policy.
 - **RANDR requests yserver does not implement** keep today's answer and ask nothing when they validate no operand:
   `CreateMode` (`BadImplementation`), `CreateLease` (`BadImplementation`), `FreeLease` (`BadValue`, no lease store).
   The stubs that succeed today (`DestroyMode`, `AddOutputMode`, `DeleteOutputMode`) and the provider-property
   requests that validate their Provider before `BadImplementation` are checked: their operands resolve against live
   objects, and a denial answers the policy's error.
-- **`SetMonitor`'s outputs are not checked:** XLibre copies them without a lookup. Monitors are not resources; only
+- **`SetMonitor`'s outputs are not checked:** Xorg copies them without a lookup. Monitors are not resources; only
   the root window is checked.
-- **RANDR `SelectInput`** checks the window `RECEIVE` (XLibre). XLibre's derived `RREvent` record has no yserver
+- **RANDR `SelectInput`** checks the window `RECEIVE` (Xorg `randr/rrdispatch.c:83`). Xorg's derived `RREvent` record has no yserver
   counterpart and is not checked.
-- **`SetCrtcConfig`** asks, in XLibre's operand order mapped onto yserver's validation order: the CRTC `SET_ATTR`,
+- **`SetCrtcConfig`** asks, in Xorg's operand order mapped onto yserver's validation order: the CRTC `SET_ATTR`,
   if present, first (yserver never validates it on its own); each output `SET_ATTR` in wire order, right after that
   output resolves and before its "drives this CRTC" `BadMatch`; the mode `SET_ATTR` right after it resolves in the
   mode table. A disable (mode 0) asks the CRTC only. No backend call follows a denial.
@@ -80,14 +83,14 @@ every row. Rulings new to this plan:
   `validate_arbitrary_resource_if_present`, inside `check_client_specs`, in wire order, after the recorder `BadMatch`
   and occupancy `BadValue` for that specifier. An occupied id the wide resolver cannot name is not asked. A denial
   answers the policy's error before canonicalization, so registration and removal lists are unchanged.
-- **RECORD contexts** are asked `USE` for every request naming an existing context (XLibre's `VERIFY_CONTEXT`),
+- **RECORD contexts** are asked `USE` for every request naming an existing context (Xorg's `VERIFY_CONTEXT`),
   right after `BadContext` and before any other validation of the request. `CreateContext` asks `CREATE`,
   `Creation { parent: None }`, after the ID, spec and range validation and before the insert.
 - **ScreenSaver `SetAttributes` value resources:** after today's owner-conflict `BadAccess` and before the attributes
   are stored, in ascending mask-bit order, each if present: background pixmap `READ` (not `None` or
   `ParentRelative`), border pixmap `READ` (not `CopyFromParent`), colormap `USE`, cursor `USE` (not `None`). These
   are Xorg's original-operand checks. A denial answers the policy's error and leaves the stored attributes as they
-  were. XLibre's PanoramiX wrappers have no counterpart (yserver has no multi-screen wrapper), and the separate saver
+  were. Xorg's PanoramiX wrappers have no counterpart (yserver has no multi-screen wrapper), and the separate saver
   hooks are excluded by the spec.
 - **ScreenSaver derived operands (sol r1 B-1).** Activation does not create the window from the original values: it
   adds override-redirect and replays Xorg's 64-bit `unsigned long` → `XID *` shift (`create_screen_saver_window`), so
@@ -106,13 +109,13 @@ every row. Rulings new to this plan:
   so the instance activation consumes has the owner that was authorized; a different kind under that id fails
   `CreateWindow`'s own lookup as today. Recorded as an accepted difference; not changed here.
 - **XRes has no site in this PR:** QueryClients, QueryClientResources, QueryClientPixmapBytes and QueryClientIds
-  check clients (PR 5); QueryResourceBytes has no resource hook in XLibre. Listed so a reviewer sees it was
+  check clients (PR 5); QueryResourceBytes has no resource hook in Xorg. Listed so a reviewer sees it was
   considered.
 
 ## Site table
 
 "After X" means immediately after X's existing validation; "if present" means checked only when it resolves and is
-not zero. Modes are XLibre's (`include/dixaccess.h`), joined with `|`.
+not zero. Modes are Xorg's (`include/dixaccess.h`), joined with `|`.
 
 ### RANDR (major 128)
 
