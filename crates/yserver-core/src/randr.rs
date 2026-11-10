@@ -179,6 +179,8 @@ pub enum ProviderRelationshipError {
     /// The initiating provider is not a secondary GPU-screen provider
     /// (`BadValue`).
     NotGpuProvider(u32),
+    /// An installed access policy denied a resolved provider operand.
+    AccessDenied { code: u8, value: u32 },
 }
 
 /// A mode's timing after the `Option<ModeTiming>` fallback has been
@@ -511,21 +513,33 @@ impl RandrState {
     /// Validate `SetProviderOutputSource` in Xorg's order: the initiating
     /// sink provider's existence and capability, the optional source
     /// provider's existence and capability, then the initiating provider's
-    /// secondary-GPU role.
+    /// secondary-GPU role. Each resolved provider is passed to
+    /// `check_resource` immediately after lookup and before its capability.
     pub fn validate_provider_output_source(
         &self,
         provider_id: u32,
         source_provider_id: u32,
+        mut check_resource: impl FnMut(
+            u32,
+            crate::access::ResourceKind,
+        ) -> Result<(), ProviderRelationshipError>,
     ) -> Result<(), ProviderRelationshipError> {
         let provider = self
             .provider(provider_id)
             .ok_or(ProviderRelationshipError::UnknownProvider(provider_id))?;
+        if provider_id != 0 {
+            check_resource(provider_id, crate::access::ResourceKind::RandrProvider)?;
+        }
         if provider.capabilities & proto::PROVIDER_CAPABILITY_SINK_OUTPUT == 0 {
             return Err(ProviderRelationshipError::MissingCapability(provider_id));
         }
         if source_provider_id != 0 {
             let source = self.provider(source_provider_id).ok_or(
                 ProviderRelationshipError::UnknownProvider(source_provider_id),
+            )?;
+            check_resource(
+                source_provider_id,
+                crate::access::ResourceKind::RandrProvider,
             )?;
             if source.capabilities & proto::PROVIDER_CAPABILITY_SOURCE_OUTPUT == 0 {
                 return Err(ProviderRelationshipError::MissingCapability(
@@ -542,14 +556,23 @@ impl RandrState {
     /// Validate `SetProviderOffloadSink` in Xorg's order: the initiating
     /// source provider's existence, capability, and secondary-GPU role,
     /// followed by the optional sink provider's existence and capability.
+    /// Each resolved provider is passed to `check_resource` immediately
+    /// after lookup and before its capability.
     pub fn validate_provider_offload_sink(
         &self,
         provider_id: u32,
         sink_provider_id: u32,
+        mut check_resource: impl FnMut(
+            u32,
+            crate::access::ResourceKind,
+        ) -> Result<(), ProviderRelationshipError>,
     ) -> Result<(), ProviderRelationshipError> {
         let provider = self
             .provider(provider_id)
             .ok_or(ProviderRelationshipError::UnknownProvider(provider_id))?;
+        if provider_id != 0 {
+            check_resource(provider_id, crate::access::ResourceKind::RandrProvider)?;
+        }
         if provider.capabilities & proto::PROVIDER_CAPABILITY_SOURCE_OFFLOAD == 0 {
             return Err(ProviderRelationshipError::MissingCapability(provider_id));
         }
@@ -562,6 +585,7 @@ impl RandrState {
         let sink = self
             .provider(sink_provider_id)
             .ok_or(ProviderRelationshipError::UnknownProvider(sink_provider_id))?;
+        check_resource(sink_provider_id, crate::access::ResourceKind::RandrProvider)?;
         if sink.capabilities & proto::PROVIDER_CAPABILITY_SINK_OFFLOAD == 0 {
             return Err(ProviderRelationshipError::MissingCapability(
                 sink_provider_id,
@@ -1362,41 +1386,42 @@ mod tests {
             },
         ]);
 
-        assert_eq!(state.validate_provider_output_source(1, 2), Ok(()));
-        assert_eq!(state.validate_provider_output_source(1, 0), Ok(()));
+        let allow = |_, _| Ok(());
+        assert_eq!(state.validate_provider_output_source(1, 2, allow), Ok(()));
+        assert_eq!(state.validate_provider_output_source(1, 0, allow), Ok(()));
         assert_eq!(
-            state.validate_provider_output_source(99, 2),
+            state.validate_provider_output_source(99, 2, allow),
             Err(ProviderRelationshipError::UnknownProvider(99))
         );
         assert_eq!(
-            state.validate_provider_output_source(5, 99),
+            state.validate_provider_output_source(5, 99, allow),
             Err(ProviderRelationshipError::MissingCapability(5)),
             "the initiating sink capability precedes peer lookup"
         );
         assert_eq!(
-            state.validate_provider_output_source(5, 0),
+            state.validate_provider_output_source(5, 0, allow),
             Err(ProviderRelationshipError::MissingCapability(5)),
             "detach still validates the initiating sink capability"
         );
         assert_eq!(
-            state.validate_provider_output_source(1, 99),
+            state.validate_provider_output_source(1, 99, allow),
             Err(ProviderRelationshipError::UnknownProvider(99))
         );
         assert_eq!(
-            state.validate_provider_output_source(1, 5),
+            state.validate_provider_output_source(1, 5, allow),
             Err(ProviderRelationshipError::MissingCapability(5))
         );
         assert_eq!(
-            state.validate_provider_output_source(6, 99),
+            state.validate_provider_output_source(6, 99, allow),
             Err(ProviderRelationshipError::UnknownProvider(99)),
             "output-source peer lookup precedes the initiating GPU-role check"
         );
         assert_eq!(
-            state.validate_provider_output_source(6, 2),
+            state.validate_provider_output_source(6, 2, allow),
             Err(ProviderRelationshipError::NotGpuProvider(6))
         );
         assert_eq!(
-            state.validate_provider_output_source(6, 0),
+            state.validate_provider_output_source(6, 0, allow),
             Err(ProviderRelationshipError::NotGpuProvider(6)),
             "detach still validates the initiating GPU role"
         );
@@ -1415,37 +1440,38 @@ mod tests {
             },
         ]);
 
-        assert_eq!(state.validate_provider_offload_sink(3, 4), Ok(()));
-        assert_eq!(state.validate_provider_offload_sink(3, 0), Ok(()));
+        let allow = |_, _| Ok(());
+        assert_eq!(state.validate_provider_offload_sink(3, 4, allow), Ok(()));
+        assert_eq!(state.validate_provider_offload_sink(3, 0, allow), Ok(()));
         assert_eq!(
-            state.validate_provider_offload_sink(99, 4),
+            state.validate_provider_offload_sink(99, 4, allow),
             Err(ProviderRelationshipError::UnknownProvider(99))
         );
         assert_eq!(
-            state.validate_provider_offload_sink(5, 99),
+            state.validate_provider_offload_sink(5, 99, allow),
             Err(ProviderRelationshipError::MissingCapability(5)),
             "the initiating source capability precedes peer lookup"
         );
         assert_eq!(
-            state.validate_provider_offload_sink(5, 0),
+            state.validate_provider_offload_sink(5, 0, allow),
             Err(ProviderRelationshipError::MissingCapability(5)),
             "detach still validates the initiating source capability"
         );
         assert_eq!(
-            state.validate_provider_offload_sink(3, 99),
+            state.validate_provider_offload_sink(3, 99, allow),
             Err(ProviderRelationshipError::UnknownProvider(99))
         );
         assert_eq!(
-            state.validate_provider_offload_sink(3, 5),
+            state.validate_provider_offload_sink(3, 5, allow),
             Err(ProviderRelationshipError::MissingCapability(5))
         );
         assert_eq!(
-            state.validate_provider_offload_sink(6, 99),
+            state.validate_provider_offload_sink(6, 99, allow),
             Err(ProviderRelationshipError::NotGpuProvider(6)),
             "offload checks the initiating GPU role before peer lookup"
         );
         assert_eq!(
-            state.validate_provider_offload_sink(6, 0),
+            state.validate_provider_offload_sink(6, 0, allow),
             Err(ProviderRelationshipError::NotGpuProvider(6)),
             "detach still validates the initiating GPU role"
         );

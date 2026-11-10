@@ -91,6 +91,180 @@ fn output_get_property_body(output: ResourceId, property: u32, delete: u8) -> Ve
     body
 }
 
+const PROVIDER: ResourceId = ResourceId(0x0010_8A40);
+const PROVIDER_SOURCE: ResourceId = ResourceId(0x0010_8A41);
+const PROVIDER_SINK: ResourceId = ResourceId(0x0010_8A42);
+
+fn install_provider_access_fixture(fixture: &mut RandrAccessFixture) {
+    use yserver_protocol::x11::randr as rr;
+
+    let provider = |provider_id, capabilities| crate::randr::RandrProvider {
+        provider_id,
+        name: format!("access-provider-{provider_id}"),
+        capabilities,
+        is_gpu: true,
+        crtcs: Vec::new(),
+        outputs: Vec::new(),
+        associations: Vec::new(),
+    };
+    fixture.state.randr.set_providers(vec![
+        provider(
+            PROVIDER.0,
+            rr::PROVIDER_CAPABILITY_SINK_OUTPUT | rr::PROVIDER_CAPABILITY_SOURCE_OFFLOAD,
+        ),
+        provider(PROVIDER_SOURCE.0, rr::PROVIDER_CAPABILITY_SOURCE_OUTPUT),
+        provider(PROVIDER_SINK.0, rr::PROVIDER_CAPABILITY_SINK_OFFLOAD),
+    ]);
+}
+
+fn provider_property_body(minor: u8, provider: ResourceId, delete: u8) -> Vec<u8> {
+    use yserver_protocol::x11::randr as rr;
+
+    let mut body = words(&[provider.0]);
+    match minor {
+        rr::RR_LIST_PROVIDER_PROPERTIES => {}
+        rr::RR_QUERY_PROVIDER_PROPERTY | rr::RR_DELETE_PROVIDER_PROPERTY => {
+            body.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        }
+        rr::RR_CONFIGURE_PROVIDER_PROPERTY => {
+            body.extend_from_slice(&[0x01, 0x00, 0, 0, 0, 0, 0, 0]);
+        }
+        rr::RR_CHANGE_PROVIDER_PROPERTY => {
+            body.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+            body.extend_from_slice(&0u32.to_le_bytes());
+            body.extend_from_slice(&[8, 0, 0, 0]);
+            body.extend_from_slice(&0u32.to_le_bytes());
+        }
+        rr::RR_GET_PROVIDER_PROPERTY => {
+            body.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+            body.extend_from_slice(&[0; 12]);
+            body.extend_from_slice(&[delete, 0, 0, 0]);
+        }
+        _ => panic!("not a provider-property request: {minor}"),
+    }
+    body
+}
+
+fn provider_access_rows() -> Vec<OutputAccessRow> {
+    use yserver_protocol::x11::randr as rr;
+
+    let provider_target = resource_target(PROVIDER, ResourceKind::RandrProvider);
+    let source_target = resource_target(PROVIDER_SOURCE, ResourceKind::RandrProvider);
+    let sink_target = resource_target(PROVIDER_SINK, ResourceKind::RandrProvider);
+    let row = |label, minor, body, target, mode, before| {
+        (
+            AccessRow {
+                label,
+                major: 128,
+                minor,
+                body,
+                target,
+                mode,
+            },
+            before,
+        )
+    };
+
+    vec![
+        row(
+            "RANDR GetProviderInfo",
+            rr::RR_GET_PROVIDER_INFO,
+            words(&[PROVIDER.0, 0]),
+            provider_target,
+            AccessMode::READ,
+            Vec::new(),
+        ),
+        row(
+            "RANDR SetProviderOffloadSink provider",
+            rr::RR_SET_PROVIDER_OFFLOAD_SINK,
+            words(&[PROVIDER.0, PROVIDER_SINK.0, 0]),
+            provider_target,
+            AccessMode::READ,
+            Vec::new(),
+        ),
+        row(
+            "RANDR SetProviderOffloadSink sink",
+            rr::RR_SET_PROVIDER_OFFLOAD_SINK,
+            words(&[PROVIDER.0, PROVIDER_SINK.0, 0]),
+            sink_target,
+            AccessMode::READ,
+            vec![(provider_target, AccessMode::READ)],
+        ),
+        row(
+            "RANDR SetProviderOutputSource provider",
+            rr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+            words(&[PROVIDER.0, PROVIDER_SOURCE.0, 0]),
+            provider_target,
+            AccessMode::READ,
+            Vec::new(),
+        ),
+        row(
+            "RANDR SetProviderOutputSource source",
+            rr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+            words(&[PROVIDER.0, PROVIDER_SOURCE.0, 0]),
+            source_target,
+            AccessMode::READ,
+            vec![(provider_target, AccessMode::READ)],
+        ),
+        row(
+            "RANDR ListProviderProperties",
+            rr::RR_LIST_PROVIDER_PROPERTIES,
+            provider_property_body(rr::RR_LIST_PROVIDER_PROPERTIES, PROVIDER, 0),
+            provider_target,
+            AccessMode::READ,
+            Vec::new(),
+        ),
+        row(
+            "RANDR QueryProviderProperty",
+            rr::RR_QUERY_PROVIDER_PROPERTY,
+            provider_property_body(rr::RR_QUERY_PROVIDER_PROPERTY, PROVIDER, 0),
+            provider_target,
+            AccessMode::READ,
+            Vec::new(),
+        ),
+        row(
+            "RANDR ConfigureProviderProperty",
+            rr::RR_CONFIGURE_PROVIDER_PROPERTY,
+            provider_property_body(rr::RR_CONFIGURE_PROVIDER_PROPERTY, PROVIDER, 0),
+            provider_target,
+            AccessMode::READ,
+            Vec::new(),
+        ),
+        row(
+            "RANDR ChangeProviderProperty",
+            rr::RR_CHANGE_PROVIDER_PROPERTY,
+            provider_property_body(rr::RR_CHANGE_PROVIDER_PROPERTY, PROVIDER, 0),
+            provider_target,
+            AccessMode::READ,
+            Vec::new(),
+        ),
+        row(
+            "RANDR DeleteProviderProperty",
+            rr::RR_DELETE_PROVIDER_PROPERTY,
+            provider_property_body(rr::RR_DELETE_PROVIDER_PROPERTY, PROVIDER, 0),
+            provider_target,
+            AccessMode::READ,
+            Vec::new(),
+        ),
+        row(
+            "RANDR GetProviderProperty without delete",
+            rr::RR_GET_PROVIDER_PROPERTY,
+            provider_property_body(rr::RR_GET_PROVIDER_PROPERTY, PROVIDER, 0),
+            provider_target,
+            AccessMode::READ,
+            Vec::new(),
+        ),
+        row(
+            "RANDR GetProviderProperty",
+            rr::RR_GET_PROVIDER_PROPERTY,
+            provider_property_body(rr::RR_GET_PROVIDER_PROPERTY, PROVIDER, 1),
+            provider_target,
+            AccessMode::READ | AccessMode::WRITE,
+            Vec::new(),
+        ),
+    ]
+}
+
 fn resource_target(id: ResourceId, kind: ResourceKind) -> ResourceTarget {
     ResourceTarget {
         id,
@@ -1940,4 +2114,394 @@ fn set_crtc_gamma_denied_before_size_check() {
             crtc: allowed_crtc.0,
         }
     ));
+}
+
+#[test]
+fn randr_provider_deny_rows_match_site_table() {
+    // Mutation: remove GetProviderInfo's READ check; its row must stop returning the policy error.
+    for (row, before) in provider_access_rows() {
+        let mut fixture = randr_access_fixture();
+        install_provider_access_fixture(&mut fixture);
+        let randr_before = format!("{:?}", fixture.state.randr);
+        let backend_calls_before = fixture.backend.calls();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        fixture
+            .state
+            .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+                Arc::clone(&calls),
+                row.target.id,
+                Some(row.mode),
+                DENY_ERROR,
+            )));
+
+        let bytes = run_request(&mut fixture, row.major, row.minor, &row.body);
+        assert_eq!(
+            bytes.get(1).copied(),
+            Some(DENY_ERROR.code),
+            "{} error code",
+            row.label
+        );
+        assert_policy_error(&bytes, row.major, row.minor);
+        assert_eq!(
+            format!("{:?}", fixture.state.randr),
+            randr_before,
+            "{} denial must leave RANDR state unchanged",
+            row.label
+        );
+        assert_eq!(
+            fixture.backend.calls(),
+            backend_calls_before,
+            "{} denial must make no backend calls",
+            row.label
+        );
+        let calls = calls.lock().unwrap();
+        let resources = resource_calls(&calls);
+        assert_eq!(resources.len(), before.len() + 1, "{} checks", row.label);
+        for (index, (target, mode)) in before.iter().enumerate() {
+            assert_resource_check(resources[index], *target, *mode, row.major, row.minor);
+        }
+        assert_resource_check(
+            resources[before.len()],
+            row.target,
+            row.mode,
+            row.major,
+            row.minor,
+        );
+    }
+}
+
+#[test]
+fn randr_provider_ask_rows_match_site_table() {
+    // Mutation: use READ for GetProviderProperty with delete; this row must observe READ | WRITE.
+    let mut fixture = randr_access_fixture();
+    install_provider_access_fixture(&mut fixture);
+    let rows = provider_access_rows();
+    let calls = install_allow_policy(&mut fixture);
+
+    for (row, _) in rows {
+        let _bytes = run_request(&mut fixture, row.major, row.minor, &row.body);
+        let mut recorded_calls = calls.lock().unwrap();
+        let resources = resource_calls(&recorded_calls);
+        let expected = match row.minor {
+            34 => vec![
+                (PROVIDER, AccessMode::READ),
+                (PROVIDER_SINK, AccessMode::READ),
+            ],
+            35 => vec![
+                (PROVIDER, AccessMode::READ),
+                (PROVIDER_SOURCE, AccessMode::READ),
+            ],
+            _ => vec![(row.target.id, row.mode)],
+        };
+        assert_eq!(resources.len(), expected.len(), "{} checks", row.label);
+        for (index, (target, mode)) in expected.iter().enumerate() {
+            assert_resource_check(
+                resources[index],
+                resource_target(*target, ResourceKind::RandrProvider),
+                *mode,
+                row.major,
+                row.minor,
+            );
+        }
+        recorded_calls.clear();
+    }
+}
+
+#[test]
+fn set_provider_output_source_denied_provider_before_capability() {
+    // Mutation: move the provider check after the relationship helper; BadValue must then win over this denial.
+    use yserver_protocol::x11::randr as rr;
+
+    let mut no_policy = randr_access_fixture();
+    install_provider_access_fixture(&mut no_policy);
+    no_policy.state.randr.providers[0].capabilities = 0;
+    let body = words(&[PROVIDER.0, 0, 0]);
+    let bytes = run_request(
+        &mut no_policy,
+        128,
+        rr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+        &body,
+    );
+    assert_eq!(bytes[1], x11::error::BAD_VALUE);
+    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 0);
+
+    let mut fixture = randr_access_fixture();
+    install_provider_access_fixture(&mut fixture);
+    fixture.state.randr.providers[0].capabilities = 0;
+    let randr_before = format!("{:?}", fixture.state.randr);
+    let backend_calls_before = fixture.backend.calls();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+            Arc::clone(&calls),
+            PROVIDER,
+            Some(AccessMode::READ),
+            DENY_ERROR,
+        )));
+
+    let bytes = run_request(&mut fixture, 128, rr::RR_SET_PROVIDER_OUTPUT_SOURCE, &body);
+    assert_policy_error(&bytes, 128, rr::RR_SET_PROVIDER_OUTPUT_SOURCE);
+    assert_eq!(format!("{:?}", fixture.state.randr), randr_before);
+    assert_eq!(fixture.backend.calls(), backend_calls_before);
+    let calls = calls.lock().unwrap();
+    let resources = resource_calls(&calls);
+    assert_eq!(resources.len(), 1);
+    assert_resource_check(
+        resources[0],
+        resource_target(PROVIDER, ResourceKind::RandrProvider),
+        AccessMode::READ,
+        128,
+        rr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+    );
+}
+
+#[test]
+fn set_provider_output_source_denied_source_makes_no_backend_call() {
+    // Mutation: perform the provider relationship check before the source access check; the backend and notification assertions must fail.
+    use yserver_protocol::x11::randr as rr;
+
+    let mut fixture = randr_access_fixture();
+    install_provider_access_fixture(&mut fixture);
+    fixture.backend.provider_output_source_changed = true;
+    fixture
+        .state
+        .randr_select_masks
+        .insert((CLIENT.0, ROOT_WINDOW), rr::NOTIFY_MASK_PROVIDER_CHANGE);
+    let randr_before = format!("{:?}", fixture.state.randr);
+    let backend_calls_before = fixture.backend.calls();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+            Arc::clone(&calls),
+            PROVIDER_SOURCE,
+            Some(AccessMode::READ),
+            DENY_ERROR,
+        )));
+
+    let bytes = run_request(
+        &mut fixture,
+        128,
+        rr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+        &words(&[PROVIDER.0, PROVIDER_SOURCE.0, 0]),
+    );
+    assert_policy_error(&bytes, 128, rr::RR_SET_PROVIDER_OUTPUT_SOURCE);
+    assert_eq!(
+        bytes.len(),
+        32,
+        "denial must not append a provider notification"
+    );
+    assert_eq!(format!("{:?}", fixture.state.randr), randr_before);
+    assert_eq!(fixture.backend.calls(), backend_calls_before);
+    let calls = calls.lock().unwrap();
+    let resources = resource_calls(&calls);
+    assert_eq!(resources.len(), 2);
+    assert_resource_check(
+        resources[0],
+        resource_target(PROVIDER, ResourceKind::RandrProvider),
+        AccessMode::READ,
+        128,
+        rr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+    );
+    assert_resource_check(
+        resources[1],
+        resource_target(PROVIDER_SOURCE, ResourceKind::RandrProvider),
+        AccessMode::READ,
+        128,
+        rr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+    );
+}
+
+#[test]
+fn offload_sink_none_sink_is_not_asked() {
+    // Mutation: check a zero sink as a provider; the synthetic provider-zero row must appear in the recorded checks.
+    use yserver_protocol::x11::randr as rr;
+
+    let mut fixture = randr_access_fixture();
+    install_provider_access_fixture(&mut fixture);
+    let mut providers = fixture.state.randr.providers.clone();
+    providers.push(crate::randr::RandrProvider {
+        provider_id: 0,
+        name: "provider-zero sentinel".to_owned(),
+        capabilities: rr::PROVIDER_CAPABILITY_SINK_OFFLOAD,
+        is_gpu: true,
+        crtcs: Vec::new(),
+        outputs: Vec::new(),
+        associations: Vec::new(),
+    });
+    fixture.state.randr.set_providers(providers);
+    let calls = install_allow_policy(&mut fixture);
+    let randr_before = format!("{:?}", fixture.state.randr);
+    let backend_calls_before = fixture.backend.calls();
+
+    let _bytes = run_request(
+        &mut fixture,
+        128,
+        rr::RR_SET_PROVIDER_OFFLOAD_SINK,
+        &words(&[PROVIDER.0, 0, 0]),
+    );
+    assert_eq!(format!("{:?}", fixture.state.randr), randr_before);
+    assert_eq!(fixture.backend.calls(), backend_calls_before);
+    let calls = calls.lock().unwrap();
+    let resources = resource_calls(&calls);
+    assert_eq!(resources.len(), 1, "None sink must not be asked");
+    assert_resource_check(
+        resources[0],
+        resource_target(PROVIDER, ResourceKind::RandrProvider),
+        AccessMode::READ,
+        128,
+        rr::RR_SET_PROVIDER_OFFLOAD_SINK,
+    );
+}
+
+#[test]
+fn randr_provider_zero_operands_are_not_asked() {
+    // Mutation: remove GetProviderInfo's nonzero guard; a resolvable provider zero must not appear in the policy calls.
+    use yserver_protocol::x11::randr as rr;
+
+    let mut fixture = randr_access_fixture();
+    install_provider_access_fixture(&mut fixture);
+    let mut providers = fixture.state.randr.providers.clone();
+    providers.push(crate::randr::RandrProvider {
+        provider_id: 0,
+        name: "provider-zero sentinel".to_owned(),
+        capabilities: rr::PROVIDER_CAPABILITY_SINK_OUTPUT | rr::PROVIDER_CAPABILITY_SOURCE_OFFLOAD,
+        is_gpu: true,
+        crtcs: Vec::new(),
+        outputs: Vec::new(),
+        associations: Vec::new(),
+    });
+    fixture.state.randr.set_providers(providers);
+    let calls = install_allow_policy(&mut fixture);
+
+    let bytes = run_request(&mut fixture, 128, rr::RR_GET_PROVIDER_INFO, &words(&[0, 0]));
+    assert_eq!(bytes[0], 1, "provider-zero info keeps today's reply");
+    assert!(resource_calls(&calls.lock().unwrap()).is_empty());
+
+    let bytes = run_request(
+        &mut fixture,
+        128,
+        rr::RR_SET_PROVIDER_OFFLOAD_SINK,
+        &words(&[0, PROVIDER_SINK.0, 0]),
+    );
+    assert_eq!(bytes[1], x11::error::BAD_IMPLEMENTATION);
+    let mut recorded_calls = calls.lock().unwrap();
+    let resources = resource_calls(&recorded_calls);
+    assert_eq!(resources.len(), 1);
+    assert_resource_check(
+        resources[0],
+        resource_target(PROVIDER_SINK, ResourceKind::RandrProvider),
+        AccessMode::READ,
+        128,
+        rr::RR_SET_PROVIDER_OFFLOAD_SINK,
+    );
+    recorded_calls.clear();
+    drop(recorded_calls);
+
+    let bytes = run_request(
+        &mut fixture,
+        128,
+        rr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+        &words(&[0, PROVIDER_SOURCE.0, 0]),
+    );
+    assert!(bytes.is_empty());
+    let mut recorded_calls = calls.lock().unwrap();
+    let resources = resource_calls(&recorded_calls);
+    assert_eq!(resources.len(), 1);
+    assert_resource_check(
+        resources[0],
+        resource_target(PROVIDER_SOURCE, ResourceKind::RandrProvider),
+        AccessMode::READ,
+        128,
+        rr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+    );
+    recorded_calls.clear();
+    drop(recorded_calls);
+
+    let bytes = run_request(
+        &mut fixture,
+        128,
+        rr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+        &words(&[PROVIDER.0, 0, 0]),
+    );
+    assert!(bytes.is_empty());
+    let mut recorded_calls = calls.lock().unwrap();
+    let resources = resource_calls(&recorded_calls);
+    assert_eq!(resources.len(), 1);
+    assert_resource_check(
+        resources[0],
+        resource_target(PROVIDER, ResourceKind::RandrProvider),
+        AccessMode::READ,
+        128,
+        rr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+    );
+    recorded_calls.clear();
+    drop(recorded_calls);
+
+    for minor in rr::RR_LIST_PROVIDER_PROPERTIES..=rr::RR_GET_PROVIDER_PROPERTY {
+        let body = provider_property_body(
+            minor,
+            ResourceId(0),
+            u8::from(minor == rr::RR_GET_PROVIDER_PROPERTY),
+        );
+        let bytes = run_request(&mut fixture, 128, minor, &body);
+        assert_eq!(bytes[1], x11::error::BAD_IMPLEMENTATION);
+        assert!(
+            resource_calls(&calls.lock().unwrap()).is_empty(),
+            "provider zero must not be asked for minor {minor}"
+        );
+    }
+}
+
+#[test]
+fn provider_property_denied_before_bad_implementation() {
+    // Mutation: emit BadImplementation before the provider check; each denial must instead return the policy error.
+    use yserver_protocol::x11::randr as rr;
+
+    for minor in rr::RR_LIST_PROVIDER_PROPERTIES..=rr::RR_GET_PROVIDER_PROPERTY {
+        let mut fixture = randr_access_fixture();
+        install_provider_access_fixture(&mut fixture);
+        let mode = if minor == rr::RR_GET_PROVIDER_PROPERTY {
+            AccessMode::READ | AccessMode::WRITE
+        } else {
+            AccessMode::READ
+        };
+        let body = provider_property_body(
+            minor,
+            PROVIDER,
+            u8::from(minor == rr::RR_GET_PROVIDER_PROPERTY),
+        );
+        let randr_before = format!("{:?}", fixture.state.randr);
+        let backend_calls_before = fixture.backend.calls();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        fixture
+            .state
+            .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+                Arc::clone(&calls),
+                PROVIDER,
+                Some(mode),
+                DENY_ERROR,
+            )));
+
+        let bytes = run_request(&mut fixture, 128, minor, &body);
+        assert_eq!(
+            bytes.get(1).copied(),
+            Some(DENY_ERROR.code),
+            "minor {minor}"
+        );
+        assert_policy_error(&bytes, 128, minor);
+        assert_eq!(format!("{:?}", fixture.state.randr), randr_before);
+        assert_eq!(fixture.backend.calls(), backend_calls_before);
+        let calls = calls.lock().unwrap();
+        let resources = resource_calls(&calls);
+        assert_eq!(resources.len(), 1, "provider property minor {minor}");
+        assert_resource_check(
+            resources[0],
+            resource_target(PROVIDER, ResourceKind::RandrProvider),
+            mode,
+            128,
+            minor,
+        );
+    }
 }
