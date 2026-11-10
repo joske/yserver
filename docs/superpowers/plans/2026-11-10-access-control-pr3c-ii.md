@@ -85,9 +85,26 @@ every row. Rulings new to this plan:
   `Creation { parent: None }`, after the ID, spec and range validation and before the insert.
 - **ScreenSaver `SetAttributes` value resources:** after today's owner-conflict `BadAccess` and before the attributes
   are stored, in ascending mask-bit order, each if present: background pixmap `READ` (not `None` or
-  `ParentRelative`), border pixmap `READ` (not `CopyFromParent`), colormap `USE`, cursor `USE` (not `None`). A
-  denial answers the policy's error and leaves the stored attributes as they were. XLibre's PanoramiX wrappers have
-  no counterpart (yserver has no multi-screen wrapper), and the separate saver hooks are excluded by the spec.
+  `ParentRelative`), border pixmap `READ` (not `CopyFromParent`), colormap `USE`, cursor `USE` (not `None`). These
+  are Xorg's original-operand checks. A denial answers the policy's error and leaves the stored attributes as they
+  were. XLibre's PanoramiX wrappers have no counterpart (yserver has no multi-screen wrapper), and the separate saver
+  hooks are excluded by the spec.
+- **ScreenSaver derived operands (sol r1 B-1).** Activation does not create the window from the original values: it
+  adds override-redirect and replays Xorg's 64-bit `unsigned long` → `XID *` shift (`create_screen_saver_window`), so
+  a scalar the client sent (a pixel) can reach `CreateWindow`, run as `SERVER_OWNER`, as a background pixmap, border
+  pixmap, colormap or cursor. Those effective operands are derived targets of `SetAttributes` (spec, "Operands are
+  not the only targets"): right after the original-operand checks, the request computes the values activation will
+  pass to `CreateWindow`, through the same function activation uses (the materialization is moved out of
+  `create_screen_saver_window` into one function both call; no second copy), and asks each effective background
+  pixmap, border pixmap, colormap and cursor that resolves, with the same modes and sentinels as above, under the
+  requesting client, skipping an effective operand identical in role and id to an original one already asked. A
+  denial answers the policy's error and stores nothing: the stored attributes are the request's only effect, so
+  there is nothing to skip. Activation itself stays unchecked server work. Xorg has the same unchecked path; this is
+  the derived-target rule, not a parity change, and with no policy nothing changes.
+- **Stored saver XIDs are bound by owner, not instance.** yserver stores raw XIDs and activation resolves them later
+  (Xorg holds references). An XID freed and reused before activation can only be reused inside its owner's id range,
+  so the instance activation consumes has the owner that was authorized; a different kind under that id fails
+  `CreateWindow`'s own lookup as today. Recorded as an accepted difference; not changed here.
 - **XRes has no site in this PR:** QueryClients, QueryClientResources, QueryClientPixmapBytes and QueryClientIds
   check clients (PR 5); QueryResourceBytes has no resource hook in XLibre. Listed so a reviewer sees it was
   considered.
@@ -140,7 +157,7 @@ not zero. Modes are XLibre's (`include/dixaccess.h`), joined with `|`.
 | Request | Checks, in order |
 |---|---|
 | 1 QueryInfo, 2 SelectInput | drawable `GET_ATTR`, if present (window first, then pixmap, as 3c-i's drawable ruling) |
-| 3 SetAttributes | drawable `GET_ATTR`, after `BadDrawable`; then the value resources per the ScreenSaver ruling |
+| 3 SetAttributes | drawable `GET_ATTR`, after `BadDrawable`; then the value resources, then the derived operands, per the two ScreenSaver rulings |
 | 4 UnsetAttributes | drawable `GET_ATTR`, after `BadDrawable`, before the owner-specific unset |
 
 ## Review Focus
@@ -249,7 +266,13 @@ registered in `tests/mod.rs`.
   sentinel (`None` / `ParentRelative` / `CopyFromParent`) asking nothing; `saver_set_attributes_denied_keeps_old_attrs`
   (the client's earlier attributes stay stored and are the ones activation uses; mutation: store before the
   checks); `saver_owner_conflict_precedes_value_checks` (another client's attributes
-  stored + denied pixmap: today's `BadAccess`); `saver_query_info_unresolved_drawable_is_not_asked`.
+  stored + denied pixmap: today's `BadAccess`); `saver_query_info_unresolved_drawable_is_not_asked`;
+  `saver_shifted_pixel_becomes_border_pixmap_is_asked` (sol r1 B-1: mask `0x7`, values `[0, P, 0]` with `P` a
+  root-depth pixmap the policy denies `READ`: the policy's error, nothing stored, and with an allow-all policy the
+  ASK row records `P` as `Pixmap` `READ`; no-policy row stores and activates exactly as today; mutation: check only
+  the original operands); `saver_activation_and_check_share_materialization` (the effective values the check asks
+  are the ones activation passes to `CreateWindow`, observed through the created saver window's border; mutation:
+  a check-side copy of the transformation without the 64-bit shift).
 - [ ] **Steps 2–5.** Commit `… Task 6: MIT-SCREEN-SAVER`.
 
 ### Task 7: Spec rows, status and gate
