@@ -822,12 +822,20 @@ fn shm_create_pixmap_missing_segment_allocates_nothing() {
 fn shm_create_pixmap_undersized_segment_allocates_nothing() {
     // Mutation: allocate the backend pixmap before checking the segment byte range; the call log must catch it.
     let mut fixture = shm_fixture();
+    // The OS may round the object up to a page (16 KiB on macOS), so the
+    // offset, not the 1-byte size, is what puts the pixmap past the end.
+    const OFFSET_PAST_ANY_PAGE: u32 = 1 << 20;
     install_segment_with_size(&mut fixture.state, SEGMENT, false, 1);
     let mut body = create_pixmap_body(NEW_PIXMAP, SEGMENT);
-    body[20..24].copy_from_slice(&1u32.to_le_bytes());
+    body[20..24].copy_from_slice(&OFFSET_PAST_ANY_PAGE.to_le_bytes());
     let bytes = dispatch(&mut fixture, shm::CREATE_PIXMAP, &body, None, 1);
 
-    assert_x_error(&bytes, x11::error::BAD_VALUE, 1, shm::CREATE_PIXMAP);
+    assert_x_error(
+        &bytes,
+        x11::error::BAD_VALUE,
+        OFFSET_PAST_ANY_PAGE,
+        shm::CREATE_PIXMAP,
+    );
     assert!(fixture.state.resources.pixmap(NEW_PIXMAP).is_none());
     assert!(fixture.state.mit_shm_segments.contains_key(&SEGMENT.0));
     assert!(fixture.backend.calls().is_empty());
