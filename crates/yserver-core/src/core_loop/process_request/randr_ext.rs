@@ -22,9 +22,10 @@ mod screen;
 mod xinerama;
 
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind},
     backend::{Backend, CrtcConfigToken},
     core_loop::process_request::{
-        RANDR_REQUEST_COUNT, RequestOutcome, emit_x11_error_with_minor,
+        RANDR_REQUEST_COUNT, RequestOutcome, check_resource, emit_x11_error_with_minor,
         randr_ext::{
             monitor::{
                 handle_randr_delete_monitor, handle_randr_get_monitors, handle_randr_set_monitor,
@@ -335,6 +336,56 @@ pub(super) fn handle_randr_request(
             header.opcode,
         ),
         other => {
+            let request = RequestOpcodes {
+                major: RANDR_MAJOR_OPCODE,
+                minor: other,
+            };
+            match other {
+                17 => {
+                    let mode = request_xid(body);
+                    if mode != 0 {
+                        check_resource!(
+                            state,
+                            client_id,
+                            sequence,
+                            request,
+                            yserver_protocol::x11::ResourceId(mode),
+                            ResourceKind::RandrMode,
+                            AccessMode::DESTROY
+                        );
+                    }
+                }
+                18 | 19 => {
+                    let output = request_xid(body);
+                    let mode = body
+                        .get(4..8)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .unwrap_or(0);
+                    if output != 0 {
+                        check_resource!(
+                            state,
+                            client_id,
+                            sequence,
+                            request,
+                            yserver_protocol::x11::ResourceId(output),
+                            ResourceKind::RandrOutput,
+                            AccessMode::READ
+                        );
+                    }
+                    if mode != 0 {
+                        check_resource!(
+                            state,
+                            client_id,
+                            sequence,
+                            request,
+                            yserver_protocol::x11::ResourceId(mode),
+                            ResourceKind::RandrMode,
+                            AccessMode::USE
+                        );
+                    }
+                }
+                _ => {}
+            }
             let request_name = match other {
                 17 => "DestroyMode",
                 18 => "AddOutputMode",

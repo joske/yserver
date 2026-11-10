@@ -86,6 +86,21 @@ pub(super) fn handle_randr_get_output_info(
             RANDR_MAJOR_OPCODE,
         );
     };
+    if req.output != 0 {
+        let request = RequestOpcodes {
+            major: RANDR_MAJOR_OPCODE,
+            minor: header.data,
+        };
+        check_resource!(
+            state,
+            client_id,
+            sequence,
+            request,
+            ResourceId(req.output),
+            ResourceKind::RandrOutput,
+            AccessMode::READ
+        );
+    }
     // The `crtcs` array is the output's *possible* CRTCs, not the
     // currently-assigned one (which is 0 for a connected-but-off
     // output and would advertise an invalid crtcs=[0]).
@@ -136,6 +151,21 @@ pub(super) fn handle_randr_list_output_properties(
             output_id,
             u16::from(minor),
             RANDR_MAJOR_OPCODE,
+        );
+    }
+    if output_id != 0 {
+        let request = RequestOpcodes {
+            major: RANDR_MAJOR_OPCODE,
+            minor,
+        };
+        check_resource!(
+            state,
+            client_id,
+            sequence,
+            request,
+            ResourceId(output_id),
+            ResourceKind::RandrOutput,
+            AccessMode::READ
         );
     }
     // Real client-set properties first, then the backend-synthesized
@@ -199,6 +229,21 @@ pub(super) fn handle_randr_query_output_property(
             req.output,
             u16::from(minor),
             RANDR_MAJOR_OPCODE,
+        );
+    }
+    if req.output != 0 {
+        let request = RequestOpcodes {
+            major: RANDR_MAJOR_OPCODE,
+            minor,
+        };
+        check_resource!(
+            state,
+            client_id,
+            sequence,
+            request,
+            ResourceId(req.output),
+            ResourceKind::RandrOutput,
+            AccessMode::READ
         );
     }
     let property = AtomId(req.property);
@@ -267,6 +312,21 @@ pub(super) fn handle_randr_configure_output_property(
             req.output,
             u16::from(minor),
             RANDR_MAJOR_OPCODE,
+        );
+    }
+    if req.output != 0 {
+        let request = RequestOpcodes {
+            major: RANDR_MAJOR_OPCODE,
+            minor,
+        };
+        check_resource!(
+            state,
+            client_id,
+            sequence,
+            request,
+            ResourceId(req.output),
+            ResourceKind::RandrOutput,
+            AccessMode::READ
         );
     }
     // Ranges must have an even number of values (min,max pairs).
@@ -369,6 +429,21 @@ pub(super) fn handle_randr_change_output_property(
             req.output,
             u16::from(minor),
             RANDR_MAJOR_OPCODE,
+        );
+    }
+    if req.output != 0 {
+        let request = RequestOpcodes {
+            major: RANDR_MAJOR_OPCODE,
+            minor,
+        };
+        check_resource!(
+            state,
+            client_id,
+            sequence,
+            request,
+            ResourceId(req.output),
+            ResourceKind::RandrOutput,
+            AccessMode::READ
         );
     }
     let property = AtomId(req.property);
@@ -516,6 +591,21 @@ pub(super) fn handle_randr_delete_output_property(
             RANDR_MAJOR_OPCODE,
         );
     }
+    if req.output != 0 {
+        let request = RequestOpcodes {
+            major: RANDR_MAJOR_OPCODE,
+            minor,
+        };
+        check_resource!(
+            state,
+            client_id,
+            sequence,
+            request,
+            ResourceId(req.output),
+            ResourceKind::RandrOutput,
+            AccessMode::READ
+        );
+    }
     let property = AtomId(req.property);
     if !state.atoms.exists(property) {
         return emit_x11_error_with_minor(
@@ -586,6 +676,19 @@ pub(super) fn handle_randr_set_output_primary(
             RANDR_MAJOR_OPCODE,
         );
     }
+    let request = RequestOpcodes {
+        major: RANDR_MAJOR_OPCODE,
+        minor,
+    };
+    check_resource!(
+        state,
+        client_id,
+        sequence,
+        request,
+        ResourceId(window),
+        ResourceKind::Window,
+        AccessMode::GET_ATTR
+    );
     let output = body
         .get(4..8)
         .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
@@ -599,6 +702,17 @@ pub(super) fn handle_randr_set_output_primary(
             output,
             u16::from(minor),
             RANDR_MAJOR_OPCODE,
+        );
+    }
+    if output != 0 {
+        check_resource!(
+            state,
+            client_id,
+            sequence,
+            request,
+            ResourceId(output),
+            ResourceKind::RandrOutput,
+            AccessMode::READ
         );
     }
     // None (0) clears the primary output. A nonzero id is already
@@ -692,6 +806,26 @@ pub(super) fn handle_randr_get_output_property(
             req.output,
             u16::from(minor),
             RANDR_MAJOR_OPCODE,
+        );
+    }
+    if req.output != 0 {
+        let request = RequestOpcodes {
+            major: RANDR_MAJOR_OPCODE,
+            minor,
+        };
+        let mode = if req.delete_raw != 0 {
+            AccessMode::READ | AccessMode::WRITE
+        } else {
+            AccessMode::READ
+        };
+        check_resource!(
+            state,
+            client_id,
+            sequence,
+            request,
+            ResourceId(req.output),
+            ResourceKind::RandrOutput,
+            mode
         );
     }
     let property = AtomId(req.property);

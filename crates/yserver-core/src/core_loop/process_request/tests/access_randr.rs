@@ -64,6 +64,33 @@ fn set_monitor_body(window: ResourceId) -> Vec<u8> {
     body
 }
 
+fn output_change_property_body(
+    output: ResourceId,
+    property: u32,
+    prop_type: u32,
+    mode: u8,
+    format: u8,
+    data: &[u8],
+) -> Vec<u8> {
+    let units = match format {
+        8 => data.len(),
+        16 => data.len() / 2,
+        32 => data.len() / 4,
+        _ => 0,
+    };
+    let mut body = words(&[output.0, property, prop_type]);
+    body.extend_from_slice(&[format, mode, 0, 0]);
+    body.extend_from_slice(&(units as u32).to_le_bytes());
+    body.extend_from_slice(data);
+    body
+}
+
+fn output_get_property_body(output: ResourceId, property: u32, delete: u8) -> Vec<u8> {
+    let mut body = words(&[output.0, property, 0, 0, 1]);
+    body.extend_from_slice(&[delete, 0, 0, 0]);
+    body
+}
+
 fn resource_target(id: ResourceId, kind: ResourceKind) -> ResourceTarget {
     ResourceTarget {
         id,
@@ -185,6 +212,146 @@ fn access_rows() -> Vec<AccessRow> {
             xin::GET_SCREEN_SIZE,
             words(&[root.0, 0]),
             AccessMode::GET_ATTR,
+        ),
+    ]
+}
+
+type OutputAccessRow = (AccessRow, Vec<(ResourceTarget, AccessMode)>);
+
+fn output_access_rows(fixture: &mut RandrAccessFixture) -> Vec<OutputAccessRow> {
+    let output = ResourceId(fixture.state.randr.outputs[0].output_id);
+    let mode = ResourceId(fixture.state.randr.mode_table[0].mode_id);
+    let property = fixture.state.atoms.intern("ACCESS_TEST_OUTPUT", false).0;
+    let prop_type = fixture.state.atoms.intern("ACCESS_TEST_CARDINAL", false).0;
+    let output_target = resource_target(output, ResourceKind::RandrOutput);
+    let mode_target = resource_target(mode, ResourceKind::RandrMode);
+    let row = |label, minor, body, target, mode| {
+        (
+            AccessRow {
+                label,
+                major: 128,
+                minor,
+                body,
+                target,
+                mode,
+            },
+            Vec::new(),
+        )
+    };
+
+    let get_output_info = words(&[output.0, fixture.state.randr.config_timestamp]);
+    let mut configure_property = words(&[output.0, property]);
+    configure_property.extend_from_slice(&[0, 0, 0, 0]);
+    let change_property =
+        output_change_property_body(output, property, prop_type, 0, 32, &[1, 0, 0, 0]);
+    let add_mode = words(&[output.0, mode.0]);
+    let set_primary = words(&[ROOT_WINDOW.0, output.0]);
+    vec![
+        row(
+            "RANDR GetOutputInfo",
+            9,
+            get_output_info,
+            output_target,
+            AccessMode::READ,
+        ),
+        row(
+            "RANDR ListOutputProperties",
+            10,
+            words(&[output.0]),
+            output_target,
+            AccessMode::READ,
+        ),
+        row(
+            "RANDR QueryOutputProperty",
+            11,
+            words(&[output.0, property]),
+            output_target,
+            AccessMode::READ,
+        ),
+        row(
+            "RANDR ConfigureOutputProperty",
+            12,
+            configure_property,
+            output_target,
+            AccessMode::READ,
+        ),
+        row(
+            "RANDR ChangeOutputProperty",
+            13,
+            change_property,
+            output_target,
+            AccessMode::READ,
+        ),
+        row(
+            "RANDR DeleteOutputProperty",
+            14,
+            words(&[output.0, property]),
+            output_target,
+            AccessMode::READ,
+        ),
+        row(
+            "RANDR GetOutputProperty",
+            15,
+            output_get_property_body(output, property, 0),
+            output_target,
+            AccessMode::READ,
+        ),
+        row(
+            "RANDR DestroyMode",
+            17,
+            words(&[mode.0]),
+            mode_target,
+            AccessMode::DESTROY,
+        ),
+        row(
+            "RANDR AddOutputMode output",
+            18,
+            add_mode.clone(),
+            output_target,
+            AccessMode::READ,
+        ),
+        (
+            row(
+                "RANDR AddOutputMode mode",
+                18,
+                add_mode.clone(),
+                mode_target,
+                AccessMode::USE,
+            )
+            .0,
+            vec![(output_target, AccessMode::READ)],
+        ),
+        row(
+            "RANDR DeleteOutputMode output",
+            19,
+            add_mode.clone(),
+            output_target,
+            AccessMode::READ,
+        ),
+        (
+            row(
+                "RANDR DeleteOutputMode mode",
+                19,
+                add_mode,
+                mode_target,
+                AccessMode::USE,
+            )
+            .0,
+            vec![(output_target, AccessMode::READ)],
+        ),
+        (
+            row(
+                "RANDR SetOutputPrimary output",
+                30,
+                set_primary,
+                resource_target(output, ResourceKind::RandrOutput),
+                AccessMode::READ,
+            )
+            .0,
+            vec![(
+                resource_target(ROOT_WINDOW, ResourceKind::Window),
+                AccessMode::GET_ATTR,
+            )],
         ),
     ]
 }
@@ -652,5 +819,529 @@ fn delete_monitor_denial_keeps_existing_monitor() {
         AccessMode::GET_ATTR,
         128,
         minor,
+    );
+}
+
+#[test]
+fn randr_output_deny_rows_match_the_site_table() {
+    // Mutation: remove the READ check from GetOutputInfo; its row must stop returning the policy error.
+    use yserver_protocol::x11::randr as rr;
+
+    let row_count = {
+        let mut fixture = randr_access_fixture();
+        output_access_rows(&mut fixture).len()
+    };
+    for row_index in 0..row_count {
+        let mut fixture = randr_access_fixture();
+        let (row, before) = output_access_rows(&mut fixture).remove(row_index);
+        if row.minor == rr::RR_SET_OUTPUT_PRIMARY {
+            fixture.state.randr.primary_output = 0;
+            fixture
+                .state
+                .randr_select_masks
+                .insert((CLIENT.0, ROOT_WINDOW), rr::NOTIFY_MASK_OUTPUT_CHANGE);
+        }
+        let primary_before = fixture.state.randr.primary_output;
+        let primary_explicit_before = fixture.state.randr_primary_output_explicit;
+        let backend_calls_before = fixture.backend.calls();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        fixture
+            .state
+            .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+                Arc::clone(&calls),
+                row.target.id,
+                Some(row.mode),
+                DENY_ERROR,
+            )));
+
+        let bytes = run_request(&mut fixture, row.major, row.minor, &row.body);
+        assert_policy_error(&bytes, row.major, row.minor);
+        if row.minor == rr::RR_SET_OUTPUT_PRIMARY {
+            assert_eq!(fixture.state.randr.primary_output, primary_before);
+            assert_eq!(
+                fixture.state.randr_primary_output_explicit,
+                primary_explicit_before
+            );
+            assert_eq!(fixture.backend.calls(), backend_calls_before);
+        }
+        let calls = calls.lock().unwrap();
+        let resources = resource_calls(&calls);
+        assert_eq!(
+            resources.len(),
+            before.len() + 1,
+            "{} resource checks",
+            row.label
+        );
+        for (index, (target, mode)) in before.iter().enumerate() {
+            assert_resource_check(resources[index], *target, *mode, row.major, row.minor);
+        }
+        assert_resource_check(
+            resources[before.len()],
+            row.target,
+            row.mode,
+            row.major,
+            row.minor,
+        );
+    }
+}
+
+#[test]
+fn randr_output_ask_rows_match_the_site_table() {
+    // Mutation: change ListOutputProperties to ask GET_ATTR; this row's access-mode assertion must fail.
+    let mut fixture = randr_access_fixture();
+    let rows = output_access_rows(&mut fixture);
+    let calls = install_allow_policy(&mut fixture);
+    for (row, before) in rows {
+        let _bytes = run_request(&mut fixture, row.major, row.minor, &row.body);
+        let mut calls = calls.lock().unwrap();
+        let resources = resource_calls(&calls);
+        let after = if matches!(row.minor, 18 | 19) && row.target.kind == ResourceKind::RandrOutput
+        {
+            vec![(
+                resource_target(
+                    ResourceId(u32::from_le_bytes(row.body[4..8].try_into().unwrap())),
+                    ResourceKind::RandrMode,
+                ),
+                AccessMode::USE,
+            )]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            resources.len(),
+            before.len() + 1 + after.len(),
+            "{} resource checks",
+            row.label
+        );
+        for (index, (target, mode)) in before.iter().enumerate() {
+            assert_resource_check(resources[index], *target, *mode, row.major, row.minor);
+        }
+        assert_resource_check(
+            resources[before.len()],
+            row.target,
+            row.mode,
+            row.major,
+            row.minor,
+        );
+        for (index, (target, mode)) in after.iter().enumerate() {
+            assert_resource_check(
+                resources[before.len() + 1 + index],
+                *target,
+                *mode,
+                row.major,
+                row.minor,
+            );
+        }
+        if row.target.kind == ResourceKind::RandrOutput {
+            assert_eq!(
+                resources[before.len()].target_owner,
+                Some(crate::resources::SERVER_OWNER)
+            );
+        }
+        calls.clear();
+        drop(calls);
+    }
+}
+
+#[test]
+fn get_output_property_delete_asks_read_write() {
+    // Mutation: validate delete as BOOL before selecting the access mode; raw 2 must still ask READ | WRITE.
+    use yserver_protocol::x11::randr as rr;
+
+    let mut fixture = randr_access_fixture();
+    let output = ResourceId(fixture.state.randr.outputs[0].output_id);
+    let property = fixture.state.atoms.intern("ACCESS_GET_DELETE", false).0;
+    let calls = install_allow_policy(&mut fixture);
+
+    for (delete, mode) in [
+        (2, AccessMode::READ | AccessMode::WRITE),
+        (0, AccessMode::READ),
+    ] {
+        let bytes = run_request(
+            &mut fixture,
+            128,
+            rr::RR_GET_OUTPUT_PROPERTY,
+            &output_get_property_body(output, property, delete),
+        );
+        if delete == 2 {
+            assert_eq!(bytes.len(), 32);
+            assert_eq!(bytes[1], x11::error::BAD_VALUE);
+            assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 2);
+        }
+        let calls = calls.lock().unwrap();
+        let resources = resource_calls(&calls);
+        assert_eq!(resources.len(), if delete == 2 { 1 } else { 2 });
+        assert_resource_check(
+            resources.last().unwrap(),
+            resource_target(output, ResourceKind::RandrOutput),
+            mode,
+            128,
+            rr::RR_GET_OUTPUT_PROPERTY,
+        );
+    }
+}
+
+#[test]
+fn delete_output_property_denied_keeps_property() {
+    // Mutation: move the DeleteOutputProperty check below removal and notify; both the store and event assertions must fail.
+    use yserver_protocol::x11::randr as rr;
+
+    let mut fixture = randr_access_fixture();
+    let output = ResourceId(fixture.state.randr.outputs[0].output_id);
+    let property = fixture.state.atoms.intern("ACCESS_DELETE_OUTPUT", false).0;
+    let prop_type = fixture.state.atoms.intern("ACCESS_DELETE_TYPE", false).0;
+    let create = output_change_property_body(output, property, prop_type, 0, 32, &[7, 0, 0, 0]);
+    let create_bytes = run_request(&mut fixture, 128, rr::RR_CHANGE_OUTPUT_PROPERTY, &create);
+    assert!(create_bytes.is_empty());
+    fixture
+        .state
+        .randr_select_masks
+        .insert((CLIENT.0, ROOT_WINDOW), rr::NOTIFY_MASK_OUTPUT_PROPERTY);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+            Arc::clone(&calls),
+            output,
+            Some(AccessMode::READ),
+            DENY_ERROR,
+        )));
+
+    let bytes = run_request(
+        &mut fixture,
+        128,
+        rr::RR_DELETE_OUTPUT_PROPERTY,
+        &words(&[output.0, property]),
+    );
+    assert_policy_error(&bytes, 128, rr::RR_DELETE_OUTPUT_PROPERTY);
+    assert_eq!(bytes.len(), 32, "denial must not append PropertyNotify");
+    assert!(
+        fixture.state.randr_output_properties[&output.0]
+            .iter()
+            .any(|(atom, _)| atom.0 == property)
+    );
+    let calls = calls.lock().unwrap();
+    assert_resource_check(
+        resource_calls(&calls)[0],
+        resource_target(output, ResourceKind::RandrOutput),
+        AccessMode::READ,
+        128,
+        rr::RR_DELETE_OUTPUT_PROPERTY,
+    );
+}
+
+#[test]
+fn configure_output_property_denied_keeps_metadata() {
+    // Mutation: move ConfigureOutputProperty's check below the property metadata update; the snapshot assertions must fail.
+    use yserver_protocol::x11::randr as rr;
+
+    let mut fixture = randr_access_fixture();
+    let output = ResourceId(fixture.state.randr.outputs[0].output_id);
+    let property = fixture
+        .state
+        .atoms
+        .intern("ACCESS_CONFIGURE_DENIED", false)
+        .0;
+    let prop_type = fixture
+        .state
+        .atoms
+        .intern("ACCESS_CONFIGURE_DENIED_TYPE", false)
+        .0;
+    let baseline = crate::randr::RandrOutputProperty {
+        current: Some(crate::properties::PropertyValue {
+            r#type: yserver_protocol::x11::AtomId(prop_type),
+            format: crate::properties::PropertyFormat::F32,
+            data: 7_u32.to_le_bytes().to_vec(),
+        }),
+        pending: Some(crate::properties::PropertyValue {
+            r#type: yserver_protocol::x11::AtomId(prop_type),
+            format: crate::properties::PropertyFormat::F32,
+            data: 9_u32.to_le_bytes().to_vec(),
+        }),
+        is_pending: true,
+        range: true,
+        immutable: false,
+        valid_values: vec![7, 9],
+    };
+    fixture
+        .state
+        .randr_output_properties
+        .entry(output.0)
+        .or_default()
+        .push((yserver_protocol::x11::AtomId(property), baseline.clone()));
+    fixture
+        .state
+        .randr_select_masks
+        .insert((CLIENT.0, ROOT_WINDOW), rr::NOTIFY_MASK_OUTPUT_PROPERTY);
+    let mut body = words(&[output.0, property]);
+    body.extend_from_slice(&[0, 0, 0, 0]);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+            Arc::clone(&calls),
+            output,
+            Some(AccessMode::READ),
+            DENY_ERROR,
+        )));
+
+    let backend_calls_before = fixture.backend.calls();
+    let bytes = run_request(&mut fixture, 128, rr::RR_CONFIGURE_OUTPUT_PROPERTY, &body);
+    let entries = &fixture.state.randr_output_properties[&output.0];
+    assert_eq!(entries.len(), 1);
+    let stored = &entries[0].1;
+    assert_eq!(stored.current, baseline.current);
+    assert_eq!(stored.pending, baseline.pending);
+    assert_eq!(stored.is_pending, baseline.is_pending);
+    assert_eq!(stored.range, baseline.range);
+    assert_eq!(stored.immutable, baseline.immutable);
+    assert_eq!(stored.valid_values, baseline.valid_values);
+    assert_policy_error(&bytes, 128, rr::RR_CONFIGURE_OUTPUT_PROPERTY);
+    assert_eq!(fixture.backend.calls(), backend_calls_before);
+
+    let calls = calls.lock().unwrap();
+    assert_resource_check(
+        resource_calls(&calls)[0],
+        resource_target(output, ResourceKind::RandrOutput),
+        AccessMode::READ,
+        128,
+        rr::RR_CONFIGURE_OUTPUT_PROPERTY,
+    );
+}
+
+#[test]
+fn change_output_property_denied_keeps_value() {
+    // Mutation: move ChangeOutputProperty's check below the store write and PropertyNotify; the snapshot and stream assertions must fail.
+    use yserver_protocol::x11::randr as rr;
+
+    let mut fixture = randr_access_fixture();
+    let output = ResourceId(fixture.state.randr.outputs[0].output_id);
+    let property = fixture.state.atoms.intern("ACCESS_CHANGE_DENIED", false).0;
+    let prop_type = fixture
+        .state
+        .atoms
+        .intern("ACCESS_CHANGE_DENIED_TYPE", false)
+        .0;
+    let baseline = crate::randr::RandrOutputProperty {
+        current: Some(crate::properties::PropertyValue {
+            r#type: yserver_protocol::x11::AtomId(prop_type),
+            format: crate::properties::PropertyFormat::F32,
+            data: 7_u32.to_le_bytes().to_vec(),
+        }),
+        ..Default::default()
+    };
+    fixture
+        .state
+        .randr_output_properties
+        .entry(output.0)
+        .or_default()
+        .push((yserver_protocol::x11::AtomId(property), baseline.clone()));
+    fixture
+        .state
+        .randr_select_masks
+        .insert((CLIENT.0, ROOT_WINDOW), rr::NOTIFY_MASK_OUTPUT_PROPERTY);
+    let body = output_change_property_body(output, property, prop_type, 0, 32, &[1, 0, 0, 0]);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+            Arc::clone(&calls),
+            output,
+            Some(AccessMode::READ),
+            DENY_ERROR,
+        )));
+
+    let backend_calls_before = fixture.backend.calls();
+    let bytes = run_request(&mut fixture, 128, rr::RR_CHANGE_OUTPUT_PROPERTY, &body);
+    let entries = &fixture.state.randr_output_properties[&output.0];
+    assert_eq!(entries.len(), 1);
+    let stored = &entries[0].1;
+    assert_eq!(stored.current, baseline.current);
+    assert_eq!(stored.pending, baseline.pending);
+    assert_eq!(stored.is_pending, baseline.is_pending);
+    assert_eq!(stored.range, baseline.range);
+    assert_eq!(stored.immutable, baseline.immutable);
+    assert_eq!(stored.valid_values, baseline.valid_values);
+    assert_policy_error(&bytes, 128, rr::RR_CHANGE_OUTPUT_PROPERTY);
+    assert_eq!(fixture.backend.calls(), backend_calls_before);
+
+    let calls = calls.lock().unwrap();
+    assert_resource_check(
+        resource_calls(&calls)[0],
+        resource_target(output, ResourceKind::RandrOutput),
+        AccessMode::READ,
+        128,
+        rr::RR_CHANGE_OUTPUT_PROPERTY,
+    );
+}
+
+#[test]
+fn get_output_property_delete_denied_keeps_property() {
+    // Mutation: move GetOutputProperty's check below the delete and PropertyNotify; the store and one-packet assertions must fail.
+    use yserver_protocol::x11::{AtomId, randr as rr};
+
+    let mut fixture = randr_access_fixture();
+    let output = ResourceId(fixture.state.randr.outputs[0].output_id);
+    let property = fixture
+        .state
+        .atoms
+        .intern("ACCESS_GET_DELETE_DENIED", false)
+        .0;
+    let prop_type = fixture
+        .state
+        .atoms
+        .intern("ACCESS_GET_DELETE_DENIED_TYPE", false)
+        .0;
+    let baseline = crate::randr::RandrOutputProperty {
+        current: Some(crate::properties::PropertyValue {
+            r#type: AtomId(prop_type),
+            format: crate::properties::PropertyFormat::F32,
+            data: 7_u32.to_le_bytes().to_vec(),
+        }),
+        ..Default::default()
+    };
+    fixture
+        .state
+        .randr_output_properties
+        .entry(output.0)
+        .or_default()
+        .push((AtomId(property), baseline.clone()));
+    fixture
+        .state
+        .randr_select_masks
+        .insert((CLIENT.0, ROOT_WINDOW), rr::NOTIFY_MASK_OUTPUT_PROPERTY);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+            Arc::clone(&calls),
+            output,
+            Some(AccessMode::READ | AccessMode::WRITE),
+            DENY_ERROR,
+        )));
+
+    let backend_calls_before = fixture.backend.calls();
+    let bytes = run_request(
+        &mut fixture,
+        128,
+        rr::RR_GET_OUTPUT_PROPERTY,
+        &output_get_property_body(output, property, 1),
+    );
+    let entries = &fixture.state.randr_output_properties[&output.0];
+    assert_eq!(entries.len(), 1);
+    let stored = &entries[0].1;
+    assert_eq!(stored.current, baseline.current);
+    assert_eq!(stored.pending, baseline.pending);
+    assert_eq!(stored.is_pending, baseline.is_pending);
+    assert_eq!(stored.range, baseline.range);
+    assert_eq!(stored.immutable, baseline.immutable);
+    assert_eq!(stored.valid_values, baseline.valid_values);
+    assert_policy_error(&bytes, 128, rr::RR_GET_OUTPUT_PROPERTY);
+    assert_eq!(fixture.backend.calls(), backend_calls_before);
+
+    let calls = calls.lock().unwrap();
+    assert_resource_check(
+        resource_calls(&calls)[0],
+        resource_target(output, ResourceKind::RandrOutput),
+        AccessMode::READ | AccessMode::WRITE,
+        128,
+        rr::RR_GET_OUTPUT_PROPERTY,
+    );
+}
+
+#[test]
+fn change_output_property_bad_value_precedes_check() {
+    // Mutation: check the output before validating ChangeOutputProperty's mode; denied output must still answer BadValue.
+    use yserver_protocol::x11::randr as rr;
+
+    let mut fixture = randr_access_fixture();
+    let output = ResourceId(fixture.state.randr.outputs[0].output_id);
+    let property = fixture.state.atoms.intern("ACCESS_BAD_MODE", false).0;
+    let prop_type = fixture.state.atoms.intern("ACCESS_BAD_MODE_TYPE", false).0;
+    let bad_mode = 0xff;
+    let body = output_change_property_body(output, property, prop_type, bad_mode, 32, &[]);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+            Arc::clone(&calls),
+            output,
+            Some(AccessMode::READ),
+            DENY_ERROR,
+        )));
+
+    let bytes = run_request(&mut fixture, 128, rr::RR_CHANGE_OUTPUT_PROPERTY, &body);
+    assert_eq!(bytes.len(), 32);
+    assert_eq!(bytes[1], x11::error::BAD_VALUE);
+    assert_eq!(
+        u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        u32::from(bad_mode)
+    );
+    assert!(resource_calls(&calls.lock().unwrap()).is_empty());
+}
+
+#[test]
+fn output_mode_stubs_unresolved_ids_are_not_asked() {
+    // Mutation: substitute a live mode id for the request's unknown mode; the deny-all policy must then reject it.
+    let mut fixture = randr_access_fixture();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_all_resources(
+            Arc::clone(&calls),
+            DENY_ERROR,
+        )));
+    let unknown_output = ResourceId(0x00de_ad01);
+    let unknown_mode = ResourceId(0x00de_ad02);
+
+    for minor in [18, 19] {
+        let bytes = run_request(
+            &mut fixture,
+            128,
+            minor,
+            &words(&[unknown_output.0, unknown_mode.0]),
+        );
+        assert!(
+            bytes.is_empty(),
+            "unsupported mode stub remains a void success"
+        );
+    }
+    assert!(resource_calls(&calls.lock().unwrap()).is_empty());
+}
+
+#[test]
+fn set_output_primary_none_output_is_not_asked() {
+    // Mutation: remove the output != 0 guard before its check; the live id-zero resolver match must be denied.
+    use yserver_protocol::x11::randr as rr;
+
+    let mut fixture = randr_access_fixture();
+    fixture.state.randr.outputs[0].output_id = 0;
+    fixture.state.randr.primary_output = 0;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+            Arc::clone(&calls),
+            ResourceId(0),
+            Some(AccessMode::READ),
+            DENY_ERROR,
+        )));
+
+    let bytes = run_request(
+        &mut fixture,
+        128,
+        rr::RR_SET_OUTPUT_PRIMARY,
+        &words(&[ROOT_WINDOW.0, 0]),
+    );
+    assert!(bytes.is_empty());
+    let calls = calls.lock().unwrap();
+    let resources = resource_calls(&calls);
+    assert_eq!(resources.len(), 1, "None output must not be asked");
+    assert_resource_check(
+        resources[0],
+        resource_target(ROOT_WINDOW, ResourceKind::Window),
+        AccessMode::GET_ATTR,
+        128,
+        rr::RR_SET_OUTPUT_PRIMARY,
     );
 }
