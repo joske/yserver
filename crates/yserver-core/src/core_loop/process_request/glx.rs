@@ -1,9 +1,9 @@
 use crate::{
-    access::{AccessMode, Creation, RequestOpcodes, ResourceKind, ResourceTarget},
+    access::{AccessMode, RequestOpcodes, ResourceKind},
     backend::{Backend, OriginContext},
     core_loop::process_request::{
-        RequestOutcome, emit_x11_error_with_minor, redirect::retarget_glx_pixmap_export,
-        write_to_client,
+        RequestOutcome, check_creation, check_resource, emit_x11_error_with_minor,
+        redirect::retarget_glx_pixmap_export, write_to_client,
     },
     resources::ROOT_WINDOW,
     server::ServerState,
@@ -306,59 +306,40 @@ pub(super) fn handle_glx_request(
         .get(&client_id.0)
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
-    macro_rules! check_resource {
-        ($id:expr, $kind:expr, $mode:expr) => {
-            crate::core_loop::process_request::return_on_access_denial!(
-                super::validate_resource_if_present(
-                    state,
-                    client_id,
-                    $id,
-                    $kind,
-                    $mode,
-                    access_request,
-                ),
-                state,
-                client_id,
-                sequence,
-                access_request,
-            );
-        };
-    }
-    macro_rules! check_creation {
-        ($id:expr, $kind:expr, $parent:expr) => {
-            crate::core_loop::process_request::return_on_access_denial!(
-                super::validate_resource_access(
-                    state,
-                    client_id,
-                    ResourceTarget {
-                        id: $id,
-                        kind: $kind,
-                        creation: Some(Creation {
-                            parent: $parent,
-                            owner: client_id,
-                        }),
-                        owner: None,
-                    },
-                    AccessMode::CREATE,
-                    access_request,
-                ),
-                state,
-                client_id,
-                sequence,
-                access_request,
-            );
-        };
-    }
     macro_rules! check_current_drawable {
         ($id:expr) => {{
             let id: ResourceId = $id;
             if id.0 != 0 {
                 if state.glx_drawables.contains_key(&id.0) {
-                    check_resource!(id, ResourceKind::GlxDrawable, AccessMode::WRITE);
+                    check_resource!(
+                        state,
+                        client_id,
+                        sequence,
+                        access_request,
+                        id,
+                        ResourceKind::GlxDrawable,
+                        AccessMode::WRITE
+                    );
                 } else if state.resources.window(id).is_some() {
-                    check_resource!(id, ResourceKind::Window, AccessMode::GET_ATTR);
+                    check_resource!(
+                        state,
+                        client_id,
+                        sequence,
+                        access_request,
+                        id,
+                        ResourceKind::Window,
+                        AccessMode::GET_ATTR
+                    );
                 } else if state.resources.pixmap(id).is_some() {
-                    check_resource!(id, ResourceKind::Pixmap, AccessMode::GET_ATTR);
+                    check_resource!(
+                        state,
+                        client_id,
+                        sequence,
+                        access_request,
+                        id,
+                        ResourceKind::Pixmap,
+                        AccessMode::GET_ATTR
+                    );
                 }
             }
         }};
@@ -456,6 +437,10 @@ pub(super) fn handle_glx_request(
                 }
             };
             check_resource!(
+                state,
+                client_id,
+                sequence,
+                access_request,
                 ResourceId(context),
                 ResourceKind::GlxContext,
                 AccessMode::READ
@@ -535,12 +520,24 @@ pub(super) fn handle_glx_request(
             };
             if req.share_list != 0 {
                 check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
                     ResourceId(req.share_list),
                     ResourceKind::GlxContext,
                     AccessMode::READ
                 );
             }
-            check_creation!(ResourceId(req.context), ResourceKind::GlxContext, None);
+            check_creation!(
+                state,
+                client_id,
+                sequence,
+                access_request,
+                ResourceId(req.context),
+                ResourceKind::GlxContext,
+                None
+            );
             state.glx_contexts.insert(
                 req.context,
                 crate::server::GlxContext {
@@ -566,6 +563,10 @@ pub(super) fn handle_glx_request(
                 0
             };
             check_resource!(
+                state,
+                client_id,
+                sequence,
+                access_request,
                 ResourceId(xid),
                 ResourceKind::GlxContext,
                 AccessMode::DESTROY
@@ -614,6 +615,10 @@ pub(super) fn handle_glx_request(
             };
             if context != 0 {
                 check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
                     ResourceId(context),
                     ResourceKind::GlxContext,
                     AccessMode::USE
@@ -684,11 +689,19 @@ pub(super) fn handle_glx_request(
 
                 if minor == x11glx::CREATE_PIXMAP {
                     check_resource!(
+                        state,
+                        client_id,
+                        sequence,
+                        access_request,
                         ResourceId(req.x_window),
                         ResourceKind::Pixmap,
                         AccessMode::ADD
                     );
                     check_creation!(
+                        state,
+                        client_id,
+                        sequence,
+                        access_request,
                         ResourceId(req.glx_window),
                         ResourceKind::GlxDrawable,
                         Some(ResourceId(req.x_window))
@@ -708,11 +721,19 @@ pub(super) fn handle_glx_request(
                         .window(ResourceId(req.x_window))
                         .map(|_| ResourceId(req.x_window));
                     check_resource!(
+                        state,
+                        client_id,
+                        sequence,
+                        access_request,
                         ResourceId(req.x_window),
                         ResourceKind::Window,
                         AccessMode::ADD
                     );
                     check_creation!(
+                        state,
+                        client_id,
+                        sequence,
+                        access_request,
                         ResourceId(req.glx_window),
                         ResourceKind::GlxDrawable,
                         parent
@@ -753,8 +774,24 @@ pub(super) fn handle_glx_request(
             // from GetDrawableAttributes so Mesa can size the buffer; key
             // the record by the pbuffer XID itself (it is its own drawable).
             if let Some(req) = x11glx::parse_create_pbuffer(body) {
-                check_creation!(ResourceId(req.pbuffer), ResourceKind::GlxDrawable, None);
-                check_creation!(ResourceId(req.pbuffer), ResourceKind::Pixmap, None);
+                check_creation!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                    ResourceId(req.pbuffer),
+                    ResourceKind::GlxDrawable,
+                    None
+                );
+                check_creation!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                    ResourceId(req.pbuffer),
+                    ResourceKind::Pixmap,
+                    None
+                );
                 state.glx_drawables.insert(
                     req.pbuffer,
                     crate::server::GlxDrawable {
@@ -861,11 +898,19 @@ pub(super) fn handle_glx_request(
                 return glx_error(state, code, req.pixmap);
             }
             check_resource!(
+                state,
+                client_id,
+                sequence,
+                access_request,
                 ResourceId(req.pixmap),
                 ResourceKind::Pixmap,
                 AccessMode::ADD
             );
             check_creation!(
+                state,
+                client_id,
+                sequence,
+                access_request,
                 ResourceId(req.glx_pixmap),
                 ResourceKind::GlxDrawable,
                 Some(ResourceId(req.pixmap))
@@ -921,6 +966,10 @@ pub(super) fn handle_glx_request(
                 );
             }
             check_resource!(
+                state,
+                client_id,
+                sequence,
+                access_request,
                 ResourceId(xid),
                 ResourceKind::GlxDrawable,
                 AccessMode::DESTROY
@@ -959,6 +1008,10 @@ pub(super) fn handle_glx_request(
             };
             if state.glx_drawables.contains_key(&xid) {
                 check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
                     ResourceId(xid),
                     ResourceKind::GlxDrawable,
                     AccessMode::DESTROY
@@ -1000,6 +1053,10 @@ pub(super) fn handle_glx_request(
                 let num_attribs = u32::from_le_bytes([body[4], body[5], body[6], body[7]]) as usize;
                 if state.glx_drawables.contains_key(&xid) {
                     check_resource!(
+                        state,
+                        client_id,
+                        sequence,
+                        access_request,
                         ResourceId(xid),
                         ResourceKind::GlxDrawable,
                         AccessMode::SET_ATTR
@@ -1077,12 +1134,24 @@ pub(super) fn handle_glx_request(
             }
             if state.glx_drawables.contains_key(&xid) {
                 check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
                     ResourceId(xid),
                     ResourceKind::GlxDrawable,
                     AccessMode::GET_ATTR
                 );
             } else {
-                check_resource!(ResourceId(xid), ResourceKind::Window, AccessMode::GET_ATTR);
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                    ResourceId(xid),
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR
+                );
             }
             let attribs = drawable_attributes_for(state, xid);
             let reply =
@@ -1138,6 +1207,10 @@ pub(super) fn handle_glx_request(
                 }
             };
             check_resource!(
+                state,
+                client_id,
+                sequence,
+                access_request,
                 ResourceId(context),
                 ResourceKind::GlxContext,
                 AccessMode::READ
@@ -1194,6 +1267,10 @@ pub(super) fn handle_glx_request(
                     );
                     if state.glx_drawables.contains_key(&glx_drawable) {
                         check_resource!(
+                            state,
+                            client_id,
+                            sequence,
+                            access_request,
                             ResourceId(glx_drawable),
                             ResourceKind::GlxDrawable,
                             AccessMode::READ
@@ -1329,12 +1406,24 @@ pub(super) fn handle_glx_request(
                     if let Some(req) = x11glx::parse_create_context_with_config_sgix(body) {
                         if req.share_list != 0 {
                             check_resource!(
+                                state,
+                                client_id,
+                                sequence,
+                                access_request,
                                 ResourceId(req.share_list),
                                 ResourceKind::GlxContext,
                                 AccessMode::READ
                             );
                         }
-                        check_creation!(ResourceId(req.context), ResourceKind::GlxContext, None);
+                        check_creation!(
+                            state,
+                            client_id,
+                            sequence,
+                            access_request,
+                            ResourceId(req.context),
+                            ResourceKind::GlxContext,
+                            None
+                        );
                         state.glx_contexts.insert(
                             req.context,
                             crate::server::GlxContext {
@@ -1397,11 +1486,19 @@ pub(super) fn handle_glx_request(
                             );
                         }
                         check_resource!(
+                            state,
+                            client_id,
+                            sequence,
+                            access_request,
                             ResourceId(req.pixmap),
                             ResourceKind::Pixmap,
                             AccessMode::ADD
                         );
                         check_creation!(
+                            state,
+                            client_id,
+                            sequence,
+                            access_request,
                             ResourceId(req.glx_pixmap),
                             ResourceKind::GlxDrawable,
                             Some(ResourceId(req.pixmap))
@@ -1456,6 +1553,10 @@ pub(super) fn handle_glx_request(
                     );
                     if state.glx_drawables.contains_key(&glx_drawable) {
                         check_resource!(
+                            state,
+                            client_id,
+                            sequence,
+                            access_request,
                             ResourceId(glx_drawable),
                             ResourceKind::GlxDrawable,
                             AccessMode::READ

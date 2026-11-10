@@ -5,8 +5,9 @@ use crate::{
         damage_fanout::accumulate_damage_to_state,
         process_request::{
             PRESENT_ALL_OPTIONS, PresentDomainSelection, RANDR_BAD_CRTC, RequestOutcome,
-            SYNC_BAD_FENCE, XFIXES_BAD_REGION, emit_x11_error_with_minor, validate_resource_access,
-            validate_resource_if_present, window_unviewable, write_to_client,
+            SYNC_BAD_FENCE, XFIXES_BAD_REGION, check_resource, emit_x11_error_with_minor,
+            validate_resource_access, validate_resource_if_present, window_unviewable,
+            write_to_client,
         },
     },
     server::{PendingPresentPixmap, PendingPresentRequest, ServerState},
@@ -1700,23 +1701,6 @@ pub(super) fn handle_present_request(
     use yserver_protocol::x11::{ClientByteOrder, present as x11present};
     const PRESENT_MAJOR_OPCODE: u8 = 145;
     let request = RequestOpcodes::for_request(header);
-    macro_rules! check_resource {
-        ($id:expr, $kind:expr, $mode:expr $(,)?) => {
-            if let Err((error_code, error_value)) =
-                validate_resource_if_present(state, client_id, $id, $kind, $mode, request)
-            {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    error_code,
-                    error_value,
-                    u16::from(header.data),
-                    PRESENT_MAJOR_OPCODE,
-                );
-            }
-        };
-    }
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -1755,10 +1739,22 @@ pub(super) fn handle_present_request(
             let target = x11present::parse_query_capabilities(body).unwrap_or(0);
             let target_resource = ResourceId(target);
             let crtc_id = if state.resources.window(target_resource).is_some() {
-                check_resource!(target_resource, ResourceKind::Window, AccessMode::GET_ATTR);
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    request,
+                    target_resource,
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR
+                );
                 default_present_crtc_for_window(state, target_resource)
             } else if present_crtc_exists(state, target) {
                 check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    request,
                     target_resource,
                     ResourceKind::RandrCrtc,
                     AccessMode::GET_ATTR
@@ -1786,9 +1782,21 @@ pub(super) fn handle_present_request(
                     client_id.0, sequence.0, req.eid, req.window, req.event_mask
                 );
                 let window = ResourceId(req.window);
-                check_resource!(window, ResourceKind::Window, AccessMode::GET_ATTR);
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    request,
+                    window,
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR
+                );
                 if let Some(selection) = state.present_event_selections.get(&req.eid) {
                     check_resource!(
+                        state,
+                        client_id,
+                        sequence,
+                        request,
                         ResourceId(req.eid),
                         ResourceKind::PresentEventSelection,
                         AccessMode::WRITE,
@@ -1876,7 +1884,15 @@ pub(super) fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             }
-            check_resource!(window, ResourceKind::Window, AccessMode::WRITE);
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                window,
+                ResourceKind::Window,
+                AccessMode::WRITE
+            );
             let pixmap_exists = state.resources.pixmap(pixmap).is_some();
             if !pixmap_exists {
                 return emit_x11_error_with_minor(
@@ -1889,7 +1905,15 @@ pub(super) fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             }
-            check_resource!(pixmap, ResourceKind::Pixmap, AccessMode::READ);
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                pixmap,
+                ResourceKind::Pixmap,
+                AccessMode::READ
+            );
             let src = state.resources.host_drawable_target(pixmap);
             let dst = state.resources.host_drawable_target(window);
             let completion_host = state.resources.present_completion_host(window);
@@ -1939,6 +1963,10 @@ pub(super) fn handle_present_request(
             }
             for notify in &req.notifies {
                 check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    request,
                     ResourceId(notify.window),
                     ResourceKind::Window,
                     AccessMode::GET_ATTR,
@@ -2195,6 +2223,10 @@ pub(super) fn handle_present_request(
                     );
                 }
                 check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    request,
                     ResourceId(req.window),
                     ResourceKind::Window,
                     AccessMode::READ,
@@ -2293,6 +2325,10 @@ pub(super) fn handle_present_request(
                 );
             }
             check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
                 ResourceId(req.acquire_syncobj),
                 ResourceKind::Dri3Syncobj,
                 AccessMode::WRITE,
@@ -2316,6 +2352,10 @@ pub(super) fn handle_present_request(
                 );
             };
             check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
                 ResourceId(req.release_syncobj),
                 ResourceKind::Dri3Syncobj,
                 AccessMode::WRITE,
@@ -2351,7 +2391,15 @@ pub(super) fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             }
-            check_resource!(window, ResourceKind::Window, AccessMode::WRITE);
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                window,
+                ResourceKind::Window,
+                AccessMode::WRITE
+            );
             let pixmap_exists = state.resources.pixmap(pixmap).is_some();
             if !pixmap_exists {
                 return emit_x11_error_with_minor(
@@ -2364,7 +2412,15 @@ pub(super) fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             }
-            check_resource!(pixmap, ResourceKind::Pixmap, AccessMode::READ);
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                pixmap,
+                ResourceKind::Pixmap,
+                AccessMode::READ
+            );
             let src = state.resources.host_drawable_target(pixmap);
             let dst = state.resources.host_drawable_target(window);
             let completion_host = state.resources.present_completion_host(window);
@@ -2414,6 +2470,10 @@ pub(super) fn handle_present_request(
             }
             for notify in &req.notifies {
                 check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    request,
                     ResourceId(notify.window),
                     ResourceKind::Window,
                     AccessMode::GET_ATTR,

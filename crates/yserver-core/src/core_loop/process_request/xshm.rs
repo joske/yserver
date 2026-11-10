@@ -5,7 +5,7 @@ use crate::{
         damage_fanout::accumulate_damage_to_state,
         fanout::fanout_event_to_clients,
         process_request::{
-            RequestOutcome, drawing::zpixmap_row_stride, emit_x11_error_with_minor,
+            RequestOutcome, check_creation, drawing::zpixmap_row_stride, emit_x11_error_with_minor,
             send_reply_with_fd, supported_pixmap_depth, validate_drawable_and_gc,
             validate_resource_access, validate_resource_if_present, write_to_client,
             zpixmap_expected_len,
@@ -22,32 +22,6 @@ use yserver_protocol::{
     x11,
     x11::{ClientId, RequestHeader, ResourceId, SequenceNumber},
 };
-
-macro_rules! check_shm_segment_creation {
-    ($state:ident, $client_id:ident, $sequence:ident, $id:expr, $request:ident $(,)?) => {
-        crate::core_loop::process_request::return_on_access_denial!(
-            validate_resource_access(
-                $state,
-                $client_id,
-                ResourceTarget {
-                    owner: None,
-                    id: ResourceId($id),
-                    kind: ResourceKind::ShmSegment,
-                    creation: Some(Creation {
-                        parent: None,
-                        owner: $client_id,
-                    }),
-                },
-                AccessMode::CREATE,
-                $request,
-            ),
-            $state,
-            $client_id,
-            $sequence,
-            $request,
-        );
-    };
-}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_mit_shm_request(
@@ -105,7 +79,15 @@ pub(super) fn handle_mit_shm_request(
                     MIT_SHM_MAJOR_OPCODE,
                 );
             };
-            check_shm_segment_creation!(state, client_id, sequence, req.shmseg, access_request,);
+            check_creation!(
+                state,
+                client_id,
+                sequence,
+                access_request,
+                ResourceId(req.shmseg),
+                ResourceKind::ShmSegment,
+                None
+            );
             match crate::server::MitShmSegment::from_shmid(client_id, req.shmid, req.read_only) {
                 Ok(segment) => {
                     state.mit_shm_segments.insert(req.shmseg, segment);
@@ -150,7 +132,15 @@ pub(super) fn handle_mit_shm_request(
                     MIT_SHM_MAJOR_OPCODE,
                 );
             };
-            check_shm_segment_creation!(state, client_id, sequence, req.shmseg, access_request,);
+            check_creation!(
+                state,
+                client_id,
+                sequence,
+                access_request,
+                ResourceId(req.shmseg),
+                ResourceKind::ShmSegment,
+                None
+            );
             // OwnedFd carries an automatic close-on-drop; from_fd takes
             // raw and assumes ownership transfer.
             let raw = std::os::fd::IntoRawFd::into_raw_fd(fd);
@@ -893,7 +883,15 @@ fn handle_mit_shm_create_segment(
         major: MIT_SHM_MAJOR_OPCODE,
         minor: shm::CREATE_SEGMENT,
     };
-    check_shm_segment_creation!(state, client_id, sequence, req.shmseg, access_request);
+    check_creation!(
+        state,
+        client_id,
+        sequence,
+        access_request,
+        ResourceId(req.shmseg),
+        ResourceKind::ShmSegment,
+        None
+    );
     let Ok(fd) = crate::anon_shm::create_anon_shm(c"yserver-shm").map(IntoRawFd::into_raw_fd)
     else {
         return emit_x11_error_with_minor(

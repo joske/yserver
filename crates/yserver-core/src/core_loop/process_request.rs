@@ -164,6 +164,53 @@ macro_rules! return_on_access_denial {
 }
 pub(crate) use return_on_access_denial;
 
+macro_rules! check_resource {
+    ($state:ident, $client_id:ident, $sequence:ident, $request:ident, $id:expr, $kind:expr, $mode:expr $(,)?) => {
+        $crate::core_loop::process_request::return_on_access_denial!(
+            $crate::core_loop::process_request::validate_resource_if_present(
+                $state, $client_id, $id, $kind, $mode, $request,
+            ),
+            $state,
+            $client_id,
+            $sequence,
+            $request,
+        );
+    };
+}
+pub(crate) use check_resource;
+
+macro_rules! check_creation {
+    ($state:ident, $client_id:ident, $sequence:ident, $request:ident, $id:expr, $kind:expr $(,)?) => {
+        $crate::core_loop::process_request::check_creation!(
+            $state, $client_id, $sequence, $request, $id, $kind, None,
+        );
+    };
+    ($state:ident, $client_id:ident, $sequence:ident, $request:ident, $id:expr, $kind:expr, $parent:expr $(,)?) => {
+        $crate::core_loop::process_request::return_on_access_denial!(
+            $crate::core_loop::process_request::validate_resource_access(
+                $state,
+                $client_id,
+                $crate::access::ResourceTarget {
+                    id: $id,
+                    kind: $kind,
+                    creation: Some($crate::access::Creation {
+                        parent: $parent,
+                        owner: $client_id,
+                    }),
+                    owner: None,
+                },
+                $crate::access::AccessMode::CREATE,
+                $request,
+            ),
+            $state,
+            $client_id,
+            $sequence,
+            $request,
+        );
+    };
+}
+pub(crate) use check_creation;
+
 /// XI2 major opcode assigned by `extension_metadata("XInputExtension")`.
 /// This matches the `XI2_MAJOR_OPCODE` constant in nested.rs and goes
 /// away in H1 with that file.
