@@ -171,6 +171,33 @@ RANDR CRTCs and providers are asked with owner `SERVER_OWNER`, so a real
 client's request on one is checked. GLX context tags, screens, visuals and
 FBConfigs are not resources and are not checked.
 
+**Arbitrary-resource operands.** SYNC `SetPriority` / `GetPriority` resources
+and `XISetClientPointer` / `XIGetClientPointer` use a resolver that searches every policy-visible
+resource kind. It checks the core-store kinds first, in this order: `Window`,
+`Pixmap`, `Gc`, `Font`, `Cursor`, `Picture`, `GlyphSet`, `Dri3Syncobj`. It then
+checks the remaining kinds in `ResourceKind` order: `Colormap`, `Region`,
+`PointerBarrier`, `SyncCounter`, `SyncAlarm`, `SyncFence`, `Damage`,
+`PresentEventSelection`, `ShmSegment`, `GlxContext`, `GlxDrawable`,
+`RecordContext`, `RandrOutput`, `RandrCrtc`, `RandrMode`, `RandrProvider`. The
+first match wins if the same id appears in more than one store. An unresolved
+id is not asked and keeps today's behavior. `KillClient` continues to use
+`resource_owner`'s narrower lookup, in its existing order; a colormap or an
+extension-only id therefore answers `BadValue` before any access check, as
+today, although Xorg's `dixLookupClient` accepts it.
+
+**GLX window alias.** Xorg registers a GLXWindow also under the X window's id
+(`glx/glxcmds.c:1192-1195`), so `MakeCurrent` / `SwapBuffers` on that X id ask
+`WRITE` on the GLX drawable. yserver keys GLX drawables by the GLX id only
+(`CreateWindow` does not validate or track the X window), so the same X id
+asks `GET_ATTR` on the core window. The `MakeCurrent` release form with
+context 0 asks nothing.
+
+The remaining differences from Xorg are in what installed policies are asked
+about: `SetCounter`, `ChangeCounter` and `DestroyCounter` on a system counter
+answer `BadAccess` before the policy is asked (Xorg asks first, but the client
+sees the same error); Present `SelectInput` with mask 0 and a new event id asks
+`CREATE` for a selection Xorg would not allocate.
+
 The context is built only when the list is not empty. Handlers often hold a
 mutable borrow of their client when they reach a check, as `handle_list_hosts`
 does, so the plan must show that each site can lend server state read-only; a
@@ -247,7 +274,6 @@ Xnamespace tells apart requests that share a mode:
 | An entry in `XIBarrierReleasePointer` | the policy's error is returned; earlier entries have already taken effect |
 | A `ChangeAlarm` counter | the policy's error; fields applied before the counter remain applied, as they do when the counter is missing |
 | A Present `Pixmap` / `PixmapSynced` notify window | the policy's error; nothing is presented |
-| The same-XID core pixmap `DestroyPbuffer` frees | the pixmap is skipped and stays; the request succeeds |
 
 A check authorizes either a whole request or one entry of a list, and the plan
 records which for each site. Rewriting is out of scope, but because sites own
