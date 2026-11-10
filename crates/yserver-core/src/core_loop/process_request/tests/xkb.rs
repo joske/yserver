@@ -99,6 +99,230 @@ fn xkb_request(
     .expect("XKB request");
 }
 
+fn per_client_flags_body(
+    order: ClientByteOrder,
+    device_spec: u16,
+    change: u32,
+    value: u32,
+    ctrls_to_change: u32,
+    auto_ctrls: u32,
+    auto_ctrl_values: u32,
+) -> [u8; 24] {
+    let mut body = [0u8; 24];
+    let put16 = |out: &mut [u8], value: u16| {
+        let bytes = match order {
+            ClientByteOrder::LittleEndian => value.to_le_bytes(),
+            ClientByteOrder::BigEndian => value.to_be_bytes(),
+        };
+        out.copy_from_slice(&bytes);
+    };
+    let put32 = |out: &mut [u8], value: u32| {
+        let bytes = match order {
+            ClientByteOrder::LittleEndian => value.to_le_bytes(),
+            ClientByteOrder::BigEndian => value.to_be_bytes(),
+        };
+        out.copy_from_slice(&bytes);
+    };
+    put16(&mut body[0..2], device_spec);
+    put32(&mut body[4..8], change);
+    put32(&mut body[8..12], value);
+    put32(&mut body[12..16], ctrls_to_change);
+    put32(&mut body[16..20], auto_ctrls);
+    put32(&mut body[20..24], auto_ctrl_values);
+    body
+}
+
+fn xkb_per_client_flags_request(
+    state: &mut ServerState,
+    backend: &mut RecordingBackend,
+    client: u32,
+    body: &[u8],
+) {
+    handle_xkb_request(
+        state,
+        backend,
+        None,
+        ClientId(client),
+        SequenceNumber(1),
+        RequestHeader {
+            opcode: 136,
+            data: 21,
+            length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+        },
+        body,
+    )
+    .expect("XkbPerClientFlags");
+}
+
+/// Mutation: reply with `value & change` from this request instead of the
+/// client's stored flags. The second request (change=0) must still report 1.
+#[test]
+fn per_client_flags_are_stored_and_reported() {
+    let mut state = ServerState::new();
+    let mut little = install_client(&mut state, 1);
+    let mut other = install_client(&mut state, 2);
+    let mut backend = RecordingBackend::new();
+    xkb_request(&mut state, &mut backend, 1, 0, &[1, 0, 0, 0]);
+    xkb_request(&mut state, &mut backend, 2, 0, &[1, 0, 0, 0]);
+    let _ = read_all_available(&mut little);
+    let _ = read_all_available(&mut other);
+
+    xkb_per_client_flags_request(
+        &mut state,
+        &mut backend,
+        1,
+        &per_client_flags_body(ClientByteOrder::LittleEndian, 0x0100, 1, 1, 0, 0, 0),
+    );
+    let reply = read_all_available(&mut little);
+    assert_eq!(reply.len(), 32);
+    assert_eq!(&reply[12..16], &1u32.to_le_bytes());
+    xkb_per_client_flags_request(
+        &mut state,
+        &mut backend,
+        1,
+        &per_client_flags_body(ClientByteOrder::LittleEndian, 0x0100, 0, 0, 0, 0, 0),
+    );
+    let reply = read_all_available(&mut little);
+    assert_eq!(reply.len(), 32);
+    assert_eq!(&reply[12..16], &1u32.to_le_bytes());
+    xkb_per_client_flags_request(
+        &mut state,
+        &mut backend,
+        1,
+        &per_client_flags_body(ClientByteOrder::LittleEndian, 0x0100, 1, 0, 0, 0, 0),
+    );
+    let reply = read_all_available(&mut little);
+    assert_eq!(reply.len(), 32);
+    assert_eq!(&reply[12..16], &0u32.to_le_bytes());
+    xkb_per_client_flags_request(
+        &mut state,
+        &mut backend,
+        2,
+        &per_client_flags_body(ClientByteOrder::LittleEndian, 0x0100, 0, 0, 0, 0, 0),
+    );
+    let reply = read_all_available(&mut other);
+    assert_eq!(reply.len(), 32);
+    assert_eq!(&reply[12..16], &0u32.to_le_bytes());
+
+    // This client is registered through the request fixture but marked
+    // initialized directly: yserver intentionally declines XKB UseExtension
+    // for big-endian clients, so this isolates PerClientFlags byte-order I/O.
+    let mut big = install_client(&mut state, 3);
+    state.clients.get_mut(&3).unwrap().byte_order = ClientByteOrder::BigEndian;
+    state.xkb_clients.entry(3).or_default().initialized = true;
+    xkb_per_client_flags_request(
+        &mut state,
+        &mut backend,
+        3,
+        &per_client_flags_body(ClientByteOrder::BigEndian, 0x0100, 1, 1, 0, 0, 0),
+    );
+    let reply = read_all_available(&mut big);
+    assert_eq!(reply.len(), 32);
+    assert_eq!(&reply[8..12], &0x1fu32.to_be_bytes());
+    assert_eq!(&reply[12..16], &1u32.to_be_bytes());
+}
+
+/// Mutation: store `value` before validating it. The invalid request must
+/// answer XKB BadMatch and a subsequent query must still report no flags.
+#[test]
+fn per_client_flags_rejects_before_mutation() {
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let mut backend = RecordingBackend::new();
+
+    xkb_per_client_flags_request(
+        &mut state,
+        &mut backend,
+        1,
+        &per_client_flags_body(ClientByteOrder::LittleEndian, 0x0100, 0, 0, 0, 0, 0)[..20],
+    );
+    let err = read_all_available(&mut peer);
+    assert_eq!((err[0], err[1]), (0, x11::error::BAD_LENGTH));
+
+    xkb_per_client_flags_request(
+        &mut state,
+        &mut backend,
+        1,
+        &per_client_flags_body(ClientByteOrder::LittleEndian, 0x0100, 0, 0, 0, 0, 0),
+    );
+    let err = read_all_available(&mut peer);
+    assert_eq!((err[0], err[1]), (0, x11::error::BAD_ACCESS));
+
+    xkb_request(&mut state, &mut backend, 1, 0, &[1, 0, 0, 0]);
+    let _ = read_all_available(&mut peer);
+
+    xkb_per_client_flags_request(
+        &mut state,
+        &mut backend,
+        1,
+        &per_client_flags_body(ClientByteOrder::LittleEndian, 0x0100, 1, 3, 0, 0, 0),
+    );
+    let err = read_all_available(&mut peer);
+    assert_eq!((err[0], err[1]), (0, x11::error::BAD_MATCH));
+    assert_eq!(&err[4..8], &0x0200_0002u32.to_le_bytes());
+    xkb_per_client_flags_request(
+        &mut state,
+        &mut backend,
+        1,
+        &per_client_flags_body(ClientByteOrder::LittleEndian, 0x0100, 0, 0, 0, 0, 0),
+    );
+    assert_eq!(&read_all_available(&mut peer)[12..16], &0u32.to_le_bytes());
+
+    for (body, expected, error_value) in [
+        (
+            per_client_flags_body(ClientByteOrder::LittleEndian, 0x0100, 0x20, 0, 0, 0, 0).to_vec(),
+            x11::error::BAD_VALUE,
+            0x0100_0020u32,
+        ),
+        (
+            per_client_flags_body(ClientByteOrder::LittleEndian, 0x0100, 0, 0, 0, 0, 0)[..20]
+                .to_vec(),
+            x11::error::BAD_LENGTH,
+            0,
+        ),
+        (
+            per_client_flags_body(ClientByteOrder::LittleEndian, 0x0200, 0, 0, 0, 0, 0).to_vec(),
+            0, // RecordingBackend has no XKB error base; KMS adds BadKeyboard's base.
+            0x0200_0200,
+        ),
+        (
+            per_client_flags_body(ClientByteOrder::LittleEndian, 0x0100, 4, 4, 0x2000, 0, 0)
+                .to_vec(),
+            x11::error::BAD_VALUE,
+            0x0300_2000,
+        ),
+        (
+            per_client_flags_body(ClientByteOrder::LittleEndian, 0x0100, 4, 4, 1, 2, 0).to_vec(),
+            x11::error::BAD_MATCH,
+            0x0400_0002,
+        ),
+        (
+            per_client_flags_body(ClientByteOrder::LittleEndian, 0x0100, 4, 4, 1, 1, 2).to_vec(),
+            x11::error::BAD_MATCH,
+            0x0500_0002,
+        ),
+    ] {
+        xkb_per_client_flags_request(&mut state, &mut backend, 1, &body);
+        let err = read_all_available(&mut peer);
+        assert_eq!(err.len(), 32);
+        assert_eq!(err[0], 0);
+        assert_eq!(err[1], expected);
+        assert_eq!(&err[4..8], &error_value.to_le_bytes());
+    }
+
+    xkb_per_client_flags_request(
+        &mut state,
+        &mut backend,
+        1,
+        &per_client_flags_body(ClientByteOrder::LittleEndian, 0x0100, 0, 0, 0, 0, 0),
+    );
+    assert_eq!(
+        &read_all_available(&mut peer)[12..16],
+        &0u32.to_le_bytes(),
+        "rejected requests leave stored flags unchanged"
+    );
+}
+
 /// Xvfb 21.1.24, XkbUseExtension(1, 0) at sequence 2 from a
 /// little-endian client: `01010200 00000000 01000000 00…`
 /// (supported, server 1.0).

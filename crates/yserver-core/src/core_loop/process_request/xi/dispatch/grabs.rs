@@ -1920,11 +1920,13 @@ pub(super) fn handle_xi1_allow_device_events(
                             crate::server::QueuedInputEvent::HostKeyTransition(
                                 event,
                                 master_transition_accepted,
+                                synthetic_repeat,
                             ) => {
                                 let _ = crate::core_loop::key_fanout::replay_frozen_key_to_focus_after_transition(
                                     state,
                                     event,
                                     master_transition_accepted,
+                                    synthetic_repeat,
                                 );
                             }
                             // Only a device event activates a grab, so

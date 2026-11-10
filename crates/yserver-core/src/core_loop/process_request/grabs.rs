@@ -177,6 +177,7 @@ pub(super) fn apply_xi2_allow_events_for_slave(
         } else if let Some(crate::server::QueuedInputEvent::HostKeyTransition(
             event,
             master_transition_accepted,
+            synthetic_repeat,
         )) = stored
         {
             if state
@@ -192,6 +193,7 @@ pub(super) fn apply_xi2_allow_events_for_slave(
                     state,
                     event,
                     master_transition_accepted,
+                    synthetic_repeat,
                 );
         } else if let Some(crate::server::QueuedInputEvent::HostKey(event)) = stored {
             if state
@@ -423,7 +425,7 @@ pub(super) fn apply_allow_events(
     if mode == 4
         && let Some(
             crate::server::QueuedInputEvent::HostKey(event)
-            | crate::server::QueuedInputEvent::HostKeyTransition(event, _),
+            | crate::server::QueuedInputEvent::HostKeyTransition(event, _, _),
         ) = frozen_keyboard.as_ref()
     {
         let press_evcode =
@@ -496,12 +498,14 @@ pub(super) fn apply_allow_events(
         && let Some(crate::server::QueuedInputEvent::HostKeyTransition(
             event,
             master_transition_accepted,
+            synthetic_repeat,
         )) = frozen_keyboard
     {
         let _dropped = crate::core_loop::key_fanout::replay_frozen_key_to_focus_after_transition(
             state,
             event,
             master_transition_accepted,
+            synthetic_repeat,
         );
     } else if keyboard_replay
         && let Some(crate::server::QueuedInputEvent::HostKey(event)) = frozen_keyboard

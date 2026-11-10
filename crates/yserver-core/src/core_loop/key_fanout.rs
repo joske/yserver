@@ -26,6 +26,8 @@ const KEY_RELEASE_MASK: u32 = 0x0000_0002;
 const XI2_MAJOR_OPCODE: u8 = 137;
 const XI2_KEYPRESS_EVTYPE: u16 = 2;
 const XI2_KEYRELEASE_EVTYPE: u16 = 3;
+/// XIKeyRepeat is bit 16 in the XI2 device-event flags word for key presses.
+const XI2_KEY_REPEAT_FLAG: u32 = 0x0001_0000;
 const XI2_MASTER_KEYBOARD_DEVICE_ID: u16 = 3;
 const XI2_RAW_KEY_PRESS_EVTYPE: u16 = 13;
 const XI2_RAW_KEY_RELEASE_EVTYPE: u16 = 14;
@@ -342,7 +344,7 @@ pub fn key_event_fanout_to_state(
         event.pressed,
         transition,
     );
-    key_event_fanout_after_transition(state, backend, event, transition.master_accepted)
+    key_event_fanout_after_transition(state, backend, event, transition.master_accepted, false)
 }
 
 /// Fan an already guarded host key transition out to clients. KMS calls this
@@ -353,6 +355,7 @@ pub fn key_event_fanout_after_transition(
     backend: &mut dyn crate::backend::Backend,
     event: HostKeyEvent,
     master_transition_accepted: bool,
+    synthetic_repeat: bool,
 ) -> Vec<ClientId> {
     let Some(xi_source) = resolve_key_xi_source(state, event.origin) else {
         return Vec::new();
@@ -448,6 +451,7 @@ pub fn key_event_fanout_after_transition(
                 event: crate::server::QueuedInputEvent::HostKeyTransition(
                     event,
                     master_transition_accepted,
+                    synthetic_repeat,
                 ),
             });
         return Vec::new();
@@ -456,7 +460,12 @@ pub fn key_event_fanout_after_transition(
     let mut dropped = switch_dropped;
     merge_dropped(
         &mut dropped,
-        deliver_routed_key_with_master_status(state, event, master_transition_accepted),
+        deliver_routed_key_with_master_status(
+            state,
+            event,
+            master_transition_accepted,
+            synthetic_repeat,
+        ),
     );
 
     // Xorg `_XkbApplyState` after the key event: libxkbcommon-x11 clients
@@ -494,21 +503,28 @@ pub fn announce_key_source_switch(
 /// callable without a backend so `xi1_compute_freezes` can replay
 /// withheld core keys on thaw.
 pub(crate) fn deliver_routed_key(state: &mut ServerState, event: HostKeyEvent) -> Vec<ClientId> {
-    deliver_routed_key_with_master_status(state, event, true)
+    deliver_routed_key_with_master_status(state, event, true, false)
 }
 
 pub(crate) fn deliver_routed_key_after_transition(
     state: &mut ServerState,
     event: HostKeyEvent,
     master_transition_accepted: bool,
+    synthetic_repeat: bool,
 ) -> Vec<ClientId> {
-    deliver_routed_key_with_master_status(state, event, master_transition_accepted)
+    deliver_routed_key_with_master_status(
+        state,
+        event,
+        master_transition_accepted,
+        synthetic_repeat,
+    )
 }
 
 fn deliver_routed_key_with_master_status(
     state: &mut ServerState,
     event: HostKeyEvent,
     master_transition_accepted: bool,
+    synthetic_repeat: bool,
 ) -> Vec<ClientId> {
     if !keyboard_origin_is_live(state, event.origin) {
         return Vec::new();
@@ -529,8 +545,12 @@ fn deliver_routed_key_with_master_status(
                 grab.grab_window,
                 grab.via_xi2,
                 device_id,
+                synthetic_repeat,
             );
-            merge_dropped(&mut dropped, deliver_xi1_focused_key(state, &event));
+            merge_dropped(
+                &mut dropped,
+                deliver_xi1_focused_key(state, &event, synthetic_repeat),
+            );
             return dropped;
         }
         let focus = current_focus(state);
@@ -538,9 +558,12 @@ fn deliver_routed_key_with_master_status(
             Vec::new()
         } else {
             let target = focused_walk_target(state, focus, &event);
-            deliver_key_to_window(state, &event, target, false, false)
+            deliver_key_to_window(state, &event, target, false, false, synthetic_repeat)
         };
-        merge_dropped(&mut dropped, deliver_xi1_focused_key(state, &event));
+        merge_dropped(
+            &mut dropped,
+            deliver_xi1_focused_key(state, &event, synthetic_repeat),
+        );
         return dropped;
     }
     match key_route(state, &event) {
@@ -549,7 +572,7 @@ fn deliver_routed_key_with_master_status(
         // device focus (default PointerRoot → window under pointer),
         // so SelectExtensionEvent subscribers still receive DeviceKey
         // events.
-        KeyRoute::Drop => deliver_xi1_focused_key(state, &event),
+        KeyRoute::Drop => deliver_xi1_focused_key(state, &event, synthetic_repeat),
         KeyRoute::PassiveGrabOwner {
             owner,
             grab_window,
@@ -568,6 +591,7 @@ fn deliver_routed_key_with_master_status(
                     Some(crate::server::QueuedInputEvent::HostKeyTransition(
                         event,
                         master_transition_accepted,
+                        synthetic_repeat,
                     ));
             }
             // Xorg DeliverGrabbedEvent: with owner_events, key events
@@ -581,7 +605,15 @@ fn deliver_routed_key_with_master_status(
                 None
             };
             let mut dropped = if let Some(target) = natural {
-                deliver_key_to_grab_owner(state, &event, owner, target, via_xi2, grab_device_id)
+                deliver_key_to_grab_owner(
+                    state,
+                    &event,
+                    owner,
+                    target,
+                    via_xi2,
+                    grab_device_id,
+                    synthetic_repeat,
+                )
             } else {
                 deliver_key_to_grab_owner(
                     state,
@@ -590,6 +622,7 @@ fn deliver_routed_key_with_master_status(
                     grab_window,
                     via_xi2,
                     grab_device_id,
+                    synthetic_repeat,
                 )
             };
             // XI1 leg runs under grabs too — the router handles its
@@ -597,7 +630,10 @@ fn deliver_routed_key_with_master_status(
             // FreezeNextEvent / FreezeBothNextEvent trip that a key
             // event delivered through the (bridged) grab must fire
             // (XTS XAllowDeviceEvents-11/-12 SyncAll re-freeze).
-            merge_dropped(&mut dropped, deliver_xi1_focused_key(state, &event));
+            merge_dropped(
+                &mut dropped,
+                deliver_xi1_focused_key(state, &event, synthetic_repeat),
+            );
             dropped
         }
         KeyRoute::Window(window) => {
@@ -613,8 +649,12 @@ fn deliver_routed_key_with_master_status(
                 target,
                 master_transition_accepted,
                 master_transition_accepted,
+                synthetic_repeat,
             );
-            merge_dropped(&mut dropped, deliver_xi1_focused_key(state, &event));
+            merge_dropped(
+                &mut dropped,
+                deliver_xi1_focused_key(state, &event, synthetic_repeat),
+            );
             dropped
         }
     }
@@ -626,13 +666,14 @@ fn deliver_routed_key_with_master_status(
 /// after the grab owner declines the key. Mirrors Xorg
 /// `ComputeFreezes` → `DeliverFocusedEvent` (dix/events.c:1360).
 pub fn replay_frozen_key_to_focus(state: &mut ServerState, event: HostKeyEvent) -> Vec<ClientId> {
-    replay_frozen_key_to_focus_after_transition(state, event, true)
+    replay_frozen_key_to_focus_after_transition(state, event, true, false)
 }
 
 pub(crate) fn replay_frozen_key_to_focus_after_transition(
     state: &mut ServerState,
     event: HostKeyEvent,
     master_transition_accepted: bool,
+    synthetic_repeat: bool,
 ) -> Vec<ClientId> {
     if !keyboard_origin_is_live(state, event.origin) {
         return Vec::new();
@@ -647,21 +688,25 @@ pub(crate) fn replay_frozen_key_to_focus_after_transition(
         focus,
         master_transition_accepted,
         master_transition_accepted,
+        synthetic_repeat,
     );
-    merge_dropped(&mut dropped, deliver_xi1_focused_key(state, &event));
+    merge_dropped(
+        &mut dropped,
+        deliver_xi1_focused_key(state, &event, synthetic_repeat),
+    );
     dropped
 }
 
 /// Deliver a key event to a single window's subscribers — the normal
-/// path (focus window, or an explicit-grab window). Core KeyPress/
-/// KeyRelease to `KeyPressMask`/`KeyReleaseMask` subscribers, plus a
-/// parallel XI2 device event to XI2 selectors on the same window.
+/// path (focus window, or an explicit-grab window). Core key events and
+/// parallel XI2 device events go to their respective selectors.
 fn deliver_key_to_window(
     state: &mut ServerState,
     event: &HostKeyEvent,
     target_window: ResourceId,
     include_master_form: bool,
     include_core_form: bool,
+    synthetic_repeat: bool,
 ) -> Vec<ClientId> {
     let mask_bit = if event.pressed {
         KEY_PRESS_MASK
@@ -697,7 +742,15 @@ fn deliver_key_to_window(
     let core_targets: Vec<ClientId> = if include_core_form {
         subscribers_by_id(state, target_window, mask_bit)
             .into_iter()
-            .filter(|c| !xi2_targets.contains(c))
+            .filter(|c| {
+                !xi2_targets.contains(c)
+                    && !(synthetic_repeat
+                        && !event.pressed
+                        && state
+                            .xkb_clients
+                            .get(&c.0)
+                            .is_some_and(|flags| flags.wants_detectable_auto_repeat()))
+            })
             .collect()
     } else {
         Vec::new()
@@ -709,6 +762,13 @@ fn deliver_key_to_window(
             x11::encode_key_event(buf, order, key_event_wire(event, seq, fields));
         })
     };
+
+    // Keep XI2-selected clients in `xi2_targets` above while suppressing the
+    // synthetic XI2 release here: XI2 still shadows the core form for that
+    // client, even though it receives no release form.
+    if synthetic_repeat && !event.pressed {
+        return dropped;
+    }
 
     for (device_id, source_id) in forms {
         let targets: Vec<ClientId> = state
@@ -723,7 +783,16 @@ fn deliver_key_to_window(
             continue;
         }
         let xi2_dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
-            encode_key_xi2_for_device(buf, order, seq, event, fields, device_id, source_id);
+            encode_key_xi2_for_device(
+                buf,
+                order,
+                seq,
+                event,
+                fields,
+                device_id,
+                source_id,
+                synthetic_repeat,
+            );
         });
         merge_dropped(&mut dropped, xi2_dropped);
     }
@@ -760,15 +829,37 @@ fn deliver_key_to_grab_owner(
     grab_window: ResourceId,
     via_xi2: bool,
     device_id: u16,
+    synthetic_repeat: bool,
 ) -> Vec<ClientId> {
     let fields = key_window_fields(state, event, grab_window);
     if via_xi2 {
+        if synthetic_repeat && !event.pressed {
+            return Vec::new();
+        }
         let source_id =
             resolve_key_xi_source(state, event.origin).map_or(device_id, |source| source.sourceid);
         fanout_event_to_clients(state, &[owner], |buf, seq, order| {
-            encode_key_xi2_for_device(buf, order, seq, event, fields, device_id, source_id);
+            encode_key_xi2_for_device(
+                buf,
+                order,
+                seq,
+                event,
+                fields,
+                device_id,
+                source_id,
+                synthetic_repeat,
+            );
         })
     } else {
+        if synthetic_repeat
+            && !event.pressed
+            && state
+                .xkb_clients
+                .get(&owner.0)
+                .is_some_and(|flags| flags.wants_detectable_auto_repeat())
+        {
+            return Vec::new();
+        }
         fanout_event_to_clients(state, &[owner], |buf, seq, order| {
             x11::encode_key_event(buf, order, key_event_wire(event, seq, fields));
         })
@@ -886,6 +977,7 @@ fn encode_key_xi2_for_device(
     fields: KeyWindowFields,
     device_id: u16,
     source_id: u16,
+    synthetic_repeat: bool,
 ) {
     x11::encode_xi2_device_event(
         buf,
@@ -905,7 +997,11 @@ fn encode_key_xi2_for_device(
         event.state,
         u32::from(event.keycode),
         source_id,
-        0, // flags: no XIPointerEmulated on key events
+        if synthetic_repeat && event.pressed {
+            XI2_KEY_REPEAT_FLAG
+        } else {
+            0
+        },
     );
 }
 
@@ -1349,7 +1445,11 @@ pub(crate) fn current_focus(state: &ServerState) -> ResourceId {
 /// (`xi1_focus::key_delivery_route`, the XI1 port of Xorg
 /// `DeliverFocusedEvent`); grab/freeze handling inside
 /// `xi1_route_device_event` is unaffected by the focus.
-fn deliver_xi1_focused_key(state: &mut ServerState, event: &HostKeyEvent) -> Vec<ClientId> {
+fn deliver_xi1_focused_key(
+    state: &mut ServerState,
+    event: &HostKeyEvent,
+    synthetic_repeat: bool,
+) -> Vec<ClientId> {
     let Some(device_id) =
         resolve_key_xi_source(state, event.origin).and_then(|source| source.slave_deviceid)
     else {
@@ -1370,6 +1470,7 @@ fn deliver_xi1_focused_key(state: &mut ServerState, event: &HostKeyEvent) -> Vec
             deviceid: device_id,
             evcode,
             detail: event.keycode,
+            synthetic_repeat,
             time: event.time,
             root_x: event.root_x,
             root_y: event.root_y,

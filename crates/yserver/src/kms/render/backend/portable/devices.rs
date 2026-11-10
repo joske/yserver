@@ -159,8 +159,13 @@ impl<P: Platform> XBackend<P> {
                 },
             );
         }
-        let _dropped =
-            key_event_fanout_after_transition(state, self, cooked, transition.master_accepted);
+        let _dropped = key_event_fanout_after_transition(
+            state,
+            self,
+            cooked,
+            transition.master_accepted,
+            repeat,
+        );
         self.synchronize_floating_keyboard_states(state);
     }
 

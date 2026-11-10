@@ -1280,7 +1280,7 @@ fn kms_pointer_authority_integrates_physical_relative_motion_in_kms() {
                 match &pending.event {
                     yserver_core::server::QueuedInputEvent::RawKey(event) => raw.push(*event),
                     yserver_core::server::QueuedInputEvent::HostKey(event) => keys.push(*event),
-                    yserver_core::server::QueuedInputEvent::HostKeyTransition(event, _) => {
+                    yserver_core::server::QueuedInputEvent::HostKeyTransition(event, _, _) => {
                         keys.push(*event);
                     }
                     yserver_core::server::QueuedInputEvent::Xi1Routed(_) => {}
@@ -1296,7 +1296,7 @@ fn kms_pointer_authority_integrates_physical_relative_motion_in_kms() {
             .filter(|pending| matches!(
                 pending.event,
                 yserver_core::server::QueuedInputEvent::HostKey(_)
-                    | yserver_core::server::QueuedInputEvent::HostKeyTransition(_, _)
+                    | yserver_core::server::QueuedInputEvent::HostKeyTransition(_, _, _)
             ))
             .count(),
         2

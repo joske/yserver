@@ -1734,6 +1734,7 @@ fn pointer_event_fanout_to_state_inner(
                 deviceid,
                 evcode,
                 detail,
+                synthetic_repeat: false,
                 time: event.time,
                 root_x: event.root_x,
                 root_y: event.root_y,
@@ -2999,6 +3000,25 @@ fn xi1_fan_device_event(
     let is_key = q.evcode
         == crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_KEY_PRESS_OFFSET
         || q.evcode == crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_KEY_RELEASE_OFFSET;
+    let targets: Vec<ClientId> = if q.synthetic_repeat
+        && q.evcode == crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_KEY_RELEASE_OFFSET
+    {
+        targets
+            .iter()
+            .copied()
+            .filter(|client| {
+                !state
+                    .xkb_clients
+                    .get(&client.0)
+                    .is_some_and(|flags| flags.wants_detectable_auto_repeat())
+            })
+            .collect()
+    } else {
+        targets.to_vec()
+    };
+    if targets.is_empty() {
+        return Vec::new();
+    }
     let sprite = if is_key {
         crate::core_loop::key_fanout::deepest_window_at_pointer(state)
     } else {
@@ -3008,7 +3028,7 @@ fn xi1_fan_device_event(
     let (ox, oy) = state.resources.window_absolute_position(event_window);
     let event_x = clamp_grab_coord(q.root_x, ox);
     let event_y = clamp_grab_coord(q.root_y, oy);
-    fanout_event_to_clients(state, targets, |buf, seq, order| {
+    fanout_event_to_clients(state, &targets, |buf, seq, order| {
         crate::xinput::encode_xi1_device_input_event(
             buf,
             order,
@@ -3122,11 +3142,13 @@ pub(crate) fn xi1_compute_freezes(
             crate::server::QueuedInputEvent::HostKeyTransition(
                 event,
                 master_transition_accepted,
+                synthetic_repeat,
             ) => {
                 let _ = crate::core_loop::key_fanout::deliver_routed_key_after_transition(
                     state,
                     event,
                     master_transition_accepted,
+                    synthetic_repeat,
                 );
             }
             crate::server::QueuedInputEvent::Xi1Routed(event) => {

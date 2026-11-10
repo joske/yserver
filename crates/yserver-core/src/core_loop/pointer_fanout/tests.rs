@@ -50,6 +50,7 @@ fn xi1_sync_state_machine_pins() {
         deviceid: PTR,
         evcode: crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET,
         detail: 1,
+        synthetic_repeat: false,
         time: 1,
         root_x: 0,
         root_y: 0,

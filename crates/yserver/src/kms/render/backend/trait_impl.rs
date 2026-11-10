@@ -62,6 +62,10 @@ impl<P: Platform> Backend for XBackend<P> {
         Some((136, 85, 162))
     }
 
+    fn xkb_per_client_flags_in_core(&self) -> bool {
+        true
+    }
+
     fn set_locked_group(&mut self, group: u8) {
         self.core.locked_group = self.clamp_group_to_keymap(group);
     }
