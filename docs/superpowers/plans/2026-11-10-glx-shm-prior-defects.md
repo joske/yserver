@@ -10,7 +10,8 @@ leaks a backend pixmap when the segment is missing or too small.
 **Tech Stack:** Rust, crate `yserver-core` (`core_loop/process_request/{glx,xshm}.rs`).
 
 **Spec:** this plan (two pre-existing defects found while planning access control PR 3c-i, #357; approved by the user
-2026-11-10). Reference (MIT): Xorg 21.1.24 `/data/Projects/xorg-drivers/xserver`.
+2026-11-10). Reference (MIT): the Xorg checkout at `/data/Projects/xorg-drivers/xserver` (master, 26.1.99.1); the GLVND
+front door cited below (`glx/vndcmds.c` `CommonMakeCurrent`) has the same shape since xserver 1.20.
 
 **Not a defect (checked):** GLX `MakeCurrent` with context 0 and non-zero drawables. Xorg's `glxcmds.c:588-590`
 `BadMatch` is not reachable from the request: the GLVND front door (`glx/vndcmds.c` `CommonMakeCurrent`) answers
@@ -43,9 +44,10 @@ Success with tag 0 when there is no old and no new context (`:231-233`), and oth
 **Files:** `core_loop/process_request/glx.rs` (the `DELETE_WINDOW | DESTROY_PIXMAP | DESTROY_PBUFFER` arm); tests in
 the existing GLX test file under `process_request/tests` (or `access_glx.rs` if that is where pbuffer fixtures live).
 
-**Invariant:** the core pixmap under the XID is freed only when the GLX record removed by this request existed and was
-of kind `GlxDrawableKind::Pbuffer` (the only case in which `CreatePbuffer` created that pixmap). Today it is freed for
-any `DESTROY_PBUFFER`, whatever the record.
+**Invariant:** the core pixmap under the XID is freed only when the request is `DESTROY_PBUFFER` **and** the GLX record
+removed by this request existed and was of kind `GlxDrawableKind::Pbuffer` (the only case in which `CreatePbuffer`
+created that pixmap). Today it is freed for any `DESTROY_PBUFFER`, whatever the record; `DestroyPixmap` and
+`DestroyWindow` never free it, and still do not (sol r1 M-1).
 
 - [ ] **Step 1: Failing tests**
   - `destroy_pbuffer_without_pbuffer_keeps_foreign_pixmap`: client A creates a core pixmap P; client B sends
@@ -55,6 +57,9 @@ any `DESTROY_PBUFFER`, whatever the record.
     Mutation: never free.
   - `destroy_pbuffer_on_glx_pixmap_record_keeps_pixmap`: DestroyPbuffer naming a GLX pixmap's id: no core pixmap is
     freed. Mutation: free when any GLX record existed.
+  - `destroy_pixmap_or_window_on_pbuffer_keeps_backing_pixmap`: CreatePbuffer P, then DestroyPixmap(P) and, in a second
+    fixture, DestroyWindow(P): P's core pixmap and backend object survive, no `free_pixmap` recorded. Mutation: drop the
+    opcode condition (free whenever the removed record is a Pbuffer).
 - [ ] **Steps 2–4:** run, fail; implement; run, pass, whole suite unmodified.
 - [ ] **Step 5: Commit** `fix(glx): DestroyPbuffer frees only its own backing pixmap`.
 
