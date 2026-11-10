@@ -1,21 +1,20 @@
-/* A client that stops reading while events flood in must be disconnected,
- * not kept alive and silently skipped. yserver caps a client's unread
- * output (OUTBOUND_CAP); Xorg grows it instead (os/io.c FlushClient), so
- * this checks yserver's policy, not an Xorg golden.
+/* A client that stops reading while events flood in keeps its connection
+ * and, once it reads again, gets every event: like Xorg, yserver grows a
+ * client's unread output up to INT_MAX (OUTBOUND_CAP, os/io.c FlushClient)
+ * and never drops an event for it.
  *
  *   ./probe [family...]     # default: every family below
  *
  * Per family: connection V selects the events and never reads again, H
  * selects the same events and reads everything, S makes FLOOD events. Then
- * V's marker window must be gone (V disconnected), H must hold every event,
- * and the server must answer S. Families: property (PropertyNotify),
+ * V's marker window must still exist, H must hold every event, the server
+ * must answer S, and V, reading at last, must hold every event too. Families: property (PropertyNotify),
  * configure (ConfigureNotify), motion (core MotionNotify via XTEST), key
  * (KeyPress/KeyRelease via XTEST), xi2motion (XI_Motion via XTEST), damage
  * (DamageNotify, raw rectangles).
  *
  *   cc -O1 -o probe slow-client-probe.c -lxcb -lxcb-xtest -lxcb-xinput -lxcb-damage
  */
-#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -135,21 +134,6 @@ static long drain(xcb_connection_t *c, const char *family, uint8_t damage_base)
     return n;
 }
 
-/* Has the server closed `c`? Reads what it holds for up to 3 s of silence. */
-static int closed_by_server(xcb_connection_t *c)
-{
-    struct pollfd p = {xcb_get_file_descriptor(c), POLLIN, 0};
-    for (;;) {
-        xcb_generic_event_t *ev;
-        while ((ev = xcb_poll_for_event(c)))
-            free(ev);
-        if (xcb_connection_has_error(c))
-            return 1;
-        if (poll(&p, 1, 3000) <= 0)
-            return 0;
-    }
-}
-
 static void run_family(const char *family)
 {
     xcb_connection_t *v = connect_or_die(), *h = connect_or_die();
@@ -193,17 +177,24 @@ static void run_family(const char *family)
 
     xcb_generic_error_t *err = NULL;
     free(xcb_get_window_attributes_reply(s, xcb_get_window_attributes(s, marker), &err));
-    int marker_gone = err && err->error_code == XCB_WINDOW;
+    int marker_ok = !err;
     free(err);
-    int v_closed = closed_by_server(v);
     int server_ok = !xcb_connection_has_error(s) && !xcb_connection_has_error(h);
-    /* Damage and motion may legitimately coalesce: H must see at least one per batch. */
+    /* V reads at last: the round trip's reply comes after every queued event. */
+    sync_conn(v);
+    long v_got = drain(v, family, damage_base);
+    int v_ok = !xcb_connection_has_error(v);
+    /* Damage may legitimately coalesce: one per batch is enough. */
     int exact = strcmp(family, "damage") != 0;
-    int h_ok = exact ? got == expected : got >= FLOOD / BATCH;
-    int ok = marker_gone && v_closed && h_ok && server_ok;
-    printf("%-10s %s: slow client %s, its window %s; healthy client %ld/%ld events; server %s\n",
-           family, ok ? "PASS" : "FAIL", v_closed ? "disconnected" : "STILL CONNECTED",
-           marker_gone ? "freed" : "STILL EXISTS", got, expected, server_ok ? "alive" : "LOST");
+    long floor = exact ? expected : FLOOD / BATCH;
+    int h_ok = exact ? got == expected : got >= floor;
+    int v_all = exact ? v_got == expected : v_got >= floor;
+    int ok = marker_ok && v_ok && v_all && h_ok && server_ok;
+    printf("%-10s %s: slow client %s, its window %s, %ld/%ld events; healthy client %ld/%ld "
+           "events; server %s\n",
+           family, ok ? "PASS" : "FAIL", v_ok ? "connected" : "DISCONNECTED",
+           marker_ok ? "kept" : "GONE", v_got, expected, got, expected,
+           server_ok ? "alive" : "LOST");
     fflush(stdout);
     failures += !ok;
 
