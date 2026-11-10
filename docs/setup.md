@@ -106,25 +106,28 @@ just install-local
 
 ### Optional build features
 
-Two capabilities are compiled in only when asked for:
+Three capabilities are compiled in only when asked for:
 
 | Feature         | Enables                                                         |
 | --------------- | --------------------------------------------------------------- |
 | `tcp-transport` | `-listen tcp`, the TCP listener                                 |
 | `xdmcp`         | `-query`, `-indirect` and `-broadcast`; implies `tcp-transport` |
+| `wayland`       | `--rootless` under a Wayland compositor (Linux only)            |
 
 ```sh
 cargo build --release --bin yserver --features tcp-transport
 cargo build --release --bin yserver --features xdmcp
+cargo build --release --bin yserver --features wayland
 ```
 
-They are off for two different reasons. Listening on TCP widens the
+They are off for different reasons. Listening on TCP widens the
 server's exposure, so it should be an affirmative decision by whoever
 builds the binary — a stronger position than the runtime `-nolisten tcp`
 convention, because the capability is absent rather than merely switched
 off. XDMCP is niche: most deployments never negotiate a session with a
 display manager, and it is several thousand lines that would otherwise
-ship unused.
+ship unused. The Wayland host is for a server started inside a Wayland
+session, and a build that does not ask for it pulls in no Wayland crates.
 
 A build without a feature does not silently ignore the options it covers.
 It exits at startup with a message naming the feature. `-nolisten tcp`
@@ -133,7 +136,7 @@ adjusting.
 
 `yserver --version` ends with the set that was compiled in, as
 `features=[tcp-transport,xdmcp]`, `features=[tcp-transport]` or
-`features=[]`.
+`features=[]`; `wayland` is listed between the two.
 
 `just install-local` builds with neither. To install a build that has
 them, run the `cargo build` above in place of the plain one, then
