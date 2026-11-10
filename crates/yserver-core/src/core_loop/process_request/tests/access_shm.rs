@@ -30,6 +30,9 @@ const ATTACH_FD_SEGMENT: ResourceId = ResourceId(0x0010_5112);
 const CREATE_SEGMENT: ResourceId = ResourceId(0x0010_5113);
 const NEW_PIXMAP: ResourceId = ResourceId(0x0010_5121);
 const MISSING: ResourceId = ResourceId(0x0010_51F0);
+const RO_SEGMENT: ResourceId = ResourceId(0x0010_5104);
+/// MIT-SHM's `BadShmSeg`, the extension's first error.
+const BAD_SHM_SEG: u8 = crate::nested::MIT_SHM_FIRST_ERROR;
 const DENY_ERROR: DenyError = DenyError {
     code: x11::error::BAD_ACCESS,
     value: 0xA55A_1234,
@@ -441,8 +444,8 @@ fn mit_shm_access_ask_table_records_each_target_and_opcode() {
     assert_resource_calls(
         &calls.lock().unwrap(),
         &[
-            existing(SEGMENT, ResourceKind::ShmSegment, AccessMode::READ),
             existing(DRAWABLE, ResourceKind::Pixmap, AccessMode::READ),
+            existing(SEGMENT, ResourceKind::ShmSegment, AccessMode::READ),
         ],
         shm::GET_IMAGE,
     );
@@ -465,8 +468,8 @@ fn mit_shm_access_ask_table_records_each_target_and_opcode() {
         &calls.lock().unwrap(),
         &[
             existing(DRAWABLE, ResourceKind::Pixmap, AccessMode::GET_ATTR),
-            pixmap_creation(NEW_PIXMAP),
             existing(SEGMENT, ResourceKind::ShmSegment, AccessMode::READ),
+            pixmap_creation(NEW_PIXMAP),
         ],
         shm::CREATE_PIXMAP,
     );
@@ -592,7 +595,10 @@ fn denial_cases() -> Vec<DenialCase> {
             target: SEGMENT,
             kind: K::ShmSegment,
             mode: M::READ,
-            expected: vec![existing(SEGMENT, K::ShmSegment, M::READ)],
+            expected: vec![
+                existing(DRAWABLE, K::Pixmap, M::READ),
+                existing(SEGMENT, K::ShmSegment, M::READ),
+            ],
         },
         DenialCase {
             label: "GetImage drawable",
@@ -601,10 +607,7 @@ fn denial_cases() -> Vec<DenialCase> {
             target: DRAWABLE,
             kind: K::Pixmap,
             mode: M::READ,
-            expected: vec![
-                existing(SEGMENT, K::ShmSegment, M::READ),
-                existing(DRAWABLE, K::Pixmap, M::READ),
-            ],
+            expected: vec![existing(DRAWABLE, K::Pixmap, M::READ)],
         },
         DenialCase {
             label: "CreatePixmap drawable",
@@ -624,6 +627,7 @@ fn denial_cases() -> Vec<DenialCase> {
             mode: M::CREATE,
             expected: vec![
                 existing(DRAWABLE, K::Pixmap, M::GET_ATTR),
+                existing(SEGMENT, K::ShmSegment, M::READ),
                 pixmap_creation(NEW_PIXMAP),
             ],
         },
@@ -636,7 +640,6 @@ fn denial_cases() -> Vec<DenialCase> {
             mode: M::READ,
             expected: vec![
                 existing(DRAWABLE, K::Pixmap, M::GET_ATTR),
-                pixmap_creation(NEW_PIXMAP),
                 existing(SEGMENT, K::ShmSegment, M::READ),
             ],
         },
@@ -764,6 +767,7 @@ fn shm_create_pixmap_denied_creation_allocates_nothing() {
         &calls.lock().unwrap(),
         &[
             existing(DRAWABLE, ResourceKind::Pixmap, AccessMode::GET_ATTR),
+            existing(SEGMENT, ResourceKind::ShmSegment, AccessMode::READ),
             pixmap_creation(NEW_PIXMAP),
         ],
         shm::CREATE_PIXMAP,
@@ -790,7 +794,6 @@ fn shm_create_pixmap_denied_segment_allocates_nothing() {
         &calls.lock().unwrap(),
         &[
             existing(DRAWABLE, ResourceKind::Pixmap, AccessMode::GET_ATTR),
-            pixmap_creation(NEW_PIXMAP),
             existing(SEGMENT, ResourceKind::ShmSegment, AccessMode::READ),
         ],
         shm::CREATE_PIXMAP,
@@ -812,7 +815,7 @@ fn shm_create_pixmap_missing_segment_allocates_nothing() {
         1,
     );
 
-    assert_x_error(&bytes, x11::error::BAD_VALUE, MISSING.0, shm::CREATE_PIXMAP);
+    assert_x_error(&bytes, BAD_SHM_SEG, MISSING.0, shm::CREATE_PIXMAP);
     assert!(fixture.state.resources.pixmap(NEW_PIXMAP).is_none());
     assert!(fixture.backend.calls().is_empty());
     assert!(fixture.backend.live_pixmaps.is_empty());
@@ -912,25 +915,19 @@ fn shm_get_image_denied_drawable_reads_back_nothing() {
     assert_policy_error(&bytes, shm::GET_IMAGE);
     assert_resource_calls(
         &calls.lock().unwrap(),
-        &[
-            existing(SEGMENT, ResourceKind::ShmSegment, AccessMode::READ),
-            existing(DRAWABLE, ResourceKind::Pixmap, AccessMode::READ),
-        ],
+        &[existing(DRAWABLE, ResourceKind::Pixmap, AccessMode::READ)],
         shm::GET_IMAGE,
     );
     assert_eq!(fixture.backend.get_image_calls, 0);
 }
 
 #[test]
-fn shm_detach_unresolved_segment_is_not_asked() {
-    // Mutation: replace the if-present Detach lookup with an unconditional check; the policy must record no target.
+fn shm_detach_unresolved_segment_is_bad_shm_seg_and_not_asked() {
+    // Mutation: drop Detach's existence check; it must answer BadShmSeg (Xorg's VERIFY_SHMSEG) without asking the policy.
     let mut fixture = shm_fixture();
     let calls = install_allow_policy(&mut fixture);
     let bytes = dispatch(&mut fixture, shm::DETACH, &words(&[MISSING.0]), None, 1);
-    assert!(
-        bytes.is_empty(),
-        "unresolved Detach keeps its silent success"
-    );
+    assert_x_error(&bytes, BAD_SHM_SEG, MISSING.0, shm::DETACH);
     assert_resource_calls(&calls.lock().unwrap(), &[], shm::DETACH);
 }
 
@@ -1011,4 +1008,281 @@ fn denied_shm_segment_creations_leave_no_mapping_or_fd() {
         &[creation(CREATE_SEGMENT, ResourceKind::ShmSegment)],
         shm::CREATE_SEGMENT,
     );
+}
+
+/// One MIT-SHM request with a bad segment, offset or extent, and what
+/// Xorg 21.1 answers (measured with xcb against Xvfb, 4 KiB segments).
+struct RangeCase {
+    label: &'static str,
+    minor: u8,
+    body: Vec<u8>,
+    /// `None` for Success; otherwise the error code and value.
+    error: Option<(u8, u32)>,
+}
+
+fn with_offset(mut body: Vec<u8>, at: usize, offset: u32) -> Vec<u8> {
+    body[at..at + 4].copy_from_slice(&offset.to_le_bytes());
+    body
+}
+
+fn shm_create(segment: ResourceId, offset: u32, width: u16, height: u16) -> Vec<u8> {
+    let mut body = with_offset(create_pixmap_body(NEW_PIXMAP, segment), 20, offset);
+    body[8..10].copy_from_slice(&width.to_le_bytes());
+    body[10..12].copy_from_slice(&height.to_le_bytes());
+    body
+}
+
+fn shm_get(segment: ResourceId, offset: u32) -> Vec<u8> {
+    with_offset(get_image_body(DRAWABLE, segment), 24, offset)
+}
+
+/// PutImage of a `total` image's `src` rectangle (x, y, width, height).
+fn shm_put(
+    segment: ResourceId,
+    offset: u32,
+    total: (u16, u16),
+    src: (u16, u16, u16, u16),
+) -> Vec<u8> {
+    let mut body = with_offset(put_image_body(segment), 32, offset);
+    for (at, value) in [
+        (8, total.0),
+        (10, total.1),
+        (12, src.0),
+        (14, src.1),
+        (16, src.2),
+        (18, src.3),
+    ] {
+        body[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    body
+}
+
+fn range_cases(size: u32) -> Vec<RangeCase> {
+    use x11::error::{BAD_ACCESS, BAD_ALLOC, BAD_VALUE};
+    let (rw, ro) = (SEGMENT.0, RO_SEGMENT.0);
+    // 4x4 at depth 24 is 64 bytes: in range at `size - 4`, but overrunning.
+    let (overrun, past) = (size - 4, size * 2);
+    let image = (4, 4, 4, 4);
+    let full = (0, 0, 4, 4);
+    let case = |label, minor, body, error| RangeCase {
+        label,
+        minor,
+        body,
+        error,
+    };
+    vec![
+        case(
+            "CreatePixmap unaligned",
+            shm::CREATE_PIXMAP,
+            shm_create(SEGMENT, 2, 4, 4),
+            Some((BAD_VALUE, 2)),
+        ),
+        case(
+            "CreatePixmap past the end",
+            shm::CREATE_PIXMAP,
+            shm_create(SEGMENT, past, 4, 4),
+            Some((BAD_VALUE, past)),
+        ),
+        case(
+            "CreatePixmap overrun",
+            shm::CREATE_PIXMAP,
+            shm_create(SEGMENT, overrun, 4, 4),
+            Some((BAD_ACCESS, rw)),
+        ),
+        case(
+            "CreatePixmap at the end",
+            shm::CREATE_PIXMAP,
+            shm_create(SEGMENT, size, 4, 4),
+            Some((BAD_ACCESS, rw)),
+        ),
+        case(
+            "CreatePixmap read-only",
+            shm::CREATE_PIXMAP,
+            shm_create(RO_SEGMENT, 0, 4, 4),
+            Some((BAD_ACCESS, ro)),
+        ),
+        case(
+            "CreatePixmap read-only unaligned",
+            shm::CREATE_PIXMAP,
+            shm_create(RO_SEGMENT, 2, 4, 4),
+            Some((BAD_VALUE, 2)),
+        ),
+        case(
+            "CreatePixmap missing segment",
+            shm::CREATE_PIXMAP,
+            shm_create(MISSING, 2, 4, 4),
+            Some((BAD_SHM_SEG, MISSING.0)),
+        ),
+        case(
+            "CreatePixmap zero width",
+            shm::CREATE_PIXMAP,
+            shm_create(SEGMENT, 0, 0, 4),
+            Some((BAD_VALUE, 0)),
+        ),
+        case(
+            "CreatePixmap over 32767 wide",
+            shm::CREATE_PIXMAP,
+            shm_create(SEGMENT, 0, 40000, 1),
+            Some((BAD_ALLOC, rw)),
+        ),
+        case(
+            "CreatePixmap wider than the segment",
+            shm::CREATE_PIXMAP,
+            shm_create(SEGMENT, 0, u16::try_from(size / 4 + 1).unwrap(), 1),
+            Some((BAD_ACCESS, rw)),
+        ),
+        case(
+            "GetImage unaligned",
+            shm::GET_IMAGE,
+            shm_get(SEGMENT, 2),
+            Some((BAD_VALUE, 2)),
+        ),
+        case(
+            "GetImage past the end",
+            shm::GET_IMAGE,
+            shm_get(SEGMENT, past),
+            Some((BAD_VALUE, past)),
+        ),
+        case(
+            "GetImage overrun",
+            shm::GET_IMAGE,
+            shm_get(SEGMENT, overrun),
+            Some((BAD_ACCESS, rw)),
+        ),
+        case(
+            "GetImage at the end",
+            shm::GET_IMAGE,
+            shm_get(SEGMENT, size),
+            Some((BAD_ACCESS, rw)),
+        ),
+        case(
+            "GetImage read-only",
+            shm::GET_IMAGE,
+            shm_get(RO_SEGMENT, 0),
+            Some((BAD_ACCESS, ro)),
+        ),
+        case(
+            "GetImage missing segment",
+            shm::GET_IMAGE,
+            shm_get(MISSING, 0),
+            Some((BAD_SHM_SEG, MISSING.0)),
+        ),
+        case(
+            "PutImage unaligned",
+            shm::PUT_IMAGE,
+            shm_put(SEGMENT, 2, (4, 4), full),
+            Some((BAD_VALUE, 2)),
+        ),
+        case(
+            "PutImage past the end",
+            shm::PUT_IMAGE,
+            shm_put(SEGMENT, past, (4, 4), full),
+            Some((BAD_VALUE, past)),
+        ),
+        case(
+            "PutImage overrun",
+            shm::PUT_IMAGE,
+            shm_put(SEGMENT, overrun, (4, 4), full),
+            Some((BAD_VALUE, 4)),
+        ),
+        case(
+            "PutImage at the end",
+            shm::PUT_IMAGE,
+            shm_put(SEGMENT, size, (4, 4), full),
+            Some((BAD_VALUE, 4)),
+        ),
+        case(
+            "PutImage read-only",
+            shm::PUT_IMAGE,
+            shm_put(RO_SEGMENT, 0, (4, 4), full),
+            None,
+        ),
+        case(
+            "PutImage missing segment",
+            shm::PUT_IMAGE,
+            shm_put(MISSING, 0, (4, 4), full),
+            Some((BAD_SHM_SEG, MISSING.0)),
+        ),
+        case(
+            "PutImage src x past the image",
+            shm::PUT_IMAGE,
+            shm_put(SEGMENT, 0, (4, 4), (5, 0, 1, 1)),
+            Some((BAD_VALUE, 5)),
+        ),
+        case(
+            "PutImage src y past the image",
+            shm::PUT_IMAGE,
+            shm_put(SEGMENT, 0, (4, 4), (0, 5, 1, 1)),
+            Some((BAD_VALUE, 5)),
+        ),
+        case(
+            "PutImage src width past the image",
+            shm::PUT_IMAGE,
+            shm_put(SEGMENT, 0, (4, 4), (2, 0, 3, 1)),
+            Some((BAD_VALUE, 3)),
+        ),
+        case(
+            "PutImage src height past the image",
+            shm::PUT_IMAGE,
+            shm_put(SEGMENT, 0, (4, 4), (0, 2, 1, 3)),
+            Some((BAD_VALUE, 3)),
+        ),
+        case(
+            "PutImage empty image",
+            shm::PUT_IMAGE,
+            shm_put(SEGMENT, 0, (4, 0), (0, 0, 0, 0)),
+            None,
+        ),
+        // 64 pixels a row (256 bytes), one row more than the segment holds.
+        case(
+            "PutImage total image overrun",
+            shm::PUT_IMAGE,
+            shm_put(
+                SEGMENT,
+                0,
+                (64, u16::try_from(size / 256 + 1).unwrap()),
+                image,
+            ),
+            Some((BAD_VALUE, 64)),
+        ),
+    ]
+}
+
+#[test]
+fn shm_range_errors_match_xorg() {
+    // Mutation: report an overrun as BadValue, drop the alignment check, or check PutImage's source rectangle before the image's rows; a row fails.
+    let probe = shm_fixture();
+    let mut sizing = probe;
+    install_segment(&mut sizing.state, SEGMENT, false);
+    let size = u32::try_from(sizing.state.mit_shm_segments[&SEGMENT.0].size).unwrap();
+    for case in range_cases(size) {
+        let mut fixture = shm_fixture();
+        install_segment(&mut fixture.state, SEGMENT, false);
+        install_segment(&mut fixture.state, RO_SEGMENT, true);
+        // A 4x4 depth-24 GetImage reply, so its size check is reached.
+        let mut reply = vec![24];
+        reply.resize(32 + 64, 0);
+        fixture.backend.get_image_reply = Some(reply);
+        let bytes = dispatch(&mut fixture, case.minor, &case.body, None, 1);
+        match case.error {
+            Some((code, value)) => {
+                assert_eq!(bytes.len(), 32, "{}: one error packet", case.label);
+                assert_eq!(bytes[0], 0, "{}: an error", case.label);
+                assert_eq!(bytes[1], code, "{}: error code", case.label);
+                assert_eq!(
+                    u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                    value,
+                    "{}: error value",
+                    case.label
+                );
+                assert_eq!(bytes[8], case.minor, "{}: minor", case.label);
+                assert!(
+                    fixture.state.resources.pixmap(NEW_PIXMAP).is_none(),
+                    "{}: no pixmap",
+                    case.label
+                );
+            }
+            None => assert!(bytes.is_empty(), "{}: Success, got {bytes:?}", case.label),
+        }
+    }
 }

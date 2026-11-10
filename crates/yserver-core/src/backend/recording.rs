@@ -390,6 +390,9 @@ pub struct RecordingBackend {
     /// Number of `get_image` calls, kept separate from the general call log
     /// so tests can assert denied readbacks without changing existing log snapshots.
     pub get_image_calls: usize,
+    /// What `get_image` answers (a core GetImage reply: 32-byte header,
+    /// then the image). `None` answers no image.
+    pub get_image_reply: Option<Vec<u8>>,
     /// Queued "the sprite now shows this cursor" report handed out by
     /// `take_displayed_cursor_change`. Tests set it to stand in for a KMS
     /// sprite change.
@@ -760,6 +763,7 @@ impl RecordingBackend {
         Self {
             calls: Mutex::new(Vec::new()),
             get_image_calls: 0,
+            get_image_reply: None,
             displayed_cursor_change: None,
             active_cursor_image: None,
             alive_cursors: HashSet::new(),
@@ -2433,7 +2437,7 @@ impl Backend for RecordingBackend {
         _plane_mask: u32,
     ) -> io::Result<Option<Vec<u8>>> {
         self.get_image_calls += 1;
-        Ok(None)
+        Ok(self.get_image_reply.clone())
     }
 
     fn poly_line(
