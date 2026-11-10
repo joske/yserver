@@ -1,8 +1,9 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind},
     backend::Backend,
     core_loop::process_request::{
-        RequestOutcome, emit_x11_error_with_minor, send_reply_with_fd, write_to_client,
-        xid_out_of_client_range,
+        RequestOutcome, check_creation, check_resource, emit_x11_error_with_minor,
+        send_reply_with_fd, write_to_client, xid_out_of_client_range,
     },
     fd::OwnedFd,
     server::ServerState,
@@ -25,6 +26,7 @@ pub(super) fn handle_dri3_request(
 ) -> io::Result<RequestOutcome> {
     use yserver_protocol::x11::{ClientByteOrder, dri3 as x11dri3};
     const DRI3_MAJOR_OPCODE: u8 = 147;
+    let access_request = RequestOpcodes::for_request(header);
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -55,6 +57,33 @@ pub(super) fn handle_dri3_request(
         x11dri3::OPEN => {
             let req = x11dri3::parse_open(body);
             let drawable = req.map_or(0, |r| r.drawable);
+            if let Some(req) = req {
+                let drawable_id = ResourceId(req.drawable);
+                let drawable_kind = super::core_resource_kind_for_access(state, drawable_id)
+                    .filter(|kind| matches!(kind, ResourceKind::Window | ResourceKind::Pixmap));
+                if let Some(kind) = drawable_kind {
+                    check_resource!(
+                        state,
+                        client_id,
+                        sequence,
+                        access_request,
+                        drawable_id,
+                        kind,
+                        AccessMode::GET_ATTR
+                    );
+                }
+                if req.provider != 0 {
+                    check_resource!(
+                        state,
+                        client_id,
+                        sequence,
+                        access_request,
+                        ResourceId(req.provider),
+                        ResourceKind::RandrProvider,
+                        AccessMode::READ
+                    );
+                }
+            }
             match backend.dri3_open(drawable) {
                 Ok(fd) => {
                     debug!(
@@ -104,6 +133,20 @@ pub(super) fn handle_dri3_request(
                     DRI3_MAJOR_OPCODE,
                 );
             };
+            let drawable_id = ResourceId(req.drawable);
+            let drawable_kind = super::core_resource_kind_for_access(state, drawable_id)
+                .filter(|kind| matches!(kind, ResourceKind::Window | ResourceKind::Pixmap));
+            if let Some(kind) = drawable_kind {
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                    drawable_id,
+                    kind,
+                    AccessMode::GET_ATTR
+                );
+            }
             let Some(fd) = attached_fd else {
                 debug!(
                     "client {} #{} DRI3::PixmapFromBuffer no SCM_RIGHTS fd attached -> BadAlloc",
@@ -119,6 +162,15 @@ pub(super) fn handle_dri3_request(
                     DRI3_MAJOR_OPCODE,
                 );
             };
+            check_creation!(
+                state,
+                client_id,
+                sequence,
+                access_request,
+                ResourceId(req.pixmap),
+                ResourceKind::Pixmap,
+                drawable_kind.map(|_| drawable_id)
+            );
             match backend.dri3_import_pixmap(
                 fd,
                 req.width,
@@ -198,6 +250,20 @@ pub(super) fn handle_dri3_request(
                     DRI3_MAJOR_OPCODE,
                 );
             };
+            let window_id = ResourceId(req.window);
+            let has_window = super::core_resource_kind_for_access(state, window_id)
+                == Some(ResourceKind::Window);
+            if has_window {
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                    window_id,
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR
+                );
+            }
             // Phase 4.2 scope: single-plane RGB only. num_buffers > 1
             // is wire-decoded (so logging is accurate) but rejected.
             if req.num_buffers != 1 {
@@ -231,6 +297,15 @@ pub(super) fn handle_dri3_request(
                     DRI3_MAJOR_OPCODE,
                 );
             };
+            check_creation!(
+                state,
+                client_id,
+                sequence,
+                access_request,
+                ResourceId(req.pixmap),
+                ResourceKind::Pixmap,
+                has_window.then_some(window_id)
+            );
             match backend.dri3_import_pixmap(
                 fd,
                 req.width,
@@ -346,6 +421,15 @@ pub(super) fn handle_dri3_request(
                 op,
                 pixmap,
             };
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                access_request,
+                ResourceId(pixmap),
+                ResourceKind::Pixmap,
+                AccessMode::WRITE
+            );
             return match backend.dri3_begin_export_pixmap_buffers(host_xid) {
                 Ok(crate::backend::Dri3ExportBegin::Ready(export)) => {
                     complete_dri3_export(state, client_id, sequence, continuation, Ok(export))
@@ -380,6 +464,19 @@ pub(super) fn handle_dri3_request(
                     );
                 }
             };
+            if super::core_resource_kind_for_access(state, ResourceId(req.window))
+                == Some(ResourceKind::Window)
+            {
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                    ResourceId(req.window),
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR
+                );
+            }
             let (window_mods, screen_mods) =
                 backend.dri3_supported_modifiers(req.window, req.depth, req.bpp);
             debug!(
@@ -458,6 +555,19 @@ pub(super) fn handle_dri3_request(
                     DRI3_MAJOR_OPCODE,
                 );
             }
+            let drawable_id = ResourceId(req.drawable);
+            let drawable_kind = super::core_resource_kind_for_access(state, drawable_id)
+                .filter(|kind| matches!(kind, ResourceKind::Window | ResourceKind::Pixmap))
+                .expect("validated DRI3 drawable must resolve to Window or Pixmap");
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                access_request,
+                drawable_id,
+                drawable_kind,
+                AccessMode::GET_ATTR
+            );
             let Some(fd) = attached_fd else {
                 return emit_x11_error_with_minor(
                     state,
@@ -469,6 +579,15 @@ pub(super) fn handle_dri3_request(
                     DRI3_MAJOR_OPCODE,
                 );
             };
+            check_creation!(
+                state,
+                client_id,
+                sequence,
+                access_request,
+                ResourceId(req.fence),
+                ResourceKind::SyncFence,
+                Some(drawable_id)
+            );
             if let Err(e) = backend.dri3_fence_from_fd(req.fence, fd) {
                 debug!(
                     "client {} #{} DRI3::FenceFromFD 0x{:x} -> BadValue ({e})",
@@ -519,6 +638,29 @@ pub(super) fn handle_dri3_request(
                     DRI3_MAJOR_OPCODE,
                 );
             };
+            let drawable_id = ResourceId(req.drawable);
+            if let Some(kind) = super::core_resource_kind_for_access(state, drawable_id)
+                .filter(|kind| matches!(kind, ResourceKind::Window | ResourceKind::Pixmap))
+            {
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                    drawable_id,
+                    kind,
+                    AccessMode::GET_ATTR
+                );
+            }
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                access_request,
+                ResourceId(req.fence),
+                ResourceKind::SyncFence,
+                AccessMode::WRITE
+            );
             match backend.dri3_fd_from_fence(req.fence) {
                 Ok(fd) => {
                     let reply = x11dri3::encode_fd_from_fence_reply(byte_order, sequence);
@@ -599,6 +741,19 @@ pub(super) fn handle_dri3_request(
                     DRI3_MAJOR_OPCODE,
                 );
             }
+            let drawable_id = ResourceId(req.drawable);
+            let drawable_kind = super::core_resource_kind_for_access(state, drawable_id)
+                .filter(|kind| matches!(kind, ResourceKind::Window | ResourceKind::Pixmap))
+                .expect("validated DRI3 drawable must resolve to Window or Pixmap");
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                access_request,
+                drawable_id,
+                drawable_kind,
+                AccessMode::GET_ATTR
+            );
             let Some(fd) = attached_fd else {
                 return emit_x11_error_with_minor(
                     state,
@@ -610,6 +765,15 @@ pub(super) fn handle_dri3_request(
                     DRI3_MAJOR_OPCODE,
                 );
             };
+            check_creation!(
+                state,
+                client_id,
+                sequence,
+                access_request,
+                ResourceId(req.syncobj),
+                ResourceKind::Dri3Syncobj,
+                Some(drawable_id)
+            );
             if let Err(e) = backend.dri3_import_syncobj(client_id, req.syncobj, fd) {
                 debug!(
                     "client {} #{} DRI3::ImportSyncobj 0x{:x} -> BadAlloc ({e})",
@@ -670,6 +834,15 @@ pub(super) fn handle_dri3_request(
                     DRI3_MAJOR_OPCODE,
                 );
             };
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                access_request,
+                ResourceId(syncobj),
+                ResourceKind::Dri3Syncobj,
+                AccessMode::WRITE
+            );
             if owner != client_id {
                 return emit_x11_error_with_minor(
                     state,
@@ -718,6 +891,23 @@ pub(super) fn handle_dri3_request(
             );
         }
         x11dri3::SET_DRM_DEVICE_IN_USE => {
+            if let Some(window) = body.get(..4) {
+                let window = ResourceId(u32::from_le_bytes(
+                    window.try_into().expect("four-byte DRI3 window id"),
+                ));
+                if super::core_resource_kind_for_access(state, window) == Some(ResourceKind::Window)
+                {
+                    check_resource!(
+                        state,
+                        client_id,
+                        sequence,
+                        access_request,
+                        window,
+                        ResourceKind::Window,
+                        AccessMode::GET_ATTR
+                    );
+                }
+            }
             // Acknowledged but ignored — single-GPU only per design §1.
             debug!(
                 "client {} #{} DRI3::SetDRMDeviceInUse (single-GPU; ignored)",

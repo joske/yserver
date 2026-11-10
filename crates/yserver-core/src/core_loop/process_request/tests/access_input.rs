@@ -5,6 +5,7 @@ use super::{
 use crate::access::{
     AccessMode, Decision, DenyError, RequestOpcodes, ResourceKind, ResourceTarget,
 };
+use std::os::fd::IntoRawFd;
 
 const CLIENT: ClientId = ClientId(1);
 const WINDOW: ResourceId = ResourceId(0x0010_8001);
@@ -12,6 +13,8 @@ const OTHER_WINDOW: ResourceId = ResourceId(0x0010_8002);
 const CURSOR: ResourceId = ResourceId(0x0090_8001);
 const BARRIER_ONE: ResourceId = ResourceId(0x00a0_8001);
 const BARRIER_TWO: ResourceId = ResourceId(0x00a0_8002);
+const POINTER_SHM: ResourceId = ResourceId(0x0010_8008);
+const POINTER_COLORMAP: ResourceId = ResourceId(0x0010_8009);
 const XI_MAJOR: u8 = 137;
 const XKB_MAJOR: u8 = 136;
 const XTEST_MAJOR: u8 = 146;
@@ -140,6 +143,190 @@ fn input_request(
     body: &[u8],
 ) -> Vec<u8> {
     super::access_resources::resource_request(state, backend, peer, 1, major, minor, body)
+}
+
+fn seed_client_pointer_resource(state: &mut ServerState, id: ResourceId, kind: ResourceKind) {
+    match kind {
+        ResourceKind::ShmSegment => {
+            let path = std::env::temp_dir().join(format!(
+                "yserver-access-input-shm-{}-{}",
+                std::process::id(),
+                id.0
+            ));
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .expect("create input access test SHM file");
+            file.set_len(4096).expect("size input access test SHM file");
+            let segment = crate::server::MitShmSegment::from_fd(CLIENT, file.into_raw_fd(), false)
+                .expect("map input access test SHM file");
+            assert!(state.mit_shm_segments.insert(id.0, segment).is_none());
+            std::fs::remove_file(path).expect("remove input access test SHM file");
+        }
+        ResourceKind::Colormap => {
+            state
+                .resources
+                .create_colormap(CLIENT, id, crate::resources::ROOT_VISUAL)
+        }
+        _ => unreachable!("not a client-pointer extension resource: {kind:?}"),
+    }
+}
+
+fn client_pointer_resource_snapshot(
+    state: &ServerState,
+    id: ResourceId,
+    kind: ResourceKind,
+) -> String {
+    match kind {
+        ResourceKind::ShmSegment => format!(
+            "{:?}",
+            state.mit_shm_segments.get(&id.0).map(|segment| (
+                segment.owner,
+                segment.size,
+                segment.read_only
+            ))
+        ),
+        ResourceKind::Colormap => format!("{:?}", state.resources.colormap(id)),
+        _ => unreachable!("not a client-pointer extension resource: {kind:?}"),
+    }
+}
+
+#[test]
+fn xi_client_pointer_extension_resource_is_asked() {
+    // Mutation: keep the eight-kind resolver list; SHM and colormap rows must fail to record their
+    // expected access checks.
+    let rows = [
+        (
+            44,
+            POINTER_SHM,
+            ResourceKind::ShmSegment,
+            AccessMode::MANAGE,
+        ),
+        (
+            44,
+            POINTER_COLORMAP,
+            ResourceKind::Colormap,
+            AccessMode::MANAGE,
+        ),
+        (
+            45,
+            POINTER_SHM,
+            ResourceKind::ShmSegment,
+            AccessMode::GET_ATTR,
+        ),
+        (
+            45,
+            POINTER_COLORMAP,
+            ResourceKind::Colormap,
+            AccessMode::GET_ATTR,
+        ),
+    ];
+
+    for (minor, id, kind, mode) in rows {
+        let body = if minor == 44 {
+            input_words(&[id.0, 2])
+        } else {
+            input_words(&[id.0])
+        };
+        let (mut state, mut peer, mut backend) = input_fixture();
+        seed_client_pointer_resource(&mut state, id, kind);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+            Decision::Allow,
+            Arc::clone(&calls),
+        )));
+        let actual = input_request(&mut state, &mut backend, &mut peer, XI_MAJOR, minor, &body);
+
+        let (mut no_policy_state, mut no_policy_peer, mut no_policy_backend) = input_fixture();
+        seed_client_pointer_resource(&mut no_policy_state, id, kind);
+        let expected = input_request(
+            &mut no_policy_state,
+            &mut no_policy_backend,
+            &mut no_policy_peer,
+            XI_MAJOR,
+            minor,
+            &body,
+        );
+        assert_eq!(actual, expected, "XI minor {minor} changed its reply");
+
+        let calls = calls.lock().unwrap();
+        let resource_calls: Vec<_> = calls
+            .iter()
+            .filter(|call| call.hook == ExtensionHook::Resource)
+            .collect();
+        assert_eq!(resource_calls.len(), 1, "XI minor {minor}, {kind:?}");
+        assert_input_check(
+            resource_calls[0],
+            check(id, kind, mode),
+            XI_MAJOR,
+            minor,
+            "XI client pointer extension resource",
+        );
+    }
+
+    let error = DenyError {
+        code: x11::error::BAD_ACCESS,
+        value: 0xA55A_1234,
+    };
+    for (minor, id, kind, mode) in rows {
+        let body = if minor == 44 {
+            input_words(&[id.0, 2])
+        } else {
+            input_words(&[id.0])
+        };
+        let (mut state, mut peer, mut backend) = input_fixture();
+        seed_client_pointer_resource(&mut state, id, kind);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        state.install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+            Arc::clone(&calls),
+            id,
+            Some(mode),
+            error,
+        )));
+        let input_before = input_state_snapshot(&state);
+        let resource_before = client_pointer_resource_snapshot(&state, id, kind);
+        let backend_before = backend.calls();
+
+        let bytes = input_request(&mut state, &mut backend, &mut peer, XI_MAJOR, minor, &body);
+
+        assert_policy_error(
+            &bytes,
+            XI_MAJOR,
+            minor,
+            error,
+            "XI client pointer extension resource",
+        );
+        assert_eq!(
+            input_state_snapshot(&state),
+            input_before,
+            "XI minor {minor} changed input state"
+        );
+        assert_eq!(
+            client_pointer_resource_snapshot(&state, id, kind),
+            resource_before,
+            "XI minor {minor} changed {kind:?}"
+        );
+        assert_eq!(
+            backend.calls(),
+            backend_before,
+            "XI minor {minor} reached backend"
+        );
+        let calls = calls.lock().unwrap();
+        let resource_calls: Vec<_> = calls
+            .iter()
+            .filter(|call| call.hook == ExtensionHook::Resource)
+            .collect();
+        assert_eq!(resource_calls.len(), 1, "XI minor {minor}, {kind:?}");
+        assert_input_check(
+            resource_calls[0],
+            check(id, kind, mode),
+            XI_MAJOR,
+            minor,
+            "XI client pointer extension resource",
+        );
+    }
 }
 
 fn enable_xkb(state: &mut ServerState, backend: &mut RecordingBackend, peer: &mut UnixStream) {

@@ -1,13 +1,17 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind},
     backend::Backend,
-    core_loop::process_request::{RequestOutcome, emit_x11_error_with_minor, write_to_client},
+    core_loop::process_request::{
+        RequestOutcome, check_creation, check_resource, emit_x11_error_with_minor,
+        validate_arbitrary_resource_if_present, validate_resource_if_present, write_to_client,
+    },
     server::ServerState,
 };
 use log::debug;
 use std::io;
 use yserver_protocol::{
     x11,
-    x11::{ClientId, RequestHeader, SequenceNumber},
+    x11::{ClientId, RequestHeader, ResourceId, SequenceNumber},
 };
 
 /// A SYNC protocol error: `code` is either a core error or
@@ -124,6 +128,24 @@ pub(super) fn handle_sync_request(
         .get(&client_id.0)
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
+    let access_request = RequestOpcodes::for_request(header);
+    macro_rules! check_arbitrary_resource {
+        ($id:expr, $mode:expr) => {
+            crate::core_loop::process_request::return_on_access_denial!(
+                validate_arbitrary_resource_if_present(
+                    state,
+                    client_id,
+                    ResourceId($id),
+                    $mode,
+                    access_request,
+                ),
+                state,
+                client_id,
+                sequence,
+                access_request,
+            );
+        };
+    }
     match minor {
         x11sync::INITIALIZE => {
             // Xorg `ProcSyncInitialize` always answers its own version
@@ -149,6 +171,14 @@ pub(super) fn handle_sync_request(
         }
         x11sync::CREATE_COUNTER => {
             if let Some((counter, value)) = x11sync::parse_counter_value(body) {
+                check_creation!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                    ResourceId(counter),
+                    ResourceKind::SyncCounter
+                );
                 state.sync_counters.insert(
                     counter,
                     crate::server::SyncCounter {
@@ -164,6 +194,15 @@ pub(super) fn handle_sync_request(
                     Ok(old) => old,
                     Err(outcome) => return outcome,
                 };
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                    ResourceId(counter),
+                    ResourceKind::SyncCounter,
+                    AccessMode::WRITE
+                );
                 if let Some(c) = state.sync_counters.get_mut(&counter) {
                     c.value = value;
                 }
@@ -176,6 +215,15 @@ pub(super) fn handle_sync_request(
                     Ok(old) => old,
                     Err(outcome) => return outcome,
                 };
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                    ResourceId(counter),
+                    ResourceKind::SyncCounter,
+                    AccessMode::WRITE
+                );
                 // Xorg: an INT64 overflow is BadValue naming the high half
                 // of the delta (Xvfb: value 0x7fffffff for i64::MAX).
                 let Some(new) = old.checked_add(delta) else {
@@ -210,6 +258,15 @@ pub(super) fn handle_sync_request(
                     counter,
                 );
             };
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                access_request,
+                ResourceId(counter),
+                ResourceKind::SyncCounter,
+                AccessMode::READ
+            );
             let reply = x11sync::encode_query_counter_reply(byte_order, sequence, value);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
@@ -224,6 +281,15 @@ pub(super) fn handle_sync_request(
                     Ok(last) => last,
                     Err(outcome) => return outcome,
                 };
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                    ResourceId(counter),
+                    ResourceKind::SyncCounter,
+                    AccessMode::DESTROY
+                );
                 state.sync_counters.remove(&counter);
                 crate::core_loop::sync_await::counter_destroyed(state, counter, last);
             }
@@ -266,6 +332,15 @@ pub(super) fn handle_sync_request(
                         c.counter,
                     );
                 };
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                    ResourceId(c.counter),
+                    ResourceKind::SyncCounter,
+                    AccessMode::READ
+                );
                 let test_value = match c.value_type {
                     x11sync::VALUE_TYPE_ABSOLUTE => c.wait_value,
                     x11sync::VALUE_TYPE_RELATIVE => {
@@ -354,9 +429,15 @@ pub(super) fn handle_sync_request(
                 ..crate::server::SyncAlarm::default()
             };
             let values = alarm_value_words(body);
-            if let Err((code, value)) =
-                change_alarm_attributes(state, alarm, &mut a, client_id, mask, &values)
-            {
+            if let Err((code, value)) = change_alarm_attributes(
+                state,
+                alarm,
+                &mut a,
+                client_id,
+                access_request,
+                mask,
+                &values,
+            ) {
                 return sync_error(state, client_id, sequence, header, code, value);
             }
             let counter = a.counter;
@@ -375,6 +456,14 @@ pub(super) fn handle_sync_request(
                 wait = a.wait_value,
                 delta = a.delta,
                 events = a.events,
+            );
+            check_creation!(
+                state,
+                client_id,
+                sequence,
+                access_request,
+                ResourceId(alarm),
+                ResourceKind::SyncAlarm
             );
             if counter == 0 {
                 // "NULL counter will not trigger in CreateAlarm and sets
@@ -406,6 +495,15 @@ pub(super) fn handle_sync_request(
             if let Err(outcome) = sync_known_alarm(state, client_id, sequence, header, alarm) {
                 return outcome;
             }
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                access_request,
+                ResourceId(alarm),
+                ResourceKind::SyncAlarm,
+                AccessMode::WRITE
+            );
             if body.len() != x11sync::alarm_request_len(mask) {
                 return sync_error(
                     state,
@@ -425,7 +523,15 @@ pub(super) fn handle_sync_request(
                 return Ok(RequestOutcome::Handled);
             };
             let values = alarm_value_words(body);
-            let outcome = change_alarm_attributes(state, alarm, &mut a, client_id, mask, &values);
+            let outcome = change_alarm_attributes(
+                state,
+                alarm,
+                &mut a,
+                client_id,
+                access_request,
+                mask,
+                &values,
+            );
             if let Err((code, value)) = outcome {
                 state.sync_alarms.insert(alarm, a);
                 return sync_error(state, client_id, sequence, header, code, value);
@@ -472,6 +578,15 @@ pub(super) fn handle_sync_request(
             if let Err(outcome) = sync_known_alarm(state, client_id, sequence, header, alarm_id) {
                 return outcome;
             }
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                access_request,
+                ResourceId(alarm_id),
+                ResourceKind::SyncAlarm,
+                AccessMode::READ
+            );
             let alarm = state
                 .sync_alarms
                 .get(&alarm_id)
@@ -509,12 +624,48 @@ pub(super) fn handle_sync_request(
             if let Err(outcome) = sync_known_alarm(state, client_id, sequence, header, alarm) {
                 return outcome;
             }
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                access_request,
+                ResourceId(alarm),
+                ResourceKind::SyncAlarm,
+                AccessMode::DESTROY
+            );
             // Xorg `FreeAlarm`: any client may destroy it; a Destroyed
             // AlarmNotify goes to the owner and the selecting clients.
             crate::core_loop::sync_await::destroy_alarm(state, alarm);
         }
         x11sync::CREATE_FENCE => {
             if let Some(req) = x11sync::parse_create_fence(body) {
+                let drawable = ResourceId(req.drawable);
+                let drawable_kind = match super::drawable_lookup(state, drawable) {
+                    super::DrawableLookup::InputOutputWindow { .. }
+                    | super::DrawableLookup::InputOnlyWindow => Some(ResourceKind::Window),
+                    super::DrawableLookup::Pixmap { .. } => Some(ResourceKind::Pixmap),
+                    super::DrawableLookup::Missing => None,
+                };
+                if let Some(kind) = drawable_kind {
+                    check_resource!(
+                        state,
+                        client_id,
+                        sequence,
+                        access_request,
+                        ResourceId(req.drawable),
+                        kind,
+                        AccessMode::GET_ATTR
+                    );
+                }
+                check_creation!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                    ResourceId(req.fence),
+                    ResourceKind::SyncFence,
+                    drawable_kind.map(|_| drawable)
+                );
                 state.sync_fences.insert(
                     req.fence,
                     crate::server::SyncFence {
@@ -533,6 +684,15 @@ pub(super) fn handle_sync_request(
                 if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
                     return outcome;
                 }
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                    ResourceId(fence),
+                    ResourceKind::SyncFence,
+                    AccessMode::DESTROY
+                );
                 crate::core_loop::sync_await::fence_destroyed(state, fence);
                 state.sync_fences.remove(&fence);
                 backend.dri3_destroy_fence(fence);
@@ -547,6 +707,15 @@ pub(super) fn handle_sync_request(
                 if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
                     return outcome;
                 }
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                    ResourceId(fence),
+                    ResourceKind::SyncFence,
+                    AccessMode::WRITE
+                );
                 // For DRI3-imported xshmfence-backed fences, the
                 // server-side triggered bit is invisible to Mesa's local
                 // `xshmfence_await`. Forward the trigger to the backend so
@@ -569,6 +738,15 @@ pub(super) fn handle_sync_request(
                 if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
                     return outcome;
                 }
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                    ResourceId(fence),
+                    ResourceKind::SyncFence,
+                    AccessMode::WRITE
+                );
                 // Xorg `ProcSyncResetFence`: only a triggered fence can be
                 // reset (Xvfb: BadMatch naming the fence); a shared-memory
                 // fence is tested, and reset, in that memory.
@@ -593,6 +771,15 @@ pub(super) fn handle_sync_request(
             if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
                 return outcome;
             }
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                access_request,
+                ResourceId(fence),
+                ResourceKind::SyncFence,
+                AccessMode::READ
+            );
             // Xorg `ProcSyncQueryFence` → `CheckTriggered`: shared memory
             // for a DRI3 xshmfence, the server's bit otherwise.
             let triggered =
@@ -631,6 +818,15 @@ pub(super) fn handle_sync_request(
                         fence,
                     );
                 }
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    access_request,
+                    ResourceId(fence),
+                    ResourceKind::SyncFence,
+                    AccessMode::READ
+                );
             }
             debug!(
                 "client {} #{} SYNC::AwaitFence n={}",
@@ -645,9 +841,18 @@ pub(super) fn handle_sync_request(
             crate::core_loop::sync_await::begin_await(state, &*backend, client_id, waits);
         }
         x11sync::SET_PRIORITY => {
-            // Stub.
+            if let Some(resource) = x11sync::parse_resource(body)
+                && resource != 0
+            {
+                check_arbitrary_resource!(resource, AccessMode::GET_ATTR);
+            }
         }
         x11sync::GET_PRIORITY => {
+            if let Some(resource) = x11sync::parse_resource(body)
+                && resource != 0
+            {
+                check_arbitrary_resource!(resource, AccessMode::GET_ATTR);
+            }
             let reply = x11sync::encode_get_priority_reply(byte_order, sequence, 0);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
@@ -700,6 +905,7 @@ fn change_alarm_attributes(
     alarm_id: u32,
     alarm: &mut crate::server::SyncAlarm,
     client: ClientId,
+    request: RequestOpcodes,
     mask: u32,
     values: &[u32],
 ) -> Result<(), (u8, u32)> {
@@ -766,6 +972,16 @@ fn change_alarm_attributes(
                 crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_COUNTER,
                 counter,
             ));
+        }
+        if counter != 0 {
+            validate_resource_if_present(
+                state,
+                client,
+                ResourceId(counter),
+                ResourceKind::SyncCounter,
+                AccessMode::READ,
+                request,
+            )?;
         }
         new_counter = counter;
     }

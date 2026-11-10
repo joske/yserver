@@ -1,12 +1,18 @@
 mod access_colormap;
 mod access_composite_damage;
 mod access_cursors;
+mod access_dri3;
 mod access_gc_font;
+mod access_glx;
 mod access_grabs;
 mod access_input;
+mod access_present;
 mod access_properties;
 mod access_render;
 mod access_resources;
+#[cfg(unix)]
+mod access_shm;
+mod access_sync;
 mod composite;
 mod core_misc;
 mod damage_ext;

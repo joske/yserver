@@ -72,7 +72,7 @@ pub(super) fn handle_xi_set_client_pointer(
     if body.len() >= 4 {
         let id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
         crate::core_loop::process_request::return_on_access_denial!(
-            crate::core_loop::process_request::validate_core_resource_if_present(
+            crate::core_loop::process_request::validate_arbitrary_resource_if_present(
                 state,
                 client_id,
                 id,
@@ -100,7 +100,7 @@ pub(super) fn handle_xi_get_client_pointer(
     if body.len() >= 4 {
         let id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
         crate::core_loop::process_request::return_on_access_denial!(
-            crate::core_loop::process_request::validate_core_resource_if_present(
+            crate::core_loop::process_request::validate_arbitrary_resource_if_present(
                 state,
                 client_id,
                 id,

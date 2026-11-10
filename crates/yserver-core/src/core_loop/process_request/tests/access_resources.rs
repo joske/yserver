@@ -11,7 +11,7 @@ pub(super) const CLIENT: ClientId = ClientId(1);
 const REQUEST: RequestOpcodes = RequestOpcodes { major: 1, minor: 0 };
 type ExpectedResourceAccess = (ResourceId, ResourceKind, AccessMode);
 type WindowAccessCase = (u8, u8, Vec<u8>, Vec<ExpectedResourceAccess>);
-type RecordedResourceExpectation = (
+pub(super) type RecordedResourceExpectation = (
     ClientId,
     ResourceId,
     ResourceKind,

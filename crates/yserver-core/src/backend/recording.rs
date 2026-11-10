@@ -284,6 +284,28 @@ pub enum RecordedCall {
         provider: u32,
         source_provider: Option<u32>,
     },
+    Dri3Open {
+        drawable: u32,
+    },
+    Dri3ImportPixmap,
+    Dri3ExportPixmapBuffers {
+        host_xid: u32,
+    },
+    Dri3SupportedModifiers {
+        window: u32,
+    },
+    Dri3FenceFromFd {
+        fence: u32,
+    },
+    Dri3FdFromFence {
+        fence: u32,
+    },
+    Dri3ImportSyncobj {
+        syncobj: u32,
+    },
+    Dri3FreeSyncobj {
+        syncobj: u32,
+    },
     ApplyCrtcConfig {
         output_id: u32,
         connector: String,
@@ -365,6 +387,9 @@ type GammaTriplet = (Vec<u16>, Vec<u16>, Vec<u16>);
 /// counter so create-then-destroy round trips read back the same xid.
 pub struct RecordingBackend {
     pub calls: Mutex<Vec<RecordedCall>>,
+    /// Number of `get_image` calls, kept separate from the general call log
+    /// so tests can assert denied readbacks without changing existing log snapshots.
+    pub get_image_calls: usize,
     /// Queued "the sprite now shows this cursor" report handed out by
     /// `take_displayed_cursor_change`. Tests set it to stand in for a KMS
     /// sprite change.
@@ -655,6 +680,8 @@ pub struct RecordingBackend {
     pub fail_fill_rectangle: bool,
     /// Failure injection for GLX pbuffer backing allocation tests.
     pub create_pixmap_fails: bool,
+    /// Failure injection for the rollback path of MIT-SHM CreatePixmap.
+    pub free_pixmap_fails: bool,
     /// The next `open_font` records its call and returns this error kind.
     /// Used to drive reset's fatal default-font reinstall boundary.
     pub fail_open_font: Option<io::ErrorKind>,
@@ -732,6 +759,7 @@ impl RecordingBackend {
     pub fn new() -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
+            get_image_calls: 0,
             displayed_cursor_change: None,
             active_cursor_image: None,
             alive_cursors: HashSet::new(),
@@ -828,6 +856,7 @@ impl RecordingBackend {
             fail_copy_area: false,
             fail_fill_rectangle: false,
             create_pixmap_fails: false,
+            free_pixmap_fails: false,
             fail_open_font: None,
             present_direct_result: false,
             reallocate_fails: false,
@@ -1087,15 +1116,58 @@ impl Backend for RecordingBackend {
         self.released_present_sources.push(pin_id);
     }
 
+    fn dri3_open(&mut self, drawable: u32) -> std::io::Result<crate::fd::OwnedFd> {
+        self.record(RecordedCall::Dri3Open { drawable });
+        Err(std::io::Error::other("DRI3 unsupported on this backend"))
+    }
+
+    fn dri3_import_pixmap(
+        &mut self,
+        _fd: crate::fd::OwnedFd,
+        _width: u16,
+        _height: u16,
+        _stride: u32,
+        _offset: u32,
+        _modifier: crate::backend::Dri3ImportModifier,
+        _depth: u8,
+        _bpp: u8,
+    ) -> std::io::Result<PixmapHandle> {
+        self.record(RecordedCall::Dri3ImportPixmap);
+        Err(std::io::Error::other(
+            "DRI3 import unsupported on this backend",
+        ))
+    }
+
+    fn dri3_supported_modifiers(&self, window: u32, _depth: u8, _bpp: u8) -> (Vec<u64>, Vec<u64>) {
+        self.record(RecordedCall::Dri3SupportedModifiers { window });
+        (vec![0], vec![0])
+    }
+
+    fn dri3_export_pixmap_buffers(
+        &mut self,
+        host_xid: u32,
+    ) -> std::io::Result<crate::backend::Dri3PixmapExport> {
+        self.record(RecordedCall::Dri3ExportPixmapBuffers { host_xid });
+        Err(std::io::Error::other(
+            "DRI3 BuffersFromPixmap unsupported on this backend",
+        ))
+    }
+
     fn dri3_fence_from_fd(
         &mut self,
-        _fence_xid: u32,
+        fence_xid: u32,
         _fd: crate::fd::OwnedFd,
     ) -> std::io::Result<()> {
+        self.record(RecordedCall::Dri3FenceFromFd { fence: fence_xid });
         if self.refuse_fence_fds {
             return Err(std::io::Error::other("not an xshmfence"));
         }
         Ok(())
+    }
+
+    fn dri3_fd_from_fence(&mut self, fence_xid: u32) -> std::io::Result<crate::fd::OwnedFd> {
+        self.record(RecordedCall::Dri3FdFromFence { fence: fence_xid });
+        Err(std::io::Error::other("DRI3 FDFromFence unsupported"))
     }
 
     fn dri3_trigger_fence(&mut self, fence_xid: u32) -> std::io::Result<()> {
@@ -1145,6 +1217,9 @@ impl Backend for RecordingBackend {
         syncobj_xid: u32,
         _fd: std::os::fd::OwnedFd,
     ) -> std::io::Result<()> {
+        self.record(RecordedCall::Dri3ImportSyncobj {
+            syncobj: syncobj_xid,
+        });
         if self.dri3_syncobj_owners.contains_key(&syncobj_xid) {
             return Err(std::io::Error::other(format!(
                 "DRI3 ImportSyncobj: syncobj 0x{syncobj_xid:x} already imported"
@@ -1164,6 +1239,9 @@ impl Backend for RecordingBackend {
         client_id: yserver_protocol::x11::ClientId,
         syncobj_xid: u32,
     ) -> std::io::Result<()> {
+        self.record(RecordedCall::Dri3FreeSyncobj {
+            syncobj: syncobj_xid,
+        });
         // Mirror the wire split Xorg gets from dixLookupResourceByType:
         // unknown -> BadValue (io::Error::other), not the owner -> BadAccess
         // (PermissionDenied). The handler maps the error kind to the code.
@@ -2059,6 +2137,10 @@ impl Backend for RecordingBackend {
     }
 
     fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        if self.free_pixmap_fails {
+            self.record(RecordedCall::FreePixmap(host_xid));
+            return Err(io::Error::other("free_pixmap failure injected"));
+        }
         self.live_pixmaps.remove(&host_xid);
         self.record(RecordedCall::FreePixmap(host_xid));
         Ok(())
@@ -2350,6 +2432,7 @@ impl Backend for RecordingBackend {
         _height: u16,
         _plane_mask: u32,
     ) -> io::Result<Option<Vec<u8>>> {
+        self.get_image_calls += 1;
         Ok(None)
     }
 

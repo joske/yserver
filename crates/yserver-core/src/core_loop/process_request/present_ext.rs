@@ -1,10 +1,12 @@
 use crate::{
+    access::{AccessMode, Creation, RequestOpcodes, ResourceKind, ResourceTarget},
     backend::{Backend, OriginContext},
     core_loop::{
         damage_fanout::accumulate_damage_to_state,
         process_request::{
             PRESENT_ALL_OPTIONS, PresentDomainSelection, RANDR_BAD_CRTC, RequestOutcome,
-            SYNC_BAD_FENCE, XFIXES_BAD_REGION, emit_x11_error_with_minor, window_unviewable,
+            SYNC_BAD_FENCE, XFIXES_BAD_REGION, check_resource, emit_x11_error_with_minor,
+            validate_resource_access, validate_resource_if_present, window_unviewable,
             write_to_client,
         },
     },
@@ -1585,6 +1587,8 @@ fn present_remainder_error_value(remainder: u64) -> u32 {
 #[allow(clippy::too_many_arguments)]
 fn present_pixmap_common_validation_error(
     state: &ServerState,
+    client_id: ClientId,
+    request: RequestOpcodes,
     valid_region: u32,
     update_region: u32,
     target_crtc: u32,
@@ -1594,26 +1598,84 @@ fn present_pixmap_common_validation_error(
     divisor: u64,
     remainder: u64,
 ) -> Option<(u8, u32)> {
-    if valid_region != 0 && !state.xfixes_regions.contains_key(&valid_region) {
-        return Some((XFIXES_BAD_REGION, valid_region));
+    if valid_region != 0 {
+        if !state.xfixes_regions.contains_key(&valid_region) {
+            return Some((XFIXES_BAD_REGION, valid_region));
+        }
+        if let Err(denial) = validate_resource_if_present(
+            state,
+            client_id,
+            ResourceId(valid_region),
+            ResourceKind::Region,
+            AccessMode::READ,
+            request,
+        ) {
+            return Some(denial);
+        }
     }
-    if update_region != 0 && !state.xfixes_regions.contains_key(&update_region) {
-        return Some((XFIXES_BAD_REGION, update_region));
+    if update_region != 0 {
+        if !state.xfixes_regions.contains_key(&update_region) {
+            return Some((XFIXES_BAD_REGION, update_region));
+        }
+        if let Err(denial) = validate_resource_if_present(
+            state,
+            client_id,
+            ResourceId(update_region),
+            ResourceKind::Region,
+            AccessMode::READ,
+            request,
+        ) {
+            return Some(denial);
+        }
     }
-    if target_crtc != 0 && !present_crtc_exists(state, target_crtc) {
-        return Some((RANDR_BAD_CRTC, target_crtc));
+    if target_crtc != 0 {
+        if !present_crtc_exists(state, target_crtc) {
+            return Some((RANDR_BAD_CRTC, target_crtc));
+        }
+        if let Err(denial) = validate_resource_if_present(
+            state,
+            client_id,
+            ResourceId(target_crtc),
+            ResourceKind::RandrCrtc,
+            AccessMode::READ,
+            request,
+        ) {
+            return Some(denial);
+        }
     }
     if let Some(wait_fence) = wait_fence
         && wait_fence != 0
-        && !state.sync_fences.contains_key(&wait_fence)
     {
-        return Some((SYNC_BAD_FENCE, wait_fence));
+        if !state.sync_fences.contains_key(&wait_fence) {
+            return Some((SYNC_BAD_FENCE, wait_fence));
+        }
+        if let Err(denial) = validate_resource_if_present(
+            state,
+            client_id,
+            ResourceId(wait_fence),
+            ResourceKind::SyncFence,
+            AccessMode::READ,
+            request,
+        ) {
+            return Some(denial);
+        }
     }
     if let Some(idle_fence) = idle_fence
         && idle_fence != 0
-        && !state.sync_fences.contains_key(&idle_fence)
     {
-        return Some((SYNC_BAD_FENCE, idle_fence));
+        if !state.sync_fences.contains_key(&idle_fence) {
+            return Some((SYNC_BAD_FENCE, idle_fence));
+        }
+        if let Err(denial) = validate_resource_if_present(
+            state,
+            client_id,
+            ResourceId(idle_fence),
+            ResourceKind::SyncFence,
+            AccessMode::WRITE,
+            request,
+        ) {
+            return Some(denial);
+        }
     }
     if options & !PRESENT_ALL_OPTIONS != 0 {
         return Some((x11::error::BAD_VALUE, options));
@@ -1638,6 +1700,7 @@ pub(super) fn handle_present_request(
 ) -> io::Result<RequestOutcome> {
     use yserver_protocol::x11::{ClientByteOrder, present as x11present};
     const PRESENT_MAJOR_OPCODE: u8 = 145;
+    let request = RequestOpcodes::for_request(header);
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -1676,8 +1739,26 @@ pub(super) fn handle_present_request(
             let target = x11present::parse_query_capabilities(body).unwrap_or(0);
             let target_resource = ResourceId(target);
             let crtc_id = if state.resources.window(target_resource).is_some() {
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    request,
+                    target_resource,
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR
+                );
                 default_present_crtc_for_window(state, target_resource)
             } else if present_crtc_exists(state, target) {
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    request,
+                    target_resource,
+                    ResourceKind::RandrCrtc,
+                    AccessMode::GET_ATTR
+                );
                 target
             } else {
                 0
@@ -1701,20 +1782,58 @@ pub(super) fn handle_present_request(
                     client_id.0, sequence.0, req.eid, req.window, req.event_mask
                 );
                 let window = ResourceId(req.window);
-                if state
-                    .present_event_selections
-                    .get(&req.eid)
-                    .is_some_and(|selection| {
-                        selection.owner != client_id || selection.window != window
-                    })
-                {
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    request,
+                    window,
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR
+                );
+                if let Some(selection) = state.present_event_selections.get(&req.eid) {
+                    check_resource!(
+                        state,
+                        client_id,
+                        sequence,
+                        request,
+                        ResourceId(req.eid),
+                        ResourceKind::PresentEventSelection,
+                        AccessMode::WRITE,
+                    );
+                    if selection.owner != client_id || selection.window != window {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_MATCH,
+                            req.eid,
+                            u16::from(minor),
+                            PRESENT_MAJOR_OPCODE,
+                        );
+                    }
+                } else if let Err((error_code, error_value)) = validate_resource_access(
+                    state,
+                    client_id,
+                    ResourceTarget {
+                        id: ResourceId(req.eid),
+                        kind: ResourceKind::PresentEventSelection,
+                        creation: Some(Creation {
+                            parent: state.resources.window(window).map(|_| window),
+                            owner: client_id,
+                        }),
+                        owner: None,
+                    },
+                    AccessMode::CREATE,
+                    request,
+                ) {
                     return emit_x11_error_with_minor(
                         state,
                         client_id,
                         sequence,
-                        x11::error::BAD_MATCH,
-                        req.eid,
-                        u16::from(minor),
+                        error_code,
+                        error_value,
+                        u16::from(header.data),
                         PRESENT_MAJOR_OPCODE,
                     );
                 }
@@ -1751,13 +1870,9 @@ pub(super) fn handle_present_request(
             // Phase 4.2.3: wait_fence / idle_fence are accepted. The
             // dispatcher mirrors the result onto state.sync_fences via
             // the XSync resource table for QueryFence / TriggerFence.
-            let window_exists = state.resources.window(ResourceId(req.window)).is_some();
-            let pixmap_exists = state.resources.pixmap(ResourceId(req.pixmap)).is_some();
-            let src = state.resources.host_drawable_target(ResourceId(req.pixmap));
-            let dst = state.resources.host_drawable_target(ResourceId(req.window));
-            let completion_host = state
-                .resources
-                .present_completion_host(ResourceId(req.window));
+            let window = ResourceId(req.window);
+            let pixmap = ResourceId(req.pixmap);
+            let window_exists = state.resources.window(window).is_some();
             if !window_exists {
                 return emit_x11_error_with_minor(
                     state,
@@ -1769,6 +1884,16 @@ pub(super) fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             }
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                window,
+                ResourceKind::Window,
+                AccessMode::WRITE
+            );
+            let pixmap_exists = state.resources.pixmap(pixmap).is_some();
             if !pixmap_exists {
                 return emit_x11_error_with_minor(
                     state,
@@ -1780,6 +1905,18 @@ pub(super) fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             }
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                pixmap,
+                ResourceKind::Pixmap,
+                AccessMode::READ
+            );
+            let src = state.resources.host_drawable_target(pixmap);
+            let dst = state.resources.host_drawable_target(window);
+            let completion_host = state.resources.present_completion_host(window);
             if let (
                 Some(crate::resources::HostDrawableTarget::Pixmap {
                     depth: src_depth, ..
@@ -1803,6 +1940,8 @@ pub(super) fn handle_present_request(
             // allocate a new lifetime generation.
             if let Some((error_code, error_value)) = present_pixmap_common_validation_error(
                 state,
+                client_id,
+                request,
                 req.valid,
                 req.update,
                 req.target_crtc,
@@ -1820,6 +1959,17 @@ pub(super) fn handle_present_request(
                     error_value,
                     u16::from(header.data),
                     PRESENT_MAJOR_OPCODE,
+                );
+            }
+            for notify in &req.notifies {
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    request,
+                    ResourceId(notify.window),
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR,
                 );
             }
             let domain =
@@ -2072,6 +2222,15 @@ pub(super) fn handle_present_request(
                         PRESENT_MAJOR_OPCODE,
                     );
                 }
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    request,
+                    ResourceId(req.window),
+                    ResourceKind::Window,
+                    AccessMode::READ,
+                );
                 // Xorg resolves the target window first. Invalid residue is
                 // BadValue only once BadWindow has been ruled out.
                 if present_remainder_invalid(req.divisor, req.remainder) {
@@ -2165,6 +2324,15 @@ pub(super) fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             }
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                ResourceId(req.acquire_syncobj),
+                ResourceKind::Dri3Syncobj,
+                AccessMode::WRITE,
+            );
             let release_handle = if req.release_syncobj != 0
                 && backend.dri3_syncobj_owned(client_id, req.release_syncobj)
             {
@@ -2183,6 +2351,15 @@ pub(super) fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             };
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                ResourceId(req.release_syncobj),
+                ResourceKind::Dri3Syncobj,
+                AccessMode::WRITE,
+            );
             if req.acquire_value == 0
                 || req.release_value == 0
                 || (req.acquire_syncobj == req.release_syncobj
@@ -2200,13 +2377,9 @@ pub(super) fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             }
-            let window_exists = state.resources.window(ResourceId(req.window)).is_some();
-            let pixmap_exists = state.resources.pixmap(ResourceId(req.pixmap)).is_some();
-            let src = state.resources.host_drawable_target(ResourceId(req.pixmap));
-            let dst = state.resources.host_drawable_target(ResourceId(req.window));
-            let completion_host = state
-                .resources
-                .present_completion_host(ResourceId(req.window));
+            let window = ResourceId(req.window);
+            let pixmap = ResourceId(req.pixmap);
+            let window_exists = state.resources.window(window).is_some();
             if !window_exists {
                 return emit_x11_error_with_minor(
                     state,
@@ -2218,6 +2391,16 @@ pub(super) fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             }
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                window,
+                ResourceKind::Window,
+                AccessMode::WRITE
+            );
+            let pixmap_exists = state.resources.pixmap(pixmap).is_some();
             if !pixmap_exists {
                 return emit_x11_error_with_minor(
                     state,
@@ -2229,6 +2412,18 @@ pub(super) fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             }
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                pixmap,
+                ResourceKind::Pixmap,
+                AccessMode::READ
+            );
+            let src = state.resources.host_drawable_target(pixmap);
+            let dst = state.resources.host_drawable_target(window);
+            let completion_host = state.resources.present_completion_host(window);
             // Keep domain binding after every fallible drawable validation:
             // a rejected request must not change the CRTC that a later
             // NotifyMSC remembers for this window.
@@ -2252,6 +2447,8 @@ pub(super) fn handle_present_request(
             }
             if let Some((error_code, error_value)) = present_pixmap_common_validation_error(
                 state,
+                client_id,
+                request,
                 req.valid,
                 req.update,
                 req.target_crtc,
@@ -2269,6 +2466,17 @@ pub(super) fn handle_present_request(
                     error_value,
                     u16::from(header.data),
                     PRESENT_MAJOR_OPCODE,
+                );
+            }
+            for notify in &req.notifies {
+                check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    request,
+                    ResourceId(notify.window),
+                    ResourceKind::Window,
+                    AccessMode::GET_ATTR,
                 );
             }
             let domain =

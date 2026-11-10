@@ -164,6 +164,53 @@ macro_rules! return_on_access_denial {
 }
 pub(crate) use return_on_access_denial;
 
+macro_rules! check_resource {
+    ($state:ident, $client_id:ident, $sequence:ident, $request:ident, $id:expr, $kind:expr, $mode:expr $(,)?) => {
+        $crate::core_loop::process_request::return_on_access_denial!(
+            $crate::core_loop::process_request::validate_resource_if_present(
+                $state, $client_id, $id, $kind, $mode, $request,
+            ),
+            $state,
+            $client_id,
+            $sequence,
+            $request,
+        );
+    };
+}
+pub(crate) use check_resource;
+
+macro_rules! check_creation {
+    ($state:ident, $client_id:ident, $sequence:ident, $request:ident, $id:expr, $kind:expr $(,)?) => {
+        $crate::core_loop::process_request::check_creation!(
+            $state, $client_id, $sequence, $request, $id, $kind, None,
+        );
+    };
+    ($state:ident, $client_id:ident, $sequence:ident, $request:ident, $id:expr, $kind:expr, $parent:expr $(,)?) => {
+        $crate::core_loop::process_request::return_on_access_denial!(
+            $crate::core_loop::process_request::validate_resource_access(
+                $state,
+                $client_id,
+                $crate::access::ResourceTarget {
+                    id: $id,
+                    kind: $kind,
+                    creation: Some($crate::access::Creation {
+                        parent: $parent,
+                        owner: $client_id,
+                    }),
+                    owner: None,
+                },
+                $crate::access::AccessMode::CREATE,
+                $request,
+            ),
+            $state,
+            $client_id,
+            $sequence,
+            $request,
+        );
+    };
+}
+pub(crate) use check_creation;
+
 /// XI2 major opcode assigned by `extension_metadata("XInputExtension")`.
 /// This matches the `XI2_MAJOR_OPCODE` constant in nested.rs and goes
 /// away in H1 with that file.
@@ -1279,19 +1326,49 @@ pub(super) fn core_resource_kind_for_access(
     .find(|kind| state.access_resource_owner(id, *kind).is_some())
 }
 
-/// Check an arbitrary core X resource operand, preserving unresolved-id
-/// behavior and KillClient's core-store scope.
-pub(super) fn validate_core_resource_if_present(
+/// Resolve any policy-visible X resource in a deterministic store order.
+/// Keep the eight core-store kinds first, in `core_resource_kind_for_access`
+/// order, then check the remaining extension stores in `ResourceKind` order.
+pub(super) fn arbitrary_resource_kind_for_access(
+    state: &ServerState,
+    id: ResourceId,
+) -> Option<ResourceKind> {
+    core_resource_kind_for_access(state, id).or_else(|| {
+        [
+            ResourceKind::Colormap,
+            ResourceKind::Region,
+            ResourceKind::PointerBarrier,
+            ResourceKind::SyncCounter,
+            ResourceKind::SyncAlarm,
+            ResourceKind::SyncFence,
+            ResourceKind::Damage,
+            ResourceKind::PresentEventSelection,
+            ResourceKind::ShmSegment,
+            ResourceKind::GlxContext,
+            ResourceKind::GlxDrawable,
+            ResourceKind::RecordContext,
+            ResourceKind::RandrOutput,
+            ResourceKind::RandrCrtc,
+            ResourceKind::RandrMode,
+            ResourceKind::RandrProvider,
+        ]
+        .into_iter()
+        .find(|kind| state.access_resource_owner(id, *kind).is_some())
+    })
+}
+
+fn validate_resource_if_present_with_resolver(
     state: &ServerState,
     client: ClientId,
     id: ResourceId,
     mode: AccessMode,
     request: RequestOpcodes,
+    resolve: fn(&ServerState, ResourceId) -> Option<ResourceKind>,
 ) -> Result<(), (u8, u32)> {
     if !state.policies_installed() || client == crate::resources::SERVER_OWNER {
         return Ok(());
     }
-    let Some(kind) = core_resource_kind_for_access(state, id) else {
+    let Some(kind) = resolve(state, id) else {
         return Ok(());
     };
     validate_resource_access(
@@ -1305,6 +1382,44 @@ pub(super) fn validate_core_resource_if_present(
         },
         mode,
         request,
+    )
+}
+
+/// Check an arbitrary core X resource operand, preserving unresolved-id
+/// behavior and KillClient's core-store scope.
+pub(super) fn validate_core_resource_if_present(
+    state: &ServerState,
+    client: ClientId,
+    id: ResourceId,
+    mode: AccessMode,
+    request: RequestOpcodes,
+) -> Result<(), (u8, u32)> {
+    validate_resource_if_present_with_resolver(
+        state,
+        client,
+        id,
+        mode,
+        request,
+        core_resource_kind_for_access,
+    )
+}
+
+/// Check an arbitrary policy-visible resource operand without making an
+/// unresolved id into a new validity error.
+pub(super) fn validate_arbitrary_resource_if_present(
+    state: &ServerState,
+    client: ClientId,
+    id: ResourceId,
+    mode: AccessMode,
+    request: RequestOpcodes,
+) -> Result<(), (u8, u32)> {
+    validate_resource_if_present_with_resolver(
+        state,
+        client,
+        id,
+        mode,
+        request,
+        arbitrary_resource_kind_for_access,
     )
 }
 

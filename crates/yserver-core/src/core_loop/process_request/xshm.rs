@@ -1,11 +1,13 @@
 use crate::{
+    access::{AccessMode, Creation, RequestOpcodes, ResourceKind, ResourceTarget},
     backend::{Backend, OriginContext},
     core_loop::{
         damage_fanout::accumulate_damage_to_state,
         fanout::fanout_event_to_clients,
         process_request::{
-            RequestOutcome, drawing::zpixmap_row_stride, emit_x11_error_with_minor,
-            send_reply_with_fd, supported_pixmap_depth, validate_drawable_and_gc, write_to_client,
+            RequestOutcome, check_creation, drawing::zpixmap_row_stride, emit_x11_error_with_minor,
+            send_reply_with_fd, supported_pixmap_depth, validate_drawable_and_gc,
+            validate_resource_access, validate_resource_if_present, write_to_client,
             zpixmap_expected_len,
         },
     },
@@ -35,6 +37,10 @@ pub(super) fn handle_mit_shm_request(
     use yserver_protocol::x11::mit_shm as shm;
     const MIT_SHM_MAJOR_OPCODE: u8 = 130;
     let minor = header.data;
+    let access_request = RequestOpcodes {
+        major: MIT_SHM_MAJOR_OPCODE,
+        minor,
+    };
     debug!(
         "client {} #{} MIT-SHM dispatch minor={minor} body_len={}",
         client_id.0,
@@ -73,6 +79,15 @@ pub(super) fn handle_mit_shm_request(
                     MIT_SHM_MAJOR_OPCODE,
                 );
             };
+            check_creation!(
+                state,
+                client_id,
+                sequence,
+                access_request,
+                ResourceId(req.shmseg),
+                ResourceKind::ShmSegment,
+                None
+            );
             match crate::server::MitShmSegment::from_shmid(client_id, req.shmid, req.read_only) {
                 Ok(segment) => {
                     state.mit_shm_segments.insert(req.shmseg, segment);
@@ -117,6 +132,15 @@ pub(super) fn handle_mit_shm_request(
                     MIT_SHM_MAJOR_OPCODE,
                 );
             };
+            check_creation!(
+                state,
+                client_id,
+                sequence,
+                access_request,
+                ResourceId(req.shmseg),
+                ResourceKind::ShmSegment,
+                None
+            );
             // OwnedFd carries an automatic close-on-drop; from_fd takes
             // raw and assumes ownership transfer.
             let raw = std::os::fd::IntoRawFd::into_raw_fd(fd);
@@ -139,6 +163,27 @@ pub(super) fn handle_mit_shm_request(
         }
         shm::DETACH => {
             if let Some(shmseg) = shm::parse_detach(body) {
+                if let Err((code, value)) = validate_resource_if_present(
+                    state,
+                    client_id,
+                    ResourceId(shmseg),
+                    ResourceKind::ShmSegment,
+                    AccessMode::READ,
+                    RequestOpcodes {
+                        major: MIT_SHM_MAJOR_OPCODE,
+                        minor,
+                    },
+                ) {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        code,
+                        value,
+                        u16::from(minor),
+                        MIT_SHM_MAJOR_OPCODE,
+                    );
+                }
                 state.mit_shm_segments.remove(&shmseg);
             }
         }
@@ -261,6 +306,33 @@ fn handle_mit_shm_create_pixmap(
             MIT_SHM_MAJOR_OPCODE,
         );
     }
+    let drawable = ResourceId(req.drawable);
+    let drawable_kind = if state.resources.window(drawable).is_some() {
+        ResourceKind::Window
+    } else {
+        ResourceKind::Pixmap
+    };
+    if let Err((code, value)) = validate_resource_if_present(
+        state,
+        client_id,
+        drawable,
+        drawable_kind,
+        AccessMode::GET_ATTR,
+        RequestOpcodes {
+            major: MIT_SHM_MAJOR_OPCODE,
+            minor: shm::CREATE_PIXMAP,
+        },
+    ) {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            code,
+            value,
+            u16::from(shm::CREATE_PIXMAP),
+            MIT_SHM_MAJOR_OPCODE,
+        );
+    }
     if !supported_pixmap_depth(req.depth) {
         return emit_x11_error_with_minor(
             state,
@@ -283,6 +355,34 @@ fn handle_mit_shm_create_pixmap(
             MIT_SHM_MAJOR_OPCODE,
         );
     };
+    if let Err((code, value)) = validate_resource_access(
+        state,
+        client_id,
+        ResourceTarget {
+            owner: None,
+            id: ResourceId(req.pid),
+            kind: ResourceKind::Pixmap,
+            creation: Some(Creation {
+                parent: Some(drawable),
+                owner: client_id,
+            }),
+        },
+        AccessMode::CREATE,
+        RequestOpcodes {
+            major: MIT_SHM_MAJOR_OPCODE,
+            minor: shm::CREATE_PIXMAP,
+        },
+    ) {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            code,
+            value,
+            u16::from(shm::CREATE_PIXMAP),
+            MIT_SHM_MAJOR_OPCODE,
+        );
+    }
     let host_xid = match backend.create_pixmap(origin, req.depth, req.width, req.height) {
         Ok(handle) => Some(handle),
         Err(err) => {
@@ -293,18 +393,52 @@ fn handle_mit_shm_create_pixmap(
             None
         }
     };
-    let snapshot: Vec<u8> = {
-        let Some(segment) = state.mit_shm_segments.get(&req.shmseg) else {
-            return emit_x11_error_with_minor(
-                state,
-                client_id,
-                sequence,
-                x11::error::BAD_VALUE,
-                req.shmseg,
-                u16::from(shm::CREATE_PIXMAP),
-                MIT_SHM_MAJOR_OPCODE,
+    if !state.mit_shm_segments.contains_key(&req.shmseg) {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            req.shmseg,
+            u16::from(shm::CREATE_PIXMAP),
+            MIT_SHM_MAJOR_OPCODE,
+        );
+    }
+    if let Err((code, value)) = validate_resource_if_present(
+        state,
+        client_id,
+        ResourceId(req.shmseg),
+        ResourceKind::ShmSegment,
+        AccessMode::READ,
+        RequestOpcodes {
+            major: MIT_SHM_MAJOR_OPCODE,
+            minor: shm::CREATE_PIXMAP,
+        },
+    ) {
+        if let Some(host_xid) = host_xid
+            && let Err(err) = backend.free_pixmap(origin, host_xid.as_raw())
+        {
+            log::warn!(
+                "client {} MIT-SHM::CreatePixmap could not free host pixmap 0x{:x} after segment access denial: {err}",
+                client_id.0,
+                host_xid.as_raw(),
             );
-        };
+        }
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            code,
+            value,
+            u16::from(shm::CREATE_PIXMAP),
+            MIT_SHM_MAJOR_OPCODE,
+        );
+    }
+    let snapshot: Vec<u8> = {
+        let segment = state
+            .mit_shm_segments
+            .get(&req.shmseg)
+            .expect("segment was checked above");
         let bytes = segment.as_slice();
         let start = req.offset as usize;
         let end = start.saturating_add(expected_len);
@@ -394,8 +528,8 @@ pub(super) fn handle_mit_shm_put_image(
         },
         drawable,
         gc,
-        None,
-        None,
+        Some(AccessMode::WRITE),
+        Some(AccessMode::USE),
     ) {
         return emit_x11_error_with_minor(
             state,
@@ -423,6 +557,27 @@ pub(super) fn handle_mit_shm_put_image(
             MIT_SHM_MAJOR_OPCODE,
         );
     };
+    if let Err((code, value)) = validate_resource_if_present(
+        state,
+        client_id,
+        ResourceId(req.shmseg),
+        ResourceKind::ShmSegment,
+        AccessMode::READ,
+        RequestOpcodes {
+            major: MIT_SHM_MAJOR_OPCODE,
+            minor: shm::PUT_IMAGE,
+        },
+    ) {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            code,
+            value,
+            u16::from(shm::PUT_IMAGE),
+            MIT_SHM_MAJOR_OPCODE,
+        );
+    }
     let Some(snapshot) = extract_shm_zpixmap_region(
         segment.as_slice(),
         req.offset,
@@ -556,6 +711,27 @@ fn handle_mit_shm_get_image(
                 MIT_SHM_MAJOR_OPCODE,
             );
         };
+        if let Err((code, value)) = validate_resource_if_present(
+            state,
+            client_id,
+            ResourceId(req.shmseg),
+            ResourceKind::ShmSegment,
+            AccessMode::READ,
+            RequestOpcodes {
+                major: MIT_SHM_MAJOR_OPCODE,
+                minor: shm::GET_IMAGE,
+            },
+        ) {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                code,
+                value,
+                u16::from(shm::GET_IMAGE),
+                MIT_SHM_MAJOR_OPCODE,
+            );
+        }
         if segment.read_only {
             return emit_x11_error_with_minor(
                 state,
@@ -582,6 +758,33 @@ fn handle_mit_shm_get_image(
             MIT_SHM_MAJOR_OPCODE,
         );
     };
+    let drawable = ResourceId(req.drawable);
+    let drawable_kind = if state.resources.window(drawable).is_some() {
+        ResourceKind::Window
+    } else {
+        ResourceKind::Pixmap
+    };
+    if let Err((code, value)) = validate_resource_if_present(
+        state,
+        client_id,
+        drawable,
+        drawable_kind,
+        AccessMode::READ,
+        RequestOpcodes {
+            major: MIT_SHM_MAJOR_OPCODE,
+            minor: shm::GET_IMAGE,
+        },
+    ) {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            code,
+            value,
+            u16::from(shm::GET_IMAGE),
+            MIT_SHM_MAJOR_OPCODE,
+        );
+    }
     let host_bytes = backend
         .get_image(
             origin,
@@ -676,6 +879,19 @@ fn handle_mit_shm_create_segment(
             MIT_SHM_MAJOR_OPCODE,
         );
     }
+    let access_request = RequestOpcodes {
+        major: MIT_SHM_MAJOR_OPCODE,
+        minor: shm::CREATE_SEGMENT,
+    };
+    check_creation!(
+        state,
+        client_id,
+        sequence,
+        access_request,
+        ResourceId(req.shmseg),
+        ResourceKind::ShmSegment,
+        None
+    );
     let Ok(fd) = crate::anon_shm::create_anon_shm(c"yserver-shm").map(IntoRawFd::into_raw_fd)
     else {
         return emit_x11_error_with_minor(
