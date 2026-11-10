@@ -2571,6 +2571,9 @@ pub(crate) struct KmsCore {
     startup_xkb_text: String,
     startup_xkb_keymap: XkbKeymap,
     startup_xkb_rmlvo: XkbRmlvo,
+    /// The startup map's [`KeymapSource`]: `Edited` for a rootless host's
+    /// own keymap ([`Self::install_host_keymap`]).
+    startup_keymap_source: KeymapSource,
     /// Whether the active keymap is `xkb_rmlvo`'s or an edited copy.
     pub(crate) keymap_source: KeymapSource,
     /// Authoritative active keyboard group (0..=3). Tracked server-side
@@ -2736,6 +2739,7 @@ impl KmsCore {
             startup_xkb_text,
             startup_xkb_keymap,
             startup_xkb_rmlvo,
+            startup_keymap_source: KeymapSource::Rmlvo,
             keymap_source: KeymapSource::Rmlvo,
             locked_group: 0,
             indicator_state: 0,
@@ -2833,6 +2837,7 @@ impl KmsCore {
             startup_xkb_text,
             startup_xkb_keymap,
             startup_xkb_rmlvo,
+            startup_keymap_source: KeymapSource::Rmlvo,
             keymap_source: KeymapSource::Rmlvo,
             locked_group: 0,
             indicator_state: 0,
@@ -2912,6 +2917,50 @@ impl KmsCore {
         )?;
         let ctx = self.xkb_context.0.clone();
         Some(self.install_keymap(&ctx, keymap, rmlvo))
+    }
+
+    /// Make a rootless host's own keymap (XKB's text form, a Wayland
+    /// compositor's) the keymap, from start: a server reset starts its
+    /// session on it too, as on one `-layout` names. Its options and custom
+    /// keys are kept, which its names alone would lose. `_XKB_RULES_NAMES`
+    /// reports `layout` (the layout and variant the rules call it), else
+    /// the names the server started with; and as no names compile to it, a
+    /// load by names always reloads. `false` when it does not compile, and
+    /// the keymap stays.
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host's keymap is installed with it")
+    )]
+    pub(crate) fn install_host_keymap(
+        &mut self,
+        text: &str,
+        layout: Option<(String, String)>,
+    ) -> bool {
+        let ctx = self.xkb_context.0.clone();
+        let Some(keymap) = xkbcommon::xkb::Keymap::new_from_string(
+            &ctx,
+            text.to_owned(),
+            xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+        ) else {
+            return false;
+        };
+        let rmlvo = match layout {
+            Some((layout, variant)) => XkbRmlvo {
+                layout,
+                variant,
+                ..self.xkb_rmlvo.clone()
+            },
+            None => self.xkb_rmlvo.clone(),
+        };
+        self.install_keymap(&ctx, keymap, &rmlvo);
+        self.keymap_source = KeymapSource::Edited;
+        self.startup_xkb_desc = self.xkb_desc.clone();
+        self.startup_xkb_text.clone_from(&self.xkb_text);
+        self.startup_xkb_keymap = XkbKeymap(self.xkb_keymap.0.clone());
+        self.startup_xkb_rmlvo = self.xkb_rmlvo.clone();
+        self.startup_keymap_source = KeymapSource::Edited;
+        true
     }
 
     /// True when the active keymap is exactly what `rmlvo` compiles to: same
@@ -3039,7 +3088,7 @@ impl KmsCore {
         self.xkb_text.clone_from(&self.startup_xkb_text);
         self.xkb_keymap = XkbKeymap(self.startup_xkb_keymap.0.clone());
         self.xkb_rmlvo = self.startup_xkb_rmlvo.clone();
-        self.keymap_source = KeymapSource::Rmlvo;
+        self.keymap_source = self.startup_keymap_source;
         self.locked_group = 0;
         self.indicator_state = 0;
         self.xkb_state = XkbState(fresh_state(&self.xkb_keymap.0));
@@ -3075,6 +3124,47 @@ mod xkb_rmlvo_tests {
             .0
             .key_get_one_sym(xkbcommon::xkb::Keycode::new(29));
         assert_eq!(de_sym, xkbcommon::xkb::keysyms::KEY_z.into());
+    }
+
+    /// A host's keymap is taken whole, options included, which its layout
+    /// name alone loses, and a server reset starts on it again.
+    #[test]
+    fn a_hosts_keymap_is_the_keymap_from_start_options_and_all() {
+        let ctx = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
+        let text = xkbcommon::xkb::Keymap::new_from_names(
+            &ctx,
+            "evdev",
+            "pc105",
+            "de",
+            "",
+            Some("ctrl:nocaps".into()),
+            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("de with ctrl:nocaps")
+        .get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1);
+        let mut core = KmsCore::for_tests();
+        let sym = |core: &KmsCore, kc: u32| {
+            core.xkb_state
+                .0
+                .key_get_one_sym(xkbcommon::xkb::Keycode::new(kc))
+        };
+        assert!(core.install_host_keymap(&text, Some(("de".into(), String::new()))));
+        // Y (AD06) is z on de, and Caps Lock (66) a Control.
+        assert_eq!(sym(&core, 29), xkbcommon::xkb::keysyms::KEY_z.into());
+        assert_eq!(
+            sym(&core, 66),
+            xkbcommon::xkb::keysyms::KEY_Control_L.into()
+        );
+        assert_eq!(core.xkb_rmlvo.layout, "de");
+        assert!(!core.keymap_is_pristine(&core.xkb_rmlvo.clone()));
+        core.reset_keyboard_session();
+        assert_eq!(sym(&core, 29), xkbcommon::xkb::keysyms::KEY_z.into());
+        assert_eq!(
+            sym(&core, 66),
+            xkbcommon::xkb::keysyms::KEY_Control_L.into()
+        );
+        assert!(!core.install_host_keymap("not a keymap", None));
+        assert_eq!(sym(&core, 29), xkbcommon::xkb::keysyms::KEY_z.into());
     }
 
     #[test]

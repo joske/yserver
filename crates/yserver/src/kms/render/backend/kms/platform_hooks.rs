@@ -519,6 +519,10 @@ impl Platform for PlatformBackend {
         b.rootless_on_display_ready(state)
     }
 
+    fn host_display_wants_writable(b: &KmsBackend) -> bool {
+        b.rootless_host_unsent()
+    }
+
     fn dump_scanout(b: &mut KmsBackend) {
         KmsBackend::backend_readback_dump_scanout(b)
     }
@@ -636,6 +640,11 @@ impl Platform for PlatformBackend {
         // connection is served on the core thread.
         let mut fds = b.platform.poll_fds();
         if let Some(fd) = b.rootless_host_fd() {
+            fds.push((fd, BackendFdKind::HostDisplay));
+        }
+        // Readable when the host's own work can move: the loop comes round,
+        // and the host's service does it.
+        if let Some(fd) = b.rootless_host_wake_fd() {
             fds.push((fd, BackendFdKind::HostDisplay));
         }
         fds

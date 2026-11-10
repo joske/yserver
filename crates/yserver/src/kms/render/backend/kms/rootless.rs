@@ -15,8 +15,11 @@ use std::{io, time::Instant};
 
 use yserver_core::{
     backend::Backend as _,
-    core_loop::handle_host_input,
-    rootless::{CoordinatePolicy, RootlessError, RootlessEvent},
+    core_loop::{
+        handle_host_input,
+        xkb_layout::{XkbStateCause, announce_xkb_state},
+    },
+    rootless::{CoordinatePolicy, HostRequest, RootlessError, RootlessEvent},
     server::ServerState,
 };
 
@@ -24,7 +27,7 @@ use crate::{
     kms::render::backend::KmsBackend,
     rootless::{
         Presenter,
-        display::{HostItem, HostWork, PresenterHandle, SharedHost},
+        display::{HostItem, HostKeyboardState, HostWork, PresenterHandle, SharedHost},
         host::FrameEvent,
         present_clock::{PresentClock, monotonic_us},
     },
@@ -46,26 +49,28 @@ pub(crate) struct RootlessKms {
 
 impl KmsBackend {
     /// Become a rootless server for `host`, before the topology is read:
-    /// the root takes the host's screen's size, and the keymap the host's
-    /// keyboard layout.
+    /// the root takes the host's screen's size, and the keymap is the
+    /// host's.
     ///
     /// # Errors
     ///
     /// Resizing the virtual screen failed.
-    #[allow(dead_code, reason = "the Wayland host attaches itself with it")]
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host attaches itself with it")
+    )]
     pub(crate) fn attach_rootless_host(&mut self, host: SharedHost) -> io::Result<()> {
-        let (screen, layout) = {
+        let (screen, keymap) = {
             let host = host.borrow();
-            (host.screen(), host.keyboard_layout())
+            (host.screen(), host.keymap())
         };
-        if let Some((layout, variant)) = layout {
-            let rmlvo = crate::kms::core::XkbRmlvo {
-                layout: layout.clone(),
-                variant: variant.clone(),
-                ..self.core.xkb_rmlvo.clone()
-            };
-            if self.core.recompile_keymap(&rmlvo).is_some() {
-                log::info!("rootless: the keyboard is the host's, {layout} {variant:?}");
+        if let Some(keymap) = keymap {
+            let named = keymap.layout.clone();
+            if self.core.install_host_keymap(&keymap.text, keymap.layout) {
+                self.sync_keyboard_leds();
+                log::info!("rootless: the keyboard is the host's keymap, {named:?}");
+            } else {
+                log::warn!("rootless: the host's keymap does not compile; the keymap stays");
             }
         }
         match screen {
@@ -101,7 +106,10 @@ impl KmsBackend {
     /// # Errors
     ///
     /// What `yserver_core::rootless::enable` refuses.
-    #[allow(dead_code, reason = "the Wayland host starts rootless mode with it")]
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host starts rootless mode with it")
+    )]
     pub(crate) fn start_rootless(&mut self, state: &mut ServerState) -> Result<(), RootlessError> {
         let Some(host) = self.pstate.rootless.as_ref().map(|r| r.host.clone()) else {
             return Ok(());
@@ -115,6 +123,21 @@ impl KmsBackend {
 
     pub(in crate::kms::render::backend) fn rootless_host_fd(&self) -> Option<std::os::fd::RawFd> {
         Some(self.pstate.rootless.as_ref()?.host.borrow().fd())
+    }
+
+    /// The host's other descriptor, its own work's (`DisplayHost::wake_fd`).
+    pub(in crate::kms::render::backend) fn rootless_host_wake_fd(
+        &self,
+    ) -> Option<std::os::fd::RawFd> {
+        self.pstate.rootless.as_ref()?.host.borrow().wake_fd()
+    }
+
+    /// The host's last flush left output queued (`DisplayHost::unsent`).
+    pub(in crate::kms::render::backend) fn rootless_host_unsent(&self) -> bool {
+        self.pstate
+            .rootless
+            .as_ref()
+            .is_some_and(|rootless| rootless.host.borrow().unsent())
     }
 
     /// The host's connection is readable: read it, then apply what it said
@@ -152,15 +175,67 @@ impl KmsBackend {
                 HostItem::Frame(event) => frames.push(event),
                 HostItem::Request(request) => {
                     self.apply_rootless_frames(std::mem::take(&mut frames));
+                    // The host's screen changed size: the root's storage
+                    // first, which the RandR state the core then reads is
+                    // of.
+                    if let HostRequest::ScreenLayout { outputs } = &request
+                        && let [output] = outputs.as_slice()
+                        && let Err(error) =
+                            self.backend_randr_set_logical_screen_size(output.width, output.height)
+                    {
+                        log::warn!(
+                            "rootless: the root cannot take the host's {}x{}: {error}",
+                            output.width,
+                            output.height
+                        );
+                        continue;
+                    }
                     yserver_core::rootless::host_request(state, self, request);
                 }
                 HostItem::Input(event) => {
                     self.apply_rootless_frames(std::mem::take(&mut frames));
                     handle_host_input(state, self, event);
                 }
+                HostItem::Keyboard(keyboard) => {
+                    self.apply_rootless_frames(std::mem::take(&mut frames));
+                    self.set_host_keyboard_state(keyboard);
+                    // Xwayland's StateNotify for wl_keyboard.modifiers:
+                    // caused by no key, as an XkbLatchLockState is.
+                    let request = (self.xkb_opcode().unwrap_or(0), 5);
+                    announce_xkb_state(
+                        state,
+                        self,
+                        XkbStateCause {
+                            keycode: 0,
+                            event_type: 0,
+                            request,
+                        },
+                    );
+                }
             }
         }
         self.apply_rootless_frames(frames);
+    }
+
+    /// The host's keyboard state (a Wayland compositor's
+    /// `wl_keyboard.modifiers`), taken as it is: the depressed, latched and
+    /// locked real modifiers and the locked group, as Xwayland sets its
+    /// keyboard's. No key is pressed for it: a key the host holds as its
+    /// window gets the keyboard is depressed in the state alone. The keys
+    /// that follow update the state as they do (`update_key`), and the
+    /// host's next word on it is the truth again.
+    fn set_host_keyboard_state(&mut self, host: HostKeyboardState) {
+        let group = self.clamp_group_to_keymap(host.group);
+        self.core.xkb_state.0.update_mask(
+            u32::from(host.depressed),
+            u32::from(host.latched),
+            u32::from(host.locked),
+            0,
+            0,
+            u32::from(group),
+        );
+        self.core.locked_group = group;
+        self.sync_keyboard_leds();
     }
 
     fn apply_rootless_frames(&mut self, frames: Vec<FrameEvent>) {
@@ -196,12 +271,16 @@ impl KmsBackend {
     }
 
     /// Once per loop iteration, before the reconcile: the host's own work
-    /// with the state in hand.
+    /// with the state in hand, then what it queued since its connection was
+    /// last read.
     pub(in crate::kms::render::backend) fn rootless_service(&mut self, state: &mut ServerState) {
         let Some(host) = self.pstate.rootless.as_ref().map(|r| r.host.clone()) else {
             return;
         };
         host.borrow_mut().service(state, self);
+        let mut work = HostWork::default();
+        host.borrow_mut().take_queued(&mut work);
+        self.apply_host_work(state, work);
     }
 
     /// The presenter's share of `maybe_composite`, then the cursor, and

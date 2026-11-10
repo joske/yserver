@@ -211,3 +211,22 @@ fn late_delivered_of_an_old_generation_does_not_show() {
     let new = f.submitted(vec![FULL], None);
     assert!(f.on_delivered(new).first);
 }
+
+/// A native window made again shows nothing and takes no frame until its
+/// setup is done, then a whole one: no frame before it, delivered late or
+/// in a buffer, stands for it.
+#[test]
+fn a_window_made_again_starts_over_at_its_setup() {
+    let mut f = shown();
+    let late = f.submitted(vec![A], None);
+    f.restart();
+    assert_eq!(f.readiness(), Readiness::Setup);
+    assert!(!f.can_submit(), "no frame before the new setup is done");
+    assert!(!f.on_delivered(late).first, "a frame for the window before");
+    f.on_setup_done();
+    assert!(f.can_submit());
+    let first = f.submitted(vec![B], None);
+    assert_eq!(f.frame_damage(first, FULL), [FULL]);
+    assert_eq!(f.fill_plan(Some((late, GEN)), first), FillPlan::Full);
+    assert!(f.on_delivered(first).first, "shown again");
+}

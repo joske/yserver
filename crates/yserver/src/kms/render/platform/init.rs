@@ -391,6 +391,7 @@ impl PlatformBackend {
     /// fails if every connected output lacks a live pool.
     pub(crate) fn open_with_commit(
         device_paths: &[PathBuf],
+        input: crate::kms::outputs::InputSource,
         commit: fn(
             &drm::Device,
             &crate::platform::drm::Output,
@@ -400,7 +401,7 @@ impl PlatformBackend {
         // `core_platform_init` runs the hardware-Vulkan preflight after it
         // discovers an active output but before allocating or committing
         // scanout. Headless platforms skip it and may use software Vulkan.
-        let platform_init = core_platform_init(device_paths, commit)?;
+        let platform_init = core_platform_init(device_paths, input, commit)?;
         Self::from_platform_init(platform_init)
     }
 

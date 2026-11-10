@@ -28,7 +28,16 @@ use crate::kms::vk::device::VkContext;
 pub(crate) enum HostItem {
     Request(HostRequest),
     Input(HostInputEvent),
-    #[allow(dead_code, reason = "the Wayland host queues its frame events")]
+    /// The window system's keyboard state, which X's takes as it is.
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host passes its keyboard's state")
+    )]
+    Keyboard(HostKeyboardState),
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host queues its frame events")
+    )]
     Frame(FrameEvent),
 }
 
@@ -48,9 +57,42 @@ impl HostWork {
         self.0.push(HostItem::Input(event));
     }
 
-    #[allow(dead_code, reason = "the Wayland host queues its frame events")]
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host passes its keyboard's state")
+    )]
+    pub(crate) fn keyboard(&mut self, state: HostKeyboardState) {
+        self.0.push(HostItem::Keyboard(state));
+    }
+
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host queues its frame events")
+    )]
     pub(crate) fn frame(&mut self, event: FrameEvent) {
         self.0.push(HostItem::Frame(event));
+    }
+
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host queues work between reads")
+    )]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// `other`'s items after this queue's.
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host queues work between reads")
+    )]
+    pub(crate) fn append(&mut self, mut other: HostWork) {
+        self.0.append(&mut other.0);
+    }
+
+    #[cfg(all(test, wayland_host))]
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, HostItem> {
+        self.0.iter()
     }
 }
 
@@ -73,10 +115,38 @@ pub(crate) struct HostScreen {
     pub refresh_mhz: u64,
 }
 
+/// The window system's keyboard state as X's: the real modifiers (X's
+/// eight, Shift to Mod5) depressed, latched and locked, and the group in
+/// force. The server's keyboard takes it as it is, as Xwayland takes
+/// `wl_keyboard.modifiers`: no key is pressed or released for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HostKeyboardState {
+    pub depressed: u8,
+    pub latched: u8,
+    pub locked: u8,
+    pub group: u8,
+}
+
+/// The window system's keymap: XKB's text form, which the server's keymap
+/// is from start, and the layout and variant the XKB rules call its group
+/// in force, where they name it (`_XKB_RULES_NAMES`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HostKeymap {
+    pub text: String,
+    pub layout: Option<(String, String)>,
+}
+
 /// A host whose display connection the core loop polls.
 pub(crate) trait DisplayHost: RootlessHost {
     /// The connection the core loop polls.
     fn fd(&self) -> RawFd;
+    /// A descriptor the core loop polls besides the connection (as
+    /// `BackendFdKind::HostDisplay` too), readable when the host's own work
+    /// can move: the pipes of a clipboard's transfers. Taken once, as the
+    /// loop starts.
+    fn wake_fd(&self) -> Option<RawFd> {
+        None
+    }
     /// Read what the window system sent into `work`, until a read would
     /// block: the core loop polls the fd edge-triggered, so what is left
     /// unread is not reported again.
@@ -85,25 +155,37 @@ pub(crate) trait DisplayHost: RootlessHost {
     ///
     /// The window system closed the connection.
     fn dispatch(&mut self, work: &mut HostWork) -> io::Result<()>;
+    /// What the host queued since its connection was last read, into
+    /// `work`: the frame events of the presenter's last tick, which come
+    /// back from the host's own calls rather than from the window system.
+    /// The platform takes it each loop iteration; a host that has some
+    /// asks for one with [`DisplayHost::next_wakeup`].
+    fn take_queued(&mut self, _work: &mut HostWork) {}
     /// Once per loop iteration, with the state in hand, for work that is not
     /// a window's (a clipboard bridge). The host must not call back into the
     /// platform's rootless state from here.
     fn service(&mut self, _state: &mut ServerState, _backend: &mut dyn Backend) {}
     /// Send what is queued, without blocking: it runs on the core thread.
-    /// What the socket does not take now stays queued, and the next call
-    /// (the platform calls this at least once each loop iteration, before
-    /// the loop blocks) sends it.
+    /// What the socket does not take now stays queued, and
+    /// [`DisplayHost::unsent`] says so; the next call (the platform calls
+    /// this at least once each loop iteration, before the loop blocks) sends
+    /// it.
     fn flush(&mut self) {}
+    /// The last [`DisplayHost::flush`] left output queued: the core loop
+    /// watches [`DisplayHost::fd`] for writable too, and comes round when
+    /// the socket takes more.
+    fn unsent(&self) -> bool {
+        false
+    }
     /// The host's screen.
     fn screen(&self) -> Option<HostScreen>;
     /// When the loop must come round for the host's own work.
     fn next_wakeup(&self) -> Option<Instant> {
         None
     }
-    /// The window system's keyboard layout and variant, which the server's
-    /// keymap takes at start, so a key means in X what it means in the
-    /// host's other windows.
-    fn keyboard_layout(&self) -> Option<(String, String)> {
+    /// The window system's keymap, which the server's takes at start, so a
+    /// key means in X what it means in the host's other windows.
+    fn keymap(&self) -> Option<HostKeymap> {
         None
     }
     /// The name of the RandR output the host's screen is.

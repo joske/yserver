@@ -146,7 +146,8 @@ pub struct LaunchOptions {
     /// KMS.
     pub geometry: Option<(u16, u16)>,
     /// `--rootless`: every top-level becomes a native window (a recording
-    /// host with `--headless`).
+    /// host with `--headless`; on a KMS build with the Wayland host, a
+    /// window of the Wayland compositor's).
     pub rootless: bool,
     /// `--rooted`: one window shows the whole root, also from the app bundle.
     pub rooted: bool,
@@ -234,7 +235,7 @@ pub(crate) fn parse_scale(value: &str) -> Result<ScaleOption, String> {
 
 /// The mode for this launch (decision 1, spec §7): an explicit flag wins;
 /// else rootless iff a window shell runs from the app bundle. `window_shell`:
-/// this build has one.
+/// this build has one (a KMS build's is the Wayland host).
 ///
 /// # Errors
 ///
@@ -247,7 +248,11 @@ pub fn shell_mode(o: &LaunchOptions, window_shell: bool) -> Result<ShellMode, St
         return Err("--rootless-record needs --rootless --headless".into());
     }
     if o.rootless && !o.headless && !window_shell {
-        return Err("--rootless needs --headless (KMS is never rootless)".into());
+        return Err(
+            "--rootless needs --headless: KMS is never rootless, and this yserver was built \
+             without the Wayland host (the `wayland` build feature, on Linux)"
+                .into(),
+        );
     }
     Ok(
         if o.rootless || (!o.rooted && window_shell && o.from_bundle && !o.headless) {
@@ -1464,6 +1469,19 @@ mod tests {
         assert!(shell_mode(&o, false).is_err(), "rootless needs --headless");
         let o = parse(&[":1", "--headless", "--rootless-record", "/tmp/r"]).unwrap();
         assert!(shell_mode(&o, false).is_err(), "a record needs --rootless");
+    }
+
+    /// A KMS build with the Wayland host passes `window_shell`: `--rootless`
+    /// alone is the Wayland host, and with `--headless` the recording host.
+    #[test]
+    fn rootless_on_a_build_with_the_wayland_host() {
+        let o = parse(&[":1", "--rootless"]).unwrap();
+        assert_eq!(shell_mode(&o, true), Ok(ShellMode::Rootless));
+        assert!(shell_mode(&o, false).is_err(), "no Wayland host");
+        let o = parse(&[":1"]).unwrap();
+        assert_eq!(shell_mode(&o, true), Ok(ShellMode::Rooted), "KMS");
+        let o = parse(&[":1", "--headless", "--rootless"]).unwrap();
+        assert_eq!(shell_mode(&o, true), Ok(ShellMode::Rootless));
     }
 
     #[test]

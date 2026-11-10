@@ -64,6 +64,14 @@ pub(crate) struct DmabufFrame {
 pub(crate) enum FrameEvent {
     /// The setup handshake is done: ready for the first frame.
     SetupDone { id: ToplevelId },
+    /// The native window was made again (a popup moved to another parent,
+    /// or repositioned where the window system cannot move one): back to
+    /// the setup handshake, nothing shown, and the next frame whole.
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host makes popups again")
+    )]
+    Recreated { id: ToplevelId },
     /// Can take another frame.
     Ready { id: ToplevelId },
     /// Shown / committed.

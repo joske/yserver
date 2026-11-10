@@ -6,7 +6,7 @@ yserver - X11 server for KMS/DRM on Linux, FreeBSD and OpenBSD
 
 # SYNOPSIS
 
-*yserver* [:_display_] [vt_N_] [-auth _file_] [-displayfd _fd_] [-layout _layout_] [-listen _protocol_] [-nolisten _protocol_] [-noreset|-reset|-terminate] [-query _host_|-indirect _host_|-broadcast] [-port _n_] [-from _address_] [-class _string_] [-displayID _string_] [-once] [--vrr [all]] [--version]
+*yserver* [:_display_] [vt_N_] [-auth _file_] [-displayfd _fd_] [-layout _layout_] [-listen _protocol_] [-nolisten _protocol_] [-noreset|-reset|-terminate] [-query _host_|-indirect _host_|-broadcast] [-port _n_] [-from _address_] [-class _string_] [-displayID _string_] [-once] [--rootless] [--vrr [all]] [--version]
 
 # DESCRIPTION
 
@@ -56,6 +56,13 @@ entries say so. *--version* reports what this binary was built with.
 
 *-layout* _layout_
 	XKB layout name, e.g. *be*.
+
+*--rootless*
+	Run rootless as a client of the Wayland compositor *WAYLAND_DISPLAY*
+	names: each top-level X window is a window of the compositor's, input
+	comes from the compositor's seat, and the server opens no console, KMS
+	card or input device. Needs a build with the *wayland* feature (Linux
+	only); without it the server refuses to start.
 
 *--vrr*
 	Enable adaptive sync for a client window in direct scanout when its
@@ -240,6 +247,11 @@ above.
 *RUST_LOG*
 	Log filter. Defaults to *info*; *warn* is quieter, *debug* and *trace*
 	are for diagnosis.
+
+*YSERVER_WM_NAME*
+	Under *--rootless* on a Wayland compositor, the window manager's name
+	(*\_NET_WM_NAME* of the *\_NET_SUPPORTING_WM_CHECK* window) when the
+	compositor's process name cannot be read from its socket.
 
 *YSERVER_DRM_DEVICE*
 	Path to the sole KMS device to use instead of auto-selecting devices,
