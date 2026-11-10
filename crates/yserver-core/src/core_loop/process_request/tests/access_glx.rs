@@ -2,8 +2,11 @@ use super::{
     extensions::{ExtensionHook, RecordedExtensionCheck, RecordingExtensionPolicy},
     *,
 };
-use crate::access::{
-    AccessMode, Creation, Decision, DenyError, RequestOpcodes, ResourceKind, ResourceTarget,
+use crate::{
+    access::{
+        AccessMode, Creation, Decision, DenyError, RequestOpcodes, ResourceKind, ResourceTarget,
+    },
+    backend::Backend,
 };
 use std::sync::{Arc, Mutex};
 use yserver_protocol::x11::{self, CreateWindowRequest, ResourceId, glx as x11glx};
@@ -575,6 +578,187 @@ fn glx_access_ask_table_records_each_target_and_opcode() {
             .cloned()
             .collect::<Vec<_>>();
         assert_recorded(&resources, &expected, CLIENT, minor);
+    }
+}
+
+#[test]
+fn destroy_pbuffer_without_pbuffer_keeps_foreign_pixmap() {
+    // Mutation: free the core pixmap for every DESTROY_PBUFFER request, even when no GLX record was removed.
+    let mut state = ServerState::new();
+    let _owner_peer = install_client(&mut state, CLIENT.0);
+    let mut destroyer_peer = install_client(&mut state, 2);
+    let mut backend = RecordingBackend::new();
+    let pixmap = ResourceId(0x0010_7141);
+    let host = backend
+        .create_pixmap(None, 24, 8, 8)
+        .expect("create foreign pixmap backend object");
+    state.resources.create_pixmap(
+        CLIENT,
+        x11::CreatePixmapRequest {
+            depth: 24,
+            pixmap,
+            drawable: crate::resources::ROOT_WINDOW,
+            width: 8,
+            height: 8,
+        },
+    );
+    assert!(state.resources.set_pixmap_host_xid(pixmap, host));
+
+    let bytes = dispatch(
+        &mut state,
+        &mut backend,
+        ClientId(2),
+        &mut destroyer_peer,
+        x11glx::DESTROY_PBUFFER,
+        &words(&[pixmap.0]),
+    );
+
+    assert!(bytes.is_empty());
+    assert!(state.resources.pixmap(pixmap).is_some());
+    assert!(backend.live_pixmaps.contains(&host.as_raw()));
+    assert_eq!(
+        backend.calls(),
+        vec![RecordedCall::CreatePixmap {
+            depth: 24,
+            width: 8,
+            height: 8,
+        }]
+    );
+}
+
+#[test]
+fn destroy_pbuffer_frees_its_backing_pixmap() {
+    // Mutation: never free the pbuffer backing pixmap after DESTROY_PBUFFER.
+    let mut fixture = fixture();
+    assert!(
+        dispatch(
+            &mut fixture.state,
+            &mut fixture.backend,
+            CLIENT,
+            &mut fixture.peer,
+            x11glx::CREATE_PBUFFER,
+            &create_pbuffer_body(PBUFFER),
+        )
+        .is_empty()
+    );
+    let host = fixture
+        .state
+        .resources
+        .pixmap(PBUFFER)
+        .and_then(|pixmap| pixmap.host_xid)
+        .expect("CreatePbuffer backing host pixmap")
+        .as_raw();
+    assert!(fixture.backend.live_pixmaps.contains(&host));
+
+    let bytes = dispatch(
+        &mut fixture.state,
+        &mut fixture.backend,
+        CLIENT,
+        &mut fixture.peer,
+        x11glx::DESTROY_PBUFFER,
+        &words(&[PBUFFER.0]),
+    );
+
+    assert!(bytes.is_empty());
+    assert!(!fixture.state.glx_drawables.contains_key(&PBUFFER.0));
+    assert!(fixture.state.resources.pixmap(PBUFFER).is_none());
+    assert!(!fixture.backend.live_pixmaps.contains(&host));
+    assert!(
+        fixture
+            .backend
+            .calls()
+            .contains(&RecordedCall::FreePixmap(host))
+    );
+}
+
+#[test]
+fn destroy_pbuffer_on_glx_pixmap_record_keeps_pixmap() {
+    // Mutation: free the core pixmap whenever any GLX drawable record existed, regardless of its kind.
+    let mut fixture = fixture();
+    let xid = ResourceId(0x0010_7142);
+    let host = fixture
+        .backend
+        .create_pixmap(None, 24, 8, 8)
+        .expect("create pixmap backend object");
+    fixture.state.resources.create_pixmap(
+        CLIENT,
+        x11::CreatePixmapRequest {
+            depth: 24,
+            pixmap: xid,
+            drawable: crate::resources::ROOT_WINDOW,
+            width: 8,
+            height: 8,
+        },
+    );
+    assert!(fixture.state.resources.set_pixmap_host_xid(xid, host));
+    seed_glx_pixmap(&mut fixture.state, xid, crate::resources::ROOT_WINDOW);
+
+    let bytes = dispatch(
+        &mut fixture.state,
+        &mut fixture.backend,
+        CLIENT,
+        &mut fixture.peer,
+        x11glx::DESTROY_PBUFFER,
+        &words(&[xid.0]),
+    );
+
+    assert!(bytes.is_empty());
+    assert!(!fixture.state.glx_drawables.contains_key(&xid.0));
+    assert!(fixture.state.resources.pixmap(xid).is_some());
+    assert!(fixture.backend.live_pixmaps.contains(&host.as_raw()));
+    assert_eq!(
+        fixture.backend.calls(),
+        vec![RecordedCall::CreatePixmap {
+            depth: 24,
+            width: 8,
+            height: 8,
+        }]
+    );
+}
+
+#[test]
+fn destroy_pixmap_or_window_on_pbuffer_keeps_backing_pixmap() {
+    // Mutation: drop the DESTROY_PBUFFER opcode condition and free any removed pbuffer's backing pixmap.
+    for minor in [x11glx::DESTROY_PIXMAP, x11glx::DELETE_WINDOW] {
+        let mut fixture = fixture();
+        assert!(
+            dispatch(
+                &mut fixture.state,
+                &mut fixture.backend,
+                CLIENT,
+                &mut fixture.peer,
+                x11glx::CREATE_PBUFFER,
+                &create_pbuffer_body(PBUFFER),
+            )
+            .is_empty()
+        );
+        let host = fixture
+            .state
+            .resources
+            .pixmap(PBUFFER)
+            .and_then(|pixmap| pixmap.host_xid)
+            .expect("CreatePbuffer backing host pixmap")
+            .as_raw();
+
+        let bytes = dispatch(
+            &mut fixture.state,
+            &mut fixture.backend,
+            CLIENT,
+            &mut fixture.peer,
+            minor,
+            &words(&[PBUFFER.0]),
+        );
+
+        assert!(bytes.is_empty());
+        assert!(!fixture.state.glx_drawables.contains_key(&PBUFFER.0));
+        assert!(fixture.state.resources.pixmap(PBUFFER).is_some());
+        assert!(fixture.backend.live_pixmaps.contains(&host));
+        assert!(
+            !fixture
+                .backend
+                .calls()
+                .contains(&RecordedCall::FreePixmap(host))
+        );
     }
 }
 

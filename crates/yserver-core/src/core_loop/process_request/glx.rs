@@ -1021,10 +1021,14 @@ pub(super) fn handle_glx_request(
             if let Some(host_xid) = release_host_xid {
                 backend.release_glx_pixmap_export(host_xid);
             }
-            state.glx_drawables.remove(&xid);
+            let removed_drawable = state.glx_drawables.remove(&xid);
             // #96 tier-2: release the GPU pixmap that backed a pbuffer (allocated
             // at CreatePbuffer under the pbuffer's own XID).
             if minor == x11glx::DESTROY_PBUFFER
+                && matches!(
+                    removed_drawable,
+                    Some(drawable) if drawable.kind == crate::server::GlxDrawableKind::Pbuffer
+                )
                 && let Some(pixmap) = state.resources.free_pixmap(ResourceId(xid))
                 && let Some(host) = pixmap.host_xid
             {
