@@ -14,7 +14,7 @@ use std::{
         fd::{AsRawFd, IntoRawFd, OwnedFd},
         unix::net::UnixStream,
     },
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
 };
 use yserver_protocol::x11::{
     CreateGcRequest, CreatePixmapRequest, ResourceId,
@@ -34,37 +34,6 @@ const DENY_ERROR: DenyError = DenyError {
     code: x11::error::BAD_ACCESS,
     value: 0xA55A_1234,
 };
-
-struct WarningCapture;
-
-static WARNING_CAPTURE: WarningCapture = WarningCapture;
-static WARNING_MESSAGES: Mutex<Vec<String>> = Mutex::new(Vec::new());
-static WARNING_CAPTURE_INIT: OnceLock<()> = OnceLock::new();
-
-impl log::Log for WarningCapture {
-    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Warn
-    }
-
-    fn log(&self, record: &log::Record<'_>) {
-        if self.enabled(record.metadata()) {
-            WARNING_MESSAGES
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(record.args().to_string());
-        }
-    }
-
-    fn flush(&self) {}
-}
-
-fn warning_messages() -> &'static Mutex<Vec<String>> {
-    WARNING_CAPTURE_INIT.get_or_init(|| {
-        log::set_logger(&WARNING_CAPTURE).expect("install MIT-SHM warning capture");
-        log::set_max_level(log::LevelFilter::Warn);
-    });
-    &WARNING_MESSAGES
-}
 
 struct ShmFixture {
     state: ServerState,
@@ -128,8 +97,12 @@ fn shm_fixture() -> ShmFixture {
 }
 
 fn test_shm_fd() -> OwnedFd {
+    test_shm_fd_with_size(4096)
+}
+
+fn test_shm_fd_with_size(size: libc::off_t) -> OwnedFd {
     let fd = crate::anon_shm::create_anon_shm(c"access-shm-test").expect("create test shm fd");
-    assert_eq!(unsafe { libc::ftruncate(fd.as_raw_fd(), 4096) }, 0);
+    assert_eq!(unsafe { libc::ftruncate(fd.as_raw_fd(), size) }, 0);
     fd
 }
 
@@ -139,7 +112,16 @@ fn test_shm_socket_fd() -> (OwnedFd, UnixStream) {
 }
 
 fn install_segment(state: &mut ServerState, id: ResourceId, read_only: bool) {
-    let fd = test_shm_fd();
+    install_segment_with_size(state, id, read_only, 4096);
+}
+
+fn install_segment_with_size(
+    state: &mut ServerState,
+    id: ResourceId,
+    read_only: bool,
+    size: libc::off_t,
+) {
+    let fd = test_shm_fd_with_size(size);
     let mut segment = crate::server::MitShmSegment::from_fd(CLIENT, fd.into_raw_fd(), read_only)
         .expect("map test SHM segment");
     if !read_only {
@@ -345,16 +327,17 @@ fn assert_resource_calls(actual: &[RecordedExtensionCheck], expected: &[Expected
 }
 
 fn assert_policy_error(bytes: &[u8], minor: u8) {
-    let mut expected = vec![0, DENY_ERROR.code];
+    assert_x_error(bytes, DENY_ERROR.code, DENY_ERROR.value, minor);
+}
+
+fn assert_x_error(bytes: &[u8], code: u8, value: u32, minor: u8) {
+    let mut expected = vec![0, code];
     expected.extend_from_slice(&1u16.to_le_bytes());
-    expected.extend_from_slice(&DENY_ERROR.value.to_le_bytes());
+    expected.extend_from_slice(&value.to_le_bytes());
     expected.extend_from_slice(&u16::from(minor).to_le_bytes());
     expected.push(130);
     expected.extend_from_slice(&[0; 21]);
-    assert_eq!(
-        bytes, expected,
-        "MIT-SHM policy error is forwarded verbatim"
-    );
+    assert_eq!(bytes, expected, "MIT-SHM error packet");
 }
 
 #[test]
@@ -754,17 +737,9 @@ fn mit_shm_resource_denial_table_matches_each_site_and_stops_effects() {
             DeniedSite::CreatePixmapSegment => {
                 assert!(fixture.state.resources.pixmap(NEW_PIXMAP).is_none());
                 assert!(fixture.backend.live_pixmaps.is_empty());
-                assert_eq!(
-                    fixture.backend.calls(),
-                    vec![
-                        crate::backend::recording::RecordedCall::CreatePixmap {
-                            depth: 24,
-                            width: 4,
-                            height: 4,
-                        },
-                        crate::backend::recording::RecordedCall::FreePixmap(0x0001_0000),
-                    ],
-                    "late segment denial frees its one allocated host pixmap"
+                assert!(
+                    fixture.backend.calls().is_empty(),
+                    "segment denial must happen before backend allocation"
                 );
             }
         }
@@ -798,8 +773,8 @@ fn shm_create_pixmap_denied_creation_allocates_nothing() {
 }
 
 #[test]
-fn shm_create_pixmap_denied_segment_frees_allocation() {
-    // Mutation: return the segment denial without backend.free_pixmap; this assertion must find the leaked host allocation.
+fn shm_create_pixmap_denied_segment_allocates_nothing() {
+    // Mutation: allocate the backend pixmap before the segment READ check; this assertion must find the unwanted allocation.
     let mut fixture = shm_fixture();
     install_segment(&mut fixture.state, SEGMENT, false);
     let calls = install_deny_policy(&mut fixture, SEGMENT, AccessMode::READ);
@@ -822,27 +797,56 @@ fn shm_create_pixmap_denied_segment_frees_allocation() {
     );
     assert!(fixture.state.resources.pixmap(NEW_PIXMAP).is_none());
     assert!(fixture.backend.live_pixmaps.is_empty());
-    assert!(matches!(
-        fixture.backend.calls().as_slice(),
-        [
-            crate::backend::recording::RecordedCall::CreatePixmap { .. },
-            crate::backend::recording::RecordedCall::FreePixmap(0x0001_0000)
-        ]
-    ));
+    assert!(fixture.backend.calls().is_empty());
 }
 
 #[test]
-fn shm_create_pixmap_keeps_policy_error_when_rollback_fails() {
-    // Mutation: omit the cleanup-error warn!; this must fail at the captured-warning assertion.
-    let warnings = warning_messages();
-    warnings
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clear();
+fn shm_create_pixmap_missing_segment_allocates_nothing() {
+    // Mutation: allocate the backend pixmap before checking segment existence; the call log must catch it.
+    let mut fixture = shm_fixture();
+    let bytes = dispatch(
+        &mut fixture,
+        shm::CREATE_PIXMAP,
+        &create_pixmap_body(NEW_PIXMAP, MISSING),
+        None,
+        1,
+    );
+
+    assert_x_error(&bytes, x11::error::BAD_VALUE, MISSING.0, shm::CREATE_PIXMAP);
+    assert!(fixture.state.resources.pixmap(NEW_PIXMAP).is_none());
+    assert!(fixture.backend.calls().is_empty());
+    assert!(fixture.backend.live_pixmaps.is_empty());
+}
+
+#[test]
+fn shm_create_pixmap_undersized_segment_allocates_nothing() {
+    // Mutation: allocate the backend pixmap before checking the segment byte range; the call log must catch it.
+    let mut fixture = shm_fixture();
+    // The OS may round the object up to a page (16 KiB on macOS), so the
+    // offset, not the 1-byte size, is what puts the pixmap past the end.
+    const OFFSET_PAST_ANY_PAGE: u32 = 1 << 20;
+    install_segment_with_size(&mut fixture.state, SEGMENT, false, 1);
+    let mut body = create_pixmap_body(NEW_PIXMAP, SEGMENT);
+    body[20..24].copy_from_slice(&OFFSET_PAST_ANY_PAGE.to_le_bytes());
+    let bytes = dispatch(&mut fixture, shm::CREATE_PIXMAP, &body, None, 1);
+
+    assert_x_error(
+        &bytes,
+        x11::error::BAD_VALUE,
+        OFFSET_PAST_ANY_PAGE,
+        shm::CREATE_PIXMAP,
+    );
+    assert!(fixture.state.resources.pixmap(NEW_PIXMAP).is_none());
+    assert!(fixture.state.mit_shm_segments.contains_key(&SEGMENT.0));
+    assert!(fixture.backend.calls().is_empty());
+    assert!(fixture.backend.live_pixmaps.is_empty());
+}
+
+#[test]
+fn shm_create_pixmap_valid_segment_allocates_exactly_once() {
+    // Mutation: skip backend.create_pixmap or the upload; their exact call records must catch it.
     let mut fixture = shm_fixture();
     install_segment(&mut fixture.state, SEGMENT, false);
-    fixture.backend.free_pixmap_fails = true;
-    let calls = install_deny_policy(&mut fixture, SEGMENT, AccessMode::READ);
     let bytes = dispatch(
         &mut fixture,
         shm::CREATE_PIXMAP,
@@ -851,38 +855,44 @@ fn shm_create_pixmap_keeps_policy_error_when_rollback_fails() {
         1,
     );
 
-    assert_policy_error(&bytes, shm::CREATE_PIXMAP);
-    assert_resource_calls(
-        &calls.lock().unwrap(),
-        &[
-            existing(DRAWABLE, ResourceKind::Pixmap, AccessMode::GET_ATTR),
-            pixmap_creation(NEW_PIXMAP),
-            existing(SEGMENT, ResourceKind::ShmSegment, AccessMode::READ),
-        ],
-        shm::CREATE_PIXMAP,
-    );
-    assert!(fixture.state.resources.pixmap(NEW_PIXMAP).is_none());
+    assert!(bytes.is_empty());
+    let calls = fixture.backend.calls();
     assert_eq!(
-        fixture.backend.calls(),
-        vec![
-            crate::backend::recording::RecordedCall::CreatePixmap {
-                depth: 24,
-                width: 4,
-                height: 4,
-            },
-            crate::backend::recording::RecordedCall::FreePixmap(0x0001_0000),
-        ]
-    );
-    assert!(fixture.backend.live_pixmaps.contains(&0x0001_0000));
-    assert!(
-        warnings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        calls
             .iter()
-            .any(|message| message.contains(
-                "MIT-SHM::CreatePixmap could not free host pixmap 0x10000 after segment access denial: free_pixmap failure injected"
-            )),
-        "rollback failure should be logged"
+            .filter(|call| matches!(
+                call,
+                crate::backend::recording::RecordedCall::CreatePixmap { .. }
+            ))
+            .count(),
+        1,
+        "valid segment creates exactly one backend pixmap"
+    );
+    let pixmap = fixture
+        .state
+        .resources
+        .pixmap(NEW_PIXMAP)
+        .expect("valid MIT-SHM CreatePixmap resource");
+    let host = pixmap.host_xid.expect("backend pixmap handle").as_raw();
+    assert_eq!(fixture.backend.live_pixmaps.len(), 1);
+    assert!(fixture.backend.live_pixmaps.contains(&host));
+    let uploads: Vec<_> = calls
+        .iter()
+        .filter_map(|call| match call {
+            crate::backend::recording::RecordedCall::PutImage {
+                host_xid,
+                depth,
+                width,
+                height,
+                ..
+            } => Some((*host_xid, *depth, *width, *height)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        uploads,
+        vec![(host, pixmap.depth, pixmap.width, pixmap.height)],
+        "valid segment uploads once to the registered pixmap with its requested dimensions"
     );
 }
 
