@@ -1326,6 +1326,43 @@ pub(super) fn core_resource_kind_for_access(
     .find(|kind| state.access_resource_owner(id, *kind).is_some())
 }
 
+/// Resolve any policy-visible X resource in a deterministic store order.
+/// Keep the eight core-store kinds first, in `core_resource_kind_for_access`
+/// order, then check the remaining extension stores in `ResourceKind` order.
+pub(super) fn arbitrary_resource_kind_for_access(
+    state: &ServerState,
+    id: ResourceId,
+) -> Option<ResourceKind> {
+    [
+        ResourceKind::Window,
+        ResourceKind::Pixmap,
+        ResourceKind::Gc,
+        ResourceKind::Font,
+        ResourceKind::Cursor,
+        ResourceKind::Picture,
+        ResourceKind::GlyphSet,
+        ResourceKind::Dri3Syncobj,
+        ResourceKind::Colormap,
+        ResourceKind::Region,
+        ResourceKind::PointerBarrier,
+        ResourceKind::SyncCounter,
+        ResourceKind::SyncAlarm,
+        ResourceKind::SyncFence,
+        ResourceKind::Damage,
+        ResourceKind::PresentEventSelection,
+        ResourceKind::ShmSegment,
+        ResourceKind::GlxContext,
+        ResourceKind::GlxDrawable,
+        ResourceKind::RecordContext,
+        ResourceKind::RandrOutput,
+        ResourceKind::RandrCrtc,
+        ResourceKind::RandrMode,
+        ResourceKind::RandrProvider,
+    ]
+    .into_iter()
+    .find(|kind| state.access_resource_owner(id, *kind).is_some())
+}
+
 /// Check an arbitrary core X resource operand, preserving unresolved-id
 /// behavior and KillClient's core-store scope.
 pub(super) fn validate_core_resource_if_present(
@@ -1339,6 +1376,35 @@ pub(super) fn validate_core_resource_if_present(
         return Ok(());
     }
     let Some(kind) = core_resource_kind_for_access(state, id) else {
+        return Ok(());
+    };
+    validate_resource_access(
+        state,
+        client,
+        ResourceTarget {
+            owner: None,
+            id,
+            kind,
+            creation: None,
+        },
+        mode,
+        request,
+    )
+}
+
+/// Check an arbitrary policy-visible resource operand without making an
+/// unresolved id into a new validity error.
+pub(super) fn validate_arbitrary_resource_if_present(
+    state: &ServerState,
+    client: ClientId,
+    id: ResourceId,
+    mode: AccessMode,
+    request: RequestOpcodes,
+) -> Result<(), (u8, u32)> {
+    if !state.policies_installed() || client == crate::resources::SERVER_OWNER {
+        return Ok(());
+    }
+    let Some(kind) = arbitrary_resource_kind_for_access(state, id) else {
         return Ok(());
     };
     validate_resource_access(

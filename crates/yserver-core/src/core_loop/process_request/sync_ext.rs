@@ -3,7 +3,7 @@ use crate::{
     backend::Backend,
     core_loop::process_request::{
         RequestOutcome, check_creation, check_resource, emit_x11_error_with_minor,
-        validate_core_resource_if_present, validate_resource_if_present, write_to_client,
+        validate_arbitrary_resource_if_present, validate_resource_if_present, write_to_client,
     },
     server::ServerState,
 };
@@ -129,10 +129,10 @@ pub(super) fn handle_sync_request(
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
     let access_request = RequestOpcodes::for_request(header);
-    macro_rules! check_core_resource {
+    macro_rules! check_arbitrary_resource {
         ($id:expr, $mode:expr) => {
             crate::core_loop::process_request::return_on_access_denial!(
-                validate_core_resource_if_present(
+                validate_arbitrary_resource_if_present(
                     state,
                     client_id,
                     ResourceId($id),
@@ -844,14 +844,14 @@ pub(super) fn handle_sync_request(
             if let Some(resource) = x11sync::parse_resource(body)
                 && resource != 0
             {
-                check_core_resource!(resource, AccessMode::GET_ATTR);
+                check_arbitrary_resource!(resource, AccessMode::GET_ATTR);
             }
         }
         x11sync::GET_PRIORITY => {
             if let Some(resource) = x11sync::parse_resource(body)
                 && resource != 0
             {
-                check_core_resource!(resource, AccessMode::GET_ATTR);
+                check_arbitrary_resource!(resource, AccessMode::GET_ATTR);
             }
             let reply = x11sync::encode_get_priority_reply(byte_order, sequence, 0);
             let Some(client) = state.clients.get_mut(&client_id.0) else {

@@ -15,6 +15,8 @@ const COUNTER: ResourceId = ResourceId(0x0010_8001);
 const NEW_COUNTER: ResourceId = ResourceId(0x0010_8002);
 const PRIORITY_WINDOW: ResourceId = ResourceId(0x0010_8003);
 const PRIORITY_PIXMAP: ResourceId = ResourceId(0x0010_8006);
+const PRIORITY_COUNTER: ResourceId = ResourceId(0x0010_8008);
+const PRIORITY_CONTEXT: ResourceId = ResourceId(0x0010_8009);
 const FENCE: ResourceId = ResourceId(0x0010_8004);
 const SECOND_FENCE: ResourceId = ResourceId(0x0010_8005);
 const THIRD_FENCE: ResourceId = ResourceId(0x0010_8007);
@@ -136,6 +138,53 @@ fn create_priority_pixmap(state: &mut ServerState) {
             height: 16,
         },
     );
+}
+
+fn seed_priority_resource(state: &mut ServerState, id: ResourceId, kind: ResourceKind) {
+    match kind {
+        ResourceKind::SyncCounter => {
+            state.sync_counters.insert(
+                id.0,
+                crate::server::SyncCounter {
+                    owner: CLIENT,
+                    value: 3,
+                },
+            );
+        }
+        ResourceKind::GlxContext => {
+            state.glx_contexts.insert(
+                id.0,
+                crate::server::GlxContext {
+                    owner: CLIENT,
+                    screen: 0,
+                    visual_id: crate::resources::ROOT_VISUAL.0,
+                    fbconfig: 0x101,
+                    render_type: yserver_protocol::x11::glx::GLX_RGBA_TYPE,
+                    share_list: 0,
+                    is_direct: true,
+                },
+            );
+        }
+        _ => unreachable!("not a priority extension resource: {kind:?}"),
+    }
+}
+
+fn priority_extension_resource_rows() -> Vec<(u8, ResourceId, ResourceKind, Vec<u8>)> {
+    use yserver_protocol::x11::sync;
+
+    [
+        (PRIORITY_COUNTER, ResourceKind::SyncCounter),
+        (PRIORITY_CONTEXT, ResourceKind::GlxContext),
+    ]
+    .into_iter()
+    .flat_map(|(id, kind)| {
+        [
+            (sync::SET_PRIORITY, priority_body(id)),
+            (sync::GET_PRIORITY, resource_body(id)),
+        ]
+        .map(move |(minor, body)| (minor, id, kind, body))
+    })
+    .collect()
 }
 
 fn assert_policy_error(bytes: &[u8], minor: u8) {
@@ -586,6 +635,149 @@ fn set_priority_unresolved_resource_is_not_asked() {
         "unresolved SetPriority resource must not reach the resource policy"
     );
     assert!(deny_fixture.backend.calls().is_empty());
+}
+
+#[test]
+fn set_get_priority_extension_resource_is_asked() {
+    // Mutation: keep the eight-kind resolver list; the SYNC counter and GLX context rows must fail
+    // to record their expected access checks.
+    let rows = priority_extension_resource_rows();
+
+    for (minor, id, kind, body) in &rows {
+        let mut fixture = sync_access_fixture();
+        seed_priority_resource(&mut fixture.state, *id, *kind);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        fixture
+            .state
+            .install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+                Decision::Allow,
+                Arc::clone(&calls),
+            )));
+
+        let actual = sync_access_request(&mut fixture, *minor, body);
+        let mut no_policy_fixture = sync_access_fixture();
+        seed_priority_resource(&mut no_policy_fixture.state, *id, *kind);
+        let expected = sync_access_request(&mut no_policy_fixture, *minor, body);
+        assert_eq!(actual, expected, "SYNC minor {minor} changed its reply");
+
+        let calls = calls.lock().unwrap();
+        let resource_calls: Vec<_> = calls
+            .iter()
+            .filter(|call| call.hook == ExtensionHook::Resource)
+            .collect();
+        assert_eq!(resource_calls.len(), 1, "SYNC minor {minor}");
+        assert_recorded_resource(
+            resource_calls[0],
+            ResourceTarget {
+                id: *id,
+                kind: *kind,
+                creation: None,
+                owner: None,
+            },
+            AccessMode::GET_ATTR,
+            *minor,
+            Some(CLIENT),
+            Some(CLIENT),
+        );
+    }
+
+    for (minor, id, kind, body) in rows {
+        let mut fixture = sync_access_fixture();
+        seed_priority_resource(&mut fixture.state, id, kind);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        fixture
+            .state
+            .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+                Arc::clone(&calls),
+                id,
+                Some(AccessMode::GET_ATTR),
+                DENY_ERROR,
+            )));
+        let counters_before = format!("{:?}", fixture.state.sync_counters);
+        let contexts_before = format!("{:?}", fixture.state.glx_contexts);
+
+        let bytes = sync_access_request(&mut fixture, minor, &body);
+
+        assert_policy_error(&bytes, minor);
+        assert_eq!(
+            format!("{:?}", fixture.state.sync_counters),
+            counters_before
+        );
+        assert_eq!(format!("{:?}", fixture.state.glx_contexts), contexts_before);
+        assert!(
+            fixture.backend.calls().is_empty(),
+            "SYNC minor {minor} reached backend"
+        );
+        let calls = calls.lock().unwrap();
+        let resource_calls: Vec<_> = calls
+            .iter()
+            .filter(|call| call.hook == ExtensionHook::Resource)
+            .collect();
+        assert_eq!(resource_calls.len(), 1, "SYNC minor {minor}");
+        assert_recorded_resource(
+            resource_calls[0],
+            ResourceTarget {
+                id,
+                kind,
+                creation: None,
+                owner: None,
+            },
+            AccessMode::GET_ATTR,
+            minor,
+            Some(CLIENT),
+            Some(CLIENT),
+        );
+    }
+}
+
+#[test]
+fn arbitrary_resource_resolution_checks_core_kinds_before_extensions() {
+    // Mutation: move SyncCounter ahead of Window in the resolver order; the recorded target kind
+    // must change and fail this assertion.
+    use yserver_protocol::x11::sync;
+
+    let mut fixture = sync_access_fixture();
+    create_priority_window(&mut fixture.state);
+    fixture.state.sync_counters.insert(
+        PRIORITY_WINDOW.0,
+        crate::server::SyncCounter {
+            owner: CLIENT,
+            value: 3,
+        },
+    );
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    fixture
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+            Decision::Allow,
+            Arc::clone(&calls),
+        )));
+
+    let _bytes = sync_access_request(
+        &mut fixture,
+        sync::SET_PRIORITY,
+        &priority_body(PRIORITY_WINDOW),
+    );
+
+    let calls = calls.lock().unwrap();
+    let resource_calls: Vec<_> = calls
+        .iter()
+        .filter(|call| call.hook == ExtensionHook::Resource)
+        .collect();
+    assert_eq!(resource_calls.len(), 1);
+    assert_recorded_resource(
+        resource_calls[0],
+        ResourceTarget {
+            id: PRIORITY_WINDOW,
+            kind: ResourceKind::Window,
+            creation: None,
+            owner: None,
+        },
+        AccessMode::GET_ATTR,
+        sync::SET_PRIORITY,
+        Some(CLIENT),
+        Some(CLIENT),
+    );
 }
 
 #[test]
