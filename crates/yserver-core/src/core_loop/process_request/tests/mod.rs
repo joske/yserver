@@ -9,6 +9,7 @@ mod access_input;
 mod access_present;
 mod access_properties;
 mod access_randr;
+mod access_record;
 mod access_render;
 mod access_resources;
 #[cfg(unix)]

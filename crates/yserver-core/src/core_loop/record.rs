@@ -17,14 +17,18 @@
 use std::{collections::BTreeMap, io};
 
 use yserver_protocol::x11::{
-    self, ClientByteOrder, ClientId, RequestHeader, SequenceNumber,
+    self, ClientByteOrder, ClientId, RequestHeader, ResourceId, SequenceNumber,
     record::{self as x11rec, Range},
 };
 
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind},
     core_loop::{
         client_io::{self, WriteOutcome},
-        process_request::{RequestOutcome, emit_x11_error_with_minor, write_to_client},
+        process_request::{
+            RequestOutcome, emit_x11_error_with_minor, validate_arbitrary_resource_if_present,
+            write_to_client,
+        },
     },
     nested::{RECORD_FIRST_ERROR, RECORD_MAJOR_OPCODE},
     resources::ROOT_WINDOW,
@@ -325,6 +329,8 @@ fn check_client_specs(
     state: &ServerState,
     specs: &[u32],
     recorder: Option<ClientId>,
+    client_id: ClientId,
+    request: RequestOpcodes,
 ) -> Result<(), Error> {
     let recorder = recorder.and_then(|r| state.clients.get(&r.0));
     for &spec in specs {
@@ -339,7 +345,15 @@ fn check_client_specs(
         }
         match owning_client(state, spec) {
             Some((_, base, _)) if spec == base => {}
-            Some(_) if state.xid_occupied(spec) => {}
+            Some(_) if state.xid_occupied(spec) => {
+                validate_arbitrary_resource_if_present(
+                    state,
+                    client_id,
+                    ResourceId(spec),
+                    AccessMode::GET_ATTR,
+                    request,
+                )?;
+            }
             Some(_) => return Err((x11::error::BAD_VALUE, spec)),
             None => return Err((x11::error::BAD_MATCH, 0)),
         }
@@ -401,6 +415,8 @@ fn check_register(
     body: &[u8],
     head: &x11rec::RegisterHeader,
     recorder: Option<ClientId>,
+    client_id: ClientId,
+    request: RequestOpcodes,
 ) -> Result<(Vec<u32>, Vec<Range>), Error> {
     if head.n_clients > LIMIT_CLIENTS {
         return Err((x11::error::BAD_VALUE, 0));
@@ -423,7 +439,7 @@ fn check_register(
     let specs: Vec<u32> = (0..n_clients)
         .map(|i| x11rec::read_list_u32(byte_order, body, x11rec::REGISTER_FIXED_BODY, i))
         .collect();
-    check_client_specs(state, &specs, recorder)?;
+    check_client_specs(state, &specs, recorder, client_id, request)?;
     let ranges_at = x11rec::REGISTER_FIXED_BODY + 4 * n_clients;
     let ranges: Vec<Range> = (0..n_ranges)
         .map(|i| Range::parse(byte_order, &body[ranges_at + x11rec::RANGE_SIZE * i..]))
@@ -618,6 +634,10 @@ pub(crate) fn handle_record_request(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let minor = header.data;
+    let request = RequestOpcodes {
+        major: RECORD_MAJOR_OPCODE,
+        minor,
+    };
     let Some(byte_order) = state.clients.get(&client_id.0).map(|c| c.byte_order) else {
         return Ok(RequestOutcome::Handled);
     };
@@ -670,13 +690,33 @@ pub(crate) fn handle_record_request(
                 let Some(ctx) = state.record.contexts.get(&head.context) else {
                     return bad_context(state, head.context);
                 };
+                crate::core_loop::process_request::check_resource!(
+                    state,
+                    client_id,
+                    sequence,
+                    request,
+                    ResourceId(head.context),
+                    ResourceKind::RecordContext,
+                    AccessMode::USE,
+                );
                 ctx.recorder.map(|r| r.client)
             };
-            let (specs, ranges) = match check_register(state, byte_order, body, &head, recorder) {
+            let (specs, ranges) = match check_register(
+                state, byte_order, body, &head, recorder, client_id, request,
+            ) {
                 Ok(parsed) => parsed,
                 Err(err) => return error(state, err),
             };
             if minor == x11rec::CREATE_CONTEXT {
+                crate::core_loop::process_request::check_creation!(
+                    state,
+                    client_id,
+                    sequence,
+                    request,
+                    ResourceId(head.context),
+                    ResourceKind::RecordContext,
+                    None,
+                );
                 state.record.contexts.insert(
                     head.context,
                     RecordContext {
@@ -714,10 +754,19 @@ pub(crate) fn handle_record_request(
             if !state.record.contains(context) {
                 return bad_context(state, context);
             }
+            crate::core_loop::process_request::check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                ResourceId(context),
+                ResourceKind::RecordContext,
+                AccessMode::USE,
+            );
             let specs: Vec<u32> = (0..n_clients as usize)
                 .map(|i| x11rec::read_list_u32(byte_order, body, x11rec::UNREGISTER_FIXED_BODY, i))
                 .collect();
-            if let Err(err) = check_client_specs(state, &specs, None) {
+            if let Err(err) = check_client_specs(state, &specs, None, client_id, request) {
                 return error(state, err);
             }
             let canon = canonicalize(state, &specs, None);
@@ -739,6 +788,15 @@ pub(crate) fn handle_record_request(
             let Some(ctx) = state.record.contexts.get(&context) else {
                 return bad_context(state, context);
             };
+            crate::core_loop::process_request::check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                ResourceId(context),
+                ResourceKind::RecordContext,
+                AccessMode::USE,
+            );
             let per_rcap: Vec<(&Rcap, Vec<Range>)> =
                 ctx.rcaps.iter().map(|r| (r, r.to_ranges())).collect();
             let infos: Vec<(u32, &[Range])> = per_rcap
@@ -769,6 +827,15 @@ pub(crate) fn handle_record_request(
             let Some(ctx) = state.record.contexts.get(&context) else {
                 return bad_context(state, context);
             };
+            crate::core_loop::process_request::check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                ResourceId(context),
+                ResourceKind::RecordContext,
+                AccessMode::USE,
+            );
             if ctx.recorder.is_some() {
                 return error(state, (x11::error::BAD_MATCH, 0));
             }
@@ -802,6 +869,15 @@ pub(crate) fn handle_record_request(
             if !state.record.contains(context) {
                 return bad_context(state, context);
             }
+            crate::core_loop::process_request::check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                ResourceId(context),
+                ResourceKind::RecordContext,
+                AccessMode::USE,
+            );
             if minor == x11rec::DISABLE_CONTEXT {
                 disable_context(state, context, false);
             } else {
