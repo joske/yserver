@@ -1333,49 +1333,42 @@ pub(super) fn arbitrary_resource_kind_for_access(
     state: &ServerState,
     id: ResourceId,
 ) -> Option<ResourceKind> {
-    [
-        ResourceKind::Window,
-        ResourceKind::Pixmap,
-        ResourceKind::Gc,
-        ResourceKind::Font,
-        ResourceKind::Cursor,
-        ResourceKind::Picture,
-        ResourceKind::GlyphSet,
-        ResourceKind::Dri3Syncobj,
-        ResourceKind::Colormap,
-        ResourceKind::Region,
-        ResourceKind::PointerBarrier,
-        ResourceKind::SyncCounter,
-        ResourceKind::SyncAlarm,
-        ResourceKind::SyncFence,
-        ResourceKind::Damage,
-        ResourceKind::PresentEventSelection,
-        ResourceKind::ShmSegment,
-        ResourceKind::GlxContext,
-        ResourceKind::GlxDrawable,
-        ResourceKind::RecordContext,
-        ResourceKind::RandrOutput,
-        ResourceKind::RandrCrtc,
-        ResourceKind::RandrMode,
-        ResourceKind::RandrProvider,
-    ]
-    .into_iter()
-    .find(|kind| state.access_resource_owner(id, *kind).is_some())
+    core_resource_kind_for_access(state, id).or_else(|| {
+        [
+            ResourceKind::Colormap,
+            ResourceKind::Region,
+            ResourceKind::PointerBarrier,
+            ResourceKind::SyncCounter,
+            ResourceKind::SyncAlarm,
+            ResourceKind::SyncFence,
+            ResourceKind::Damage,
+            ResourceKind::PresentEventSelection,
+            ResourceKind::ShmSegment,
+            ResourceKind::GlxContext,
+            ResourceKind::GlxDrawable,
+            ResourceKind::RecordContext,
+            ResourceKind::RandrOutput,
+            ResourceKind::RandrCrtc,
+            ResourceKind::RandrMode,
+            ResourceKind::RandrProvider,
+        ]
+        .into_iter()
+        .find(|kind| state.access_resource_owner(id, *kind).is_some())
+    })
 }
 
-/// Check an arbitrary core X resource operand, preserving unresolved-id
-/// behavior and KillClient's core-store scope.
-pub(super) fn validate_core_resource_if_present(
+fn validate_resource_if_present_with_resolver(
     state: &ServerState,
     client: ClientId,
     id: ResourceId,
     mode: AccessMode,
     request: RequestOpcodes,
+    resolve: fn(&ServerState, ResourceId) -> Option<ResourceKind>,
 ) -> Result<(), (u8, u32)> {
     if !state.policies_installed() || client == crate::resources::SERVER_OWNER {
         return Ok(());
     }
-    let Some(kind) = core_resource_kind_for_access(state, id) else {
+    let Some(kind) = resolve(state, id) else {
         return Ok(());
     };
     validate_resource_access(
@@ -1392,6 +1385,25 @@ pub(super) fn validate_core_resource_if_present(
     )
 }
 
+/// Check an arbitrary core X resource operand, preserving unresolved-id
+/// behavior and KillClient's core-store scope.
+pub(super) fn validate_core_resource_if_present(
+    state: &ServerState,
+    client: ClientId,
+    id: ResourceId,
+    mode: AccessMode,
+    request: RequestOpcodes,
+) -> Result<(), (u8, u32)> {
+    validate_resource_if_present_with_resolver(
+        state,
+        client,
+        id,
+        mode,
+        request,
+        core_resource_kind_for_access,
+    )
+}
+
 /// Check an arbitrary policy-visible resource operand without making an
 /// unresolved id into a new validity error.
 pub(super) fn validate_arbitrary_resource_if_present(
@@ -1401,23 +1413,13 @@ pub(super) fn validate_arbitrary_resource_if_present(
     mode: AccessMode,
     request: RequestOpcodes,
 ) -> Result<(), (u8, u32)> {
-    if !state.policies_installed() || client == crate::resources::SERVER_OWNER {
-        return Ok(());
-    }
-    let Some(kind) = arbitrary_resource_kind_for_access(state, id) else {
-        return Ok(());
-    };
-    validate_resource_access(
+    validate_resource_if_present_with_resolver(
         state,
         client,
-        ResourceTarget {
-            owner: None,
-            id,
-            kind,
-            creation: None,
-        },
+        id,
         mode,
         request,
+        arbitrary_resource_kind_for_access,
     )
 }
 
