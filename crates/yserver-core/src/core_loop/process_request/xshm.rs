@@ -383,16 +383,6 @@ fn handle_mit_shm_create_pixmap(
             MIT_SHM_MAJOR_OPCODE,
         );
     }
-    let host_xid = match backend.create_pixmap(origin, req.depth, req.width, req.height) {
-        Ok(handle) => Some(handle),
-        Err(err) => {
-            log::warn!(
-                "client {} MIT-SHM::CreatePixmap host CreatePixmap failed: {err}",
-                client_id.0
-            );
-            None
-        }
-    };
     if !state.mit_shm_segments.contains_key(&req.shmseg) {
         return emit_x11_error_with_minor(
             state,
@@ -415,15 +405,6 @@ fn handle_mit_shm_create_pixmap(
             minor: shm::CREATE_PIXMAP,
         },
     ) {
-        if let Some(host_xid) = host_xid
-            && let Err(err) = backend.free_pixmap(origin, host_xid.as_raw())
-        {
-            log::warn!(
-                "client {} MIT-SHM::CreatePixmap could not free host pixmap 0x{:x} after segment access denial: {err}",
-                client_id.0,
-                host_xid.as_raw(),
-            );
-        }
         return emit_x11_error_with_minor(
             state,
             client_id,
@@ -454,6 +435,16 @@ fn handle_mit_shm_create_pixmap(
             );
         }
         bytes[start..end].to_vec()
+    };
+    let host_xid = match backend.create_pixmap(origin, req.depth, req.width, req.height) {
+        Ok(handle) => Some(handle),
+        Err(err) => {
+            log::warn!(
+                "client {} MIT-SHM::CreatePixmap host CreatePixmap failed: {err}",
+                client_id.0
+            );
+            None
+        }
     };
     if let Some(host_xid) = host_xid {
         // The new pixmap takes the segment's bytes as they are: no client
