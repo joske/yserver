@@ -665,6 +665,207 @@ fn assert_glx_legacy_error(what: &str, bytes: &[u8], code: u8, value: u32, minor
     );
 }
 
+const GLX_OTHER_CLIENT_XID_BASE: u32 = 0x0040_0000;
+
+fn glx_set_client_xid_range(state: &mut ServerState, client: u32, base: u32) {
+    let client = state.clients.get_mut(&client).expect("test client");
+    client.resource_id_base = base;
+    client.resource_id_mask = GLX_TEST_XID_MASK;
+}
+
+fn create_pbuffer_body(pbuffer: u32) -> Vec<u8> {
+    use yserver_protocol::x11::glx;
+
+    glx_legacy_words(&[
+        0,
+        0x101,
+        pbuffer,
+        2,
+        glx::GLX_PBUFFER_WIDTH,
+        8,
+        glx::GLX_PBUFFER_HEIGHT,
+        8,
+    ])
+}
+
+#[test]
+fn create_pbuffer_rejects_foreign_client_xid() {
+    // Mutation: drop the owned-range check for CREATE_PBUFFER; B must not claim an XID in A's range.
+    use yserver_protocol::x11::glx;
+
+    let (mut state, mut backend, _owner_peer) = glx_legacy_fixture();
+    let mut other_peer = install_client(&mut state, 2);
+    glx_set_client_xid_range(&mut state, 2, GLX_OTHER_CLIENT_XID_BASE);
+    let foreign = GLX_TEST_XID_BASE | 0x70;
+
+    let bytes = glx_legacy_send(
+        &mut state,
+        &mut backend,
+        &mut other_peer,
+        2,
+        glx::CREATE_PBUFFER,
+        &create_pbuffer_body(foreign),
+    );
+
+    assert_glx_legacy_error(
+        "foreign CreatePbuffer XID",
+        &bytes,
+        yserver_protocol::x11::error::BAD_ID_CHOICE,
+        foreign,
+        glx::CREATE_PBUFFER,
+    );
+    assert!(!state.glx_drawables.contains_key(&foreign));
+    assert!(state.resources.pixmap(ResourceId(foreign)).is_none());
+    assert!(backend.calls().is_empty());
+}
+
+#[test]
+fn create_pbuffer_rejects_occupied_client_xid() {
+    // Mutation: drop the occupied-XID check; the existing pixmap and host object must remain unchanged.
+    use crate::backend::Backend;
+    use yserver_protocol::x11::glx;
+
+    let (mut state, mut backend, _owner_peer) = glx_legacy_fixture();
+    let mut other_peer = install_client(&mut state, 2);
+    glx_set_client_xid_range(&mut state, 2, GLX_OTHER_CLIENT_XID_BASE);
+    let occupied = GLX_OTHER_CLIENT_XID_BASE | 0x80;
+    let host = backend
+        .create_pixmap(None, 24, 64, 32)
+        .expect("existing pixmap host object");
+    state.resources.create_pixmap(
+        ClientId(2),
+        CreatePixmapRequest {
+            depth: 24,
+            pixmap: ResourceId(occupied),
+            drawable: ROOT_WINDOW,
+            width: 64,
+            height: 32,
+        },
+    );
+    assert!(
+        state
+            .resources
+            .set_pixmap_host_xid(ResourceId(occupied), host)
+    );
+    let calls_before = backend.calls();
+    let live_before = backend.live_pixmaps.clone();
+    let pixmap_before = state.resources.pixmap(ResourceId(occupied)).unwrap();
+    let pixmap_fields_before = (
+        pixmap_before.owner,
+        pixmap_before.drawable,
+        pixmap_before.width,
+        pixmap_before.height,
+        pixmap_before.depth,
+        pixmap_before.host_xid,
+    );
+
+    let bytes = glx_legacy_send(
+        &mut state,
+        &mut backend,
+        &mut other_peer,
+        2,
+        glx::CREATE_PBUFFER,
+        &create_pbuffer_body(occupied),
+    );
+
+    assert_glx_legacy_error(
+        "occupied CreatePbuffer XID",
+        &bytes,
+        yserver_protocol::x11::error::BAD_ID_CHOICE,
+        occupied,
+        glx::CREATE_PBUFFER,
+    );
+    assert!(
+        !state.glx_drawables.contains_key(&occupied),
+        "an occupied xid must not acquire a GLX record"
+    );
+    let pixmap_after = state.resources.pixmap(ResourceId(occupied)).unwrap();
+    assert_eq!(
+        (
+            pixmap_after.owner,
+            pixmap_after.drawable,
+            pixmap_after.width,
+            pixmap_after.height,
+            pixmap_after.depth,
+            pixmap_after.host_xid,
+        ),
+        pixmap_fields_before,
+        "existing core pixmap must be unchanged"
+    );
+    assert_eq!(backend.calls(), calls_before);
+    assert_eq!(backend.live_pixmaps, live_before);
+    assert!(backend.live_pixmaps.contains(&host.as_raw()));
+}
+
+#[test]
+fn create_pbuffer_failed_allocation_destroy_keeps_other_pixmaps() {
+    // Mutation: move the new-ID check after the GLX record insert; a legal fresh XID must still be accepted before insertion.
+    use crate::backend::Backend;
+    use yserver_protocol::x11::glx;
+
+    let (mut state, mut backend, mut owner_peer) = glx_legacy_fixture();
+    let mut other_peer = install_client(&mut state, 2);
+    glx_set_client_xid_range(&mut state, 2, GLX_OTHER_CLIENT_XID_BASE);
+    let other_pixmap = GLX_TEST_XID_BASE | 0x71;
+    let other_host = backend
+        .create_pixmap(None, 24, 64, 32)
+        .expect("other client's host pixmap");
+    glx_legacy_x_pixmap(&mut state, other_pixmap, 24, Some(other_host.as_raw()));
+    backend.create_pixmap_fails = true;
+    let pbuffer = GLX_OTHER_CLIENT_XID_BASE | 0x81;
+    let create_calls_before = backend.calls().len();
+
+    let create_bytes = glx_legacy_send(
+        &mut state,
+        &mut backend,
+        &mut other_peer,
+        2,
+        glx::CREATE_PBUFFER,
+        &create_pbuffer_body(pbuffer),
+    );
+
+    assert!(
+        create_bytes.is_empty(),
+        "a legal new id must pass validation before its GLX record is inserted"
+    );
+    assert!(state.glx_drawables.contains_key(&pbuffer));
+    assert!(state.resources.pixmap(ResourceId(pbuffer)).is_none());
+    assert!(matches!(
+        backend.calls().get(create_calls_before),
+        Some(RecordedCall::CreatePixmap {
+            width: 8,
+            height: 8,
+            ..
+        })
+    ));
+
+    let destroy_bytes = glx_legacy_send(
+        &mut state,
+        &mut backend,
+        &mut other_peer,
+        2,
+        glx::DESTROY_PBUFFER,
+        &pbuffer.to_le_bytes(),
+    );
+
+    assert!(destroy_bytes.is_empty());
+    assert!(!state.glx_drawables.contains_key(&pbuffer));
+    assert!(
+        !backend
+            .calls()
+            .iter()
+            .any(|call| matches!(call, RecordedCall::FreePixmap(_)))
+    );
+    let pixmap = state
+        .resources
+        .pixmap(ResourceId(other_pixmap))
+        .expect("other client's pixmap remains registered");
+    assert_eq!(pixmap.owner, ClientId(1));
+    assert_eq!(pixmap.host_xid, Some(other_host));
+    assert!(backend.live_pixmaps.contains(&other_host.as_raw()));
+    assert!(read_all_available(&mut owner_peer).is_empty());
+}
+
 fn create_glx_pixmap_body(screen: u32, visual: u32, pixmap: u32, glx_pixmap: u32) -> Vec<u8> {
     glx_legacy_words(&[screen, visual, pixmap, glx_pixmap])
 }

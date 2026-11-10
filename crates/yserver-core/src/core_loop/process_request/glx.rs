@@ -15,6 +15,17 @@ use yserver_protocol::{
     x11::{ClientId, RequestHeader, ResourceId, SequenceNumber},
 };
 
+fn glx_new_resource_id_is_available(state: &ServerState, client_id: ClientId, id: u32) -> bool {
+    let owned = state.clients.get(&client_id.0).is_some_and(|client| {
+        crate::server::IdAllocator::validate_owned(
+            id,
+            client.resource_id_base,
+            client.resource_id_mask,
+        )
+    });
+    owned && !state.xid_occupied(id)
+}
+
 /// Build the FBConfig list returned by `GetFBConfigs`. We synthesise
 /// from each X visual (depth-24 RGB and depth-32 ARGB), double buffered,
 /// plus one visual-less, single-buffered pixmap configuration for
@@ -775,6 +786,17 @@ pub(super) fn handle_glx_request(
             // from GetDrawableAttributes so Mesa can size the buffer; key
             // the record by the pbuffer XID itself (it is its own drawable).
             if let Some(req) = x11glx::parse_create_pbuffer(body) {
+                if !glx_new_resource_id_is_available(state, client_id, req.pbuffer) {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_ID_CHOICE,
+                        req.pbuffer,
+                        u16::from(minor),
+                        crate::nested::GLX_MAJOR_OPCODE,
+                    );
+                }
                 check_creation!(
                     state,
                     client_id,
@@ -873,14 +895,7 @@ pub(super) fn handle_glx_request(
             let Some(req) = x11glx::parse_create_glx_pixmap(body) else {
                 return glx_error(state, x11::error::BAD_LENGTH, 0);
             };
-            let owned = state.clients.get(&client_id.0).is_some_and(|c| {
-                crate::server::IdAllocator::validate_owned(
-                    req.glx_pixmap,
-                    c.resource_id_base,
-                    c.resource_id_mask,
-                )
-            });
-            if !owned || state.xid_occupied(req.glx_pixmap) {
+            if !glx_new_resource_id_is_available(state, client_id, req.glx_pixmap) {
                 return glx_error(state, x11::error::BAD_ID_CHOICE, req.glx_pixmap);
             }
             // yserver has exactly one screen (screenInfo.numScreens == 1).
