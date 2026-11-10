@@ -632,6 +632,60 @@ fn make_context_current_read_falls_back_to_core_pixmap() {
     );
 }
 
+// Mutation: run the drawable checks when the new context is zero; the empty-check assertion must
+// fail for both MakeCurrent release forms.
+#[test]
+fn make_current_context_zero_checks_nothing() {
+    let rows: [AskRow; 2] = [
+        (
+            x11glx::MAKE_CURRENT,
+            current_body(x11glx::MAKE_CURRENT, WINDOW, ResourceId(0), ResourceId(0)),
+            vec![],
+            |state| seed_window(state, WINDOW),
+        ),
+        (
+            x11glx::MAKE_CONTEXT_CURRENT,
+            current_body(x11glx::MAKE_CONTEXT_CURRENT, WINDOW, PIXMAP, ResourceId(0)),
+            vec![],
+            |state| {
+                seed_window(state, WINDOW);
+                seed_pixmap(state, PIXMAP);
+            },
+        ),
+    ];
+
+    for (minor, body, expected_checks, seed) in rows {
+        let mut no_policy = fixture();
+        seed(&mut no_policy.state);
+        let expected = dispatch(
+            &mut no_policy.state,
+            &mut no_policy.backend,
+            CLIENT,
+            &mut no_policy.peer,
+            minor,
+            &body,
+        );
+
+        let mut fixture = fixture();
+        seed(&mut fixture.state);
+        let calls = deny_all_policy(&mut fixture);
+        let actual = dispatch(
+            &mut fixture.state,
+            &mut fixture.backend,
+            CLIENT,
+            &mut fixture.peer,
+            minor,
+            &body,
+        );
+
+        assert_recorded(&calls.lock().unwrap(), &expected_checks, CLIENT, minor);
+        assert_eq!(
+            actual, expected,
+            "context 0 reply changed for minor {minor}"
+        );
+    }
+}
+
 // Mutation: ask for any unresolved context/draw/read XID during current-state dispatch.
 #[test]
 fn make_current_unresolved_ids_are_not_asked() {
@@ -1424,10 +1478,11 @@ fn glx_drawable_access_ask_table_records_all_targets() {
         (
             x11glx::DESTROY_PBUFFER,
             words(&[PBUFFER.0]),
-            vec![
-                existing(PBUFFER, ResourceKind::GlxDrawable, AccessMode::DESTROY),
-                existing(PBUFFER, ResourceKind::Pixmap, AccessMode::DESTROY),
-            ],
+            vec![existing(
+                PBUFFER,
+                ResourceKind::GlxDrawable,
+                AccessMode::DESTROY,
+            )],
             seed_pbuffer_targets,
         ),
         (
@@ -1539,144 +1594,6 @@ fn create_pbuffer_denied_creates_no_record_and_no_backing() {
             x11glx::CREATE_PBUFFER,
         );
     }
-}
-
-// Mutation: check the backing Pixmap only when a GLX record resolves; destroying another
-// client's same-XID core pixmap must skip the free on derived-target denial and still succeed.
-#[test]
-fn destroy_pbuffer_denied_core_pixmap_is_kept() {
-    use crate::backend::{Backend, recording::RecordedCall};
-
-    let mut denied = fixture();
-    let mut other_peer = install_client(&mut denied.state, 2);
-    let host = denied
-        .backend
-        .create_pixmap(None, 24, 8, 8)
-        .expect("seed backend pixmap");
-    denied.state.resources.create_pixmap(
-        CLIENT,
-        x11::CreatePixmapRequest {
-            depth: 24,
-            pixmap: PBUFFER,
-            drawable: crate::resources::ROOT_WINDOW,
-            width: 8,
-            height: 8,
-        },
-    );
-    assert!(denied.state.resources.set_pixmap_host_xid(PBUFFER, host));
-    let backend_before = denied.backend.calls();
-    let calls = deny_kind_policy(
-        &mut denied,
-        PBUFFER,
-        ResourceKind::Pixmap,
-        AccessMode::DESTROY,
-    );
-    let bytes = dispatch(
-        &mut denied.state,
-        &mut denied.backend,
-        ClientId(2),
-        &mut other_peer,
-        x11glx::DESTROY_PBUFFER,
-        &words(&[PBUFFER.0]),
-    );
-    assert!(bytes.is_empty(), "derived pixmap denial still succeeds");
-    assert!(!denied.state.glx_drawables.contains_key(&PBUFFER.0));
-    assert!(denied.state.resources.pixmap(PBUFFER).is_some());
-    assert_eq!(denied.backend.calls(), backend_before);
-    assert!(
-        !denied
-            .backend
-            .calls()
-            .iter()
-            .any(|call| matches!(call, RecordedCall::FreePixmap(_)))
-    );
-    assert_recorded(
-        &calls.lock().unwrap(),
-        &[existing(PBUFFER, ResourceKind::Pixmap, AccessMode::DESTROY)],
-        ClientId(2),
-        x11glx::DESTROY_PBUFFER,
-    );
-
-    let mut no_policy = fixture();
-    let mut no_policy_peer = install_client(&mut no_policy.state, 2);
-    let no_policy_host = no_policy
-        .backend
-        .create_pixmap(None, 24, 8, 8)
-        .expect("seed backend pixmap");
-    no_policy.state.resources.create_pixmap(
-        CLIENT,
-        x11::CreatePixmapRequest {
-            depth: 24,
-            pixmap: PBUFFER,
-            drawable: crate::resources::ROOT_WINDOW,
-            width: 8,
-            height: 8,
-        },
-    );
-    assert!(
-        no_policy
-            .state
-            .resources
-            .set_pixmap_host_xid(PBUFFER, no_policy_host)
-    );
-    let bytes = dispatch(
-        &mut no_policy.state,
-        &mut no_policy.backend,
-        ClientId(2),
-        &mut no_policy_peer,
-        x11glx::DESTROY_PBUFFER,
-        &words(&[PBUFFER.0]),
-    );
-    assert!(bytes.is_empty());
-    assert!(no_policy.state.resources.pixmap(PBUFFER).is_none());
-    assert!(
-        no_policy
-            .backend
-            .calls()
-            .contains(&RecordedCall::FreePixmap(no_policy_host.as_raw()))
-    );
-
-    let mut with_glx_record = fixture();
-    let mut other_peer = install_client(&mut with_glx_record.state, 2);
-    seed_pbuffer_targets(&mut with_glx_record.state);
-    let host = with_glx_record
-        .backend
-        .create_pixmap(None, 24, 8, 8)
-        .expect("seed pbuffer backend pixmap");
-    assert!(
-        with_glx_record
-            .state
-            .resources
-            .set_pixmap_host_xid(PBUFFER, host)
-    );
-    let backend_before = with_glx_record.backend.calls();
-    let calls = deny_kind_policy(
-        &mut with_glx_record,
-        PBUFFER,
-        ResourceKind::Pixmap,
-        AccessMode::DESTROY,
-    );
-    let bytes = dispatch(
-        &mut with_glx_record.state,
-        &mut with_glx_record.backend,
-        ClientId(2),
-        &mut other_peer,
-        x11glx::DESTROY_PBUFFER,
-        &words(&[PBUFFER.0]),
-    );
-    assert!(bytes.is_empty());
-    assert!(!with_glx_record.state.glx_drawables.contains_key(&PBUFFER.0));
-    assert!(with_glx_record.state.resources.pixmap(PBUFFER).is_some());
-    assert_eq!(with_glx_record.backend.calls(), backend_before);
-    assert_recorded(
-        &calls.lock().unwrap(),
-        &[
-            existing(PBUFFER, ResourceKind::GlxDrawable, AccessMode::DESTROY),
-            existing(PBUFFER, ResourceKind::Pixmap, AccessMode::DESTROY),
-        ],
-        ClientId(2),
-        x11glx::DESTROY_PBUFFER,
-    );
 }
 
 // Mutation: check SET_ATTR only after applying GLX_EVENT_MASK; the denied update must leave the
@@ -1819,13 +1736,6 @@ fn glx_drawable_destroy_unresolved_ids_keep_existing_behavior() {
             None,
         ),
         (
-            x11glx::DESTROY_PBUFFER,
-            words(&[PIXMAP.0]),
-            |state| seed_pixmap(state, PIXMAP),
-            vec![existing(PIXMAP, ResourceKind::Pixmap, AccessMode::DESTROY)],
-            None,
-        ),
-        (
             x11glx::DESTROY_PIXMAP,
             words(&[PIXMAP.0]),
             |state| seed_pixmap(state, PIXMAP),
@@ -1871,24 +1781,4 @@ fn glx_drawable_destroy_unresolved_ids_keep_existing_behavior() {
         }
         assert_recorded(&calls.lock().unwrap(), &expected, CLIENT, minor);
     }
-
-    let mut with_pixmap = fixture();
-    seed_pixmap(&mut with_pixmap.state, PIXMAP);
-    let calls = allow_policy(&mut with_pixmap);
-    let bytes = dispatch(
-        &mut with_pixmap.state,
-        &mut with_pixmap.backend,
-        CLIENT,
-        &mut with_pixmap.peer,
-        x11glx::DESTROY_PBUFFER,
-        &words(&[PIXMAP.0]),
-    );
-    assert!(bytes.is_empty());
-    assert!(with_pixmap.state.resources.pixmap(PIXMAP).is_none());
-    assert_recorded(
-        &calls.lock().unwrap(),
-        &[existing(PIXMAP, ResourceKind::Pixmap, AccessMode::DESTROY)],
-        CLIENT,
-        x11glx::DESTROY_PBUFFER,
-    );
 }

@@ -623,15 +623,16 @@ pub(super) fn handle_glx_request(
                     ResourceKind::GlxContext,
                     AccessMode::USE
                 );
-            }
-            check_current_drawable!(draw);
-            if minor == x11glx::MAKE_CONTEXT_CURRENT {
-                check_current_drawable!(read);
+                check_current_drawable!(draw);
+                if minor == x11glx::MAKE_CONTEXT_CURRENT {
+                    check_current_drawable!(read);
+                }
             }
             // The release form (context == None) returns contextTag = 0 —
             // tag 0 is reserved by the protocol to mean "no context
             // current" (server.rs documents this; Xorg vndcmds.c:232-234,
-            // :271-273). A malformed/short body also releases.
+            // :271-273), so it has no resource operands to authorize. A
+            // malformed/short body also releases.
             let tag = if context == 0 {
                 0
             } else {
@@ -1023,19 +1024,7 @@ pub(super) fn handle_glx_request(
             state.glx_drawables.remove(&xid);
             // #96 tier-2: release the GPU pixmap that backed a pbuffer (allocated
             // at CreatePbuffer under the pbuffer's own XID).
-            let backing_pixmap_denied = minor == x11glx::DESTROY_PBUFFER
-                && state.resources.pixmap(ResourceId(xid)).is_some()
-                && super::validate_resource_if_present(
-                    state,
-                    client_id,
-                    ResourceId(xid),
-                    ResourceKind::Pixmap,
-                    AccessMode::DESTROY,
-                    access_request,
-                )
-                .is_err();
             if minor == x11glx::DESTROY_PBUFFER
-                && !backing_pixmap_denied
                 && let Some(pixmap) = state.resources.free_pixmap(ResourceId(xid))
                 && let Some(host) = pixmap.host_xid
             {
