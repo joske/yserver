@@ -1807,6 +1807,46 @@ impl ServerState {
         })
     }
 
+    /// Ask installed policies whether a client may send this event batch to a window.
+    // The core and XI send-site tasks consume this interface in the same PR series.
+    #[allow(dead_code)]
+    pub(crate) fn check_send(
+        &self,
+        sender: ClientId,
+        window: ResourceId,
+        device: Option<u16>,
+        events: &crate::access::EventBatch<'_>,
+        request: Option<crate::access::RequestOpcodes>,
+    ) -> crate::access::Decision {
+        if !self.policies_installed() {
+            return crate::access::Decision::Allow;
+        }
+        if sender == crate::resources::SERVER_OWNER {
+            return crate::access::Decision::Allow;
+        }
+        self.first_denial(request, |policy, context| {
+            policy.send(context, sender, window, device, events)
+        })
+    }
+
+    /// Ask installed policies whether a client may receive this event batch for a subject.
+    // Receive-site checks are introduced by the later tasks in the same PR series.
+    #[allow(dead_code)]
+    pub(crate) fn check_receive(
+        &self,
+        recipient: ClientId,
+        subject: crate::access::EventSubject,
+        events: &crate::access::EventBatch<'_>,
+        request: Option<crate::access::RequestOpcodes>,
+    ) -> crate::access::Decision {
+        if !self.policies_installed() {
+            return crate::access::Decision::Allow;
+        }
+        self.first_denial(request, |policy, context| {
+            policy.receive(context, recipient, subject, events)
+        })
+    }
+
     /// Ask installed policies about a server operation, stopping at the first denial.
     pub(crate) fn check_server(
         &self,
