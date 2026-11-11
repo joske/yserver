@@ -1,6 +1,8 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind},
     core_loop::process_request::{
-        RequestOutcome, emit_x11_error_with_minor, randr_ext::active_monitors, write_to_client,
+        RequestOutcome, check_resource, emit_x11_error_with_minor, randr_ext::active_monitors,
+        write_to_client,
     },
     server::ServerState,
 };
@@ -23,6 +25,10 @@ pub(in crate::core_loop::process_request) fn handle_xinerama_request(
         .get(&client_id.0)
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
+    let request = RequestOpcodes {
+        major: XINERAMA_MAJOR_OPCODE,
+        minor,
+    };
 
     // RRXineramaScreenCount counts every monitor (`RRMonitorCountList`,
     // get_active FALSE); QueryScreens lists only the non-empty ones
@@ -81,6 +87,15 @@ pub(in crate::core_loop::process_request) fn handle_xinerama_request(
                     XINERAMA_MAJOR_OPCODE,
                 );
             }
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                ResourceId(window),
+                ResourceKind::Window,
+                AccessMode::GET_ATTR
+            );
             xin::encode_get_state_reply(byte_order, sequence, true, window)
         }
         xin::GET_SCREEN_COUNT => {
@@ -97,6 +112,15 @@ pub(in crate::core_loop::process_request) fn handle_xinerama_request(
                     XINERAMA_MAJOR_OPCODE,
                 );
             }
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                ResourceId(window),
+                ResourceKind::Window,
+                AccessMode::GET_ATTR
+            );
             #[allow(clippy::cast_possible_truncation)]
             let count = screen_count as u8;
             xin::encode_get_screen_count_reply(byte_order, sequence, count, window)
@@ -116,6 +140,15 @@ pub(in crate::core_loop::process_request) fn handle_xinerama_request(
                     XINERAMA_MAJOR_OPCODE,
                 );
             }
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                ResourceId(window),
+                ResourceKind::Window,
+                AccessMode::GET_ATTR
+            );
             xin::encode_get_screen_size_reply(
                 byte_order,
                 sequence,

@@ -123,6 +123,11 @@ pub enum RecordedCall {
     ReleaseRedirectedBacking(u32),
     RetainBackingStorage(u32),
     DropBackingStorage(u32),
+    ReprobeConnectors,
+    SetLogicalScreenSize {
+        width: u16,
+        height: u16,
+    },
     PaintWindowBorderRects {
         host_xid: u32,
         rects: Vec<yserver_protocol::x11::xfixes::RegionRect>,
@@ -312,6 +317,12 @@ pub enum RecordedCall {
         mode: Option<ModeSpec>,
         x: i32,
         y: i32,
+    },
+    CrtcGammaSize {
+        crtc: u32,
+    },
+    GetCrtcGamma {
+        crtc: u32,
     },
     /// GLX-TFP Task 3.4: `acquire_glx_pixmap_export(host_xid)` called.
     AcquireGlxPixmapExport(u32),
@@ -1445,6 +1456,16 @@ impl Backend for RecordingBackend {
         (self.randr_outputs.clone(), self.randr_modes.clone())
     }
 
+    fn reprobe_connectors(&mut self, _state: &mut crate::server::ServerState) -> io::Result<()> {
+        self.record(RecordedCall::ReprobeConnectors);
+        Ok(())
+    }
+
+    fn set_logical_screen_size(&mut self, width: u16, height: u16) -> io::Result<()> {
+        self.record(RecordedCall::SetLogicalScreenSize { width, height });
+        Ok(())
+    }
+
     fn randr_providers(&mut self) -> Vec<crate::randr::RandrProvider> {
         self.randr_providers.clone()
     }
@@ -1596,7 +1617,8 @@ impl Backend for RecordingBackend {
         Ok(self.provider_output_source_changed)
     }
 
-    fn crtc_gamma_size(&self, _crtc: u32) -> u16 {
+    fn crtc_gamma_size(&self, crtc: u32) -> u16 {
+        self.record(RecordedCall::CrtcGammaSize { crtc });
         256
     }
 
@@ -1763,6 +1785,7 @@ impl Backend for RecordingBackend {
     }
 
     fn get_crtc_gamma(&self, crtc: u32) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+        self.record(RecordedCall::GetCrtcGamma { crtc });
         if let Some(lut) = self.gamma.borrow().get(&crtc) {
             return lut.clone();
         }

@@ -179,6 +179,8 @@ pub enum ProviderRelationshipError {
     /// The initiating provider is not a secondary GPU-screen provider
     /// (`BadValue`).
     NotGpuProvider(u32),
+    /// An installed access policy denied a resolved provider operand.
+    AccessDenied { code: u8, value: u32 },
 }
 
 /// A mode's timing after the `Option<ModeTiming>` fallback has been
@@ -511,21 +513,33 @@ impl RandrState {
     /// Validate `SetProviderOutputSource` in Xorg's order: the initiating
     /// sink provider's existence and capability, the optional source
     /// provider's existence and capability, then the initiating provider's
-    /// secondary-GPU role.
+    /// secondary-GPU role. Each resolved provider is passed to
+    /// `check_resource` immediately after lookup and before its capability.
     pub fn validate_provider_output_source(
         &self,
         provider_id: u32,
         source_provider_id: u32,
+        mut check_resource: impl FnMut(
+            u32,
+            crate::access::ResourceKind,
+        ) -> Result<(), ProviderRelationshipError>,
     ) -> Result<(), ProviderRelationshipError> {
         let provider = self
             .provider(provider_id)
             .ok_or(ProviderRelationshipError::UnknownProvider(provider_id))?;
+        if provider_id != 0 {
+            check_resource(provider_id, crate::access::ResourceKind::RandrProvider)?;
+        }
         if provider.capabilities & proto::PROVIDER_CAPABILITY_SINK_OUTPUT == 0 {
             return Err(ProviderRelationshipError::MissingCapability(provider_id));
         }
         if source_provider_id != 0 {
             let source = self.provider(source_provider_id).ok_or(
                 ProviderRelationshipError::UnknownProvider(source_provider_id),
+            )?;
+            check_resource(
+                source_provider_id,
+                crate::access::ResourceKind::RandrProvider,
             )?;
             if source.capabilities & proto::PROVIDER_CAPABILITY_SOURCE_OUTPUT == 0 {
                 return Err(ProviderRelationshipError::MissingCapability(
@@ -542,14 +556,23 @@ impl RandrState {
     /// Validate `SetProviderOffloadSink` in Xorg's order: the initiating
     /// source provider's existence, capability, and secondary-GPU role,
     /// followed by the optional sink provider's existence and capability.
+    /// Each resolved provider is passed to `check_resource` immediately
+    /// after lookup and before its capability.
     pub fn validate_provider_offload_sink(
         &self,
         provider_id: u32,
         sink_provider_id: u32,
+        mut check_resource: impl FnMut(
+            u32,
+            crate::access::ResourceKind,
+        ) -> Result<(), ProviderRelationshipError>,
     ) -> Result<(), ProviderRelationshipError> {
         let provider = self
             .provider(provider_id)
             .ok_or(ProviderRelationshipError::UnknownProvider(provider_id))?;
+        if provider_id != 0 {
+            check_resource(provider_id, crate::access::ResourceKind::RandrProvider)?;
+        }
         if provider.capabilities & proto::PROVIDER_CAPABILITY_SOURCE_OFFLOAD == 0 {
             return Err(ProviderRelationshipError::MissingCapability(provider_id));
         }
@@ -562,6 +585,7 @@ impl RandrState {
         let sink = self
             .provider(sink_provider_id)
             .ok_or(ProviderRelationshipError::UnknownProvider(sink_provider_id))?;
+        check_resource(sink_provider_id, crate::access::ResourceKind::RandrProvider)?;
         if sink.capabilities & proto::PROVIDER_CAPABILITY_SINK_OFFLOAD == 0 {
             return Err(ProviderRelationshipError::MissingCapability(
                 sink_provider_id,
@@ -769,7 +793,8 @@ impl RandrState {
 
     /// Validate arity + output/mode resolution for `SetCrtcConfig` (Xorg
     /// `rrcrtc.c` order, EXCLUDING rotation — the handler does that
-    /// after). `Ok(None)` = disable; `Ok(Some(mode))` = enable with this
+    /// after). `check_resource` runs immediately after each output or mode
+    /// resolves. `Ok(None)` = disable; `Ok(Some(mode))` = enable with this
     /// resolved mode;
     /// `Err((code, error_value))` = protocol error + field-specific
     /// `errorValue`.
@@ -778,6 +803,7 @@ impl RandrState {
         crtc_id: u32,
         mode_id: u32,
         outputs: &[u32],
+        mut check_resource: impl FnMut(u32, crate::access::ResourceKind) -> Result<(), (u8, u32)>,
     ) -> Result<Option<RandrMode>, (u8, u32)> {
         use yserver_protocol::x11::error;
         // 1. mode/outputs arity. errorValue = the addressed crtc.
@@ -795,6 +821,7 @@ impl RandrState {
             let Some(out) = self.outputs.iter().find(|o| o.output_id == oid) else {
                 return Err((error::BAD_MATCH, oid)); // unknown output
             };
+            check_resource(oid, crate::access::ResourceKind::RandrOutput)?;
             if out.crtc_id != crtc_id {
                 return Err((error::BAD_MATCH, crtc_id)); // output doesn't drive crtc
             }
@@ -815,6 +842,7 @@ impl RandrState {
             .find(|m| m.mode_id == mode_id)
             .copied()
             .ok_or((error::BAD_MATCH, mode_id))?;
+        check_resource(mode_id, crate::access::ResourceKind::RandrMode)?;
         Ok(Some(mode))
     }
 
@@ -1358,41 +1386,42 @@ mod tests {
             },
         ]);
 
-        assert_eq!(state.validate_provider_output_source(1, 2), Ok(()));
-        assert_eq!(state.validate_provider_output_source(1, 0), Ok(()));
+        let allow = |_, _| Ok(());
+        assert_eq!(state.validate_provider_output_source(1, 2, allow), Ok(()));
+        assert_eq!(state.validate_provider_output_source(1, 0, allow), Ok(()));
         assert_eq!(
-            state.validate_provider_output_source(99, 2),
+            state.validate_provider_output_source(99, 2, allow),
             Err(ProviderRelationshipError::UnknownProvider(99))
         );
         assert_eq!(
-            state.validate_provider_output_source(5, 99),
+            state.validate_provider_output_source(5, 99, allow),
             Err(ProviderRelationshipError::MissingCapability(5)),
             "the initiating sink capability precedes peer lookup"
         );
         assert_eq!(
-            state.validate_provider_output_source(5, 0),
+            state.validate_provider_output_source(5, 0, allow),
             Err(ProviderRelationshipError::MissingCapability(5)),
             "detach still validates the initiating sink capability"
         );
         assert_eq!(
-            state.validate_provider_output_source(1, 99),
+            state.validate_provider_output_source(1, 99, allow),
             Err(ProviderRelationshipError::UnknownProvider(99))
         );
         assert_eq!(
-            state.validate_provider_output_source(1, 5),
+            state.validate_provider_output_source(1, 5, allow),
             Err(ProviderRelationshipError::MissingCapability(5))
         );
         assert_eq!(
-            state.validate_provider_output_source(6, 99),
+            state.validate_provider_output_source(6, 99, allow),
             Err(ProviderRelationshipError::UnknownProvider(99)),
             "output-source peer lookup precedes the initiating GPU-role check"
         );
         assert_eq!(
-            state.validate_provider_output_source(6, 2),
+            state.validate_provider_output_source(6, 2, allow),
             Err(ProviderRelationshipError::NotGpuProvider(6))
         );
         assert_eq!(
-            state.validate_provider_output_source(6, 0),
+            state.validate_provider_output_source(6, 0, allow),
             Err(ProviderRelationshipError::NotGpuProvider(6)),
             "detach still validates the initiating GPU role"
         );
@@ -1411,37 +1440,38 @@ mod tests {
             },
         ]);
 
-        assert_eq!(state.validate_provider_offload_sink(3, 4), Ok(()));
-        assert_eq!(state.validate_provider_offload_sink(3, 0), Ok(()));
+        let allow = |_, _| Ok(());
+        assert_eq!(state.validate_provider_offload_sink(3, 4, allow), Ok(()));
+        assert_eq!(state.validate_provider_offload_sink(3, 0, allow), Ok(()));
         assert_eq!(
-            state.validate_provider_offload_sink(99, 4),
+            state.validate_provider_offload_sink(99, 4, allow),
             Err(ProviderRelationshipError::UnknownProvider(99))
         );
         assert_eq!(
-            state.validate_provider_offload_sink(5, 99),
+            state.validate_provider_offload_sink(5, 99, allow),
             Err(ProviderRelationshipError::MissingCapability(5)),
             "the initiating source capability precedes peer lookup"
         );
         assert_eq!(
-            state.validate_provider_offload_sink(5, 0),
+            state.validate_provider_offload_sink(5, 0, allow),
             Err(ProviderRelationshipError::MissingCapability(5)),
             "detach still validates the initiating source capability"
         );
         assert_eq!(
-            state.validate_provider_offload_sink(3, 99),
+            state.validate_provider_offload_sink(3, 99, allow),
             Err(ProviderRelationshipError::UnknownProvider(99))
         );
         assert_eq!(
-            state.validate_provider_offload_sink(3, 5),
+            state.validate_provider_offload_sink(3, 5, allow),
             Err(ProviderRelationshipError::MissingCapability(5))
         );
         assert_eq!(
-            state.validate_provider_offload_sink(6, 99),
+            state.validate_provider_offload_sink(6, 99, allow),
             Err(ProviderRelationshipError::NotGpuProvider(6)),
             "offload checks the initiating GPU role before peer lookup"
         );
         assert_eq!(
-            state.validate_provider_offload_sink(6, 0),
+            state.validate_provider_offload_sink(6, 0, allow),
             Err(ProviderRelationshipError::NotGpuProvider(6)),
             "detach still validates the initiating GPU role"
         );
@@ -2421,7 +2451,7 @@ mod tests {
     fn set_crtc_config_mode_none_with_outputs_is_badmatch() {
         let st = one_output_state();
         assert_eq!(
-            st.validate_set_crtc_config(2, 0, &[1]),
+            st.validate_set_crtc_config(2, 0, &[1], |_, _| Ok(())),
             Err((x11_err::BAD_MATCH, 2))
         );
     }
@@ -2430,7 +2460,7 @@ mod tests {
     fn set_crtc_config_mode_set_with_no_outputs_is_badmatch() {
         let st = one_output_state();
         assert_eq!(
-            st.validate_set_crtc_config(2, 7, &[]),
+            st.validate_set_crtc_config(2, 7, &[], |_, _| Ok(())),
             Err((x11_err::BAD_MATCH, 2))
         );
     }
@@ -2440,7 +2470,7 @@ mod tests {
         let st = one_output_state();
         // crtc 999 isn't this output's crtc → errorValue = the bad crtc.
         assert_eq!(
-            st.validate_set_crtc_config(999, 7, &[1]),
+            st.validate_set_crtc_config(999, 7, &[1], |_, _| Ok(())),
             Err((x11_err::BAD_MATCH, 999))
         );
     }
@@ -2450,7 +2480,7 @@ mod tests {
         let st = one_output_state();
         // bad mode → errorValue = the bad mode id.
         assert_eq!(
-            st.validate_set_crtc_config(2, 555, &[1]),
+            st.validate_set_crtc_config(2, 555, &[1], |_, _| Ok(())),
             Err((x11_err::BAD_MATCH, 555))
         );
     }
@@ -2459,7 +2489,7 @@ mod tests {
     fn set_crtc_config_valid_enable_resolves_mode() {
         let st = one_output_state();
         let mode = st
-            .validate_set_crtc_config(2, 8, &[1])
+            .validate_set_crtc_config(2, 8, &[1], |_, _| Ok(()))
             .expect("valid")
             .expect("enable");
         assert_eq!((mode.width, mode.height), (1280, 720));
@@ -2468,7 +2498,10 @@ mod tests {
     #[test]
     fn set_crtc_config_valid_disable() {
         let st = one_output_state();
-        assert_eq!(st.validate_set_crtc_config(2, 0, &[]), Ok(None));
+        assert_eq!(
+            st.validate_set_crtc_config(2, 0, &[], |_, _| Ok(())),
+            Ok(None)
+        );
     }
 
     fn scale_transform(word: i32) -> CrtcTransform {

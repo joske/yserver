@@ -1292,7 +1292,7 @@ fn validate_gc_only(
     }
 }
 
-fn validate_resource_access(
+pub(super) fn validate_resource_access(
     state: &ServerState,
     client: ClientId,
     target: ResourceTarget,

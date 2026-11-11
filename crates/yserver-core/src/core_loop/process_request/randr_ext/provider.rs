@@ -1,9 +1,10 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind},
     backend::Backend,
     core_loop::process_request::{
-        RANDR_BAD_PROVIDER, RequestOutcome, emit_x11_error_with_minor,
+        RANDR_BAD_PROVIDER, RequestOutcome, check_resource, emit_x11_error_with_minor,
         randr_ext::{RANDR_MAJOR_OPCODE, request_xid, warn_randr_unsupported_once},
-        write_to_client,
+        validate_resource_if_present, write_to_client,
     },
     properties,
     server::ServerState,
@@ -26,6 +27,7 @@ fn provider_relationship_protocol_error(
         // client->errorValue, so the wire value remains zero.
         crate::randr::ProviderRelationshipError::MissingCapability(_)
         | crate::randr::ProviderRelationshipError::NotGpuProvider(_) => (x11::error::BAD_VALUE, 0),
+        crate::randr::ProviderRelationshipError::AccessDenied { code, value } => (code, value),
     }
 }
 
@@ -62,6 +64,19 @@ pub(super) fn handle_randr_get_providers(
             RANDR_MAJOR_OPCODE,
         );
     }
+    let request = RequestOpcodes {
+        major: RANDR_MAJOR_OPCODE,
+        minor,
+    };
+    check_resource!(
+        state,
+        client_id,
+        sequence,
+        request,
+        ResourceId(window),
+        ResourceKind::Window,
+        AccessMode::GET_ATTR
+    );
     let timestamp = state.randr.timestamp;
     let providers: Vec<u32> = state
         .randr
@@ -108,6 +123,21 @@ pub(super) fn handle_randr_get_provider_info(
             RANDR_MAJOR_OPCODE,
         );
     };
+    let request = RequestOpcodes {
+        major: RANDR_MAJOR_OPCODE,
+        minor,
+    };
+    if req.provider != 0 {
+        check_resource!(
+            state,
+            client_id,
+            sequence,
+            request,
+            ResourceId(req.provider),
+            ResourceKind::RandrProvider,
+            AccessMode::READ
+        );
+    }
     // Xorg accepts config_timestamp but does not use it for this
     // request; a live provider always reports RRSetConfigSuccess.
     let _ = req.config_timestamp;
@@ -160,10 +190,27 @@ pub(super) fn handle_randr_set_provider_offload_sink(
             RANDR_MAJOR_OPCODE,
         );
     };
-    if let Err(error) = state
-        .randr
-        .validate_provider_offload_sink(req.provider, req.sink_provider)
-    {
+    let request = RequestOpcodes {
+        major: RANDR_MAJOR_OPCODE,
+        minor,
+    };
+    if let Err(error) = state.randr.validate_provider_offload_sink(
+        req.provider,
+        req.sink_provider,
+        |provider, kind| {
+            validate_resource_if_present(
+                state,
+                client_id,
+                ResourceId(provider),
+                kind,
+                AccessMode::READ,
+                request,
+            )
+            .map_err(|(code, value)| {
+                crate::randr::ProviderRelationshipError::AccessDenied { code, value }
+            })
+        },
+    ) {
         let (error_code, error_value) = provider_relationship_protocol_error(error);
         return emit_x11_error_with_minor(
             state,
@@ -215,10 +262,27 @@ pub(super) fn handle_randr_set_provider_output_source(
             RANDR_MAJOR_OPCODE,
         );
     };
-    if let Err(error) = state
-        .randr
-        .validate_provider_output_source(req.provider, req.source_provider)
-    {
+    let request = RequestOpcodes {
+        major: RANDR_MAJOR_OPCODE,
+        minor,
+    };
+    if let Err(error) = state.randr.validate_provider_output_source(
+        req.provider,
+        req.source_provider,
+        |provider, kind| {
+            validate_resource_if_present(
+                state,
+                client_id,
+                ResourceId(provider),
+                kind,
+                AccessMode::READ,
+                request,
+            )
+            .map_err(|(code, value)| {
+                crate::randr::ProviderRelationshipError::AccessDenied { code, value }
+            })
+        },
+    ) {
         let (error_code, error_value) = provider_relationship_protocol_error(error);
         return emit_x11_error_with_minor(
             state,
@@ -367,6 +431,28 @@ pub(super) fn handle_randr_provider_property(
             provider,
             u16::from(minor),
             RANDR_MAJOR_OPCODE,
+        );
+    }
+    let request = RequestOpcodes {
+        major: RANDR_MAJOR_OPCODE,
+        minor,
+    };
+    let mode = if minor == x11randr::RR_GET_PROVIDER_PROPERTY
+        && body.get(20).is_some_and(|delete| *delete != 0)
+    {
+        AccessMode::READ | AccessMode::WRITE
+    } else {
+        AccessMode::READ
+    };
+    if provider != 0 {
+        check_resource!(
+            state,
+            client_id,
+            sequence,
+            request,
+            ResourceId(provider),
+            ResourceKind::RandrProvider,
+            mode
         );
     }
     let request_name = match minor {
