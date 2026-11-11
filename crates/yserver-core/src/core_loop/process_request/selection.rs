@@ -460,7 +460,13 @@ pub(crate) fn apply_convert_selection(
             "client {} #{} ConvertSelection -> owner 0x{:x}",
             client_id.0, sequence.0, owner_window.0
         );
-    } else if crate::rootless::selection::note_refusal(state, requestor, selection, target_atom) {
+    } else if crate::rootless::selection::note_refusal(
+        state,
+        requestor,
+        time_val,
+        selection,
+        target_atom,
+    ) {
         // No owner, and the server's window asked: its host hears it.
     } else {
         // No owner, or its setter is gone (`dix/selection.c:297-301`):
@@ -565,7 +571,7 @@ pub(super) fn handle_send_event(
         if crate::rootless::selection::note_selection_notify(
             state,
             req.destination,
-            [word(12), word(16), word(20)],
+            [word(4), word(12), word(16), word(20)],
         ) {
             debug!(
                 "client {} #{} SendEvent SelectionNotify to the server's window 0x{:x}",

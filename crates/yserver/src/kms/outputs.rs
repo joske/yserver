@@ -146,6 +146,16 @@ pub(crate) fn primary_output_center(outputs: &[ActiveOutput], fb_w: u16, fb_h: u
     )
 }
 
+/// Where the server's input comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputSource {
+    /// libinput, on the devices of the seat the server runs on.
+    Libinput,
+    /// A host's seat (the Wayland host): the host's window system owns the
+    /// devices, and no libinput context is made.
+    HostSeat,
+}
+
 /// One DRM/KMS device opened during platform bring-up.
 pub(crate) struct PlatformInitDevice {
     pub(crate) key: crate::platform::drm::DrmDeviceKey,
@@ -307,6 +317,7 @@ fn validate_unique_kms_device_identity(
 /// committed gets disabled before returning so the next caller starts clean.
 pub(crate) fn platform_init(
     device_paths: &[PathBuf],
+    input: InputSource,
     commit: fn(
         &crate::drm::Device,
         &crate::platform::drm::Output,
@@ -385,14 +396,17 @@ pub(crate) fn platform_init(
         .max()
         .unwrap_or(0);
 
-    let input_ctx = match crate::input::SendContext::new() {
-        Ok(ctx) => Some(ctx),
-        Err(err) => {
-            // Note: not a decision point. `run()` treats a missing context as
-            // fatal and refuses to start (see `input_startup_action`).
-            log::warn!("libinput SendContext unavailable: {err}");
-            None
-        }
+    let input_ctx = match input {
+        InputSource::HostSeat => None,
+        InputSource::Libinput => match crate::input::SendContext::new() {
+            Ok(ctx) => Some(ctx),
+            Err(err) => {
+                // Not a decision point: `run()` treats a missing context as
+                // fatal and refuses to start (see `input_startup_action`).
+                log::warn!("libinput SendContext unavailable: {err}");
+                None
+            }
+        },
     };
 
     Ok(PlatformInit {
@@ -450,11 +464,18 @@ mod platform_init_tests {
 
     #[test]
     fn accepts_empty_device_list_as_headless() {
-        let init = platform_init(&[], unused_commit)
+        let init = platform_init(&[], InputSource::Libinput, unused_commit)
             .expect("an empty DRM device list should produce a headless platform");
         assert!(init.devices.is_empty());
         assert!(init.layouts.is_empty());
         assert_eq!((init.fb_w, init.fb_h), (0, 0));
+    }
+
+    #[test]
+    fn a_host_seat_makes_no_libinput_context() {
+        let init = platform_init(&[], InputSource::HostSeat, unused_commit)
+            .expect("a host seat's headless platform");
+        assert!(init.input_ctx.is_none());
     }
 
     #[test]
@@ -464,7 +485,7 @@ mod platform_init_tests {
             std::env::temp_dir().join(format!("yserver-missing-drm-{suffix}-a")),
             std::env::temp_dir().join(format!("yserver-missing-drm-{suffix}-b")),
         ];
-        let init = platform_init(&paths, unused_commit)
+        let init = platform_init(&paths, InputSource::Libinput, unused_commit)
             .expect("missing DRM paths should produce a headless platform");
         assert!(init.devices.is_empty());
         assert!(init.layouts.is_empty());

@@ -116,6 +116,13 @@ impl CpuState {
         self.needs_full = true;
     }
 
+    /// The host made the native window again: a readback under way would
+    /// be a frame for the window before, and the next one is whole.
+    pub(crate) fn restart(&mut self) {
+        drop(self.take_in_flight());
+        self.needs_full = true;
+    }
+
     pub(crate) fn backing(&self) -> Option<DrawableId> {
         self.backing
     }

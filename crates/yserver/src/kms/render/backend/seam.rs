@@ -455,9 +455,15 @@ pub trait Platform: OutputSink + Sized + 'static {
     }
 
     /// `Backend::on_host_display_ready`: a rootless host's display
-    /// connection is readable; `false` when it closed.
+    /// connection is readable, or writable while it has output queued;
+    /// `false` when it closed.
     fn on_host_display_ready(_b: &mut XBackend<Self>, _state: &mut ServerState) -> bool {
         true
+    }
+
+    /// `Backend::host_display_wants_writable`.
+    fn host_display_wants_writable(_b: &XBackend<Self>) -> bool {
+        false
     }
 
     fn poll_deferred_input(_b: &mut XBackend<Self>, _state: &mut ServerState) {}

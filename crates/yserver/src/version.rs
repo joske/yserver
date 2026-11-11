@@ -13,7 +13,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const GIT_COMMIT: &str = env!("YSERVER_GIT_COMMIT");
 
 /// Built feature set, alphabetical and comma-separated with no spaces, e.g.
-/// `tcp-transport,xdmcp` or empty when neither is compiled in.
+/// `tcp-transport,xdmcp` or empty when none is compiled in. `wayland` is
+/// listed where the Wayland host is built (`cfg(wayland_host)`: the feature,
+/// on Linux).
 ///
 /// Ordering is by construction — each feature occupies a fixed array slot in
 /// alphabetical position, present (`Some`) or absent (`None`) depending on
@@ -25,12 +27,17 @@ fn feature_list() -> String {
     #[cfg(not(tcp_transport))]
     let tcp_transport: Option<&'static str> = None;
 
+    #[cfg(wayland_host)]
+    let wayland = Some("wayland");
+    #[cfg(not(wayland_host))]
+    let wayland: Option<&'static str> = None;
+
     #[cfg(feature = "xdmcp")]
     let xdmcp = Some("xdmcp");
     #[cfg(not(feature = "xdmcp"))]
     let xdmcp: Option<&'static str> = None;
 
-    [tcp_transport, xdmcp]
+    [tcp_transport, wayland, xdmcp]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
@@ -57,27 +64,42 @@ mod tests {
     use super::*;
 
     // Pins the exact, literal suffix per build configuration. Each assertion
-    // only holds under the matching `--features` invocation; run all three to
-    // see all three strings. Names describe what is built, not which one is
+    // only holds under the matching `--features` invocation; run each to
+    // see its string. Names describe what is built, not which one is
     // the default — the default set is a policy that can change.
-    #[cfg(all(tcp_transport, feature = "xdmcp"))]
+    #[cfg(all(tcp_transport, feature = "xdmcp", not(wayland_host)))]
     #[test]
     fn feature_suffix_full_build() {
         assert_eq!(feature_list(), "tcp-transport,xdmcp");
         assert!(line().ends_with(" features=[tcp-transport,xdmcp]"));
     }
 
-    #[cfg(all(tcp_transport, not(feature = "xdmcp")))]
+    #[cfg(all(tcp_transport, not(feature = "xdmcp"), not(wayland_host)))]
     #[test]
     fn feature_suffix_tcp_transport_only() {
         assert_eq!(feature_list(), "tcp-transport");
         assert!(line().ends_with(" features=[tcp-transport]"));
     }
 
-    #[cfg(not(tcp_transport))]
+    #[cfg(all(not(tcp_transport), not(wayland_host)))]
     #[test]
     fn feature_suffix_minimal_build() {
         assert_eq!(feature_list(), "");
         assert!(line().ends_with(" features=[]"));
+    }
+
+    #[cfg(all(wayland_host, not(tcp_transport)))]
+    #[test]
+    fn feature_suffix_wayland_only() {
+        assert_eq!(feature_list(), "wayland");
+        assert!(line().ends_with(" features=[wayland]"));
+    }
+
+    // Between the other two, where the alphabet puts it.
+    #[cfg(all(wayland_host, feature = "xdmcp"))]
+    #[test]
+    fn feature_suffix_wayland_in_the_full_build() {
+        assert_eq!(feature_list(), "tcp-transport,wayland,xdmcp");
+        assert!(line().ends_with(" features=[tcp-transport,wayland,xdmcp]"));
     }
 }

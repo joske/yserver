@@ -206,6 +206,18 @@ impl WindowFrames {
         self.held.clear();
     }
 
+    /// The host made the native window again: it shows nothing, takes no
+    /// frame until its setup is done, and then a whole one, which no frame
+    /// before it (delivered late, or a buffer it filled) stands for.
+    pub(crate) fn restart(&mut self) {
+        self.readiness = Readiness::Setup;
+        self.visible = false;
+        self.gen_start = FrameSeq(self.next_seq);
+        self.last_delivered = None;
+        self.history.clear();
+        self.held.clear();
+    }
+
     /// The damage frame `n` carries: since the last delivered frame, or
     /// `full` (§4.5.2).
     pub(crate) fn frame_damage(&self, n: FrameSeq, full: Rect) -> Vec<Rect> {

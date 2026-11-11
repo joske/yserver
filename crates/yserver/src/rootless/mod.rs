@@ -191,6 +191,16 @@ impl Presenter {
                         w.host_event();
                     }
                 }
+                FrameEvent::Recreated { id } => {
+                    if let Some(w) = self.windows.get_mut(&id) {
+                        w.frames.restart();
+                        if let Path::Cpu(cpu) = &mut w.path {
+                            cpu.restart();
+                        }
+                        w.wanted = false;
+                        w.host_event();
+                    }
+                }
                 FrameEvent::Delivered { id, seq } => {
                     let Some(w) = self.windows.get_mut(&id) else {
                         continue;

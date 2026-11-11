@@ -57,6 +57,10 @@ pub enum SelectionEvent {
     /// The `SelectionNotify` a selection's owner sent the server's window
     /// that asked for it, or the server sent itself when nothing owned it.
     Notify {
+        /// The answer's time. ICCCM §2.2 has the owner answer with its
+        /// request's ([`convert_selection`]'s `time`), so an answer with
+        /// another time is to another request.
+        time: u32,
         selection: AtomId,
         /// The type asked for.
         target: AtomId,
@@ -257,6 +261,7 @@ pub(crate) fn note_selection_clear(
 pub(crate) fn note_refusal(
     state: &mut ServerState,
     requestor: ResourceId,
+    time: u32,
     selection: AtomId,
     target: AtomId,
 ) -> bool {
@@ -266,6 +271,7 @@ pub(crate) fn note_refusal(
     push(
         state,
         SelectionEvent::Notify {
+            time,
             selection,
             target,
             property: AtomId(0),
@@ -275,19 +281,21 @@ pub(crate) fn note_refusal(
 }
 
 /// `SendEvent` hook: a `SelectionNotify` for the server's window, the
-/// answer to a [`convert_selection`]. Whether it was taken here.
+/// answer to a [`convert_selection`]: its time, selection, target and
+/// property. Whether it was taken here.
 pub(crate) fn note_selection_notify(
     state: &mut ServerState,
     destination: ResourceId,
-    words: [u32; 3],
+    words: [u32; 4],
 ) -> bool {
     if state.rootless.is_none() || !is_bridge_window(state, destination) {
         return false;
     }
-    let [selection, target, property] = words;
+    let [time, selection, target, property] = words;
     push(
         state,
         SelectionEvent::Notify {
+            time,
             selection: AtomId(selection),
             target: AtomId(target),
             property: AtomId(property),
@@ -364,8 +372,10 @@ pub fn set_selection_owner(
 }
 
 /// Ask for `selection` as `target`, to be put in `property` on the server's
-/// selection window, as a client's `ConvertSelection` at `CurrentTime`
-/// would. The answer is a [`SelectionEvent::Notify`].
+/// selection window, as a client's `ConvertSelection` at `time` would. The
+/// answer is a [`SelectionEvent::Notify`], which has the time the owner
+/// answered with: its request's (ICCCM §2.2), so a host that asks each time
+/// with a time of its own knows which request an answer is to.
 ///
 /// # Errors
 ///
@@ -375,6 +385,7 @@ pub fn convert_selection(
     selection: AtomId,
     target: AtomId,
     property: AtomId,
+    time: u32,
 ) -> Result<(), SelectionError> {
     atoms_exist(state, &[selection, target, property])?;
     let requestor = selection_window(state);
@@ -384,7 +395,7 @@ pub fn convert_selection(
         SequenceNumber(0),
         requestor,
         [selection, target, property],
-        0,
+        time,
     );
     Ok(())
 }

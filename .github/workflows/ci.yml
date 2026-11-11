@@ -31,6 +31,10 @@ jobs:
           # what proves tcp-transport does not drag xdmcp back in.
           - name: xdmcp
             flags: "--features xdmcp"
+          # A fourth, for the rootless Wayland host: no other leg builds
+          # `src/wayland/` or the `cfg(wayland_host)` half of the rootless code.
+          - name: wayland
+            flags: "--features wayland"
     steps:
       - uses: actions/checkout@v7
       - name: Configure apt (mirror, retries)

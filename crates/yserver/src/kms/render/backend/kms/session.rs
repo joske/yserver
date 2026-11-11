@@ -129,12 +129,14 @@ impl KmsBackend {
     /// init failures from `KmsCore::new`.
     pub fn open(
         device_paths: &[std::path::PathBuf],
+        input: crate::kms::outputs::InputSource,
         console_guard: crate::kms::ConsoleGuardOpt,
         layout: Option<String>,
         vrr_mode: crate::launch::VrrMode,
     ) -> io::Result<Self> {
         Self::open_with_commit(
             device_paths,
+            input,
             console_guard,
             layout,
             vrr_mode,
@@ -144,6 +146,7 @@ impl KmsBackend {
 
     fn open_with_commit(
         device_paths: &[std::path::PathBuf],
+        input: crate::kms::outputs::InputSource,
         console_guard: crate::kms::ConsoleGuardOpt,
         layout: Option<String>,
         vrr_mode: crate::launch::VrrMode,
@@ -153,7 +156,7 @@ impl KmsBackend {
             ::drm::control::framebuffer::Handle,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
-        let platform = PlatformBackend::open_with_commit(device_paths, commit)?;
+        let platform = PlatformBackend::open_with_commit(device_paths, input, commit)?;
         let driver_name = platform.primary_device().and_then(|device| {
             device
                 .device
