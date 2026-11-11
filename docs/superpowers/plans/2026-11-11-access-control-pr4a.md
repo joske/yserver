@@ -74,8 +74,14 @@ decides, the spec binds; where it is silent, Xorg's behaviour is followed (user 
   - Not propagating: one send check at the destination; denial → `Success`, no delivery (Xorg `:5587`); then receive per
     recipient.
   - `InputFocus` with no focus (`None`) asks nothing and answers as today.
-  - The rootless `SelectionNotify` interception and the root `ClientMessage` handling are deliveries of this request:
-    the send check at the destination runs before the interception; a denial skips the interception.
+  - The rootless `SelectionNotify` interception and the root `ClientMessage` handling are deliveries of this request
+    whose recipient is the server itself (the host selection bridge, the rootless window manager), not a client
+    connection (sol r1 M-1). Order: the send check at the destination first; then a receive check with recipient
+    `SERVER_OWNER`, `EventSubject::Window(destination)`, the request's batch and opcodes, before the host queue insertion
+    (`SelectionEvent::Notify`) or the immediate effect (`_NET_REQUEST_FRAME_EXTENTS`, queued WM requests). Either denial
+    ends the request with `Success` and leaves the host queues and window-manager state unchanged. What the rootless
+    window manager does later with an accepted request is server work and is not checked (spec "Who is checked"). Xorg
+    has no rootless mode, so this follows the spec's receive contract (recipient, delivery window, batch).
 - **XI `SendExtensionEvent`** (`xi/dispatch/events.rs`, resolver `xi1_send_extension_event_resolve_targets`): the same
   rules, with `device = Some(request device id)` and the batch built from all supplied events. The spec asks the send
   check at every propagated candidate (Xorg checks only the non-propagated case, `Xi/exevents.c:2962-2974`); the spec
@@ -124,7 +130,7 @@ decides, the spec binds; where it is silent, Xorg's behaviour is followed (user 
   denied at a middle candidate while propagating (no delivery from that window or above);
   `receive_denied_for_all_selectors_continues_to_parent` (mutation: stop when the window has selectors);
   `receive_denied_creator_under_zero_mask_stops` (mutation: continue); `receive_denied_one_of_two_selectors` (the other
-  gets the event, the walk stops); `rootless_selection_notify_send_denied_skips_interception`; no-policy rows equal to
+  gets the event, the walk stops); `rootless_selection_notify_send_denied_skips_interception`; `rootless_interceptions_receive_denied_change_nothing` (send allowed, receive denied for `SERVER_OWNER`: no `SelectionEvent::Notify` queued, no WM request queued, no frame-extents change, `Success`; ASK row records recipient `SERVER_OWNER` and the destination window; mutation: check receive after the queue insertion); no-policy rows equal to
   today's bytes for every resolver branch.
 - [ ] **Steps 2–5.** Commit `… Task 2: core SendEvent`.
 
