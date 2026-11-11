@@ -1,7 +1,9 @@
 use crate::{
+    access::{AccessMode, RequestOpcodes, ResourceKind},
     backend::Backend,
     core_loop::process_request::{
-        RequestOutcome, drawable_exists, emit_x11_error, emit_x11_error_with_minor,
+        RequestOutcome, check_resource, drawable_exists, emit_x11_error, emit_x11_error_with_minor,
+        validate_resource_if_present,
         window_destroy::destroy_window_subtree,
         windows::{handle_create_window, handle_map_window},
         write_to_client,
@@ -132,6 +134,7 @@ fn emit_dpms_notify(state: &mut ServerState) {
 fn screen_saver_set_attributes(
     state: &mut ServerState,
     client_id: ClientId,
+    request: RequestOpcodes,
     body: &[u8],
 ) -> Result<(), (u8, u32)> {
     use crate::server::SaverAttributes;
@@ -147,6 +150,22 @@ fn screen_saver_set_attributes(
     if !drawable_exists(state, ResourceId(drawable)) {
         return Err((x11::error::BAD_DRAWABLE, drawable));
     }
+    validate_resource_if_present(
+        state,
+        client_id,
+        ResourceId(drawable),
+        ResourceKind::Window,
+        AccessMode::GET_ATTR,
+        request,
+    )?;
+    validate_resource_if_present(
+        state,
+        client_id,
+        ResourceId(drawable),
+        ResourceKind::Pixmap,
+        AccessMode::GET_ATTR,
+        request,
+    )?;
     let values: Vec<u32> = body[24..].chunks_exact(4).map(u32_at_slice).collect();
     if usize::try_from(value_mask.count_ones()).ok() != Some(values.len()) {
         return Err((x11::error::BAD_LENGTH, 0));
@@ -197,6 +216,29 @@ fn screen_saver_set_attributes(
         .is_some_and(|a| a.client != client_id)
     {
         return Err((x11::error::BAD_ACCESS, 0));
+    }
+    // These are CreateWindow value operands, so preserve its ascending bit order.
+    let mut value_index = 0;
+    for bit in 0..32 {
+        if value_mask & (1_u32 << bit) == 0 {
+            continue;
+        }
+        let value = values[value_index];
+        value_index += 1;
+        let (kind, mode, is_resource) = match bit {
+            0 => (
+                ResourceKind::Pixmap,
+                AccessMode::READ,
+                value != 0 && value != 1, // None and ParentRelative.
+            ),
+            2 => (ResourceKind::Pixmap, AccessMode::READ, value != 0), // CopyFromParent.
+            13 => (ResourceKind::Colormap, AccessMode::USE, value != 0), // CopyFromParent.
+            14 => (ResourceKind::Cursor, AccessMode::USE, value != 0), // None.
+            _ => continue,
+        };
+        if is_resource {
+            validate_resource_if_present(state, client_id, ResourceId(value), kind, mode, request)?;
+        }
     }
     state.screensaver.attributes = Some(SaverAttributes {
         client: client_id,
@@ -272,11 +314,47 @@ fn create_screen_saver_window(state: &mut ServerState, backend: &mut dyn Backend
     // every other XID it reads is the high half of the one before, 0.
     // dtsession's mask-0 window (override-redirect alone) is unaffected;
     // a mask with background pixel loses its override-redirect.
-    let values: Vec<u32> = values
+    let mut values: Vec<u32> = values
         .iter()
         .flat_map(|v| [*v, 0])
         .take(values.len())
         .collect();
+    let request = RequestOpcodes {
+        major: crate::nested::MIT_SCREEN_SAVER_MAJOR_OPCODE,
+        minor: yserver_protocol::x11::screensaver::SET_ATTRIBUTES,
+    };
+    let mut value_index = 0;
+    for bit in 0..15u32 {
+        let b = 1 << bit;
+        if mask & b == 0 {
+            continue;
+        }
+        let Some(value) = values.get(value_index).copied() else {
+            break;
+        };
+        let operand = match bit {
+            0 if value != 0 && value != 1 => Some((ResourceKind::Pixmap, AccessMode::READ)),
+            2 if value != 0 => Some((ResourceKind::Pixmap, AccessMode::READ)),
+            13 if value != 0 => Some((ResourceKind::Colormap, AccessMode::USE)),
+            14 if value != 0 => Some((ResourceKind::Cursor, AccessMode::USE)),
+            _ => None,
+        };
+        if let Some((kind, mode)) = operand
+            && validate_resource_if_present(
+                state,
+                attrs.client,
+                ResourceId(value),
+                kind,
+                mode,
+                request,
+            )
+            .is_err()
+        {
+            // Activation has no request to answer: neutralize this derived operand.
+            values[value_index] = 0;
+        }
+        value_index += 1;
+    }
     let window = crate::resources::SCREEN_SAVER_WINDOW;
     let mut body = Vec::with_capacity(28 + 4 * values.len());
     body.extend_from_slice(&window.0.to_le_bytes());
@@ -757,6 +835,10 @@ pub(super) fn handle_screen_saver_request(
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
     let minor_u16 = u16::from(minor);
+    let request = RequestOpcodes {
+        major: MIT_SCREEN_SAVER_MAJOR_OPCODE,
+        minor,
+    };
     debug!(
         "client {} #{} ScreenSaver::minor={} body_len={}",
         client_id.0,
@@ -779,7 +861,7 @@ pub(super) fn handle_screen_saver_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11ss::QUERY_INFO => {
-            if x11ss::parse_query_info_request(body).is_none() {
+            let Some(drawable) = x11ss::parse_query_info_request(body) else {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -789,7 +871,25 @@ pub(super) fn handle_screen_saver_request(
                     minor_u16,
                     MIT_SCREEN_SAVER_MAJOR_OPCODE,
                 );
-            }
+            };
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                ResourceId(drawable),
+                ResourceKind::Window,
+                AccessMode::GET_ATTR
+            );
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                ResourceId(drawable),
+                ResourceKind::Pixmap,
+                AccessMode::GET_ATTR
+            );
             debug_assert!(
                 !matches!(state.screensaver.active, ScreenSaverActive::Cycle),
                 "Cycle must never appear in screensaver.active — \
@@ -837,7 +937,7 @@ pub(super) fn handle_screen_saver_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11ss::SELECT_INPUT => {
-            let Some((_drawable, mask)) = x11ss::parse_select_input_request(body) else {
+            let Some((drawable, mask)) = x11ss::parse_select_input_request(body) else {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -848,6 +948,24 @@ pub(super) fn handle_screen_saver_request(
                     MIT_SCREEN_SAVER_MAJOR_OPCODE,
                 );
             };
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                ResourceId(drawable),
+                ResourceKind::Window,
+                AccessMode::GET_ATTR
+            );
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                ResourceId(drawable),
+                ResourceKind::Pixmap,
+                AccessMode::GET_ATTR
+            );
             if mask == 0 {
                 state.screensaver.selected_by.remove(&client_id);
             } else {
@@ -855,7 +973,7 @@ pub(super) fn handle_screen_saver_request(
             }
         }
         x11ss::SET_ATTRIBUTES => {
-            return match screen_saver_set_attributes(state, client_id, body) {
+            return match screen_saver_set_attributes(state, client_id, request, body) {
                 Ok(()) => Ok(RequestOutcome::Handled),
                 Err((code, value)) => emit_x11_error_with_minor(
                     state,
@@ -891,6 +1009,24 @@ pub(super) fn handle_screen_saver_request(
                     MIT_SCREEN_SAVER_MAJOR_OPCODE,
                 );
             }
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                ResourceId(drawable),
+                ResourceKind::Window,
+                AccessMode::GET_ATTR
+            );
+            check_resource!(
+                state,
+                client_id,
+                sequence,
+                request,
+                ResourceId(drawable),
+                ResourceKind::Pixmap,
+                AccessMode::GET_ATTR
+            );
             unset_screen_saver_attributes(state, _backend, client_id);
         }
         x11ss::SUSPEND => {

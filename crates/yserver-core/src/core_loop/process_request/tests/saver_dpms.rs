@@ -964,17 +964,6 @@ fn screen_saver_set_attributes_belongs_to_one_client_and_shows_a_window() {
     let bytes = read_all_available(&mut peer2);
     assert_eq!((bytes[0], bytes[1]), (0, x11::error::BAD_ACCESS));
 
-    // Mutation: remove the SERVER_OWNER fast path; the saver CreateWindow must stay authorized.
-    state.install_access_policy(Arc::new(DenyAllAccessPolicy));
-    let saver = crate::resources::SCREEN_SAVER_WINDOW;
-    apply_screen_saver_transition(&mut state, &mut backend, ScreenSaverActive::On, true);
-    let w = state.resources.window(saver).expect("saver window");
-    assert_eq!((w.width, w.height, w.parent), (1, 1, ROOT_WINDOW));
-    assert!(w.override_redirect);
-    assert_eq!(w.map_state, MapState::Viewable);
-    apply_screen_saver_transition(&mut state, &mut backend, ScreenSaverActive::Off, true);
-    assert!(state.resources.window(saver).is_none());
-
     request(
         &mut state,
         &mut backend,
@@ -993,6 +982,17 @@ fn screen_saver_set_attributes_belongs_to_one_client_and_shows_a_window() {
         read_all_available(&mut peer2).is_empty(),
         "client 2 after the unset"
     );
+
+    // Mutation: remove the SERVER_OWNER fast path; the saver CreateWindow must stay authorized.
+    state.install_access_policy(Arc::new(DenyAllAccessPolicy));
+    let saver = crate::resources::SCREEN_SAVER_WINDOW;
+    apply_screen_saver_transition(&mut state, &mut backend, ScreenSaverActive::On, true);
+    let w = state.resources.window(saver).expect("saver window");
+    assert_eq!((w.width, w.height, w.parent), (1, 1, ROOT_WINDOW));
+    assert!(w.override_redirect);
+    assert_eq!(w.map_state, MapState::Viewable);
+    apply_screen_saver_transition(&mut state, &mut backend, ScreenSaverActive::Off, true);
+    assert!(state.resources.window(saver).is_none());
 }
 
 #[test]
