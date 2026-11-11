@@ -262,6 +262,14 @@ fn provider_access_rows() -> Vec<OutputAccessRow> {
             AccessMode::READ | AccessMode::WRITE,
             Vec::new(),
         ),
+        row(
+            "RANDR GetProviderProperty raw delete 2",
+            rr::RR_GET_PROVIDER_PROPERTY,
+            provider_property_body(rr::RR_GET_PROVIDER_PROPERTY, PROVIDER, 2),
+            provider_target,
+            AccessMode::READ | AccessMode::WRITE,
+            Vec::new(),
+        ),
     ]
 }
 
@@ -582,6 +590,13 @@ fn output_access_rows(fixture: &mut RandrAccessFixture) -> Vec<OutputAccessRow> 
             output_get_property_body(output, property, 0),
             output_target,
             AccessMode::READ,
+        ),
+        row(
+            "RANDR GetOutputProperty raw delete 2",
+            15,
+            output_get_property_body(output, property, 2),
+            output_target,
+            AccessMode::READ | AccessMode::WRITE,
         ),
         row(
             "RANDR DestroyMode",
@@ -1112,6 +1127,7 @@ fn delete_monitor_denial_keeps_existing_monitor() {
 #[test]
 fn randr_output_deny_rows_match_the_site_table() {
     // Mutation: remove the READ check from GetOutputInfo; its row must stop returning the policy error.
+    // Mutation: change GetOutputProperty's raw delete check from != 0 to == 1; raw byte 2 must still be denied as READ | WRITE.
     use yserver_protocol::x11::randr as rr;
 
     let row_count = {
@@ -1128,8 +1144,11 @@ fn randr_output_deny_rows_match_the_site_table() {
                 .randr_select_masks
                 .insert((CLIENT.0, ROOT_WINDOW), rr::NOTIFY_MASK_OUTPUT_CHANGE);
         }
-        let primary_before = fixture.state.randr.primary_output;
+        let randr_before = format!("{:?}", fixture.state.randr);
+        let output_properties_before = format!("{:?}", fixture.state.randr_output_properties);
+        let select_masks_before = fixture.state.randr_select_masks.clone();
         let primary_explicit_before = fixture.state.randr_primary_output_explicit;
+        let primary_before = fixture.state.randr.primary_output;
         let backend_calls_before = fixture.backend.calls();
         let calls = Arc::new(Mutex::new(Vec::new()));
         fixture
@@ -1143,6 +1162,40 @@ fn randr_output_deny_rows_match_the_site_table() {
 
         let bytes = run_request(&mut fixture, row.major, row.minor, &row.body);
         assert_policy_error(&bytes, row.major, row.minor);
+        assert_eq!(
+            bytes.len(),
+            32,
+            "{} denial must not append events",
+            row.label
+        );
+        assert_eq!(
+            format!("{:?}", fixture.state.randr),
+            randr_before,
+            "{} denial must leave RANDR state unchanged",
+            row.label
+        );
+        assert_eq!(
+            format!("{:?}", fixture.state.randr_output_properties),
+            output_properties_before,
+            "{} denial must leave output properties unchanged",
+            row.label
+        );
+        assert_eq!(
+            fixture.state.randr_select_masks, select_masks_before,
+            "{} denial must leave selections unchanged",
+            row.label
+        );
+        assert_eq!(
+            fixture.state.randr_primary_output_explicit, primary_explicit_before,
+            "{} denial must leave primary metadata unchanged",
+            row.label
+        );
+        assert_eq!(
+            fixture.backend.calls(),
+            backend_calls_before,
+            "{} denial must make no backend calls",
+            row.label
+        );
         if row.minor == rr::RR_SET_OUTPUT_PRIMARY {
             assert_eq!(fixture.state.randr.primary_output, primary_before);
             assert_eq!(
@@ -1175,6 +1228,7 @@ fn randr_output_deny_rows_match_the_site_table() {
 #[test]
 fn randr_output_ask_rows_match_the_site_table() {
     // Mutation: change ListOutputProperties to ask GET_ATTR; this row's access-mode assertion must fail.
+    // Mutation: change GetOutputProperty's raw delete check from != 0 to == 1; raw byte 2 must still ask READ | WRITE.
     let mut fixture = randr_access_fixture();
     let rows = output_access_rows(&mut fixture);
     let calls = install_allow_policy(&mut fixture);
@@ -2119,6 +2173,7 @@ fn set_crtc_gamma_denied_before_size_check() {
 #[test]
 fn randr_provider_deny_rows_match_site_table() {
     // Mutation: remove GetProviderInfo's READ check; its row must stop returning the policy error.
+    // Mutation: change GetProviderProperty's raw delete check from != 0 to == 1; raw byte 2 must still be denied as READ | WRITE.
     for (row, before) in provider_access_rows() {
         let mut fixture = randr_access_fixture();
         install_provider_access_fixture(&mut fixture);
@@ -2142,6 +2197,12 @@ fn randr_provider_deny_rows_match_site_table() {
             row.label
         );
         assert_policy_error(&bytes, row.major, row.minor);
+        assert_eq!(
+            bytes.len(),
+            32,
+            "{} denial must not append events",
+            row.label
+        );
         assert_eq!(
             format!("{:?}", fixture.state.randr),
             randr_before,
@@ -2173,6 +2234,7 @@ fn randr_provider_deny_rows_match_site_table() {
 #[test]
 fn randr_provider_ask_rows_match_site_table() {
     // Mutation: use READ for GetProviderProperty with delete; this row must observe READ | WRITE.
+    // Mutation: change GetProviderProperty's raw delete check from != 0 to == 1; raw byte 2 must still ask READ | WRITE.
     let mut fixture = randr_access_fixture();
     install_provider_access_fixture(&mut fixture);
     let rows = provider_access_rows();

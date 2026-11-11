@@ -167,9 +167,11 @@ or an animated cursor's frames. Existing cursor release points sweep records
 whose host cursor is neither core-referenced nor reported alive by the backend.
 
 Server objects are still policy-visible targets: system SYNC counters and
-RANDR CRTCs and providers are asked with owner `SERVER_OWNER`, so a real
-client's request on one is checked. GLX context tags, screens, visuals and
-FBConfigs are not resources and are not checked.
+RANDR outputs, CRTCs, modes and providers are asked with owner `SERVER_OWNER`,
+so a real client's request on one is checked. This follows Xorg's RANDR
+resource lookups (`randr/rroutput.c:475`, `rrcrtc.c:1173`, `rrmode.c:339-358`,
+`rrprovider.c:153`). GLX context tags, screens, visuals and FBConfigs are not
+resources and are not checked.
 
 **Arbitrary-resource operands.** SYNC `SetPriority` / `GetPriority` resources
 and `XISetClientPointer` / `XIGetClientPointer` use a resolver that searches every policy-visible
@@ -265,6 +267,7 @@ Xnamespace tells apart requests that share a mode:
 | Extension access | the extension is reported as absent |
 | Extension dispatch | `BadRequest` with value 0, whatever the policy's error. Xorg also answers `BadRequest` (`Xext/xace.c:45-46`), but with `client->errorValue` as the value (`dix/dispatch.c:571-573`); that field is not reset between requests and successful handlers set it (`CreateGC`, `dix/dispatch.c:1559`), so Xorg leaks a stale value. Value 0 leaks nothing |
 | `QueryKeymap` and similar reads | the zeroed reply XLibre gives |
+| A denied effective MIT-SCREEN-SAVER value operand during activation | the operand is replaced with its neutral value (`None` for a background pixmap or cursor; `CopyFromParent` for a border pixmap or colormap), and saver-window creation continues with the remaining values; no error is reported |
 | `MapWindow` / `ReparentWindow` remap | `Success`; the window stays unmapped |
 | `MapSubwindows` / `UnmapSubwindows` / `CirculateWindow` derived child | the child is skipped; the request succeeds |
 | A derived target in `DestroySubwindows` | the loop stops, the remaining children stay unmapped, and the request succeeds (Xorg `dix/dispatch.c:852`) |
@@ -290,6 +293,15 @@ same checks; a policy decides how to treat it.
 
 Server-generated events have no sender, so the send check does not run for
 them. Their recipients do go through the receive check.
+
+MIT-SCREEN-SAVER attributes saved by `SetAttributes` are deferred work of the
+client that installed them. When activation computes the effective values for
+the saver window, yserver checks their resource operands as derived targets for
+that client. A denied operand is replaced with its role's neutral value, and
+activation continues without an error. The deferred-client relationship
+follows Xorg's saved `ScreenSaverAttrRec.client` and server-side saver-window
+creation (`Xext/saver.c:455-490, 722-854`); the effective-operand checks and
+neutral replacements are this policy's rule.
 
 ### Where the checks go
 
@@ -369,9 +381,13 @@ check, as in XLibre, because the input path keeps only the device and loses the
 client.
 
 **Property.** The window property handlers use the property hook. XI1 and XI2
-device properties use the device hook, and RANDR output properties the resource
-hook, as in XLibre. Requests that read and delete, such as `GetProperty` with
-`delete`, ask for both modes. Server writes through `change_property_as_server`
+device properties use the device hook; RANDR output properties use resource
+checks following Xorg's lookup sites. Requests that read and delete, such as
+`GetProperty` with `delete`, ask for both modes. RANDR `GetOutputProperty` and
+`GetProviderProperty` requests that read and delete likewise ask `READ | WRITE`
+on the output or provider. Xorg asks `WRITE` alone for these RANDR requests
+(`randr/rrproperty.c:626`, `rrproviderproperty.c:599`); yserver follows the
+combined read-and-delete rule. Server writes through `change_property_as_server`
 are not checked.
 
 **Extension dispatch and access.** Dispatch has one site in `process_request`,
@@ -423,7 +439,7 @@ until the last one.
 |---|---|---|
 | 1 | Interface, policy list, reset carry-over, context skeleton, lifecycle, admission record, server hook at the #321 sites | Sites run, list empty |
 | 2 | Extension access and dispatch checks | Same |
-| 3 | Resource and property checks, including creation and several-target requests | Same |
+| 3 | **Complete:** Resource and property checks, including creation and several-target requests; XRes and RECORD client specifiers deferred to PR 5 | Sites run, list empty |
 | 4 | Send and receive checks, with `EventSubject` | Same |
 | 5 | Device and client checks, remaining server sites | Same |
 | 6 | SECURITY in one step: protocol, generated credentials, rules, protections for untrusted pixels, dispatch and discovery | First denying policy |
