@@ -36,7 +36,7 @@ decides, the spec binds; where it is silent, Xorg's behaviour is followed (user 
 - Licensing: Xorg is MIT and may be read; no code copied.
 - Tests exercise production paths through `process_request`, with the shared recording/decision policy of
   `process_request/tests/extensions.rs`. Every DENY row asserts the policy's effect and that nothing else changed (no
-  bytes to any client, state unchanged). Every new test names the mutation that makes it fail, and every mutation is
+  bytes to the denied recipients, no state change); recipients the policy allowed keep their delivery. Every new test names the mutation that makes it fail, and every mutation is
   run and compiles. Suites run under CPU load. Test files stay under 6000 lines.
 
 ## Scope decisions
@@ -76,12 +76,19 @@ decides, the spec binds; where it is silent, Xorg's behaviour is followed (user 
   - `InputFocus` with no focus (`None`) asks nothing and answers as today.
   - The rootless `SelectionNotify` interception and the root `ClientMessage` handling are deliveries of this request
     whose recipient is the server itself (the host selection bridge, the rootless window manager), not a client
-    connection (sol r1 M-1). Order: the send check at the destination first; then a receive check with recipient
-    `SERVER_OWNER`, `EventSubject::Window(destination)`, the request's batch and opcodes, before the host queue insertion
-    (`SelectionEvent::Notify`) or the immediate effect (`_NET_REQUEST_FRAME_EXTENTS`, queued WM requests). Either denial
-    ends the request with `Success` and leaves the host queues and window-manager state unchanged. What the rootless
-    window manager does later with an accepted request is server work and is not checked (spec "Who is checked"). Xorg
-    has no rootless mode, so this follows the spec's receive contract (recipient, delivery window, batch).
+    connection (sol r1 M-1). The send check at the destination comes first, as for any send. The server's reception is
+    then one more recipient, asked `receive` with recipient `SERVER_OWNER`, `EventSubject::Window(destination)`, the
+    request's batch and opcodes; a denial skips only that reception, like any denied recipient (sol r2 M-1):
+    - `SelectionNotify` to a host-bridge window: the interception returns before the client resolver today, and that
+      window has no client recipients; the `SERVER_OWNER` receive check runs before the `SelectionEvent::Notify` queue
+      insertion; denial → nothing queued, `Success`.
+    - Root `ClientMessage`: ordinary delivery to root listeners happens first, with their own receive checks, exactly as
+      today's order ("delivery to other root listeners is unchanged", `docs/superpowers/specs/2026-10-19-rootless-core-design.md`);
+      then the `SERVER_OWNER` receive check before the rootless WM handling (queued WM requests,
+      `_NET_REQUEST_FRAME_EXTENTS`); denial → listeners keep their delivery, WM queues and state unchanged, `Success`.
+    What the rootless window manager does later with an accepted request is server work and is not checked (spec "Who
+    is checked"). Xorg has no rootless mode, so this follows the spec's receive contract (recipient, delivery window,
+    batch).
 - **XI `SendExtensionEvent`** (`xi/dispatch/events.rs`, resolver `xi1_send_extension_event_resolve_targets`): the same
   rules, with `device = Some(request device id)` and the batch built from all supplied events. The spec asks the send
   check at every propagated candidate (Xorg checks only the non-propagated case, `Xi/exevents.c:2962-2974`); the spec
@@ -130,7 +137,7 @@ decides, the spec binds; where it is silent, Xorg's behaviour is followed (user 
   denied at a middle candidate while propagating (no delivery from that window or above);
   `receive_denied_for_all_selectors_continues_to_parent` (mutation: stop when the window has selectors);
   `receive_denied_creator_under_zero_mask_stops` (mutation: continue); `receive_denied_one_of_two_selectors` (the other
-  gets the event, the walk stops); `rootless_selection_notify_send_denied_skips_interception`; `rootless_interceptions_receive_denied_change_nothing` (send allowed, receive denied for `SERVER_OWNER`: no `SelectionEvent::Notify` queued, no WM request queued, no frame-extents change, `Success`; ASK row records recipient `SERVER_OWNER` and the destination window; mutation: check receive after the queue insertion); no-policy rows equal to
+  gets the event, the walk stops); `rootless_selection_notify_send_denied_skips_interception`; `rootless_selection_notify_server_receive_denied_queues_nothing` (send allowed, `SERVER_OWNER` receive denied: no `SelectionEvent::Notify`, `Success`; mutation: check after the insertion); `rootless_root_client_message_server_receive_denied_keeps_listeners` (a root `SubstructureNotify` listener allowed, `SERVER_OWNER` denied: the listener gets the event, WM queues and frame extents unchanged; mutation: deny the whole request on the server denial); ASK rows record recipient `SERVER_OWNER` and the destination window; `send_and_receive_revocation` (sol r2 M-2: two identical requests through `process_request` with the existing mutable decision policy — first allowed and delivered, then send revoked: fresh send call, `Success`, nothing delivered; then send allowed and the recipient's receive revoked: fresh receive call, nothing to that recipient; mutation: cache the first decision); no-policy rows equal to
   today's bytes for every resolver branch.
 - [ ] **Steps 2–5.** Commit `… Task 2: core SendEvent`.
 
@@ -138,7 +145,7 @@ decides, the spec binds; where it is silent, Xorg's behaviour is followed (user 
 
 **Files:** `process_request/xi/dispatch/events.rs`, `process_request/xi/mod.rs`; tests in `access_send.rs`.
 
-- [ ] **Step 1: Failing tests:** as Task 2, with `device: Some(id)` and a multi-event batch (every event described);
+- [ ] **Step 1: Failing tests:** as Task 2 (revocation included), with `device: Some(id)` and a multi-event batch (every event described);
   send checked at every propagated candidate (mutation: check only the destination); the class do-not-propagate walk
   unchanged with no policy.
 - [ ] **Steps 2–5.** Commit `… Task 3: XI SendExtensionEvent`.
