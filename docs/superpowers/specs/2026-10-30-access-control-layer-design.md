@@ -1,7 +1,7 @@
 # Access control layer
 
-Status: draft, revised after the maintainer's second answer on #320: go ahead
-with the implementation plan. Nothing is implemented.
+Status: approved by the maintainer on #320. PRs 1, 2 and 3 of the series are
+implemented (see the series table); PRs 4 to 6 are not.
 
 ## Why
 
