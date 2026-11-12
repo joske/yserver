@@ -13,6 +13,7 @@ mod access_record;
 mod access_render;
 mod access_resources;
 mod access_saver;
+mod access_send;
 #[cfg(unix)]
 mod access_shm;
 mod access_sync;

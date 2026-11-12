@@ -211,6 +211,13 @@ fn is_bridge_window(state: &ServerState, window: ResourceId) -> bool {
         && state.resources.window_owner(window) == Some(SERVER_OWNER)
 }
 
+/// Whether a `SendEvent` addressed to `window` will be received by the host
+/// selection bridge. The request handler asks access policies before it
+/// queues the bridge's notification.
+pub(crate) fn is_selection_bridge_window(state: &ServerState, window: ResourceId) -> bool {
+    state.rootless.is_some() && is_bridge_window(state, window)
+}
+
 fn push(state: &mut ServerState, event: SelectionEvent) {
     if let Some(rootless) = state.rootless.as_mut() {
         rootless.selection.events.push(event);
@@ -281,7 +288,7 @@ pub(crate) fn note_selection_notify(
     destination: ResourceId,
     words: [u32; 3],
 ) -> bool {
-    if state.rootless.is_none() || !is_bridge_window(state, destination) {
+    if !is_selection_bridge_window(state, destination) {
         return false;
     }
     let [selection, target, property] = words;
@@ -404,8 +411,13 @@ pub fn send_selection_notify(
     requestor: ResourceId,
     [selection, target, property]: [AtomId; 3],
 ) -> Result<(), SelectionError> {
-    let targets = crate::core_loop::process_request::send_event_recipients(state, requestor, 0, 0)
-        .map_err(|_| SelectionError::BadWindow(requestor))?;
+    let candidates =
+        crate::core_loop::process_request::send_event_recipients(state, requestor, 0, 0)
+            .map_err(|_| SelectionError::BadWindow(requestor))?;
+    let targets: Vec<_> = candidates
+        .into_iter()
+        .flat_map(|candidate| candidate.recipients)
+        .collect();
     let mut event = [0u8; 32];
     event[0] = 31 | 0x80; // SelectionNotify, from SendEvent
     event[4..8].copy_from_slice(&time.to_le_bytes());

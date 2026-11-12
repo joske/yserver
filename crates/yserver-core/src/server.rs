@@ -1808,8 +1808,6 @@ impl ServerState {
     }
 
     /// Ask installed policies whether a client may send this event batch to a window.
-    // The core and XI send-site tasks consume this interface in the same PR series.
-    #[allow(dead_code)]
     pub(crate) fn check_send(
         &self,
         sender: ClientId,
@@ -1830,8 +1828,6 @@ impl ServerState {
     }
 
     /// Ask installed policies whether a client may receive this event batch for a subject.
-    // Receive-site checks are introduced by the later tasks in the same PR series.
-    #[allow(dead_code)]
     pub(crate) fn check_receive(
         &self,
         recipient: ClientId,
