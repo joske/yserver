@@ -45,10 +45,15 @@ pub(crate) fn send_client_message_as_server(
     r#type: &str,
     data: [u32; 5],
 ) {
-    let Ok(targets) = crate::core_loop::process_request::send_event_recipients(state, window, 0, 0)
+    let Ok(candidates) =
+        crate::core_loop::process_request::send_event_recipients(state, window, 0, 0)
     else {
         return;
     };
+    let targets: Vec<_> = candidates
+        .into_iter()
+        .flat_map(|candidate| candidate.recipients)
+        .collect();
     let r#type = state.atoms.intern(r#type, false);
     let mut event = [0u8; 32];
     event[0] = 33 | 0x80;

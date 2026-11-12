@@ -1,10 +1,11 @@
 use crate::{
-    access::{AccessMode, RequestOpcodes, ResourceKind},
+    access::{AccessMode, EventBatch, EventSubject, RequestOpcodes, ResourceKind},
     backend::{Backend, OriginContext},
     core_loop::{
         fanout::fanout_event_to_clients,
         process_request::{
-            RequestOutcome, XI2_FIRST_ERROR, XI2_MAJOR_OPCODE, emit_x11_error_with_minor,
+            RequestOutcome, XI2_FIRST_ERROR, XI2_MAJOR_OPCODE, describe_wire_event,
+            emit_x11_error_with_minor,
             xi::{
                 XI1_ERROR_BAD_CLASS, XI1_ERROR_BAD_DEVICE, XI1_ERROR_BAD_MODE,
                 dispatch::xi_write_reply, emit_xi2_device_changed_bootstrap, xi1_device_valid,
@@ -693,11 +694,13 @@ pub(super) fn handle_xi1_get_device_dont_propagate_list(
 // count, num_events } + events (32 bytes each) + classes.
 pub(super) fn handle_xi1_send_extension_event(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
     byte_order: ClientByteOrder,
     minor: u8,
+    access_request: RequestOpcodes,
 ) -> io::Result<RequestOutcome> {
     {
         if body.len() < 12 {
@@ -776,8 +779,8 @@ pub(super) fn handle_xi1_send_extension_event(
         // class-intersection rule preserves XI1 event chains
         // (DeviceKeyPress + DeviceValuator continuation), which
         // the client selects via the head class only.
-        // Propagate semantics are not yet honoured — direct-window
-        // match only, like core SendEvent with propagate=False.
+        // Propagation follows the XI class do-not-propagate walk in
+        // `xi1_send_extension_event_resolve_targets` below.
         //
         // Specials (xserver.git Xi/exevents.c:2915-2944):
         //  - PointerWindow → sprite window (deepest mapped window
@@ -854,42 +857,82 @@ pub(super) fn handle_xi1_send_extension_event(
                     .iter()
                     .all(|c| (c & 0xff) as u8 == XI1_NO_EXTENSION_EVENT_OFFSET);
             let propagate = matches!(body.get(5), Some(&p) if p != 0);
-            let targets = xi1_send_extension_event_resolve_targets(
+            // Keep the full batch for policy checks and the existing fanout
+            // writer; the template bytes themselves stay in sender order.
+            let mut events_bytes: Vec<[u8; 32]> = Vec::with_capacity(num_events);
+            for i in 0..num_events {
+                let off = 12 + i * 32;
+                let Some(ev) = body.get(off..off + 32) else {
+                    break;
+                };
+                events_bytes.push(ev.try_into().expect("32-byte slice"));
+            }
+            let descriptions: Vec<_> = events_bytes
+                .iter()
+                .map(|event| describe_wire_event(event, byte_order, backend))
+                .collect();
+            let event_batch = EventBatch::new(&descriptions);
+            let candidates = xi1_send_extension_event_resolve_targets(
                 state,
                 dest_window,
                 &request_classes,
                 mask_is_zero,
                 propagate,
             );
-            if !targets.is_empty() {
-                // Pre-snapshot all event bytes so the fanout
-                // closure can borrow them per-recipient.
-                let mut events_bytes: Vec<[u8; 32]> = Vec::with_capacity(num_events);
-                for i in 0..num_events {
-                    let off = 12 + i * 32;
-                    let Some(ev) = body.get(off..off + 32) else {
-                        break;
-                    };
-                    events_bytes.push(ev.try_into().expect("32-byte slice"));
+            for candidate in candidates {
+                if !matches!(
+                    state.check_send(
+                        client_id,
+                        candidate.window,
+                        Some(dev),
+                        &event_batch,
+                        Some(access_request),
+                    ),
+                    crate::access::Decision::Allow
+                ) {
+                    break;
                 }
-                let targets_vec: Vec<ClientId> = targets.into_iter().collect();
-                let _dropped = fanout_event_to_clients(state, &targets_vec, |buf, seq, order| {
-                    for ev_bytes in &events_bytes {
-                        let mut out = *ev_bytes;
-                        out[0] |= 0x80; // send_event
-                        let seq_bytes = match order {
-                            yserver_protocol::x11::ClientByteOrder::LittleEndian => {
-                                seq.0.to_le_bytes()
+                let zero_mask_creator_selected = mask_is_zero && !candidate.recipients.is_empty();
+                let recipients: Vec<ClientId> = candidate
+                    .recipients
+                    .iter()
+                    .copied()
+                    .filter(|recipient| {
+                        matches!(
+                            state.check_receive(
+                                *recipient,
+                                EventSubject::Window(candidate.window),
+                                &event_batch,
+                                Some(access_request),
+                            ),
+                            crate::access::Decision::Allow
+                        )
+                    })
+                    .collect();
+                if !recipients.is_empty() {
+                    let _dropped =
+                        fanout_event_to_clients(state, &recipients, |buf, seq, order| {
+                            for ev_bytes in &events_bytes {
+                                let mut out = *ev_bytes;
+                                out[0] |= 0x80; // send_event
+                                let seq_bytes = match order {
+                                    yserver_protocol::x11::ClientByteOrder::LittleEndian => {
+                                        seq.0.to_le_bytes()
+                                    }
+                                    yserver_protocol::x11::ClientByteOrder::BigEndian => {
+                                        seq.0.to_be_bytes()
+                                    }
+                                };
+                                out[2] = seq_bytes[0];
+                                out[3] = seq_bytes[1];
+                                buf.extend_from_slice(&out);
                             }
-                            yserver_protocol::x11::ClientByteOrder::BigEndian => {
-                                seq.0.to_be_bytes()
-                            }
-                        };
-                        out[2] = seq_bytes[0];
-                        out[3] = seq_bytes[1];
-                        buf.extend_from_slice(&out);
-                    }
-                });
+                        });
+                    break;
+                }
+                if zero_mask_creator_selected || !candidate.continue_propagation {
+                    break;
+                }
             }
         }
         debug!(

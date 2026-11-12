@@ -550,6 +550,10 @@ pub struct RecordingBackend {
     /// without a real keymap; tests that exercise `_XKB_RULES_NAMES`
     /// publishing set it via `with_xkb_rules_names`.
     pub xkb_rules_names: Option<[String; 5]>,
+    /// Live XKB extension `(major opcode, first event, first error)` returned
+    /// by `xkb_info`. `None` (the default) keeps XKB unavailable in tests
+    /// that do not explicitly model a host XKB extension.
+    pub xkb_info_result: Option<(u8, u8, u8)>,
     /// Return value for `set_keymap_rmlvo`. `None` (the default) models
     /// a backend without a real keymap (matches the trait default);
     /// tests that need `apply_rules_names_change` to take its recompile
@@ -826,6 +830,7 @@ impl RecordingBackend {
             gamma: std::cell::RefCell::new(std::collections::HashMap::new()),
             vidmode_gamma: None,
             xkb_rules_names: None,
+            xkb_info_result: None,
             keymap_rmlvo_result: None,
             kbd_by_name_result: None,
             xkb_mods: (0, 0, 0, 0),
@@ -1475,11 +1480,12 @@ impl Backend for RecordingBackend {
     }
 
     fn xkb_opcode(&self) -> Option<u8> {
-        None
+        self.xkb_info_result
+            .map(|(major_opcode, _, _)| major_opcode)
     }
 
     fn xkb_info(&self) -> Option<(u8, u8, u8)> {
-        None
+        self.xkb_info_result
     }
 
     fn set_locked_mods(&mut self, affect: u8, values: u8) {

@@ -1,5 +1,8 @@
 use crate::{
-    access::{AccessMode, RequestOpcodes, ResourceKind, ResourceTarget},
+    access::{
+        AccessMode, EventBatch, EventDescription, EventSubject, RequestOpcodes, ResourceKind,
+        ResourceTarget,
+    },
     backend::Backend,
     core_loop::{
         fanout::{
@@ -549,7 +552,12 @@ pub(super) fn handle_send_event(
     // A SelectionNotify for the server's own selection window, the answer
     // to the rootless host's ConvertSelection: the host takes it, as no
     // client can.
-    if event_type == 31 {
+    let event_description = [describe_wire_event(req.event, sender_byte_order, backend)];
+    let event_batch = EventBatch::new(&event_description);
+    let access_request = Some(RequestOpcodes::for_request(header));
+    if event_type == 31
+        && crate::rootless::selection::is_selection_bridge_window(state, req.destination)
+    {
         let word = |at: usize| {
             let bytes = [
                 req.event[at],
@@ -562,17 +570,39 @@ pub(super) fn handle_send_event(
                 ClientByteOrder::LittleEndian => u32::from_le_bytes(bytes),
             }
         };
-        if crate::rootless::selection::note_selection_notify(
+        if !matches!(
+            state.check_send(
+                client_id,
+                req.destination,
+                None,
+                &event_batch,
+                access_request
+            ),
+            crate::access::Decision::Allow
+        ) {
+            return Ok(RequestOutcome::Handled);
+        }
+        if !matches!(
+            state.check_receive(
+                crate::resources::SERVER_OWNER,
+                EventSubject::Window(req.destination),
+                &event_batch,
+                access_request,
+            ),
+            crate::access::Decision::Allow
+        ) {
+            return Ok(RequestOutcome::Handled);
+        }
+        let _queued = crate::rootless::selection::note_selection_notify(
             state,
             req.destination,
             [word(12), word(16), word(20)],
-        ) {
-            debug!(
-                "client {} #{} SendEvent SelectionNotify to the server's window 0x{:x}",
-                client_id.0, sequence.0, req.destination.0
-            );
-            return Ok(RequestOutcome::Handled);
-        }
+        );
+        debug!(
+            "client {} #{} SendEvent SelectionNotify to the server's window 0x{:x}",
+            client_id.0, sequence.0, req.destination.0
+        );
+        return Ok(RequestOutcome::Handled);
     }
     let targets = match send_event_recipients(state, req.destination, req.event_mask, header.data) {
         Ok(targets) => targets,
@@ -581,14 +611,69 @@ pub(super) fn handle_send_event(
     // Set the sent-event bit (bit 7 of first byte).
     let mut event_copy = *req.event;
     event_copy[0] |= 0x80;
-    let _dropped = fanout_raw_event_to_clients(state, &targets, &event_copy, sender_byte_order);
-    crate::rootless::note_root_client_message(
-        state,
-        backend,
-        req.destination,
-        req.event,
-        sender_byte_order,
-    );
+    let mut delivered_to = Vec::new();
+    for candidate in targets {
+        if !matches!(
+            state.check_send(
+                client_id,
+                candidate.window,
+                None,
+                &event_batch,
+                access_request,
+            ),
+            crate::access::Decision::Allow
+        ) {
+            return Ok(RequestOutcome::Handled);
+        }
+        let recipients: Vec<ClientId> = candidate
+            .recipients
+            .into_iter()
+            .filter(|recipient| {
+                matches!(
+                    state.check_receive(
+                        *recipient,
+                        EventSubject::Window(candidate.window),
+                        &event_batch,
+                        access_request,
+                    ),
+                    crate::access::Decision::Allow
+                )
+            })
+            .collect();
+        if !recipients.is_empty() {
+            let _dropped =
+                fanout_raw_event_to_clients(state, &recipients, &event_copy, sender_byte_order);
+            delivered_to = recipients;
+            break;
+        }
+        if !candidate.continue_propagation {
+            break;
+        }
+    }
+    // The rootless WM is another recipient of root ClientMessages. It sees
+    // the request after ordinary root listeners, as it did before access checks.
+    if state.rootless.is_some()
+        && req.destination == ROOT_WINDOW
+        && event_type == 33
+        && req.event[1] == 32
+        && matches!(
+            state.check_receive(
+                crate::resources::SERVER_OWNER,
+                EventSubject::Window(req.destination),
+                &event_batch,
+                access_request,
+            ),
+            crate::access::Decision::Allow
+        )
+    {
+        crate::rootless::note_root_client_message(
+            state,
+            backend,
+            req.destination,
+            req.event,
+            sender_byte_order,
+        );
+    }
     let core_type_logged = req.event[0] & 0x7f;
     // For synthetic ConfigureNotify (type=22), decode and log x/y/w/h
     // so we can see what the WM tells clients about their root
@@ -623,7 +708,7 @@ pub(super) fn handle_send_event(
             h,
             bw,
             or,
-            targets.iter().map(|c| c.0).collect::<Vec<_>>(),
+            delivered_to.iter().map(|c| c.0).collect::<Vec<_>>(),
         );
     } else {
         debug!(
@@ -634,16 +719,71 @@ pub(super) fn handle_send_event(
             req.destination.0,
             req.event_mask,
             req.propagate,
-            targets.iter().map(|c| c.0).collect::<Vec<_>>(),
+            delivered_to.iter().map(|c| c.0).collect::<Vec<_>>(),
         );
     }
     Ok(RequestOutcome::Handled)
 }
 
+/// Describe a wire event for access policies, resolving advertised extension
+/// event codes through the same live registry used by SendEvent. GenericEvent
+/// metadata is carried directly by the event template and its sender's byte
+/// order.
+pub(crate) fn describe_wire_event(
+    event: &[u8; 32],
+    byte_order: yserver_protocol::x11::ClientByteOrder,
+    backend: &mut dyn Backend,
+) -> EventDescription {
+    let event_type = event[0] & 0x7f;
+    if event_type == 35 {
+        let event_subtype = match byte_order {
+            yserver_protocol::x11::ClientByteOrder::BigEndian => {
+                u16::from_be_bytes([event[8], event[9]])
+            }
+            yserver_protocol::x11::ClientByteOrder::LittleEndian => {
+                u16::from_le_bytes([event[8], event[9]])
+            }
+        };
+        return EventDescription::extension(event_type, event[1], event_subtype);
+    }
+    if event_type >= 64 {
+        crate::nested::EXTENSIONS
+            .iter()
+            .find_map(|extension| {
+                let (major_opcode, first_event, _) =
+                    super::misc::extension_query_reply(extension.name, backend)?;
+                let event_offset = event_type.checked_sub(first_event)?;
+                let event_count =
+                    if extension.availability == crate::nested::ExtensionAvailability::HostXkb {
+                        1
+                    } else {
+                        extension.event_count
+                    };
+                (event_offset < event_count).then_some(EventDescription::extension(
+                    event_type,
+                    major_opcode,
+                    u16::from(event_offset),
+                ))
+            })
+            .unwrap_or_else(|| EventDescription::core(event_type))
+    } else {
+        EventDescription::core(event_type)
+    }
+}
+
 /// Xorg `AllEventMasks` (`include/inputstr.h`): the 25 core event-mask bits.
 const ALL_EVENT_MASKS: u32 = 0x01FF_FFFF;
 
-/// The clients a `SendEvent` reaches — Xorg `ProcSendEvent`
+/// A candidate in the `SendEvent` propagation walk. The resolver retains
+/// later candidates so the caller can continue when policies deny every
+/// recipient selected at this window.
+pub(crate) struct SendEventCandidate {
+    pub(crate) window: ResourceId,
+    pub(crate) recipients: Vec<ClientId>,
+    pub(crate) continue_propagation: bool,
+}
+
+/// The windows and clients a `SendEvent` walks — Xorg `ProcSendEvent`
 /// (`dix/events.c:5592-5640`) with `DeliverEventsToWindow`
 /// (`dix/events.c:2364`). A core event template is matched against CORE
 /// event masks only: `GetClientsForDelivery` (`dix/events.c:2241`) takes the
@@ -656,7 +796,7 @@ pub(crate) fn send_event_recipients(
     destination: ResourceId,
     event_mask: u32,
     propagate: u8,
-) -> Result<Vec<ClientId>, (u8, u32)> {
+) -> Result<Vec<SendEventCandidate>, (u8, u32)> {
     let sprite = state
         .root_pointer_target_at(state.pointer_root.0, state.pointer_root.1)
         .map_or(ROOT_WINDOW, |(w, _, _)| w);
@@ -690,6 +830,7 @@ pub(crate) fn send_event_recipients(
         return Err((x11::error::BAD_VALUE, u32::from(propagate)));
     }
     let mut mask = event_mask;
+    let mut candidates = Vec::new();
     loop {
         let targets: Vec<ClientId> = if mask == 0 {
             // `CantBeFiltered`: only the window's creator, never the server.
@@ -703,17 +844,22 @@ pub(crate) fn send_event_recipients(
         } else {
             subscribers_by_id(state, window, mask)
         };
-        if !targets.is_empty() || propagate == 0 || effective_focus == Some(window) {
-            return Ok(targets);
-        }
-        let Some(win) = state.resources.window(window) else {
-            return Ok(Vec::new());
+        let next = state.resources.window(window).and_then(|win| {
+            let next_mask = mask & !u32::from(win.do_not_propagate_mask);
+            (next_mask != 0 && win.parent != window).then_some((win.parent, next_mask))
+        });
+        let continue_propagation =
+            propagate != 0 && effective_focus != Some(window) && mask != 0 && next.is_some();
+        candidates.push(SendEventCandidate {
+            window,
+            recipients: targets,
+            continue_propagation,
+        });
+        let Some((parent, next_mask)) = next.filter(|_| continue_propagation) else {
+            return Ok(candidates);
         };
-        mask &= !u32::from(win.do_not_propagate_mask);
-        if mask == 0 || win.parent == window {
-            return Ok(Vec::new());
-        }
-        window = win.parent;
+        window = parent;
+        mask = next_mask;
     }
 }
 

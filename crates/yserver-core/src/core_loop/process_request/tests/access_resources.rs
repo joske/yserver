@@ -3,7 +3,8 @@ use super::{
     *,
 };
 use crate::access::{
-    AccessMode, Creation, Decision, DenyError, RequestOpcodes, ResourceKind, ResourceTarget,
+    AccessMode, AccessPolicy, Creation, Decision, DenyError, EventBatch, EventDescription,
+    EventSubject, RequestOpcodes, ResourceKind, ResourceTarget,
 };
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -4146,5 +4147,214 @@ fn circulate_core_policy_context_uses_zero_minor() {
                 minor: 0
             }),
         )]
+    );
+}
+
+struct DefaultAccessPolicy;
+
+impl AccessPolicy for DefaultAccessPolicy {}
+
+#[test]
+fn send_and_receive_default_allow() {
+    // Mutation: make either default send/receive hook deny; the corresponding Allow assertion
+    // must fail.
+    let mut state = ServerState::new();
+    state.install_access_policy(Arc::new(DefaultAccessPolicy));
+    let batch = EventBatch::new(&[]);
+
+    assert_eq!(
+        state.check_send(CLIENT, ResourceId(0x0060_0010), None, &batch, Some(REQUEST)),
+        Decision::Allow
+    );
+    assert_eq!(
+        state.check_receive(
+            CLIENT,
+            EventSubject::Window(ResourceId(0x0060_0010)),
+            &batch,
+            Some(REQUEST),
+        ),
+        Decision::Allow
+    );
+}
+
+#[test]
+fn check_send_and_receive_follow_first_denial() {
+    // Mutation: ask every policy after the first denial; deny-then-allow must leave the second
+    // policy unasked for both hooks.
+    let first_error = DenyError {
+        code: x11::error::BAD_ACCESS,
+        value: 0x1111,
+    };
+    let second_error = DenyError {
+        code: x11::error::BAD_VALUE,
+        value: 0x2222,
+    };
+    let batch_events = [EventDescription::core(2)];
+    let batch = EventBatch::new(&batch_events);
+    let window = ResourceId(0x0060_0020);
+    let subject = EventSubject::Window(window);
+
+    for hook in [ExtensionHook::Send, ExtensionHook::Receive] {
+        for deny_first in [false, true] {
+            let mut state = ServerState::new();
+            let first_calls = Arc::new(Mutex::new(Vec::new()));
+            let second_calls = Arc::new(Mutex::new(Vec::new()));
+            let (first_decision, second_decision, expected_error) = if deny_first {
+                (Decision::Deny(first_error), Decision::Allow, first_error)
+            } else {
+                (Decision::Allow, Decision::Deny(second_error), second_error)
+            };
+            state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+                first_decision,
+                Arc::clone(&first_calls),
+            )));
+            state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+                second_decision,
+                Arc::clone(&second_calls),
+            )));
+
+            let decision = match hook {
+                ExtensionHook::Send => {
+                    state.check_send(CLIENT, window, Some(7), &batch, Some(REQUEST))
+                }
+                ExtensionHook::Receive => {
+                    state.check_receive(CLIENT, subject, &batch, Some(REQUEST))
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(decision, Decision::Deny(expected_error));
+
+            let first = first_calls.lock().unwrap();
+            let second = second_calls.lock().unwrap();
+            assert_eq!(first.len(), 1);
+            assert_eq!(first[0].hook, hook);
+            assert_eq!(first[0].client, CLIENT);
+            assert_eq!(first[0].request, Some(REQUEST));
+            assert_eq!(first[0].events.as_deref(), Some(&batch_events[..]));
+            if deny_first {
+                assert!(second.is_empty(), "policy after a denier must not run");
+            } else {
+                assert_eq!(second.len(), 1);
+                assert_eq!(second[0].hook, hook);
+            }
+            if hook == ExtensionHook::Send {
+                assert_eq!(first[0].send, Some((window, Some(7))));
+                assert_eq!(first[0].receive, None);
+            } else {
+                assert_eq!(first[0].send, None);
+                assert_eq!(first[0].receive, Some(subject));
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_policy_list_builds_no_context() {
+    // Mutation: construct the context before checking for policies; the source-order assertion
+    // must fail. AccessContext::new is a pure value construction, so callback counts alone cannot
+    // observe it.
+    let mut state = ServerState::new();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        Decision::Deny(DenyError {
+            code: x11::error::BAD_ACCESS,
+            value: 0x44,
+        }),
+        Arc::clone(&calls),
+    )));
+    state.host_access.policies.clear();
+    let batch = EventBatch::new(&[]);
+    assert!(!state.policies_installed());
+    assert_eq!(
+        state.check_send(CLIENT, ResourceId(0x0060_0030), None, &batch, Some(REQUEST)),
+        Decision::Allow
+    );
+    assert_eq!(
+        state.check_receive(CLIENT, EventSubject::Global, &batch, Some(REQUEST),),
+        Decision::Allow
+    );
+    assert!(calls.lock().unwrap().is_empty());
+
+    let first_denial = include_str!("../../../server.rs")
+        .split("fn first_denial(")
+        .nth(1)
+        .expect("ServerState::first_denial source")
+        .split("\n    /// Resolve a resource's owner")
+        .next()
+        .expect("end of ServerState::first_denial source");
+    let empty_check = first_denial
+        .find("if policies.is_empty()")
+        .expect("empty-policy fast path");
+    let context_build = first_denial
+        .find("let context = crate::access::AccessContext::new")
+        .expect("policy context construction");
+    assert!(
+        empty_check < context_build,
+        "the empty-policy fast path must return before constructing AccessContext"
+    );
+}
+
+#[test]
+fn server_owner_sender_is_not_checked() {
+    // Mutation: remove the SERVER_OWNER send bypass; the denial and recorded call must be absent.
+    let mut state = ServerState::new();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        Decision::Deny(DenyError {
+            code: x11::error::BAD_ACCESS,
+            value: 0x55,
+        }),
+        Arc::clone(&calls),
+    )));
+
+    assert_eq!(
+        state.check_send(
+            crate::resources::SERVER_OWNER,
+            ResourceId(0x0060_0040),
+            None,
+            &EventBatch::new(&[]),
+            None,
+        ),
+        Decision::Allow
+    );
+    assert!(calls.lock().unwrap().is_empty());
+
+    assert_eq!(
+        state.check_receive(
+            crate::resources::SERVER_OWNER,
+            EventSubject::Window(ResourceId(0x0060_0040)),
+            &EventBatch::new(&[]),
+            None,
+        ),
+        Decision::Deny(DenyError {
+            code: x11::error::BAD_ACCESS,
+            value: 0x55,
+        })
+    );
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].hook, ExtensionHook::Receive);
+    assert_eq!(calls[0].client, crate::resources::SERVER_OWNER);
+}
+
+#[test]
+fn event_batch_describes_core_and_extension_events() {
+    // Mutation: retain the send-event bit or misread the XI major opcode/evtype; these literal
+    // descriptor assertions must fail.
+    let descriptions = [
+        EventDescription::core(0x82),
+        EventDescription::extension(0xa3, 131, 12),
+    ];
+    let batch = EventBatch::new(&descriptions);
+
+    assert_eq!(batch.events()[0].type_code, 2);
+    assert_eq!(batch.events()[0].extension, None);
+    assert_eq!(batch.events()[1].type_code, 35);
+    assert_eq!(
+        batch.events()[1].extension,
+        Some(crate::access::ExtensionEventDescription {
+            major_opcode: 131,
+            event_type: 12,
+        })
     );
 }

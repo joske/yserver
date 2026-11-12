@@ -4,7 +4,7 @@ use crate::{
     access::{AccessMode, ResourceKind},
     backend::{Backend, OriginContext},
     core_loop::process_request::{
-        RequestOutcome, XI2_MAJOR_OPCODE, emit_x11_error_with_minor,
+        RequestOutcome, SendEventCandidate, XI2_MAJOR_OPCODE, emit_x11_error_with_minor,
         focus_pointer::{apply_core_input_focus, core_focus_window_error},
         write_to_client,
     },
@@ -183,7 +183,7 @@ fn xi1_send_extension_event_resolve_targets(
     request_classes: &[u32],
     mask_is_zero: bool,
     propagate: bool,
-) -> std::collections::HashSet<ClientId> {
+) -> Vec<SendEventCandidate> {
     let mut current = dest_window;
     // The active class set shrinks as the walk crosses windows whose
     // do-not-propagate-list bans a class (Xorg
@@ -191,39 +191,46 @@ fn xi1_send_extension_event_resolve_targets(
     // remaining set is empty, propagation stops without delivery —
     // xts5 XSendExtensionEvent-8.
     let mut active: std::collections::HashSet<u32> = request_classes.iter().copied().collect();
+    let mut candidates = Vec::new();
     for _ in 0..256 {
-        let mut targets: std::collections::HashSet<ClientId> = std::collections::HashSet::new();
+        let mut recipients = Vec::new();
         if mask_is_zero {
             if let Some(owner) = state.resources.window_owner(current) {
-                targets.insert(owner);
+                recipients.push(owner);
             }
         } else {
-            for (cid, c) in &state.clients {
-                if let Some(set) = c.xi1_window_event_classes.get(&current)
+            for (cid, client) in &state.clients {
+                if let Some(set) = client.xi1_window_event_classes.get(&current)
                     && active.iter().any(|cl| set.contains(cl))
                 {
-                    targets.insert(ClientId(*cid));
+                    recipients.push(ClientId(*cid));
                 }
             }
         }
-        if !targets.is_empty() || !propagate {
-            return targets;
-        }
-        // No selector at `current` — apply this window's
-        // do-not-propagate list to the active class set before walking
-        // up, then move to the parent.
+        // Apply this window's do-not-propagate list before walking to its
+        // parent. If all selected recipients are denied, the caller resumes
+        // from the next candidate with this filtered class set.
         if let Some(blocked) = state.xi1_window_dont_propagate.get(&current) {
             active.retain(|c| !blocked.contains(c));
-            if active.is_empty() {
-                return std::collections::HashSet::new();
-            }
         }
-        match state.resources.parent_of(current) {
-            Some(parent) if parent != current => current = parent,
-            _ => return std::collections::HashSet::new(),
+        let next = (!active.is_empty())
+            .then(|| state.resources.parent_of(current))
+            .flatten()
+            .filter(|parent| *parent != current);
+        let continue_propagation = propagate && next.is_some();
+        recipients.sort_unstable_by_key(|client| client.0);
+        candidates.push(SendEventCandidate {
+            window: current,
+            recipients,
+            continue_propagation,
+        });
+        if let Some(parent) = next.filter(|_| continue_propagation) {
+            current = parent;
+        } else {
+            return candidates;
         }
     }
-    std::collections::HashSet::new()
+    candidates
 }
 
 /// XISetFocus (XI 2.0 minor 49) — Xorg `ProcXISetFocus`

@@ -1,15 +1,18 @@
 use super::*;
 use crate::access::{
-    AccessContext, AccessMode, AccessPolicy, Decision, DenyError, RequestOpcodes, ResourceTarget,
+    AccessContext, AccessMode, AccessPolicy, Decision, DenyError, EventBatch, EventDescription,
+    EventSubject, RequestOpcodes, ResourceTarget,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ExtensionHook {
     Access,
     Dispatch,
     Resource,
     Property,
+    Send,
+    Receive,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -23,6 +26,9 @@ pub(super) struct RecordedExtensionCheck {
     pub(super) target: Option<ResourceTarget>,
     pub(super) property: Option<(ResourceId, AtomId)>,
     pub(super) mode: Option<AccessMode>,
+    pub(super) send: Option<(ResourceId, Option<u16>)>,
+    pub(super) receive: Option<EventSubject>,
+    pub(super) events: Option<Vec<EventDescription>>,
     /// Owner returned by the live-resource resolver.
     pub(super) owner: Option<ClientId>,
     /// Owner associated with this particular target instance.
@@ -156,6 +162,9 @@ impl RecordingExtensionPolicy {
         target: Option<ResourceTarget>,
         property: Option<(ResourceId, AtomId)>,
         mode: Option<AccessMode>,
+        send: Option<(ResourceId, Option<u16>)>,
+        receive: Option<EventSubject>,
+        events: Option<&EventBatch<'_>>,
     ) -> Decision {
         if !self.record_calls {
             return self
@@ -165,7 +174,7 @@ impl RecordingExtensionPolicy {
         }
 
         let recorded = RecordedExtensionCheck {
-            hook: hook.clone(),
+            hook,
             client,
             extension: if hook == ExtensionHook::Resource {
                 self.resource_extension
@@ -182,10 +191,13 @@ impl RecordingExtensionPolicy {
             target,
             property,
             mode,
+            send,
+            receive,
+            events: events.map(|batch| batch.events().to_vec()),
         };
         let decide = |index| {
             if let Some(decide) = &self.custom_decision {
-                decide(index, Some(&recorded), hook.clone())
+                decide(index, Some(&recorded), hook)
             } else if hook == ExtensionHook::Resource {
                 if let Some(error) = self.deny_all_resources {
                     Decision::Deny(error)
@@ -229,6 +241,9 @@ impl AccessPolicy for RecordingExtensionPolicy {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         )
     }
 
@@ -243,6 +258,9 @@ impl AccessPolicy for RecordingExtensionPolicy {
             ctx,
             client,
             extension,
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -264,6 +282,9 @@ impl AccessPolicy for RecordingExtensionPolicy {
             Some(*target),
             None,
             Some(mode),
+            None,
+            None,
+            None,
         )
     }
 
@@ -283,6 +304,52 @@ impl AccessPolicy for RecordingExtensionPolicy {
             None,
             Some((window, property)),
             Some(mode),
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn send(
+        &self,
+        ctx: &AccessContext<'_>,
+        sender: ClientId,
+        window: ResourceId,
+        device: Option<u16>,
+        events: &EventBatch<'_>,
+    ) -> Decision {
+        self.check(
+            ExtensionHook::Send,
+            ctx,
+            sender,
+            "",
+            None,
+            None,
+            None,
+            Some((window, device)),
+            None,
+            Some(events),
+        )
+    }
+
+    fn receive(
+        &self,
+        ctx: &AccessContext<'_>,
+        recipient: ClientId,
+        subject: EventSubject,
+        events: &EventBatch<'_>,
+    ) -> Decision {
+        self.check(
+            ExtensionHook::Receive,
+            ctx,
+            recipient,
+            "",
+            None,
+            None,
+            None,
+            None,
+            Some(subject),
+            Some(events),
         )
     }
 }
@@ -563,6 +630,9 @@ fn extension_access_asks_once_per_available_extension() {
         target: None,
         property: None,
         mode: None,
+        send: None,
+        receive: None,
+        events: None,
         owner: None,
         target_owner: None,
     }];
@@ -579,6 +649,9 @@ fn extension_access_asks_once_per_available_extension() {
         target: None,
         property: None,
         mode: None,
+        send: None,
+        receive: None,
+        events: None,
         owner: None,
         target_owner: None,
     }));
@@ -810,6 +883,9 @@ fn every_extension_dispatch_denial_answers_bad_request() {
                 target: None,
                 property: None,
                 mode: None,
+                send: None,
+                receive: None,
+                events: None,
                 owner: None,
                 target_owner: None,
             }],
@@ -857,6 +933,9 @@ fn extension_dispatch_preserves_nonzero_minor_in_check_and_error() {
             target: None,
             property: None,
             mode: None,
+            send: None,
+            receive: None,
+            events: None,
             owner: None,
             target_owner: None,
         }],
@@ -982,6 +1061,9 @@ fn extension_dispatch_asks_with_client_name_and_opcodes() {
                 target: None,
                 property: None,
                 mode: None,
+                send: None,
+                receive: None,
+                events: None,
                 owner: None,
                 target_owner: None,
             },
@@ -998,6 +1080,9 @@ fn extension_dispatch_asks_with_client_name_and_opcodes() {
                 target: None,
                 property: None,
                 mode: None,
+                send: None,
+                receive: None,
+                events: None,
                 owner: None,
                 target_owner: None,
             },

@@ -113,6 +113,78 @@ pub struct ResourceTarget {
     pub owner: Option<ClientId>,
 }
 
+/// The window or other target that gives an event its access-control context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventSubject {
+    Window(ResourceId),
+    Drawable(ResourceId),
+    Device(u16),
+    Global,
+}
+
+/// An event's policy-visible type information.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventDescription {
+    /// Core event type, with the sent-event bit removed.
+    pub type_code: u8,
+    /// Extension event metadata, when the event belongs to an extension.
+    pub extension: Option<ExtensionEventDescription>,
+}
+
+impl EventDescription {
+    /// Describe a core event from its wire type byte.
+    #[must_use]
+    pub const fn core(type_code: u8) -> Self {
+        Self {
+            type_code: type_code & 0x7f,
+            extension: None,
+        }
+    }
+
+    /// Describe an extension event from its wire type byte and extension metadata.
+    ///
+    /// `event_type` is the extension event code, or the XI2 `evtype` for a
+    /// GenericEvent (`type_code == 35`).
+    #[must_use]
+    pub const fn extension(type_code: u8, major_opcode: u8, event_type: u16) -> Self {
+        Self {
+            type_code: type_code & 0x7f,
+            extension: Some(ExtensionEventDescription {
+                major_opcode,
+                event_type,
+            }),
+        }
+    }
+}
+
+/// Extension-specific event information exposed alongside an event type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExtensionEventDescription {
+    pub major_opcode: u8,
+    pub event_type: u16,
+}
+
+/// A borrowed list of event descriptions passed to send and receive policies.
+///
+/// The batch exposes type metadata rather than event bytes, so a receiver can
+/// be checked before the server encodes a client-specific event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventBatch<'a> {
+    events: &'a [EventDescription],
+}
+
+impl<'a> EventBatch<'a> {
+    #[must_use]
+    pub const fn new(events: &'a [EventDescription]) -> Self {
+        Self { events }
+    }
+
+    #[must_use]
+    pub const fn events(&self) -> &[EventDescription] {
+        self.events
+    }
+}
+
 /// The request opcodes active at an access check.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RequestOpcodes {
@@ -270,6 +342,29 @@ pub trait AccessPolicy: Send + Sync {
         _window: ResourceId,
         _property: AtomId,
         _mode: AccessMode,
+    ) -> Decision {
+        Decision::Allow
+    }
+
+    /// Decide whether a client may send an event batch to a window.
+    fn send(
+        &self,
+        _ctx: &AccessContext<'_>,
+        _sender: ClientId,
+        _window: ResourceId,
+        _device: Option<u16>,
+        _events: &EventBatch<'_>,
+    ) -> Decision {
+        Decision::Allow
+    }
+
+    /// Decide whether a client may receive an event batch for a subject.
+    fn receive(
+        &self,
+        _ctx: &AccessContext<'_>,
+        _recipient: ClientId,
+        _subject: EventSubject,
+        _events: &EventBatch<'_>,
     ) -> Decision {
         Decision::Allow
     }
