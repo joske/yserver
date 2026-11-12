@@ -56,6 +56,9 @@ SECURITY policy's rules get their own spec; this one fixes what they rest on.
 
 ## Reference model
 
+Line references to Xorg in this spec are to xorg-server 21.1.24 unless
+another source is named.
+
 XLibre (Xorg-derived) has XACE plus separate callback lists. These are the ten
 hooks both SECURITY and Xnamespace register, which set this spec's scope:
 
@@ -442,9 +445,24 @@ server bridge or window manager is the recipient and is checked as
 `SERVER_OWNER` before its queue or state is changed; Xorg's selection bridge
 also identifies the server-client callback path (`dix/selection.c:322-327`).
 
+If Receive denies the owner its `SelectionRequest`, the conversion proceeds as
+if the selection had no owner: the server writes the requestor's client a
+`SelectionNotify` with property `None`, as Xorg does when there is no owner
+(`dix/selection.c:305-311`). Without that answer the requestor would wait
+forever. That `SelectionNotify`, like the one written when there is no owner,
+goes to the client that issued `ConvertSelection` as the direct result of its
+own request and is exempt, like `GraphicsExpose`. A `SelectionNotify` the
+owner sends with `SendEvent` follows the `SendEvent` rules.
+
 An event with no window, drawable, or device subject uses `EventSubject::Global`.
-This includes SYNC alarm notifications, DPMS notifications, `MappingNotify`,
-and other subjectless notifications. Xorg writes these notifications directly
+This includes SYNC alarm notifications, DPMS notifications, and other
+subjectless notifications. A client denied an `AlarmNotify` does not learn that
+the alarm fired and must read its state with `QueryAlarm`; access to the alarm
+itself is already a resource check. Core `MappingNotify` is exempt, as in Xorg,
+which writes it with no hook: every client can read the keyboard and pointer
+mappings with `GetKeyboardMapping` and `GetPointerMapping`, so a denial would
+hide nothing and would only leave the client decoding input with a stale
+keymap. Xorg writes these notifications directly
 to their clients (`Xext/sync.c:455-467`, `Xext/dpms.c:225`,
 `dix/inpututils.c:71-103`). RECORD receives a check only for records that carry
 X events; Xorg's recorder distinguishes delivered events from client protocol
@@ -455,10 +473,15 @@ are direct results of the initiating request and are exempt, like
 `GraphicsExpose`. Xorg writes SHM completion directly after `ShmPutImage`
 (`Xext/shm.c:601-613`), sends Await notifications only to the unblocked
 client (`Xext/sync.c:470-510, 609-699`), and treats `GraphicsExpose` as a
-critical direct result (`dix/dispatch.c:1718-1756`). Present notifications
-are checked for their selected recipient and associated window; Xorg emits
-Present configure, complete, and idle notifications to the selected clients
-(`present/present_event.c:131-205`). The legacy event writers in `server.rs`
+critical direct result (`dix/dispatch.c:1718-1756`). Present
+`CompleteNotify` and `IdleNotify` delivered to the client that issued the
+`PresentPixmap` are direct results of its request and are exempt, like SHM
+`Completion`: a denied `IdleNotify` would leave that client unable to reuse or
+free its pixmap. Present notifications delivered to any other selecting client,
+and every `ConfigureNotify`, are checked for that recipient with the event's
+window as subject. Xorg writes all three Present notifications to the
+selected clients with no check at all (`present/present_event.c:133, 171,
+201`); this is a yserver decision, not Xorg behaviour. The legacy event writers in `server.rs`
 with no production callers remain out of scope.
 
 **Send.** Core `SendEvent` and XI `SendExtensionEvent` are checked at the
