@@ -460,6 +460,47 @@ fn send_event_ask_describes_advertised_extension_metadata() {
     assert_extension_receive(&calls[1], RECEIVER_A, LEAF, 89, 128, 0);
 }
 
+// Mutation: filter extension events by the registry's static first_event,
+// which omits XKEYBOARD's live event base.
+#[test]
+fn send_event_xkb_live_event_base_is_described_and_denied() {
+    let mut fixture = Fixture::new();
+    fixture.backend.xkb_info_result = Some((136, 85, 162));
+    fixture.select(RECEIVER_A, LEAF, EVENT_MASK);
+    let xkb_description = EventDescription::extension(85, 136, 0);
+    let calls = fixture.install_policy(move |_, call| {
+        if call.hook == ExtensionHook::Receive
+            && call.events.as_deref() == Some(std::slice::from_ref(&xkb_description))
+        {
+            Decision::Deny(DENY_ERROR)
+        } else {
+            Decision::Allow
+        }
+    });
+    let backend_before = fixture.backend.calls();
+    let state_before = send_state_snapshot(&fixture.state);
+    let mut event = key_event();
+    event[0] = 85; // XKB's live first event code from xkb_info().
+
+    assert!(
+        fixture
+            .send_event(1, LEAF.0, EVENT_MASK, 0, event)
+            .is_empty()
+    );
+    let observed = fixture.drain_all();
+    assert!(
+        observed.values().all(Vec::is_empty),
+        "denied XKB SendEvent wrote bytes: {observed:?}"
+    );
+    assert_eq!(fixture.backend.calls(), backend_before);
+    assert_eq!(send_state_snapshot(&fixture.state), state_before);
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_extension_send(&calls[0], LEAF, 85, 136, 0);
+    assert_extension_receive(&calls[1], RECEIVER_A, LEAF, 85, 136, 0);
+}
+
 // Mutation: skip the destination send check and allow selected clients to receive.
 #[test]
 fn send_denied_at_destination_is_success_without_delivery() {
@@ -1192,6 +1233,60 @@ fn xi_send_ask_checks_every_candidate_with_device_and_full_batch() {
     assert_xi_send(event_calls[1], MIDDLE, &descriptions);
     assert_xi_send(event_calls[2], PARENT, &descriptions);
     assert_xi_receive(event_calls[3], RECEIVER_A, PARENT, &descriptions);
+}
+
+// Mutation: filter extension events by the registry's static first_event,
+// which omits XKEYBOARD's live event base.
+#[test]
+fn xi_send_xkb_live_event_base_is_described_and_denied() {
+    let mut fixture = Fixture::new();
+    fixture.backend.xkb_info_result = Some((136, 85, 162));
+    let event = xi_event(85); // XKB's live first event code from xkb_info().
+    let class = xi_event_class(event[0]);
+    fixture
+        .state
+        .clients
+        .get_mut(&RECEIVER_A.0)
+        .unwrap()
+        .xi1_window_event_classes
+        .entry(LEAF)
+        .or_default()
+        .insert(class);
+    let xkb_description = EventDescription::extension(85, 136, 0);
+    let calls = fixture.install_policy(move |_, call| {
+        if call.hook == ExtensionHook::Receive
+            && call.events.as_deref() == Some(std::slice::from_ref(&xkb_description))
+        {
+            Decision::Deny(DENY_ERROR)
+        } else {
+            Decision::Allow
+        }
+    });
+    let backend_before = fixture.backend.calls();
+    let state_before = xi_send_state_snapshot(&fixture.state);
+
+    assert!(
+        fixture
+            .send_extension_event(1, LEAF.0, false, &[event], class)
+            .is_empty()
+    );
+    let observed = fixture.drain_all();
+    assert!(
+        observed.values().all(Vec::is_empty),
+        "denied XKB SendExtensionEvent wrote bytes: {observed:?}"
+    );
+    assert_eq!(fixture.backend.calls(), backend_before);
+    assert_eq!(xi_send_state_snapshot(&fixture.state), state_before);
+
+    let calls = calls.lock().unwrap();
+    let event_calls: Vec<_> = calls
+        .iter()
+        .filter(|call| matches!(call.hook, ExtensionHook::Send | ExtensionHook::Receive))
+        .collect();
+    let descriptions = [EventDescription::extension(85, 136, 0)];
+    assert_eq!(event_calls.len(), 2);
+    assert_xi_send(event_calls[0], LEAF, &descriptions);
+    assert_xi_receive(event_calls[1], RECEIVER_A, LEAF, &descriptions);
 }
 
 // Mutation: describe GenericEvent templates as core events without extension metadata.

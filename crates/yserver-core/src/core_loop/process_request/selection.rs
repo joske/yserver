@@ -749,16 +749,17 @@ pub(crate) fn describe_wire_event(
     if event_type >= 64 {
         crate::nested::EXTENSIONS
             .iter()
-            .filter(|extension| {
-                event_type
-                    .checked_sub(extension.first_event)
-                    .is_some_and(|event_offset| event_offset < extension.event_count)
-            })
             .find_map(|extension| {
                 let (major_opcode, first_event, _) =
                     super::misc::extension_query_reply(extension.name, backend)?;
                 let event_offset = event_type.checked_sub(first_event)?;
-                (event_offset < extension.event_count).then_some(EventDescription::extension(
+                let event_count =
+                    if extension.availability == crate::nested::ExtensionAvailability::HostXkb {
+                        1
+                    } else {
+                        extension.event_count
+                    };
+                (event_offset < event_count).then_some(EventDescription::extension(
                     event_type,
                     major_opcode,
                     u16::from(event_offset),
