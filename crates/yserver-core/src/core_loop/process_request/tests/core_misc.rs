@@ -1997,7 +1997,7 @@ fn send_event_input_focus_stops_at_the_focus_window() {
     );
 }
 
-/// `ProcSendEvent` errors (`dix/events.c:5563-5619`), each measured on
+/// `ProcSendEvent` errors (`dix/events.c:5568-5590, 5612-5620`), each measured on
 /// Xorg (goldens/sendevent-xi2.txt): an unknown destination is
 /// BadWindow; event types outside 2..=34 and 64.. (GenericEvent too),
 /// a ClientMessage format other than 8/16/32, and mask bits above

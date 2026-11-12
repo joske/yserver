@@ -791,10 +791,12 @@ impl RandrState {
         })
     }
 
-    /// Validate arity + output/mode resolution for `SetCrtcConfig` (Xorg
-    /// `rrcrtc.c` order, EXCLUDING rotation — the handler does that
-    /// after). `check_resource` runs immediately after each output or mode
-    /// resolves. `Ok(None)` = disable; `Ok(Some(mode))` = enable with this
+    /// Validate `SetCrtcConfig` in yserver's order: arity, outputs, then mode.
+    /// Xorg verifies the mode immediately after the CRTC and before outputs
+    /// (`randr/rrcrtc.c:1294-1320`), so if both a mode and output are bad the
+    /// client sees a different error here. Rotation is checked afterward by
+    /// the handler. `check_resource` runs immediately after each output or
+    /// mode resolves. `Ok(None)` = disable; `Ok(Some(mode))` = enable with this
     /// resolved mode;
     /// `Err((code, error_value))` = protocol error + field-specific
     /// `errorValue`.

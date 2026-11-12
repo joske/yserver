@@ -1289,9 +1289,76 @@ fn xi_send_xkb_live_event_base_is_described_and_denied() {
     assert_xi_receive(event_calls[1], RECEIVER_A, LEAF, &descriptions);
 }
 
-// Mutation: describe GenericEvent templates as core events without extension metadata.
+// Mutation: decode GenericEvent evtype in a fixed byte order or describe type 35 as core.
 #[test]
-fn xi_generic_event_metadata_uses_sender_byte_order_and_denial() {
+fn describe_generic_event_reads_evtype_in_sender_byte_order() {
+    let mut fixture = Fixture::new();
+    let mut generic_event = [0; 32];
+    generic_event[0] = 35;
+    generic_event[1] = 0xf2;
+    generic_event[8..10].copy_from_slice(&0x1234u16.to_be_bytes());
+
+    assert_eq!(
+        super::super::selection::describe_wire_event(
+            &generic_event,
+            yserver_protocol::x11::ClientByteOrder::BigEndian,
+            &mut fixture.backend,
+        ),
+        EventDescription::extension(35, 0xf2, 0x1234)
+    );
+    assert_eq!(
+        super::super::selection::describe_wire_event(
+            &generic_event,
+            yserver_protocol::x11::ClientByteOrder::LittleEndian,
+            &mut fixture.backend,
+        ),
+        EventDescription::extension(35, 0xf2, 0x3412)
+    );
+
+    generic_event[0] |= 0x80;
+    assert_eq!(
+        super::super::selection::describe_wire_event(
+            &generic_event,
+            yserver_protocol::x11::ClientByteOrder::BigEndian,
+            &mut fixture.backend,
+        ),
+        EventDescription::extension(35, 0xf2, 0x1234)
+    );
+}
+
+// Mutation: map the unassigned code 86 into the nearest extension's event range.
+#[test]
+fn describe_unassigned_extension_code_has_no_extension_metadata() {
+    let mut fixture = Fixture::new();
+    let mut event = [0; 32];
+    event[0] = 86; // XKB uses 85, XFIXES starts at 87; 86 is unassigned.
+
+    assert_eq!(
+        super::super::selection::describe_wire_event(
+            &event,
+            yserver_protocol::x11::ClientByteOrder::LittleEndian,
+            &mut fixture.backend,
+        ),
+        EventDescription {
+            type_code: 86,
+            extension: None,
+        }
+    );
+
+    event[0] = 66;
+    assert_eq!(
+        super::super::selection::describe_wire_event(
+            &event,
+            yserver_protocol::x11::ClientByteOrder::LittleEndian,
+            &mut fixture.backend,
+        ),
+        EventDescription::extension(66, 137, 0)
+    );
+}
+
+// Mutation: decode the XI event class in little-endian order for a big-endian sender.
+#[test]
+fn xi_send_extension_event_metadata_uses_sender_byte_order_and_denial() {
     let mut fixture = Fixture::new();
     fixture
         .state
@@ -1300,13 +1367,10 @@ fn xi_generic_event_metadata_uses_sender_byte_order_and_denial() {
         .expect("sender")
         .byte_order = yserver_protocol::x11::ClientByteOrder::BigEndian;
 
-    let mut generic_event = [0; 32];
-    generic_event[0] = 35;
-    generic_event[1] = 0xf2; // Unknown extension opcodes are described, not rejected.
-    generic_event[8..10].copy_from_slice(&0x1234u16.to_be_bytes());
+    // Only extension event types are valid here (Xorg `Xi/sendexev.c:150-158`).
     let xi_event =
         xi_event(crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_KEY_PRESS_OFFSET);
-    let events = [generic_event, xi_event];
+    let events = [xi_event];
     let class = xi_event_class(xi_event[0]);
     fixture
         .state
@@ -1318,17 +1382,14 @@ fn xi_generic_event_metadata_uses_sender_byte_order_and_denial() {
         .or_default()
         .insert(class);
 
-    let generic_description = EventDescription::extension(35, 0xf2, 0x1234);
-    let expected_batch = [
-        generic_description,
-        EventDescription::extension(
-            xi_event[0],
-            XI_SEND.major,
-            u16::from(xi_event[0] - crate::server::XI_FIRST_EVENT),
-        ),
-    ];
+    let expected_batch = [EventDescription::extension(
+        xi_event[0],
+        XI_SEND.major,
+        u16::from(xi_event[0] - crate::server::XI_FIRST_EVENT),
+    )];
     let calls = fixture.install_policy(move |_, call| {
-        if call.hook == ExtensionHook::Send
+        if call.hook == ExtensionHook::Receive
+            && call.client == RECEIVER_A
             && call.events.as_deref() == Some(expected_batch.as_slice())
         {
             Decision::Deny(DENY_ERROR)
@@ -1350,23 +1411,24 @@ fn xi_generic_event_metadata_uses_sender_byte_order_and_denial() {
                 yserver_protocol::x11::ClientByteOrder::BigEndian,
             )
             .is_empty(),
-        "unknown GenericEvent extension opcode must not add a validity error"
+        "valid XI SendExtensionEvent must be denied without a validity error"
     );
     let observed = fixture.drain_all();
     assert!(
         observed.values().all(Vec::is_empty),
-        "GenericEvent denial wrote bytes: {observed:?}"
+        "XI event denial wrote bytes: {observed:?}"
     );
     assert_eq!(fixture.backend.calls(), backend_before);
     assert_eq!(xi_send_state_snapshot(&fixture.state), state_before);
 
     let calls = calls.lock().unwrap();
-    let send_calls: Vec<_> = calls
+    let event_calls: Vec<_> = calls
         .iter()
-        .filter(|call| call.hook == ExtensionHook::Send)
+        .filter(|call| matches!(call.hook, ExtensionHook::Send | ExtensionHook::Receive))
         .collect();
-    assert_eq!(send_calls.len(), 1);
-    assert_xi_send(send_calls[0], LEAF, &expected_batch);
+    assert_eq!(event_calls.len(), 2);
+    assert_xi_send(event_calls[0], LEAF, &expected_batch);
+    assert_xi_receive(event_calls[1], RECEIVER_A, LEAF, &expected_batch);
 }
 
 // Mutation: skip SendExtensionEvent's send check at the destination.

@@ -730,9 +730,12 @@ pub(super) fn handle_send_event(
 }
 
 /// Describe a wire event for access policies, resolving advertised extension
-/// event codes through the same live registry used by SendEvent. GenericEvent
-/// metadata is carried directly by the event template and its sender's byte
-/// order.
+/// event codes through the same live registry used by SendEvent. Core events
+/// have `type_code < 64` and no extension metadata. A code `>= 64` with no
+/// extension metadata is unassigned; core `SendEvent` accepts such codes
+/// today. A GenericEvent (`type_code == 35`) carries extension metadata whose
+/// `major_opcode` is wire byte 1 and whose `event_type` is the `evtype` in
+/// bytes 8–9, read in the sender's byte order.
 pub(crate) fn describe_wire_event(
     event: &[u8; 32],
     byte_order: yserver_protocol::x11::ClientByteOrder,
@@ -788,7 +791,7 @@ pub(crate) struct SendEventCandidate {
 }
 
 /// The windows and clients a `SendEvent` walks — Xorg `ProcSendEvent`
-/// (`dix/events.c:5592-5640`) with `DeliverEventsToWindow`
+/// (`dix/events.c:5617-5641`) with `DeliverEventsToWindow`
 /// (`dix/events.c:2364`). A core event template is matched against CORE
 /// event masks only: `GetClientsForDelivery` (`dix/events.c:2241`) takes the
 /// window's core `OtherClients` for any core type, so an XI2 selection never

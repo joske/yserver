@@ -161,7 +161,7 @@ fn xi1_window_exists(state: &ServerState, xid: u32) -> bool {
 
 /// Walk the XI1 clients receiving a `SendExtensionEvent`
 /// dispatched to `dest_window`. Implements Xorg
-/// `Xi/exevents.c::SendEvent` (xserver.git:2952-2965) selection +
+/// `Xi/exevents.c::SendEvent` (`Xi/exevents.c:2905-2963`) selection +
 /// propagation, with two simplifications from the canonical path:
 ///
 ///  - per-window per-device do-not-propagate-mask is not yet modelled
@@ -188,7 +188,8 @@ fn xi1_send_extension_event_resolve_targets<'a>(
     let mut steps_left = 256;
     // The active class set shrinks as the walk crosses windows whose
     // do-not-propagate-list bans a class (Xorg
-    // `wOtherInputMasks(pWin)->dontPropagateMask[d->id]`). When the
+    // `wOtherInputMasks(pWin)->dontPropagateMask[d->id]`,
+    // `Xi/exevents.c:2955-2958`). When the
     // remaining set is empty, propagation stops without delivery —
     // xts5 XSendExtensionEvent-8.
     let mut active: std::collections::HashSet<u32> = request_classes.iter().copied().collect();
