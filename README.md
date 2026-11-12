@@ -187,7 +187,7 @@ https://github.com/user-attachments/assets/dc266c55-e9ee-4649-a0c4-be3db2526713
 - MATE
 - XFCE
 - FVWM3
-- sonic (KDE plasma X11 fork)
+- SonicDE (KDE plasma X11 fork)
 - wmaker
 - openbox
 - awesome
