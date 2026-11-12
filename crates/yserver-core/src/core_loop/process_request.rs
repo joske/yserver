@@ -45,6 +45,7 @@ mod redirect;
 mod render;
 mod saver_dpms;
 mod selection;
+pub(crate) use selection::{SendEventCandidate, describe_wire_event};
 mod shape_xfixes;
 mod sync_ext;
 mod vidmode;

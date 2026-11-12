@@ -31,6 +31,11 @@ const CORE_SEND: RequestOpcodes = RequestOpcodes {
     major: 25,
     minor: 0,
 };
+const XI_SEND: RequestOpcodes = RequestOpcodes {
+    major: 137,
+    minor: 31,
+};
+const XI_DEVICE: u8 = 4;
 const DENY_ERROR: DenyError = DenyError {
     code: x11::error::BAD_VALUE,
     value: 0x55,
@@ -111,6 +116,69 @@ impl Fixture {
         self.drain(SENDER)
     }
 
+    fn send_extension_event(
+        &mut self,
+        sequence: u16,
+        destination: u32,
+        propagate: bool,
+        events: &[[u8; 32]],
+        class: u32,
+    ) -> Vec<u8> {
+        self.send_extension_event_with_byte_order(
+            sequence,
+            destination,
+            propagate,
+            events,
+            class,
+            yserver_protocol::x11::ClientByteOrder::LittleEndian,
+        )
+    }
+
+    fn send_extension_event_with_byte_order(
+        &mut self,
+        sequence: u16,
+        destination: u32,
+        propagate: bool,
+        events: &[[u8; 32]],
+        class: u32,
+        byte_order: yserver_protocol::x11::ClientByteOrder,
+    ) -> Vec<u8> {
+        let mut body = Vec::with_capacity(12 + events.len() * 32 + 4);
+        body.extend_from_slice(&destination.to_le_bytes());
+        body.push(XI_DEVICE);
+        body.push(u8::from(propagate));
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.push(u8::try_from(events.len()).expect("XI1 event count"));
+        body.extend_from_slice(&[0; 3]);
+        for event in events {
+            body.extend_from_slice(event);
+        }
+        match byte_order {
+            yserver_protocol::x11::ClientByteOrder::LittleEndian => {
+                body.extend_from_slice(&class.to_le_bytes());
+            }
+            yserver_protocol::x11::ClientByteOrder::BigEndian => {
+                body.extend_from_slice(&class.to_be_bytes());
+            }
+        }
+        let length_units = 4 + 8 * u32::try_from(events.len()).expect("XI1 event count") + 1;
+        process_request(
+            &mut self.state,
+            &mut self.backend,
+            SENDER,
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: XI_SEND.major,
+                data: XI_SEND.minor,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("SendExtensionEvent through process_request");
+        self.drain(SENDER)
+    }
+
     fn drain(&mut self, client: ClientId) -> Vec<u8> {
         read_all_available(self.peers.get_mut(&client.0).expect("peer"))
     }
@@ -137,6 +205,22 @@ fn send_state_snapshot(state: &ServerState) -> String {
             state.core_focus,
             state.pointer_root,
             event_masks,
+        )
+    )
+}
+
+fn xi_send_state_snapshot(state: &ServerState) -> String {
+    let xi1_classes: Vec<_> = state
+        .clients
+        .iter()
+        .map(|(id, client)| (*id, &client.xi1_window_event_classes))
+        .collect();
+    format!(
+        "{:?}",
+        (
+            send_state_snapshot(state),
+            xi1_classes,
+            &state.xi1_window_dont_propagate,
         )
     )
 }
@@ -175,6 +259,49 @@ fn sent_key_event(sequence: u16) -> [u8; 32] {
     event[0] |= 0x80;
     event[2..4].copy_from_slice(&sequence.to_le_bytes());
     event
+}
+
+fn xi_event(event_type: u8) -> [u8; 32] {
+    let mut event = [0; 32];
+    event[0] = event_type;
+    event[4..8].copy_from_slice(&LEAF.0.to_le_bytes());
+    event
+}
+
+fn xi_event_pair() -> [[u8; 32]; 2] {
+    [
+        xi_event(crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_KEY_PRESS_OFFSET),
+        xi_event(crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET),
+    ]
+}
+
+fn xi_event_class(event_type: u8) -> u32 {
+    (u32::from(XI_DEVICE) << 8) | u32::from(event_type)
+}
+
+fn xi_event_descriptions(events: &[[u8; 32]]) -> Vec<EventDescription> {
+    events
+        .iter()
+        .map(|event| {
+            let event_type = event[0] & 0x7f;
+            EventDescription::extension(
+                event_type,
+                XI_SEND.major,
+                u16::from(event_type - crate::server::XI_FIRST_EVENT),
+            )
+        })
+        .collect()
+}
+
+fn sent_xi_events(events: &[[u8; 32]], sequence: u16) -> Vec<u8> {
+    let mut expected = Vec::with_capacity(events.len() * 32);
+    for event in events {
+        let mut sent = *event;
+        sent[0] |= 0x80;
+        sent[2..4].copy_from_slice(&sequence.to_le_bytes());
+        expected.extend_from_slice(&sent);
+    }
+    expected
 }
 
 fn assert_core_send(call: &RecordedExtensionCheck, window: ResourceId) {
@@ -255,6 +382,31 @@ fn assert_receive_type(
     assert_eq!(call.receive, Some(EventSubject::Window(window)));
     assert_eq!(call.events, Some(vec![EventDescription::core(type_code)]));
     assert_eq!(call.request, Some(CORE_SEND));
+}
+
+fn assert_xi_send(
+    call: &RecordedExtensionCheck,
+    window: ResourceId,
+    descriptions: &[EventDescription],
+) {
+    assert_eq!(call.hook, ExtensionHook::Send);
+    assert_eq!(call.client, SENDER);
+    assert_eq!(call.send, Some((window, Some(u16::from(XI_DEVICE)))));
+    assert_eq!(call.events.as_deref(), Some(descriptions));
+    assert_eq!(call.request, Some(XI_SEND));
+}
+
+fn assert_xi_receive(
+    call: &RecordedExtensionCheck,
+    client: ClientId,
+    window: ResourceId,
+    descriptions: &[EventDescription],
+) {
+    assert_eq!(call.hook, ExtensionHook::Receive);
+    assert_eq!(call.client, client);
+    assert_eq!(call.receive, Some(EventSubject::Window(window)));
+    assert_eq!(call.events.as_deref(), Some(descriptions));
+    assert_eq!(call.request, Some(XI_SEND));
 }
 
 // Mutation: omit check_send from the SendEvent delivery path.
@@ -1003,4 +1155,485 @@ fn no_policy_rootless_interceptions_keep_their_queue_and_event_bytes() {
             .properties
             .contains_key(&frame_extents)
     );
+}
+
+// Mutation: describe only the first event in the XI SendExtensionEvent batch.
+#[test]
+fn xi_send_ask_checks_every_candidate_with_device_and_full_batch() {
+    let mut fixture = Fixture::new();
+    let events = xi_event_pair();
+    let class = xi_event_class(events[0][0]);
+    fixture
+        .state
+        .clients
+        .get_mut(&RECEIVER_A.0)
+        .unwrap()
+        .xi1_window_event_classes
+        .entry(PARENT)
+        .or_default()
+        .insert(class);
+    let calls = fixture.install_policy(|_, _| Decision::Allow);
+
+    assert!(
+        fixture
+            .send_extension_event(1, LEAF.0, true, &events, class)
+            .is_empty()
+    );
+    assert_eq!(fixture.drain(RECEIVER_A), sent_xi_events(&events, 0));
+
+    let calls = calls.lock().unwrap();
+    let event_calls: Vec<_> = calls
+        .iter()
+        .filter(|call| matches!(call.hook, ExtensionHook::Send | ExtensionHook::Receive))
+        .collect();
+    let descriptions = xi_event_descriptions(&events);
+    assert_eq!(event_calls.len(), 4);
+    assert_xi_send(event_calls[0], LEAF, &descriptions);
+    assert_xi_send(event_calls[1], MIDDLE, &descriptions);
+    assert_xi_send(event_calls[2], PARENT, &descriptions);
+    assert_xi_receive(event_calls[3], RECEIVER_A, PARENT, &descriptions);
+}
+
+// Mutation: describe GenericEvent templates as core events without extension metadata.
+#[test]
+fn xi_generic_event_metadata_uses_sender_byte_order_and_denial() {
+    let mut fixture = Fixture::new();
+    fixture
+        .state
+        .clients
+        .get_mut(&SENDER.0)
+        .expect("sender")
+        .byte_order = yserver_protocol::x11::ClientByteOrder::BigEndian;
+
+    let mut generic_event = [0; 32];
+    generic_event[0] = 35;
+    generic_event[1] = 0xf2; // Unknown extension opcodes are described, not rejected.
+    generic_event[8..10].copy_from_slice(&0x1234u16.to_be_bytes());
+    let xi_event =
+        xi_event(crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_KEY_PRESS_OFFSET);
+    let events = [generic_event, xi_event];
+    let class = xi_event_class(xi_event[0]);
+    fixture
+        .state
+        .clients
+        .get_mut(&RECEIVER_A.0)
+        .expect("receiver")
+        .xi1_window_event_classes
+        .entry(LEAF)
+        .or_default()
+        .insert(class);
+
+    let generic_description = EventDescription::extension(35, 0xf2, 0x1234);
+    let expected_batch = [
+        generic_description,
+        EventDescription::extension(
+            xi_event[0],
+            XI_SEND.major,
+            u16::from(xi_event[0] - crate::server::XI_FIRST_EVENT),
+        ),
+    ];
+    let calls = fixture.install_policy(move |_, call| {
+        if call.hook == ExtensionHook::Send
+            && call.events.as_deref() == Some(expected_batch.as_slice())
+        {
+            Decision::Deny(DENY_ERROR)
+        } else {
+            Decision::Allow
+        }
+    });
+    let backend_before = fixture.backend.calls();
+    let state_before = xi_send_state_snapshot(&fixture.state);
+
+    assert!(
+        fixture
+            .send_extension_event_with_byte_order(
+                1,
+                LEAF.0,
+                false,
+                &events,
+                class,
+                yserver_protocol::x11::ClientByteOrder::BigEndian,
+            )
+            .is_empty(),
+        "unknown GenericEvent extension opcode must not add a validity error"
+    );
+    let observed = fixture.drain_all();
+    assert!(
+        observed.values().all(Vec::is_empty),
+        "GenericEvent denial wrote bytes: {observed:?}"
+    );
+    assert_eq!(fixture.backend.calls(), backend_before);
+    assert_eq!(xi_send_state_snapshot(&fixture.state), state_before);
+
+    let calls = calls.lock().unwrap();
+    let send_calls: Vec<_> = calls
+        .iter()
+        .filter(|call| call.hook == ExtensionHook::Send)
+        .collect();
+    assert_eq!(send_calls.len(), 1);
+    assert_xi_send(send_calls[0], LEAF, &expected_batch);
+}
+
+// Mutation: skip SendExtensionEvent's send check at the destination.
+#[test]
+fn xi_send_denied_at_destination_leaves_all_clients_and_state_unchanged() {
+    let mut fixture = Fixture::new();
+    let events = xi_event_pair();
+    let class = xi_event_class(events[0][0]);
+    fixture
+        .state
+        .clients
+        .get_mut(&RECEIVER_A.0)
+        .unwrap()
+        .xi1_window_event_classes
+        .entry(LEAF)
+        .or_default()
+        .insert(class);
+    fixture
+        .state
+        .clients
+        .get_mut(&RECEIVER_B.0)
+        .unwrap()
+        .xi1_window_event_classes
+        .entry(LEAF)
+        .or_default()
+        .insert(class);
+    let calls = fixture.install_policy(|_, call| {
+        if call.hook == ExtensionHook::Send {
+            Decision::Deny(DENY_ERROR)
+        } else {
+            Decision::Allow
+        }
+    });
+    let backend_before = fixture.backend.calls();
+    let state_before = xi_send_state_snapshot(&fixture.state);
+
+    assert!(
+        fixture
+            .send_extension_event(1, LEAF.0, false, &events, class)
+            .is_empty()
+    );
+    let observed = fixture.drain_all();
+    assert!(
+        observed.values().all(Vec::is_empty),
+        "denied XI send wrote bytes: {observed:?}"
+    );
+    assert_eq!(fixture.backend.calls(), backend_before);
+    assert_eq!(xi_send_state_snapshot(&fixture.state), state_before);
+    let calls = calls.lock().unwrap();
+    let event_calls: Vec<_> = calls
+        .iter()
+        .filter(|call| matches!(call.hook, ExtensionHook::Send | ExtensionHook::Receive))
+        .collect();
+    assert_eq!(event_calls.len(), 1);
+    assert_xi_send(event_calls[0], LEAF, &xi_event_descriptions(&events));
+}
+
+// Mutation: check XI send only at the original destination, not each ancestor.
+#[test]
+fn xi_send_denied_at_middle_candidate_stops_before_parent_delivery() {
+    let mut fixture = Fixture::new();
+    let events = xi_event_pair();
+    let class = xi_event_class(events[0][0]);
+    for (client, window) in [(RECEIVER_A, MIDDLE), (RECEIVER_B, PARENT)] {
+        fixture
+            .state
+            .clients
+            .get_mut(&client.0)
+            .unwrap()
+            .xi1_window_event_classes
+            .entry(window)
+            .or_default()
+            .insert(class);
+    }
+    let calls = fixture.install_policy(|_, call| {
+        if call.hook == ExtensionHook::Send
+            && call.send == Some((MIDDLE, Some(u16::from(XI_DEVICE))))
+        {
+            Decision::Deny(DENY_ERROR)
+        } else {
+            Decision::Allow
+        }
+    });
+    let backend_before = fixture.backend.calls();
+    let state_before = xi_send_state_snapshot(&fixture.state);
+
+    assert!(
+        fixture
+            .send_extension_event(1, LEAF.0, true, &events, class)
+            .is_empty()
+    );
+    let observed = fixture.drain_all();
+    assert!(
+        observed.values().all(Vec::is_empty),
+        "middle-candidate denial wrote bytes: {observed:?}"
+    );
+    assert_eq!(fixture.backend.calls(), backend_before);
+    assert_eq!(xi_send_state_snapshot(&fixture.state), state_before);
+    let calls = calls.lock().unwrap();
+    let event_calls: Vec<_> = calls
+        .iter()
+        .filter(|call| matches!(call.hook, ExtensionHook::Send | ExtensionHook::Receive))
+        .collect();
+    let descriptions = xi_event_descriptions(&events);
+    assert_eq!(event_calls.len(), 2);
+    assert_xi_send(event_calls[0], LEAF, &descriptions);
+    assert_xi_send(event_calls[1], MIDDLE, &descriptions);
+}
+
+// Mutation: stop the XI propagation walk when a window has selectors, even if all are denied.
+#[test]
+fn xi_receive_denied_for_all_selectors_continues_to_parent() {
+    let mut fixture = Fixture::new();
+    let events = xi_event_pair();
+    let class = xi_event_class(events[0][0]);
+    for (client, window) in [
+        (RECEIVER_A, LEAF),
+        (RECEIVER_B, MIDDLE),
+        (RECEIVER_C, PARENT),
+    ] {
+        fixture
+            .state
+            .clients
+            .get_mut(&client.0)
+            .unwrap()
+            .xi1_window_event_classes
+            .entry(window)
+            .or_default()
+            .insert(class);
+    }
+    let calls = fixture.install_policy(|_, call| {
+        if call.hook == ExtensionHook::Receive && call.client != RECEIVER_C {
+            Decision::Deny(DENY_ERROR)
+        } else {
+            Decision::Allow
+        }
+    });
+    let backend_before = fixture.backend.calls();
+    let state_before = xi_send_state_snapshot(&fixture.state);
+
+    assert!(
+        fixture
+            .send_extension_event(1, LEAF.0, true, &events, class)
+            .is_empty()
+    );
+    assert!(fixture.drain(RECEIVER_A).is_empty());
+    assert!(fixture.drain(RECEIVER_B).is_empty());
+    assert_eq!(fixture.drain(RECEIVER_C), sent_xi_events(&events, 0));
+    assert_eq!(fixture.backend.calls(), backend_before);
+    assert_eq!(xi_send_state_snapshot(&fixture.state), state_before);
+    let calls = calls.lock().unwrap();
+    let event_calls: Vec<_> = calls
+        .iter()
+        .filter(|call| matches!(call.hook, ExtensionHook::Send | ExtensionHook::Receive))
+        .collect();
+    let descriptions = xi_event_descriptions(&events);
+    assert_eq!(event_calls.len(), 6);
+    assert_xi_send(event_calls[0], LEAF, &descriptions);
+    assert_xi_receive(event_calls[1], RECEIVER_A, LEAF, &descriptions);
+    assert_xi_send(event_calls[2], MIDDLE, &descriptions);
+    assert_xi_receive(event_calls[3], RECEIVER_B, MIDDLE, &descriptions);
+    assert_xi_send(event_calls[4], PARENT, &descriptions);
+    assert_xi_receive(event_calls[5], RECEIVER_C, PARENT, &descriptions);
+}
+
+// Mutation: continue XI propagation after the zero-mask window creator refuses delivery.
+#[test]
+fn xi_receive_denied_creator_under_zero_mask_stops() {
+    let mut fixture = Fixture::new();
+    let events = xi_event_pair();
+    let no_event_class = (u32::from(XI_DEVICE) << 8) | 9;
+    let calls = fixture.install_policy(|_, call| {
+        if call.hook == ExtensionHook::Receive && call.client == SENDER {
+            Decision::Deny(DENY_ERROR)
+        } else {
+            Decision::Allow
+        }
+    });
+    let backend_before = fixture.backend.calls();
+    let state_before = xi_send_state_snapshot(&fixture.state);
+
+    assert!(
+        fixture
+            .send_extension_event(1, LEAF.0, true, &events, no_event_class)
+            .is_empty()
+    );
+    assert!(fixture.drain_all().values().all(Vec::is_empty));
+    assert_eq!(fixture.backend.calls(), backend_before);
+    assert_eq!(xi_send_state_snapshot(&fixture.state), state_before);
+    let calls = calls.lock().unwrap();
+    let event_calls: Vec<_> = calls
+        .iter()
+        .filter(|call| matches!(call.hook, ExtensionHook::Send | ExtensionHook::Receive))
+        .collect();
+    let descriptions = xi_event_descriptions(&events);
+    assert_eq!(event_calls.len(), 2);
+    assert_xi_send(event_calls[0], LEAF, &descriptions);
+    assert_xi_receive(event_calls[1], SENDER, LEAF, &descriptions);
+}
+
+// Mutation: stop checking XI recipients after the first selected recipient is denied.
+#[test]
+fn xi_receive_denied_one_of_two_selectors_keeps_the_other_delivery() {
+    let mut fixture = Fixture::new();
+    let events = xi_event_pair();
+    let class = xi_event_class(events[0][0]);
+    for client in [RECEIVER_A, RECEIVER_B] {
+        fixture
+            .state
+            .clients
+            .get_mut(&client.0)
+            .unwrap()
+            .xi1_window_event_classes
+            .entry(LEAF)
+            .or_default()
+            .insert(class);
+    }
+    let calls = fixture.install_policy(|_, call| {
+        if call.hook == ExtensionHook::Receive && call.client == RECEIVER_A {
+            Decision::Deny(DENY_ERROR)
+        } else {
+            Decision::Allow
+        }
+    });
+    let backend_before = fixture.backend.calls();
+    let state_before = xi_send_state_snapshot(&fixture.state);
+
+    assert!(
+        fixture
+            .send_extension_event(1, LEAF.0, true, &events, class)
+            .is_empty()
+    );
+    assert!(fixture.drain(RECEIVER_A).is_empty());
+    assert_eq!(fixture.drain(RECEIVER_B), sent_xi_events(&events, 0));
+    assert_eq!(fixture.backend.calls(), backend_before);
+    assert_eq!(xi_send_state_snapshot(&fixture.state), state_before);
+    let calls = calls.lock().unwrap();
+    let event_calls: Vec<_> = calls
+        .iter()
+        .filter(|call| matches!(call.hook, ExtensionHook::Send | ExtensionHook::Receive))
+        .collect();
+    let descriptions = xi_event_descriptions(&events);
+    assert_eq!(event_calls.len(), 3);
+    assert_xi_send(event_calls[0], LEAF, &descriptions);
+    assert_xi_receive(event_calls[1], RECEIVER_A, LEAF, &descriptions);
+    assert_xi_receive(event_calls[2], RECEIVER_B, LEAF, &descriptions);
+}
+
+// Mutation: cache XI SendExtensionEvent's first send or receive decision across requests.
+#[test]
+fn xi_send_and_receive_revocation_is_checked_on_each_request() {
+    let mut fixture = Fixture::new();
+    let events = xi_event_pair();
+    let class = xi_event_class(events[0][0]);
+    fixture
+        .state
+        .clients
+        .get_mut(&RECEIVER_A.0)
+        .unwrap()
+        .xi1_window_event_classes
+        .entry(LEAF)
+        .or_default()
+        .insert(class);
+    let revoke_send = Arc::new(AtomicBool::new(false));
+    let revoke_receive = Arc::new(AtomicBool::new(false));
+    let send_flag = Arc::clone(&revoke_send);
+    let receive_flag = Arc::clone(&revoke_receive);
+    let calls = fixture.install_policy(move |_, call| {
+        if call.hook == ExtensionHook::Send && send_flag.load(Ordering::SeqCst)
+            || call.hook == ExtensionHook::Receive
+                && call.client == RECEIVER_A
+                && receive_flag.load(Ordering::SeqCst)
+        {
+            Decision::Deny(DENY_ERROR)
+        } else {
+            Decision::Allow
+        }
+    });
+
+    assert!(
+        fixture
+            .send_extension_event(1, LEAF.0, false, &events, class)
+            .is_empty()
+    );
+    assert_eq!(fixture.drain(RECEIVER_A), sent_xi_events(&events, 0));
+    revoke_send.store(true, Ordering::SeqCst);
+    let state_before_send_deny = xi_send_state_snapshot(&fixture.state);
+    assert!(
+        fixture
+            .send_extension_event(2, LEAF.0, false, &events, class)
+            .is_empty()
+    );
+    assert!(fixture.drain(RECEIVER_A).is_empty());
+    assert_eq!(
+        xi_send_state_snapshot(&fixture.state),
+        state_before_send_deny
+    );
+    revoke_send.store(false, Ordering::SeqCst);
+    revoke_receive.store(true, Ordering::SeqCst);
+    let state_before_receive_deny = xi_send_state_snapshot(&fixture.state);
+    assert!(
+        fixture
+            .send_extension_event(3, LEAF.0, false, &events, class)
+            .is_empty()
+    );
+    assert!(fixture.drain(RECEIVER_A).is_empty());
+    assert_eq!(
+        xi_send_state_snapshot(&fixture.state),
+        state_before_receive_deny
+    );
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.hook == ExtensionHook::Send)
+            .count(),
+        3
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.hook == ExtensionHook::Receive)
+            .count(),
+        2
+    );
+}
+
+// Mutation: ignore XI class do-not-propagate masks when building the no-policy walk.
+#[test]
+fn no_policy_xi_class_do_not_propagate_walk_is_unchanged() {
+    let mut fixture = Fixture::new();
+    let events = xi_event_pair();
+    let class = xi_event_class(events[0][0]);
+    fixture
+        .state
+        .clients
+        .get_mut(&RECEIVER_A.0)
+        .unwrap()
+        .xi1_window_event_classes
+        .entry(PARENT)
+        .or_default()
+        .insert(class);
+    fixture
+        .state
+        .xi1_window_dont_propagate
+        .entry(LEAF)
+        .or_default()
+        .insert(class);
+
+    assert!(
+        fixture
+            .send_extension_event(1, LEAF.0, true, &events, class)
+            .is_empty()
+    );
+    assert!(fixture.drain(RECEIVER_A).is_empty());
+
+    fixture.state.xi1_window_dont_propagate.remove(&LEAF);
+    assert!(
+        fixture
+            .send_extension_event(2, LEAF.0, true, &events, class)
+            .is_empty()
+    );
+    assert_eq!(fixture.drain(RECEIVER_A), sent_xi_events(&events, 0));
 }

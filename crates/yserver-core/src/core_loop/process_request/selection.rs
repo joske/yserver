@@ -552,28 +552,7 @@ pub(super) fn handle_send_event(
     // A SelectionNotify for the server's own selection window, the answer
     // to the rootless host's ConvertSelection: the host takes it, as no
     // client can.
-    let event_description = [if event_type >= 64 {
-        crate::nested::EXTENSIONS
-            .iter()
-            .filter(|extension| {
-                event_type
-                    .checked_sub(extension.first_event)
-                    .is_some_and(|event_offset| event_offset < extension.event_count)
-            })
-            .find_map(|extension| {
-                let (major_opcode, first_event, _) =
-                    super::misc::extension_query_reply(extension.name, backend)?;
-                let event_offset = event_type.checked_sub(first_event)?;
-                (event_offset < extension.event_count).then_some(EventDescription::extension(
-                    event_type,
-                    major_opcode,
-                    u16::from(event_offset),
-                ))
-            })
-            .unwrap_or_else(|| EventDescription::core(event_type))
-    } else {
-        EventDescription::core(event_type)
-    }];
+    let event_description = [describe_wire_event(req.event, sender_byte_order, backend)];
     let event_batch = EventBatch::new(&event_description);
     let access_request = Some(RequestOpcodes::for_request(header));
     if event_type == 31
@@ -744,6 +723,51 @@ pub(super) fn handle_send_event(
         );
     }
     Ok(RequestOutcome::Handled)
+}
+
+/// Describe a wire event for access policies, resolving advertised extension
+/// event codes through the same live registry used by SendEvent. GenericEvent
+/// metadata is carried directly by the event template and its sender's byte
+/// order.
+pub(crate) fn describe_wire_event(
+    event: &[u8; 32],
+    byte_order: yserver_protocol::x11::ClientByteOrder,
+    backend: &mut dyn Backend,
+) -> EventDescription {
+    let event_type = event[0] & 0x7f;
+    if event_type == 35 {
+        let event_subtype = match byte_order {
+            yserver_protocol::x11::ClientByteOrder::BigEndian => {
+                u16::from_be_bytes([event[8], event[9]])
+            }
+            yserver_protocol::x11::ClientByteOrder::LittleEndian => {
+                u16::from_le_bytes([event[8], event[9]])
+            }
+        };
+        return EventDescription::extension(event_type, event[1], event_subtype);
+    }
+    if event_type >= 64 {
+        crate::nested::EXTENSIONS
+            .iter()
+            .filter(|extension| {
+                event_type
+                    .checked_sub(extension.first_event)
+                    .is_some_and(|event_offset| event_offset < extension.event_count)
+            })
+            .find_map(|extension| {
+                let (major_opcode, first_event, _) =
+                    super::misc::extension_query_reply(extension.name, backend)?;
+                let event_offset = event_type.checked_sub(first_event)?;
+                (event_offset < extension.event_count).then_some(EventDescription::extension(
+                    event_type,
+                    major_opcode,
+                    u16::from(event_offset),
+                ))
+            })
+            .unwrap_or_else(|| EventDescription::core(event_type))
+    } else {
+        EventDescription::core(event_type)
+    }
 }
 
 /// Xorg `AllEventMasks` (`include/inputstr.h`): the 25 core event-mask bits.
