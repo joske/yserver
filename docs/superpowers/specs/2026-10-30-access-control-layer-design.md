@@ -298,8 +298,9 @@ builds descriptions from wire events: it resolves ordinary extension event
 codes by range through the live extension table and reads GenericEvent
 metadata from its wire fields. This supplies the event identity policies
 need without encoding per recipient. Xorg's SECURITY policy checks the sender
-and window once and, on failure, reads the batch's event types to find an
-exempt one (`Xext/security.c:869-899`), and its dispatch uses the
+and window once and, if that is denied, denies the whole batch unless every
+event in it is an `UnmapNotify`, `ConfigureRequest` or `ClientMessage`
+(`Xext/security.c:869-899`), and its dispatch uses the
 extension and `evtype` to identify GenericEvents (`dix/events.c:183-191,
 419-435, 459-468`).
 
