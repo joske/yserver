@@ -4250,9 +4250,19 @@ fn check_send_and_receive_follow_first_denial() {
 
 #[test]
 fn empty_policy_list_builds_no_context() {
-    // Mutation: bypass the empty-policy Allow path and deny either check; both no-policy
-    // assertions must fail.
-    let state = ServerState::new();
+    // Mutation: construct the context before checking for policies; the source-order assertion
+    // must fail. AccessContext::new is a pure value construction, so callback counts alone cannot
+    // observe it.
+    let mut state = ServerState::new();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.install_access_policy(Arc::new(RecordingExtensionPolicy::new(
+        Decision::Deny(DenyError {
+            code: x11::error::BAD_ACCESS,
+            value: 0x44,
+        }),
+        Arc::clone(&calls),
+    )));
+    state.host_access.policies.clear();
     let batch = EventBatch::new(&[]);
     assert!(!state.policies_installed());
     assert_eq!(
@@ -4262,6 +4272,25 @@ fn empty_policy_list_builds_no_context() {
     assert_eq!(
         state.check_receive(CLIENT, EventSubject::Global, &batch, Some(REQUEST),),
         Decision::Allow
+    );
+    assert!(calls.lock().unwrap().is_empty());
+
+    let first_denial = include_str!("../../../server.rs")
+        .split("fn first_denial(")
+        .nth(1)
+        .expect("ServerState::first_denial source")
+        .split("\n    /// Resolve a resource's owner")
+        .next()
+        .expect("end of ServerState::first_denial source");
+    let empty_check = first_denial
+        .find("if policies.is_empty()")
+        .expect("empty-policy fast path");
+    let context_build = first_denial
+        .find("let context = crate::access::AccessContext::new")
+        .expect("policy context construction");
+    assert!(
+        empty_check < context_build,
+        "the empty-policy fast path must return before constructing AccessContext"
     );
 }
 

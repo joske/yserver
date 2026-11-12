@@ -253,6 +253,52 @@ Xnamespace tells apart requests that share a mode:
 | Client | client, target client, mode |
 | Device | client, device, mode |
 
+The event hooks have these signatures:
+
+```rust
+fn send(
+    &self,
+    ctx: &AccessContext<'_>,
+    sender: ClientId,
+    window: ResourceId,
+    device: Option<u16>,
+    events: &EventBatch<'_>,
+) -> Decision;
+
+fn receive(
+    &self,
+    ctx: &AccessContext<'_>,
+    recipient: ClientId,
+    subject: EventSubject,
+    events: &EventBatch<'_>,
+) -> Decision;
+
+pub enum EventSubject {
+    Window(ResourceId),
+    Drawable(ResourceId),
+    Device(u16),
+    Global,
+}
+```
+
+`EventBatch<'a>` borrows an ordered slice of `EventDescription`s; it exposes
+event metadata, not encoded bytes, so a client can be denied before the
+server encodes its event. `EventBatch` wraps `&[EventDescription]` and exposes
+it through `events()`. An `EventDescription` stores `type_code: u8` and
+`extension: Option<ExtensionEventDescription>`; extension metadata stores
+`major_opcode: u8` and `event_type: u16`. The `type_code` is the core event
+type with the send-event bit removed; `event_type` is the extension event code
+or XI2 `evtype`. For a GenericEvent,
+the major opcode is wire byte 1 and the `evtype` is bytes 8–9 interpreted in
+the sender's byte order. `describe_wire_event` is the single function that
+builds descriptions from wire events: it resolves ordinary extension event
+codes by range through the live extension table and reads GenericEvent
+metadata from its wire fields. This supplies the event identity policies
+need without encoding per recipient. Xorg's SECURITY policy checks every
+event in a send batch (`Xext/security.c:869-899`), and its dispatch uses the
+extension and `evtype` to identify GenericEvents (`dix/events.c:419-435,
+459-469`).
+
 ### A denial is interpreted by its site
 
 `Deny` does not always mean an X error. As in the reference, each site decides:
@@ -262,7 +308,7 @@ Xnamespace tells apart requests that share a mode:
 | Resource, property, device, client, server on a whole request | the policy's `DenyError` |
 | A check per returned entry, such as `XResQueryClients` | the entry is left out and the reply succeeds |
 | `ListProperties` property entry | the entry is left out; the reply succeeds |
-| Core `SendEvent` | no delivery, and the request succeeds |
+| Core `SendEvent` or XI `SendExtensionEvent` send check | no delivery; the request succeeds |
 | Receive | no delivery and no error |
 | Extension access | the extension is reported as absent |
 | Extension dispatch | `BadRequest` with value 0, whatever the policy's error. Xorg also answers `BadRequest` (`Xext/xace.c:45-46`), but with `client->errorValue` as the value (`dix/dispatch.c:571-573`); that field is not reset between requests and successful handlers set it (`CreateGC`, `dix/dispatch.c:1559`), so Xorg leaks a stale value. Value 0 leaks nothing |
@@ -282,6 +328,17 @@ A check authorizes either a whole request or one entry of a list, and the plan
 records which for each site. Rewriting is out of scope, but because sites own
 their denial, adding a filter or censor beside a check later does not change
 this interface.
+
+For a propagating core `SendEvent`, a denied send check at any candidate
+window stops the request successfully. If a window has selected recipients
+but every selected recipient is denied by Receive, that window counts as a
+non-delivery and propagation continues to its parent, subject to the existing
+do-not-propagate mask and effective-focus stop. A denied receive check for the
+creator selected by a zero event mask is also a non-delivery, but ends the
+walk. These rulings follow Xorg's per-candidate send check and successful
+early return (`dix/events.c:5571-5585`), its receive-denied input-client path
+and delivery count (`dix/events.c:2287-2291, 2415-2431`), and its creator
+delivery result (`dix/events.c:2200-2222`).
 
 ### Who is checked
 
@@ -371,9 +428,49 @@ goes through the receive check, and a denial drops that event and keeps the
 reply and the other events. Only a direct result of the request, such as
 `GraphicsExpose`, is exempt, since its resource checks already cover it.
 
-**Send.** `SendEvent` and XI `SendExtensionEvent`, at the request. A propagated
-send is checked at each candidate window, so its recipient resolver must keep
-the window it resolved.
+Receive denials for redirect notifications (`MapRequest`, `ConfigureRequest`,
+`ResizeRequest`, and `CirculateRequest`) count as delivered, so redirection
+remains in effect. Xorg returns success from the recipient path when Receive
+denies a selected redirect event (`dix/events.c:2560-2585`). Selection events
+also go through Receive in yserver for their recipient: the selection owner
+receives a `SelectionRequest`, and the requestor receives a `SelectionNotify`.
+Xorg identifies those recipients and emits the events in
+`dix/selection.c:308-337`; its SECURITY receive hook takes the recipient,
+window and event (`Xext/security.c:901-916`), while the selection handler's
+direct writes do not call that hook. In yserver's rootless interception, the
+server bridge or window manager is the recipient and is checked as
+`SERVER_OWNER` before its queue or state is changed; Xorg's selection bridge
+also identifies the server-client callback path (`dix/selection.c:322-327`).
+
+An event with no window, drawable, or device subject uses `EventSubject::Global`.
+This includes SYNC alarm notifications, DPMS notifications, `MappingNotify`,
+and other subjectless notifications. Xorg writes these notifications directly
+to their clients (`Xext/sync.c:455-467`, `Xext/dpms.c:225`,
+`dix/inpututils.c:71-103`). RECORD receives a check only for records that carry
+X events; Xorg's recorder distinguishes delivered events from client protocol
+data (`record/record.c:658-794`).
+
+MIT-SHM `Completion` events and `CounterNotify` events that unblock an `Await`
+are direct results of the initiating request and are exempt, like
+`GraphicsExpose`. Xorg writes SHM completion directly after `ShmPutImage`
+(`Xext/shm.c:601-613`), sends Await notifications only to the unblocked
+client (`Xext/sync.c:470-510, 609-699`), and treats `GraphicsExpose` as a
+critical direct result (`dix/dispatch.c:1718-1756`). Present notifications
+are checked for their selected recipient and associated window; Xorg emits
+Present configure, complete, and idle notifications to the selected clients
+(`present/present_event.c:131-205`). The legacy event writers in `server.rs`
+with no production callers remain out of scope.
+
+**Send.** Core `SendEvent` and XI `SendExtensionEvent` are checked at the
+request, with the sender, current candidate window, optional device id, and
+descriptions of all supplied events. Core propagation checks each candidate
+and stops successfully if the sender is denied there; each selected recipient
+then gets a Receive check. XI uses the same candidate and recipient rules with
+the request's device id. In particular, yserver checks XI sends at every
+propagated candidate as required by this policy, while Xorg checks send access
+only for the non-propagated XI path (`Xi/exevents.c:2962-2976`). Xorg's core
+resolver demonstrates the corresponding per-candidate check
+(`dix/events.c:5571-5590`).
 
 **XTEST.** `FakeInput` has no target window, so it is not a send. It is
 authorized at admission by the extension dispatch check and a device write
