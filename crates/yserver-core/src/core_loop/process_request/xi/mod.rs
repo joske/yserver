@@ -159,7 +159,7 @@ fn xi1_window_exists(state: &ServerState, xid: u32) -> bool {
     state.resources.window(ResourceId(xid)).is_some()
 }
 
-/// Collect the set of XI1 clients receiving a `SendExtensionEvent`
+/// Walk the XI1 clients receiving a `SendExtensionEvent`
 /// dispatched to `dest_window`. Implements Xorg
 /// `Xi/exevents.c::SendEvent` (xserver.git:2952-2965) selection +
 /// propagation, with two simplifications from the canonical path:
@@ -177,30 +177,36 @@ fn xi1_window_exists(state: &ServerState, xid: u32) -> bool {
 /// (`_noExtensionEvent = 9`). On a zero mask, delivery falls through
 /// to the window's creator — Xorg's `DeliverToWindowOwner` short-
 /// circuit on `filter == CantBeFiltered`.
-fn xi1_send_extension_event_resolve_targets(
-    state: &ServerState,
+fn xi1_send_extension_event_resolve_targets<'a>(
+    state: &'a ServerState,
     dest_window: ResourceId,
     request_classes: &[u32],
     mask_is_zero: bool,
     propagate: bool,
-) -> Vec<SendEventCandidate> {
-    let mut current = dest_window;
+) -> impl Iterator<Item = SendEventCandidate> + 'a {
+    let mut current = Some(dest_window);
+    let mut steps_left = 256;
     // The active class set shrinks as the walk crosses windows whose
     // do-not-propagate-list bans a class (Xorg
     // `wOtherInputMasks(pWin)->dontPropagateMask[d->id]`). When the
     // remaining set is empty, propagation stops without delivery —
     // xts5 XSendExtensionEvent-8.
     let mut active: std::collections::HashSet<u32> = request_classes.iter().copied().collect();
-    let mut candidates = Vec::new();
-    for _ in 0..256 {
+    std::iter::from_fn(move || {
+        if steps_left == 0 {
+            current = None;
+            return None;
+        }
+        let current_window = current.take()?;
+        steps_left -= 1;
         let mut recipients = Vec::new();
         if mask_is_zero {
-            if let Some(owner) = state.resources.window_owner(current) {
+            if let Some(owner) = state.resources.window_owner(current_window) {
                 recipients.push(owner);
             }
         } else {
             for (cid, client) in &state.clients {
-                if let Some(set) = client.xi1_window_event_classes.get(&current)
+                if let Some(set) = client.xi1_window_event_classes.get(&current_window)
                     && active.iter().any(|cl| set.contains(cl))
                 {
                     recipients.push(ClientId(*cid));
@@ -210,27 +216,24 @@ fn xi1_send_extension_event_resolve_targets(
         // Apply this window's do-not-propagate list before walking to its
         // parent. If all selected recipients are denied, the caller resumes
         // from the next candidate with this filtered class set.
-        if let Some(blocked) = state.xi1_window_dont_propagate.get(&current) {
+        if let Some(blocked) = state.xi1_window_dont_propagate.get(&current_window) {
             active.retain(|c| !blocked.contains(c));
         }
         let next = (!active.is_empty())
-            .then(|| state.resources.parent_of(current))
+            .then(|| state.resources.parent_of(current_window))
             .flatten()
-            .filter(|parent| *parent != current);
+            .filter(|parent| *parent != current_window);
         let continue_propagation = propagate && next.is_some();
         recipients.sort_unstable_by_key(|client| client.0);
-        candidates.push(SendEventCandidate {
-            window: current,
+        if let Some(parent) = next.filter(|_| continue_propagation) {
+            current = Some(parent);
+        }
+        Some(SendEventCandidate {
+            window: current_window,
             recipients,
             continue_propagation,
-        });
-        if let Some(parent) = next.filter(|_| continue_propagation) {
-            current = parent;
-        } else {
-            return candidates;
-        }
-    }
-    candidates
+        })
+    })
 }
 
 /// XISetFocus (XI 2.0 minor 49) — Xorg `ProcXISetFocus`

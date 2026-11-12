@@ -879,6 +879,7 @@ pub(super) fn handle_xi1_send_extension_event(
                 mask_is_zero,
                 propagate,
             );
+            let mut fanout_recipients = None;
             for candidate in candidates {
                 if !matches!(
                     state.check_send(
@@ -910,29 +911,31 @@ pub(super) fn handle_xi1_send_extension_event(
                     })
                     .collect();
                 if !recipients.is_empty() {
-                    let _dropped =
-                        fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-                            for ev_bytes in &events_bytes {
-                                let mut out = *ev_bytes;
-                                out[0] |= 0x80; // send_event
-                                let seq_bytes = match order {
-                                    yserver_protocol::x11::ClientByteOrder::LittleEndian => {
-                                        seq.0.to_le_bytes()
-                                    }
-                                    yserver_protocol::x11::ClientByteOrder::BigEndian => {
-                                        seq.0.to_be_bytes()
-                                    }
-                                };
-                                out[2] = seq_bytes[0];
-                                out[3] = seq_bytes[1];
-                                buf.extend_from_slice(&out);
-                            }
-                        });
+                    fanout_recipients = Some(recipients);
                     break;
                 }
                 if zero_mask_creator_selected || !candidate.continue_propagation {
                     break;
                 }
+            }
+            if let Some(recipients) = fanout_recipients {
+                let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
+                    for ev_bytes in &events_bytes {
+                        let mut out = *ev_bytes;
+                        out[0] |= 0x80; // send_event
+                        let seq_bytes = match order {
+                            yserver_protocol::x11::ClientByteOrder::LittleEndian => {
+                                seq.0.to_le_bytes()
+                            }
+                            yserver_protocol::x11::ClientByteOrder::BigEndian => {
+                                seq.0.to_be_bytes()
+                            }
+                        };
+                        out[2] = seq_bytes[0];
+                        out[3] = seq_bytes[1];
+                        buf.extend_from_slice(&out);
+                    }
+                });
             }
         }
         debug!(

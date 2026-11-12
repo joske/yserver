@@ -411,13 +411,16 @@ pub fn send_selection_notify(
     requestor: ResourceId,
     [selection, target, property]: [AtomId; 3],
 ) -> Result<(), SelectionError> {
-    let candidates =
-        crate::core_loop::process_request::send_event_recipients(state, requestor, 0, 0)
-            .map_err(|_| SelectionError::BadWindow(requestor))?;
-    let targets: Vec<_> = candidates
-        .into_iter()
-        .flat_map(|candidate| candidate.recipients)
-        .collect();
+    let targets: Vec<_> = {
+        let mut candidates =
+            crate::core_loop::process_request::send_event_recipients(state, requestor, 0, 0)
+                .map_err(|_| SelectionError::BadWindow(requestor))?;
+        candidates
+            .next()
+            .into_iter()
+            .flat_map(|candidate| candidate.recipients)
+            .collect()
+    };
     let mut event = [0u8; 32];
     event[0] = 31 | 0x80; // SelectionNotify, from SendEvent
     event[4..8].copy_from_slice(&time.to_le_bytes());
