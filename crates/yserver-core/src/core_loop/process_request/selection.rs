@@ -6,8 +6,8 @@ use crate::{
     backend::Backend,
     core_loop::{
         fanout::{
-            client_target_id, fanout_event_to_clients, fanout_raw_event_to_clients,
-            selection_owner_target_id, subscribers_by_id,
+            client_target_id, fanout_event_to_clients, fanout_event_to_clients_with_receive,
+            fanout_raw_event_to_clients, selection_owner_target_id, subscribers_by_id,
         },
         process_request::{RequestOutcome, emit_x11_error, write_to_client},
     },
@@ -181,16 +181,24 @@ pub(crate) fn apply_set_selection_owner(
         if !crate::rootless::selection::note_selection_clear(state, &old, selection, resolved_time)
             && let Some(old_target) = client_target_id(state, old_client)
         {
-            let _dropped = fanout_event_to_clients(state, &[old_target], |buf, seq, order| {
-                x11::encode_selection_clear_event(
-                    buf,
-                    seq,
-                    order,
-                    resolved_time,
-                    old_window,
-                    selection,
-                );
-            });
+            let descriptions = [EventDescription::core(29)];
+            let batch = EventBatch::new(&descriptions);
+            let _dropped = fanout_event_to_clients_with_receive(
+                state,
+                &[old_target],
+                EventSubject::Window(old_window),
+                &batch,
+                |buf, seq, order| {
+                    x11::encode_selection_clear_event(
+                        buf,
+                        seq,
+                        order,
+                        resolved_time,
+                        old_window,
+                        selection,
+                    );
+                },
+            );
         }
     }
 
@@ -419,14 +427,41 @@ pub(crate) fn apply_convert_selection(
     [selection, target_atom, property]: [AtomId; 3],
     time_val: u32,
 ) {
+    let descriptions = [EventDescription::core(30)];
+    let batch = EventBatch::new(&descriptions);
+
     // A selection the server's own window owns is answered by the rootless
     // host that made it, which has no connection for the SelectionRequest.
-    if let Some(owner) = state
-        .selections
-        .get(&selection)
-        .copied()
-        .filter(|owner| owner.window.0 != 0)
-        && crate::rootless::selection::note_request(
+    if let Some(owner) = state.selections.get(&selection).copied().filter(|owner| {
+        owner.client == Some(crate::resources::SERVER_OWNER)
+            && crate::rootless::selection::is_selection_bridge_window(state, owner.window)
+    }) {
+        let denied = state.policies_installed()
+            && matches!(
+                state.check_receive(
+                    crate::resources::SERVER_OWNER,
+                    EventSubject::Window(owner.window),
+                    &batch,
+                    state.receive_request,
+                ),
+                crate::access::Decision::Deny(_)
+            );
+        if denied {
+            answer_denied_selection_request(
+                state,
+                client_id,
+                requestor,
+                selection,
+                target_atom,
+                time_val,
+            );
+            debug!(
+                "client {} #{} ConvertSelection: denied bridge owner, sent failure",
+                client_id.0, sequence.0
+            );
+            return;
+        }
+        if crate::rootless::selection::note_request(
             state,
             &owner,
             crate::rootless::SelectionEvent::Request {
@@ -436,16 +471,41 @@ pub(crate) fn apply_convert_selection(
                 target: target_atom,
                 property,
             },
-        )
-    {
-        debug!(
-            "client {} #{} ConvertSelection -> the server's window 0x{:x}",
-            client_id.0, sequence.0, owner.window.0
-        );
-        return;
+        ) {
+            debug!(
+                "client {} #{} ConvertSelection -> the server's window 0x{:x}",
+                client_id.0, sequence.0, owner.window.0
+            );
+            return;
+        }
     }
 
     if let Some((owner_window, owner_id)) = selection_owner_target_id(state, selection) {
+        let denied = state.policies_installed()
+            && matches!(
+                state.check_receive(
+                    owner_id,
+                    EventSubject::Window(owner_window),
+                    &batch,
+                    state.receive_request,
+                ),
+                crate::access::Decision::Deny(_)
+            );
+        if denied {
+            answer_denied_selection_request(
+                state,
+                client_id,
+                requestor,
+                selection,
+                target_atom,
+                time_val,
+            );
+            debug!(
+                "client {} #{} ConvertSelection: denied owner, sent failure",
+                client_id.0, sequence.0
+            );
+            return;
+        }
         let _dropped = fanout_event_to_clients(state, &[owner_id], |buf, seq, order| {
             x11::encode_selection_request_event(
                 buf,
@@ -469,24 +529,68 @@ pub(crate) fn apply_convert_selection(
         // No owner, or its setter is gone (`dix/selection.c:297-301`):
         // SelectionNotify(None) to the client that issued ConvertSelection
         // (`dix/selection.c:304-311`), whoever created the requestor window.
-        if let Some(rt) = client_target_id(state, client_id) {
-            let mut template = [0u8; 32];
-            template[0] = 31; // SelectionNotify
-            template[4..8].copy_from_slice(&time_val.to_le_bytes());
-            template[8..12].copy_from_slice(&requestor.0.to_le_bytes());
-            template[12..16].copy_from_slice(&selection.0.to_le_bytes());
-            template[16..20].copy_from_slice(&target_atom.0.to_le_bytes());
-            // property = 0 (None): conversion failed.
-            let _dropped = fanout_raw_event_to_clients(
-                state,
-                &[rt],
-                &template,
-                yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            );
-        }
+        send_selection_failure(
+            state,
+            client_id,
+            requestor,
+            selection,
+            target_atom,
+            time_val,
+        );
         debug!(
             "client {} #{} ConvertSelection: no owner, sent SelectionNotify(None)",
             client_id.0, sequence.0
+        );
+    }
+}
+
+fn answer_denied_selection_request(
+    state: &mut ServerState,
+    client_id: ClientId,
+    requestor: ResourceId,
+    selection: AtomId,
+    target_atom: AtomId,
+    time_val: u32,
+) {
+    if client_id == crate::resources::SERVER_OWNER {
+        // A typed bridge ConvertSelection is answered on the host queue. A
+        // socket request is always answered to its issuer, even when its
+        // requestor window is the bridge's.
+        let _queued =
+            crate::rootless::selection::note_refusal(state, requestor, selection, target_atom);
+    } else {
+        send_selection_failure(
+            state,
+            client_id,
+            requestor,
+            selection,
+            target_atom,
+            time_val,
+        );
+    }
+}
+
+fn send_selection_failure(
+    state: &mut ServerState,
+    client_id: ClientId,
+    requestor: ResourceId,
+    selection: AtomId,
+    target_atom: AtomId,
+    time_val: u32,
+) {
+    if let Some(target) = client_target_id(state, client_id) {
+        let mut template = [0u8; 32];
+        template[0] = 31; // SelectionNotify
+        template[4..8].copy_from_slice(&time_val.to_le_bytes());
+        template[8..12].copy_from_slice(&requestor.0.to_le_bytes());
+        template[12..16].copy_from_slice(&selection.0.to_le_bytes());
+        template[16..20].copy_from_slice(&target_atom.0.to_le_bytes());
+        // property = 0 (None): conversion failed.
+        let _dropped = fanout_raw_event_to_clients(
+            state,
+            &[target],
+            &template,
+            yserver_protocol::x11::ClientByteOrder::LittleEndian,
         );
     }
 }

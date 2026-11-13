@@ -712,13 +712,51 @@ pub fn fanout_raw_event_to_clients(
     event: &[u8; 32],
     template_byte_order: ClientByteOrder,
 ) -> Vec<ClientId> {
+    fanout_raw_event_to_clients_inner(state, client_ids, event, template_byte_order, None)
+}
+
+/// Fan out a raw core event after checking each recipient against its typed
+/// subject and event description.
+pub(crate) fn fanout_raw_event_to_clients_with_receive(
+    state: &mut ServerState,
+    client_ids: &[ClientId],
+    subject: EventSubject,
+    events: &EventBatch<'_>,
+    event: &[u8; 32],
+    template_byte_order: ClientByteOrder,
+) -> Vec<ClientId> {
+    fanout_raw_event_to_clients_inner(
+        state,
+        client_ids,
+        event,
+        template_byte_order,
+        Some((subject, events)),
+    )
+}
+
+fn fanout_raw_event_to_clients_inner(
+    state: &mut ServerState,
+    client_ids: &[ClientId],
+    event: &[u8; 32],
+    template_byte_order: ClientByteOrder,
+    receive: Option<(EventSubject, &EventBatch<'_>)>,
+) -> Vec<ClientId> {
     use yserver_protocol::x11::wire_swap;
     let mut disconnected = Vec::new();
     let mut seen = HashSet::new();
+    let receive_request = state.receive_request;
     let event_type = event[0] & 0x7f;
     let entries = wire_swap::core_event_swap_table(event_type);
     for cid in client_ids {
         if !seen.insert(cid.0) {
+            continue;
+        }
+        if !state.clients.contains_key(&cid.0) {
+            continue;
+        }
+        if let Some((subject, events)) = receive
+            && let Decision::Deny(_) = state.check_receive(*cid, subject, events, receive_request)
+        {
             continue;
         }
         let Some(client) = state.clients.get_mut(&cid.0) else {

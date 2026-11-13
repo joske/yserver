@@ -256,6 +256,16 @@ pub(crate) fn note_selection_clear(
     if state.rootless.is_none() || !bridge_owns(state, old) {
         return false;
     }
+    let descriptions = [EventDescription::core(29)];
+    let batch = EventBatch::new(&descriptions);
+    if let Decision::Deny(_) = state.check_receive(
+        SERVER_OWNER,
+        EventSubject::Window(old.window),
+        &batch,
+        state.receive_request,
+    ) {
+        return true;
+    }
     push(state, SelectionEvent::Clear { selection, time });
     true
 }
@@ -442,9 +452,13 @@ pub fn send_selection_notify(
     event[12..16].copy_from_slice(&selection.0.to_le_bytes());
     event[16..20].copy_from_slice(&target.0.to_le_bytes());
     event[20..24].copy_from_slice(&property.0.to_le_bytes());
-    let _dropped = crate::core_loop::fanout::fanout_raw_event_to_clients(
+    let descriptions = [EventDescription::core(31)];
+    let batch = EventBatch::new(&descriptions);
+    let _dropped = crate::core_loop::fanout::fanout_raw_event_to_clients_with_receive(
         state,
         &targets,
+        EventSubject::Window(requestor),
+        &batch,
         &event,
         ClientByteOrder::LittleEndian,
     );
