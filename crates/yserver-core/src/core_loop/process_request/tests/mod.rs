@@ -6,6 +6,8 @@ mod access_gc_font;
 mod access_glx;
 mod access_grabs;
 mod access_input;
+mod access_notify_egress;
+mod access_notify_support;
 mod access_present;
 mod access_properties;
 mod access_randr;

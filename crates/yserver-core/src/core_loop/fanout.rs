@@ -24,6 +24,7 @@ use std::{
 use yserver_protocol::x11::{self, ClientByteOrder, ClientId, ResourceId, SequenceNumber};
 
 use crate::{
+    access::{Decision, EventBatch, EventSubject},
     core_loop::client_io::{self, WriteOutcome},
     host_x11::{HostExposeEvent, HostXidMap},
     resources::{MapState, ROOT_WINDOW},
@@ -274,10 +275,46 @@ pub fn fanout_event_to_clients<F>(
 where
     F: Fn(&mut Vec<u8>, SequenceNumber, ClientByteOrder),
 {
+    fanout_event_to_clients_inner(state, client_ids, None, encode)
+}
+
+/// Fan out a described core notification, checking each existing recipient
+/// before encoding or buffering that recipient's event.
+pub(crate) fn fanout_event_to_clients_with_receive<F>(
+    state: &mut ServerState,
+    client_ids: &[ClientId],
+    subject: EventSubject,
+    events: &EventBatch<'_>,
+    encode: F,
+) -> Vec<ClientId>
+where
+    F: Fn(&mut Vec<u8>, SequenceNumber, ClientByteOrder),
+{
+    fanout_event_to_clients_inner(state, client_ids, Some((subject, events)), encode)
+}
+
+fn fanout_event_to_clients_inner<F>(
+    state: &mut ServerState,
+    client_ids: &[ClientId],
+    receive: Option<(EventSubject, &EventBatch<'_>)>,
+    encode: F,
+) -> Vec<ClientId>
+where
+    F: Fn(&mut Vec<u8>, SequenceNumber, ClientByteOrder),
+{
     let mut disconnected = Vec::new();
     let mut seen = HashSet::new();
+    let receive_request = state.receive_request;
     for cid in client_ids {
         if !seen.insert(cid.0) {
+            continue;
+        }
+        if !state.clients.contains_key(&cid.0) {
+            continue;
+        }
+        if let Some((subject, events)) = receive
+            && let Decision::Deny(_) = state.check_receive(*cid, subject, events, receive_request)
+        {
             continue;
         }
         let Some(client) = state.clients.get_mut(&cid.0) else {
@@ -318,6 +355,31 @@ where
         return Vec::new();
     }
     fanout_event_to_clients(state, &targets, encode)
+}
+
+/// Emit a described core notification to the current subscribers of a window
+/// and apply Receive separately for each recipient through the shared fanout.
+pub(crate) fn emit_window_event_to_state_with_receive<F>(
+    state: &mut ServerState,
+    window: ResourceId,
+    mask_bits: u32,
+    events: &EventBatch<'_>,
+    encode: F,
+) -> Vec<ClientId>
+where
+    F: Fn(&mut Vec<u8>, SequenceNumber, ClientByteOrder),
+{
+    let targets = subscribers_by_id(state, window, mask_bits);
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    fanout_event_to_clients_with_receive(
+        state,
+        &targets,
+        EventSubject::Window(window),
+        events,
+        encode,
+    )
 }
 
 /// State-borrowing replacement for `nested::emit_xi2_focus_event`.

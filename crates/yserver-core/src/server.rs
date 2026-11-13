@@ -1098,6 +1098,9 @@ pub struct ServerState {
     /// The core's way to the host access list (`xhost`). Survives a reset
     /// with the new generation, like `start_instant`.
     pub host_access: crate::core_loop::auth::HostAccessHandle,
+    /// Request metadata visible to core notification Receive checks while a
+    /// request is synchronously dispatched.
+    pub(crate) receive_request: Option<crate::access::RequestOpcodes>,
     pub randr: RandrState,
     /// RANDR event masks selected via RRSelectInput: (client, window) -> mask.
     pub randr_select_masks: HashMap<(u32, ResourceId), u16>,
@@ -2045,6 +2048,7 @@ impl ServerState {
             id_allocator: IdAllocator::new(),
             start_instant: Instant::now(),
             host_access: crate::core_loop::auth::HostAccessHandle::default(),
+            receive_request: None,
             randr: RandrState::nested(0, width, height),
             randr_select_masks: HashMap::new(),
             randr_primary_output_explicit: false,
