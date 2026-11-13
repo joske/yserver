@@ -32,6 +32,7 @@ use std::collections::HashSet;
 use yserver_protocol::x11::{AtomId, ClientByteOrder, ResourceId, SequenceNumber};
 
 use crate::{
+    access::{Decision, EventBatch, EventDescription, EventSubject},
     backend::Backend,
     resources::{ROOTLESS_SELECTION_WINDOW, SERVER_OWNER},
     server::{SelectionOwner, ServerState},
@@ -312,25 +313,38 @@ pub(crate) fn note_property_notify(
     time: u32,
     deleted: bool,
 ) {
-    let Some(rootless) = state.rootless.as_ref() else {
+    let heard = {
+        let Some(rootless) = state.rootless.as_ref() else {
+            return;
+        };
+        if window == ROOTLESS_SELECTION_WINDOW {
+            is_bridge_window(state, window)
+        } else {
+            rootless.selection.watched.contains(&window)
+        }
+    };
+    if !heard {
         return;
-    };
-    let heard = if window == ROOTLESS_SELECTION_WINDOW {
-        is_bridge_window(state, window)
-    } else {
-        rootless.selection.watched.contains(&window)
-    };
-    if heard {
-        push(
-            state,
-            SelectionEvent::Property {
-                window,
-                property,
-                time,
-                deleted,
-            },
-        );
     }
+    let descriptions = [EventDescription::core(28)];
+    let batch = EventBatch::new(&descriptions);
+    if let Decision::Deny(_) = state.check_receive(
+        SERVER_OWNER,
+        EventSubject::Window(window),
+        &batch,
+        state.receive_request,
+    ) {
+        return;
+    }
+    push(
+        state,
+        SelectionEvent::Property {
+            window,
+            property,
+            time,
+            deleted,
+        },
+    );
 }
 
 fn atoms_exist(state: &ServerState, atoms: &[AtomId]) -> Result<(), SelectionError> {

@@ -261,10 +261,14 @@ pub(super) fn handle_copy_colormap_and_free(
 fn emit_colormap_notify_for(state: &mut ServerState, cmap: ResourceId, installed: bool) {
     let windows = state.resources.windows_with_colormap(cmap);
     for w in windows {
-        let _dropped = crate::core_loop::fanout::emit_window_event_to_state(
+        let event = crate::access::EventDescription::core(32);
+        let events = [event];
+        let batch = crate::access::EventBatch::new(&events);
+        let _dropped = crate::core_loop::fanout::emit_window_event_to_state_with_receive(
             state,
             w,
             0x0080_0000,
+            &batch,
             |buf, seq, order| {
                 x11::encode_colormap_notify_event(buf, seq, order, w, cmap, false, installed);
             },

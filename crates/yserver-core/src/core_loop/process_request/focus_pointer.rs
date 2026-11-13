@@ -2,7 +2,7 @@ use crate::{
     access::{AccessMode, RequestOpcodes, ResourceKind, ResourceTarget},
     backend::{Backend, OriginContext},
     core_loop::{
-        fanout::{emit_window_event_to_state, emit_xi2_focus_event_to_state},
+        fanout::{emit_window_event_to_state_with_receive, emit_xi2_focus_event_to_state},
         process_request::{
             FOCUS_CHANGE_MASK, RequestOutcome, XI2_MAJOR_OPCODE, emit_x11_error,
             emit_x11_error_with_minor, write_to_client,
@@ -395,12 +395,20 @@ pub(crate) fn emit_core_focus_transition(
     };
     let (ptr_x, ptr_y) = state.pointer_root;
     for e in events {
-        let _dropped =
-            emit_window_event_to_state(state, e.window, FOCUS_CHANGE_MASK, |buf, seq, order| {
+        let event = crate::access::EventDescription::core(if e.focus_in { 9 } else { 10 });
+        let descriptions = [event];
+        let batch = crate::access::EventBatch::new(&descriptions);
+        let _dropped = emit_window_event_to_state_with_receive(
+            state,
+            e.window,
+            FOCUS_CHANGE_MASK,
+            &batch,
+            |buf, seq, order| {
                 x11::encode_focus_event_with_mode_detail(
                     buf, seq, order, e.focus_in, e.window, mode, e.detail,
                 );
-            });
+            },
+        );
     }
     // Xorg DoFocusEvents: the whole core sequence, then the XI2 one
     // (DeviceFocusEvents), which has its own windows.
