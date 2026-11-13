@@ -38,7 +38,6 @@ nix = { version = "0.31", features = [
 ] }
 roxmltree = "0.21"
 serde_json = "1"
-signal-hook = "0.4"
 thiserror = "2"
 udev = "0.9"
 xkbcommon = { version = "0.9", default-features = false }
@@ -58,6 +57,11 @@ too_many_arguments = "allow"
 # `&[u8]`, which breaks function-item `.map()` calls and churns hot
 # protocol-parsing paths for no behavioural or measured gain.
 chunks_exact_to_as_chunks = "allow"
+
+# clippy 1.100 widened needless_range_loop. The XKB keymap code mirrors
+# Xorg's indexed loops (keycode ranges, parallel per-type arrays), which
+# reads closer to the C than enumerate()/skip() chains.
+needless_range_loop = "allow"
 
 # Explicit imports (docs/superpowers/plans/2026-10-12-explicit-imports.md);
 # `use super::*` in test modules and `pub` re-export globs are exempt.

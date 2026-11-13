@@ -29,9 +29,8 @@ log.workspace = true
 regex = "1.13.1"
 roxmltree.workspace = true
 serde_json.workspace = true
-signal-hook.workspace = true
 # IPV6_V6ONLY before bind, which std cannot set.
-socket2 = "0.6"
+socket2 = { version = "0.6", optional = true }
 thiserror.workspace = true
 xkbcommon.workspace = true
 yserver-core.workspace = true
@@ -74,6 +73,8 @@ embed-resource = "3.0.12"
 
 # The Win32 window shell (`src/windows/`).
 [target.'cfg(windows)'.dependencies]
+# TCP is Windows' only transport: `cfg(tcp_transport)` is always on there.
+socket2 = "0.6"
 windows-sys = { version = "0.61", features = [
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_Display",
@@ -98,7 +99,7 @@ windows-sys = { version = "0.61", features = [
 # most deployments never negotiate a session over. `--features xdmcp` implies
 # `tcp-transport` because XDMCP's whole purpose is the TCP connect-back.
 default = []
-tcp-transport = []
+tcp-transport = ["dep:socket2"]
 xdmcp = ["tcp-transport", "yserver-core/xdmcp"]
 
 [lints]

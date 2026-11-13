@@ -39,13 +39,9 @@ struct SlotTracker {
 
 impl SlotTracker {
     fn acquire(&mut self) -> Option<usize> {
-        for i in 0..RING_LEN {
-            if !self.in_use[i] {
-                self.in_use[i] = true;
-                return Some(i);
-            }
-        }
-        None
+        let i = self.in_use.iter().position(|used| !used)?;
+        self.in_use[i] = true;
+        Some(i)
     }
 
     fn release(&mut self, slot: usize) {

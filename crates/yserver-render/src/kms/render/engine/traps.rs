@@ -89,7 +89,6 @@ impl RenderEngine {
     /// - `Vk(...)` for pipeline / scratch / CB failures.
     /// - `RendererFailed` if `gpu.renderer_failed`.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn render_traps_or_tris(
         &mut self,
         store: &mut DrawableStore,
