@@ -652,12 +652,15 @@ modify `docs/status.md`. No additional production changes planned unless these n
 - [ ] **Step 1 — tests:** `receive_frozen_input_rechecks_on_thaw`: table covers canonical HostPointer, HostKey,
   HostKeyTransition, Xi1Routed and RawKey queues, with core and XI2/XI1 sync grabs installed by requests. Enqueue
   while Allow, revoke before dispatched thaw/replay; no premature Receive for withheld batches, fresh Receive at
-  delivery, no denied event bytes or unrelated loss, correct capture/refreeze/store/release and current focus/window.
+  delivery, no denied event bytes or unrelated loss, correct capture/refreeze/store/release. Replay keeps the routing the queue saved (XI1 `Xi1Routed` stores
+  `natural_target`/`focus_route` verbatim, freeze plan 2026-07-15 lines 29-38): authorization is fresh, routing is not;
+  an XI1 event queued `WindowOnly(A)` is checked against the current policy for A even after focus moves to B.
   Reverse Deny→Allow before delivery and receive normally; repeat once with policy changed between immediate events.
   Slave raw delivery that precedes master freeze remains independently checked once. Mutations: cache enqueue-time
   Allow; skip replay checks; gate both raw forms with master freeze; count denial as disconnected.
   `receive_replay_revalidates_source_and_request_context`: change focus, detach/remove source while pending, then
-  replay; stale origin emits/asks nothing; live origin uses current window and current grant. Dispatch thaw records
+  replay; stale origin emits/asks nothing; a live origin is routed as the existing replay routes it today (saved XI1
+  route unchanged) and Receive is asked for the actual recipient under the current grant; no routing change. Dispatch thaw records
   its real major/minor (core and XI forms); after successful/invalid requests independent server thaw/input records
   None. State/queue cleanup and allowed recipients match control. Mutations: use queued source without validation;
   retain original request opcodes; leak thaw opcodes to subsequent input. Xorg reprocesses queued facts in
