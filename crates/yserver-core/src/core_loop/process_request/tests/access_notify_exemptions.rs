@@ -343,6 +343,51 @@ fn receive_calls(calls: &[RecordedExtensionCheck]) -> Vec<&RecordedExtensionChec
         .collect()
 }
 
+fn present_configure_bytes(allow_policy: bool) -> Vec<u8> {
+    const WINDOW: ResourceId = ResourceId(0x200);
+    const PRESENT_EID: u32 = 0x0010_0042;
+    let (mut state, mut peer) = two_children_under_root();
+    state
+        .clients
+        .get_mut(&1)
+        .unwrap()
+        .event_masks
+        .insert(WINDOW, 0x0002_0000);
+    state.present_event_selections.insert(
+        PRESENT_EID,
+        PresentEventSelection {
+            owner: ClientId(1),
+            window: WINDOW,
+            event_mask: x11present::EVENT_MASK_CONFIGURE_NOTIFY,
+        },
+    );
+    let _ = read_all_available(&mut peer);
+    if allow_policy {
+        state.install_access_policy(std::sync::Arc::new(
+            super::extensions::RecordingExtensionPolicy::new(
+                Decision::Allow,
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+    }
+    let body = cw_restack_body(WINDOW.0, 0x0003, &[610, 250]);
+    let mut backend = RecordingBackend::new();
+    handle_configure_window(
+        &mut state,
+        &mut backend,
+        None,
+        ClientId(1),
+        SequenceNumber(1),
+        crate::access::RequestOpcodes {
+            major: 12,
+            minor: 0,
+        },
+        &body,
+    )
+    .expect("handle_configure_window for Present parity");
+    read_all_available(&mut peer)
+}
+
 // Mutations: add Receive before emit_copy_exposures' mutable client borrow;
 // check MappingNotify at its fanout caller; classify failure SelectionNotify as a notification.
 #[test]
@@ -562,8 +607,9 @@ fn synthetic_selection_notify(allow_policy: bool) -> (Vec<u8>, Vec<RecordedExten
 }
 
 // Mutations: force synthetic-bit/sequence fields to constants; gate the old
-// writers; drop a later extension event. Every case below compares no-policy
-// bytes with recording-Allow output and keeps its row's fixed wire assertions.
+// writers; drop a later extension event; suppress N38 ColormapNotify only
+// when no policy is installed. Every advertised site includes an empty-policy
+// run, independent expected bytes, and recording-Allow parity.
 #[test]
 fn receive_no_policy_core_bytes_match_baseline() {
     let fixtures: &[(&str, fn())] = &[
@@ -608,6 +654,10 @@ fn receive_no_policy_core_bytes_match_baseline() {
     receive_deny_all_keeps_later_extension_writers();
     buffered_property_output(false);
     buffered_property_output(true);
+    assert_eq!(
+        present_configure_bytes(false),
+        present_configure_bytes(true)
+    );
 }
 
 fn run_xi_mapping(deny_receive: bool) -> (Vec<Vec<u8>>, Vec<RecordedExtensionCheck>) {
@@ -894,23 +944,15 @@ fn receive_deny_all_keeps_later_extension_writers() {
         "Allow policy preserves fixed wire bytes"
     );
 
-    let (xfixes_baseline, _) = super::access_notify_selection::run_xfixes_owner_change(false);
-    let (xfixes_denied, xfixes_calls) =
+    let (xfixes_baseline, _, xfixes_baseline_bounds) =
+        super::access_notify_selection::run_xfixes_owner_change(false);
+    let (xfixes_denied, xfixes_calls, xfixes_denied_bounds) =
         super::access_notify_selection::run_xfixes_owner_change(true);
-    assert_eq!(
-        xfixes_denied[1].first(),
-        xfixes_baseline[1].first(),
-        "XFIXES SelectionNotify event byte survives"
-    );
-    assert_eq!(xfixes_denied[1].len(), xfixes_baseline[1].len());
-    let mut denied_xfixes = xfixes_denied[1].clone();
-    let mut baseline_xfixes = xfixes_baseline[1].clone();
-    // CurrentTime is derived from each fixture's independent monotonic start.
-    denied_xfixes[16..20].copy_from_slice(&[0; 4]);
-    baseline_xfixes[16..20].copy_from_slice(&[0; 4]);
-    assert_eq!(
-        denied_xfixes, baseline_xfixes,
-        "XFIXES SelectionNotify payload survives Receive denial"
+    super::access_notify_selection::assert_xfixes_event_matches_except_timestamps(
+        &xfixes_denied[1],
+        xfixes_denied_bounds,
+        &xfixes_baseline[1],
+        xfixes_baseline_bounds,
     );
     assert_eq!(
         xfixes_denied[1].first(),

@@ -305,11 +305,12 @@ where
     let mut disconnected = Vec::new();
     let mut seen = HashSet::new();
     let receive_request = state.receive_request;
+    let receive = receive.filter(|_| state.policies_installed());
     for cid in client_ids {
         if !seen.insert(cid.0) {
             continue;
         }
-        if !state.clients.contains_key(&cid.0) {
+        if receive.is_some() && !state.clients.contains_key(&cid.0) {
             continue;
         }
         if let Some((subject, events)) = receive
@@ -745,13 +746,14 @@ fn fanout_raw_event_to_clients_inner(
     let mut disconnected = Vec::new();
     let mut seen = HashSet::new();
     let receive_request = state.receive_request;
+    let receive = receive.filter(|_| state.policies_installed());
     let event_type = event[0] & 0x7f;
     let entries = wire_swap::core_event_swap_table(event_type);
     for cid in client_ids {
         if !seen.insert(cid.0) {
             continue;
         }
-        if !state.clients.contains_key(&cid.0) {
+        if receive.is_some() && !state.clients.contains_key(&cid.0) {
             continue;
         }
         if let Some((subject, events)) = receive

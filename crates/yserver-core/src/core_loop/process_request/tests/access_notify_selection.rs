@@ -160,6 +160,64 @@ fn literal_selection_notify(
     event
 }
 
+fn literal_selection_clear(
+    order: ClientByteOrder,
+    sequence: u16,
+    time: u32,
+    window: ResourceId,
+    selection: AtomId,
+) -> Vec<u8> {
+    let word = |value: u32| match order {
+        ClientByteOrder::LittleEndian => value.to_le_bytes(),
+        ClientByteOrder::BigEndian => value.to_be_bytes(),
+    };
+    let seq = match order {
+        ClientByteOrder::LittleEndian => sequence.to_le_bytes(),
+        ClientByteOrder::BigEndian => sequence.to_be_bytes(),
+    };
+    let mut event = vec![29, 0];
+    event.extend_from_slice(&seq);
+    event.extend_from_slice(&word(time));
+    event.extend_from_slice(&word(window.0));
+    event.extend_from_slice(&word(selection.0));
+    event.resize(32, 0);
+    event
+}
+
+fn literal_selection_request(
+    order: ClientByteOrder,
+    sequence: u16,
+    time: u32,
+    owner: ResourceId,
+    requestor: ResourceId,
+    selection: AtomId,
+    target: AtomId,
+    property: AtomId,
+) -> Vec<u8> {
+    let word = |value: u32| match order {
+        ClientByteOrder::LittleEndian => value.to_le_bytes(),
+        ClientByteOrder::BigEndian => value.to_be_bytes(),
+    };
+    let seq = match order {
+        ClientByteOrder::LittleEndian => sequence.to_le_bytes(),
+        ClientByteOrder::BigEndian => sequence.to_be_bytes(),
+    };
+    let mut event = vec![30, 0];
+    event.extend_from_slice(&seq);
+    for value in [
+        time,
+        owner.0,
+        requestor.0,
+        selection.0,
+        target.0,
+        property.0,
+    ] {
+        event.extend_from_slice(&word(value));
+    }
+    event.resize(32, 0);
+    event
+}
+
 fn event_frames(bytes: &[u8]) -> Vec<[u8; 32]> {
     assert!(bytes.len().is_multiple_of(32), "complete events: {bytes:?}");
     bytes
@@ -178,11 +236,61 @@ fn receive_selection_clear_targets_previous_setter() {
         1 << x11xfixes::SELECTION_NOTIFY_SET_OWNER,
     );
     create_window(&mut control, C, REQUESTOR_A);
-    set_owner_request(&mut control, C, 52, REQUESTOR_A, selection, 77);
+    assert!(!control.state.policies_installed());
+    let control_before = control.state.timestamp_now();
+    let selection_time = control_before;
+    set_owner_request(&mut control, C, 52, REQUESTOR_A, selection, selection_time);
+    let control_bounds = (control_before, control.state.timestamp_now());
     let control_clear = control.drain(A);
     let control_xfixes = control.drain(B);
-    assert_eq!(event_frames(&control_clear)[0][0] & 0x7f, 29);
+    assert_eq!(
+        control_clear,
+        literal_selection_clear(
+            ClientByteOrder::BigEndian,
+            0x4567,
+            selection_time,
+            OWNER_WINDOW,
+            selection,
+        )
+    );
     assert_eq!(control_xfixes[0], crate::nested::XFIXES_FIRST_EVENT);
+
+    let (mut allow, selection, _, _) = selection_owner_fixture();
+    let subscriber = fixture_window_for_xfixes(&mut allow, B);
+    allow.state.xfixes_selection_masks.insert(
+        (B.0, subscriber, selection),
+        1 << x11xfixes::SELECTION_NOTIFY_SET_OWNER,
+    );
+    create_window(&mut allow, C, REQUESTOR_A);
+    let allow_calls = allow.install_policy(|_, _| Decision::Allow);
+    let allow_before = allow.state.timestamp_now();
+    let allow_time = allow_before;
+    set_owner_request(&mut allow, C, 52, REQUESTOR_A, selection, allow_time);
+    let allow_bounds = (allow_before, allow.state.timestamp_now());
+    let allow_clear = allow.drain(A);
+    let allow_xfixes = allow.drain(B);
+    assert_eq!(
+        allow_clear,
+        literal_selection_clear(
+            ClientByteOrder::BigEndian,
+            0x4567,
+            allow_time,
+            OWNER_WINDOW,
+            selection,
+        )
+    );
+    let mut allow_clear_without_time = allow_clear.clone();
+    let mut control_clear_without_time = control_clear.clone();
+    allow_clear_without_time[4..8].fill(0);
+    control_clear_without_time[4..8].fill(0);
+    assert_eq!(allow_clear_without_time, control_clear_without_time);
+    assert_xfixes_event_matches_except_timestamps(
+        &allow_xfixes,
+        allow_bounds,
+        &control_xfixes,
+        control_bounds,
+    );
+    assert_eq!(receive_checks(&allow_calls.lock().unwrap()).len(), 1);
 
     let (mut denied, selection, _, _) = selection_owner_fixture();
     let subscriber = fixture_window_for_xfixes(&mut denied, B);
@@ -202,12 +310,22 @@ fn receive_selection_clear_targets_previous_setter() {
         }
     });
     let backend_before = denied.backend.calls();
-    set_owner_request(&mut denied, C, 52, REQUESTOR_A, selection, 77);
+    let denied_before = denied.state.timestamp_now();
+    let denied_time = denied_before;
+    set_owner_request(&mut denied, C, 52, REQUESTOR_A, selection, denied_time);
+    let denied_bounds = (denied_before, denied.state.timestamp_now());
+    let denied_xfixes = denied.drain(B);
     assert!(denied.drain(A).is_empty(), "denied SelectionClear only");
     assert_eq!(
-        denied.drain(B),
-        control_xfixes,
+        denied_xfixes[0],
+        crate::nested::XFIXES_FIRST_EVENT,
         "XFIXES remains independent"
+    );
+    assert_xfixes_event_matches_except_timestamps(
+        &denied_xfixes,
+        denied_bounds,
+        &control_xfixes,
+        control_bounds,
     );
     assert!(denied.drain(C).is_empty());
     assert_eq!(denied.backend.calls(), backend_before);
@@ -215,7 +333,7 @@ fn receive_selection_clear_targets_previous_setter() {
         denied.state.selections[&selection],
         SelectionOwner {
             window: REQUESTOR_A,
-            last_time_changed: 77,
+            last_time_changed: denied_time,
             client: Some(C),
         }
     );
@@ -268,8 +386,6 @@ pub(super) fn run_no_policy_parity_fixtures() {
     receive_selection_clear_targets_previous_setter();
     receive_selection_request_denied_answers_actual_requester();
     receive_bridge_selection_denial_answers_requester();
-    receive_denied_owner_with_bridge_requestor_answers_issuing_client();
-    receive_denied_owner_for_bridge_conversion_queues_refusal();
     receive_bridge_clear_denial_does_not_queue();
     receive_rootless_outgoing_core_events_are_checked();
 }
@@ -280,8 +396,10 @@ pub(super) fn run_denied_owner_refusal_fixture() {
 
 pub(super) fn run_xfixes_owner_change(
     deny_receive: bool,
-) -> (Vec<Vec<u8>>, Vec<RecordedExtensionCheck>) {
+) -> (Vec<Vec<u8>>, Vec<RecordedExtensionCheck>, (u32, u32)) {
     let (mut fixture, selection, _, _) = selection_owner_fixture();
+    fixture.state.start_instant = std::time::Instant::now()
+        - std::time::Duration::from_secs(if deny_receive { 65 } else { 60 });
     let subscriber = fixture_window_for_xfixes(&mut fixture, NOTIFY_RECEIVER_DENIED);
     fixture.state.xfixes_selection_masks.insert(
         (NOTIFY_RECEIVER_DENIED.0, subscriber, selection),
@@ -298,14 +416,17 @@ pub(super) fn run_xfixes_owner_change(
             }
         })
     });
+    let before = fixture.state.timestamp_now();
+    let timestamp = before;
     set_owner_request(
         &mut fixture,
         NOTIFY_RECEIVER_ALLOWED,
         52,
         requestor,
         selection,
-        77,
+        timestamp,
     );
+    let after = fixture.state.timestamp_now();
     let outputs = [
         NOTIFY_SENDER,
         NOTIFY_RECEIVER_DENIED,
@@ -315,12 +436,79 @@ pub(super) fn run_xfixes_owner_change(
     .map(|client| fixture.drain(client))
     .collect();
     let calls = checks.map_or_else(Vec::new, |calls| calls.lock().unwrap().clone());
-    (outputs, calls)
+    (outputs, calls, (before, after))
+}
+
+pub(super) fn assert_xfixes_event_matches_except_timestamps(
+    actual: &[u8],
+    actual_bounds: (u32, u32),
+    expected: &[u8],
+    expected_bounds: (u32, u32),
+) {
+    fn timestamp_is_between(value: u32, (before, after): (u32, u32)) -> bool {
+        value.wrapping_sub(before) <= after.wrapping_sub(before)
+    }
+
+    assert_eq!(actual.len(), 32, "complete XFIXES SelectionNotify");
+    assert_eq!(expected.len(), 32, "complete XFIXES SelectionNotify");
+    for (bytes, bounds, label) in [
+        (actual, actual_bounds, "actual"),
+        (expected, expected_bounds, "expected"),
+    ] {
+        for offset in [16, 20] {
+            let timestamp = u32::from_le_bytes(
+                bytes[offset..offset + 4]
+                    .try_into()
+                    .expect("XFIXES timestamp"),
+            );
+            assert!(
+                timestamp_is_between(timestamp, bounds),
+                "{label} timestamp {timestamp} is within {bounds:?}"
+            );
+        }
+    }
+    let mut actual_without_timestamps = actual.to_vec();
+    let mut expected_without_timestamps = expected.to_vec();
+    actual_without_timestamps[16..24].fill(0);
+    expected_without_timestamps[16..24].fill(0);
+    assert_eq!(
+        actual_without_timestamps, expected_without_timestamps,
+        "all non-timestamp XFIXES event bytes match"
+    );
 }
 
 // Mutations: silently drop denied requests; answer by window creator; Receive-check the failure; clear owner on denial.
 #[test]
 fn receive_selection_request_denied_answers_actual_requester() {
+    let (mut baseline, selection, target, property) = selection_owner_fixture();
+    assert!(!baseline.state.policies_installed());
+    convert_request(
+        &mut baseline,
+        C,
+        77,
+        REQUESTOR_B,
+        selection,
+        target,
+        property,
+        0x1122_3344,
+    );
+    let baseline_owner_event = baseline.drain(A);
+    assert!(baseline.drain(B).is_empty());
+    assert!(baseline.drain(C).is_empty());
+    assert_eq!(
+        baseline_owner_event,
+        literal_selection_request(
+            ClientByteOrder::BigEndian,
+            0x4567,
+            0x1122_3344,
+            OWNER_WINDOW,
+            REQUESTOR_B,
+            selection,
+            target,
+            property,
+        )
+    );
+
     let (mut allowed, selection, target, property) = selection_owner_fixture();
     let owner_before = allowed.state.selections[&selection];
     let backend_before = allowed.backend.calls();
@@ -336,6 +524,7 @@ fn receive_selection_request_denied_answers_actual_requester() {
         0x1122_3344,
     );
     let owner_event = allowed.drain(A);
+    assert_eq!(owner_event, baseline_owner_event);
     assert_eq!(owner_event.len(), 32);
     assert_eq!(owner_event[0] & 0x7f, 30);
     assert_eq!(
@@ -500,6 +689,42 @@ fn rootless_fixture() -> NotifyFixture {
 // Mutations: queue before checking; treat a denied, unqueued bridge request as handled without refusing it.
 #[test]
 fn receive_bridge_selection_denial_answers_requester() {
+    let mut baseline = rootless_fixture();
+    create_window(&mut baseline, C, REQUESTOR_A);
+    let selection = baseline
+        .state
+        .atoms
+        .intern("ACCESS_BRIDGE_SELECTION", false);
+    let target = baseline.state.atoms.intern("ACCESS_BRIDGE_TARGET", false);
+    let property = baseline.state.atoms.intern("ACCESS_BRIDGE_PROPERTY", false);
+    rootless::selection::set_selection_owner(&mut baseline.state, selection, true).unwrap();
+    let owner_before = baseline.state.selections[&selection];
+    let _ = rootless::selection::take_selection_events(&mut baseline.state);
+    assert!(!baseline.state.policies_installed());
+    convert_request(
+        &mut baseline,
+        C,
+        61,
+        REQUESTOR_A,
+        selection,
+        target,
+        property,
+        0x2233_4455,
+    );
+    assert!(baseline.drain(C).is_empty());
+    assert_eq!(baseline.state.selections[&selection], owner_before);
+    let baseline_events = rootless::selection::take_selection_events(&mut baseline.state);
+    assert_eq!(
+        baseline_events,
+        [SelectionEvent::Request {
+            time: 0x2233_4455,
+            requestor: REQUESTOR_A,
+            selection,
+            target,
+            property,
+        }]
+    );
+
     let mut allow = rootless_fixture();
     create_window(&mut allow, C, REQUESTOR_A);
     let selection = allow.state.atoms.intern("ACCESS_BRIDGE_SELECTION", false);
@@ -523,13 +748,7 @@ fn receive_bridge_selection_denial_answers_requester() {
     assert_eq!(allow.state.selections[&selection], owner_before);
     assert_eq!(
         rootless::selection::take_selection_events(&mut allow.state),
-        [SelectionEvent::Request {
-            time: 0x2233_4455,
-            requestor: REQUESTOR_A,
-            selection,
-            target,
-            property,
-        }]
+        baseline_events
     );
     let checked = receive_checks(&allow_calls.lock().unwrap());
     assert_eq!(checked.len(), 1);
@@ -734,11 +953,21 @@ fn receive_denied_owner_for_bridge_conversion_queues_refusal() {
     assert_eq!(receives[0].request, None);
 }
 
-// Mutations: exempt SERVER_OWNER; queue before checking; treat a denied clear as conversion success; fall through after denial.
+// Mutations: exempt SERVER_OWNER; queue before checking; treat a denied clear as conversion success; fall through after denial; compare independent fixture timestamps instead of bounding each event's timestamps.
 #[test]
 fn receive_bridge_clear_denial_does_not_queue() {
-    fn run(deny: bool) -> (NotifyFixture, AtomId, Vec<u8>, Vec<RecordedExtensionCheck>) {
+    fn run(
+        policy: Option<bool>,
+    ) -> (
+        NotifyFixture,
+        AtomId,
+        Vec<u8>,
+        Vec<RecordedExtensionCheck>,
+        (u32, u32),
+    ) {
         let mut fixture = rootless_fixture();
+        fixture.state.start_instant = std::time::Instant::now()
+            - std::time::Duration::from_secs(if policy == Some(true) { 65 } else { 60 });
         let server_peer = install_client(&mut fixture.state, SERVER_OWNER.0);
         fixture.peers.insert(SERVER_OWNER.0, server_peer);
         create_window(&mut fixture, C, REQUESTOR_A);
@@ -751,9 +980,10 @@ fn receive_bridge_clear_denial_does_not_queue() {
             (B.0, REQUESTOR_B, selection),
             1 << x11xfixes::SELECTION_NOTIFY_SET_OWNER,
         );
-        let calls = if deny {
-            Some(fixture.install_policy(|_, call| {
-                if call.hook == ExtensionHook::Receive
+        let calls = policy.map(|deny| {
+            fixture.install_policy(move |_, call| {
+                if deny
+                    && call.hook == ExtensionHook::Receive
                     && call.client == SERVER_OWNER
                     && call.events == Some(vec![EventDescription::core(29)])
                 {
@@ -761,18 +991,18 @@ fn receive_bridge_clear_denial_does_not_queue() {
                 } else {
                     Decision::Allow
                 }
-            }))
-        } else {
-            None
-        };
-        let time = fixture.state.timestamp_now();
+            })
+        });
+        let before = fixture.state.timestamp_now();
+        let time = before;
         set_owner_request(&mut fixture, C, 63, REQUESTOR_A, selection, time);
+        let after = fixture.state.timestamp_now();
         let xfixes = fixture.drain(B);
         let recorded = calls.map_or_else(Vec::new, |calls| calls.lock().unwrap().clone());
-        (fixture, selection, xfixes, recorded)
+        (fixture, selection, xfixes, recorded, (before, after))
     }
 
-    let (mut control, selection, control_xfixes, _) = run(false);
+    let (mut control, selection, control_xfixes, _, control_bounds) = run(None);
     assert!(
         !control_xfixes.is_empty(),
         "the XFIXES control event is delivered"
@@ -788,13 +1018,54 @@ fn receive_bridge_clear_denial_does_not_queue() {
         "Allow control queues the bridge SelectionClear"
     );
 
-    let (mut denied, selection, denied_xfixes, calls) = run(true);
-    assert_eq!(denied_xfixes.len(), control_xfixes.len());
-    assert_eq!(&denied_xfixes[..16], &control_xfixes[..16]);
-    assert_eq!(
-        &denied_xfixes[24..],
-        &control_xfixes[24..],
-        "XFIXES event padding survives core denial"
+    let (mut allow, allow_selection, allow_xfixes, allow_calls, allow_bounds) = run(Some(false));
+    assert_eq!(allow_selection, selection);
+    assert_xfixes_event_matches_except_timestamps(
+        &allow_xfixes,
+        allow_bounds,
+        &control_xfixes,
+        control_bounds,
+    );
+    let allow_events = rootless::selection::take_selection_events(&mut allow.state);
+    assert_eq!(allow_events.len(), events.len());
+    for (baseline, permitted) in events.iter().zip(&allow_events) {
+        match (baseline, permitted) {
+            (
+                SelectionEvent::Owner {
+                    selection: baseline_selection,
+                    owner: baseline_owner,
+                    ..
+                },
+                SelectionEvent::Owner {
+                    selection: allow_selection,
+                    owner: allow_owner,
+                    ..
+                },
+            ) => assert_eq!(
+                (baseline_selection, baseline_owner),
+                (allow_selection, allow_owner)
+            ),
+            (
+                SelectionEvent::Clear {
+                    selection: baseline_selection,
+                    ..
+                },
+                SelectionEvent::Clear {
+                    selection: allow_selection,
+                    ..
+                },
+            ) => assert_eq!(baseline_selection, allow_selection),
+            other => panic!("no-policy/Allow selection event mismatch: {other:?}"),
+        }
+    }
+    assert_eq!(receive_checks(&allow_calls).len(), 1);
+
+    let (mut denied, selection, denied_xfixes, calls, denied_bounds) = run(Some(true));
+    assert_xfixes_event_matches_except_timestamps(
+        &denied_xfixes,
+        denied_bounds,
+        &control_xfixes,
+        control_bounds,
     );
     assert!(denied.drain(A).is_empty());
     assert!(denied.drain(C).is_empty());
@@ -906,6 +1177,73 @@ fn host_wm_state(fixture: &mut NotifyFixture, window: ResourceId) -> Option<Vec<
 // Mutations: bypass raw checks; describe sent type with bit 7; exempt host SelectionNotify(None) by type/property.
 #[test]
 fn receive_rootless_outgoing_core_events_are_checked() {
+    let (mut baseline, baseline_window, baseline_id) = rootless_host_fixture();
+    assert!(!baseline.state.policies_installed());
+    host_request(
+        &mut baseline,
+        HostRequest::Moved {
+            id: baseline_id,
+            x: 30,
+            y: 40,
+            serial: HostSerial(7),
+        },
+    );
+    let baseline_a_move = baseline.drain(A);
+    let baseline_b_move = baseline.drain(B);
+    assert!(
+        event_frames(&baseline_a_move)
+            .iter()
+            .any(|event| event[0] == (22 | 0x80))
+    );
+    assert!(
+        event_frames(&baseline_b_move)
+            .iter()
+            .any(|event| event[0] == (22 | 0x80))
+    );
+    assert_eq!(
+        baseline.state.resources.window(baseline_window).unwrap().x,
+        30
+    );
+    host_request(
+        &mut baseline,
+        HostRequest::CloseRequested { id: baseline_id },
+    );
+    let baseline_close = baseline.drain(A);
+    assert_eq!(event_frames(&baseline_close)[0][0], 33 | 0x80);
+    let baseline_requestor = ResourceId(0x0057_0011);
+    create_window(&mut baseline, B, baseline_requestor);
+    let baseline_selection = baseline
+        .state
+        .atoms
+        .intern("ACCESS_HOST_NOTIFY_SELECTION", false);
+    let baseline_target = baseline
+        .state
+        .atoms
+        .intern("ACCESS_HOST_NOTIFY_TARGET", false);
+    let baseline_property = baseline
+        .state
+        .atoms
+        .intern("ACCESS_HOST_NOTIFY_PROPERTY", false);
+    let mut baseline_notify = Vec::new();
+    for property_value in [baseline_property, AtomId(0)] {
+        rootless::selection::send_selection_notify(
+            &mut baseline.state,
+            0x4455_6677,
+            baseline_window,
+            [baseline_selection, baseline_target, property_value],
+        )
+        .unwrap();
+        assert_eq!(baseline.drain(A).len(), 32);
+        rootless::selection::send_selection_notify(
+            &mut baseline.state,
+            0x4455_6677,
+            baseline_requestor,
+            [baseline_selection, baseline_target, property_value],
+        )
+        .unwrap();
+        baseline_notify.push(baseline.drain(B));
+    }
+
     let (mut control, window, id) = rootless_host_fixture();
     let control_calls = control.install_policy(|_, _| Decision::Allow);
     host_request(
@@ -919,6 +1257,8 @@ fn receive_rootless_outgoing_core_events_are_checked() {
     );
     let control_a_move = control.drain(A);
     let control_b_move = control.drain(B);
+    assert_eq!(control_a_move, baseline_a_move);
+    assert_eq!(control_b_move, baseline_b_move);
     assert!(
         event_frames(&control_a_move)
             .iter()
@@ -936,6 +1276,7 @@ fn receive_rootless_outgoing_core_events_are_checked() {
     let delete_window = control.state.atoms.intern("WM_DELETE_WINDOW", false);
     host_request(&mut control, HostRequest::CloseRequested { id });
     let control_close = control.drain(A);
+    assert_eq!(control_close, baseline_close);
     assert_eq!(event_frames(&control_close)[0][0], 33 | 0x80);
     assert_eq!(
         u32::from_le_bytes(control_close[12..16].try_into().unwrap()),
@@ -984,6 +1325,7 @@ fn receive_rootless_outgoing_core_events_are_checked() {
         .unwrap();
         control_notify.push(control.drain(B));
     }
+    assert_eq!(control_notify, baseline_notify);
     assert!(
         receive_checks(&control_calls.lock().unwrap())
             .iter()

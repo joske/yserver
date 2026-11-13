@@ -233,11 +233,19 @@ fn install_destroy_policy(
 #[test]
 fn receive_destroy_denial_keeps_cleanup() {
     for opcode in [4, 5] {
+        let mut baseline = destroy_fixture();
+        assert!(!baseline.state.policies_installed());
+        run_destroy_request(&mut baseline, opcode);
+        let baseline_denied_stream = baseline.drain(NOTIFY_RECEIVER_DENIED);
+        let baseline_allowed_stream = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+
         let mut control = destroy_fixture();
         install_destroy_policy(&mut control, false);
         run_destroy_request(&mut control, opcode);
-        let _control_denied_stream = control.drain(NOTIFY_RECEIVER_DENIED);
+        let control_denied_stream = control.drain(NOTIFY_RECEIVER_DENIED);
         let control_allowed_stream = control.drain(NOTIFY_RECEIVER_ALLOWED);
+        assert_eq!(control_denied_stream, baseline_denied_stream);
+        assert_eq!(control_allowed_stream, baseline_allowed_stream);
         let control_backend = control.backend.calls();
         assert!(control.drain(NOTIFY_SENDER).is_empty());
         assert_destroy_cleanup(&control, opcode);
@@ -418,11 +426,19 @@ fn install_disconnect_policy(
 // Mutation: skip Receive when execute_destroy runs from server teardown.
 #[test]
 fn receive_disconnect_destroy_notifies_survivors() {
+    let mut baseline = destroy_fixture();
+    assert!(!baseline.state.policies_installed());
+    process_disconnect(&mut baseline.state, &mut baseline.backend, NOTIFY_SENDER);
+    let baseline_denied_stream = baseline.drain(NOTIFY_RECEIVER_DENIED);
+    let baseline_allowed_stream = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+
     let mut control = destroy_fixture();
     install_disconnect_policy(&mut control, false);
     process_disconnect(&mut control.state, &mut control.backend, NOTIFY_SENDER);
     let control_denied_stream = control.drain(NOTIFY_RECEIVER_DENIED);
     let control_allowed_stream = control.drain(NOTIFY_RECEIVER_ALLOWED);
+    assert_eq!(control_denied_stream, baseline_denied_stream);
+    assert_eq!(control_allowed_stream, baseline_allowed_stream);
     let control_backend = control.backend.calls();
     assert_destroy_cleanup(&control, 4);
 
@@ -571,12 +587,21 @@ fn install_cow_policy(fixture: &mut NotifyFixture) -> Arc<Mutex<Vec<RecordedExte
 // exempt core events solely because the producer is COMPOSITE.
 #[test]
 fn receive_cow_notifications_keep_extension_request() {
+    let mut baseline = NotifyFixture::new();
+    select_cow_notifications(&mut baseline);
+    assert!(!baseline.state.policies_installed());
+    dispatch_composite(&mut baseline, NOTIFY_SENDER, 70, 7);
+    let baseline_requestor_get = baseline.drain(NOTIFY_SENDER);
+    let baseline_create_events = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+
     let mut control = NotifyFixture::new();
     select_cow_notifications(&mut control);
     control.install_policy(|_, _| Decision::Allow);
     dispatch_composite(&mut control, NOTIFY_SENDER, 70, 7);
     let control_requestor_get = control.drain(NOTIFY_SENDER);
     let control_create_events = control.drain(NOTIFY_RECEIVER_ALLOWED);
+    assert_eq!(control_requestor_get, baseline_requestor_get);
+    assert_eq!(control_create_events, baseline_create_events);
     assert_eq!(
         event_tuples(&control_create_events),
         vec![
@@ -739,6 +764,24 @@ fn receive_cow_notifications_keep_extension_request() {
 // Mutation: reuse the previous COMPOSITE request context for COW server teardown.
 #[test]
 fn receive_last_cow_claim_disconnect_uses_no_request() {
+    let mut baseline = NotifyFixture::new();
+    select_cow_notifications(&mut baseline);
+    assert!(!baseline.state.policies_installed());
+    dispatch_composite(&mut baseline, NOTIFY_SENDER, 72, 7);
+    let _ = baseline.drain(NOTIFY_SENDER);
+    let _ = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+    for client in [NOTIFY_SENDER, NOTIFY_RECEIVER_ALLOWED] {
+        baseline
+            .state
+            .clients
+            .get_mut(&client.0)
+            .expect("live COW subscriber")
+            .event_masks
+            .insert(COMPOSITE_OVERLAY_WINDOW, STRUCTURE_NOTIFY);
+    }
+    process_disconnect(&mut baseline.state, &mut baseline.backend, NOTIFY_SENDER);
+    let baseline_release_allowed = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+
     let mut control = NotifyFixture::new();
     select_cow_notifications(&mut control);
     control.install_policy(|_, _| Decision::Allow);
@@ -756,6 +799,7 @@ fn receive_last_cow_claim_disconnect_uses_no_request() {
     }
     process_disconnect(&mut control.state, &mut control.backend, NOTIFY_SENDER);
     let control_release_allowed = control.drain(NOTIFY_RECEIVER_ALLOWED);
+    assert_eq!(control_release_allowed, baseline_release_allowed);
     assert_eq!(
         event_tuples(&control_release_allowed),
         vec![

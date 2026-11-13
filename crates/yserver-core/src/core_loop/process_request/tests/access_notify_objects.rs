@@ -285,10 +285,26 @@ fn assert_only_focus_event_removed(
 // skip checks for NotifyGrab/Ungrab/server mode.
 #[test]
 fn receive_focus_checks_transition_windows_and_keeps_xi2() {
+    let mut baseline = access_notify_focus_fixture();
+    assert!(!baseline.state.policies_installed());
+    set_focus_to_new_child(&mut baseline);
+    let baseline_focus = clear_focus_streams(&mut baseline);
+
     let mut control = access_notify_focus_fixture();
     let control_calls = focus_policy(&mut control, false);
     set_focus_to_new_child(&mut control);
     let control_focus = clear_focus_streams(&mut control);
+    for client in [
+        NOTIFY_SENDER,
+        NOTIFY_RECEIVER_DENIED,
+        NOTIFY_RECEIVER_ALLOWED,
+    ] {
+        assert_eq!(
+            stream(&control_focus, client),
+            stream(&baseline_focus, client),
+            "focus transition no-policy bytes match recording-Allow"
+        );
+    }
     assert_eq!(
         focus_fields(stream(&control_focus, NOTIFY_RECEIVER_ALLOWED)),
         [
@@ -351,6 +367,19 @@ fn receive_focus_checks_transition_windows_and_keeps_xi2() {
     for (opcode, sequence, expected_mode) in [(31, 42, 1), (32, 43, 2)] {
         focus_grab(&mut control, opcode, sequence);
         let control_streams = clear_focus_streams(&mut control);
+        focus_grab(&mut baseline, opcode, sequence);
+        let baseline_streams = clear_focus_streams(&mut baseline);
+        for client in [
+            NOTIFY_SENDER,
+            NOTIFY_RECEIVER_DENIED,
+            NOTIFY_RECEIVER_ALLOWED,
+        ] {
+            assert_eq!(
+                stream(&control_streams, client),
+                stream(&baseline_streams, client),
+                "grab transition no-policy bytes match recording-Allow"
+            );
+        }
         focus_grab(&mut denied, opcode, sequence);
         let denied_streams = clear_focus_streams(&mut denied);
         assert_only_focus_event_removed(
@@ -384,6 +413,22 @@ fn receive_focus_checks_transition_windows_and_keeps_xi2() {
         RequestOutcome::Handled
     ));
     let control_destroy = clear_focus_streams(&mut control);
+    assert!(matches!(
+        request(&mut baseline, NOTIFY_SENDER, 44, 4, 0, &destroy_body),
+        RequestOutcome::Handled
+    ));
+    let baseline_destroy = clear_focus_streams(&mut baseline);
+    for client in [
+        NOTIFY_SENDER,
+        NOTIFY_RECEIVER_DENIED,
+        NOTIFY_RECEIVER_ALLOWED,
+    ] {
+        assert_eq!(
+            stream(&control_destroy, client),
+            stream(&baseline_destroy, client),
+            "destroy focus no-policy bytes match recording-Allow"
+        );
+    }
     assert!(matches!(
         request(&mut denied, NOTIFY_SENDER, 44, 4, 0, &destroy_body),
         RequestOutcome::Handled
@@ -483,29 +528,15 @@ fn receive_focus_checks_transition_windows_and_keeps_xi2() {
 
     // Host activation is independent server work: it reaches the real host entry point
     // with a live mapped top-level and carries no stale request opcode.
-    let mut host = NotifyFixture::new();
-    host.backend = RecordingBackend::new().with_redirect_activation();
-    rootless::enable(&mut host.state, &mut host.backend, CoordinatePolicy::Opaque)
-        .expect("enable rootless");
-    create_window(&mut host.state, HOST_TOP, ROOT_WINDOW, None);
-    let _ = host.state.resources.map_window(HOST_TOP);
-    let id = host
-        .backend
-        .calls()
-        .iter()
-        .flat_map(|call| match call {
-            RecordedCall::RootlessEvents(events) => events.iter().collect::<Vec<_>>(),
-            _ => Vec::new(),
-        })
-        .find_map(|event| match event {
-            RootlessEvent::Mapped { id, window, .. } if *window == HOST_TOP => Some(*id),
-            _ => None,
-        });
-    if id.is_none() {
-        rootless::reconcile_and_dispatch(&mut host.state, &mut host.backend);
-    }
-    let id = id.or_else(|| {
-        host.backend
+    let host_fixture = || {
+        let mut host = NotifyFixture::new();
+        host.backend = RecordingBackend::new().with_redirect_activation();
+        rootless::enable(&mut host.state, &mut host.backend, CoordinatePolicy::Opaque)
+            .expect("enable rootless");
+        create_window(&mut host.state, HOST_TOP, ROOT_WINDOW, None);
+        let _ = host.state.resources.map_window(HOST_TOP);
+        let id = host
+            .backend
             .calls()
             .iter()
             .flat_map(|call| match call {
@@ -515,18 +546,52 @@ fn receive_focus_checks_transition_windows_and_keeps_xi2() {
             .find_map(|event| match event {
                 RootlessEvent::Mapped { id, window, .. } if *window == HOST_TOP => Some(*id),
                 _ => None,
+            });
+        if id.is_none() {
+            rootless::reconcile_and_dispatch(&mut host.state, &mut host.backend);
+        }
+        let id = id
+            .or_else(|| {
+                host.backend
+                    .calls()
+                    .iter()
+                    .flat_map(|call| match call {
+                        RecordedCall::RootlessEvents(events) => events.iter().collect::<Vec<_>>(),
+                        _ => Vec::new(),
+                    })
+                    .find_map(|event| match event {
+                        RootlessEvent::Mapped { id, window, .. } if *window == HOST_TOP => {
+                            Some(*id)
+                        }
+                        _ => None,
+                    })
             })
-    });
-    let id = id.expect("reconciled live top-level id");
-    for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
-        host.state
-            .clients
-            .get_mut(&client.0)
-            .unwrap()
-            .event_masks
-            .insert(HOST_TOP, FOCUS_MASK);
-    }
-    host.state.start_instant = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            .expect("reconciled live top-level id");
+        for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+            host.state
+                .clients
+                .get_mut(&client.0)
+                .unwrap()
+                .event_masks
+                .insert(HOST_TOP, FOCUS_MASK);
+        }
+        host.state.start_instant = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        (host, id)
+    };
+
+    let (mut host_baseline, host_baseline_id) = host_fixture();
+    assert!(!host_baseline.state.policies_installed());
+    rootless::host_request(
+        &mut host_baseline.state,
+        &mut host_baseline.backend,
+        HostRequest::Activated {
+            id: host_baseline_id,
+        },
+    );
+    let host_baseline_denied = host_baseline.drain(NOTIFY_RECEIVER_DENIED);
+    let host_baseline_allowed = host_baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+
+    let (mut host, id) = host_fixture();
     let host_calls = host.install_policy(|_, _| Decision::Allow);
     rootless::host_request(
         &mut host.state,
@@ -534,6 +599,9 @@ fn receive_focus_checks_transition_windows_and_keeps_xi2() {
         HostRequest::Activated { id },
     );
     assert_eq!(host.state.core_focus.raw, HOST_TOP.0);
+    assert_eq!(host.drain(NOTIFY_RECEIVER_DENIED), host_baseline_denied);
+    let host_allowed = host.drain(NOTIFY_RECEIVER_ALLOWED);
+    assert_eq!(host_allowed, host_baseline_allowed);
     assert!(receives(&host_calls.lock().unwrap()).iter().any(|call| {
         call.request.is_none()
             && call.receive == Some(EventSubject::Window(HOST_TOP))
@@ -543,7 +611,7 @@ fn receive_focus_checks_transition_windows_and_keeps_xi2() {
     let host_receive_checks = receives(&host_recorded);
     assert_eq!(host_receive_checks.len(), 4, "{host_receive_checks:#?}");
     assert_eq!(
-        focus_fields(&host.drain(NOTIFY_RECEIVER_ALLOWED)),
+        focus_fields(&host_allowed),
         [(10, 5, HOST_TOP, 0), (9, 3, HOST_TOP, 0)]
     );
 }
@@ -602,6 +670,49 @@ fn colormap_windows(bytes: &[u8]) -> Vec<ResourceId> {
         .collect();
     windows.sort_unstable_by_key(|window| window.0);
     windows
+}
+
+fn literal_colormap_notify(window: ResourceId) -> Vec<u8> {
+    let mut event = vec![32, 0, 0, 0];
+    event.extend_from_slice(&window.0.to_le_bytes());
+    event.extend_from_slice(&TEST_COLORMAP.0.to_le_bytes());
+    event.extend_from_slice(&[0, 1]); // new=false, installed=true
+    event.resize(32, 0);
+    event
+}
+
+fn colormap_install_output(allow_policy: bool) -> (Vec<u8>, Vec<u8>) {
+    let mut fixture = colormap_fixture();
+    assert!(!fixture.state.policies_installed());
+    if allow_policy {
+        fixture.install_policy(|_, _| Decision::Allow);
+    }
+    colormap_request(&mut fixture, 81, 53);
+    (
+        fixture.drain(NOTIFY_RECEIVER_DENIED),
+        fixture.drain(NOTIFY_RECEIVER_ALLOWED),
+    )
+}
+
+// Mutation: suppress N38 ColormapNotify only when no access policy is installed.
+fn assert_colormap_no_policy_parity() {
+    let (without_policy_denied, without_policy_allowed) = colormap_install_output(false);
+    let (allow_denied, allow_allowed) = colormap_install_output(true);
+    let expected = [
+        literal_colormap_notify(WINDOW_A),
+        literal_colormap_notify(WINDOW_B),
+    ];
+    let sorted = |bytes: &[u8]| {
+        let mut frames = wire_frames(bytes);
+        frames.sort();
+        frames
+    };
+    assert_eq!(sorted(&without_policy_denied), expected);
+    assert_eq!(sorted(&without_policy_allowed), expected);
+    assert_eq!(sorted(&allow_denied), expected);
+    assert_eq!(sorted(&allow_allowed), expected);
+    assert_eq!(sorted(&without_policy_denied), sorted(&allow_denied));
+    assert_eq!(sorted(&without_policy_allowed), sorted(&allow_allowed));
 }
 
 // Mutations: use W(colormap) as the subject, or skip the installed-list update on denial.
@@ -726,6 +837,20 @@ fn property_event(property: AtomId, deleted: bool) -> Vec<u8> {
     event
 }
 
+fn literal_get_property_reply(sequence: u16, type_atom: AtomId, value: &[u8]) -> Vec<u8> {
+    assert_eq!(value.len(), 10, "fixture reply has ten property bytes");
+    let mut reply = vec![1, 8];
+    reply.extend_from_slice(&sequence.to_be_bytes());
+    reply.extend_from_slice(&3_u32.to_be_bytes());
+    reply.extend_from_slice(&type_atom.0.to_be_bytes());
+    reply.extend_from_slice(&0_u32.to_be_bytes());
+    reply.extend_from_slice(&10_u32.to_be_bytes());
+    reply.extend_from_slice(&[0; 12]);
+    reply.extend_from_slice(value);
+    reply.extend_from_slice(&[0; 2]);
+    reply
+}
+
 fn assert_property_calls(calls: &[RecordedExtensionCheck], request_opcode: u8, count: usize) {
     let receive = receives(calls);
     assert_eq!(receive.len(), count);
@@ -755,6 +880,50 @@ fn assert_property_calls(calls: &[RecordedExtensionCheck], request_opcode: u8, c
 // Mutations: drop mixed request output/reply, or skip deletion/rotation on denial.
 #[test]
 fn receive_get_property_delete_keeps_reply() {
+    fn get_delete_output(allow_policy: bool) -> (Vec<u8>, Vec<u8>, AtomId, AtomId) {
+        let mut fixture = NotifyFixture::new();
+        select_property_change(&mut fixture);
+        let property = fixture.state.atoms.intern("TASK6_GET_DELETE", false);
+        let type_atom = seed_property(&mut fixture, property, b"reply-data");
+        assert!(!fixture.state.policies_installed());
+        if allow_policy {
+            fixture.install_policy(|_, _| Decision::Allow);
+        }
+        let mut body = NOTIFY_WINDOW.0.to_le_bytes().to_vec();
+        body.extend_from_slice(&property.0.to_le_bytes());
+        body.extend_from_slice(&type_atom.0.to_le_bytes());
+        body.extend_from_slice(&0_u32.to_le_bytes());
+        body.extend_from_slice(&1024_u32.to_le_bytes());
+        assert!(matches!(
+            request(&mut fixture, NOTIFY_RECEIVER_DENIED, 64, 20, 1, &body),
+            RequestOutcome::Handled
+        ));
+        (
+            fixture.drain(NOTIFY_RECEIVER_DENIED),
+            fixture.drain(NOTIFY_RECEIVER_ALLOWED),
+            property,
+            type_atom,
+        )
+    }
+
+    let (baseline_mixed, baseline_allowed, get_property, get_type) = get_delete_output(false);
+    let (allow_mixed, allow_allowed, allow_property, allow_type) = get_delete_output(true);
+    assert_eq!((allow_property, allow_type), (get_property, get_type));
+    let mut expected_reply = literal_get_property_reply(64, get_type, b"reply-data");
+    let mut expected_event = literal_property_notify(ClientByteOrder::BigEndian, 64, get_property);
+    expected_event[16] = 1;
+    expected_reply.extend_from_slice(&expected_event);
+    assert_eq!(
+        baseline_mixed, expected_reply,
+        "no-policy reply and delete event"
+    );
+    assert_eq!(baseline_allowed, property_event(get_property, true));
+    assert_eq!(allow_mixed, baseline_mixed, "recording-Allow mixed output");
+    assert_eq!(
+        allow_allowed, baseline_allowed,
+        "recording-Allow fanout bytes"
+    );
+
     let mut changed = NotifyFixture::new();
     select_property_change(&mut changed);
     let property = changed.state.atoms.intern("TASK6_CHANGE", false);
@@ -965,6 +1134,7 @@ fn rootless_change(fixture: &mut NotifyFixture, window: ResourceId, property: At
 #[test]
 fn receive_bridge_property_denial_keeps_clients_and_property() {
     let (mut control, control_property) = rootless_property_fixture();
+    assert!(!control.state.policies_installed());
     rootless_change(&mut control, NOTIFY_WINDOW, control_property, 71);
     let control_denied_client = control.drain(NOTIFY_RECEIVER_DENIED);
     let control_allowed_client = control.drain(NOTIFY_RECEIVER_ALLOWED);
@@ -975,6 +1145,13 @@ fn receive_bridge_property_denial_keeps_clients_and_property() {
         [SelectionEvent::Property { window, property, .. }]
             if *window == NOTIFY_WINDOW && *property == control_property
     ));
+
+    let (mut allow, allow_property) = rootless_property_fixture();
+    assert_eq!(allow_property, control_property);
+    allow.install_policy(|_, _| Decision::Allow);
+    rootless_change(&mut allow, NOTIFY_WINDOW, allow_property, 71);
+    assert_eq!(allow.drain(NOTIFY_RECEIVER_DENIED), control_denied_client);
+    assert_eq!(allow.drain(NOTIFY_RECEIVER_ALLOWED), control_allowed_client);
 
     let (mut fixture, property) = rootless_property_fixture();
     assert_eq!(property, control_property);
@@ -1084,6 +1261,7 @@ fn receive_bridge_property_denial_keeps_clients_and_property() {
 pub(super) fn run_no_policy_parity_fixtures() {
     receive_focus_checks_transition_windows_and_keeps_xi2();
     receive_colormap_uses_each_subscribing_window();
+    assert_colormap_no_policy_parity();
     receive_get_property_delete_keeps_reply();
     receive_bridge_property_denial_keeps_clients_and_property();
 }

@@ -6,7 +6,7 @@ use super::{
 use crate::{
     access::{Decision, DenyError, EventDescription, EventSubject},
     backend::{WindowHandle, recording::RecordedCall},
-    core_loop::fanout::expose_event_fanout_to_state,
+    core_loop::fanout::{expose_event_fanout_to_state, subscribers_by_id},
     host_x11::{HostExposeEvent, HostXidMap},
     resources::{MapState, ROOT_WINDOW},
 };
@@ -557,6 +557,19 @@ fn receive_host_expose_checks_each_delivery_window() {
         count: 1,
     };
     let map = HostXidMap::from([(HOST_WINDOW, PARENT_WINDOW)]);
+    let mut baseline = fixture();
+    assert!(!baseline.state.policies_installed());
+    assert!(expose_event_fanout_to_state(&mut baseline.state, &map, event).is_empty());
+    let baseline_denied = baseline.drain(NOTIFY_RECEIVER_DENIED);
+    let baseline_allowed = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+    let expected_parent = literal_expose(PARENT_WINDOW, 0, 0, 100, 100, 1);
+    let expected_child = literal_expose(CHILD_WINDOW, 0, 0, 30, 40, 0);
+    assert_eq!(
+        baseline_denied,
+        [expected_parent.clone(), expected_child.clone()].concat()
+    );
+    assert_eq!(baseline_allowed, baseline_denied);
+
     let mut allow = fixture();
     allow.install_policy(|_, _| Decision::Allow);
     assert!(
@@ -565,18 +578,17 @@ fn receive_host_expose_checks_each_delivery_window() {
     );
     let allow_denied = allow.drain(NOTIFY_RECEIVER_DENIED);
     let allow_permitted = allow.drain(NOTIFY_RECEIVER_ALLOWED);
-    let expected_parent = literal_expose(PARENT_WINDOW, 0, 0, 100, 100, 1);
-    let expected_child = literal_expose(CHILD_WINDOW, 0, 0, 30, 40, 0);
-    assert_eq!(
-        allow_denied,
-        [expected_parent.clone(), expected_child.clone()].concat()
-    );
-    assert_eq!(allow_permitted, allow_denied);
+    assert_eq!(allow_denied, baseline_denied);
+    assert_eq!(allow_permitted, baseline_allowed);
 
     let mut denied = fixture();
-    let calls = denied.install_policy(|_, call| {
+    let recipients = subscribers_by_id(&denied.state, PARENT_WINDOW, EXPOSURE_MASK);
+    assert_eq!(recipients.len(), 2, "parent has two selected recipients");
+    let denied_recipient = recipients[0];
+    let allowed_recipient = recipients[1];
+    let calls = denied.install_policy(move |_, call| {
         if call.hook == ExtensionHook::Receive
-            && call.client == NOTIFY_RECEIVER_DENIED
+            && call.client == denied_recipient
             && call.receive == Some(EventSubject::Window(PARENT_WINDOW))
         {
             Decision::Deny(DENY)
@@ -588,14 +600,19 @@ fn receive_host_expose_checks_each_delivery_window() {
         expose_event_fanout_to_state(&mut denied.state, &map, event).is_empty(),
         "Receive denial must not be reported as a transport failure"
     );
+    let recorded = calls.lock().unwrap();
+    let receive_calls = receives(&recorded);
     assert_eq!(
-        receives(&calls.lock().unwrap()).len(),
+        receive_calls.len(),
         4,
         "the policy must be asked once for each selected window/client delivery"
     );
+    assert_eq!(receive_calls[0].client, denied_recipient);
+    assert_eq!(receive_calls[1].client, allowed_recipient);
+    drop(recorded);
     assert!(denied.drain(NOTIFY_SENDER).is_empty());
-    assert_eq!(denied.drain(NOTIFY_RECEIVER_DENIED), expected_child);
-    let permitted = denied.drain(NOTIFY_RECEIVER_ALLOWED);
+    assert_eq!(denied.drain(denied_recipient), expected_child);
+    let permitted = denied.drain(allowed_recipient);
     assert_eq!(permitted, allow_permitted);
     assert_eq!(
         expose_fields(&permitted),
@@ -610,7 +627,7 @@ fn receive_host_expose_checks_each_delivery_window() {
             allow.state.resources.window(window).unwrap().map_state
         );
     }
-    for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+    for client in [denied_recipient, allowed_recipient] {
         assert!(denied.state.clients.contains_key(&client.0));
     }
     assert_eq!(denied.backend.calls(), allow.backend.calls());
@@ -707,6 +724,20 @@ fn receive_clear_area_expose_denial_keeps_paint() {
         fixture
     }
 
+    let mut baseline = fixture();
+    assert!(!baseline.state.policies_installed());
+    assert!(matches!(
+        clear_area(&mut baseline, 31, true),
+        RequestOutcome::Handled
+    ));
+    let baseline_denied = baseline.drain(NOTIFY_RECEIVER_DENIED);
+    let baseline_allowed = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+    assert_eq!(
+        baseline_denied,
+        literal_expose(NOTIFY_WINDOW, 0, 0, 64, 48, 0)
+    );
+    assert_eq!(baseline_allowed, baseline_denied);
+
     let mut allow = fixture();
     allow.install_policy(|_, _| Decision::Allow);
     assert!(matches!(
@@ -715,8 +746,8 @@ fn receive_clear_area_expose_denial_keeps_paint() {
     ));
     let allow_denied = allow.drain(NOTIFY_RECEIVER_DENIED);
     let allow_permitted = allow.drain(NOTIFY_RECEIVER_ALLOWED);
-    assert_eq!(allow_denied, literal_expose(NOTIFY_WINDOW, 0, 0, 64, 48, 0));
-    assert_eq!(allow_permitted, allow_denied);
+    assert_eq!(allow_denied, baseline_denied);
+    assert_eq!(allow_permitted, baseline_allowed);
     let allow_calls = allow.backend.calls();
     assert!(allow_calls.iter().any(|call| matches!(
         call,
@@ -888,13 +919,29 @@ fn receive_map_visibility_denial_keeps_descendant_walk() {
             .collect()
     }
 
+    let mut baseline = fixture();
+    assert!(!baseline.state.policies_installed());
+    assert!(matches!(map_parent(&mut baseline), RequestOutcome::Handled));
+    let baseline_denied = baseline.drain(NOTIFY_RECEIVER_DENIED);
+    let baseline_permitted = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+    assert_eq!(baseline_denied.len(), 3 * 32);
+    assert_eq!(baseline_permitted, baseline_denied);
+    assert_eq!(
+        visibility_fields(&baseline_permitted),
+        vec![
+            (PARENT_WINDOW, 0),
+            (CHILD_WINDOW, 0),
+            (GRANDCHILD_WINDOW, 0),
+        ]
+    );
+
     let mut allow = fixture();
     allow.install_policy(|_, _| Decision::Allow);
     assert!(matches!(map_parent(&mut allow), RequestOutcome::Handled));
     let allow_denied = allow.drain(NOTIFY_RECEIVER_DENIED);
     let allow_permitted = allow.drain(NOTIFY_RECEIVER_ALLOWED);
-    assert_eq!(allow_denied.len(), 3 * 32);
-    assert_eq!(allow_permitted, allow_denied);
+    assert_eq!(allow_denied, baseline_denied);
+    assert_eq!(allow_permitted, baseline_permitted);
 
     let mut denied = fixture();
     let calls = denied.install_policy(|_, call| {
@@ -969,6 +1016,7 @@ fn receive_map_visibility_denial_keeps_descendant_walk() {
 #[test]
 fn receive_expose_rectangles_keep_counts_and_collapse() {
     let split_window = ResourceId(0x0054_0001);
+    let mut baseline_split = configured_window_fixture(split_window, 100, 100);
     let mut allow_split = configured_window_fixture(split_window, 100, 100);
     let mut denied_split = configured_window_fixture(split_window, 100, 100);
     let split_rects = vec![
@@ -985,7 +1033,7 @@ fn receive_expose_rectangles_keep_counts_and_collapse() {
             height: 20,
         },
     ];
-    for fixture in [&mut allow_split, &mut denied_split] {
+    for fixture in [&mut baseline_split, &mut allow_split, &mut denied_split] {
         assert!(crate::nested::set_shape_rects(
             &mut fixture.state,
             split_window,
@@ -1001,6 +1049,17 @@ fn receive_expose_rectangles_keep_counts_and_collapse() {
             Decision::Allow
         }
     });
+    assert!(!baseline_split.state.policies_installed());
+    configure_width(&mut baseline_split, split_window, 51, 101);
+    let baseline_split_denied = baseline_split.drain(NOTIFY_RECEIVER_DENIED);
+    let baseline_split_permitted = baseline_split.drain(NOTIFY_RECEIVER_ALLOWED);
+    let expected_split = [
+        literal_expose(split_window, 0, 0, 10, 10, 1),
+        literal_expose(split_window, 80, 70, 10, 20, 0),
+    ]
+    .concat();
+    assert_eq!(baseline_split_denied, expected_split);
+    assert_eq!(baseline_split_permitted, expected_split);
     configure_width(&mut allow_split, split_window, 51, 101);
     configure_width(&mut denied_split, split_window, 51, 101);
     assert_eq!(
@@ -1010,7 +1069,8 @@ fn receive_expose_rectangles_keep_counts_and_collapse() {
     );
     let allow_split_denied = allow_split.drain(NOTIFY_RECEIVER_DENIED);
     let allow_split_permitted = allow_split.drain(NOTIFY_RECEIVER_ALLOWED);
-    assert_eq!(allow_split_denied, allow_split_permitted);
+    assert_eq!(allow_split_denied, baseline_split_denied);
+    assert_eq!(allow_split_permitted, baseline_split_permitted);
     assert_eq!(
         expose_fields(&allow_split_permitted),
         vec![
@@ -1050,6 +1110,7 @@ fn receive_expose_rectangles_keep_counts_and_collapse() {
     }
 
     let collapsed_window = ResourceId(0x0054_0002);
+    let mut baseline_collapsed = configured_window_fixture(collapsed_window, 300, 100);
     let mut allow_collapsed = configured_window_fixture(collapsed_window, 300, 100);
     let mut denied_collapsed = configured_window_fixture(collapsed_window, 300, 100);
     let many_rects: Vec<_> = (0..26)
@@ -1060,7 +1121,11 @@ fn receive_expose_rectangles_keep_counts_and_collapse() {
             height: 1,
         })
         .collect();
-    for fixture in [&mut allow_collapsed, &mut denied_collapsed] {
+    for fixture in [
+        &mut baseline_collapsed,
+        &mut allow_collapsed,
+        &mut denied_collapsed,
+    ] {
         assert!(crate::nested::set_shape_rects(
             &mut fixture.state,
             collapsed_window,
@@ -1076,6 +1141,13 @@ fn receive_expose_rectangles_keep_counts_and_collapse() {
             Decision::Allow
         }
     });
+    assert!(!baseline_collapsed.state.policies_installed());
+    configure_width(&mut baseline_collapsed, collapsed_window, 52, 301);
+    let baseline_collapsed_denied = baseline_collapsed.drain(NOTIFY_RECEIVER_DENIED);
+    let baseline_collapsed_permitted = baseline_collapsed.drain(NOTIFY_RECEIVER_ALLOWED);
+    let expected_collapsed = literal_expose(collapsed_window, 0, 0, 251, 1, 0);
+    assert_eq!(baseline_collapsed_denied, expected_collapsed);
+    assert_eq!(baseline_collapsed_permitted, expected_collapsed);
     configure_width(&mut allow_collapsed, collapsed_window, 52, 301);
     configure_width(&mut denied_collapsed, collapsed_window, 52, 301);
     assert_eq!(
@@ -1085,7 +1157,8 @@ fn receive_expose_rectangles_keep_counts_and_collapse() {
     );
     let allow_collapsed_denied = allow_collapsed.drain(NOTIFY_RECEIVER_DENIED);
     let allow_collapsed_permitted = allow_collapsed.drain(NOTIFY_RECEIVER_ALLOWED);
-    assert_eq!(allow_collapsed_denied, allow_collapsed_permitted);
+    assert_eq!(allow_collapsed_denied, baseline_collapsed_denied);
+    assert_eq!(allow_collapsed_permitted, baseline_collapsed_permitted);
     assert_eq!(
         expose_fields(&allow_collapsed_permitted),
         vec![(collapsed_window, 0, 0, 251, 1, 0)]
@@ -1345,6 +1418,7 @@ fn receive_structure_subject_is_delivery_window() {
 
     for case in cases {
         let mut baseline = structure_fixture(case.request);
+        assert!(!baseline.state.policies_installed());
         assert!(
             matches!(
                 structure_request(&mut baseline, case.request),
@@ -1531,6 +1605,15 @@ fn receive_reparent_preserves_three_targets_and_order() {
             .expect("same-parent ReparentWindow through production dispatcher")
     }
 
+    let mut baseline = structure_fixture(StructureRequest::Reparent);
+    assert!(!baseline.state.policies_installed());
+    assert!(matches!(
+        structure_request(&mut baseline, StructureRequest::Reparent),
+        RequestOutcome::Handled
+    ));
+    let baseline_denied_client = baseline.drain(NOTIFY_RECEIVER_DENIED);
+    let baseline_allowed_client = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+
     let mut allow = structure_fixture(StructureRequest::Reparent);
     allow.install_policy(|_, _| Decision::Allow);
     assert!(matches!(
@@ -1594,6 +1677,7 @@ fn receive_reparent_preserves_three_targets_and_order() {
         decode_structure_events(&allow_allowed_client, ClientByteOrder::LittleEndian),
         expected_allow
     );
+    assert_eq!(baseline_allowed_client, allow_allowed_client);
     let expected_allow_denied: Vec<_> = expected_allow
         .iter()
         .map(|event| StructureEvent {
@@ -1608,6 +1692,7 @@ fn receive_reparent_preserves_three_targets_and_order() {
         decode_structure_events(&allow_denied_client, ClientByteOrder::BigEndian),
         expected_allow_denied
     );
+    assert_eq!(baseline_denied_client, allow_denied_client);
 
     let mut denied = structure_fixture(StructureRequest::Reparent);
     let calls = denied.install_policy(|_, call| {
@@ -1691,6 +1776,15 @@ fn receive_reparent_preserves_three_targets_and_order() {
             reparent: None,
         },
     ];
+    let mut same_baseline = structure_fixture(StructureRequest::Reparent);
+    assert!(!same_baseline.state.policies_installed());
+    assert!(matches!(
+        same_parent_request(&mut same_baseline),
+        RequestOutcome::Handled
+    ));
+    let same_baseline_denied_bytes = same_baseline.drain(NOTIFY_RECEIVER_DENIED);
+    let same_baseline_allowed_bytes = same_baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+
     let mut same_allow = structure_fixture(StructureRequest::Reparent);
     let same_allow_calls = same_allow.install_policy(|_, _| Decision::Allow);
     assert!(matches!(
@@ -1716,6 +1810,8 @@ fn receive_reparent_preserves_three_targets_and_order() {
         decode_structure_events(&same_allow_allowed_bytes, ClientByteOrder::LittleEndian),
         same_parent_events
     );
+    assert_eq!(same_baseline_denied_bytes, same_allow_denied_bytes);
+    assert_eq!(same_baseline_allowed_bytes, same_allow_allowed_bytes);
     let same_allow_log = same_allow_calls.lock().unwrap();
     assert_eq!(receives(&same_allow_log).len(), 12);
     assert!(
@@ -1857,11 +1953,22 @@ fn receive_gravity_denial_keeps_child_move() {
         (child.x, child.y)
     }
 
+    let mut baseline = fixture();
+    assert!(!baseline.state.policies_installed());
+    assert!(matches!(
+        resize_parent(&mut baseline),
+        RequestOutcome::Handled
+    ));
+    let baseline_denied = baseline.drain(NOTIFY_RECEIVER_DENIED);
+    let baseline_allowed = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+
     let mut allow = fixture();
     allow.install_policy(|_, _| Decision::Allow);
     assert!(matches!(resize_parent(&mut allow), RequestOutcome::Handled));
     let allow_denied = allow.drain(NOTIFY_RECEIVER_DENIED);
     let allow_allowed = allow.drain(NOTIFY_RECEIVER_ALLOWED);
+    assert_eq!(baseline_denied, allow_denied);
+    assert_eq!(baseline_allowed, allow_allowed);
     assert_eq!(
         decode_structure_events(&allow_denied, ClientByteOrder::BigEndian),
         vec![StructureEvent {
@@ -1944,51 +2051,72 @@ fn receive_gravity_denial_keeps_child_move() {
 // Mutation: move the Receive check ahead of the existing no-change exit.
 #[test]
 fn receive_structure_noop_does_not_ask() {
-    let mut fixture = structure_fixture(StructureRequest::Unmap);
-    fixture
-        .state
-        .resources
-        .window_mut(CHILD_WINDOW)
-        .expect("child")
-        .map_state = MapState::Unmapped;
-    let calls = fixture.install_policy(|_, _| Decision::Allow);
+    fn run_noop_requests(fixture: &mut NotifyFixture) {
+        fixture
+            .state
+            .resources
+            .window_mut(CHILD_WINDOW)
+            .expect("child")
+            .map_state = MapState::Unmapped;
 
-    // Put the child in the states that make each operation an existing no-op.
-    fixture.state.resources.window_mut(CHILD_WINDOW).unwrap().x = 7;
-    fixture
-        .state
-        .resources
-        .window_mut(CHILD_WINDOW)
-        .unwrap()
-        .map_state = MapState::Viewable;
-    assert!(matches!(
-        structure_request(&mut fixture, StructureRequest::Configure),
-        RequestOutcome::Handled
-    ));
-    fixture
-        .state
-        .resources
-        .window_mut(CHILD_WINDOW)
-        .unwrap()
-        .map_state = MapState::Viewable;
-    assert!(matches!(
-        structure_request(&mut fixture, StructureRequest::Map),
-        RequestOutcome::Handled
-    ));
-    fixture
-        .state
-        .resources
-        .window_mut(CHILD_WINDOW)
-        .unwrap()
-        .map_state = MapState::Unmapped;
-    assert!(matches!(
-        structure_request(&mut fixture, StructureRequest::Unmap),
-        RequestOutcome::Handled
-    ));
+        // Put the child in the states that make each operation an existing no-op.
+        fixture.state.resources.window_mut(CHILD_WINDOW).unwrap().x = 7;
+        fixture
+            .state
+            .resources
+            .window_mut(CHILD_WINDOW)
+            .unwrap()
+            .map_state = MapState::Viewable;
+        assert!(matches!(
+            structure_request(fixture, StructureRequest::Configure),
+            RequestOutcome::Handled
+        ));
+        fixture
+            .state
+            .resources
+            .window_mut(CHILD_WINDOW)
+            .unwrap()
+            .map_state = MapState::Viewable;
+        assert!(matches!(
+            structure_request(fixture, StructureRequest::Map),
+            RequestOutcome::Handled
+        ));
+        fixture
+            .state
+            .resources
+            .window_mut(CHILD_WINDOW)
+            .unwrap()
+            .map_state = MapState::Unmapped;
+        assert!(matches!(
+            structure_request(fixture, StructureRequest::Unmap),
+            RequestOutcome::Handled
+        ));
+    }
+
+    let mut baseline = structure_fixture(StructureRequest::Unmap);
+    assert!(!baseline.state.policies_installed());
+    run_noop_requests(&mut baseline);
+    for client in [
+        NOTIFY_SENDER,
+        NOTIFY_RECEIVER_DENIED,
+        NOTIFY_RECEIVER_ALLOWED,
+    ] {
+        assert!(baseline.drain(client).is_empty(), "no-policy no-op output");
+    }
+
+    let mut fixture = structure_fixture(StructureRequest::Unmap);
+    let calls = fixture.install_policy(|_, _| Decision::Allow);
+    run_noop_requests(&mut fixture);
     assert!(receives(&calls.lock().unwrap()).is_empty());
-    assert!(fixture.drain(NOTIFY_SENDER).is_empty());
-    assert!(fixture.drain(NOTIFY_RECEIVER_DENIED).is_empty());
-    assert!(fixture.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
+    for client in [
+        NOTIFY_SENDER,
+        NOTIFY_RECEIVER_DENIED,
+        NOTIFY_RECEIVER_ALLOWED,
+    ] {
+        let allow_output = fixture.drain(client);
+        assert!(allow_output.is_empty(), "recording-Allow no-op output");
+        assert_eq!(allow_output, baseline.drain(client));
+    }
 }
 
 const SUBSTRUCTURE_REDIRECT_MASK: u32 = 0x0010_0000;
