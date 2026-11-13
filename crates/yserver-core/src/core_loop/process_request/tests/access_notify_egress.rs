@@ -263,3 +263,90 @@ fn receive_request_scope_restores_after_dispatch() {
     assert_eq!(error[1], x11::error::BAD_LENGTH);
     assert_eq!(fixture.state.receive_request, None);
 }
+
+// Mutation: leave the most recent request opcode active for later host-generated events.
+#[test]
+fn receive_request_context_does_not_leak_to_host_expose() {
+    let (mut fixture, property) = property_fixture();
+    let calls = fixture.install_policy(|_, _| Decision::Allow);
+    assert!(matches!(
+        run_property_change(&mut fixture, 12, property, b"host-context"),
+        RequestOutcome::Handled
+    ));
+    assert_eq!(fixture.state.receive_request, None);
+    let _ = fixture.drain(NOTIFY_RECEIVER_DENIED);
+    let _ = fixture.drain(NOTIFY_RECEIVER_ALLOWED);
+
+    let invalid = fixture
+        .request(
+            NOTIFY_SENDER,
+            SequenceNumber(13),
+            RequestHeader {
+                opcode: 18,
+                data: 0,
+                length_units: 1,
+            },
+            &[],
+        )
+        .expect("invalid-length ChangeProperty returns an X error outcome");
+    assert!(matches!(invalid, RequestOutcome::Handled));
+    let error = fixture.drain(NOTIFY_SENDER);
+    assert_eq!(error.len(), 32);
+    assert_eq!(error[0], 0);
+    assert_eq!(error[1], x11::error::BAD_LENGTH);
+    assert_eq!(fixture.state.receive_request, None);
+
+    for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+        fixture
+            .state
+            .clients
+            .get_mut(&client.0)
+            .expect("selected receiver")
+            .event_masks
+            .insert(NOTIFY_WINDOW, 0x0000_8000);
+    }
+    fixture
+        .state
+        .resources
+        .window_mut(NOTIFY_WINDOW)
+        .expect("selected mapped window")
+        .map_state = crate::resources::MapState::Viewable;
+    let host_xid = 0x0055_0001;
+    let dropped = crate::core_loop::fanout::expose_event_fanout_to_state(
+        &mut fixture.state,
+        &crate::host_x11::HostXidMap::from([(host_xid, NOTIFY_WINDOW)]),
+        crate::host_x11::HostExposeEvent {
+            host_xid,
+            x: 1,
+            y: 2,
+            width: 10,
+            height: 11,
+            count: 0,
+        },
+    );
+    assert!(dropped.is_empty());
+    assert_eq!(fixture.drain(NOTIFY_RECEIVER_DENIED)[0], 12);
+    assert_eq!(fixture.drain(NOTIFY_RECEIVER_ALLOWED)[0], 12);
+    assert_eq!(fixture.state.receive_request, None);
+
+    let calls = calls.lock().unwrap();
+    let receives = receive_checks(&calls);
+    let property_receives: Vec<_> = receives
+        .iter()
+        .filter(|call| call.events == Some(vec![EventDescription::core(28)]))
+        .collect();
+    assert_eq!(property_receives.len(), 2);
+    assert!(
+        property_receives
+            .iter()
+            .all(|call| call.request == request_opcodes(18, 0))
+    );
+    let host_exposes: Vec<_> = receives
+        .iter()
+        .filter(|call| call.events == Some(vec![EventDescription::core(12)]))
+        .collect();
+    assert_eq!(host_exposes.len(), 2);
+    assert!(host_exposes.iter().all(|call| {
+        call.receive == Some(EventSubject::Window(NOTIFY_WINDOW)) && call.request.is_none()
+    }));
+}

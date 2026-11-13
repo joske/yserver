@@ -24,7 +24,7 @@ use std::{
 use yserver_protocol::x11::{self, ClientByteOrder, ClientId, ResourceId, SequenceNumber};
 
 use crate::{
-    access::{Decision, EventBatch, EventSubject},
+    access::{Decision, EventBatch, EventDescription, EventSubject},
     core_loop::client_io::{self, WriteOutcome},
     host_x11::{HostExposeEvent, HostXidMap},
     resources::{MapState, ROOT_WINDOW},
@@ -596,12 +596,19 @@ pub fn expose_event_fanout_to_state(
     let Some(window) = xid_map.get(&ev.host_xid).copied() else {
         return Vec::new();
     };
-    let mut dropped =
-        emit_window_event_to_state(state, window, EXPOSURE_MASK_BIT, |buf, seq, order| {
+    let expose_description = [EventDescription::core(12)];
+    let expose_batch = EventBatch::new(&expose_description);
+    let mut dropped = emit_window_event_to_state_with_receive(
+        state,
+        window,
+        EXPOSURE_MASK_BIT,
+        &expose_batch,
+        |buf, seq, order| {
             x11::encode_expose_event(
                 buf, seq, order, window, ev.x, ev.y, ev.width, ev.height, ev.count,
             );
-        });
+        },
+    );
     if window == ROOT_WINDOW {
         return dropped;
     }
@@ -614,10 +621,11 @@ pub fn expose_event_fanout_to_state(
     );
     for rect in exposed {
         let target_window = rect.window;
-        let more = emit_window_event_to_state(
+        let more = emit_window_event_to_state_with_receive(
             state,
             target_window,
             EXPOSURE_MASK_BIT,
+            &expose_batch,
             |buf, seq, order| {
                 x11::encode_expose_event(
                     buf,
@@ -651,6 +659,8 @@ pub fn emit_visibility_unobscured_subtree_to_state(
     root: ResourceId,
 ) -> Vec<ClientId> {
     let mut dropped = Vec::new();
+    let visibility_description = [EventDescription::core(15)];
+    let visibility_batch = EventBatch::new(&visibility_description);
     let children: Vec<ResourceId> = state.resources.children(root).to_vec();
     for child in children {
         let viewable = state
@@ -659,10 +669,11 @@ pub fn emit_visibility_unobscured_subtree_to_state(
             .is_some_and(|w| w.map_state == MapState::Viewable);
         if viewable {
             let target = child;
-            let more = emit_window_event_to_state(
+            let more = emit_window_event_to_state_with_receive(
                 state,
                 target,
                 VISIBILITY_MASK_BIT,
+                &visibility_batch,
                 |buf, seq, order| {
                     x11::encode_visibility_notify_event(buf, seq, order, target, 0);
                 },

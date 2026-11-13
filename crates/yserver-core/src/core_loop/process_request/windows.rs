@@ -1,5 +1,8 @@
 use crate::{
-    access::{AccessMode, Creation, RequestOpcodes, ResourceKind, ResourceTarget},
+    access::{
+        AccessMode, Creation, EventBatch, EventDescription, RequestOpcodes, ResourceKind,
+        ResourceTarget,
+    },
     backend::{Backend, OriginContext},
     core_loop::{
         damage_fanout::{
@@ -8,7 +11,7 @@ use crate::{
         },
         fanout::{
             emit_visibility_unobscured_subtree_to_state, emit_window_event_to_state,
-            fanout_event_to_clients, subscribers_by_id,
+            emit_window_event_to_state_with_receive, fanout_event_to_clients, subscribers_by_id,
         },
         process_request::{
             RequestOutcome, emit_x11_error,
@@ -106,22 +109,30 @@ pub(crate) fn send_window_exposures(
         region
     };
     let last = events.len() - 1;
+    let expose_description = [EventDescription::core(12)];
+    let expose_batch = EventBatch::new(&expose_description);
     for (i, r) in events.iter().enumerate() {
         let count = u16::try_from(last - i).unwrap_or(u16::MAX);
         let r = *r;
-        let _dropped = emit_window_event_to_state(state, window, 0x0000_8000, |buf, seq, order| {
-            x11::encode_expose_event(
-                buf,
-                seq,
-                order,
-                window,
-                u16::try_from(r.x).unwrap_or(0),
-                u16::try_from(r.y).unwrap_or(0),
-                r.width,
-                r.height,
-                count,
-            );
-        });
+        let _dropped = emit_window_event_to_state_with_receive(
+            state,
+            window,
+            0x0000_8000,
+            &expose_batch,
+            |buf, seq, order| {
+                x11::encode_expose_event(
+                    buf,
+                    seq,
+                    order,
+                    window,
+                    u16::try_from(r.x).unwrap_or(0),
+                    u16::try_from(r.y).unwrap_or(0),
+                    r.width,
+                    r.height,
+                    count,
+                );
+            },
+        );
     }
 }
 
@@ -2796,10 +2807,17 @@ pub(super) fn handle_map_window(
             // that. (We never send Obscured: a composited top-level is
             // always paintable, and unmap is signalled by UnmapNotify
             // per spec, not VisibilityNotify.)
-            let _dropped =
-                emit_window_event_to_state(state, window, 0x0001_0000, |buf, seq, order| {
+            let visibility_description = [EventDescription::core(15)];
+            let visibility_batch = EventBatch::new(&visibility_description);
+            let _dropped = emit_window_event_to_state_with_receive(
+                state,
+                window,
+                0x0001_0000,
+                &visibility_batch,
+                |buf, seq, order| {
                     x11::encode_visibility_notify_event(buf, seq, order, window, 0);
-                });
+                },
+            );
             // Descendants that were MapWindow'd while this window was
             // still unmapped were Unviewable; mapping this window
             // transitions them to Viewable. Xorg fires

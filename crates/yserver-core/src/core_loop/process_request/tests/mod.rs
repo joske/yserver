@@ -8,6 +8,7 @@ mod access_grabs;
 mod access_input;
 mod access_notify_egress;
 mod access_notify_support;
+mod access_notify_windows;
 mod access_present;
 mod access_properties;
 mod access_randr;
