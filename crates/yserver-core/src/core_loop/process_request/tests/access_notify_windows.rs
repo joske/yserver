@@ -2396,3 +2396,19 @@ fn receive_redirect_revocation_still_redirects() {
         }
     }
 }
+
+// Keep existing fixture tests private while letting the Task 8 parity test
+// rerun these established no-policy/Allow comparisons from its sibling module.
+pub(super) fn run_no_policy_parity_fixtures() {
+    receive_host_expose_checks_each_delivery_window();
+    receive_clear_area_expose_denial_keeps_paint();
+    receive_map_visibility_denial_keeps_descendant_walk();
+    receive_expose_rectangles_keep_counts_and_collapse();
+    receive_structure_subject_is_delivery_window();
+    receive_reparent_preserves_three_targets_and_order();
+    receive_gravity_denial_keeps_child_move();
+    receive_structure_noop_does_not_ask();
+    receive_redirect_denial_preserves_redirection();
+    receive_redirect_does_not_check_unselected_clients();
+    receive_redirect_revocation_still_redirects();
+}

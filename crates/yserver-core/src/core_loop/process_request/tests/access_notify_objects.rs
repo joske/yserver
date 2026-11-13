@@ -1078,3 +1078,12 @@ fn receive_bridge_property_denial_keeps_clients_and_property() {
             .any(|call| call.hook == ExtensionHook::Send)
     );
 }
+
+// Keep existing fixture tests private while letting the Task 8 parity test
+// rerun these established no-policy/Allow comparisons from its sibling module.
+pub(super) fn run_no_policy_parity_fixtures() {
+    receive_focus_checks_transition_windows_and_keeps_xi2();
+    receive_colormap_uses_each_subscribing_window();
+    receive_get_property_delete_keeps_reply();
+    receive_bridge_property_denial_keeps_clients_and_property();
+}

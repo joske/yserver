@@ -139,6 +139,12 @@ fn receive_property_fanout_is_per_recipient() {
     );
 }
 
+// Keep the existing fixture test private while letting Task 8 rerun its
+// established no-policy/Allow byte comparison from a sibling module.
+pub(super) fn run_no_policy_parity_fixtures() {
+    receive_property_fanout_is_per_recipient();
+}
+
 // Mutation: cache the first Receive Allow and reuse it for the next delivery.
 #[test]
 fn receive_notification_revocation_is_immediate() {

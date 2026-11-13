@@ -806,3 +806,12 @@ fn receive_last_cow_claim_disconnect_uses_no_request() {
     assert!(receives.iter().all(|call| call.request.is_none()));
     assert!(receives.iter().all(|call| call.client != NOTIFY_SENDER));
 }
+
+// Keep existing fixture tests private while letting the Task 8 parity test
+// rerun these established no-policy/Allow comparisons from its sibling module.
+pub(super) fn run_no_policy_parity_fixtures() {
+    receive_destroy_denial_keeps_cleanup();
+    receive_disconnect_destroy_notifies_survivors();
+    receive_cow_notifications_keep_extension_request();
+    receive_last_cow_claim_disconnect_uses_no_request();
+}

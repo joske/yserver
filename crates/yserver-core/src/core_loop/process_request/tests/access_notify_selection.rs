@@ -262,6 +262,62 @@ fn fixture_window_for_xfixes(fixture: &mut NotifyFixture, owner: ClientId) -> Re
     window
 }
 
+// Keep existing fixture tests/helpers private while letting Task 8 rerun the
+// selection fixtures and compare XFIXES with denied core SelectionClear.
+pub(super) fn run_no_policy_parity_fixtures() {
+    receive_selection_clear_targets_previous_setter();
+    receive_selection_request_denied_answers_actual_requester();
+    receive_bridge_selection_denial_answers_requester();
+    receive_denied_owner_with_bridge_requestor_answers_issuing_client();
+    receive_denied_owner_for_bridge_conversion_queues_refusal();
+    receive_bridge_clear_denial_does_not_queue();
+    receive_rootless_outgoing_core_events_are_checked();
+}
+
+pub(super) fn run_denied_owner_refusal_fixture() {
+    receive_selection_request_denied_answers_actual_requester();
+}
+
+pub(super) fn run_xfixes_owner_change(
+    deny_receive: bool,
+) -> (Vec<Vec<u8>>, Vec<RecordedExtensionCheck>) {
+    let (mut fixture, selection, _, _) = selection_owner_fixture();
+    let subscriber = fixture_window_for_xfixes(&mut fixture, NOTIFY_RECEIVER_DENIED);
+    fixture.state.xfixes_selection_masks.insert(
+        (NOTIFY_RECEIVER_DENIED.0, subscriber, selection),
+        1 << x11xfixes::SELECTION_NOTIFY_SET_OWNER,
+    );
+    let requestor = ResourceId(0x0057_0004);
+    create_window(&mut fixture, NOTIFY_RECEIVER_ALLOWED, requestor);
+    let checks = deny_receive.then(|| {
+        fixture.install_policy(|_, call| {
+            if call.hook == ExtensionHook::Receive {
+                Decision::Deny(DENY)
+            } else {
+                Decision::Allow
+            }
+        })
+    });
+    set_owner_request(
+        &mut fixture,
+        NOTIFY_RECEIVER_ALLOWED,
+        52,
+        requestor,
+        selection,
+        77,
+    );
+    let outputs = [
+        NOTIFY_SENDER,
+        NOTIFY_RECEIVER_DENIED,
+        NOTIFY_RECEIVER_ALLOWED,
+    ]
+    .into_iter()
+    .map(|client| fixture.drain(client))
+    .collect();
+    let calls = checks.map_or_else(Vec::new, |calls| calls.lock().unwrap().clone());
+    (outputs, calls)
+}
+
 // Mutations: silently drop denied requests; answer by window creator; Receive-check the failure; clear owner on denial.
 #[test]
 fn receive_selection_request_denied_answers_actual_requester() {
