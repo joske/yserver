@@ -535,7 +535,10 @@ Create `core_loop/process_request/tests/access_notify_objects.rs` (N37–N39, N4
   window W exists, ordinary client A owns S, socket client C issues ConvertSelection naming W as requestor; deny A's
   code 30 and also every code 31: C receives exactly one exempt code-31 failure (C's sequence and byte order), the
   bridge queue is unchanged (no `SelectionEvent::Notify`). Mutation: route the denied-owner outcome through
-  `note_refusal` by requestor window. `receive_bridge_clear_denial_does_not_queue`: deny SERVER_OWNER code 29 before
+  `note_refusal` by requestor window. `receive_denied_owner_for_bridge_conversion_queues_refusal` (sol r2 B-1): the
+  bridge's typed `convert_selection` with ordinary owner A denied code 30: exactly one queued
+  `SelectionEvent::Notify(property=None)`, no owner event, no Receive recorded for the refusal. Mutation: answer every
+  denied owner through the socket writer. `receive_bridge_clear_denial_does_not_queue`: deny SERVER_OWNER code 29 before
   insertion; no Clear queued, new ownership/XFIXES behavior retained. Mutations: exempt server recipient; queue before
   check; treat “not queued” as conversion success; let bridge clear denial fall through to another recipient.
   `receive_rootless_outgoing_core_events_are_checked`: use real `rootless::host_request` move/close paths and
@@ -551,8 +554,11 @@ Create `core_loop/process_request/tests/access_notify_objects.rs` (N37–N39, N4
   In `apply_convert_selection`, resolve an existing bridge owner (`owner.client == Some(SERVER_OWNER)` and existing
   bridge-window predicate) or ordinary owner with the existing resolver; ask Receive **once** for that recipient
   and `[core(30)]`. Allow uses the existing `note_request` or unchecked writer (already authorized); deny answers
-  the issuing `client_id` with the exempt SelectionNotify(None) writer used for an absent owner (never
-  `note_refusal`, which recognises the bridge by requestor window only; sol r1 B-1), never re-queries the owner as another recipient and never calls a checked writer a second
+  by the ISSUING identity (sol r1 B-1, r2 B-1): when `client_id == SERVER_OWNER` (the bridge's typed
+  `rootless::selection::convert_selection`), the existing `note_refusal` queues its exempt
+  `SelectionEvent::Notify(property=None)`; for a socket issuer, the exempt SelectionNotify(None) socket writer used
+  for an absent owner answers `client_id`, even when the requestor window is the bridge's (never `note_refusal`
+  there, which recognises the bridge by requestor window only). Never re-queries the owner as another recipient and never calls a checked writer a second
   time. Keep absent/gone-owner and bridge-requestor refusal semantics; do not introduce a selection policy hook.
   N42/N44 use checked raw fanout; N43 checked window fanout, preserving template/source byte order, synthetic bit,
   target resolution and success returns. No Send check and no change to 4a's explicit-send writers/interceptions.
