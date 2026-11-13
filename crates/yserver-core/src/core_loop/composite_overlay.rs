@@ -22,13 +22,16 @@
 use yserver_protocol::x11::ClientId;
 
 use crate::{
+    access::{EventBatch, EventDescription},
     backend::{Backend, OriginContext},
-    core_loop::fanout::emit_window_event_to_state,
+    core_loop::fanout::emit_window_event_to_state_with_receive,
     resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_WINDOW},
     server::ServerState,
 };
 
 const SUBSTRUCTURE_NOTIFY: u32 = 0x0008_0000;
+const CREATE_NOTIFY_EVENTS: EventBatch<'static> = EventBatch::new(&[EventDescription::core(16)]);
+const MAP_NOTIFY_EVENTS: EventBatch<'static> = EventBatch::new(&[EventDescription::core(19)]);
 
 /// Ask the backend to materialize the overlay, then mirror it on the
 /// resources side. Called only while no core COW record exists.
@@ -78,8 +81,12 @@ pub(crate) fn materialize_overlay(
                 depth: w.depth,
             })
     {
-        let _dropped =
-            emit_window_event_to_state(state, ROOT_WINDOW, SUBSTRUCTURE_NOTIFY, |buf, seq, o| {
+        let _dropped = emit_window_event_to_state_with_receive(
+            state,
+            ROOT_WINDOW,
+            SUBSTRUCTURE_NOTIFY,
+            &CREATE_NOTIFY_EVENTS,
+            |buf, seq, o| {
                 yserver_protocol::x11::encode_create_notify_event(
                     buf,
                     seq,
@@ -89,9 +96,14 @@ pub(crate) fn materialize_overlay(
                     geometry,
                     true,
                 );
-            });
-        let _dropped =
-            emit_window_event_to_state(state, ROOT_WINDOW, SUBSTRUCTURE_NOTIFY, |buf, seq, o| {
+            },
+        );
+        let _dropped = emit_window_event_to_state_with_receive(
+            state,
+            ROOT_WINDOW,
+            SUBSTRUCTURE_NOTIFY,
+            &MAP_NOTIFY_EVENTS,
+            |buf, seq, o| {
                 yserver_protocol::x11::encode_map_notify_event(
                     buf,
                     seq,
@@ -100,7 +112,8 @@ pub(crate) fn materialize_overlay(
                     COMPOSITE_OVERLAY_WINDOW,
                     true,
                 );
-            });
+            },
+        );
     }
     // The COW is now a core root child (capped on top); reproject the
     // backend top-level order from core so it enters the projection at

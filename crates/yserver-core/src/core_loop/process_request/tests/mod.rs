@@ -7,6 +7,7 @@ mod access_glx;
 mod access_grabs;
 mod access_input;
 mod access_notify_egress;
+mod access_notify_lifecycle;
 mod access_notify_support;
 mod access_notify_windows;
 mod access_present;
