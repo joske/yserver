@@ -531,8 +531,11 @@ Create `core_loop/process_request/tests/access_notify_objects.rs` (N37–N39, N4
   clear owner on denial. LE/BE recipients and nonzero explicit time prevent accidental identity/byte-order passes.
   `receive_bridge_selection_denial_answers_requester`: server bridge owns selection; deny SERVER_OWNER's code-30
   W(owner) before `note_request`; no queued Request, client requestor gets the same exempt failure. Allow row queues
-  one Request; normal client owner with bridge requestor denied yields exempt `SelectionEvent::Notify(property=0)`
-  through existing `note_refusal`. `receive_bridge_clear_denial_does_not_queue`: deny SERVER_OWNER code 29 before
+  one Request. `receive_denied_owner_with_bridge_requestor_answers_issuing_client` (sol r1 B-1): rootless bridge
+  window W exists, ordinary client A owns S, socket client C issues ConvertSelection naming W as requestor; deny A's
+  code 30 and also every code 31: C receives exactly one exempt code-31 failure (C's sequence and byte order), the
+  bridge queue is unchanged (no `SelectionEvent::Notify`). Mutation: route the denied-owner outcome through
+  `note_refusal` by requestor window. `receive_bridge_clear_denial_does_not_queue`: deny SERVER_OWNER code 29 before
   insertion; no Clear queued, new ownership/XFIXES behavior retained. Mutations: exempt server recipient; queue before
   check; treat “not queued” as conversion success; let bridge clear denial fall through to another recipient.
   `receive_rootless_outgoing_core_events_are_checked`: use real `rootless::host_request` move/close paths and
@@ -547,8 +550,9 @@ Create `core_loop/process_request/tests/access_notify_objects.rs` (N37–N39, N4
   recognition, before push; a recognized denied clear still returns `true` (handled), preventing fallback.
   In `apply_convert_selection`, resolve an existing bridge owner (`owner.client == Some(SERVER_OWNER)` and existing
   bridge-window predicate) or ordinary owner with the existing resolver; ask Receive **once** for that recipient
-  and `[core(30)]`. Allow uses the existing `note_request` or unchecked writer (already authorized); deny uses the
-  existing refusal path, never re-queries the owner as another recipient and never calls a checked writer a second
+  and `[core(30)]`. Allow uses the existing `note_request` or unchecked writer (already authorized); deny answers
+  the issuing `client_id` with the exempt SelectionNotify(None) writer used for an absent owner (never
+  `note_refusal`, which recognises the bridge by requestor window only; sol r1 B-1), never re-queries the owner as another recipient and never calls a checked writer a second
   time. Keep absent/gone-owner and bridge-requestor refusal semantics; do not introduce a selection policy hook.
   N42/N44 use checked raw fanout; N43 checked window fanout, preserving template/source byte order, synthetic bit,
   target resolution and success returns. No Send check and no change to 4a's explicit-send writers/interceptions.
