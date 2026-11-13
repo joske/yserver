@@ -123,16 +123,27 @@ pub enum EventSubject {
 }
 
 /// An event's policy-visible type information.
+///
+/// A core event has `type_code < 64` and no extension metadata. When
+/// `describe_wire_event` returns a type code `>= 64` with no extension
+/// metadata, no extension has assigned that code; core `SendEvent` accepts
+/// such codes today. A GenericEvent has `type_code == 35` and extension
+/// metadata: `major_opcode` is its wire byte 1, and `event_type` is its
+/// `evtype`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EventDescription {
-    /// Core event type, with the sent-event bit removed.
+    /// Event code with the sent-event bit removed. Core event codes are below 64.
     pub type_code: u8,
-    /// Extension event metadata, when the event belongs to an extension.
+    /// Extension metadata, or `None` for core and unassigned event codes.
     pub extension: Option<ExtensionEventDescription>,
 }
 
 impl EventDescription {
-    /// Describe a core event from its wire type byte.
+    /// Describe a core event or the no-extension fallback for an unassigned code.
+    ///
+    /// Core event codes are below 64. For codes `>= 64`, use this only after
+    /// the live extension registry finds no assignment; core `SendEvent`
+    /// accepts such codes today.
     #[must_use]
     pub const fn core(type_code: u8) -> Self {
         Self {

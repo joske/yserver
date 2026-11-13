@@ -56,6 +56,9 @@ SECURITY policy's rules get their own spec; this one fixes what they rest on.
 
 ## Reference model
 
+Line references to Xorg in this spec are to xorg-server 21.1.24 unless
+another source is named.
+
 XLibre (Xorg-derived) has XACE plus separate callback lists. These are the ten
 hooks both SECURITY and Xnamespace register, which set this spec's scope:
 
@@ -169,8 +172,8 @@ whose host cursor is neither core-referenced nor reported alive by the backend.
 Server objects are still policy-visible targets: system SYNC counters and
 RANDR outputs, CRTCs, modes and providers are asked with owner `SERVER_OWNER`,
 so a real client's request on one is checked. This follows Xorg's RANDR
-resource lookups (`randr/rroutput.c:475`, `rrcrtc.c:1173`, `rrmode.c:339-358`,
-`rrprovider.c:153`). GLX context tags, screens, visuals and FBConfigs are not
+resource lookups (`randr/rroutput.c:478`, `randr/rrcrtc.c:1160`,
+`randr/rrmode.c:339-358`, `randr/rrprovider.c:153`). GLX context tags, screens, visuals and FBConfigs are not
 resources and are not checked.
 
 **Arbitrary-resource operands.** SYNC `SetPriority` / `GetPriority` resources
@@ -294,10 +297,12 @@ the sender's byte order. `describe_wire_event` is the single function that
 builds descriptions from wire events: it resolves ordinary extension event
 codes by range through the live extension table and reads GenericEvent
 metadata from its wire fields. This supplies the event identity policies
-need without encoding per recipient. Xorg's SECURITY policy checks every
-event in a send batch (`Xext/security.c:869-899`), and its dispatch uses the
-extension and `evtype` to identify GenericEvents (`dix/events.c:419-435,
-459-469`).
+need without encoding per recipient. Xorg's SECURITY policy checks the sender
+and window once and, if that is denied, denies the whole batch unless every
+event in it is an `UnmapNotify`, `ConfigureRequest` or `ClientMessage`
+(`Xext/security.c:869-899`), and its dispatch uses the
+extension and `evtype` to identify GenericEvents (`dix/events.c:183-191,
+419-435, 459-468`).
 
 ### A denial is interpreted by its site
 
@@ -336,9 +341,9 @@ non-delivery and propagation continues to its parent, subject to the existing
 do-not-propagate mask and effective-focus stop. A denied receive check for the
 creator selected by a zero event mask is also a non-delivery, but ends the
 walk. These rulings follow Xorg's per-candidate send check and successful
-early return (`dix/events.c:5571-5585`), its receive-denied input-client path
-and delivery count (`dix/events.c:2287-2291, 2415-2431`), and its creator
-delivery result (`dix/events.c:2200-2222`).
+early return (`dix/events.c:5622-5630`), its receive-denied input-client path
+and delivery count (`dix/events.c:2291-2295, 2377-2433`), and its creator
+delivery result (`dix/events.c:2201-2224`).
 
 ### Who is checked
 
@@ -357,7 +362,7 @@ the saver window, yserver checks their resource operands as derived targets for
 that client. A denied operand is replaced with its role's neutral value, and
 activation continues without an error. The deferred-client relationship
 follows Xorg's saved `ScreenSaverAttrRec.client` and server-side saver-window
-creation (`Xext/saver.c:455-490, 722-854`); the effective-operand checks and
+creation (`Xext/saver.c:150-164, 465-564, 846-870`); the effective-operand checks and
 neutral replacements are this policy's rule.
 
 ### Where the checks go
@@ -435,18 +440,33 @@ denies a selected redirect event (`dix/events.c:2560-2585`). Selection events
 also go through Receive in yserver for their recipient: the selection owner
 receives a `SelectionRequest`, and the requestor receives a `SelectionNotify`.
 Xorg identifies those recipients and emits the events in
-`dix/selection.c:308-337`; its SECURITY receive hook takes the recipient,
+`dix/selection.c:285-312`; its SECURITY receive hook takes the recipient,
 window and event (`Xext/security.c:901-916`), while the selection handler's
 direct writes do not call that hook. In yserver's rootless interception, the
 server bridge or window manager is the recipient and is checked as
-`SERVER_OWNER` before its queue or state is changed; Xorg's selection bridge
-also identifies the server-client callback path (`dix/selection.c:322-327`).
+`SERVER_OWNER` before its queue or state is changed; Xorg skips writing a
+`SelectionRequest` to a selection owned by `serverClient` and answers the
+requestor as if there were no owner (`dix/selection.c:298-303`).
+
+If Receive denies the owner its `SelectionRequest`, the conversion proceeds as
+if the selection had no owner: the server writes the requestor's client a
+`SelectionNotify` with property `None`, as Xorg does when there is no owner
+(`dix/selection.c:305-311`). Without that answer the requestor would wait
+forever. That `SelectionNotify`, like the one written when there is no owner,
+goes to the client that issued `ConvertSelection` as the direct result of its
+own request and is exempt, like `GraphicsExpose`. A `SelectionNotify` the
+owner sends with `SendEvent` follows the `SendEvent` rules.
 
 An event with no window, drawable, or device subject uses `EventSubject::Global`.
-This includes SYNC alarm notifications, DPMS notifications, `MappingNotify`,
-and other subjectless notifications. Xorg writes these notifications directly
-to their clients (`Xext/sync.c:455-467`, `Xext/dpms.c:225`,
-`dix/inpututils.c:71-103`). RECORD receives a check only for records that carry
+This includes SYNC alarm notifications and other subjectless notifications
+(Xorg 21.1.24 has no DPMS notification). A client denied an `AlarmNotify` does not learn that
+the alarm fired and must read its state with `QueryAlarm`; access to the alarm
+itself is already a resource check. Core `MappingNotify` is exempt, as in Xorg,
+which writes it with no hook: every client can read the keyboard and pointer
+mappings with `GetKeyboardMapping` and `GetPointerMapping`, so a denial would
+hide nothing and would only leave the client decoding input with a stale
+keymap. Xorg writes these notifications directly
+to their clients (`Xext/sync.c:425-465`, `dix/inpututils.c:71-103`). RECORD receives a check only for records that carry
 X events; Xorg's recorder distinguishes delivered events from client protocol
 data (`record/record.c:658-794`).
 
@@ -455,10 +475,15 @@ are direct results of the initiating request and are exempt, like
 `GraphicsExpose`. Xorg writes SHM completion directly after `ShmPutImage`
 (`Xext/shm.c:601-613`), sends Await notifications only to the unblocked
 client (`Xext/sync.c:470-510, 609-699`), and treats `GraphicsExpose` as a
-critical direct result (`dix/dispatch.c:1718-1756`). Present notifications
-are checked for their selected recipient and associated window; Xorg emits
-Present configure, complete, and idle notifications to the selected clients
-(`present/present_event.c:131-205`). The legacy event writers in `server.rs`
+critical direct result (`dix/dispatch.c:1718-1756`). Present
+`CompleteNotify` and `IdleNotify` delivered to the client that issued the
+`PresentPixmap` are direct results of its request and are exempt, like SHM
+`Completion`: a denied `IdleNotify` would leave that client unable to reuse or
+free its pixmap. Present notifications delivered to any other selecting client,
+and every `ConfigureNotify`, are checked for that recipient with the event's
+window as subject. Xorg writes all three Present notifications to the
+selected clients with no check at all (`present/present_event.c:133, 171,
+201`); this is a yserver decision, not Xorg behaviour. The legacy event writers in `server.rs`
 with no production callers remain out of scope.
 
 **Send.** Core `SendEvent` and XI `SendExtensionEvent` are checked at the
@@ -468,9 +493,9 @@ and stops successfully if the sender is denied there; each selected recipient
 then gets a Receive check. XI uses the same candidate and recipient rules with
 the request's device id. In particular, yserver checks XI sends at every
 propagated candidate as required by this policy, while Xorg checks send access
-only for the non-propagated XI path (`Xi/exevents.c:2962-2976`). Xorg's core
+only for the non-propagated XI path (`Xi/exevents.c:2961-2963`). Xorg's core
 resolver demonstrates the corresponding per-candidate check
-(`dix/events.c:5571-5590`).
+(`dix/events.c:5622-5641`).
 
 **XTEST.** `FakeInput` has no target window, so it is not a send. It is
 authorized at admission by the extension dispatch check and a device write
@@ -483,7 +508,7 @@ checks following Xorg's lookup sites. Requests that read and delete, such as
 `GetProperty` with `delete`, ask for both modes. RANDR `GetOutputProperty` and
 `GetProviderProperty` requests that read and delete likewise ask `READ | WRITE`
 on the output or provider. Xorg asks `WRITE` alone for these RANDR requests
-(`randr/rrproperty.c:626`, `rrproviderproperty.c:599`); yserver follows the
+(`randr/rrproperty.c:626`, `randr/rrproviderproperty.c:594-595`); yserver follows the
 combined read-and-delete rule. Server writes through `change_property_as_server`
 are not checked.
 
@@ -554,9 +579,9 @@ The hooks alone do not establish SECURITY's boundary. Two Xorg behaviours that
 are not checks keep other clients' pixels away from an untrusted client:
 
 - An untrusted client's windows cannot have background None
-  (`Xext/security.c:749`, `forcedBG`): on Xorg a None background shows
+  (`Xext/security.c:749-752`, `forcedBG`): on Xorg a None background shows
   whatever was on screen, which may belong to another client.
-- `GetImage` on a window is censored (`XaceCensorImage`, `Xext/xace.c:183`,
+- `GetImage` on a window is censored (`XaceCensorImage`, `Xext/xace.c:207-313`,
   called from `dix/dispatch.c` and `Xext/shm.c`): the parts of the image outside
   the window's `borderClip` are overwritten, so windows that cover it do not
   show. This is not part of SECURITY: Xorg does it for every client, trusted or
@@ -575,7 +600,7 @@ includes a test that an untrusted client cannot read a trusted client's pixels.
 
 It covers every path that returns pixels from a window and that SECURITY's
 extension rules leave open to untrusted clients. Xorg's SECURITY shows them only
-XC-MISC and BIG-REQUESTS (`Xext/security.c:72-76`), so by default the paths
+XC-MISC and BIG-REQUESTS (`Xext/security.c:66-71`), so by default the paths
 are core `GetImage`, `CopyArea` and `CopyPlane`; each extension the SECURITY
 spec chooses to expose adds its own.
 
@@ -657,7 +682,7 @@ since behaviour must not change before PR 6.
 
 ## Provenance
 
-Read for behaviour and scope, with no code copied: Xorg xserver master
+Read for behaviour and scope, with no code copied: Xorg xorg-server 21.1.24
 (`dix/window.c`, `dix/dispatch.c`, `Xext/security.c`, `Xext/xace.c`, MIT
 licensed) and XLibre `Xext/xace.c`,
 `Xext/xace.h`, `include/dixaccess.h`, `dix/`, `Xext/security/security.c` and

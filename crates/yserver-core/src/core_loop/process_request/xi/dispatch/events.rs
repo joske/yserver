@@ -720,7 +720,8 @@ pub(super) fn handle_xi1_send_extension_event(
                 minor,
             );
         }
-        // Xorg Xi/sendexev.c order: device, then the class list
+        // Xorg Xi/sendexev.c order (`Xi/sendexev.c:142-167`): device, then
+        // the class list
         // (CreateMaskFromList → BadClass), and only then the
         // destination window inside SendEvent — XTS
         // XSendExtensionEvent-20 sends a stale window + bogus class
@@ -768,21 +769,23 @@ pub(super) fn handle_xi1_send_extension_event(
                 minor,
             );
         }
-        // Per Xorg `Xi/sendexev.c::ProcXSendExtensionEvent` →
-        // `Xi/exevents.c::SendEvent`: resolve the destination,
+        // Per Xorg `Xi/sendexev.c::ProcXSendExtensionEvent`
+        // (`Xi/sendexev.c:142-169`) → `Xi/exevents.c::SendEvent`
+        // (`Xi/exevents.c:2905-2963`): resolve the destination,
         // then deliver each supplied event to (a) clients whose
         // XI1 selection on the destination window intersects the
         // request's class list, and (b) the window's CREATOR when
         // the per-device mask is empty (the `noextensioneventclass`
         // case — Xorg `DeliverToWindowOwner` short-circuits on
-        // `filter == CantBeFiltered` = `NoEventMask` = 0). The
+        // `filter == CantBeFiltered` = `NoEventMask` = 0
+        // (`dix/events.c:2205-2208`). The
         // class-intersection rule preserves XI1 event chains
         // (DeviceKeyPress + DeviceValuator continuation), which
         // the client selects via the head class only.
         // Propagation follows the XI class do-not-propagate walk in
         // `xi1_send_extension_event_resolve_targets` below.
         //
-        // Specials (xserver.git Xi/exevents.c:2915-2944):
+        // Specials (Xorg 21.1.24 `Xi/exevents.c:2912-2943`):
         //  - PointerWindow → sprite window (deepest mapped window
         //    under the pointer);
         //  - InputFocus → device's focus window, with PointerRoot
@@ -800,8 +803,8 @@ pub(super) fn handle_xi1_send_extension_event(
                         crate::core_loop::key_fanout::deepest_window_at_pointer(state),
                     ),
                     crate::core_loop::xi1_focus::Xi1FocusTarget::Window(f) => {
-                        // Xorg `effectiveFocus` rule (xserver.git
-                        // Xi/exevents.c:2936-2941): if the focus is
+                        // Xorg `effectiveFocus` rule
+                        // (`Xi/exevents.c:2933-2941`): if the focus is
                         // an ancestor of (or equal to) the sprite,
                         // deliver to the sprite — the focus
                         // bounds propagation but the deepest
@@ -837,7 +840,8 @@ pub(super) fn handle_xi1_send_extension_event(
                 };
                 request_classes.push(class);
             }
-            // Xorg `Xi/grabdev.c::CreateMaskFromList` walks the
+            // Xorg `Xi/grabdev.c::CreateMaskFromList`
+            // (`Xi/grabdev.c:171-198`) walks the
             // class list and OR's per-class mask bits into the
             // per-device mask. `noextensioneventclass` (low byte
             // `_noExtensionEvent = 9` per XI.h:260) has no
@@ -879,6 +883,7 @@ pub(super) fn handle_xi1_send_extension_event(
                 mask_is_zero,
                 propagate,
             );
+            let mut fanout_recipients = None;
             for candidate in candidates {
                 if !matches!(
                     state.check_send(
@@ -910,29 +915,31 @@ pub(super) fn handle_xi1_send_extension_event(
                     })
                     .collect();
                 if !recipients.is_empty() {
-                    let _dropped =
-                        fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-                            for ev_bytes in &events_bytes {
-                                let mut out = *ev_bytes;
-                                out[0] |= 0x80; // send_event
-                                let seq_bytes = match order {
-                                    yserver_protocol::x11::ClientByteOrder::LittleEndian => {
-                                        seq.0.to_le_bytes()
-                                    }
-                                    yserver_protocol::x11::ClientByteOrder::BigEndian => {
-                                        seq.0.to_be_bytes()
-                                    }
-                                };
-                                out[2] = seq_bytes[0];
-                                out[3] = seq_bytes[1];
-                                buf.extend_from_slice(&out);
-                            }
-                        });
+                    fanout_recipients = Some(recipients);
                     break;
                 }
                 if zero_mask_creator_selected || !candidate.continue_propagation {
                     break;
                 }
+            }
+            if let Some(recipients) = fanout_recipients {
+                let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
+                    for ev_bytes in &events_bytes {
+                        let mut out = *ev_bytes;
+                        out[0] |= 0x80; // send_event
+                        let seq_bytes = match order {
+                            yserver_protocol::x11::ClientByteOrder::LittleEndian => {
+                                seq.0.to_le_bytes()
+                            }
+                            yserver_protocol::x11::ClientByteOrder::BigEndian => {
+                                seq.0.to_be_bytes()
+                            }
+                        };
+                        out[2] = seq_bytes[0];
+                        out[3] = seq_bytes[1];
+                        buf.extend_from_slice(&out);
+                    }
+                });
             }
         }
         debug!(

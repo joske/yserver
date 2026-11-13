@@ -604,10 +604,12 @@ pub(super) fn handle_send_event(
         );
         return Ok(RequestOutcome::Handled);
     }
-    let targets = match send_event_recipients(state, req.destination, req.event_mask, header.data) {
-        Ok(targets) => targets,
-        Err((code, value)) => return emit_x11_error(state, client_id, sequence, code, value, 25),
-    };
+    let target_result = send_event_recipients(state, req.destination, req.event_mask, header.data);
+    if let Some((code, value)) = target_result.as_ref().err().copied() {
+        drop(target_result);
+        return emit_x11_error(state, client_id, sequence, code, value, 25);
+    }
+    let targets = target_result.unwrap_or_else(|_| unreachable!("resolver error handled above"));
     // Set the sent-event bit (bit 7 of first byte).
     let mut event_copy = *req.event;
     event_copy[0] |= 0x80;
@@ -641,14 +643,16 @@ pub(super) fn handle_send_event(
             })
             .collect();
         if !recipients.is_empty() {
-            let _dropped =
-                fanout_raw_event_to_clients(state, &recipients, &event_copy, sender_byte_order);
             delivered_to = recipients;
             break;
         }
         if !candidate.continue_propagation {
             break;
         }
+    }
+    if !delivered_to.is_empty() {
+        let _dropped =
+            fanout_raw_event_to_clients(state, &delivered_to, &event_copy, sender_byte_order);
     }
     // The rootless WM is another recipient of root ClientMessages. It sees
     // the request after ordinary root listeners, as it did before access checks.
@@ -726,9 +730,12 @@ pub(super) fn handle_send_event(
 }
 
 /// Describe a wire event for access policies, resolving advertised extension
-/// event codes through the same live registry used by SendEvent. GenericEvent
-/// metadata is carried directly by the event template and its sender's byte
-/// order.
+/// event codes through the same live registry used by SendEvent. Core events
+/// have `type_code < 64` and no extension metadata. A code `>= 64` with no
+/// extension metadata is unassigned; core `SendEvent` accepts such codes
+/// today. A GenericEvent (`type_code == 35`) carries extension metadata whose
+/// `major_opcode` is wire byte 1 and whose `event_type` is the `evtype` in
+/// bytes 8–9, read in the sender's byte order.
 pub(crate) fn describe_wire_event(
     event: &[u8; 32],
     byte_order: yserver_protocol::x11::ClientByteOrder,
@@ -774,9 +781,9 @@ pub(crate) fn describe_wire_event(
 /// Xorg `AllEventMasks` (`include/inputstr.h`): the 25 core event-mask bits.
 const ALL_EVENT_MASKS: u32 = 0x01FF_FFFF;
 
-/// A candidate in the `SendEvent` propagation walk. The resolver retains
-/// later candidates so the caller can continue when policies deny every
-/// recipient selected at this window.
+/// A candidate in the `SendEvent` propagation walk. The resolver yields a
+/// later candidate only when the caller continues after every recipient
+/// selected at this window is denied.
 pub(crate) struct SendEventCandidate {
     pub(crate) window: ResourceId,
     pub(crate) recipients: Vec<ClientId>,
@@ -784,7 +791,7 @@ pub(crate) struct SendEventCandidate {
 }
 
 /// The windows and clients a `SendEvent` walks — Xorg `ProcSendEvent`
-/// (`dix/events.c:5592-5640`) with `DeliverEventsToWindow`
+/// (`dix/events.c:5617-5641`) with `DeliverEventsToWindow`
 /// (`dix/events.c:2364`). A core event template is matched against CORE
 /// event masks only: `GetClientsForDelivery` (`dix/events.c:2241`) takes the
 /// window's core `OtherClients` for any core type, so an XI2 selection never
@@ -796,71 +803,72 @@ pub(crate) fn send_event_recipients(
     destination: ResourceId,
     event_mask: u32,
     propagate: u8,
-) -> Result<Vec<SendEventCandidate>, (u8, u32)> {
+) -> Result<impl Iterator<Item = SendEventCandidate> + '_, (u8, u32)> {
     let sprite = state
         .root_pointer_target_at(state.pointer_root.0, state.pointer_root.1)
         .map_or(ROOT_WINDOW, |(w, _, _)| w);
     let mut effective_focus = None;
     let mut window = match destination.0 {
-        0 => sprite,
+        0 => Some(sprite),
         1 => {
             let focus = match state.core_focus.raw {
-                0 => return Ok(Vec::new()),
-                1 => ROOT_WINDOW,
-                w => ResourceId(w),
+                0 => None,
+                1 => Some(ROOT_WINDOW),
+                w => Some(ResourceId(w)),
             };
-            // `IsParent(inputFocus, pSprite->win)`: the pointer is in a
-            // strict inferior of the focus window.
-            let window = if is_strict_ancestor(state, focus, sprite) {
-                sprite
-            } else {
-                focus
-            };
-            effective_focus = Some(focus);
-            window
+            focus.map(|focus| {
+                // `IsParent(inputFocus, pSprite->win)`: the pointer is in a
+                // strict inferior of the focus window.
+                let window = if is_strict_ancestor(state, focus, sprite) {
+                    sprite
+                } else {
+                    focus
+                };
+                effective_focus = Some(focus);
+                window
+            })
         }
         _ => {
             if state.resources.window(destination).is_none() {
                 return Err((x11::error::BAD_WINDOW, destination.0));
             }
-            destination
+            Some(destination)
         }
     };
-    if propagate > 1 {
+    if window.is_some() && propagate > 1 {
         return Err((x11::error::BAD_VALUE, u32::from(propagate)));
     }
     let mut mask = event_mask;
-    let mut candidates = Vec::new();
-    loop {
+    Ok(std::iter::from_fn(move || {
+        let current = window.take()?;
         let targets: Vec<ClientId> = if mask == 0 {
             // `CantBeFiltered`: only the window's creator, never the server.
             state
                 .resources
-                .window_owner(window)
-                .filter(|_| window != ROOT_WINDOW)
+                .window_owner(current)
+                .filter(|_| current != ROOT_WINDOW)
                 .and_then(|owner| client_target_id(state, owner))
                 .into_iter()
                 .collect()
         } else {
-            subscribers_by_id(state, window, mask)
+            subscribers_by_id(state, current, mask)
         };
-        let next = state.resources.window(window).and_then(|win| {
+        let next = state.resources.window(current).and_then(|win| {
             let next_mask = mask & !u32::from(win.do_not_propagate_mask);
-            (next_mask != 0 && win.parent != window).then_some((win.parent, next_mask))
+            (next_mask != 0 && win.parent != current).then_some((win.parent, next_mask))
         });
         let continue_propagation =
-            propagate != 0 && effective_focus != Some(window) && mask != 0 && next.is_some();
-        candidates.push(SendEventCandidate {
-            window,
+            propagate != 0 && effective_focus != Some(current) && mask != 0 && next.is_some();
+        if let Some((parent, next_mask)) = next.filter(|_| continue_propagation) {
+            window = Some(parent);
+            mask = next_mask;
+        }
+        Some(SendEventCandidate {
+            window: current,
             recipients: targets,
             continue_propagation,
-        });
-        let Some((parent, next_mask)) = next.filter(|_| continue_propagation) else {
-            return Ok(candidates);
-        };
-        window = parent;
-        mask = next_mask;
-    }
+        })
+    }))
 }
 
 /// Xorg `IsParent(a, b)`: `a` is a strict ancestor of `b`.
