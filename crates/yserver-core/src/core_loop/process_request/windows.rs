@@ -1,7 +1,7 @@
 use crate::{
     access::{
-        AccessMode, Creation, EventBatch, EventDescription, RequestOpcodes, ResourceKind,
-        ResourceTarget,
+        AccessMode, Creation, EventBatch, EventDescription, EventSubject, RequestOpcodes,
+        ResourceKind, ResourceTarget,
     },
     backend::{Backend, OriginContext},
     core_loop::{
@@ -11,7 +11,7 @@ use crate::{
         },
         fanout::{
             emit_visibility_unobscured_subtree_to_state, emit_window_event_to_state_with_receive,
-            fanout_event_to_clients, fanout_event_to_clients_with_receive, subscribers_by_id,
+            fanout_event_to_clients_with_receive, subscribers_by_id,
         },
         process_request::{
             RequestOutcome, emit_x11_error,
@@ -2030,6 +2030,8 @@ pub(crate) fn configure_window_apply(
         .resources
         .window(request.window)
         .map(|w| (w.parent, w.override_redirect));
+    // ResizeRedirect is selectable, but ConfigureWindow has no ResizeRequest
+    // emitter today; keep this site limited to its existing ConfigureRequest.
     let redirect_targets: Vec<ClientId> = if let Some((parent, false)) = pre {
         let requester_has = state
             .clients
@@ -2046,9 +2048,24 @@ pub(crate) fn configure_window_apply(
     };
     if !redirect_targets.is_empty() {
         let parent = pre.map(|(p, _)| p).unwrap_or(ROOT_WINDOW);
-        let _dropped = fanout_event_to_clients(state, &redirect_targets, |buf, seq, order| {
-            x11::encode_configure_request_event(buf, seq, order, parent, request.window, &request);
-        });
+        let description = [EventDescription::core(23)];
+        let batch = EventBatch::new(&description);
+        let _dropped = fanout_event_to_clients_with_receive(
+            state,
+            &redirect_targets,
+            EventSubject::Window(parent),
+            &batch,
+            |buf, seq, order| {
+                x11::encode_configure_request_event(
+                    buf,
+                    seq,
+                    order,
+                    parent,
+                    request.window,
+                    &request,
+                );
+            },
+        );
         return Ok(RequestOutcome::Handled);
     }
     crate::rootless::note_configure(state, &request, source);
@@ -2826,9 +2843,17 @@ pub(super) fn handle_map_window(
             "client {} MapWindow 0x{:x} -> MapRequest to WM",
             client_id.0, window.0
         );
-        let _dropped = fanout_event_to_clients(state, &redirect_targets, |buf, seq, order| {
-            x11::encode_map_request_event(buf, seq, order, parent, window);
-        });
+        let description = [EventDescription::core(20)];
+        let batch = EventBatch::new(&description);
+        let _dropped = fanout_event_to_clients_with_receive(
+            state,
+            &redirect_targets,
+            EventSubject::Window(parent),
+            &batch,
+            |buf, seq, order| {
+                x11::encode_map_request_event(buf, seq, order, parent, window);
+            },
+        );
         return Ok(RequestOutcome::Handled);
     }
 
@@ -3593,10 +3618,19 @@ pub(super) fn handle_circulate_window(
         .into_iter()
         .find(|c| *c != client_id);
     if let Some(target) = redirect_target {
-        let _dropped = fanout_event_to_clients(state, &[target], |buf, seq, order| {
-            let _ =
-                x11::write_circulate_request_event(buf, order, seq, container, child, direction);
-        });
+        let description = [EventDescription::core(27)];
+        let batch = EventBatch::new(&description);
+        let _dropped = fanout_event_to_clients_with_receive(
+            state,
+            &[target],
+            EventSubject::Window(container),
+            &batch,
+            |buf, seq, order| {
+                let _ = x11::write_circulate_request_event(
+                    buf, order, seq, container, child, direction,
+                );
+            },
+        );
     } else {
         let tree_change = crate::core_loop::clip_list::TreeChange::begin(state, child, None);
         state.resources.circulate_child(child, direction == 0);

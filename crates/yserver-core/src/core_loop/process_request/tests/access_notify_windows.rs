@@ -1990,3 +1990,409 @@ fn receive_structure_noop_does_not_ask() {
     assert!(fixture.drain(NOTIFY_RECEIVER_DENIED).is_empty());
     assert!(fixture.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
 }
+
+const SUBSTRUCTURE_REDIRECT_MASK: u32 = 0x0010_0000;
+
+#[derive(Clone, Copy)]
+struct RedirectCase {
+    name: &'static str,
+    request: StructureRequest,
+    request_opcode: u8,
+    redirect_event: u8,
+    ordinary_event: u8,
+}
+
+const REDIRECT_CASES: [RedirectCase; 3] = [
+    RedirectCase {
+        name: "MapWindow",
+        request: StructureRequest::Map,
+        request_opcode: 8,
+        redirect_event: 20,
+        ordinary_event: 19,
+    },
+    RedirectCase {
+        name: "ConfigureWindow",
+        request: StructureRequest::Configure,
+        request_opcode: 12,
+        redirect_event: 23,
+        ordinary_event: 22,
+    },
+    RedirectCase {
+        name: "CirculateWindow",
+        request: StructureRequest::Circulate,
+        request_opcode: 13,
+        redirect_event: 27,
+        ordinary_event: 26,
+    },
+];
+
+fn redirect_fixture(
+    case: RedirectCase,
+    selector: Option<ClientId>,
+    override_redirect: bool,
+) -> NotifyFixture {
+    let mut fixture = structure_fixture(case.request);
+    if let Some(selector) = selector {
+        fixture
+            .state
+            .clients
+            .get_mut(&selector.0)
+            .expect("redirect selector")
+            .event_masks
+            .insert(PARENT_WINDOW, SUBSTRUCTURE_REDIRECT_MASK);
+    }
+    fixture
+        .state
+        .resources
+        .window_mut(CHILD_WINDOW)
+        .expect("redirected child")
+        .override_redirect = override_redirect;
+    for (index, id) in [CHILD_WINDOW, CIRCULATE_SIBLING].into_iter().enumerate() {
+        if let Some(window) = fixture.state.resources.window_mut(id) {
+            window.host_xid = Some(WindowHandle::from_raw_for_test(
+                0x0053_0010 + u32::try_from(index).unwrap(),
+            ));
+        }
+    }
+    fixture
+}
+
+fn assert_redirect_frame(bytes: &[u8], case: RedirectCase, order: ClientByteOrder) {
+    assert_eq!(
+        bytes.len(),
+        32,
+        "{} emits exactly one redirect event",
+        case.name
+    );
+    assert_eq!(bytes[0], case.redirect_event, "{} event code", case.name);
+    let read_u32 = |slice: &[u8]| match order {
+        ClientByteOrder::LittleEndian => u32::from_le_bytes(slice.try_into().unwrap()),
+        ClientByteOrder::BigEndian => u32::from_be_bytes(slice.try_into().unwrap()),
+    };
+    assert_eq!(
+        read_u32(&bytes[4..8]),
+        PARENT_WINDOW.0,
+        "{} parent",
+        case.name
+    );
+    assert_eq!(
+        read_u32(&bytes[8..12]),
+        CHILD_WINDOW.0,
+        "{} target",
+        case.name
+    );
+}
+
+fn event_types(bytes: &[u8]) -> Vec<u8> {
+    assert!(bytes.len().is_multiple_of(32), "complete event frames");
+    bytes.chunks_exact(32).map(|event| event[0]).collect()
+}
+
+// Mutation per row: after a checked redirect recipient gets no bytes, continue
+// into MapWindow, ConfigureWindow, or CirculateWindow; the pre-state and
+// ordinary-notification assertions below must fail for that row.
+#[test]
+fn receive_redirect_denial_preserves_redirection() {
+    for case in REDIRECT_CASES {
+        let mut baseline = redirect_fixture(case, Some(NOTIFY_RECEIVER_DENIED), false);
+        let before = structure_snapshot(&baseline);
+        let backend_before = baseline.backend.calls();
+        assert!(matches!(
+            structure_request(&mut baseline, case.request),
+            RequestOutcome::Handled
+        ));
+        let baseline_redirect = baseline.drain(NOTIFY_RECEIVER_DENIED);
+        assert_redirect_frame(&baseline_redirect, case, ClientByteOrder::BigEndian);
+        assert!(baseline.drain(NOTIFY_SENDER).is_empty());
+        assert!(baseline.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
+        assert_eq!(
+            structure_snapshot(&baseline),
+            before,
+            "{} baseline state",
+            case.name
+        );
+        assert_eq!(
+            baseline.backend.calls(),
+            backend_before,
+            "{} baseline backend",
+            case.name
+        );
+
+        let mut allow = redirect_fixture(case, Some(NOTIFY_RECEIVER_DENIED), false);
+        allow.install_policy(|_, _| Decision::Allow);
+        assert!(matches!(
+            structure_request(&mut allow, case.request),
+            RequestOutcome::Handled
+        ));
+        let allow_redirect = allow.drain(NOTIFY_RECEIVER_DENIED);
+        assert_eq!(
+            allow_redirect, baseline_redirect,
+            "{} allow wire parity",
+            case.name
+        );
+        assert!(allow.drain(NOTIFY_SENDER).is_empty());
+        assert!(allow.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
+        assert_eq!(
+            structure_snapshot(&allow),
+            before,
+            "{} allow state",
+            case.name
+        );
+        assert_eq!(
+            allow.backend.calls(),
+            backend_before,
+            "{} allow backend",
+            case.name
+        );
+
+        let mut denied = redirect_fixture(case, Some(NOTIFY_RECEIVER_DENIED), false);
+        let calls = denied.install_policy(move |_, call| {
+            if call.hook == ExtensionHook::Receive
+                && call.client == NOTIFY_RECEIVER_DENIED
+                && call.receive == Some(EventSubject::Window(PARENT_WINDOW))
+                && call.events == Some(vec![EventDescription::core(case.redirect_event)])
+            {
+                Decision::Deny(DENY)
+            } else {
+                Decision::Allow
+            }
+        });
+        assert!(matches!(
+            structure_request(&mut denied, case.request),
+            RequestOutcome::Handled
+        ));
+        assert!(
+            denied.drain(NOTIFY_SENDER).is_empty(),
+            "{} no request error",
+            case.name
+        );
+        assert!(
+            denied.drain(NOTIFY_RECEIVER_DENIED).is_empty(),
+            "{} denied selector receives no event bytes",
+            case.name
+        );
+        assert!(
+            denied.drain(NOTIFY_RECEIVER_ALLOWED).is_empty(),
+            "{} ordinary listeners receive no operation notification",
+            case.name
+        );
+        assert_eq!(
+            structure_snapshot(&denied),
+            before,
+            "{} denied state",
+            case.name
+        );
+        assert_eq!(structure_snapshot(&denied), structure_snapshot(&allow));
+        assert_eq!(
+            denied.backend.calls(),
+            backend_before,
+            "{} denied backend",
+            case.name
+        );
+        assert_eq!(denied.backend.calls(), allow.backend.calls());
+        for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+            assert!(
+                denied.state.clients.contains_key(&client.0),
+                "{} stays connected",
+                case.name
+            );
+        }
+
+        let log = calls.lock().unwrap();
+        assert!(!log.iter().any(|call| call.hook == ExtensionHook::Send));
+        let receive_calls = receives(&log);
+        assert_eq!(receive_calls.len(), 1, "{} one legal selector", case.name);
+        let call = receive_calls[0];
+        assert_eq!(call.client, NOTIFY_RECEIVER_DENIED);
+        assert_eq!(call.receive, Some(EventSubject::Window(PARENT_WINDOW)));
+        assert_eq!(
+            call.events,
+            Some(vec![EventDescription::core(case.redirect_event)])
+        );
+        assert_eq!(call.request, request_opcodes(case.request_opcode, 0));
+    }
+}
+
+// Mutation: manufacture a redirect Receive check from a mask bit before the
+// existing requester, override-redirect, and no-selector filters.
+#[test]
+fn receive_redirect_does_not_check_unselected_clients() {
+    let cases = [
+        // The requester owns the only redirect selection; its request is not redirected.
+        (REDIRECT_CASES[1], Some(NOTIFY_SENDER), false),
+        // A different client selected the parent, but override_redirect bypasses it.
+        (REDIRECT_CASES[0], Some(NOTIFY_RECEIVER_DENIED), true),
+        // No redirect selection exists; CirculateWindow performs its normal operation.
+        (REDIRECT_CASES[2], None, false),
+    ];
+
+    for (case, selector, override_redirect) in cases {
+        let mut baseline = redirect_fixture(case, selector, override_redirect);
+        let before = structure_snapshot(&baseline);
+        assert!(matches!(
+            structure_request(&mut baseline, case.request),
+            RequestOutcome::Handled
+        ));
+        let baseline_denied = baseline.drain(NOTIFY_RECEIVER_DENIED);
+        let baseline_allowed = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+        assert!(baseline.drain(NOTIFY_SENDER).is_empty());
+        assert_ne!(
+            structure_snapshot(&baseline),
+            before,
+            "{} operation proceeds",
+            case.name
+        );
+        let mut baseline_event_types = event_types(&baseline_denied);
+        baseline_event_types.extend(event_types(&baseline_allowed));
+        assert!(
+            !baseline_event_types.contains(&case.redirect_event),
+            "{} no redirect notification is manufactured",
+            case.name
+        );
+        assert!(
+            baseline_event_types.contains(&case.ordinary_event),
+            "{} ordinary notification is preserved",
+            case.name
+        );
+
+        let mut observed = redirect_fixture(case, selector, override_redirect);
+        let calls = observed.install_policy(|_, _| Decision::Allow);
+        assert!(matches!(
+            structure_request(&mut observed, case.request),
+            RequestOutcome::Handled
+        ));
+        assert!(observed.drain(NOTIFY_SENDER).is_empty());
+        assert_eq!(
+            observed.drain(NOTIFY_RECEIVER_DENIED),
+            baseline_denied,
+            "{} denied listener",
+            case.name
+        );
+        assert_eq!(
+            observed.drain(NOTIFY_RECEIVER_ALLOWED),
+            baseline_allowed,
+            "{} allowed listener",
+            case.name
+        );
+        assert_eq!(structure_snapshot(&observed), structure_snapshot(&baseline));
+        assert_eq!(observed.backend.calls(), baseline.backend.calls());
+        let log = calls.lock().unwrap();
+        assert!(!log.iter().any(|call| call.hook == ExtensionHook::Send));
+        let receive_calls = receives(&log);
+        assert!(
+            receive_calls.iter().all(|call| {
+                call.events != Some(vec![EventDescription::core(case.redirect_event)])
+            }),
+            "{} never checks a redirect event with no selected redirect recipient",
+            case.name
+        );
+        assert!(
+            receive_calls
+                .iter()
+                .all(|call| call.request == request_opcodes(case.request_opcode, 0)),
+            "{} ordinary notifications keep request context",
+            case.name
+        );
+    }
+}
+
+// Mutation: cache the selector's first Allow across revocation, or let a later
+// denied delivery fall through into the requested operation.
+#[test]
+fn receive_redirect_revocation_still_redirects() {
+    for case in REDIRECT_CASES {
+        let mut fixture = redirect_fixture(case, Some(NOTIFY_RECEIVER_DENIED), false);
+        let before = structure_snapshot(&fixture);
+        let backend_before = fixture.backend.calls();
+        let revoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let policy_revoked = std::sync::Arc::clone(&revoked);
+        let calls = fixture.install_policy(move |_, call| {
+            if call.hook == ExtensionHook::Receive
+                && call.client == NOTIFY_RECEIVER_DENIED
+                && call.receive == Some(EventSubject::Window(PARENT_WINDOW))
+                && call.events == Some(vec![EventDescription::core(case.redirect_event)])
+                && policy_revoked.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                Decision::Deny(DENY)
+            } else {
+                Decision::Allow
+            }
+        });
+
+        assert!(matches!(
+            structure_request(&mut fixture, case.request),
+            RequestOutcome::Handled
+        ));
+        let first = fixture.drain(NOTIFY_RECEIVER_DENIED);
+        assert_redirect_frame(&first, case, ClientByteOrder::BigEndian);
+        assert!(fixture.drain(NOTIFY_SENDER).is_empty());
+        assert!(fixture.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
+        assert_eq!(
+            structure_snapshot(&fixture),
+            before,
+            "{} first request stays redirected",
+            case.name
+        );
+        assert_eq!(
+            fixture.backend.calls(),
+            backend_before,
+            "{} first backend",
+            case.name
+        );
+
+        revoked.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(
+            structure_request(&mut fixture, case.request),
+            RequestOutcome::Handled
+        ));
+        assert!(
+            fixture.drain(NOTIFY_SENDER).is_empty(),
+            "{} no request error",
+            case.name
+        );
+        assert!(
+            fixture.drain(NOTIFY_RECEIVER_DENIED).is_empty(),
+            "{} revoked selector receives no second event",
+            case.name
+        );
+        assert!(fixture.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
+        assert_eq!(
+            structure_snapshot(&fixture),
+            before,
+            "{} second request stays redirected",
+            case.name
+        );
+        assert_eq!(
+            fixture.backend.calls(),
+            backend_before,
+            "{} second backend",
+            case.name
+        );
+        for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+            assert!(
+                fixture.state.clients.contains_key(&client.0),
+                "{} stays connected after revocation",
+                case.name
+            );
+        }
+
+        let log = calls.lock().unwrap();
+        assert!(!log.iter().any(|call| call.hook == ExtensionHook::Send));
+        let receive_calls = receives(&log);
+        assert_eq!(
+            receive_calls.len(),
+            2,
+            "{} rechecks after revocation",
+            case.name
+        );
+        for call in receive_calls {
+            assert_eq!(call.client, NOTIFY_RECEIVER_DENIED);
+            assert_eq!(call.receive, Some(EventSubject::Window(PARENT_WINDOW)));
+            assert_eq!(
+                call.events,
+                Some(vec![EventDescription::core(case.redirect_event)])
+            );
+            assert_eq!(call.request, request_opcodes(case.request_opcode, 0));
+        }
+    }
+}
