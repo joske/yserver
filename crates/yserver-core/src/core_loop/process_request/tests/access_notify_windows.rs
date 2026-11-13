@@ -20,6 +20,8 @@ const VISIBILITY_MASK: u32 = 0x0001_0000;
 const PARENT_WINDOW: ResourceId = ResourceId(0x0051_0010);
 const CHILD_WINDOW: ResourceId = ResourceId(0x0051_0011);
 const GRANDCHILD_WINDOW: ResourceId = ResourceId(0x0051_0012);
+const NEW_PARENT_WINDOW: ResourceId = ResourceId(0x0051_0013);
+const CIRCULATE_SIBLING: ResourceId = ResourceId(0x0051_0014);
 const HOST_WINDOW: u32 = 0x0052_0010;
 
 fn add_window(
@@ -174,6 +176,338 @@ fn configure_width(fixture: &mut NotifyFixture, window: ResourceId, sequence: u1
             .expect("ConfigureWindow through production dispatcher"),
         RequestOutcome::Handled
     ));
+}
+
+#[derive(Clone, Copy)]
+struct StructureDelivery {
+    id: &'static str,
+    event_type: u8,
+    delivery_window: ResourceId,
+    affected_window: ResourceId,
+    reparent: Option<ResourceId>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StructureEvent {
+    event_type: u8,
+    sequence: u16,
+    delivery_window: ResourceId,
+    affected_window: ResourceId,
+    reparent: Option<ResourceId>,
+}
+
+#[derive(Clone, Copy)]
+enum StructureRequest {
+    Create,
+    Map,
+    Unmap,
+    Configure,
+    Reparent,
+    MapSubwindows,
+    UnmapSubwindows,
+    Circulate,
+}
+
+struct StructureCase {
+    name: &'static str,
+    request: StructureRequest,
+    opcode: u8,
+    deny_window: ResourceId,
+    deliveries: &'static [StructureDelivery],
+}
+
+fn structure_fixture(request: StructureRequest) -> NotifyFixture {
+    const STRUCTURE_NOTIFY: u32 = 0x0002_0000;
+    const SUBSTRUCTURE_NOTIFY: u32 = 0x0008_0000;
+
+    let mut fixture = NotifyFixture::new();
+    add_window(
+        &mut fixture,
+        PARENT_WINDOW,
+        ROOT_WINDOW,
+        0,
+        0,
+        100,
+        100,
+        None,
+    );
+    add_window(
+        &mut fixture,
+        NEW_PARENT_WINDOW,
+        ROOT_WINDOW,
+        150,
+        0,
+        100,
+        100,
+        None,
+    );
+    fixture
+        .state
+        .resources
+        .window_mut(PARENT_WINDOW)
+        .expect("old parent")
+        .map_state = MapState::Viewable;
+    fixture
+        .state
+        .resources
+        .window_mut(NEW_PARENT_WINDOW)
+        .expect("new parent")
+        .map_state = MapState::Viewable;
+
+    if !matches!(request, StructureRequest::Create) {
+        add_window(
+            &mut fixture,
+            CHILD_WINDOW,
+            PARENT_WINDOW,
+            5,
+            6,
+            10,
+            11,
+            None,
+        );
+        let map_state = if matches!(
+            request,
+            StructureRequest::Map | StructureRequest::MapSubwindows
+        ) {
+            MapState::Unmapped
+        } else {
+            MapState::Viewable
+        };
+        fixture
+            .state
+            .resources
+            .window_mut(CHILD_WINDOW)
+            .expect("child")
+            .map_state = map_state;
+    }
+    if matches!(request, StructureRequest::Circulate) {
+        add_window(
+            &mut fixture,
+            CIRCULATE_SIBLING,
+            PARENT_WINDOW,
+            5,
+            6,
+            10,
+            11,
+            None,
+        );
+        fixture
+            .state
+            .resources
+            .window_mut(CIRCULATE_SIBLING)
+            .expect("overlapping sibling")
+            .map_state = MapState::Viewable;
+    }
+
+    for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+        let masks = &mut fixture
+            .state
+            .clients
+            .get_mut(&client.0)
+            .expect("receiver")
+            .event_masks;
+        masks.insert(PARENT_WINDOW, SUBSTRUCTURE_NOTIFY);
+        masks.insert(NEW_PARENT_WINDOW, SUBSTRUCTURE_NOTIFY);
+        masks.insert(CHILD_WINDOW, STRUCTURE_NOTIFY);
+    }
+    fixture
+        .state
+        .clients
+        .get_mut(&NOTIFY_RECEIVER_DENIED.0)
+        .expect("denied receiver")
+        .byte_order = ClientByteOrder::BigEndian;
+    fixture
+        .state
+        .clients
+        .get_mut(&NOTIFY_RECEIVER_DENIED.0)
+        .expect("denied receiver")
+        .last_sequence
+        .store(0x1234, std::sync::atomic::Ordering::Relaxed);
+    fixture
+        .state
+        .clients
+        .get_mut(&NOTIFY_RECEIVER_ALLOWED.0)
+        .expect("allowed receiver")
+        .last_sequence
+        .store(0x5678, std::sync::atomic::Ordering::Relaxed);
+    fixture
+}
+
+fn structure_request(fixture: &mut NotifyFixture, request: StructureRequest) -> RequestOutcome {
+    let (header, body) = match request {
+        StructureRequest::Create => {
+            let mut body = Vec::with_capacity(28);
+            body.extend_from_slice(&CHILD_WINDOW.0.to_le_bytes());
+            body.extend_from_slice(&PARENT_WINDOW.0.to_le_bytes());
+            body.extend_from_slice(&5_i16.to_le_bytes());
+            body.extend_from_slice(&6_i16.to_le_bytes());
+            body.extend_from_slice(&10_u16.to_le_bytes());
+            body.extend_from_slice(&11_u16.to_le_bytes());
+            body.extend_from_slice(&0_u16.to_le_bytes()); // border width
+            body.extend_from_slice(&1_u16.to_le_bytes()); // InputOutput
+            body.extend_from_slice(&crate::resources::ROOT_VISUAL.0.to_le_bytes());
+            body.extend_from_slice(&0_u32.to_le_bytes()); // value mask
+            (
+                RequestHeader {
+                    opcode: 1,
+                    data: 24,
+                    length_units: 8,
+                },
+                body,
+            )
+        }
+        StructureRequest::Map => (
+            RequestHeader {
+                opcode: 8,
+                data: 0,
+                length_units: 2,
+            },
+            CHILD_WINDOW.0.to_le_bytes().to_vec(),
+        ),
+        StructureRequest::Unmap => (
+            RequestHeader {
+                opcode: 10,
+                data: 0,
+                length_units: 2,
+            },
+            CHILD_WINDOW.0.to_le_bytes().to_vec(),
+        ),
+        StructureRequest::Configure => {
+            let mut body = Vec::with_capacity(12);
+            body.extend_from_slice(&CHILD_WINDOW.0.to_le_bytes());
+            body.extend_from_slice(&1_u16.to_le_bytes()); // CWX
+            body.extend_from_slice(&[0; 2]);
+            body.extend_from_slice(&7_i32.to_le_bytes());
+            (
+                RequestHeader {
+                    opcode: 12,
+                    data: 0,
+                    length_units: 4,
+                },
+                body,
+            )
+        }
+        StructureRequest::Reparent => {
+            let mut body = Vec::with_capacity(12);
+            body.extend_from_slice(&CHILD_WINDOW.0.to_le_bytes());
+            body.extend_from_slice(&NEW_PARENT_WINDOW.0.to_le_bytes());
+            body.extend_from_slice(&0_i16.to_le_bytes());
+            body.extend_from_slice(&0_i16.to_le_bytes());
+            (
+                RequestHeader {
+                    opcode: 7,
+                    data: 0,
+                    length_units: 4,
+                },
+                body,
+            )
+        }
+        StructureRequest::MapSubwindows => (
+            RequestHeader {
+                opcode: 9,
+                data: 0,
+                length_units: 2,
+            },
+            PARENT_WINDOW.0.to_le_bytes().to_vec(),
+        ),
+        StructureRequest::UnmapSubwindows => (
+            RequestHeader {
+                opcode: 11,
+                data: 0,
+                length_units: 2,
+            },
+            PARENT_WINDOW.0.to_le_bytes().to_vec(),
+        ),
+        StructureRequest::Circulate => (
+            RequestHeader {
+                opcode: 13,
+                data: 0, // RaiseLowest
+                length_units: 2,
+            },
+            PARENT_WINDOW.0.to_le_bytes().to_vec(),
+        ),
+    };
+    fixture
+        .request(NOTIFY_SENDER, SequenceNumber(41), header, &body)
+        .expect("core window request through production dispatcher")
+}
+
+fn decode_structure_events(bytes: &[u8], order: ClientByteOrder) -> Vec<StructureEvent> {
+    let read_u16 = |bytes: &[u8]| match order {
+        ClientByteOrder::LittleEndian => u16::from_le_bytes(bytes.try_into().unwrap()),
+        ClientByteOrder::BigEndian => u16::from_be_bytes(bytes.try_into().unwrap()),
+    };
+    let read_u32 = |bytes: &[u8]| match order {
+        ClientByteOrder::LittleEndian => u32::from_le_bytes(bytes.try_into().unwrap()),
+        ClientByteOrder::BigEndian => u32::from_be_bytes(bytes.try_into().unwrap()),
+    };
+    assert!(bytes.len().is_multiple_of(32), "complete event frames");
+    bytes
+        .chunks_exact(32)
+        .map(|event| {
+            assert_ne!(event[0], 0, "notification stream contains no X error");
+            StructureEvent {
+                event_type: event[0],
+                sequence: read_u16(&event[2..4]),
+                delivery_window: ResourceId(read_u32(&event[4..8])),
+                affected_window: ResourceId(read_u32(&event[8..12])),
+                reparent: (event[0] == 21).then(|| ResourceId(read_u32(&event[12..16]))),
+            }
+        })
+        .collect()
+}
+
+fn filter_structure_frames(
+    bytes: &[u8],
+    order: ClientByteOrder,
+    denied_window: ResourceId,
+) -> Vec<u8> {
+    let read_window = |event: &[u8]| match order {
+        ClientByteOrder::LittleEndian => u32::from_le_bytes(event[4..8].try_into().unwrap()),
+        ClientByteOrder::BigEndian => u32::from_be_bytes(event[4..8].try_into().unwrap()),
+    };
+    bytes
+        .chunks_exact(32)
+        .filter(|event| read_window(event) != denied_window.0)
+        .flatten()
+        .copied()
+        .collect()
+}
+
+type StructureSnapshotRow = (
+    ResourceId,
+    ResourceId,
+    i16,
+    i16,
+    u16,
+    u16,
+    MapState,
+    Vec<ResourceId>,
+);
+
+fn structure_snapshot(fixture: &NotifyFixture) -> Vec<StructureSnapshotRow> {
+    [
+        PARENT_WINDOW,
+        NEW_PARENT_WINDOW,
+        CHILD_WINDOW,
+        CIRCULATE_SIBLING,
+    ]
+    .into_iter()
+    .filter_map(|id| {
+        fixture.state.resources.window(id).map(|window| {
+            (
+                id,
+                window.parent,
+                window.x,
+                window.y,
+                window.width,
+                window.height,
+                window.map_state,
+                window.children.clone(),
+            )
+        })
+    })
+    .collect()
 }
 
 // Mutations: use the ancestor subject for descendant Expose; return on the first denial;
@@ -789,4 +1123,870 @@ fn receive_expose_rectangles_keep_counts_and_collapse() {
         assert_eq!(call.events, Some(vec![EventDescription::core(12)]));
         assert_eq!(call.request, request_opcodes(12, 0));
     }
+}
+
+// Mutations: use W(affected child) for every delivery, suppress every event
+// for a denied client after its first denial, or describe the wrong core type
+// at any migrated N05–N12/N14–N17/N19–N20/N22–N27/N29–N30 emitter.
+#[test]
+fn receive_structure_subject_is_delivery_window() {
+    const CREATE: [StructureDelivery; 1] = [StructureDelivery {
+        id: "N12",
+        event_type: 16,
+        delivery_window: PARENT_WINDOW,
+        affected_window: CHILD_WINDOW,
+        reparent: None,
+    }];
+    const MAP: [StructureDelivery; 2] = [
+        StructureDelivery {
+            id: "N19",
+            event_type: 19,
+            delivery_window: CHILD_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+        StructureDelivery {
+            id: "N20",
+            event_type: 19,
+            delivery_window: PARENT_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+    ];
+    const UNMAP: [StructureDelivery; 2] = [
+        StructureDelivery {
+            id: "N24",
+            event_type: 18,
+            delivery_window: CHILD_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+        StructureDelivery {
+            id: "N25",
+            event_type: 18,
+            delivery_window: PARENT_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+    ];
+    const CONFIGURE: [StructureDelivery; 2] = [
+        StructureDelivery {
+            id: "N14",
+            event_type: 22,
+            delivery_window: CHILD_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+        StructureDelivery {
+            id: "N15",
+            event_type: 22,
+            delivery_window: PARENT_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+    ];
+    const REPARENT: [StructureDelivery; 7] = [
+        StructureDelivery {
+            id: "N05",
+            event_type: 18,
+            delivery_window: CHILD_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+        StructureDelivery {
+            id: "N06",
+            event_type: 18,
+            delivery_window: PARENT_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+        StructureDelivery {
+            id: "N07",
+            event_type: 21,
+            delivery_window: CHILD_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: Some(NEW_PARENT_WINDOW),
+        },
+        StructureDelivery {
+            id: "N08",
+            event_type: 21,
+            delivery_window: PARENT_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: Some(NEW_PARENT_WINDOW),
+        },
+        StructureDelivery {
+            id: "N09",
+            event_type: 21,
+            delivery_window: NEW_PARENT_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: Some(NEW_PARENT_WINDOW),
+        },
+        StructureDelivery {
+            id: "N10",
+            event_type: 19,
+            delivery_window: CHILD_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+        StructureDelivery {
+            id: "N11",
+            event_type: 19,
+            delivery_window: NEW_PARENT_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+    ];
+    const MAP_SUBWINDOWS: [StructureDelivery; 2] = [
+        StructureDelivery {
+            id: "N22",
+            event_type: 19,
+            delivery_window: CHILD_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+        StructureDelivery {
+            id: "N23",
+            event_type: 19,
+            delivery_window: PARENT_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+    ];
+    const UNMAP_SUBWINDOWS: [StructureDelivery; 2] = [
+        StructureDelivery {
+            id: "N26",
+            event_type: 18,
+            delivery_window: CHILD_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+        StructureDelivery {
+            id: "N27",
+            event_type: 18,
+            delivery_window: PARENT_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+    ];
+    const CIRCULATE: [StructureDelivery; 2] = [
+        StructureDelivery {
+            id: "N29",
+            event_type: 26,
+            delivery_window: CHILD_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+        StructureDelivery {
+            id: "N30",
+            event_type: 26,
+            delivery_window: PARENT_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+    ];
+    let cases = [
+        StructureCase {
+            name: "CreateWindow",
+            request: StructureRequest::Create,
+            opcode: 1,
+            deny_window: PARENT_WINDOW,
+            deliveries: &CREATE,
+        },
+        StructureCase {
+            name: "MapWindow",
+            request: StructureRequest::Map,
+            opcode: 8,
+            deny_window: PARENT_WINDOW,
+            deliveries: &MAP,
+        },
+        StructureCase {
+            name: "UnmapWindow",
+            request: StructureRequest::Unmap,
+            opcode: 10,
+            deny_window: PARENT_WINDOW,
+            deliveries: &UNMAP,
+        },
+        StructureCase {
+            name: "ConfigureWindow",
+            request: StructureRequest::Configure,
+            opcode: 12,
+            deny_window: PARENT_WINDOW,
+            deliveries: &CONFIGURE,
+        },
+        StructureCase {
+            name: "ReparentWindow",
+            request: StructureRequest::Reparent,
+            opcode: 7,
+            deny_window: NEW_PARENT_WINDOW,
+            deliveries: &REPARENT,
+        },
+        StructureCase {
+            name: "MapSubwindows",
+            request: StructureRequest::MapSubwindows,
+            opcode: 9,
+            deny_window: PARENT_WINDOW,
+            deliveries: &MAP_SUBWINDOWS,
+        },
+        StructureCase {
+            name: "UnmapSubwindows",
+            request: StructureRequest::UnmapSubwindows,
+            opcode: 11,
+            deny_window: PARENT_WINDOW,
+            deliveries: &UNMAP_SUBWINDOWS,
+        },
+        StructureCase {
+            name: "CirculateWindow",
+            request: StructureRequest::Circulate,
+            opcode: 13,
+            deny_window: PARENT_WINDOW,
+            deliveries: &CIRCULATE,
+        },
+    ];
+
+    for case in cases {
+        let mut baseline = structure_fixture(case.request);
+        assert!(
+            matches!(
+                structure_request(&mut baseline, case.request),
+                RequestOutcome::Handled
+            ),
+            "{} baseline outcome",
+            case.name
+        );
+        let baseline_denied = baseline.drain(NOTIFY_RECEIVER_DENIED);
+        let baseline_allowed = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+
+        let mut allow = structure_fixture(case.request);
+        allow.install_policy(|_, _| Decision::Allow);
+        assert!(
+            matches!(
+                structure_request(&mut allow, case.request),
+                RequestOutcome::Handled
+            ),
+            "{} allow outcome",
+            case.name
+        );
+        let allow_denied = allow.drain(NOTIFY_RECEIVER_DENIED);
+        let allow_allowed = allow.drain(NOTIFY_RECEIVER_ALLOWED);
+        assert_eq!(
+            allow_denied, baseline_denied,
+            "{} no-policy denied bytes",
+            case.name
+        );
+        assert_eq!(
+            allow_allowed, baseline_allowed,
+            "{} no-policy allowed bytes",
+            case.name
+        );
+        assert_eq!(structure_snapshot(&allow), structure_snapshot(&baseline));
+        assert_eq!(allow.backend.calls(), baseline.backend.calls());
+
+        let mut denied = structure_fixture(case.request);
+        let calls = denied.install_policy(move |_, call| {
+            if call.hook == ExtensionHook::Receive
+                && call.client == NOTIFY_RECEIVER_DENIED
+                && call.receive == Some(EventSubject::Window(case.deny_window))
+            {
+                Decision::Deny(DENY)
+            } else {
+                Decision::Allow
+            }
+        });
+        assert!(
+            matches!(
+                structure_request(&mut denied, case.request),
+                RequestOutcome::Handled
+            ),
+            "{} denied outcome",
+            case.name
+        );
+        assert!(
+            denied.drain(NOTIFY_SENDER).is_empty(),
+            "{} no sender bytes",
+            case.name
+        );
+        let denied_bytes = denied.drain(NOTIFY_RECEIVER_DENIED);
+        let allowed_bytes = denied.drain(NOTIFY_RECEIVER_ALLOWED);
+
+        let expected_allowed: Vec<_> = case
+            .deliveries
+            .iter()
+            .map(|delivery| StructureEvent {
+                event_type: delivery.event_type,
+                sequence: 0x5678,
+                delivery_window: delivery.delivery_window,
+                affected_window: delivery.affected_window,
+                reparent: delivery.reparent,
+            })
+            .collect();
+        let expected_denied: Vec<_> = case
+            .deliveries
+            .iter()
+            .filter(|delivery| delivery.delivery_window != case.deny_window)
+            .map(|delivery| StructureEvent {
+                event_type: delivery.event_type,
+                sequence: 0x1234,
+                delivery_window: delivery.delivery_window,
+                affected_window: delivery.affected_window,
+                reparent: delivery.reparent,
+            })
+            .collect();
+        assert_eq!(
+            decode_structure_events(&allow_allowed, ClientByteOrder::LittleEndian),
+            expected_allowed,
+            "{} allow stream and event ordering; IDs {:?}",
+            case.name,
+            case.deliveries.iter().map(|d| d.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            decode_structure_events(&denied_bytes, ClientByteOrder::BigEndian),
+            expected_denied,
+            "{} denied only at delivery window; IDs {:?}",
+            case.name,
+            case.deliveries.iter().map(|d| d.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            allowed_bytes, allow_allowed,
+            "{} allowed bytes are isolated",
+            case.name
+        );
+        assert_eq!(
+            denied_bytes,
+            filter_structure_frames(
+                &baseline_denied,
+                ClientByteOrder::BigEndian,
+                case.deny_window
+            ),
+            "{} surviving denied-client events remain byte-identical",
+            case.name
+        );
+        assert_eq!(structure_snapshot(&denied), structure_snapshot(&allow));
+        assert_eq!(denied.backend.calls(), allow.backend.calls());
+        for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+            assert!(denied.state.clients.contains_key(&client.0));
+        }
+
+        let log = calls.lock().unwrap();
+        assert!(!log.iter().any(|call| call.hook == ExtensionHook::Send));
+        let receive_calls = receives(&log);
+        assert_eq!(
+            receive_calls.len(),
+            case.deliveries.len() * 2,
+            "{} hook count",
+            case.name
+        );
+        for (index, delivery) in case.deliveries.iter().enumerate() {
+            let group = &receive_calls[index * 2..index * 2 + 2];
+            let mut clients: Vec<_> = group.iter().map(|call| call.client).collect();
+            clients.sort_by_key(|client| client.0);
+            assert_eq!(
+                clients,
+                [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
+                "{} {} recipients",
+                case.name,
+                delivery.id
+            );
+            for call in group {
+                assert_eq!(
+                    call.receive,
+                    Some(EventSubject::Window(delivery.delivery_window)),
+                    "{} {} subject",
+                    case.name,
+                    delivery.id
+                );
+                assert_eq!(
+                    call.events,
+                    Some(vec![EventDescription::core(delivery.event_type)]),
+                    "{} {} type",
+                    case.name,
+                    delivery.id
+                );
+                assert_eq!(call.request, request_opcodes(case.opcode, 0));
+            }
+        }
+    }
+}
+
+// Mutation: drop N08's old-parent delivery or duplicate N09's new-parent
+// delivery in the same-parent case.
+#[test]
+fn receive_reparent_preserves_three_targets_and_order() {
+    fn same_parent_request(fixture: &mut NotifyFixture) -> RequestOutcome {
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&CHILD_WINDOW.0.to_le_bytes());
+        body.extend_from_slice(&PARENT_WINDOW.0.to_le_bytes());
+        body.extend_from_slice(&5_i16.to_le_bytes());
+        body.extend_from_slice(&6_i16.to_le_bytes());
+        fixture
+            .request(
+                NOTIFY_SENDER,
+                SequenceNumber(43),
+                RequestHeader {
+                    opcode: 7,
+                    data: 0,
+                    length_units: 4,
+                },
+                &body,
+            )
+            .expect("same-parent ReparentWindow through production dispatcher")
+    }
+
+    let mut allow = structure_fixture(StructureRequest::Reparent);
+    allow.install_policy(|_, _| Decision::Allow);
+    assert!(matches!(
+        structure_request(&mut allow, StructureRequest::Reparent),
+        RequestOutcome::Handled
+    ));
+    let expected_allow = vec![
+        StructureEvent {
+            event_type: 18,
+            sequence: 0x5678,
+            delivery_window: CHILD_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+        StructureEvent {
+            event_type: 18,
+            sequence: 0x5678,
+            delivery_window: PARENT_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+        StructureEvent {
+            event_type: 21,
+            sequence: 0x5678,
+            delivery_window: CHILD_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: Some(NEW_PARENT_WINDOW),
+        },
+        StructureEvent {
+            event_type: 21,
+            sequence: 0x5678,
+            delivery_window: PARENT_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: Some(NEW_PARENT_WINDOW),
+        },
+        StructureEvent {
+            event_type: 21,
+            sequence: 0x5678,
+            delivery_window: NEW_PARENT_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: Some(NEW_PARENT_WINDOW),
+        },
+        StructureEvent {
+            event_type: 19,
+            sequence: 0x5678,
+            delivery_window: CHILD_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+        StructureEvent {
+            event_type: 19,
+            sequence: 0x5678,
+            delivery_window: NEW_PARENT_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+    ];
+    let allow_denied_client = allow.drain(NOTIFY_RECEIVER_DENIED);
+    let allow_allowed_client = allow.drain(NOTIFY_RECEIVER_ALLOWED);
+    assert_eq!(
+        decode_structure_events(&allow_allowed_client, ClientByteOrder::LittleEndian),
+        expected_allow
+    );
+    let expected_allow_denied: Vec<_> = expected_allow
+        .iter()
+        .map(|event| StructureEvent {
+            sequence: 0x1234,
+            event_type: event.event_type,
+            delivery_window: event.delivery_window,
+            affected_window: event.affected_window,
+            reparent: event.reparent,
+        })
+        .collect();
+    assert_eq!(
+        decode_structure_events(&allow_denied_client, ClientByteOrder::BigEndian),
+        expected_allow_denied
+    );
+
+    let mut denied = structure_fixture(StructureRequest::Reparent);
+    let calls = denied.install_policy(|_, call| {
+        if call.hook == ExtensionHook::Receive
+            && call.client == NOTIFY_RECEIVER_DENIED
+            && call.receive == Some(EventSubject::Window(NEW_PARENT_WINDOW))
+        {
+            Decision::Deny(DENY)
+        } else {
+            Decision::Allow
+        }
+    });
+    assert!(matches!(
+        structure_request(&mut denied, StructureRequest::Reparent),
+        RequestOutcome::Handled
+    ));
+    assert!(denied.drain(NOTIFY_SENDER).is_empty());
+    let denied_bytes = denied.drain(NOTIFY_RECEIVER_DENIED);
+    let allowed_bytes = denied.drain(NOTIFY_RECEIVER_ALLOWED);
+    let expected_denied: Vec<_> = expected_allow
+        .iter()
+        .filter(|event| event.delivery_window != NEW_PARENT_WINDOW)
+        .map(|event| StructureEvent {
+            sequence: 0x1234,
+            event_type: event.event_type,
+            delivery_window: event.delivery_window,
+            affected_window: event.affected_window,
+            reparent: event.reparent,
+        })
+        .collect();
+    assert_eq!(
+        decode_structure_events(&denied_bytes, ClientByteOrder::BigEndian),
+        expected_denied
+    );
+    assert_eq!(allowed_bytes, allow_allowed_client);
+    assert_eq!(structure_snapshot(&denied), structure_snapshot(&allow));
+    assert_eq!(denied.backend.calls(), allow.backend.calls());
+    assert_eq!(receives(&calls.lock().unwrap()).len(), 14);
+
+    let same_parent_events = vec![
+        StructureEvent {
+            event_type: 18,
+            sequence: 0x5678,
+            delivery_window: CHILD_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+        StructureEvent {
+            event_type: 18,
+            sequence: 0x5678,
+            delivery_window: PARENT_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+        StructureEvent {
+            event_type: 21,
+            sequence: 0x5678,
+            delivery_window: CHILD_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: Some(PARENT_WINDOW),
+        },
+        StructureEvent {
+            event_type: 21,
+            sequence: 0x5678,
+            delivery_window: PARENT_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: Some(PARENT_WINDOW),
+        },
+        StructureEvent {
+            event_type: 19,
+            sequence: 0x5678,
+            delivery_window: CHILD_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+        StructureEvent {
+            event_type: 19,
+            sequence: 0x5678,
+            delivery_window: PARENT_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        },
+    ];
+    let mut same_allow = structure_fixture(StructureRequest::Reparent);
+    let same_allow_calls = same_allow.install_policy(|_, _| Decision::Allow);
+    assert!(matches!(
+        same_parent_request(&mut same_allow),
+        RequestOutcome::Handled
+    ));
+    let same_allow_denied_bytes = same_allow.drain(NOTIFY_RECEIVER_DENIED);
+    let same_allow_allowed_bytes = same_allow.drain(NOTIFY_RECEIVER_ALLOWED);
+    assert_eq!(
+        decode_structure_events(&same_allow_denied_bytes, ClientByteOrder::BigEndian),
+        same_parent_events
+            .iter()
+            .map(|event| StructureEvent {
+                sequence: 0x1234,
+                event_type: event.event_type,
+                delivery_window: event.delivery_window,
+                affected_window: event.affected_window,
+                reparent: event.reparent,
+            })
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        decode_structure_events(&same_allow_allowed_bytes, ClientByteOrder::LittleEndian),
+        same_parent_events
+    );
+    let same_allow_log = same_allow_calls.lock().unwrap();
+    assert_eq!(receives(&same_allow_log).len(), 12);
+    assert!(
+        !receives(&same_allow_log)
+            .iter()
+            .any(|call| call.receive == Some(EventSubject::Window(NEW_PARENT_WINDOW)))
+    );
+
+    let mut same_denied = structure_fixture(StructureRequest::Reparent);
+    let same_denied_calls = same_denied.install_policy(|_, call| {
+        if call.hook == ExtensionHook::Receive
+            && call.client == NOTIFY_RECEIVER_DENIED
+            && call.receive == Some(EventSubject::Window(PARENT_WINDOW))
+        {
+            Decision::Deny(DENY)
+        } else {
+            Decision::Allow
+        }
+    });
+    assert!(matches!(
+        same_parent_request(&mut same_denied),
+        RequestOutcome::Handled
+    ));
+    let same_denied_bytes = same_denied.drain(NOTIFY_RECEIVER_DENIED);
+    let same_denied_allowed = same_denied.drain(NOTIFY_RECEIVER_ALLOWED);
+    let expected_same_denied = same_parent_events
+        .iter()
+        .filter(|event| event.delivery_window != PARENT_WINDOW)
+        .map(|event| StructureEvent {
+            sequence: 0x1234,
+            event_type: event.event_type,
+            delivery_window: event.delivery_window,
+            affected_window: event.affected_window,
+            reparent: event.reparent,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        decode_structure_events(&same_denied_bytes, ClientByteOrder::BigEndian),
+        expected_same_denied
+    );
+    assert_eq!(same_denied_allowed, same_allow_allowed_bytes);
+    assert_eq!(
+        structure_snapshot(&same_denied),
+        structure_snapshot(&same_allow)
+    );
+    assert_eq!(same_denied.backend.calls(), same_allow.backend.calls());
+    assert_eq!(receives(&same_denied_calls.lock().unwrap()).len(), 12);
+}
+
+// Mutation: skip child gravity application when Receive denies GravityNotify.
+#[test]
+fn receive_gravity_denial_keeps_child_move() {
+    const HOST_PARENT: u32 = 0x0055_0001;
+    const HOST_CHILD: u32 = 0x0055_0002;
+
+    fn fixture() -> NotifyFixture {
+        let mut fixture = NotifyFixture::new();
+        add_window(
+            &mut fixture,
+            PARENT_WINDOW,
+            ROOT_WINDOW,
+            0,
+            0,
+            100,
+            100,
+            None,
+        );
+        add_window(
+            &mut fixture,
+            CHILD_WINDOW,
+            PARENT_WINDOW,
+            10,
+            20,
+            10,
+            10,
+            None,
+        );
+        let parent = fixture.state.resources.window_mut(PARENT_WINDOW).unwrap();
+        parent.map_state = MapState::Viewable;
+        parent.host_xid = Some(WindowHandle::from_raw_for_test(HOST_PARENT));
+        let child = fixture.state.resources.window_mut(CHILD_WINDOW).unwrap();
+        child.map_state = MapState::Viewable;
+        child.win_gravity = 8; // SouthGravity
+        child.host_xid = Some(WindowHandle::from_raw_for_test(HOST_CHILD));
+        for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+            let masks = &mut fixture
+                .state
+                .clients
+                .get_mut(&client.0)
+                .unwrap()
+                .event_masks;
+            if client == NOTIFY_RECEIVER_DENIED {
+                masks.insert(CHILD_WINDOW, 0x0002_0000);
+            } else {
+                masks.insert(PARENT_WINDOW, 0x0008_0000);
+            }
+        }
+        let denied = fixture
+            .state
+            .clients
+            .get_mut(&NOTIFY_RECEIVER_DENIED.0)
+            .expect("denied receiver");
+        denied.byte_order = ClientByteOrder::BigEndian;
+        denied
+            .last_sequence
+            .store(0x1234, std::sync::atomic::Ordering::Relaxed);
+        fixture
+            .state
+            .clients
+            .get_mut(&NOTIFY_RECEIVER_ALLOWED.0)
+            .expect("allowed receiver")
+            .last_sequence
+            .store(0x5678, std::sync::atomic::Ordering::Relaxed);
+        fixture
+    }
+
+    fn resize_parent(fixture: &mut NotifyFixture) -> RequestOutcome {
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&PARENT_WINDOW.0.to_le_bytes());
+        body.extend_from_slice(&8_u16.to_le_bytes()); // CWHeight
+        body.extend_from_slice(&[0; 2]);
+        body.extend_from_slice(&120_u32.to_le_bytes());
+        fixture
+            .request(
+                NOTIFY_SENDER,
+                SequenceNumber(42),
+                RequestHeader {
+                    opcode: 12,
+                    data: 0,
+                    length_units: 4,
+                },
+                &body,
+            )
+            .expect("ConfigureWindow through production dispatcher")
+    }
+
+    fn child_position(fixture: &NotifyFixture) -> (i16, i16) {
+        let child = fixture.state.resources.window(CHILD_WINDOW).unwrap();
+        (child.x, child.y)
+    }
+
+    let mut allow = fixture();
+    allow.install_policy(|_, _| Decision::Allow);
+    assert!(matches!(resize_parent(&mut allow), RequestOutcome::Handled));
+    let allow_denied = allow.drain(NOTIFY_RECEIVER_DENIED);
+    let allow_allowed = allow.drain(NOTIFY_RECEIVER_ALLOWED);
+    assert_eq!(
+        decode_structure_events(&allow_denied, ClientByteOrder::BigEndian),
+        vec![StructureEvent {
+            event_type: 24,
+            sequence: 0x1234,
+            delivery_window: CHILD_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        }]
+    );
+    assert_eq!(
+        decode_structure_events(&allow_allowed, ClientByteOrder::LittleEndian),
+        vec![StructureEvent {
+            event_type: 24,
+            sequence: 0x5678,
+            delivery_window: PARENT_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        }]
+    );
+    assert_eq!(child_position(&allow), (10, 40));
+    assert!(allow.backend.calls().iter().any(|call| matches!(
+        call,
+        RecordedCall::MoveSubwindowsForGravity { moves, .. }
+            if moves == &vec![(HOST_CHILD, 10, 40)]
+    )));
+
+    let mut denied = fixture();
+    let calls = denied.install_policy(|_, call| {
+        if call.hook == ExtensionHook::Receive
+            && call.client == NOTIFY_RECEIVER_DENIED
+            && call.receive == Some(EventSubject::Window(CHILD_WINDOW))
+        {
+            Decision::Deny(DENY)
+        } else {
+            Decision::Allow
+        }
+    });
+    assert!(matches!(
+        resize_parent(&mut denied),
+        RequestOutcome::Handled
+    ));
+    assert_eq!(
+        child_position(&denied),
+        child_position(&allow),
+        "GravityNotify denial must not suppress the child move"
+    );
+    assert_eq!(
+        denied.backend.calls(),
+        allow.backend.calls(),
+        "GravityNotify denial must not suppress backend movement"
+    );
+    assert!(denied.drain(NOTIFY_SENDER).is_empty());
+    assert!(denied.drain(NOTIFY_RECEIVER_DENIED).is_empty());
+    let denied_allowed = denied.drain(NOTIFY_RECEIVER_ALLOWED);
+    assert_eq!(denied_allowed, allow_allowed);
+    assert_eq!(child_position(&denied), child_position(&allow));
+    assert_eq!(denied.backend.calls(), allow.backend.calls());
+    assert!(denied.state.clients.contains_key(&NOTIFY_RECEIVER_DENIED.0));
+    let log = calls.lock().unwrap();
+    let receive_calls = receives(&log);
+    assert_eq!(receive_calls.len(), 2);
+    assert_eq!(receive_calls[0].client, NOTIFY_RECEIVER_DENIED);
+    assert_eq!(
+        receive_calls[0].receive,
+        Some(EventSubject::Window(CHILD_WINDOW))
+    );
+    assert_eq!(receive_calls[1].client, NOTIFY_RECEIVER_ALLOWED);
+    assert_eq!(
+        receive_calls[1].receive,
+        Some(EventSubject::Window(PARENT_WINDOW))
+    );
+    assert!(receive_calls.iter().all(|call| {
+        call.events == Some(vec![EventDescription::core(24)])
+            && call.request == request_opcodes(12, 0)
+    }));
+    assert!(!log.iter().any(|call| call.hook == ExtensionHook::Send));
+}
+
+// Mutation: move the Receive check ahead of the existing no-change exit.
+#[test]
+fn receive_structure_noop_does_not_ask() {
+    let mut fixture = structure_fixture(StructureRequest::Unmap);
+    fixture
+        .state
+        .resources
+        .window_mut(CHILD_WINDOW)
+        .expect("child")
+        .map_state = MapState::Unmapped;
+    let calls = fixture.install_policy(|_, _| Decision::Allow);
+
+    // Put the child in the states that make each operation an existing no-op.
+    fixture.state.resources.window_mut(CHILD_WINDOW).unwrap().x = 7;
+    fixture
+        .state
+        .resources
+        .window_mut(CHILD_WINDOW)
+        .unwrap()
+        .map_state = MapState::Viewable;
+    assert!(matches!(
+        structure_request(&mut fixture, StructureRequest::Configure),
+        RequestOutcome::Handled
+    ));
+    fixture
+        .state
+        .resources
+        .window_mut(CHILD_WINDOW)
+        .unwrap()
+        .map_state = MapState::Viewable;
+    assert!(matches!(
+        structure_request(&mut fixture, StructureRequest::Map),
+        RequestOutcome::Handled
+    ));
+    fixture
+        .state
+        .resources
+        .window_mut(CHILD_WINDOW)
+        .unwrap()
+        .map_state = MapState::Unmapped;
+    assert!(matches!(
+        structure_request(&mut fixture, StructureRequest::Unmap),
+        RequestOutcome::Handled
+    ));
+    assert!(receives(&calls.lock().unwrap()).is_empty());
+    assert!(fixture.drain(NOTIFY_SENDER).is_empty());
+    assert!(fixture.drain(NOTIFY_RECEIVER_DENIED).is_empty());
+    assert!(fixture.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
 }

@@ -1021,6 +1021,7 @@ pub(super) fn expected_resource_checks(
 ) -> Vec<RecordedResourceExpectation> {
     calls
         .iter()
+        .filter(|call| call.hook == ExtensionHook::Resource)
         .map(|call| {
             let target = call.target.expect("resource target");
             let expected_target_owner = target.owner.or(call.owner);
