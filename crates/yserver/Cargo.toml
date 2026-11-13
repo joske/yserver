@@ -27,8 +27,6 @@ freetype-rs.workspace = true
 libc.workspace = true
 log.workspace = true
 regex = "1.13.1"
-roxmltree.workspace = true
-serde_json.workspace = true
 # IPV6_V6ONLY before bind, which std cannot set.
 socket2 = { version = "0.6", optional = true }
 thiserror.workspace = true
@@ -52,6 +50,9 @@ fontconfig = "0.11"
 drm.workspace = true
 gbm.workspace = true
 input.workspace = true
+# The VRR exclusion list (`vrr_exclusions.rs`).
+roxmltree.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 udev.workspace = true
