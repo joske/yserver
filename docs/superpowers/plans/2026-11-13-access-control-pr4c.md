@@ -2,6 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Status: DRAFT — not ready to implement.** An implementation of this plan was attempted and discarded: with a
+> policy installed, pointer delivery under a denial (grabs, owner-events, XI2 versus core, implicit grab, grab
+> fallback) cannot follow Xorg without first changing how yserver routes input when no policy is installed. How to
+> continue is an open question for the maintainer; see the draft PR.
+
 **Goal:** Check Receive on every existing input, XI and XKB delivery below, including grabbed and deferred input,
 without changing any client-observable byte when no policy is installed.
 
