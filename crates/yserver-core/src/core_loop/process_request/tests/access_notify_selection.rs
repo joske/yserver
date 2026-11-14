@@ -439,16 +439,16 @@ pub(super) fn run_xfixes_owner_change(
     (outputs, calls, (before, after))
 }
 
+fn timestamp_is_between(value: u32, (before, after): (u32, u32)) -> bool {
+    value.wrapping_sub(before) <= after.wrapping_sub(before)
+}
+
 pub(super) fn assert_xfixes_event_matches_except_timestamps(
     actual: &[u8],
     actual_bounds: (u32, u32),
     expected: &[u8],
     expected_bounds: (u32, u32),
 ) {
-    fn timestamp_is_between(value: u32, (before, after): (u32, u32)) -> bool {
-        value.wrapping_sub(before) <= after.wrapping_sub(before)
-    }
-
     assert_eq!(actual.len(), 32, "complete XFIXES SelectionNotify");
     assert_eq!(expected.len(), 32, "complete XFIXES SelectionNotify");
     for (bytes, bounds, label) in [
@@ -1174,7 +1174,9 @@ fn host_wm_state(fixture: &mut NotifyFixture, window: ResourceId) -> Option<Vec<
         .map(|value| value.data.clone())
 }
 
-// Mutations: bypass raw checks; describe sent type with bit 7; exempt host SelectionNotify(None) by type/property.
+// Mutations: bypass raw checks; describe sent type with bit 7; exempt host
+// SelectionNotify(None) by type/property; let a ClientMessage time escape its
+// fixture bounds or change a non-time byte without failing.
 #[test]
 fn receive_rootless_outgoing_core_events_are_checked() {
     let (mut baseline, baseline_window, baseline_id) = rootless_host_fixture();
@@ -1204,11 +1206,14 @@ fn receive_rootless_outgoing_core_events_are_checked() {
         baseline.state.resources.window(baseline_window).unwrap().x,
         30
     );
+    let baseline_close_before = baseline.state.timestamp_now();
     host_request(
         &mut baseline,
         HostRequest::CloseRequested { id: baseline_id },
     );
+    let baseline_close_after = baseline.state.timestamp_now();
     let baseline_close = baseline.drain(A);
+    assert_eq!(baseline_close.len(), 32, "one complete ClientMessage");
     assert_eq!(event_frames(&baseline_close)[0][0], 33 | 0x80);
     let baseline_requestor = ResourceId(0x0057_0011);
     create_window(&mut baseline, B, baseline_requestor);
@@ -1274,9 +1279,37 @@ fn receive_rootless_outgoing_core_events_are_checked() {
     let control_wm_state = host_wm_state(&mut control, window);
     let control_backend = control.backend.calls();
     let delete_window = control.state.atoms.intern("WM_DELETE_WINDOW", false);
+    let control_close_before = control.state.timestamp_now();
     host_request(&mut control, HostRequest::CloseRequested { id });
+    let control_close_after = control.state.timestamp_now();
     let control_close = control.drain(A);
-    assert_eq!(control_close, baseline_close);
+    assert_eq!(control_close.len(), 32, "one complete ClientMessage");
+    for (label, event, bounds) in [
+        (
+            "baseline",
+            &baseline_close,
+            (baseline_close_before, baseline_close_after),
+        ),
+        (
+            "recording-Allow",
+            &control_close,
+            (control_close_before, control_close_after),
+        ),
+    ] {
+        let timestamp = u32::from_le_bytes(event[16..20].try_into().unwrap());
+        assert!(
+            timestamp_is_between(timestamp, bounds),
+            "{label} ClientMessage timestamp {timestamp} is within {bounds:?}"
+        );
+    }
+    let mut baseline_close_without_timestamp = baseline_close.clone();
+    let mut control_close_without_timestamp = control_close.clone();
+    baseline_close_without_timestamp[16..20].fill(0);
+    control_close_without_timestamp[16..20].fill(0);
+    assert_eq!(
+        control_close_without_timestamp, baseline_close_without_timestamp,
+        "all non-timestamp ClientMessage bytes match"
+    );
     assert_eq!(event_frames(&control_close)[0][0], 33 | 0x80);
     assert_eq!(
         u32::from_le_bytes(control_close[12..16].try_into().unwrap()),
