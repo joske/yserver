@@ -686,6 +686,85 @@ fn rootless_fixture() -> NotifyFixture {
     fixture
 }
 
+// Mutation: restore note_refusal(requestor) before the issuer check.
+#[test]
+fn no_owner_socket_conversion_with_bridge_requestor_answers_issuer() {
+    let mut fixture = rootless_fixture();
+    let requestor = rootless::selection::selection_window(&mut fixture.state);
+    let selection = fixture
+        .state
+        .atoms
+        .intern("ACCESS_NO_OWNER_SELECTION", false);
+    let target = fixture.state.atoms.intern("ACCESS_NO_OWNER_TARGET", false);
+    let property = fixture
+        .state
+        .atoms
+        .intern("ACCESS_NO_OWNER_PROPERTY", false);
+
+    convert_request(
+        &mut fixture,
+        C,
+        63,
+        requestor,
+        selection,
+        target,
+        property,
+        0x4455_6677,
+    );
+
+    let received = fixture.drain(C);
+    assert_eq!(received.len(), 32, "one complete SelectionNotify");
+    assert_eq!(received[0], 31, "SelectionNotify without the synthetic bit");
+    assert_eq!(
+        received,
+        literal_selection_notify(
+            ClientByteOrder::LittleEndian,
+            63,
+            0x4455_6677,
+            requestor,
+            selection,
+            target,
+        )
+    );
+    assert!(
+        rootless::selection::take_selection_events(&mut fixture.state).is_empty(),
+        "socket conversion is answered to its issuer, not the host queue"
+    );
+}
+
+// Mutation: always call send_selection_failure for no-owner conversions.
+#[test]
+fn no_owner_bridge_conversion_queues_refusal() {
+    let mut fixture = rootless_fixture();
+    let selection = fixture
+        .state
+        .atoms
+        .intern("ACCESS_NO_OWNER_SELECTION", false);
+    let target = fixture.state.atoms.intern("ACCESS_NO_OWNER_TARGET", false);
+    let property = fixture
+        .state
+        .atoms
+        .intern("ACCESS_NO_OWNER_PROPERTY", false);
+
+    rootless::selection::convert_selection(&mut fixture.state, selection, target, property)
+        .expect("typed bridge ConvertSelection");
+
+    assert_eq!(
+        rootless::selection::take_selection_events(&mut fixture.state),
+        [SelectionEvent::Notify {
+            selection,
+            target,
+            property: AtomId(0),
+        }]
+    );
+    for client in [A, B, C] {
+        assert!(
+            fixture.drain(client).is_empty(),
+            "no socket bytes for {client:?}"
+        );
+    }
+}
+
 // Mutations: queue before checking; treat a denied, unqueued bridge request as handled without refusing it.
 #[test]
 fn receive_bridge_selection_denial_answers_requester() {

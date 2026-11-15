@@ -447,7 +447,7 @@ pub(crate) fn apply_convert_selection(
                 crate::access::Decision::Deny(_)
             );
         if denied {
-            answer_denied_selection_request(
+            answer_selection_failure(
                 state,
                 client_id,
                 requestor,
@@ -492,7 +492,7 @@ pub(crate) fn apply_convert_selection(
                 crate::access::Decision::Deny(_)
             );
         if denied {
-            answer_denied_selection_request(
+            answer_selection_failure(
                 state,
                 client_id,
                 requestor,
@@ -523,13 +523,10 @@ pub(crate) fn apply_convert_selection(
             "client {} #{} ConvertSelection -> owner 0x{:x}",
             client_id.0, sequence.0, owner_window.0
         );
-    } else if crate::rootless::selection::note_refusal(state, requestor, selection, target_atom) {
-        // No owner, and the server's window asked: its host hears it.
     } else {
-        // No owner, or its setter is gone (`dix/selection.c:297-301`):
-        // SelectionNotify(None) to the client that issued ConvertSelection
-        // (`dix/selection.c:304-311`), whoever created the requestor window.
-        send_selection_failure(
+        // Xorg answers a missing-owner conversion to its issuer
+        // (`../xserver`, tag `xorg-server-21.1.24`, dix/selection.c:297-311).
+        answer_selection_failure(
             state,
             client_id,
             requestor,
@@ -544,7 +541,7 @@ pub(crate) fn apply_convert_selection(
     }
 }
 
-fn answer_denied_selection_request(
+fn answer_selection_failure(
     state: &mut ServerState,
     client_id: ClientId,
     requestor: ResourceId,
@@ -553,8 +550,8 @@ fn answer_denied_selection_request(
     time_val: u32,
 ) {
     if client_id == crate::resources::SERVER_OWNER {
-        // A typed bridge ConvertSelection is answered on the host queue. A
-        // socket request is always answered to its issuer, even when its
+        // The bridge's own typed conversion is answered on the host queue.
+        // Socket conversions always go to their issuer, even when their
         // requestor window is the bridge's.
         let _queued =
             crate::rootless::selection::note_refusal(state, requestor, selection, target_atom);
