@@ -1019,9 +1019,18 @@ fn get_image_checks_read_before_bounds_validation() {
 pub(super) fn expected_resource_checks(
     calls: &[RecordedExtensionCheck],
 ) -> Vec<RecordedResourceExpectation> {
+    for call in calls {
+        assert_eq!(
+            call.hook,
+            ExtensionHook::Resource,
+            "unexpected {:?} for request {:?}",
+            call.hook,
+            call.request
+        );
+    }
+
     calls
         .iter()
-        .filter(|call| call.hook == ExtensionHook::Resource)
         .map(|call| {
             let target = call.target.expect("resource target");
             let expected_target_owner = target.owner.or(call.owner);
@@ -1039,6 +1048,72 @@ pub(super) fn expected_resource_checks(
             )
         })
         .collect()
+}
+
+pub(super) fn expected_resource_checks_and_receives(
+    calls: &[RecordedExtensionCheck],
+) -> (
+    Vec<RecordedResourceExpectation>,
+    Vec<RecordedExtensionCheck>,
+) {
+    let mut resources = Vec::new();
+    let mut receives = Vec::new();
+    for call in calls {
+        match call.hook {
+            ExtensionHook::Resource => resources.push(call.clone()),
+            ExtensionHook::Receive => receives.push(call.clone()),
+            hook => panic!("unexpected {hook:?} for request {:?}", call.request),
+        }
+    }
+    (expected_resource_checks(&resources), receives)
+}
+
+#[test]
+#[should_panic(expected = "unexpected Receive")]
+fn expected_resource_checks_rejects_unexpected_receive() {
+    // Mutation: restore the Resource-only filter in expected_resource_checks; this must stop panicking.
+    let target = ResourceTarget {
+        id: ResourceId(0x0060_0010),
+        kind: ResourceKind::Window,
+        creation: None,
+        owner: None,
+    };
+    let calls = [
+        RecordedExtensionCheck {
+            hook: ExtensionHook::Resource,
+            client: CLIENT,
+            extension: "TEST".to_owned(),
+            request: Some(REQUEST),
+            peer: None,
+            admission: None,
+            target: Some(target),
+            property: None,
+            mode: Some(AccessMode::READ),
+            send: None,
+            receive: None,
+            events: None,
+            owner: None,
+            target_owner: None,
+        },
+        RecordedExtensionCheck {
+            hook: ExtensionHook::Receive,
+            client: CLIENT,
+            extension: "TEST".to_owned(),
+            request: Some(REQUEST),
+            peer: None,
+            admission: None,
+            target: None,
+            property: None,
+            mode: None,
+            send: None,
+            receive: Some(EventSubject::Window(target.id)),
+            events: None,
+            owner: None,
+            target_owner: None,
+        },
+    ];
+
+    expected_resource_checks(&calls);
 }
 
 fn core_check(
@@ -2491,8 +2566,9 @@ fn destroy_subwindows_denied_child_stops_the_loop() {
         destroyed,
         [child_hosts.iter().find(|(id, _)| *id == c1).unwrap().1]
     );
+    let (resource_checks, receives) = expected_resource_checks_and_receives(&calls.lock().unwrap());
     assert_eq!(
-        expected_resource_checks(&calls.lock().unwrap()),
+        resource_checks,
         [
             (
                 CLIENT,
@@ -2514,6 +2590,38 @@ fn destroy_subwindows_denied_child_stops_the_loop() {
                 ResourceKind::Window,
                 AccessMode::DESTROY,
                 Some(RequestOpcodes { major: 5, minor: 0 })
+            ),
+        ]
+    );
+    assert_eq!(
+        receives
+            .iter()
+            .map(|call| (call.client, call.receive, call.events.clone(), call.request))
+            .collect::<Vec<_>>(),
+        [
+            (
+                ClientId(2),
+                Some(EventSubject::Window(c1)),
+                Some(vec![EventDescription::core(18)]),
+                Some(RequestOpcodes { major: 5, minor: 0 }),
+            ),
+            (
+                ClientId(2),
+                Some(EventSubject::Window(c2)),
+                Some(vec![EventDescription::core(18)]),
+                Some(RequestOpcodes { major: 5, minor: 0 }),
+            ),
+            (
+                ClientId(2),
+                Some(EventSubject::Window(c3)),
+                Some(vec![EventDescription::core(18)]),
+                Some(RequestOpcodes { major: 5, minor: 0 }),
+            ),
+            (
+                ClientId(2),
+                Some(EventSubject::Window(c1)),
+                Some(vec![EventDescription::core(17)]),
+                Some(RequestOpcodes { major: 5, minor: 0 }),
             ),
         ]
     );
@@ -2575,8 +2683,41 @@ fn destroy_subwindows_bulk_unmap_ignores_hide() {
             Some(crate::resources::MapState::Unmapped)
         );
     }
+    let (resource_checks, receives) = expected_resource_checks_and_receives(&calls.lock().unwrap());
+    assert_eq!(
+        receives
+            .iter()
+            .map(|call| (call.client, call.receive, call.events.clone(), call.request))
+            .collect::<Vec<_>>(),
+        [
+            (
+                ClientId(2),
+                Some(EventSubject::Window(c1)),
+                Some(vec![EventDescription::core(18)]),
+                Some(RequestOpcodes { major: 5, minor: 0 }),
+            ),
+            (
+                ClientId(2),
+                Some(EventSubject::Window(c2)),
+                Some(vec![EventDescription::core(18)]),
+                Some(RequestOpcodes { major: 5, minor: 0 }),
+            ),
+            (
+                ClientId(2),
+                Some(EventSubject::Window(c3)),
+                Some(vec![EventDescription::core(18)]),
+                Some(RequestOpcodes { major: 5, minor: 0 }),
+            ),
+            (
+                ClientId(2),
+                Some(EventSubject::Window(c1)),
+                Some(vec![EventDescription::core(17)]),
+                Some(RequestOpcodes { major: 5, minor: 0 }),
+            ),
+        ]
+    );
     assert!(
-        expected_resource_checks(&calls.lock().unwrap())
+        resource_checks
             .iter()
             .all(|(_, _, _, mode, _)| *mode != AccessMode::HIDE),
         "DestroySubwindows asks only REMOVE and DESTROY"
@@ -3221,8 +3362,9 @@ fn map_subwindows_skips_denied_child() {
         })
         .collect::<Vec<_>>();
     assert_eq!(mapped, [host_c3, host_c1]);
+    let (resource_checks, receives) = expected_resource_checks_and_receives(&calls.lock().unwrap());
     assert_eq!(
-        expected_resource_checks(&calls.lock().unwrap()),
+        resource_checks,
         [
             (
                 CLIENT,
@@ -3251,6 +3393,26 @@ fn map_subwindows_skips_denied_child() {
                 ResourceKind::Window,
                 AccessMode::SHOW,
                 Some(RequestOpcodes { major: 9, minor: 0 })
+            ),
+        ]
+    );
+    assert_eq!(
+        receives
+            .iter()
+            .map(|call| (call.client, call.receive, call.events.clone(), call.request))
+            .collect::<Vec<_>>(),
+        [
+            (
+                ClientId(2),
+                Some(EventSubject::Window(c3)),
+                Some(vec![EventDescription::core(19)]),
+                Some(RequestOpcodes { major: 9, minor: 0 }),
+            ),
+            (
+                ClientId(2),
+                Some(EventSubject::Window(c1)),
+                Some(vec![EventDescription::core(19)]),
+                Some(RequestOpcodes { major: 9, minor: 0 }),
             ),
         ]
     );
@@ -3325,8 +3487,9 @@ fn unmap_subwindows_skips_denied_child() {
         })
         .collect::<Vec<_>>();
     assert_eq!(unmapped, [host_c1, host_c3]);
+    let (resource_checks, receives) = expected_resource_checks_and_receives(&calls.lock().unwrap());
     assert_eq!(
-        expected_resource_checks(&calls.lock().unwrap()),
+        resource_checks,
         [
             (
                 CLIENT,
@@ -3367,6 +3530,32 @@ fn unmap_subwindows_skips_denied_child() {
                     major: 11,
                     minor: 0
                 })
+            ),
+        ]
+    );
+    assert_eq!(
+        receives
+            .iter()
+            .map(|call| (call.client, call.receive, call.events.clone(), call.request))
+            .collect::<Vec<_>>(),
+        [
+            (
+                ClientId(2),
+                Some(EventSubject::Window(c1)),
+                Some(vec![EventDescription::core(18)]),
+                Some(RequestOpcodes {
+                    major: 11,
+                    minor: 0
+                }),
+            ),
+            (
+                ClientId(2),
+                Some(EventSubject::Window(c3)),
+                Some(vec![EventDescription::core(18)]),
+                Some(RequestOpcodes {
+                    major: 11,
+                    minor: 0
+                }),
             ),
         ]
     );
@@ -3629,8 +3818,10 @@ fn reparent_denied_remap_leaves_window_reparented_and_unmapped() {
         assert_eq!(fixture.state.core_focus.revert_to, expected_revert);
         assert!(fixture.state.active_pointer_grab.is_none());
         assert_eq!(fixture.backend.calls()[start..], expected_backend);
+        let (resource_checks, receives) =
+            expected_resource_checks_and_receives(&calls.lock().unwrap());
         assert_eq!(
-            expected_resource_checks(&calls.lock().unwrap()),
+            resource_checks,
             [
                 (
                     CLIENT,
@@ -3652,6 +3843,44 @@ fn reparent_denied_remap_leaves_window_reparented_and_unmapped() {
                     ResourceKind::Window,
                     AccessMode::SHOW,
                     Some(RequestOpcodes { major: 7, minor: 0 })
+                ),
+            ]
+        );
+        assert_eq!(
+            receives
+                .iter()
+                .map(|call| (call.client, call.receive, call.events.clone(), call.request))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    ClientId(2),
+                    Some(EventSubject::Window(fixture.window)),
+                    Some(vec![EventDescription::core(18)]),
+                    Some(RequestOpcodes { major: 7, minor: 0 }),
+                ),
+                (
+                    ClientId(2),
+                    Some(EventSubject::Window(ResourceId(0x0058_0001))),
+                    Some(vec![EventDescription::core(18)]),
+                    Some(RequestOpcodes { major: 7, minor: 0 }),
+                ),
+                (
+                    ClientId(2),
+                    Some(EventSubject::Window(fixture.window)),
+                    Some(vec![EventDescription::core(21)]),
+                    Some(RequestOpcodes { major: 7, minor: 0 }),
+                ),
+                (
+                    ClientId(2),
+                    Some(EventSubject::Window(ResourceId(0x0058_0001))),
+                    Some(vec![EventDescription::core(21)]),
+                    Some(RequestOpcodes { major: 7, minor: 0 }),
+                ),
+                (
+                    ClientId(2),
+                    Some(EventSubject::Window(fixture.new_parent)),
+                    Some(vec![EventDescription::core(21)]),
+                    Some(RequestOpcodes { major: 7, minor: 0 }),
                 ),
             ]
         );
