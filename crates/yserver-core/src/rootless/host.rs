@@ -66,9 +66,13 @@ pub(crate) fn send_client_message_as_server(
     for (i, v) in data.iter().enumerate() {
         event[12 + 4 * i..16 + 4 * i].copy_from_slice(&v.to_le_bytes());
     }
-    let _dropped = crate::core_loop::fanout::fanout_raw_event_to_clients(
+    let descriptions = [crate::access::EventDescription::core(33)];
+    let batch = crate::access::EventBatch::new(&descriptions);
+    let _dropped = crate::core_loop::fanout::fanout_raw_event_to_clients_with_receive(
         state,
         &targets,
+        crate::access::EventSubject::Window(window),
+        &batch,
         &event,
         ClientByteOrder::LittleEndian,
     );
@@ -184,10 +188,13 @@ fn synthetic_configure_notify(state: &mut ServerState, window: ResourceId) {
     };
     let override_redirect = w.override_redirect;
     let above = state.resources.configure_notify_above_sibling(window);
-    let _dropped = crate::core_loop::fanout::emit_window_event_to_state(
+    let descriptions = [crate::access::EventDescription::core(22)];
+    let batch = crate::access::EventBatch::new(&descriptions);
+    let _dropped = crate::core_loop::fanout::emit_window_event_to_state_with_receive(
         state,
         window,
         0x0002_0000, // StructureNotify
+        &batch,
         |buf, seq, order| {
             let start = buf.len();
             x11::encode_configure_notify_event(

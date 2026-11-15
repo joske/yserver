@@ -152,6 +152,12 @@ fn configure_window_pure_move_emits_present_configure_notify() {
     );
 }
 
+// Keep the existing fixture test private while letting Task 8 rerun its
+// established no-policy/Allow byte comparison from a sibling module.
+pub(super) fn run_no_policy_parity_fixtures() {
+    configure_window_pure_move_emits_present_configure_notify();
+}
+
 #[test]
 fn present_default_crtc_uses_the_transformed_footprint() {
     const WINDOW: u32 = 0x0001_1001;

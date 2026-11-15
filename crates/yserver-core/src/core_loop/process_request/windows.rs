@@ -1,5 +1,8 @@
 use crate::{
-    access::{AccessMode, Creation, RequestOpcodes, ResourceKind, ResourceTarget},
+    access::{
+        AccessMode, Creation, EventBatch, EventDescription, EventSubject, RequestOpcodes,
+        ResourceKind, ResourceTarget,
+    },
     backend::{Backend, OriginContext},
     core_loop::{
         damage_fanout::{
@@ -7,8 +10,8 @@ use crate::{
             accumulate_damage_region_to_state,
         },
         fanout::{
-            emit_visibility_unobscured_subtree_to_state, emit_window_event_to_state,
-            fanout_event_to_clients, subscribers_by_id,
+            emit_visibility_unobscured_subtree_to_state, emit_window_event_to_state_with_receive,
+            fanout_event_to_clients_with_receive, subscribers_by_id,
         },
         process_request::{
             RequestOutcome, emit_x11_error,
@@ -106,22 +109,30 @@ pub(crate) fn send_window_exposures(
         region
     };
     let last = events.len() - 1;
+    let expose_description = [EventDescription::core(12)];
+    let expose_batch = EventBatch::new(&expose_description);
     for (i, r) in events.iter().enumerate() {
         let count = u16::try_from(last - i).unwrap_or(u16::MAX);
         let r = *r;
-        let _dropped = emit_window_event_to_state(state, window, 0x0000_8000, |buf, seq, order| {
-            x11::encode_expose_event(
-                buf,
-                seq,
-                order,
-                window,
-                u16::try_from(r.x).unwrap_or(0),
-                u16::try_from(r.y).unwrap_or(0),
-                r.width,
-                r.height,
-                count,
-            );
-        });
+        let _dropped = emit_window_event_to_state_with_receive(
+            state,
+            window,
+            0x0000_8000,
+            &expose_batch,
+            |buf, seq, order| {
+                x11::encode_expose_event(
+                    buf,
+                    seq,
+                    order,
+                    window,
+                    u16::try_from(r.x).unwrap_or(0),
+                    u16::try_from(r.y).unwrap_or(0),
+                    r.width,
+                    r.height,
+                    count,
+                );
+            },
+        );
     }
 }
 
@@ -560,13 +571,26 @@ pub(super) fn handle_reparent_window(
         } else {
             Vec::new()
         };
-        let _dropped = emit_window_event_to_state(state, window, 0x0002_0000, |buf, seq, order| {
-            x11::encode_unmap_notify_event(buf, seq, order, window, window, false);
-        });
-        let _dropped =
-            emit_window_event_to_state(state, old_parent, 0x0008_0000, |buf, seq, order| {
+        let unmap_description = [EventDescription::core(18)];
+        let unmap_batch = EventBatch::new(&unmap_description);
+        let _dropped = emit_window_event_to_state_with_receive(
+            state,
+            window,
+            0x0002_0000,
+            &unmap_batch,
+            |buf, seq, order| {
+                x11::encode_unmap_notify_event(buf, seq, order, window, window, false);
+            },
+        );
+        let _dropped = emit_window_event_to_state_with_receive(
+            state,
+            old_parent,
+            0x0008_0000,
+            &unmap_batch,
+            |buf, seq, order| {
                 x11::encode_unmap_notify_event(buf, seq, order, old_parent, window, false);
-            });
+            },
+        );
         if let Some(w) = state.resources.window_mut(window) {
             w.map_state = MapState::Unmapped;
         }
@@ -741,51 +765,83 @@ pub(super) fn handle_reparent_window(
     if unmapped_host.is_some() {
         reapply_redirect_mode_after_map(state, backend, origin, window);
     }
-    let _dropped = fanout_event_to_clients(state, &on_window, |buf, seq, order| {
-        x11::encode_reparent_notify_event(
-            buf,
-            seq,
-            order,
-            window,
-            window,
-            new_parent,
-            rx,
-            ry,
-            override_redirect,
-        );
-    });
-    let _dropped = fanout_event_to_clients(state, &on_old_parent, |buf, seq, order| {
-        x11::encode_reparent_notify_event(
-            buf,
-            seq,
-            order,
-            old_parent,
-            window,
-            new_parent,
-            rx,
-            ry,
-            override_redirect,
-        );
-    });
-    let _dropped = fanout_event_to_clients(state, &on_new_parent, |buf, seq, order| {
-        x11::encode_reparent_notify_event(
-            buf,
-            seq,
-            order,
-            new_parent,
-            window,
-            new_parent,
-            rx,
-            ry,
-            override_redirect,
-        );
-    });
+    let reparent_description = [EventDescription::core(21)];
+    let reparent_batch = EventBatch::new(&reparent_description);
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &on_window,
+        crate::access::EventSubject::Window(window),
+        &reparent_batch,
+        |buf, seq, order| {
+            x11::encode_reparent_notify_event(
+                buf,
+                seq,
+                order,
+                window,
+                window,
+                new_parent,
+                rx,
+                ry,
+                override_redirect,
+            );
+        },
+    );
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &on_old_parent,
+        crate::access::EventSubject::Window(old_parent),
+        &reparent_batch,
+        |buf, seq, order| {
+            x11::encode_reparent_notify_event(
+                buf,
+                seq,
+                order,
+                old_parent,
+                window,
+                new_parent,
+                rx,
+                ry,
+                override_redirect,
+            );
+        },
+    );
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &on_new_parent,
+        crate::access::EventSubject::Window(new_parent),
+        &reparent_batch,
+        |buf, seq, order| {
+            x11::encode_reparent_notify_event(
+                buf,
+                seq,
+                order,
+                new_parent,
+                window,
+                new_parent,
+                rx,
+                ry,
+                override_redirect,
+            );
+        },
+    );
     if let Some((_, _, override_redirect)) = unmapped {
-        let _dropped = emit_window_event_to_state(state, window, 0x0002_0000, |buf, seq, order| {
-            x11::encode_map_notify_event(buf, seq, order, window, window, override_redirect);
-        });
-        let _dropped =
-            emit_window_event_to_state(state, new_parent, 0x0008_0000, |buf, seq, order| {
+        let map_description = [EventDescription::core(19)];
+        let map_batch = EventBatch::new(&map_description);
+        let _dropped = emit_window_event_to_state_with_receive(
+            state,
+            window,
+            0x0002_0000,
+            &map_batch,
+            |buf, seq, order| {
+                x11::encode_map_notify_event(buf, seq, order, window, window, override_redirect);
+            },
+        );
+        let _dropped = emit_window_event_to_state_with_receive(
+            state,
+            new_parent,
+            0x0008_0000,
+            &map_batch,
+            |buf, seq, order| {
                 x11::encode_map_notify_event(
                     buf,
                     seq,
@@ -794,7 +850,8 @@ pub(super) fn handle_reparent_window(
                     window,
                     override_redirect,
                 );
-            });
+            },
+        );
         // MapWindow exposes it in the new place, its background painted
         // there: the storage it kept is not what Xorg shows.
         for (w, region) in crate::core_loop::clip_list::subtree_clip_lists(state, window) {
@@ -1254,8 +1311,14 @@ pub(super) fn handle_create_window(
         let geometry_opt = state.resources.window(window_id).map(window_geometry);
         if let Some(geometry) = geometry_opt {
             let override_redir = request.override_redirect.unwrap_or(false);
-            let _dropped =
-                fanout_event_to_clients(state, &create_notify_targets, |buf, seq, order| {
+            let event_description = [EventDescription::core(16)];
+            let event_batch = EventBatch::new(&event_description);
+            let _dropped = fanout_event_to_clients_with_receive(
+                state,
+                &create_notify_targets,
+                crate::access::EventSubject::Window(parent),
+                &event_batch,
+                |buf, seq, order| {
                     x11::encode_create_notify_event(
                         buf,
                         seq,
@@ -1265,7 +1328,8 @@ pub(super) fn handle_create_window(
                         geometry,
                         override_redir,
                     );
-                });
+                },
+            );
         }
     }
     debug!("client {} #{} CreateWindow", client_id.0, sequence.0);
@@ -1966,6 +2030,8 @@ pub(crate) fn configure_window_apply(
         .resources
         .window(request.window)
         .map(|w| (w.parent, w.override_redirect));
+    // ResizeRedirect is selectable, but ConfigureWindow has no ResizeRequest
+    // emitter today; keep this site limited to its existing ConfigureRequest.
     let redirect_targets: Vec<ClientId> = if let Some((parent, false)) = pre {
         let requester_has = state
             .clients
@@ -1982,9 +2048,24 @@ pub(crate) fn configure_window_apply(
     };
     if !redirect_targets.is_empty() {
         let parent = pre.map(|(p, _)| p).unwrap_or(ROOT_WINDOW);
-        let _dropped = fanout_event_to_clients(state, &redirect_targets, |buf, seq, order| {
-            x11::encode_configure_request_event(buf, seq, order, parent, request.window, &request);
-        });
+        let description = [EventDescription::core(23)];
+        let batch = EventBatch::new(&description);
+        let _dropped = fanout_event_to_clients_with_receive(
+            state,
+            &redirect_targets,
+            EventSubject::Window(parent),
+            &batch,
+            |buf, seq, order| {
+                x11::encode_configure_request_event(
+                    buf,
+                    seq,
+                    order,
+                    parent,
+                    request.window,
+                    &request,
+                );
+            },
+        );
         return Ok(RequestOutcome::Handled);
     }
     crate::rootless::note_configure(state, &request, source);
@@ -2089,8 +2170,14 @@ pub(crate) fn configure_window_apply(
             // parent-relative coordinates while the native root child had
             // already moved.
             fire_present_configure_notify_for_window(state, window_id, geometry);
-            let _dropped =
-                emit_window_event_to_state(state, window_id, 0x0002_0000, |buf, seq, order| {
+            let configure_description = [EventDescription::core(22)];
+            let configure_batch = EventBatch::new(&configure_description);
+            let _dropped = emit_window_event_to_state_with_receive(
+                state,
+                window_id,
+                0x0002_0000,
+                &configure_batch,
+                |buf, seq, order| {
                     x11::encode_configure_notify_event(
                         buf,
                         seq,
@@ -2101,10 +2188,15 @@ pub(crate) fn configure_window_apply(
                         geometry,
                         override_redirect,
                     );
-                });
+                },
+            );
             if let Some(parent) = parent {
-                let _dropped =
-                    emit_window_event_to_state(state, parent, 0x0008_0000, |buf, seq, order| {
+                let _dropped = emit_window_event_to_state_with_receive(
+                    state,
+                    parent,
+                    0x0008_0000,
+                    &configure_batch,
+                    |buf, seq, order| {
                         x11::encode_configure_notify_event(
                             buf,
                             seq,
@@ -2115,7 +2207,8 @@ pub(crate) fn configure_window_apply(
                             geometry,
                             override_redirect,
                         );
-                    });
+                    },
+                );
             }
         }
         // X11 window gravity: resizing a window repositions its children
@@ -2195,14 +2288,26 @@ pub(crate) fn configure_window_apply(
         for (child, nx, ny) in moved {
             // GravityNotify → child (StructureNotify) and its parent
             // (SubstructureNotify), mirroring ConfigureNotify delivery.
-            let _dropped =
-                emit_window_event_to_state(state, child, 0x0002_0000, |buf, seq, order| {
+            let gravity_description = [EventDescription::core(24)];
+            let gravity_batch = EventBatch::new(&gravity_description);
+            let _dropped = emit_window_event_to_state_with_receive(
+                state,
+                child,
+                0x0002_0000,
+                &gravity_batch,
+                |buf, seq, order| {
                     x11::encode_gravity_notify_event(buf, seq, order, child, child, nx, ny);
-                });
-            let _dropped =
-                emit_window_event_to_state(state, window_id, 0x0008_0000, |buf, seq, order| {
+                },
+            );
+            let _dropped = emit_window_event_to_state_with_receive(
+                state,
+                window_id,
+                0x0008_0000,
+                &gravity_batch,
+                |buf, seq, order| {
                     x11::encode_gravity_notify_event(buf, seq, order, window_id, child, nx, ny);
-                });
+                },
+            );
         }
         // NOTE (Issue 2 — 2026-07-01): a pure move MUST NOT rotate the
         // redirected backing. picom glx holds a one-time `NameWindowPixmap`
@@ -2738,9 +2843,17 @@ pub(super) fn handle_map_window(
             "client {} MapWindow 0x{:x} -> MapRequest to WM",
             client_id.0, window.0
         );
-        let _dropped = fanout_event_to_clients(state, &redirect_targets, |buf, seq, order| {
-            x11::encode_map_request_event(buf, seq, order, parent, window);
-        });
+        let description = [EventDescription::core(20)];
+        let batch = EventBatch::new(&description);
+        let _dropped = fanout_event_to_clients_with_receive(
+            state,
+            &redirect_targets,
+            EventSubject::Window(parent),
+            &batch,
+            |buf, seq, order| {
+                x11::encode_map_request_event(buf, seq, order, parent, window);
+            },
+        );
         return Ok(RequestOutcome::Handled);
     }
 
@@ -2771,12 +2884,26 @@ pub(super) fn handle_map_window(
     }
 
     if let Some((parent, override_redir)) = map_info {
-        let _dropped = emit_window_event_to_state(state, window, 0x0002_0000, |buf, seq, order| {
-            x11::encode_map_notify_event(buf, seq, order, window, window, override_redir);
-        });
-        let _dropped = emit_window_event_to_state(state, parent, 0x0008_0000, |buf, seq, order| {
-            x11::encode_map_notify_event(buf, seq, order, parent, window, override_redir);
-        });
+        let map_description = [EventDescription::core(19)];
+        let map_batch = EventBatch::new(&map_description);
+        let _dropped = emit_window_event_to_state_with_receive(
+            state,
+            window,
+            0x0002_0000,
+            &map_batch,
+            |buf, seq, order| {
+                x11::encode_map_notify_event(buf, seq, order, window, window, override_redir);
+            },
+        );
+        let _dropped = emit_window_event_to_state_with_receive(
+            state,
+            parent,
+            0x0008_0000,
+            &map_batch,
+            |buf, seq, order| {
+                x11::encode_map_notify_event(buf, seq, order, parent, window, override_redir);
+            },
+        );
         // Emit VisibilityNotify(Unobscured) then Expose on the window
         // itself when it becomes viewable. Subscribed clients want the
         // newly-viewable window to redraw.
@@ -2796,10 +2923,17 @@ pub(super) fn handle_map_window(
             // that. (We never send Obscured: a composited top-level is
             // always paintable, and unmap is signalled by UnmapNotify
             // per spec, not VisibilityNotify.)
-            let _dropped =
-                emit_window_event_to_state(state, window, 0x0001_0000, |buf, seq, order| {
+            let visibility_description = [EventDescription::core(15)];
+            let visibility_batch = EventBatch::new(&visibility_description);
+            let _dropped = emit_window_event_to_state_with_receive(
+                state,
+                window,
+                0x0001_0000,
+                &visibility_batch,
+                |buf, seq, order| {
                     x11::encode_visibility_notify_event(buf, seq, order, window, 0);
-                });
+                },
+            );
             // Descendants that were MapWindow'd while this window was
             // still unmapped were Unviewable; mapping this window
             // transitions them to Viewable. Xorg fires
@@ -2902,6 +3036,8 @@ pub(super) fn map_subwindows_with_delta(
         .copied()
         .collect();
     let mut newly_viewable = Vec::new();
+    let map_description = [EventDescription::core(19)];
+    let map_batch = EventBatch::new(&map_description);
     for child in children {
         if super::validate_resource_access(
             state,
@@ -2937,14 +3073,24 @@ pub(super) fn map_subwindows_with_delta(
             reapply_redirect_mode_after_map(state, backend, origin, child);
         }
         if was_unmapped {
-            let _dropped =
-                emit_window_event_to_state(state, child, 0x0002_0000, |buf, seq, order| {
+            let _dropped = emit_window_event_to_state_with_receive(
+                state,
+                child,
+                0x0002_0000,
+                &map_batch,
+                |buf, seq, order| {
                     x11::encode_map_notify_event(buf, seq, order, child, child, override_redirect);
-                });
-            let _dropped =
-                emit_window_event_to_state(state, parent, 0x0008_0000, |buf, seq, order| {
+                },
+            );
+            let _dropped = emit_window_event_to_state_with_receive(
+                state,
+                parent,
+                0x0008_0000,
+                &map_batch,
+                |buf, seq, order| {
                     x11::encode_map_notify_event(buf, seq, order, parent, child, override_redirect);
-                });
+                },
+            );
         }
         // Only a child now Viewable (its parent mapped too) is exposed,
         // with the descendants that mapping it promoted to Viewable.
@@ -3073,12 +3219,26 @@ pub(super) fn unmap_window(
         }
     }
     if was_mapped {
-        let _dropped = emit_window_event_to_state(state, window, 0x0002_0000, |buf, seq, order| {
-            x11::encode_unmap_notify_event(buf, seq, order, window, window, from_configure);
-        });
-        let _dropped = emit_window_event_to_state(state, parent, 0x0008_0000, |buf, seq, order| {
-            x11::encode_unmap_notify_event(buf, seq, order, parent, window, from_configure);
-        });
+        let unmap_description = [EventDescription::core(18)];
+        let unmap_batch = EventBatch::new(&unmap_description);
+        let _dropped = emit_window_event_to_state_with_receive(
+            state,
+            window,
+            0x0002_0000,
+            &unmap_batch,
+            |buf, seq, order| {
+                x11::encode_unmap_notify_event(buf, seq, order, window, window, from_configure);
+            },
+        );
+        let _dropped = emit_window_event_to_state_with_receive(
+            state,
+            parent,
+            0x0008_0000,
+            &unmap_batch,
+            |buf, seq, order| {
+                x11::encode_unmap_notify_event(buf, seq, order, parent, window, from_configure);
+            },
+        );
         // What it covered is exposed: its parent's and lower
         // siblings' backgrounds painted there, and Expose sent
         // (`UnmapWindow`, `dix/window.c:2856-2866`). From a configure the
@@ -3245,17 +3405,31 @@ pub(super) fn unmap_subwindows_with_delta(
             pending.push(PendingUnmap { child, host_xid });
         }
     }
+    let unmap_description = [EventDescription::core(18)];
+    let unmap_batch = EventBatch::new(&unmap_description);
     for item in pending {
         if let Some(xid) = item.host_xid {
             let _ = backend.unmap_subwindow(origin, xid.as_raw());
         }
         let child = item.child;
-        let _dropped = emit_window_event_to_state(state, child, 0x0002_0000, |buf, seq, order| {
-            x11::encode_unmap_notify_event(buf, seq, order, child, child, false);
-        });
-        let _dropped = emit_window_event_to_state(state, parent, 0x0008_0000, |buf, seq, order| {
-            x11::encode_unmap_notify_event(buf, seq, order, parent, child, false);
-        });
+        let _dropped = emit_window_event_to_state_with_receive(
+            state,
+            child,
+            0x0002_0000,
+            &unmap_batch,
+            |buf, seq, order| {
+                x11::encode_unmap_notify_event(buf, seq, order, child, child, false);
+            },
+        );
+        let _dropped = emit_window_event_to_state_with_receive(
+            state,
+            parent,
+            0x0008_0000,
+            &unmap_batch,
+            |buf, seq, order| {
+                x11::encode_unmap_notify_event(buf, seq, order, parent, child, false);
+            },
+        );
     }
     // Xorg frees each redirect pixmap at unrealize (`compwindow.c:291`).
     apply_viewability_delta_to_redirects(state, backend, origin, &delta);
@@ -3444,10 +3618,19 @@ pub(super) fn handle_circulate_window(
         .into_iter()
         .find(|c| *c != client_id);
     if let Some(target) = redirect_target {
-        let _dropped = fanout_event_to_clients(state, &[target], |buf, seq, order| {
-            let _ =
-                x11::write_circulate_request_event(buf, order, seq, container, child, direction);
-        });
+        let description = [EventDescription::core(27)];
+        let batch = EventBatch::new(&description);
+        let _dropped = fanout_event_to_clients_with_receive(
+            state,
+            &[target],
+            EventSubject::Window(container),
+            &batch,
+            |buf, seq, order| {
+                let _ = x11::write_circulate_request_event(
+                    buf, order, seq, container, child, direction,
+                );
+            },
+        );
     } else {
         let tree_change = crate::core_loop::clip_list::TreeChange::begin(state, child, None);
         state.resources.circulate_child(child, direction == 0);
@@ -3470,14 +3653,27 @@ pub(super) fn handle_circulate_window(
         // CirculateNotify to the window's StructureNotify and the parent's
         // SubstructureNotify selectors, each with its own event window; the
         // place (OnTop 0 / OnBottom 1) equals the direction.
-        let _dropped = emit_window_event_to_state(state, child, 0x0002_0000, |buf, seq, order| {
-            let _ = x11::write_circulate_notify_event(buf, order, seq, child, child, direction);
-        });
-        let _dropped =
-            emit_window_event_to_state(state, container, 0x0008_0000, |buf, seq, order| {
+        let circulate_description = [EventDescription::core(26)];
+        let circulate_batch = EventBatch::new(&circulate_description);
+        let _dropped = emit_window_event_to_state_with_receive(
+            state,
+            child,
+            0x0002_0000,
+            &circulate_batch,
+            |buf, seq, order| {
+                let _ = x11::write_circulate_notify_event(buf, order, seq, child, child, direction);
+            },
+        );
+        let _dropped = emit_window_event_to_state_with_receive(
+            state,
+            container,
+            0x0008_0000,
+            &circulate_batch,
+            |buf, seq, order| {
                 let _ =
                     x11::write_circulate_notify_event(buf, order, seq, container, child, direction);
-            });
+            },
+        );
         // Then ReflectStackChange validates and exposes (`dix/window.c:2149-2176`).
         if let Some(change) = tree_change {
             send_exposures(state, backend, None, change.exposed(state, None), None);

@@ -1,7 +1,7 @@
 use super::*;
 use crate::access::{
     AccessContext, AccessMode, AccessPolicy, Decision, DenyError, EventBatch, EventDescription,
-    EventSubject, RequestOpcodes, ResourceTarget,
+    EventSubject, RequestOpcodes, ResourceKind, ResourceTarget,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -186,7 +186,12 @@ impl RecordingExtensionPolicy {
             request: ctx.request(),
             peer: ctx.peer(client).copied(),
             admission: ctx.admission(client).cloned(),
-            owner: target.and_then(|target| ctx.owner(target.id, target.kind)),
+            owner: target
+                .and_then(|target| ctx.owner(target.id, target.kind))
+                .or_else(|| match receive {
+                    Some(EventSubject::Window(window)) => ctx.owner(window, ResourceKind::Window),
+                    _ => None,
+                }),
             target_owner: target.and_then(|target| ctx.target_owner(&target)),
             target,
             property,

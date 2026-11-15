@@ -6,9 +6,10 @@ use std::{collections::HashSet, io};
 use yserver_protocol::x11::{self, ClientId, ResourceId, xfixes::SELECTION_NOTIFY_WINDOW_DESTROY};
 
 use crate::{
+    access::{EventBatch, EventDescription, EventSubject},
     backend::{Backend, OriginContext},
     core_loop::{
-        fanout::{fanout_event_to_clients, subscribers_by_id},
+        fanout::{fanout_event_to_clients_with_receive, subscribers_by_id},
         process_request::{
             focus_pointer::revert_core_focus_from,
             grabs::{deactivate_core_keyboard_grab, deactivate_core_pointer_grab},
@@ -25,6 +26,9 @@ use crate::{
     resources::{COMPOSITE_OVERLAY_WINDOW, MapState, PreparedDestroy, ROOT_WINDOW},
     server::ServerState,
 };
+
+const UNMAP_NOTIFY_EVENTS: EventBatch<'static> = EventBatch::new(&[EventDescription::core(18)]);
+const DESTROY_NOTIFY_EVENTS: EventBatch<'static> = EventBatch::new(&[EventDescription::core(17)]);
 
 /// What one executed plan destroyed, for the caller's cleanup that is not
 /// window-scoped.
@@ -87,12 +91,24 @@ pub(crate) fn execute_destroy(
     if top_map_state != MapState::Unmapped {
         let top_entry = captured.last().expect("a plan has its top window");
         let parent = top_entry.parent;
-        let _dropped = fanout_event_to_clients(state, &top_entry.on_window, |buf, seq, order| {
-            x11::encode_unmap_notify_event(buf, seq, order, top, top, false);
-        });
-        let _dropped = fanout_event_to_clients(state, &top_entry.on_parent, |buf, seq, order| {
-            x11::encode_unmap_notify_event(buf, seq, order, parent, top, false);
-        });
+        let _dropped = fanout_event_to_clients_with_receive(
+            state,
+            &top_entry.on_window,
+            EventSubject::Window(top),
+            &UNMAP_NOTIFY_EVENTS,
+            |buf, seq, order| {
+                x11::encode_unmap_notify_event(buf, seq, order, top, top, false);
+            },
+        );
+        let _dropped = fanout_event_to_clients_with_receive(
+            state,
+            &top_entry.on_parent,
+            EventSubject::Window(parent),
+            &UNMAP_NOTIFY_EVENTS,
+            |buf, seq, order| {
+                x11::encode_unmap_notify_event(buf, seq, order, parent, top, false);
+            },
+        );
         let realized = top_map_state == MapState::Viewable;
         let clips_before = if realized {
             crate::core_loop::clip_list::clip_entries_under(state, top)
@@ -125,12 +141,24 @@ pub(crate) fn execute_destroy(
     // `FreeWindowResources` (`:994-1018`).
     for entry in &captured {
         let (window, parent) = (entry.window, entry.parent);
-        let _dropped = fanout_event_to_clients(state, &entry.on_window, |buf, seq, order| {
-            x11::encode_destroy_notify_event(buf, seq, order, window, window);
-        });
-        let _dropped = fanout_event_to_clients(state, &entry.on_parent, |buf, seq, order| {
-            x11::encode_destroy_notify_event(buf, seq, order, parent, window);
-        });
+        let _dropped = fanout_event_to_clients_with_receive(
+            state,
+            &entry.on_window,
+            EventSubject::Window(window),
+            &DESTROY_NOTIFY_EVENTS,
+            |buf, seq, order| {
+                x11::encode_destroy_notify_event(buf, seq, order, window, window);
+            },
+        );
+        let _dropped = fanout_event_to_clients_with_receive(
+            state,
+            &entry.on_parent,
+            EventSubject::Window(parent),
+            &DESTROY_NOTIFY_EVENTS,
+            |buf, seq, order| {
+                x11::encode_destroy_notify_event(buf, seq, order, parent, window);
+            },
+        );
         // CrushTree's `FreeResource(id, RT_WINDOW)` (`:1043`) frees the
         // inferior's other same-id resources before `FreeWindowResources`.
         drop_xfixes_selection_inputs_on(state, window);

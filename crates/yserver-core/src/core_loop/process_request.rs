@@ -301,6 +301,35 @@ pub fn process_request(
     body: &[u8],
     attached_fd: Option<OwnedFd>,
 ) -> io::Result<RequestOutcome> {
+    let previous_receive_request = state.receive_request;
+    state.receive_request = Some(RequestOpcodes::for_request(header));
+    let result = process_request_inner(
+        state,
+        backend,
+        client_id,
+        sequence,
+        header,
+        body,
+        attached_fd,
+    );
+    state.receive_request = previous_receive_request;
+    result
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "attached_fd is moved into the segment table on AttachFd; \
+              passing by value keeps the OwnedFd ownership story simple"
+)]
+fn process_request_inner(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+    attached_fd: Option<OwnedFd>,
+) -> io::Result<RequestOutcome> {
     let origin = Some(OriginContext {
         client_id,
         nested_seq: sequence.0,

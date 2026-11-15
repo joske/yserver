@@ -24,6 +24,7 @@ use std::{
 use yserver_protocol::x11::{self, ClientByteOrder, ClientId, ResourceId, SequenceNumber};
 
 use crate::{
+    access::{Decision, EventBatch, EventDescription, EventSubject},
     core_loop::client_io::{self, WriteOutcome},
     host_x11::{HostExposeEvent, HostXidMap},
     resources::{MapState, ROOT_WINDOW},
@@ -274,10 +275,47 @@ pub fn fanout_event_to_clients<F>(
 where
     F: Fn(&mut Vec<u8>, SequenceNumber, ClientByteOrder),
 {
+    fanout_event_to_clients_inner(state, client_ids, None, encode)
+}
+
+/// Fan out a described core notification, checking each existing recipient
+/// before encoding or buffering that recipient's event.
+pub(crate) fn fanout_event_to_clients_with_receive<F>(
+    state: &mut ServerState,
+    client_ids: &[ClientId],
+    subject: EventSubject,
+    events: &EventBatch<'_>,
+    encode: F,
+) -> Vec<ClientId>
+where
+    F: Fn(&mut Vec<u8>, SequenceNumber, ClientByteOrder),
+{
+    fanout_event_to_clients_inner(state, client_ids, Some((subject, events)), encode)
+}
+
+fn fanout_event_to_clients_inner<F>(
+    state: &mut ServerState,
+    client_ids: &[ClientId],
+    receive: Option<(EventSubject, &EventBatch<'_>)>,
+    encode: F,
+) -> Vec<ClientId>
+where
+    F: Fn(&mut Vec<u8>, SequenceNumber, ClientByteOrder),
+{
     let mut disconnected = Vec::new();
     let mut seen = HashSet::new();
+    let receive_request = state.receive_request;
+    let receive = receive.filter(|_| state.policies_installed());
     for cid in client_ids {
         if !seen.insert(cid.0) {
+            continue;
+        }
+        if receive.is_some() && !state.clients.contains_key(&cid.0) {
+            continue;
+        }
+        if let Some((subject, events)) = receive
+            && let Decision::Deny(_) = state.check_receive(*cid, subject, events, receive_request)
+        {
             continue;
         }
         let Some(client) = state.clients.get_mut(&cid.0) else {
@@ -318,6 +356,31 @@ where
         return Vec::new();
     }
     fanout_event_to_clients(state, &targets, encode)
+}
+
+/// Emit a described core notification to the current subscribers of a window
+/// and apply Receive separately for each recipient through the shared fanout.
+pub(crate) fn emit_window_event_to_state_with_receive<F>(
+    state: &mut ServerState,
+    window: ResourceId,
+    mask_bits: u32,
+    events: &EventBatch<'_>,
+    encode: F,
+) -> Vec<ClientId>
+where
+    F: Fn(&mut Vec<u8>, SequenceNumber, ClientByteOrder),
+{
+    let targets = subscribers_by_id(state, window, mask_bits);
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    fanout_event_to_clients_with_receive(
+        state,
+        &targets,
+        EventSubject::Window(window),
+        events,
+        encode,
+    )
 }
 
 /// State-borrowing replacement for `nested::emit_xi2_focus_event`.
@@ -534,12 +597,19 @@ pub fn expose_event_fanout_to_state(
     let Some(window) = xid_map.get(&ev.host_xid).copied() else {
         return Vec::new();
     };
-    let mut dropped =
-        emit_window_event_to_state(state, window, EXPOSURE_MASK_BIT, |buf, seq, order| {
+    let expose_description = [EventDescription::core(12)];
+    let expose_batch = EventBatch::new(&expose_description);
+    let mut dropped = emit_window_event_to_state_with_receive(
+        state,
+        window,
+        EXPOSURE_MASK_BIT,
+        &expose_batch,
+        |buf, seq, order| {
             x11::encode_expose_event(
                 buf, seq, order, window, ev.x, ev.y, ev.width, ev.height, ev.count,
             );
-        });
+        },
+    );
     if window == ROOT_WINDOW {
         return dropped;
     }
@@ -552,10 +622,11 @@ pub fn expose_event_fanout_to_state(
     );
     for rect in exposed {
         let target_window = rect.window;
-        let more = emit_window_event_to_state(
+        let more = emit_window_event_to_state_with_receive(
             state,
             target_window,
             EXPOSURE_MASK_BIT,
+            &expose_batch,
             |buf, seq, order| {
                 x11::encode_expose_event(
                     buf,
@@ -589,6 +660,8 @@ pub fn emit_visibility_unobscured_subtree_to_state(
     root: ResourceId,
 ) -> Vec<ClientId> {
     let mut dropped = Vec::new();
+    let visibility_description = [EventDescription::core(15)];
+    let visibility_batch = EventBatch::new(&visibility_description);
     let children: Vec<ResourceId> = state.resources.children(root).to_vec();
     for child in children {
         let viewable = state
@@ -597,10 +670,11 @@ pub fn emit_visibility_unobscured_subtree_to_state(
             .is_some_and(|w| w.map_state == MapState::Viewable);
         if viewable {
             let target = child;
-            let more = emit_window_event_to_state(
+            let more = emit_window_event_to_state_with_receive(
                 state,
                 target,
                 VISIBILITY_MASK_BIT,
+                &visibility_batch,
                 |buf, seq, order| {
                     x11::encode_visibility_notify_event(buf, seq, order, target, 0);
                 },
@@ -639,13 +713,52 @@ pub fn fanout_raw_event_to_clients(
     event: &[u8; 32],
     template_byte_order: ClientByteOrder,
 ) -> Vec<ClientId> {
+    fanout_raw_event_to_clients_inner(state, client_ids, event, template_byte_order, None)
+}
+
+/// Fan out a raw core event after checking each recipient against its typed
+/// subject and event description.
+pub(crate) fn fanout_raw_event_to_clients_with_receive(
+    state: &mut ServerState,
+    client_ids: &[ClientId],
+    subject: EventSubject,
+    events: &EventBatch<'_>,
+    event: &[u8; 32],
+    template_byte_order: ClientByteOrder,
+) -> Vec<ClientId> {
+    fanout_raw_event_to_clients_inner(
+        state,
+        client_ids,
+        event,
+        template_byte_order,
+        Some((subject, events)),
+    )
+}
+
+fn fanout_raw_event_to_clients_inner(
+    state: &mut ServerState,
+    client_ids: &[ClientId],
+    event: &[u8; 32],
+    template_byte_order: ClientByteOrder,
+    receive: Option<(EventSubject, &EventBatch<'_>)>,
+) -> Vec<ClientId> {
     use yserver_protocol::x11::wire_swap;
     let mut disconnected = Vec::new();
     let mut seen = HashSet::new();
+    let receive_request = state.receive_request;
+    let receive = receive.filter(|_| state.policies_installed());
     let event_type = event[0] & 0x7f;
     let entries = wire_swap::core_event_swap_table(event_type);
     for cid in client_ids {
         if !seen.insert(cid.0) {
+            continue;
+        }
+        if receive.is_some() && !state.clients.contains_key(&cid.0) {
+            continue;
+        }
+        if let Some((subject, events)) = receive
+            && let Decision::Deny(_) = state.check_receive(*cid, subject, events, receive_request)
+        {
             continue;
         }
         let Some(client) = state.clients.get_mut(&cid.0) else {

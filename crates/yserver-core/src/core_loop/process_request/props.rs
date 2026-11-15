@@ -2,7 +2,7 @@ use crate::{
     access::{AccessMode, Decision, RequestOpcodes, ResourceKind, ResourceTarget},
     backend::{Backend, OriginContext},
     core_loop::{
-        fanout::{emit_window_event_to_state, fanout_event_to_clients},
+        fanout::fanout_event_to_clients,
         process_request::{
             RequestOutcome, XI2_FIRST_ERROR, XI2_MAJOR_OPCODE, emit_x11_error,
             emit_x11_error_with_minor, write_to_client,
@@ -1198,10 +1198,13 @@ fn emit_property_notify(
     deleted: bool,
 ) {
     let timestamp = state.timestamp_now();
-    let _dropped = emit_window_event_to_state(
+    let events = [crate::access::EventDescription::core(28)];
+    let batch = crate::access::EventBatch::new(&events);
+    let _dropped = crate::core_loop::fanout::emit_window_event_to_state_with_receive(
         state,
         window,
         0x0040_0000, // PropertyChangeMask
+        &batch,
         |buf, seq, order| {
             x11::encode_property_notify_event(
                 buf, seq, order, window, property, timestamp, deleted,
