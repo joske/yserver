@@ -503,6 +503,20 @@ fn buffered_property_output(allow_policy: bool) -> Vec<u8> {
             )
         };
         assert_eq!(result, 0, "set small sender buffer");
+        // FreeBSD AF_UNIX streams are bounded by the peer's receive buffer,
+        // not by SO_SNDBUF, so shrink that too (as `client_io`'s tests do).
+        let peer = &fixture.peers[&NOTIFY_RECEIVER_ALLOWED.0];
+        // SAFETY: setsockopt reads the live integer for the peer's SO_RCVBUF.
+        let result = unsafe {
+            libc::setsockopt(
+                peer.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                std::ptr::addr_of!(send_buffer).cast(),
+                std::mem::size_of_val(&send_buffer) as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0, "set small receiver buffer");
     }
     {
         let client = fixture
