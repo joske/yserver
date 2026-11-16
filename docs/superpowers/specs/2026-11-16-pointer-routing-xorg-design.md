@@ -15,29 +15,49 @@ Reference: Xorg is cited as `../xserver` at tag xorg-server-21.1.24.
 
 ## Goals
 
-1. **Owner-events grab, XI2 natural delivery.** With an active grab that has
-   `owner_events` set, natural delivery may go only to the grab client. If the
-   walk meets a window where another client selected the event, the walk
-   stops there (Xorg `TryClientEvents` returns -1 for a non-owner,
-   `dix/events.c:2071-2075`, `:2924-2927`) and the event goes to the grab
-   window instead (`:4458-4461`). Today `pointer_fanout.rs:1894-1897` keeps
-   every natural XI2 selector in `xi2_targets`: with A grabbing with
-   owner_events and B selecting `XI_Motion` on the window under the pointer, B
-   receives motion and buttons; under Xorg B receives nothing.
+Routing contract for goals 1-3 (mirrors `DeliverDeviceEvents`,
+`../xserver/dix/events.c:2895-2930`, and grab delivery, `:4354-4462`):
+
+- **Per device form.** The slave event and its master copy are delivered in
+  separate passes (`../xserver/mi/mieq.c:484-508`); each pass uses that
+  device's own grab (`../xserver/Xi/exevents.c:1901,1942-1951`). An ungrabbed
+  form keeps normal delivery: with an XIGrabDevice on master 2 and no slave
+  grab, a client selecting slave-4 XI_Motion still receives the slave form.
+  The owner-only rule never applies a master grab to the slave form or the
+  reverse.
+- **Per window, in Xorg's order.** On each window of the natural walk try XI2,
+  then XI1, then core. Within one attempt the grab owner is delivered to and
+  every other selector is rejected (`:2279-2313`, `TryClientEvents` -1 for a
+  non-owner, `:2071-2075`). A rejected XI2 attempt does not end the window:
+  XI1 and core are still tried there. A positive delivery ends the walk.
+  Propagation stops at the window when its final result is non-zero
+  (`:2924-2927`), so a window where only foreign clients selected blocks the
+  walk.
+- **Fallback.** When the natural walk delivers nothing, the event goes to the
+  grab window if the grab's mask selects it (`:4431-4462`).
+
+1. **Owner-events grab, XI2 natural delivery.** Today
+   `pointer_fanout.rs:1894-1897` keeps every natural XI2 selector in
+   `xi2_targets` under an owner-events grab: with A grabbing master 2 with
+   owner_events and B selecting master `XI_Motion`, `XI_ButtonPress` and
+   `XI_ButtonRelease` on the window under the pointer, B receives those
+   events; under Xorg B receives none of the master form. Apply the contract.
 2. **The same rule on the smooth-scroll Motion path** (`pointer_fanout.rs`
    ~2097-2113), which builds its own natural target list.
 3. **Core owner-events walk.** `grabbed_natural_target` already stops at a
-   foreign core selection and falls back to the grab window. It must also stop
-   at a window where another client holds a matching XI2 selection, as Xorg's
-   per-window XI2→XI1→core order does.
+   foreign core selection and falls back to the grab window. It must also
+   treat a window where another client holds a matching master-form XI2
+   selection as a rejected attempt, then still try core on that window
+   (A's own core selection there is delivered). A slave-only XI2 selection
+   does not block the core walk (`fanout.rs:147-159`).
 4. **XI1 `MORE_EVENTS`.** `encode_xi1_device_input_event` writes
    `deviceid & 0x7f` (`xinput/mod.rs` ~1392) and clears the bit the caller set
    when a DeviceValuator follows; Xorg keeps it (`dix/eventconvert.c:369-370`).
    Keep the bit.
 
-Every expected result in goals 1-3 comes from a measured Xorg run (see
-Evidence), or, where a case cannot be measured, from a cited `../xserver` line.
-No expected result comes from reasoning alone.
+Every expected result in goals 1 and 3 comes from a measured Xorg run (see
+Evidence). Goal 2 is source-backed (see Evidence: scroll). No expected result
+comes from reasoning alone.
 
 ## Must keep (regression cases these paths came from)
 
@@ -89,9 +109,18 @@ No expected result comes from reasoning alone.
   (c) a window owned by the grab client outside the grab window; the same for
   a core GrabPointer with owner_events and a foreign XI2 selector below; the
   core implicit grab (XFCE case); slave + master XI2 selections (E27 case);
-  smooth-scroll motion under an owner-events grab; an XI1 motion with
-  valuators beyond the first event (`MORE_EVENTS`).
-- **Existing tests** that pin today's owner-events behaviour change their
+  an XI1 motion with valuators beyond the first event (`MORE_EVENTS`). Each
+  case names the grabbed device, the selected device and the event types.
+- **Scroll is source-backed.** Xvfb/XTest has no scroll-capable source (the
+  XTest pointer and the vfb mouse have only X/Y axes,
+  `../xserver/Xext/xtest.c:620-622`, `../xserver/hw/vfb/InitInput.c:81-107`;
+  smooth-scroll Motion needs a scroll axis, `../xserver/dix/getevents.c:1646-1692`).
+  Goal 2's expected results are derived from the same contract as goal 1 with
+  the cited lines; its yserver test injects through a registered
+  `PhysicalPointer` with a scroll class, the production scroll input path
+  (`pointer_source_has_scroll_class`). Pinned scroll expectations change only
+  with such a citation. The hardware smoke covers real wheel scrolling.
+- **Existing tests** (except scroll, above) that pin today's owner-events behaviour change their
   expected values only where the Xorg measurement gives a different answer;
   the PR lists each changed expectation with its measured case.
 - **Hardware smoke** (user's machine, his permission, he watches): Steam
