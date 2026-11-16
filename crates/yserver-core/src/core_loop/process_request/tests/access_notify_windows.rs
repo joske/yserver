@@ -91,6 +91,156 @@ fn literal_expose(
     bytes
 }
 
+fn literal_visibility_notify(
+    order: ClientByteOrder,
+    sequence: u16,
+    window: ResourceId,
+    state: u8,
+) -> Vec<u8> {
+    let mut event = literal_event_header(15, 0, sequence, order);
+    append_event_u32(&mut event, order, window.0);
+    event.push(state);
+    finish_literal_event(event)
+}
+
+fn literal_structure_frame(
+    request: StructureRequest,
+    delivery: StructureDelivery,
+    reparent_position: (i16, i16),
+    sequence: u16,
+    order: ClientByteOrder,
+) -> Vec<u8> {
+    let mut event = literal_event_header(delivery.event_type, 0, sequence, order);
+    match delivery.event_type {
+        16 => {
+            append_event_u32(&mut event, order, delivery.delivery_window.0);
+            append_event_u32(&mut event, order, delivery.affected_window.0);
+            append_event_u16(&mut event, order, 5);
+            append_event_u16(&mut event, order, 6);
+            append_event_u16(&mut event, order, 10);
+            append_event_u16(&mut event, order, 11);
+            append_event_u16(&mut event, order, 0);
+            event.push(0);
+        }
+        18 => {
+            append_event_u32(&mut event, order, delivery.delivery_window.0);
+            append_event_u32(&mut event, order, delivery.affected_window.0);
+            event.push(0); // from_configure
+        }
+        19 => {
+            append_event_u32(&mut event, order, delivery.delivery_window.0);
+            append_event_u32(&mut event, order, delivery.affected_window.0);
+            event.push(0); // override_redirect
+        }
+        21 => {
+            append_event_u32(&mut event, order, delivery.delivery_window.0);
+            append_event_u32(&mut event, order, delivery.affected_window.0);
+            append_event_u32(
+                &mut event,
+                order,
+                delivery.reparent.expect("ReparentNotify parent").0,
+            );
+            assert!(matches!(request, StructureRequest::Reparent));
+            let (x, y) = reparent_position;
+            event.extend_from_slice(&match order {
+                ClientByteOrder::LittleEndian => x.to_le_bytes(),
+                ClientByteOrder::BigEndian => x.to_be_bytes(),
+            });
+            event.extend_from_slice(&match order {
+                ClientByteOrder::LittleEndian => y.to_le_bytes(),
+                ClientByteOrder::BigEndian => y.to_be_bytes(),
+            });
+            event.push(0); // override_redirect
+        }
+        22 => {
+            append_event_u32(&mut event, order, delivery.delivery_window.0);
+            append_event_u32(&mut event, order, delivery.affected_window.0);
+            append_event_u32(&mut event, order, 0); // above_sibling
+            append_event_u16(&mut event, order, 7);
+            append_event_u16(&mut event, order, 6);
+            append_event_u16(&mut event, order, 10);
+            append_event_u16(&mut event, order, 11);
+            append_event_u16(&mut event, order, 0); // border_width
+            event.push(0); // override_redirect
+        }
+        26 => {
+            append_event_u32(&mut event, order, delivery.delivery_window.0);
+            append_event_u32(&mut event, order, delivery.affected_window.0);
+            event.push(0); // PlaceOnTop
+        }
+        event_type => panic!("unexpected structure event {event_type}"),
+    }
+    finish_literal_event(event)
+}
+
+fn literal_redirect_frame(case: RedirectCase, order: ClientByteOrder) -> Vec<u8> {
+    let mut event = literal_event_header(case.redirect_event, 0, 0x1234, order);
+    match case.redirect_event {
+        20 => {
+            append_event_u32(&mut event, order, PARENT_WINDOW.0);
+            append_event_u32(&mut event, order, CHILD_WINDOW.0);
+        }
+        23 => {
+            event[1] = 0; // stack_mode
+            append_event_u32(&mut event, order, PARENT_WINDOW.0);
+            append_event_u32(&mut event, order, CHILD_WINDOW.0);
+            append_event_u32(&mut event, order, 0); // sibling
+            append_event_u16(&mut event, order, 7);
+            append_event_u16(&mut event, order, 0);
+            append_event_u16(&mut event, order, 0); // width
+            append_event_u16(&mut event, order, 0); // height
+            append_event_u16(&mut event, order, 0); // border_width
+            append_event_u16(&mut event, order, 1); // value_mask: CWX
+        }
+        27 => {
+            event[1] = 0; // PlaceOnTop
+            append_event_u32(&mut event, order, PARENT_WINDOW.0);
+            append_event_u32(&mut event, order, CHILD_WINDOW.0);
+        }
+        event_type => panic!("unexpected redirect event {event_type}"),
+    }
+    finish_literal_event(event)
+}
+
+fn literal_ordinary_structure_frame(
+    case: RedirectCase,
+    event_type: u8,
+    event_window: ResourceId,
+    order: ClientByteOrder,
+    override_redirect: bool,
+) -> Vec<u8> {
+    let sequence = match order {
+        ClientByteOrder::LittleEndian => 0x5678,
+        ClientByteOrder::BigEndian => 0x1234,
+    };
+    let mut event = literal_event_header(event_type, 0, sequence, order);
+    match event_type {
+        19 => {
+            append_event_u32(&mut event, order, event_window.0);
+            append_event_u32(&mut event, order, CHILD_WINDOW.0);
+            event.push(u8::from(override_redirect));
+        }
+        22 => {
+            append_event_u32(&mut event, order, event_window.0);
+            append_event_u32(&mut event, order, CHILD_WINDOW.0);
+            append_event_u32(&mut event, order, 0);
+            append_event_u16(&mut event, order, 7);
+            append_event_u16(&mut event, order, 6);
+            append_event_u16(&mut event, order, 10);
+            append_event_u16(&mut event, order, 11);
+            append_event_u16(&mut event, order, 0);
+            event.push(0);
+        }
+        26 => {
+            append_event_u32(&mut event, order, event_window.0);
+            append_event_u32(&mut event, order, CHILD_WINDOW.0);
+            event.push(0);
+        }
+        other => panic!("unexpected ordinary event {other} for {}", case.name),
+    }
+    finish_literal_event(event)
+}
+
 fn expose_fields(bytes: &[u8]) -> Vec<(ResourceId, u16, u16, u16, u16, u16)> {
     bytes
         .chunks_exact(32)
@@ -187,7 +337,7 @@ struct StructureDelivery {
     reparent: Option<ResourceId>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StructureEvent {
     event_type: u8,
     sequence: u16,
@@ -214,6 +364,33 @@ struct StructureCase {
     opcode: u8,
     deny_window: ResourceId,
     deliveries: &'static [StructureDelivery],
+}
+
+fn literal_structure_events(
+    request: StructureRequest,
+    events: &[StructureEvent],
+    reparent_position: (i16, i16),
+    sequence: u16,
+    order: ClientByteOrder,
+) -> Vec<u8> {
+    events
+        .iter()
+        .flat_map(|event| {
+            literal_structure_frame(
+                request,
+                StructureDelivery {
+                    id: "expected frame",
+                    event_type: event.event_type,
+                    delivery_window: event.delivery_window,
+                    affected_window: event.affected_window,
+                    reparent: event.reparent,
+                },
+                reparent_position,
+                sequence,
+                order,
+            )
+        })
+        .collect()
 }
 
 fn structure_fixture(request: StructureRequest) -> NotifyFixture {
@@ -844,7 +1021,8 @@ fn receive_clear_area_expose_denial_keeps_paint() {
     }
 }
 
-// Mutations: describe Visibility as Expose, or prune the descendant walk after a root denial.
+// Mutations: change a no-policy VisibilityNotify byte or padding, describe it
+// as Expose, or prune the descendant walk after a root denial.
 #[test]
 fn receive_map_visibility_denial_keeps_descendant_walk() {
     fn fixture() -> NotifyFixture {
@@ -925,16 +1103,12 @@ fn receive_map_visibility_denial_keeps_descendant_walk() {
     assert!(matches!(map_parent(&mut baseline), RequestOutcome::Handled));
     let baseline_denied = baseline.drain(NOTIFY_RECEIVER_DENIED);
     let baseline_permitted = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
-    assert_eq!(baseline_denied.len(), 3 * 32);
+    let expected_visibility = [PARENT_WINDOW, CHILD_WINDOW, GRANDCHILD_WINDOW]
+        .into_iter()
+        .flat_map(|window| literal_visibility_notify(ClientByteOrder::LittleEndian, 0, window, 0))
+        .collect::<Vec<_>>();
+    assert_eq!(baseline_denied, expected_visibility);
     assert_eq!(baseline_permitted, baseline_denied);
-    assert_eq!(
-        visibility_fields(&baseline_permitted),
-        vec![
-            (PARENT_WINDOW, 0),
-            (CHILD_WINDOW, 0),
-            (GRANDCHILD_WINDOW, 0),
-        ]
-    );
 
     let mut allow = fixture();
     allow.install_policy(|_, _| Decision::Allow);
@@ -1199,7 +1373,7 @@ fn receive_expose_rectangles_keep_counts_and_collapse() {
     }
 }
 
-// Mutations: use W(affected child) for every delivery, suppress every event
+// Mutations: change any no-policy structure-frame field or padding, use W(affected child) for every delivery, suppress every event
 // for a denied client after its first denial, or describe the wrong core type
 // at any migrated N05–N12/N14–N17/N19–N20/N22–N27/N29–N30 emitter.
 #[test]
@@ -1506,29 +1680,57 @@ fn receive_structure_subject_is_delivery_window() {
                 reparent: delivery.reparent,
             })
             .collect();
-        let expected_no_policy_denied: Vec<_> = expected_allowed
+        let expected_no_policy_allowed = case
+            .deliveries
             .iter()
-            .map(|event| StructureEvent {
-                sequence: 0x1234,
-                event_type: event.event_type,
-                delivery_window: event.delivery_window,
-                affected_window: event.affected_window,
-                reparent: event.reparent,
+            .copied()
+            .flat_map(|delivery| {
+                literal_structure_frame(
+                    case.request,
+                    delivery,
+                    (0, 0),
+                    0x5678,
+                    ClientByteOrder::LittleEndian,
+                )
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let expected_no_policy_denied = case
+            .deliveries
+            .iter()
+            .copied()
+            .flat_map(|delivery| {
+                literal_structure_frame(
+                    case.request,
+                    delivery,
+                    (0, 0),
+                    0x1234,
+                    ClientByteOrder::BigEndian,
+                )
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            decode_structure_events(&baseline_allowed, ClientByteOrder::LittleEndian),
-            expected_allowed,
-            "{} no-policy allowed events; IDs {:?}",
+            baseline_allowed,
+            expected_no_policy_allowed,
+            "{} no-policy allowed frames; IDs {:?}",
             case.name,
             case.deliveries.iter().map(|d| d.id).collect::<Vec<_>>()
         );
         assert_eq!(
-            decode_structure_events(&baseline_denied, ClientByteOrder::BigEndian),
+            baseline_denied,
             expected_no_policy_denied,
-            "{} no-policy denied events; IDs {:?}",
+            "{} no-policy denied frames; IDs {:?}",
             case.name,
             case.deliveries.iter().map(|d| d.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            allow_allowed, expected_no_policy_allowed,
+            "{} recording-Allow allowed frames",
+            case.name
+        );
+        assert_eq!(
+            allow_denied, expected_no_policy_denied,
+            "{} recording-Allow denied frames",
+            case.name
         );
         assert_eq!(
             decode_structure_events(&allow_allowed, ClientByteOrder::LittleEndian),
@@ -1696,25 +1898,27 @@ fn receive_reparent_preserves_three_targets_and_order() {
             reparent: None,
         },
     ];
-    assert_eq!(
-        decode_structure_events(&baseline_allowed_client, ClientByteOrder::LittleEndian),
-        expected_allow,
-        "no-policy ReparentNotify and structure bytes"
+    let expected_allow_frames = literal_structure_events(
+        StructureRequest::Reparent,
+        &expected_allow,
+        (0, 0),
+        0x5678,
+        ClientByteOrder::LittleEndian,
     );
-    let expected_baseline_denied: Vec<_> = expected_allow
-        .iter()
-        .map(|event| StructureEvent {
-            sequence: 0x1234,
-            event_type: event.event_type,
-            delivery_window: event.delivery_window,
-            affected_window: event.affected_window,
-            reparent: event.reparent,
-        })
-        .collect();
+    let expected_baseline_denied = literal_structure_events(
+        StructureRequest::Reparent,
+        &expected_allow,
+        (0, 0),
+        0x1234,
+        ClientByteOrder::BigEndian,
+    );
     assert_eq!(
-        decode_structure_events(&baseline_denied_client, ClientByteOrder::BigEndian),
-        expected_baseline_denied,
-        "no-policy big-endian ReparentNotify and structure bytes"
+        baseline_allowed_client, expected_allow_frames,
+        "no-policy ReparentNotify and structure frames"
+    );
+    assert_eq!(
+        baseline_denied_client, expected_baseline_denied,
+        "no-policy big-endian ReparentNotify and structure frames"
     );
     let allow_denied_client = allow.drain(NOTIFY_RECEIVER_DENIED);
     let allow_allowed_client = allow.drain(NOTIFY_RECEIVER_ALLOWED);
@@ -1838,23 +2042,24 @@ fn receive_reparent_preserves_three_targets_and_order() {
     ));
     let same_allow_denied_bytes = same_allow.drain(NOTIFY_RECEIVER_DENIED);
     let same_allow_allowed_bytes = same_allow.drain(NOTIFY_RECEIVER_ALLOWED);
-    assert_eq!(
-        decode_structure_events(&same_allow_denied_bytes, ClientByteOrder::BigEndian),
-        same_parent_events
-            .iter()
-            .map(|event| StructureEvent {
-                sequence: 0x1234,
-                event_type: event.event_type,
-                delivery_window: event.delivery_window,
-                affected_window: event.affected_window,
-                reparent: event.reparent,
-            })
-            .collect::<Vec<_>>()
+    let same_parent_allowed_frames = literal_structure_events(
+        StructureRequest::Reparent,
+        &same_parent_events,
+        (5, 6),
+        0x5678,
+        ClientByteOrder::LittleEndian,
     );
-    assert_eq!(
-        decode_structure_events(&same_allow_allowed_bytes, ClientByteOrder::LittleEndian),
-        same_parent_events
+    let same_parent_denied_frames = literal_structure_events(
+        StructureRequest::Reparent,
+        &same_parent_events,
+        (5, 6),
+        0x1234,
+        ClientByteOrder::BigEndian,
     );
+    assert_eq!(same_baseline_allowed_bytes, same_parent_allowed_frames);
+    assert_eq!(same_baseline_denied_bytes, same_parent_denied_frames);
+    assert_eq!(same_allow_allowed_bytes, same_parent_allowed_frames);
+    assert_eq!(same_allow_denied_bytes, same_parent_denied_frames);
     assert_eq!(same_baseline_denied_bytes, same_allow_denied_bytes);
     assert_eq!(same_baseline_allowed_bytes, same_allow_allowed_bytes);
     let same_allow_log = same_allow_calls.lock().unwrap();
@@ -1906,7 +2111,8 @@ fn receive_reparent_preserves_three_targets_and_order() {
     assert_eq!(receives(&same_denied_calls.lock().unwrap()).len(), 12);
 }
 
-// Mutation: skip child gravity application when Receive denies GravityNotify.
+// Mutations: encode nx+1 in either no-policy GravityNotify, or skip child
+// gravity application when Receive denies GravityNotify.
 #[test]
 fn receive_gravity_denial_keeps_child_move() {
     const HOST_PARENT: u32 = 0x0055_0001;
@@ -2006,27 +2212,27 @@ fn receive_gravity_denial_keeps_child_move() {
     ));
     let baseline_denied = baseline.drain(NOTIFY_RECEIVER_DENIED);
     let baseline_allowed = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+    let literal_gravity = |order: ClientByteOrder, sequence: u16, event_window: ResourceId| {
+        let mut event = literal_event_header(24, 0, sequence, order);
+        append_event_u32(&mut event, order, event_window.0);
+        append_event_u32(&mut event, order, CHILD_WINDOW.0);
+        for value in [10_i16, 40_i16] {
+            event.extend_from_slice(&match order {
+                ClientByteOrder::LittleEndian => value.to_le_bytes(),
+                ClientByteOrder::BigEndian => value.to_be_bytes(),
+            });
+        }
+        finish_literal_event(event)
+    };
     assert_eq!(
-        decode_structure_events(&baseline_denied, ClientByteOrder::BigEndian),
-        vec![StructureEvent {
-            event_type: 24,
-            sequence: 0x1234,
-            delivery_window: CHILD_WINDOW,
-            affected_window: CHILD_WINDOW,
-            reparent: None,
-        }],
-        "no-policy GravityNotify for denied recipient"
+        baseline_denied,
+        literal_gravity(ClientByteOrder::BigEndian, 0x1234, CHILD_WINDOW),
+        "no-policy denied-recipient GravityNotify frame"
     );
     assert_eq!(
-        decode_structure_events(&baseline_allowed, ClientByteOrder::LittleEndian),
-        vec![StructureEvent {
-            event_type: 24,
-            sequence: 0x5678,
-            delivery_window: PARENT_WINDOW,
-            affected_window: CHILD_WINDOW,
-            reparent: None,
-        }],
-        "no-policy GravityNotify for allowed recipient"
+        baseline_allowed,
+        literal_gravity(ClientByteOrder::LittleEndian, 0x5678, PARENT_WINDOW),
+        "no-policy allowed-recipient GravityNotify frame"
     );
 
     let mut allow = fixture();
@@ -2036,26 +2242,8 @@ fn receive_gravity_denial_keeps_child_move() {
     let allow_allowed = allow.drain(NOTIFY_RECEIVER_ALLOWED);
     assert_eq!(baseline_denied, allow_denied);
     assert_eq!(baseline_allowed, allow_allowed);
-    assert_eq!(
-        decode_structure_events(&allow_denied, ClientByteOrder::BigEndian),
-        vec![StructureEvent {
-            event_type: 24,
-            sequence: 0x1234,
-            delivery_window: CHILD_WINDOW,
-            affected_window: CHILD_WINDOW,
-            reparent: None,
-        }]
-    );
-    assert_eq!(
-        decode_structure_events(&allow_allowed, ClientByteOrder::LittleEndian),
-        vec![StructureEvent {
-            event_type: 24,
-            sequence: 0x5678,
-            delivery_window: PARENT_WINDOW,
-            affected_window: CHILD_WINDOW,
-            reparent: None,
-        }]
-    );
+    assert_eq!(allow_denied, baseline_denied);
+    assert_eq!(allow_allowed, baseline_allowed);
     assert_eq!(child_position(&allow), (10, 40));
     assert!(allow.backend.calls().iter().any(|call| matches!(
         call,
@@ -2254,33 +2442,11 @@ fn redirect_fixture(
 
 fn assert_redirect_frame(bytes: &[u8], case: RedirectCase, order: ClientByteOrder) {
     assert_eq!(
-        bytes.len(),
-        32,
-        "{} emits exactly one redirect event",
+        bytes,
+        literal_redirect_frame(case, order),
+        "{} complete redirect frame",
         case.name
     );
-    assert_eq!(bytes[0], case.redirect_event, "{} event code", case.name);
-    let read_u32 = |slice: &[u8]| match order {
-        ClientByteOrder::LittleEndian => u32::from_le_bytes(slice.try_into().unwrap()),
-        ClientByteOrder::BigEndian => u32::from_be_bytes(slice.try_into().unwrap()),
-    };
-    assert_eq!(
-        read_u32(&bytes[4..8]),
-        PARENT_WINDOW.0,
-        "{} parent",
-        case.name
-    );
-    assert_eq!(
-        read_u32(&bytes[8..12]),
-        CHILD_WINDOW.0,
-        "{} target",
-        case.name
-    );
-}
-
-fn event_types(bytes: &[u8]) -> Vec<u8> {
-    assert!(bytes.len().is_multiple_of(32), "complete event frames");
-    bytes.chunks_exact(32).map(|event| event[0]).collect()
 }
 
 // Mutation per row: after a checked redirect recipient gets no bytes, continue
@@ -2437,16 +2603,44 @@ fn receive_redirect_does_not_check_unselected_clients() {
             "{} operation proceeds",
             case.name
         );
-        let mut baseline_event_types = event_types(&baseline_denied);
-        baseline_event_types.extend(event_types(&baseline_allowed));
-        assert!(
-            !baseline_event_types.contains(&case.redirect_event),
-            "{} no redirect notification is manufactured",
+        let denied_event_windows = if case.ordinary_event == 19 {
+            vec![CHILD_WINDOW]
+        } else {
+            vec![CHILD_WINDOW, PARENT_WINDOW]
+        };
+        let expected_denied = denied_event_windows
+            .iter()
+            .copied()
+            .flat_map(|event_window| {
+                literal_ordinary_structure_frame(
+                    case,
+                    case.ordinary_event,
+                    event_window,
+                    ClientByteOrder::BigEndian,
+                    override_redirect,
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected_allowed = [CHILD_WINDOW, PARENT_WINDOW]
+            .iter()
+            .flat_map(|event_window| {
+                literal_ordinary_structure_frame(
+                    case,
+                    case.ordinary_event,
+                    *event_window,
+                    ClientByteOrder::LittleEndian,
+                    override_redirect,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            baseline_denied, expected_denied,
+            "{} no-policy denied-listener frames",
             case.name
         );
-        assert!(
-            baseline_event_types.contains(&case.ordinary_event),
-            "{} ordinary notification is preserved",
+        assert_eq!(
+            baseline_allowed, expected_allowed,
+            "{} no-policy allowed-listener frames",
             case.name
         );
 

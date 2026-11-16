@@ -18,6 +18,37 @@ pub(super) const NOTIFY_RECEIVER_ALLOWED: ClientId = ClientId(3);
 pub(super) const NOTIFY_WINDOW: ResourceId = ResourceId(0x0051_0001);
 pub(super) const PROPERTY_CHANGE_MASK: u32 = 1 << 22;
 
+pub(super) fn literal_event_header(
+    event_type: u8,
+    detail: u8,
+    sequence: u16,
+    order: ClientByteOrder,
+) -> Vec<u8> {
+    let mut event = vec![event_type, detail];
+    append_event_u16(&mut event, order, sequence);
+    event
+}
+
+pub(super) fn append_event_u16(event: &mut Vec<u8>, order: ClientByteOrder, value: u16) {
+    match order {
+        ClientByteOrder::LittleEndian => event.extend_from_slice(&value.to_le_bytes()),
+        ClientByteOrder::BigEndian => event.extend_from_slice(&value.to_be_bytes()),
+    }
+}
+
+pub(super) fn append_event_u32(event: &mut Vec<u8>, order: ClientByteOrder, value: u32) {
+    match order {
+        ClientByteOrder::LittleEndian => event.extend_from_slice(&value.to_le_bytes()),
+        ClientByteOrder::BigEndian => event.extend_from_slice(&value.to_be_bytes()),
+    }
+}
+
+pub(super) fn finish_literal_event(mut event: Vec<u8>) -> Vec<u8> {
+    assert!(event.len() <= 32, "core event fields fit one frame");
+    event.resize(32, 0);
+    event
+}
+
 pub(super) struct NotifyFixture {
     pub state: ServerState,
     pub backend: RecordingBackend,

@@ -245,6 +245,57 @@ fn event_frames(bytes: &[u8]) -> Vec<[u8; 32]> {
         .collect()
 }
 
+fn literal_configure_notify(
+    order: ClientByteOrder,
+    event_type: u8,
+    sequence: u16,
+    event_window: ResourceId,
+    window: ResourceId,
+    sibling: ResourceId,
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+    border_width: u16,
+    override_redirect: bool,
+) -> [u8; 32] {
+    let mut event = literal_event_header(event_type, 0, sequence, order);
+    append_event_u32(&mut event, order, event_window.0);
+    append_event_u32(&mut event, order, window.0);
+    append_event_u32(&mut event, order, sibling.0);
+    event.extend_from_slice(&match order {
+        ClientByteOrder::LittleEndian => x.to_le_bytes(),
+        ClientByteOrder::BigEndian => x.to_be_bytes(),
+    });
+    event.extend_from_slice(&match order {
+        ClientByteOrder::LittleEndian => y.to_le_bytes(),
+        ClientByteOrder::BigEndian => y.to_be_bytes(),
+    });
+    append_event_u16(&mut event, order, width);
+    append_event_u16(&mut event, order, height);
+    append_event_u16(&mut event, order, border_width);
+    event.push(u8::from(override_redirect));
+    finish_literal_event(event)
+        .try_into()
+        .expect("ConfigureNotify is 32 bytes")
+}
+
+fn literal_wm_delete_client_message(
+    order: ClientByteOrder,
+    sequence: u16,
+    window: ResourceId,
+    protocols: AtomId,
+    delete_window: AtomId,
+) -> Vec<u8> {
+    let mut event = literal_event_header(33 | 0x80, 32, sequence, order);
+    append_event_u32(&mut event, order, window.0);
+    append_event_u32(&mut event, order, protocols.0);
+    append_event_u32(&mut event, order, delete_window.0);
+    append_event_u32(&mut event, order, 0); // timestamp normalized after bounds check
+    event.extend_from_slice(&[0; 12]);
+    event
+}
+
 // Mutations: ask the window creator; undo ownership after denial; gate XFIXES with the core denial.
 #[test]
 fn receive_selection_clear_targets_previous_setter() {
@@ -272,7 +323,15 @@ fn receive_selection_clear_targets_previous_setter() {
             selection,
         )
     );
-    assert_eq!(control_xfixes[0], crate::nested::XFIXES_FIRST_EVENT);
+    assert_xfixes_event_matches_expected(
+        &control_xfixes,
+        control_bounds,
+        0,
+        subscriber,
+        REQUESTOR_A,
+        selection,
+        selection_time,
+    );
 
     let (mut allow, selection, _, _) = selection_owner_fixture();
     let subscriber = fixture_window_for_xfixes(&mut allow, B);
@@ -297,6 +356,15 @@ fn receive_selection_clear_targets_previous_setter() {
             OWNER_WINDOW,
             selection,
         )
+    );
+    assert_xfixes_event_matches_expected(
+        &allow_xfixes,
+        allow_bounds,
+        0,
+        subscriber,
+        REQUESTOR_A,
+        selection,
+        allow_time,
     );
     let mut allow_clear_without_time = allow_clear.clone();
     let mut control_clear_without_time = control_clear.clone();
@@ -339,6 +407,15 @@ fn receive_selection_clear_targets_previous_setter() {
         denied_xfixes[0],
         crate::nested::XFIXES_FIRST_EVENT,
         "XFIXES remains independent"
+    );
+    assert_xfixes_event_matches_expected(
+        &denied_xfixes,
+        denied_bounds,
+        0,
+        subscriber,
+        REQUESTOR_A,
+        selection,
+        denied_time,
     );
     assert_xfixes_event_matches_except_timestamps(
         &denied_xfixes,
@@ -432,7 +509,7 @@ pub(super) fn run_xfixes_owner_change(
         timestamp,
     );
     let after = fixture.state.timestamp_now();
-    let outputs = [
+    let outputs: Vec<Vec<u8>> = [
         NOTIFY_SENDER,
         NOTIFY_RECEIVER_DENIED,
         NOTIFY_RECEIVER_ALLOWED,
@@ -440,12 +517,64 @@ pub(super) fn run_xfixes_owner_change(
     .into_iter()
     .map(|client| fixture.drain(client))
     .collect();
+    if !deny_receive {
+        assert_xfixes_event_matches_expected(
+            &outputs[1],
+            (before, after),
+            0,
+            subscriber,
+            requestor,
+            selection,
+            timestamp,
+        );
+    }
     let calls = checks.map_or_else(Vec::new, |calls| calls.lock().unwrap().clone());
     (outputs, calls, (before, after))
 }
 
 fn timestamp_is_between(value: u32, (before, after): (u32, u32)) -> bool {
     value.wrapping_sub(before) <= after.wrapping_sub(before)
+}
+
+pub(super) fn assert_xfixes_event_matches_expected(
+    actual: &[u8],
+    bounds: (u32, u32),
+    sequence: u16,
+    window: ResourceId,
+    owner: ResourceId,
+    selection: AtomId,
+    selection_timestamp: u32,
+) {
+    let timestamp = u32::from_le_bytes(
+        actual
+            .get(16..20)
+            .expect("XFIXES current-time field")
+            .try_into()
+            .unwrap(),
+    );
+    assert!(
+        timestamp_is_between(timestamp, bounds),
+        "XFIXES current time {timestamp} is within {bounds:?}"
+    );
+    let mut expected = literal_event_header(
+        crate::nested::XFIXES_FIRST_EVENT,
+        x11xfixes::SELECTION_NOTIFY_SET_OWNER,
+        sequence,
+        ClientByteOrder::LittleEndian,
+    );
+    append_event_u32(&mut expected, ClientByteOrder::LittleEndian, window.0);
+    append_event_u32(&mut expected, ClientByteOrder::LittleEndian, owner.0);
+    append_event_u32(&mut expected, ClientByteOrder::LittleEndian, selection.0);
+    append_event_u32(&mut expected, ClientByteOrder::LittleEndian, 0); // dynamic current time
+    append_event_u32(
+        &mut expected,
+        ClientByteOrder::LittleEndian,
+        selection_timestamp,
+    );
+    expected.extend_from_slice(&[0; 8]);
+    let mut actual_without_current_time = actual.to_vec();
+    actual_without_current_time[16..20].fill(0);
+    assert_eq!(actual_without_current_time, expected);
 }
 
 pub(super) fn assert_xfixes_event_matches_except_timestamps(
@@ -1092,15 +1221,26 @@ fn receive_bridge_clear_denial_does_not_queue() {
         "the XFIXES control event is delivered"
     );
     let events = rootless::selection::take_selection_events(&mut control.state);
-    assert!(events.iter().any(|event| matches!(event, SelectionEvent::Owner { selection: s, owner: Some(w), .. } if *s == selection && *w == REQUESTOR_A)));
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| matches!(event, SelectionEvent::Clear { .. }))
-            .count(),
-        1,
-        "Allow control queues the bridge SelectionClear"
-    );
+    match events.as_slice() {
+        [
+            SelectionEvent::Clear {
+                selection: clear_selection,
+                time: clear_time,
+            },
+            SelectionEvent::Owner {
+                selection: owner_selection,
+                owner: Some(owner),
+                time: owner_time,
+            },
+        ] => {
+            assert_eq!(*clear_selection, selection);
+            assert_eq!(*owner_selection, selection);
+            assert_eq!(*owner, REQUESTOR_A);
+            assert!(timestamp_is_between(*owner_time, control_bounds));
+            assert!(timestamp_is_between(*clear_time, control_bounds));
+        }
+        other => panic!("complete no-policy bridge selection records: {other:?}"),
+    }
 
     let (mut allow, allow_selection, allow_xfixes, allow_calls, allow_bounds) = run(Some(false));
     assert_eq!(allow_selection, selection);
@@ -1111,37 +1251,49 @@ fn receive_bridge_clear_denial_does_not_queue() {
         control_bounds,
     );
     let allow_events = rootless::selection::take_selection_events(&mut allow.state);
-    assert_eq!(allow_events.len(), events.len());
-    for (baseline, permitted) in events.iter().zip(&allow_events) {
-        match (baseline, permitted) {
-            (
-                SelectionEvent::Owner {
-                    selection: baseline_selection,
-                    owner: baseline_owner,
-                    ..
-                },
-                SelectionEvent::Owner {
-                    selection: allow_selection,
-                    owner: allow_owner,
-                    ..
-                },
-            ) => assert_eq!(
-                (baseline_selection, baseline_owner),
-                (allow_selection, allow_owner)
-            ),
-            (
-                SelectionEvent::Clear {
-                    selection: baseline_selection,
-                    ..
-                },
-                SelectionEvent::Clear {
-                    selection: allow_selection,
-                    ..
-                },
-            ) => assert_eq!(baseline_selection, allow_selection),
-            other => panic!("no-policy/Allow selection event mismatch: {other:?}"),
+    match allow_events.as_slice() {
+        [
+            SelectionEvent::Clear {
+                selection: clear_selection,
+                time: clear_time,
+            },
+            SelectionEvent::Owner {
+                selection: owner_selection,
+                owner: Some(owner),
+                time: owner_time,
+            },
+        ] => {
+            assert_eq!(*clear_selection, selection);
+            assert_eq!(*owner_selection, selection);
+            assert_eq!(*owner, REQUESTOR_A);
+            assert!(timestamp_is_between(*owner_time, allow_bounds));
+            assert!(timestamp_is_between(*clear_time, allow_bounds));
         }
+        other => panic!("complete recording-Allow bridge selection records: {other:?}"),
     }
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| match event {
+                SelectionEvent::Owner {
+                    selection, owner, ..
+                } => (*selection, *owner),
+                SelectionEvent::Clear { selection, .. } => (*selection, None),
+                other => panic!("unexpected baseline selection record {other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        allow_events
+            .iter()
+            .map(|event| match event {
+                SelectionEvent::Owner {
+                    selection, owner, ..
+                } => (*selection, *owner),
+                SelectionEvent::Clear { selection, .. } => (*selection, None),
+                other => panic!("unexpected Allow selection record {other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        "recording-Allow bridge queue parity"
+    );
     assert_eq!(receive_checks(&allow_calls).len(), 1);
 
     let (mut denied, selection, denied_xfixes, calls, denied_bounds) = run(Some(true));
@@ -1156,12 +1308,20 @@ fn receive_bridge_clear_denial_does_not_queue() {
     assert_eq!(denied.state.selections[&selection].window, REQUESTOR_A);
     assert_eq!(denied.state.selections[&selection].client, Some(C));
     let events = rootless::selection::take_selection_events(&mut denied.state);
-    assert!(events.iter().any(|event| matches!(event, SelectionEvent::Owner { selection: s, owner: Some(w), .. } if *s == selection && *w == REQUESTOR_A)));
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, SelectionEvent::Clear { .. }))
-    );
+    match events.as_slice() {
+        [
+            SelectionEvent::Owner {
+                selection: event_selection,
+                owner: Some(owner),
+                time,
+            },
+        ] => {
+            assert_eq!(*event_selection, selection);
+            assert_eq!(*owner, REQUESTOR_A);
+            assert!(timestamp_is_between(*time, denied_bounds));
+        }
+        other => panic!("complete denied bridge selection records: {other:?}"),
+    }
     let receives = receive_checks(&calls);
     assert_eq!(
         receives.len(),
@@ -1260,9 +1420,10 @@ fn host_wm_state(fixture: &mut NotifyFixture, window: ResourceId) -> Option<Vec<
         .map(|value| value.data.clone())
 }
 
-// Mutations: bypass raw checks; describe sent type with bit 7; exempt host
-// SelectionNotify(None) by type/property; let a ClientMessage time escape its
-// fixture bounds or change a non-time byte without failing.
+// Mutations: format 32->16 for ClientMessage; invert synthetic
+// ConfigureNotify override_redirect; bypass raw checks; describe sent type
+// without bit 7; exempt host SelectionNotify(None); or let ClientMessage time
+// escape its fixture bounds.
 #[test]
 fn receive_rootless_outgoing_core_events_are_checked() {
     let (mut baseline, baseline_window, baseline_id) = rootless_host_fixture();
@@ -1278,68 +1439,76 @@ fn receive_rootless_outgoing_core_events_are_checked() {
     );
     let baseline_a_move = baseline.drain(A);
     let baseline_b_move = baseline.drain(B);
-    for (client, event) in [(A, &baseline_a_move), (B, &baseline_b_move)] {
-        let frames = event_frames(event);
-        assert_eq!(
-            frames.len(),
+    let expected_a_move = vec![
+        literal_configure_notify(
+            ClientByteOrder::LittleEndian,
+            22,
             2,
-            "two no-policy ConfigureNotify frames for {client:?}"
-        );
-        for (frame_index, frame) in frames.into_iter().enumerate() {
-            let expected_type = if frame_index == 0 { 22 } else { 22 | 0x80 };
-            assert_eq!(
-                frame[0], expected_type,
-                "ordinary then synthetic ConfigureNotify type"
-            );
-            if client == A {
-                assert_eq!(&frame[2..4], &2_u16.to_le_bytes());
-                assert_eq!(
-                    u32::from_le_bytes(frame[4..8].try_into().unwrap()),
-                    baseline_window.0
-                );
-                assert_eq!(
-                    u32::from_le_bytes(frame[8..12].try_into().unwrap()),
-                    baseline_window.0
-                );
-                assert_eq!(
-                    u32::from_le_bytes(frame[12..16].try_into().unwrap()),
-                    0x0000_0107
-                );
-                assert_eq!(
-                    (
-                        i16::from_le_bytes(frame[16..18].try_into().unwrap()),
-                        i16::from_le_bytes(frame[18..20].try_into().unwrap()),
-                        u16::from_le_bytes(frame[20..22].try_into().unwrap()),
-                        u16::from_le_bytes(frame[22..24].try_into().unwrap()),
-                    ),
-                    (30, 40, 100, 80)
-                );
-            } else {
-                assert_eq!(&frame[2..4], &0x1234_u16.to_be_bytes());
-                assert_eq!(
-                    u32::from_be_bytes(frame[4..8].try_into().unwrap()),
-                    baseline_window.0
-                );
-                assert_eq!(
-                    u32::from_be_bytes(frame[8..12].try_into().unwrap()),
-                    baseline_window.0
-                );
-                assert_eq!(
-                    u32::from_be_bytes(frame[12..16].try_into().unwrap()),
-                    0x0000_0107
-                );
-                assert_eq!(
-                    (
-                        i16::from_be_bytes(frame[16..18].try_into().unwrap()),
-                        i16::from_be_bytes(frame[18..20].try_into().unwrap()),
-                        u16::from_be_bytes(frame[20..22].try_into().unwrap()),
-                        u16::from_be_bytes(frame[22..24].try_into().unwrap()),
-                    ),
-                    (30, 40, 100, 80)
-                );
-            }
-        }
-    }
+            baseline_window,
+            baseline_window,
+            ResourceId(0x0000_0107),
+            30,
+            40,
+            100,
+            80,
+            0,
+            false,
+        ),
+        literal_configure_notify(
+            ClientByteOrder::LittleEndian,
+            22 | 0x80,
+            2,
+            baseline_window,
+            baseline_window,
+            ResourceId(0x0000_0107),
+            30,
+            40,
+            100,
+            80,
+            0,
+            false,
+        ),
+    ];
+    let expected_b_move = vec![
+        literal_configure_notify(
+            ClientByteOrder::BigEndian,
+            22,
+            0x1234,
+            baseline_window,
+            baseline_window,
+            ResourceId(0x0000_0107),
+            30,
+            40,
+            100,
+            80,
+            0,
+            false,
+        ),
+        literal_configure_notify(
+            ClientByteOrder::BigEndian,
+            22 | 0x80,
+            0x1234,
+            baseline_window,
+            baseline_window,
+            ResourceId(0x0000_0107),
+            30,
+            40,
+            100,
+            80,
+            0,
+            false,
+        ),
+    ];
+    assert_eq!(
+        event_frames(&baseline_a_move),
+        expected_a_move,
+        "complete no-policy ConfigureNotify frames for A"
+    );
+    assert_eq!(
+        event_frames(&baseline_b_move),
+        expected_b_move,
+        "complete no-policy ConfigureNotify frames for B"
+    );
     assert_eq!(
         baseline.state.resources.window(baseline_window).unwrap().x,
         30
@@ -1351,12 +1520,28 @@ fn receive_rootless_outgoing_core_events_are_checked() {
     );
     let baseline_close_after = baseline.state.timestamp_now();
     let baseline_close = baseline.drain(A);
-    assert_eq!(baseline_close.len(), 32, "one complete ClientMessage");
-    assert_eq!(event_frames(&baseline_close)[0][0], 33 | 0x80);
+    let baseline_timestamp = u32::from_le_bytes(baseline_close[16..20].try_into().unwrap());
+    assert!(
+        timestamp_is_between(
+            baseline_timestamp,
+            (baseline_close_before, baseline_close_after)
+        ),
+        "baseline ClientMessage timestamp {baseline_timestamp} is within ({baseline_close_before}, {baseline_close_after})"
+    );
+    let protocols = baseline.state.atoms.intern("WM_PROTOCOLS", false);
+    let delete_window = baseline.state.atoms.intern("WM_DELETE_WINDOW", false);
+    let mut baseline_close_without_timestamp = baseline_close.clone();
+    baseline_close_without_timestamp[16..20].fill(0);
     assert_eq!(
-        u32::from_le_bytes(baseline_close[12..16].try_into().unwrap()),
-        baseline.state.atoms.intern("WM_DELETE_WINDOW", false).0,
-        "no-policy WM_PROTOCOLS ClientMessage type"
+        baseline_close_without_timestamp,
+        literal_wm_delete_client_message(
+            ClientByteOrder::LittleEndian,
+            2,
+            baseline_window,
+            protocols,
+            delete_window,
+        ),
+        "no-policy full ClientMessage frame with bounded timestamp normalized"
     );
     let baseline_requestor = ResourceId(0x0057_0011);
     create_window(&mut baseline, B, baseline_requestor);
@@ -1436,30 +1621,20 @@ fn receive_rootless_outgoing_core_events_are_checked() {
     let control_geometry = host_geometry(&control, window);
     let control_wm_state = host_wm_state(&mut control, window);
     let control_backend = control.backend.calls();
+    let control_protocols = control.state.atoms.intern("WM_PROTOCOLS", false);
     let delete_window = control.state.atoms.intern("WM_DELETE_WINDOW", false);
     let control_close_before = control.state.timestamp_now();
     host_request(&mut control, HostRequest::CloseRequested { id });
     let control_close_after = control.state.timestamp_now();
     let control_close = control.drain(A);
-    assert_eq!(control_close.len(), 32, "one complete ClientMessage");
-    for (label, event, bounds) in [
-        (
-            "baseline",
-            &baseline_close,
-            (baseline_close_before, baseline_close_after),
+    let control_timestamp = u32::from_le_bytes(control_close[16..20].try_into().unwrap());
+    assert!(
+        timestamp_is_between(
+            control_timestamp,
+            (control_close_before, control_close_after)
         ),
-        (
-            "recording-Allow",
-            &control_close,
-            (control_close_before, control_close_after),
-        ),
-    ] {
-        let timestamp = u32::from_le_bytes(event[16..20].try_into().unwrap());
-        assert!(
-            timestamp_is_between(timestamp, bounds),
-            "{label} ClientMessage timestamp {timestamp} is within {bounds:?}"
-        );
-    }
+        "recording-Allow ClientMessage timestamp {control_timestamp} is within ({control_close_before}, {control_close_after})"
+    );
     let mut baseline_close_without_timestamp = baseline_close.clone();
     let mut control_close_without_timestamp = control_close.clone();
     baseline_close_without_timestamp[16..20].fill(0);
@@ -1468,10 +1643,18 @@ fn receive_rootless_outgoing_core_events_are_checked() {
         control_close_without_timestamp, baseline_close_without_timestamp,
         "all non-timestamp ClientMessage bytes match"
     );
-    assert_eq!(event_frames(&control_close)[0][0], 33 | 0x80);
+    let mut control_close_without_timestamp = control_close.clone();
+    control_close_without_timestamp[16..20].fill(0);
     assert_eq!(
-        u32::from_le_bytes(control_close[12..16].try_into().unwrap()),
-        delete_window.0
+        control_close_without_timestamp,
+        literal_wm_delete_client_message(
+            ClientByteOrder::LittleEndian,
+            2,
+            window,
+            control_protocols,
+            delete_window,
+        ),
+        "recording-Allow full ClientMessage frame with bounded timestamp normalized"
     );
     assert!(
         receive_checks(&control_calls.lock().unwrap())
