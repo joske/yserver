@@ -132,15 +132,18 @@ fn no_listen_tcp_has_no_bound_tcp_socket() {
         &["-nolisten", "tcp"][..],
         &["-listen", "tcp", "-nolisten", "tcp"][..],
     ] {
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let opts = fixture.options(args);
         let auth = AuthState::new(None);
-        let listeners = fixture.bind(&opts, &auth).unwrap();
+        // Keep the port reserved: a connect-refused check after releasing it
+        // races any parallel test whose ephemeral bind lands on the same
+        // port (seen on FreeBSD). Holding 0.0.0.0:port instead makes a
+        // production TCP bind fail with AddrInUse, which `unwrap` reports.
+        let unix = UnixListener::bind(fixture.unix_path()).unwrap();
+        let listeners = super::bind_client_listeners(unix, fixture.port - 6000, &opts, &auth)
+            .expect("no TCP bind without opt-in");
         assert_eq!(listeners.len(), 1);
         assert!(matches!(&listeners[0], Listener::Unix(_)));
-        let err = TcpStream::connect_timeout(&fixture.address(), Duration::from_secs(1))
-            .expect_err("TCP must not be bound without opt-in");
-        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
     }
 }
 
