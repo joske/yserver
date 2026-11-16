@@ -224,9 +224,10 @@ def main():
     # 2. BE append + BE prepend on format 32, LE append on the same.
     be.change(2, win, p["PROBE_BE32"], CARDINAL, 32, [0x0A0B0C0D])
     be.change(1, win, p["PROBE_BE32"], CARDINAL, 32, [0x11223344])
+    # Two connections have no request order: finish BE's before LE appends.
+    be.sync()
     le.change(2, win, p["PROBE_BE32"], CARDINAL, 32, [0x55667788])
     le.sync()
-    be.sync()
     events("append")
     reads("PROBE_BE32-appended", p["PROBE_BE32"])
 
