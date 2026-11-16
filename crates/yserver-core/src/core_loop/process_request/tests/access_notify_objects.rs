@@ -281,14 +281,25 @@ fn assert_only_focus_event_removed(
     );
 }
 
-// Mutations: use the final focus for every subject; suppress XI2 with core denial;
-// skip checks for NotifyGrab/Ungrab/server mode.
+// Mutations: change a no-policy focus field in production, use the final focus
+// for every subject, suppress XI2 with core denial, or skip NotifyGrab/Ungrab
+// and server-mode checks.
 #[test]
 fn receive_focus_checks_transition_windows_and_keeps_xi2() {
     let mut baseline = access_notify_focus_fixture();
     assert!(!baseline.state.policies_installed());
     set_focus_to_new_child(&mut baseline);
     let baseline_focus = clear_focus_streams(&mut baseline);
+    assert_eq!(
+        focus_fields(stream(&baseline_focus, NOTIFY_RECEIVER_ALLOWED)),
+        [
+            (10, 3, FOCUS_OLD_CHILD, 0),
+            (10, 4, FOCUS_OLD_TOP, 0),
+            (9, 4, FOCUS_NEW_TOP, 0),
+            (9, 3, FOCUS_NEW_CHILD, 0),
+        ],
+        "no-policy focus transition fields"
+    );
 
     let mut control = access_notify_focus_fixture();
     let control_calls = focus_policy(&mut control, false);
@@ -418,6 +429,11 @@ fn receive_focus_checks_transition_windows_and_keeps_xi2() {
         RequestOutcome::Handled
     ));
     let baseline_destroy = clear_focus_streams(&mut baseline);
+    assert_eq!(
+        focus_fields(stream(&baseline_destroy, NOTIFY_RECEIVER_ALLOWED)),
+        [(10, 0, FOCUS_NEW_CHILD, 0), (9, 2, FOCUS_NEW_TOP, 0)],
+        "no-policy DestroyWindow focus events"
+    );
     for client in [
         NOTIFY_SENDER,
         NOTIFY_RECEIVER_DENIED,
@@ -590,6 +606,11 @@ fn receive_focus_checks_transition_windows_and_keeps_xi2() {
     );
     let host_baseline_denied = host_baseline.drain(NOTIFY_RECEIVER_DENIED);
     let host_baseline_allowed = host_baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+    assert_eq!(
+        focus_fields(&host_baseline_allowed),
+        [(10, 5, HOST_TOP, 0), (9, 3, HOST_TOP, 0)],
+        "no-policy host activation focus fields"
+    );
 
     let (mut host, id) = host_fixture();
     let host_calls = host.install_policy(|_, _| Decision::Allow);
@@ -695,7 +716,8 @@ fn colormap_install_output(allow_policy: bool) -> (Vec<u8>, Vec<u8>) {
 }
 
 // Mutation: suppress N38 ColormapNotify only when no access policy is installed.
-fn assert_colormap_no_policy_parity() {
+#[test]
+fn receive_colormap_no_policy_matches_independent_bytes() {
     let (without_policy_denied, without_policy_allowed) = colormap_install_output(false);
     let (allow_denied, allow_allowed) = colormap_install_output(true);
     let expected = [
@@ -1116,6 +1138,20 @@ fn rootless_property_fixture() -> (NotifyFixture, AtomId) {
             .event_masks
             .insert(NOTIFY_WINDOW, PROPERTY_CHANGE_MASK);
     }
+    let denied = fixture
+        .state
+        .clients
+        .get_mut(&NOTIFY_RECEIVER_DENIED.0)
+        .unwrap();
+    denied.byte_order = ClientByteOrder::BigEndian;
+    denied.last_sequence.store(0x1234, Ordering::Relaxed);
+    let allowed = fixture
+        .state
+        .clients
+        .get_mut(&NOTIFY_RECEIVER_ALLOWED.0)
+        .unwrap();
+    allowed.byte_order = ClientByteOrder::LittleEndian;
+    allowed.last_sequence.store(0x5678, Ordering::Relaxed);
     fixture.state.start_instant = std::time::Instant::now() + std::time::Duration::from_secs(30);
     rootless::selection::watch_properties(&mut fixture.state, NOTIFY_WINDOW, true);
     let property = fixture.state.atoms.intern("TASK6_ROOTLESS_PROPERTY", false);
@@ -1140,6 +1176,16 @@ fn receive_bridge_property_denial_keeps_clients_and_property() {
     let control_allowed_client = control.drain(NOTIFY_RECEIVER_ALLOWED);
     assert_eq!(control_denied_client.len(), 32);
     assert_eq!(control_allowed_client.len(), 32);
+    assert_eq!(
+        control_denied_client,
+        literal_property_notify(ClientByteOrder::BigEndian, 0x1234, control_property),
+        "no-policy bridge PropertyNotify for the big-endian client"
+    );
+    assert_eq!(
+        control_allowed_client,
+        literal_property_notify(ClientByteOrder::LittleEndian, 0x5678, control_property),
+        "no-policy bridge PropertyNotify for the little-endian client"
+    );
     assert!(matches!(
         rootless::selection::take_selection_events(&mut control.state).as_slice(),
         [SelectionEvent::Property { window, property, .. }]
@@ -1254,14 +1300,4 @@ fn receive_bridge_property_denial_keeps_clients_and_property() {
             .iter()
             .any(|call| call.hook == ExtensionHook::Send)
     );
-}
-
-// Keep existing fixture tests private while letting the Task 8 parity test
-// rerun these established no-policy/Allow comparisons from its sibling module.
-pub(super) fn run_no_policy_parity_fixtures() {
-    receive_focus_checks_transition_windows_and_keeps_xi2();
-    receive_colormap_uses_each_subscribing_window();
-    assert_colormap_no_policy_parity();
-    receive_get_property_delete_keeps_reply();
-    receive_bridge_property_denial_keeps_clients_and_property();
 }

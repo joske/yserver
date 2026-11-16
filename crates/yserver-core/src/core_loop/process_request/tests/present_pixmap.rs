@@ -81,6 +81,7 @@ fn overflowing_present_selector_is_flagged_for_disconnect() {
 /// a pure move. Steam's DRI3 popup windows select this event and use its
 /// x/y to keep the presentation surface synchronized with the native
 /// override-redirect window.
+// Mutation: change the Present ConfigureNotify x coordinate in production.
 #[test]
 fn configure_window_pure_move_emits_present_configure_notify() {
     use crate::server::PresentEventSelection;
@@ -89,73 +90,80 @@ fn configure_window_pure_move_emits_present_configure_notify() {
     const WINDOW: ResourceId = ResourceId(0x200);
     const PRESENT_EID: u32 = 0x0010_0042;
 
-    let (mut state, mut peer) = two_children_under_root();
-    state
-        .clients
-        .get_mut(&1)
-        .unwrap()
-        .event_masks
-        .insert(WINDOW, 0x0002_0000);
-    state.present_event_selections.insert(
-        PRESENT_EID,
-        PresentEventSelection {
-            owner: ClientId(1),
-            window: WINDOW,
-            event_mask: x11present::EVENT_MASK_CONFIGURE_NOTIFY,
-        },
-    );
-    let _ = read_all_available(&mut peer);
+    fn run(allow_policy: bool) -> Vec<u8> {
+        let (mut state, mut peer) = two_children_under_root();
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .event_masks
+            .insert(WINDOW, 0x0002_0000);
+        state.present_event_selections.insert(
+            PRESENT_EID,
+            PresentEventSelection {
+                owner: ClientId(1),
+                window: WINDOW,
+                event_mask: x11present::EVENT_MASK_CONFIGURE_NOTIFY,
+            },
+        );
+        let _ = read_all_available(&mut peer);
+        if allow_policy {
+            state.install_access_policy(std::sync::Arc::new(
+                super::extensions::RecordingExtensionPolicy::new(
+                    crate::access::Decision::Allow,
+                    std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                ),
+            ));
+        }
 
-    let body = cw_restack_body(WINDOW.0, 0x0003, &[610, 250]); // CWX|CWY
-    let mut backend = RecordingBackend::new();
-    handle_configure_window(
-        &mut state,
-        &mut backend,
-        None,
-        ClientId(1),
-        SequenceNumber(1),
-        crate::access::RequestOpcodes {
-            major: 12,
-            minor: 0,
-        },
-        &body,
-    )
-    .expect("handle_configure_window");
+        let body = cw_restack_body(WINDOW.0, 0x0003, &[610, 250]); // CWX|CWY
+        let mut backend = RecordingBackend::new();
+        handle_configure_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            crate::access::RequestOpcodes {
+                major: 12,
+                minor: 0,
+            },
+            &body,
+        )
+        .expect("handle_configure_window");
+        read_all_available(&mut peer)
+    }
 
-    let bytes = read_all_available(&mut peer);
-    assert_eq!(bytes.len(), 72, "Present XGE plus core ConfigureNotify");
+    let bytes = run(false);
+    let allow_bytes = run(true);
+    let mut expected = [0_u8; 72];
+    expected[0] = 35; // GenericEvent
+    expected[1] = 145; // Present extension opcode assigned in this fixture
+    expected[4..8].copy_from_slice(&2_u32.to_le_bytes()); // two extra XGE words
+    expected[8..10].copy_from_slice(&u16::from(x11present::EVENT_CONFIGURE_NOTIFY).to_le_bytes());
+    expected[12..16].copy_from_slice(&PRESENT_EID.to_le_bytes());
+    expected[16..20].copy_from_slice(&WINDOW.0.to_le_bytes());
+    expected[20..22].copy_from_slice(&610_i16.to_le_bytes());
+    expected[22..24].copy_from_slice(&250_i16.to_le_bytes());
+    expected[24..26].copy_from_slice(&50_u16.to_le_bytes());
+    expected[26..28].copy_from_slice(&50_u16.to_le_bytes());
+    expected[32..34].copy_from_slice(&50_u16.to_le_bytes());
+    expected[34..36].copy_from_slice(&50_u16.to_le_bytes());
+    expected[40] = 22; // core ConfigureNotify follows Present
+    expected[44..48].copy_from_slice(&WINDOW.0.to_le_bytes());
+    expected[48..52].copy_from_slice(&WINDOW.0.to_le_bytes());
+    expected[56..58].copy_from_slice(&610_i16.to_le_bytes());
+    expected[58..60].copy_from_slice(&250_i16.to_le_bytes());
+    expected[60..62].copy_from_slice(&50_u16.to_le_bytes());
+    expected[62..64].copy_from_slice(&50_u16.to_le_bytes());
+    assert_eq!(bytes, expected, "no-policy Present and core event bytes");
+    assert_eq!(allow_bytes, expected, "recording-Allow expected bytes");
+    assert_eq!(allow_bytes, bytes, "recording-Allow parity");
+
     // Xorg dix/window.c invokes the Present ConfigNotify screen hook
     // before DeliverEvents sends the core ConfigureNotify. This ordering
-    // matters to clients which merge the two configure streams.
-    assert_eq!(bytes[0], 35, "GenericEvent");
-    assert_eq!(bytes[1], 145, "PRESENT major opcode");
-    assert_eq!(
-        u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
-        u16::from(x11present::EVENT_CONFIGURE_NOTIFY),
-    );
-    assert_eq!(
-        u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
-        PRESENT_EID,
-    );
-    assert_eq!(
-        u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
-        WINDOW.0,
-    );
-    assert_eq!(i16::from_le_bytes(bytes[20..22].try_into().unwrap()), 610);
-    assert_eq!(i16::from_le_bytes(bytes[22..24].try_into().unwrap()), 250);
-    assert_eq!(u16::from_le_bytes(bytes[24..26].try_into().unwrap()), 50);
-    assert_eq!(u16::from_le_bytes(bytes[26..28].try_into().unwrap()), 50);
-    assert_eq!(bytes[40] & 0x7f, 22, "core ConfigureNotify follows Present");
-    assert_eq!(
-        u32::from_le_bytes(bytes[48..52].try_into().unwrap()),
-        WINDOW.0,
-    );
-}
-
-// Keep the existing fixture test private while letting Task 8 rerun its
-// established no-policy/Allow byte comparison from a sibling module.
-pub(super) fn run_no_policy_parity_fixtures() {
-    configure_window_pure_move_emits_present_configure_notify();
+    // matters to clients which merge the two configure streams. The literal
+    // expected frame above pins order and every protocol field.
 }
 
 #[test]

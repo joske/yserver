@@ -160,6 +160,25 @@ fn literal_selection_notify(
     event
 }
 
+fn literal_synthetic_selection_notify(
+    order: ClientByteOrder,
+    sequence: u16,
+    time: u32,
+    requestor: ResourceId,
+    selection: AtomId,
+    target: AtomId,
+    property: AtomId,
+) -> Vec<u8> {
+    let mut event = literal_selection_notify(order, sequence, time, requestor, selection, target);
+    event[0] |= 0x80;
+    let property_bytes = match order {
+        ClientByteOrder::LittleEndian => property.0.to_le_bytes(),
+        ClientByteOrder::BigEndian => property.0.to_be_bytes(),
+    };
+    event[20..24].copy_from_slice(&property_bytes);
+    event
+}
+
 fn literal_selection_clear(
     order: ClientByteOrder,
     sequence: u16,
@@ -378,20 +397,6 @@ fn fixture_window_for_xfixes(fixture: &mut NotifyFixture, owner: ClientId) -> Re
     let window = ResourceId(0x0057_00f0 + owner.0);
     create_window(fixture, owner, window);
     window
-}
-
-// Keep existing fixture tests/helpers private while letting Task 8 rerun the
-// selection fixtures and compare XFIXES with denied core SelectionClear.
-pub(super) fn run_no_policy_parity_fixtures() {
-    receive_selection_clear_targets_previous_setter();
-    receive_selection_request_denied_answers_actual_requester();
-    receive_bridge_selection_denial_answers_requester();
-    receive_bridge_clear_denial_does_not_queue();
-    receive_rootless_outgoing_core_events_are_checked();
-}
-
-pub(super) fn run_denied_owner_refusal_fixture() {
-    receive_selection_request_denied_answers_actual_requester();
 }
 
 pub(super) fn run_xfixes_owner_change(
@@ -1232,6 +1237,8 @@ fn rootless_host_fixture() -> (NotifyFixture, ResourceId, rootless::ToplevelId) 
     fixture.state.clients.get_mut(&B.0).unwrap().byte_order = ClientByteOrder::BigEndian;
     let _ = fixture.drain(A);
     let _ = fixture.drain(B);
+    set_sequence(&mut fixture, A, 2);
+    set_sequence(&mut fixture, B, 0x1234);
     (fixture, HOST_WINDOW, id)
 }
 
@@ -1271,16 +1278,68 @@ fn receive_rootless_outgoing_core_events_are_checked() {
     );
     let baseline_a_move = baseline.drain(A);
     let baseline_b_move = baseline.drain(B);
-    assert!(
-        event_frames(&baseline_a_move)
-            .iter()
-            .any(|event| event[0] == (22 | 0x80))
-    );
-    assert!(
-        event_frames(&baseline_b_move)
-            .iter()
-            .any(|event| event[0] == (22 | 0x80))
-    );
+    for (client, event) in [(A, &baseline_a_move), (B, &baseline_b_move)] {
+        let frames = event_frames(event);
+        assert_eq!(
+            frames.len(),
+            2,
+            "two no-policy ConfigureNotify frames for {client:?}"
+        );
+        for (frame_index, frame) in frames.into_iter().enumerate() {
+            let expected_type = if frame_index == 0 { 22 } else { 22 | 0x80 };
+            assert_eq!(
+                frame[0], expected_type,
+                "ordinary then synthetic ConfigureNotify type"
+            );
+            if client == A {
+                assert_eq!(&frame[2..4], &2_u16.to_le_bytes());
+                assert_eq!(
+                    u32::from_le_bytes(frame[4..8].try_into().unwrap()),
+                    baseline_window.0
+                );
+                assert_eq!(
+                    u32::from_le_bytes(frame[8..12].try_into().unwrap()),
+                    baseline_window.0
+                );
+                assert_eq!(
+                    u32::from_le_bytes(frame[12..16].try_into().unwrap()),
+                    0x0000_0107
+                );
+                assert_eq!(
+                    (
+                        i16::from_le_bytes(frame[16..18].try_into().unwrap()),
+                        i16::from_le_bytes(frame[18..20].try_into().unwrap()),
+                        u16::from_le_bytes(frame[20..22].try_into().unwrap()),
+                        u16::from_le_bytes(frame[22..24].try_into().unwrap()),
+                    ),
+                    (30, 40, 100, 80)
+                );
+            } else {
+                assert_eq!(&frame[2..4], &0x1234_u16.to_be_bytes());
+                assert_eq!(
+                    u32::from_be_bytes(frame[4..8].try_into().unwrap()),
+                    baseline_window.0
+                );
+                assert_eq!(
+                    u32::from_be_bytes(frame[8..12].try_into().unwrap()),
+                    baseline_window.0
+                );
+                assert_eq!(
+                    u32::from_be_bytes(frame[12..16].try_into().unwrap()),
+                    0x0000_0107
+                );
+                assert_eq!(
+                    (
+                        i16::from_be_bytes(frame[16..18].try_into().unwrap()),
+                        i16::from_be_bytes(frame[18..20].try_into().unwrap()),
+                        u16::from_be_bytes(frame[20..22].try_into().unwrap()),
+                        u16::from_be_bytes(frame[22..24].try_into().unwrap()),
+                    ),
+                    (30, 40, 100, 80)
+                );
+            }
+        }
+    }
     assert_eq!(
         baseline.state.resources.window(baseline_window).unwrap().x,
         30
@@ -1294,6 +1353,11 @@ fn receive_rootless_outgoing_core_events_are_checked() {
     let baseline_close = baseline.drain(A);
     assert_eq!(baseline_close.len(), 32, "one complete ClientMessage");
     assert_eq!(event_frames(&baseline_close)[0][0], 33 | 0x80);
+    assert_eq!(
+        u32::from_le_bytes(baseline_close[12..16].try_into().unwrap()),
+        baseline.state.atoms.intern("WM_DELETE_WINDOW", false).0,
+        "no-policy WM_PROTOCOLS ClientMessage type"
+    );
     let baseline_requestor = ResourceId(0x0057_0011);
     create_window(&mut baseline, B, baseline_requestor);
     let baseline_selection = baseline
@@ -1317,7 +1381,19 @@ fn receive_rootless_outgoing_core_events_are_checked() {
             [baseline_selection, baseline_target, property_value],
         )
         .unwrap();
-        assert_eq!(baseline.drain(A).len(), 32);
+        assert_eq!(
+            baseline.drain(A),
+            literal_synthetic_selection_notify(
+                ClientByteOrder::LittleEndian,
+                2,
+                0x4455_6677,
+                baseline_window,
+                baseline_selection,
+                baseline_target,
+                property_value,
+            ),
+            "no-policy bridge-owned synthetic SelectionNotify"
+        );
         rootless::selection::send_selection_notify(
             &mut baseline.state,
             0x4455_6677,
@@ -1326,6 +1402,19 @@ fn receive_rootless_outgoing_core_events_are_checked() {
         )
         .unwrap();
         baseline_notify.push(baseline.drain(B));
+        assert_eq!(
+            baseline_notify.last().unwrap(),
+            &literal_synthetic_selection_notify(
+                ClientByteOrder::BigEndian,
+                0x1234,
+                0x4455_6677,
+                baseline_requestor,
+                baseline_selection,
+                baseline_target,
+                property_value,
+            ),
+            "no-policy socket-owned synthetic SelectionNotify"
+        );
     }
 
     let (mut control, window, id) = rootless_host_fixture();
@@ -1343,16 +1432,6 @@ fn receive_rootless_outgoing_core_events_are_checked() {
     let control_b_move = control.drain(B);
     assert_eq!(control_a_move, baseline_a_move);
     assert_eq!(control_b_move, baseline_b_move);
-    assert!(
-        event_frames(&control_a_move)
-            .iter()
-            .any(|event| event[0] == (22 | 0x80))
-    );
-    assert!(
-        event_frames(&control_b_move)
-            .iter()
-            .any(|event| event[0] == (22 | 0x80))
-    );
     assert_eq!(control.state.resources.window(window).unwrap().x, 30);
     let control_geometry = host_geometry(&control, window);
     let control_wm_state = host_wm_state(&mut control, window);

@@ -228,8 +228,9 @@ fn install_destroy_policy(
     })
 }
 
-// Mutations: return from the destroy loop on denial; perform the receive
-// check after deleting subscriptions/resources; use the top subject for every descendant.
+// Mutations: change a no-policy event field in production, return from the
+// destroy loop on denial, perform the receive check after resource deletion,
+// or use the top subject for every descendant.
 #[test]
 fn receive_destroy_denial_keeps_cleanup() {
     for opcode in [4, 5] {
@@ -238,6 +239,32 @@ fn receive_destroy_denial_keeps_cleanup() {
         run_destroy_request(&mut baseline, opcode);
         let baseline_denied_stream = baseline.drain(NOTIFY_RECEIVER_DENIED);
         let baseline_allowed_stream = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+        let expected_no_policy_allowed = if opcode == 4 {
+            vec![
+                (18, DESTROY_PARENT.0, DESTROY_PARENT.0),
+                (18, ROOT_WINDOW.0, DESTROY_PARENT.0),
+                (17, DESTROY_GRANDCHILD.0, DESTROY_GRANDCHILD.0),
+                (17, DESTROY_CHILD.0, DESTROY_GRANDCHILD.0),
+                (17, DESTROY_CHILD.0, DESTROY_CHILD.0),
+                (17, DESTROY_PARENT.0, DESTROY_CHILD.0),
+                (17, DESTROY_PARENT.0, DESTROY_PARENT.0),
+                (17, ROOT_WINDOW.0, DESTROY_PARENT.0),
+            ]
+        } else {
+            vec![
+                (18, DESTROY_CHILD.0, DESTROY_CHILD.0),
+                (18, DESTROY_PARENT.0, DESTROY_CHILD.0),
+                (17, DESTROY_GRANDCHILD.0, DESTROY_GRANDCHILD.0),
+                (17, DESTROY_CHILD.0, DESTROY_GRANDCHILD.0),
+                (17, DESTROY_CHILD.0, DESTROY_CHILD.0),
+                (17, DESTROY_PARENT.0, DESTROY_CHILD.0),
+            ]
+        };
+        assert_eq!(
+            event_tuples(&baseline_allowed_stream),
+            expected_no_policy_allowed,
+            "no-policy allowed destruction bytes"
+        );
 
         let mut control = destroy_fixture();
         install_destroy_policy(&mut control, false);
@@ -302,27 +329,7 @@ fn receive_destroy_denial_keeps_cleanup() {
         assert_eq!(event_tuples(&denied_stream), expected_denied);
         assert_eq!(
             event_tuples(&control_allowed_stream),
-            if opcode == 4 {
-                vec![
-                    (18, DESTROY_PARENT.0, DESTROY_PARENT.0),
-                    (18, ROOT_WINDOW.0, DESTROY_PARENT.0),
-                    (17, DESTROY_GRANDCHILD.0, DESTROY_GRANDCHILD.0),
-                    (17, DESTROY_CHILD.0, DESTROY_GRANDCHILD.0),
-                    (17, DESTROY_CHILD.0, DESTROY_CHILD.0),
-                    (17, DESTROY_PARENT.0, DESTROY_CHILD.0),
-                    (17, DESTROY_PARENT.0, DESTROY_PARENT.0),
-                    (17, ROOT_WINDOW.0, DESTROY_PARENT.0),
-                ]
-            } else {
-                vec![
-                    (18, DESTROY_CHILD.0, DESTROY_CHILD.0),
-                    (18, DESTROY_PARENT.0, DESTROY_CHILD.0),
-                    (17, DESTROY_GRANDCHILD.0, DESTROY_GRANDCHILD.0),
-                    (17, DESTROY_CHILD.0, DESTROY_GRANDCHILD.0),
-                    (17, DESTROY_CHILD.0, DESTROY_CHILD.0),
-                    (17, DESTROY_PARENT.0, DESTROY_CHILD.0),
-                ]
-            }
+            expected_no_policy_allowed
         );
         let calls = calls.lock().unwrap();
         let receives = receives(&calls);
@@ -467,6 +474,20 @@ fn receive_disconnect_destroy_notifies_survivors() {
         "the allow control has selected events"
     );
     assert_eq!(
+        event_tuples(&baseline_allowed_stream),
+        vec![
+            (18, DESTROY_PARENT.0, DESTROY_PARENT.0),
+            (18, ROOT_WINDOW.0, DESTROY_PARENT.0),
+            (17, DESTROY_GRANDCHILD.0, DESTROY_GRANDCHILD.0),
+            (17, DESTROY_CHILD.0, DESTROY_GRANDCHILD.0),
+            (17, DESTROY_CHILD.0, DESTROY_CHILD.0),
+            (17, DESTROY_PARENT.0, DESTROY_CHILD.0),
+            (17, DESTROY_PARENT.0, DESTROY_PARENT.0),
+            (17, ROOT_WINDOW.0, DESTROY_PARENT.0),
+        ],
+        "no-policy disconnect destruction bytes"
+    );
+    assert_eq!(
         event_tuples(&control_allowed_stream),
         vec![
             (18, DESTROY_PARENT.0, DESTROY_PARENT.0),
@@ -593,6 +614,14 @@ fn receive_cow_notifications_keep_extension_request() {
     dispatch_composite(&mut baseline, NOTIFY_SENDER, 70, 7);
     let baseline_requestor_get = baseline.drain(NOTIFY_SENDER);
     let baseline_create_events = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+    assert_eq!(
+        event_tuples(&baseline_create_events),
+        vec![
+            (16, ROOT_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
+            (19, ROOT_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
+        ],
+        "no-policy COW create/map notifications"
+    );
 
     let mut control = NotifyFixture::new();
     select_cow_notifications(&mut control);
@@ -781,6 +810,16 @@ fn receive_last_cow_claim_disconnect_uses_no_request() {
     }
     process_disconnect(&mut baseline.state, &mut baseline.backend, NOTIFY_SENDER);
     let baseline_release_allowed = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+    assert_eq!(
+        event_tuples(&baseline_release_allowed),
+        vec![
+            (18, COMPOSITE_OVERLAY_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
+            (18, ROOT_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
+            (17, COMPOSITE_OVERLAY_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
+            (17, ROOT_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
+        ],
+        "no-policy COW unmap/destroy notifications"
+    );
 
     let mut control = NotifyFixture::new();
     select_cow_notifications(&mut control);
@@ -849,13 +888,4 @@ fn receive_last_cow_claim_disconnect_uses_no_request() {
     );
     assert!(receives.iter().all(|call| call.request.is_none()));
     assert!(receives.iter().all(|call| call.client != NOTIFY_SENDER));
-}
-
-// Keep existing fixture tests private while letting the Task 8 parity test
-// rerun these established no-policy/Allow comparisons from its sibling module.
-pub(super) fn run_no_policy_parity_fixtures() {
-    receive_destroy_denial_keeps_cleanup();
-    receive_disconnect_destroy_notifies_survivors();
-    receive_cow_notifications_keep_extension_request();
-    receive_last_cow_claim_disconnect_uses_no_request();
 }

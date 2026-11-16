@@ -343,51 +343,6 @@ fn receive_calls(calls: &[RecordedExtensionCheck]) -> Vec<&RecordedExtensionChec
         .collect()
 }
 
-fn present_configure_bytes(allow_policy: bool) -> Vec<u8> {
-    const WINDOW: ResourceId = ResourceId(0x200);
-    const PRESENT_EID: u32 = 0x0010_0042;
-    let (mut state, mut peer) = two_children_under_root();
-    state
-        .clients
-        .get_mut(&1)
-        .unwrap()
-        .event_masks
-        .insert(WINDOW, 0x0002_0000);
-    state.present_event_selections.insert(
-        PRESENT_EID,
-        PresentEventSelection {
-            owner: ClientId(1),
-            window: WINDOW,
-            event_mask: x11present::EVENT_MASK_CONFIGURE_NOTIFY,
-        },
-    );
-    let _ = read_all_available(&mut peer);
-    if allow_policy {
-        state.install_access_policy(std::sync::Arc::new(
-            super::extensions::RecordingExtensionPolicy::new(
-                Decision::Allow,
-                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            ),
-        ));
-    }
-    let body = cw_restack_body(WINDOW.0, 0x0003, &[610, 250]);
-    let mut backend = RecordingBackend::new();
-    handle_configure_window(
-        &mut state,
-        &mut backend,
-        None,
-        ClientId(1),
-        SequenceNumber(1),
-        crate::access::RequestOpcodes {
-            major: 12,
-            minor: 0,
-        },
-        &body,
-    )
-    .expect("handle_configure_window for Present parity");
-    read_all_available(&mut peer)
-}
-
 // Mutations: add Receive before emit_copy_exposures' mutable client borrow;
 // check MappingNotify at its fanout caller; classify failure SelectionNotify as a notification.
 #[test]
@@ -467,10 +422,6 @@ fn receive_exempt_results_and_mapping_bypass_policy() {
             denied.calls
         );
     }
-
-    // Task 7's dispatch fixture pins that the absent/denied-owner direct
-    // SelectionNotify(None) answer receives no code-31 Receive check.
-    super::access_notify_selection::run_denied_owner_refusal_fixture();
 }
 
 fn buffered_property_output(allow_policy: bool) -> Vec<u8> {
@@ -620,57 +571,30 @@ fn synthetic_selection_notify(allow_policy: bool) -> (Vec<u8>, Vec<RecordedExten
     (output, calls)
 }
 
-// Mutations: force synthetic-bit/sequence fields to constants; gate the old
-// writers; drop a later extension event; suppress N38 ColormapNotify only
-// when no policy is installed. Every advertised site includes an empty-policy
-// run, independent expected bytes, and recording-Allow parity.
+// Mutation: make a synthetic SelectionNotify lose its synthetic bit.
 #[test]
-fn receive_no_policy_core_bytes_match_baseline() {
-    let fixtures: &[(&str, fn())] = &[
-        (
-            "N01–N30 window notifications and redirects",
-            super::access_notify_windows::run_no_policy_parity_fixtures,
-        ),
-        (
-            "N31–N36 destruction and COW notifications",
-            super::access_notify_lifecycle::run_no_policy_parity_fixtures,
-        ),
-        (
-            "N37–N38/N47 focus, colormap, and property",
-            super::access_notify_objects::run_no_policy_parity_fixtures,
-        ),
-        (
-            "N39 property fanout",
-            super::access_notify_egress::run_no_policy_parity_fixtures,
-        ),
-        (
-            "N40–N46 selection and rootless notifications",
-            super::access_notify_selection::run_no_policy_parity_fixtures,
-        ),
-        (
-            "Present before core ConfigureNotify",
-            super::present_pixmap::run_no_policy_parity_fixtures,
-        ),
-    ];
-    assert_eq!(fixtures.len(), 6, "enumerated no-policy fixture groups");
+fn receive_no_policy_aggregate_paths_match_expected_bytes() {
     let (synthetic_baseline, _) = synthetic_selection_notify(false);
     let (synthetic_allow, synthetic_calls) = synthetic_selection_notify(true);
-    assert_eq!(synthetic_allow, synthetic_baseline);
+    assert_eq!(
+        synthetic_baseline[0],
+        31 | 0x80,
+        "no-policy synthetic SelectionNotify has its send-event bit"
+    );
+    assert_eq!(
+        synthetic_allow, synthetic_baseline,
+        "recording-Allow synthetic SelectionNotify parity"
+    );
     assert_eq!(receive_calls(&synthetic_calls).len(), 1);
     assert_eq!(
         receive_calls(&synthetic_calls)[0].events,
         Some(vec![EventDescription::core(31)])
     );
-    for (_row, run) in fixtures {
-        run();
-    }
-    receive_exempt_results_and_mapping_bypass_policy();
-    receive_deny_all_keeps_later_extension_writers();
-    buffered_property_output(false);
-    buffered_property_output(true);
+    let buffered_baseline = buffered_property_output(false);
+    let buffered_allow = buffered_property_output(true);
     assert_eq!(
-        present_configure_bytes(false),
-        present_configure_bytes(true)
+        buffered_allow, buffered_baseline,
+        "recording-Allow buffered PropertyNotify parity"
     );
 }
 

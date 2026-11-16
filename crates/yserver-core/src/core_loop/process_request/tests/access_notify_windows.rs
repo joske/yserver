@@ -510,8 +510,9 @@ fn structure_snapshot(fixture: &NotifyFixture) -> Vec<StructureSnapshotRow> {
     .collect()
 }
 
-// Mutations: use the ancestor subject for descendant Expose; return on the first denial;
-// and ask policy for an unknown host XID or an unsubscribed target.
+// Mutations: change an Expose field in production; use the ancestor subject for
+// descendant Expose; return on the first denial; and ask policy for an unknown
+// host XID or an unsubscribed target.
 #[test]
 fn receive_host_expose_checks_each_delivery_window() {
     fn fixture() -> NotifyFixture {
@@ -1505,6 +1506,30 @@ fn receive_structure_subject_is_delivery_window() {
                 reparent: delivery.reparent,
             })
             .collect();
+        let expected_no_policy_denied: Vec<_> = expected_allowed
+            .iter()
+            .map(|event| StructureEvent {
+                sequence: 0x1234,
+                event_type: event.event_type,
+                delivery_window: event.delivery_window,
+                affected_window: event.affected_window,
+                reparent: event.reparent,
+            })
+            .collect();
+        assert_eq!(
+            decode_structure_events(&baseline_allowed, ClientByteOrder::LittleEndian),
+            expected_allowed,
+            "{} no-policy allowed events; IDs {:?}",
+            case.name,
+            case.deliveries.iter().map(|d| d.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            decode_structure_events(&baseline_denied, ClientByteOrder::BigEndian),
+            expected_no_policy_denied,
+            "{} no-policy denied events; IDs {:?}",
+            case.name,
+            case.deliveries.iter().map(|d| d.id).collect::<Vec<_>>()
+        );
         assert_eq!(
             decode_structure_events(&allow_allowed, ClientByteOrder::LittleEndian),
             expected_allowed,
@@ -1671,6 +1696,26 @@ fn receive_reparent_preserves_three_targets_and_order() {
             reparent: None,
         },
     ];
+    assert_eq!(
+        decode_structure_events(&baseline_allowed_client, ClientByteOrder::LittleEndian),
+        expected_allow,
+        "no-policy ReparentNotify and structure bytes"
+    );
+    let expected_baseline_denied: Vec<_> = expected_allow
+        .iter()
+        .map(|event| StructureEvent {
+            sequence: 0x1234,
+            event_type: event.event_type,
+            delivery_window: event.delivery_window,
+            affected_window: event.affected_window,
+            reparent: event.reparent,
+        })
+        .collect();
+    assert_eq!(
+        decode_structure_events(&baseline_denied_client, ClientByteOrder::BigEndian),
+        expected_baseline_denied,
+        "no-policy big-endian ReparentNotify and structure bytes"
+    );
     let allow_denied_client = allow.drain(NOTIFY_RECEIVER_DENIED);
     let allow_allowed_client = allow.drain(NOTIFY_RECEIVER_ALLOWED);
     assert_eq!(
@@ -1961,6 +2006,28 @@ fn receive_gravity_denial_keeps_child_move() {
     ));
     let baseline_denied = baseline.drain(NOTIFY_RECEIVER_DENIED);
     let baseline_allowed = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+    assert_eq!(
+        decode_structure_events(&baseline_denied, ClientByteOrder::BigEndian),
+        vec![StructureEvent {
+            event_type: 24,
+            sequence: 0x1234,
+            delivery_window: CHILD_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        }],
+        "no-policy GravityNotify for denied recipient"
+    );
+    assert_eq!(
+        decode_structure_events(&baseline_allowed, ClientByteOrder::LittleEndian),
+        vec![StructureEvent {
+            event_type: 24,
+            sequence: 0x5678,
+            delivery_window: PARENT_WINDOW,
+            affected_window: CHILD_WINDOW,
+            reparent: None,
+        }],
+        "no-policy GravityNotify for allowed recipient"
+    );
 
     let mut allow = fixture();
     allow.install_policy(|_, _| Decision::Allow);
@@ -2523,20 +2590,4 @@ fn receive_redirect_revocation_still_redirects() {
             assert_eq!(call.request, request_opcodes(case.request_opcode, 0));
         }
     }
-}
-
-// Keep existing fixture tests private while letting the Task 8 parity test
-// rerun these established no-policy/Allow comparisons from its sibling module.
-pub(super) fn run_no_policy_parity_fixtures() {
-    receive_host_expose_checks_each_delivery_window();
-    receive_clear_area_expose_denial_keeps_paint();
-    receive_map_visibility_denial_keeps_descendant_walk();
-    receive_expose_rectangles_keep_counts_and_collapse();
-    receive_structure_subject_is_delivery_window();
-    receive_reparent_preserves_three_targets_and_order();
-    receive_gravity_denial_keeps_child_move();
-    receive_structure_noop_does_not_ask();
-    receive_redirect_denial_preserves_redirection();
-    receive_redirect_does_not_check_unselected_clients();
-    receive_redirect_revocation_still_redirects();
 }
