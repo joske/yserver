@@ -1422,7 +1422,7 @@ fn host_wm_state(fixture: &mut NotifyFixture, window: ResourceId) -> Option<Vec<
 
 // Mutations: format 32->16 for ClientMessage; invert synthetic
 // ConfigureNotify override_redirect; bypass raw checks; describe sent type
-// without bit 7; exempt host SelectionNotify(None); or let ClientMessage time
+// with bit 7; exempt host SelectionNotify(None); or let ClientMessage time
 // escape its fixture bounds.
 #[test]
 fn receive_rootless_outgoing_core_events_are_checked() {
