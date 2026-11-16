@@ -99,8 +99,8 @@ Invariants:
   - Merge the two PR 4b entries (Task 3, Task 8) into one entry: "PR 4b: Receive checks on core notifications (#369)". Keep the facts (47 sites, exemptions, `ResizeRedirect` gap, remaining 4c–4e work) and add one line for this follow-up.
   - Remove the duplicate PR 4a entry (two identical lines).
   - Drop the "Full details … report" sentences from the access-control entries; those files are not in the repo.
-- [ ] **Step 2: Citations.** In the five access-control plans, replace the local path `/data/Projects/xorg-21.1.24` with `../xserver` (tag `xorg-server-21.1.24`).
-- [ ] **Step 3: Check** `grep -rn "/data/Projects" docs/superpowers/plans/*access-control*` (expected: no output), `grep -n "PR 4b" docs/status.md` (expected: one entry) and `tools/check-layout.sh` (expected: pass).
+- [ ] **Step 2: Citations.** In the five access-control plans, replace the local absolute Xorg path with `../xserver` (tag `xorg-server-21.1.24`).
+- [ ] **Step 3: Check** `grep -rn "/data/Projects" docs/superpowers/plans/*access-control*` (expected: no output other than this check line), `grep -n "PR 4b" docs/status.md` (expected: one entry) and `tools/check-layout.sh` (expected: pass).
 - [ ] **Step 4: Commit** `docs: one PR 4b status entry, repo-relative Xorg citations`.
 
 ### Gate

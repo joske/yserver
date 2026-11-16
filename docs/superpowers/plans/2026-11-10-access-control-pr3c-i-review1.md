@@ -12,7 +12,7 @@ differences from Xorg (including the GLX window alias, which is documented rathe
 
 **Spec:** `docs/superpowers/specs/2026-10-30-access-control-layer-design.md`; base plan
 `docs/superpowers/plans/2026-11-09-access-control-pr3c-i.md`. Reference (MIT): Xorg 21.1.24 at
-`/data/Projects/xorg-drivers/xserver`, XLibre at `/data/Projects/xlibre`.
+`../xserver` (tag `xorg-server-21.1.24`), XLibre at `../xlibre`.
 
 ## Global Constraints
 

@@ -16,7 +16,7 @@ plans 4b–4e (core notifications; input and keyboard; extensions; RANDR, RECORD
 **Spec:** `docs/superpowers/specs/2026-10-30-access-control-layer-design.md`, series row 4 ("What a policy can see",
 "A denial is interpreted by its site", "Who is checked", "Where the checks go" → Receive / Send / XTEST).
 
-**Reference:** Xorg (MIT) at `/data/Projects/xorg-drivers/xserver`; paths below are relative to it. Where the spec
+**Reference:** Xorg (MIT) at `../xserver` (tag `xorg-server-21.1.24`); paths below are relative to it. Where the spec
 decides, the spec binds; where it is silent, Xorg's behaviour is followed (user ruling 2026-11-11).
 
 **Source inventory:** `~/Projects/claude-scratch/access-control/pr4/inventory.md` (taken at `d14eaecb`), §1, §2, §4,

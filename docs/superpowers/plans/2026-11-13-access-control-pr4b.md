@@ -16,7 +16,7 @@ SelectionRequest. No new policy interface or authorization mode.
 **Spec:** `docs/superpowers/specs/2026-10-30-access-control-layer-design.md`, “What a policy can see”, “A denial is
 interpreted by its site”, “Who is checked”, “Where the checks go” → Receive, including the merged 4a/follow-up rulings.
 
-**Reference:** Xorg (MIT), **xorg-server 21.1.24**, `/data/Projects/xorg-21.1.24`. Every Xorg path and line below refers
+**Reference:** Xorg (MIT), **xorg-server 21.1.24**, `../xserver` at tag `xorg-server-21.1.24`. Every Xorg path and line below refers
 to that tree, rechecked for this plan. The spec binds where it decides; otherwise follow Xorg. No XLibre reference.
 
 **Source inventory:** `/home/ariel_santangelo/Projects/claude-scratch/access-control/pr4/inventory.md`, taken at

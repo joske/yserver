@@ -18,7 +18,7 @@ and every `AccessMode` bit used below.
 round, 3c-i (`2026-11-09-access-control-pr3c-i.md`) and its review round (`2026-11-10-access-control-pr3c-i-review1.md`)
 are the earlier parts of the same row.
 
-**Reference:** Xorg (MIT) at `/data/Projects/xorg-drivers/xserver` (`eae2c21`); file paths below are relative to it.
+**Reference:** Xorg (MIT) at `../xserver` (tag `xorg-server-21.1.24`, `eae2c21`); file paths below are relative to it.
 The source inventory cites XLibre lines; the access modes in these files are the same in Xorg (compared per file). Where the plan states an order, the reviewer checks it against Xorg.
 
 **Source inventory:** `~/Projects/claude-scratch/access-control/pr3c/inventory.md` (taken at `f83615a4`; the RANDR,

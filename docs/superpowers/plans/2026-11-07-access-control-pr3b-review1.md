@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust; `yserver-core` (`core_loop::process_request`, `resources`, `backend` trait, `RecordingBackend`); `yserver` KMS backend (`kms/render/backend/portable/cursor.rs`).
 
-**Spec:** `docs/superpowers/specs/2026-10-30-access-control-layer-design.md`; base plan `docs/superpowers/plans/2026-11-06-access-control-pr3b.md`. Reference (MIT, behaviour and code may be read): `/data/Projects/xlibre`.
+**Spec:** `docs/superpowers/specs/2026-10-30-access-control-layer-design.md`; base plan `docs/superpowers/plans/2026-11-06-access-control-pr3b.md`. Reference (MIT, behaviour and code may be read): `../xlibre`.
 
 ## Global Constraints
 
