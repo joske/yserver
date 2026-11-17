@@ -163,9 +163,10 @@ once next to `FIRST_CLIENT_BASE`:
   the replies advertise for backend modes** (today the synthesized `"WxH"`),
   so `--newmode 1920x1080 …` fails with BadName when a probed 1920x1080 mode
   is listed, as on Xorg. Window lookup goes through the existing access path
-  with GetAttr. The policy hook asks `CREATE` on the new mode id before insertion,
-  if that is how the resource layer treats other new objects (to check
-  against the access-control spec; Xorg's `AddResource` asks nothing). Reply
+  with GetAttr. Then the policy is asked `CREATE` on the new mode id
+  (`ResourceKind::RandrMode`, owner `SERVER_OWNER`) before insertion; a denial
+  answers the policy's error and nothing is stored. The mode is recorded as
+  owned by `SERVER_OWNER`. Reply
   `mode = id`. No events.
 - **DestroyMode:** unknown id → BadRRMode; a backend mode → BadMatch;
   referenced → BadAccess; else remove. Existing `DESTROY` access check stays
@@ -186,8 +187,8 @@ once next to `FIRST_CLIENT_BASE`:
   Add CreateMode: window, then the `ModeInfo` id, width, height, dotClock,
   h/v sync start/end/total, nameLength and modeFlags; the name is untouched
   (`SProcRRCreateMode`, `randr/rrsdispatch.c:221-246`). Xorg does **not** swap
-  `hSkew` there; we do, a deliberate divergence that only changes a
-  big-endian client's nonzero skew (Xorg would use the byte-swapped value).
+  `hSkew` there, and we match it: a big-endian client's skew arrives
+  byte-swapped, as on Xorg.
   Tests feed big-endian wire data for all four requests through
   `swap_request_body`.
 - `access_resource_owner` recognizes user modes in the new store (owner
@@ -215,9 +216,9 @@ RANDR notifications (`run.rs:4121`), SetCrtcConfig validation, and the
 - A backend id that the projection replaced by a user mode is not advertised
   anywhere (replies or events), so clients only ever see one id per CRTC.
 
-This needs the backend to report the **full** programmed timing: `ModeTiming`
-gains `hskew` and keeps all `FLAG_BITS` (the KMS `mode_timing` and
-`ModeIdentity` stop masking to six bits). VidMode's `GetModeLine` forwards
+This needs the backend to report the **full** programmed timing: the
+platform `drm::Mode`, `ModeIdentity` and `ModeTiming` all carry `hskew`, and
+keep all `FLAG_BITS` (the KMS `mode_timing` stops masking to six bits). VidMode's `GetModeLine` forwards
 `mode_flags` verbatim and the `V_*` namespace diverges above bit 10
 (`randr.rs:111-118`), so VidMode masks to the six shared bits itself before
 it encodes; that keeps its current bytes.
@@ -249,6 +250,13 @@ it encodes; that keeps its current bytes.
   `resolve_connector_enable` accept it. The existing `TEST_ONLY` commit runs
   first; a refusal becomes `Err`, which the core already answers with
   `RRSetConfigFailed`. Nothing else changes in the commit path.
+- **Change detection compares full timing.** `apply_crtc_config` treats an
+  unchanged `(w, h, vrefresh, x, y)` as a no-op (`kms/crtc_config.rs:996`),
+  and `PerCrtcChange::classify` treats an unchanged `(w, h, vrefresh)` as
+  position-only (`:1302`). A user mode with the same nominal size and refresh
+  but different sync timing would then succeed without being programmed. Both
+  compare the effective timing (the `ModeIdentity` of the programmed mode
+  against the requested one) instead; `ConnectorConfig::Enabled` carries it.
 - **The programmed mode must survive** rescans, VT resume and DPMS. Today
   `ConnectorConfig::Enabled` stores only w/h/refresh (`kms/state.rs:1103-1114`),
   while relighting uses the stored `layout.output.mode` (`kms/session.rs:679`,
@@ -327,6 +335,10 @@ it encodes; that keeps its current bytes.
   empty name, type 0).
 - SetCrtcConfig with a user mode not in the connector list reaches the
   commit; a `TEST_ONLY` refusal gives `RRSetConfigFailed`.
+- A user mode with the same width, height and refresh as the current mode
+  but different sync timing is programmed, both at the same position (not a
+  no-op) and at a changed position (not position-only).
+- `hskew` round-trips through `drm::Mode`, `ModeIdentity` and `ModeTiming`.
 - The programmed user mode survives a rescan, VT suspend/resume and DPMS
   off/on (the `per_crtc_config.rs` and `tests/randr.rs` fixtures).
 
