@@ -102,8 +102,8 @@ output BadAccess.
   outputs, CRTCs, modes and providers have been handed out, and aliases the
   root window. Surface (`3`, `4..`) and nested (`1..=3`) ids stay small.
 - SetCrtcConfig already maps a backend `Err` to `RRSetConfigFailed`
-  (`randr_ext/crtc.rs:930-934`) and already runs a `TEST_ONLY` commit on KMS
-  (`drm/modeset.rs:1809-1821`).
+  (`randr_ext/crtc.rs:930-934`); KMS runs `TEST_ONLY` only in the PRIME
+  qualifier helper (`drm/modeset.rs:1809-1821`).
 - Client monitors (`SetMonitor`) already live outside `RandrState`, in
   `ServerState::randr_client_monitors`, for the same rebuild reason
   (`randr.rs:1077-1080`). A server reset seeds a fresh `ServerState`
@@ -247,9 +247,13 @@ it encodes; that keeps its current bytes.
   resolving it in the connector's list: empty name, `type = 0`, `vrefresh`
   left for the kernel, as Xorg. The connector-list re-checks in
   `kms/crtc_config.rs` (`:497`, `:682-693`) and
-  `resolve_connector_enable` accept it. The existing `TEST_ONLY` commit runs
-  first; a refusal becomes `Err`, which the core already answers with
-  `RRSetConfigFailed`. Nothing else changes in the commit path.
+  `resolve_connector_enable` accept it. On the normal (same-device) path the
+  modeset is a real `ALLOW_MODESET` commit; `TEST_ONLY` runs only in the PRIME
+  qualifier helper. A refused atomic commit changes nothing, and the error
+  becomes `Err`, which the core already answers with `RRSetConfigFailed`; the
+  global-quiesce fallback relights the previous configuration. Xorg's
+  `drmmode_set_mode_major` does no `TEST_ONLY` either. Nothing else changes in
+  the commit path.
 - **Change detection compares full timing.** `apply_crtc_config` treats an
   unchanged `(w, h, vrefresh, x, y)` as a no-op (`kms/crtc_config.rs:996`),
   and `PerCrtcChange::classify` treats an unchanged `(w, h, vrefresh)` as
