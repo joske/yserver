@@ -11,8 +11,11 @@ use std::{
 };
 
 use ash::vk;
-use yserver_core::backend::{
-    CrtcConfigToken, PixmapHandle, PresentScanoutCandidate, identity_ramp, resample_channel,
+use yserver_core::{
+    backend::{
+        CrtcConfigToken, PixmapHandle, PresentScanoutCandidate, identity_ramp, resample_channel,
+    },
+    server::{RANDR_BACKEND_XID_FIRST, RANDR_BACKEND_XID_LAST},
 };
 
 use crate::{
@@ -1054,9 +1057,16 @@ pub(in crate::kms::render::backend) enum ScanoutM1Reject {
 /// `client_configured` bit, and the last-known advertised mode list.
 /// The rescan/resume layout-preservation rule and `apply_crtc_config`
 /// key off this; the core only sees the resulting `Vec<RandrOutput>`.
-#[derive(Debug, Default)]
+///
+/// Ids come from [`RANDR_BACKEND_XID_FIRST`]`..=`[`RANDR_BACKEND_XID_LAST`]
+/// and never leave it. Once the range is used up, [`Self::fresh`] answers
+/// [`RANDR_ID_EXHAUSTED`] and the projection leaves out whatever got it.
+#[derive(Debug)]
 pub(crate) struct RandrIdAllocator {
+    /// The next id to hand out; past [`RANDR_BACKEND_XID_LAST`] when the
+    /// range is used up.
     pub(in crate::kms::render::backend) next: u32,
+    pub(in crate::kms::render::backend) exhaustion_logged: bool,
     pub(in crate::kms::render::backend) providers: HashMap<RandrProviderEndpoint, u32>,
     pub(in crate::kms::render::backend) connectors: HashMap<OutputKey, ConnectorEntry>,
     pub(in crate::kms::render::backend) modes: HashMap<ModeIdentity, u32>,
@@ -1110,6 +1120,9 @@ pub(crate) enum ConnectorConfig {
         vrefresh: u32,
         x: i32,
         y: i32,
+        /// The full timing: a user mode can share size and refresh with
+        /// the mode it replaces.
+        timing: crate::platform::drm::ModeIdentity,
     },
 }
 
@@ -1243,10 +1256,39 @@ impl GammaLut {
     }
 }
 
+/// What [`RandrIdAllocator::fresh`] answers once the backend range is used
+/// up: RANDR's `None`, which is no resource's XID.
+pub(crate) const RANDR_ID_EXHAUSTED: u32 = 0;
+
+impl Default for RandrIdAllocator {
+    fn default() -> Self {
+        Self {
+            next: RANDR_BACKEND_XID_FIRST,
+            exhaustion_logged: false,
+            providers: HashMap::new(),
+            connectors: HashMap::new(),
+            modes: HashMap::new(),
+        }
+    }
+}
+
 impl RandrIdAllocator {
+    /// A new id in the backend range, or [`RANDR_ID_EXHAUSTED`] once the
+    /// range is used up: it never wraps or saturates into another range.
     pub(in crate::kms::render::backend) fn fresh(&mut self) -> u32 {
-        self.next = self.next.saturating_add(1);
-        self.next
+        if !(RANDR_BACKEND_XID_FIRST..=RANDR_BACKEND_XID_LAST).contains(&self.next) {
+            if !self.exhaustion_logged {
+                self.exhaustion_logged = true;
+                log::error!(
+                    "RANDR backend ids {RANDR_BACKEND_XID_FIRST:#x}..={RANDR_BACKEND_XID_LAST:#x} \
+                     used up: new outputs, CRTCs, modes and providers are not advertised"
+                );
+            }
+            return RANDR_ID_EXHAUSTED;
+        }
+        let id = self.next;
+        self.next += 1;
+        id
     }
 
     pub(in crate::kms::render::backend) fn provider_id_for(

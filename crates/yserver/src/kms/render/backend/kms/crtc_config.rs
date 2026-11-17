@@ -12,6 +12,7 @@ use crate::{
         scanout_route::{RenderKmsRelationship, ScanoutRoute},
         vk::scanout::OutputScanout,
     },
+    platform::drm::ModeIdentity,
 };
 use std::{collections::HashSet, io, os::fd::AsFd as _, rc::Rc};
 use yserver_core::backend::{Backend as _, CrtcConfigApply, CrtcConfigToken};
@@ -491,11 +492,13 @@ impl KmsBackend {
         if !entry.connected {
             return Some(format!("connector {} disconnected", pending.connector));
         }
-        if !entry.modes.iter().any(|candidate| {
-            candidate.width == pending.mode.width
-                && candidate.height == pending.mode.height
-                && candidate.vrefresh == pending.mode.vrefresh
-        }) {
+        if pending.mode.user_timing.is_none()
+            && !entry.modes.iter().any(|candidate| {
+                candidate.width == pending.mode.width
+                    && candidate.height == pending.mode.height
+                    && candidate.vrefresh == pending.mode.vrefresh
+            })
+        {
             return Some(format!(
                 "connector {} no longer advertises {}x{}@{}",
                 pending.connector, pending.mode.width, pending.mode.height, pending.mode.vrefresh
@@ -596,25 +599,8 @@ impl KmsBackend {
             ));
         }
 
-        let requested = ConnectorConfig::Enabled {
-            mode_w: mode_spec.width,
-            mode_h: mode_spec.height,
-            vrefresh: mode_spec.vrefresh,
-            x,
-            y,
-        };
-        let current = self
-            .platform
-            .outputs
-            .iter()
-            .find(|layout| layout.key == output_key)
-            .map_or(ConnectorConfig::Off, |layout| ConnectorConfig::Enabled {
-                mode_w: layout.width,
-                mode_h: layout.height,
-                vrefresh: layout.output.picked.vrefresh,
-                x: layout.x,
-                y: layout.y,
-            });
+        let requested = self.requested_connector_config(&output_key, Some(mode_spec), x, y);
+        let current = self.current_connector_config(&output_key);
         if current == requested {
             return self
                 .apply_crtc_config(output_id, connector, mode, x, y)
@@ -679,11 +665,13 @@ impl KmsBackend {
                 ),
             ));
         }
-        if !prepared_output.modes.iter().any(|candidate| {
-            candidate.width == mode_spec.width
-                && candidate.height == mode_spec.height
-                && candidate.vrefresh == mode_spec.vrefresh
-        }) {
+        if mode_spec.user_timing.is_none()
+            && !prepared_output.modes.iter().any(|candidate| {
+                candidate.width == mode_spec.width
+                    && candidate.height == mode_spec.height
+                    && candidate.vrefresh == mode_spec.vrefresh
+            })
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -832,14 +820,9 @@ impl KmsBackend {
             .sync_output_count(self.platform.outputs.len());
 
         {
+            let config = self.current_connector_config(&pending.output_key);
             let entry = self.pstate.randr_id_alloc.entry_mut(&pending.output_key);
-            entry.config = ConnectorConfig::Enabled {
-                mode_w: pending.mode.width,
-                mode_h: pending.mode.height,
-                vrefresh: pending.mode.vrefresh,
-                x: pending.x,
-                y: pending.y,
-            };
+            entry.config = config;
             entry.client_configured = true;
             entry.connected = true;
         }
@@ -971,28 +954,8 @@ impl KmsBackend {
         // request against the ACTUAL current scanout state (`platform.outputs`
         // is the source of truth) and no-op when nothing changed, so only a
         // genuine mode/position/on-off change pays the modeset cost.
-        let requested = match mode {
-            None => ConnectorConfig::Off,
-            Some(m) => ConnectorConfig::Enabled {
-                mode_w: m.width,
-                mode_h: m.height,
-                vrefresh: m.vrefresh,
-                x,
-                y,
-            },
-        };
-        let current = self
-            .platform
-            .outputs
-            .iter()
-            .find(|layout| layout.key == output_key)
-            .map_or(ConnectorConfig::Off, |l| ConnectorConfig::Enabled {
-                mode_w: l.width,
-                mode_h: l.height,
-                vrefresh: l.output.picked.vrefresh,
-                x: l.x,
-                y: l.y,
-            });
+        let requested = self.requested_connector_config(&output_key, mode, x, y);
+        let current = self.current_connector_config(&output_key);
         if current == requested {
             log::debug!(
                 "apply_crtc_config: {connector} already at requested config ({requested:?}); no-op"
@@ -1199,7 +1162,7 @@ impl KmsBackend {
                     return Err(self.recover_failed_crtc_config(restore_old_on_failure, e));
                 }
 
-                self.record_crtc_config_enabled(&output_key, mode_spec, x, y);
+                self.record_crtc_config_enabled(&output_key);
 
                 log::info!(
                     "apply_crtc_config: enabled {connector} {}×{}@{} at ({x},{y})",
@@ -1290,16 +1253,20 @@ impl PerCrtcChange {
                     mode_w,
                     mode_h,
                     vrefresh,
+                    timing,
                     ..
                 },
                 ConnectorConfig::Enabled {
                     mode_w: new_w,
                     mode_h: new_h,
                     vrefresh: new_vrefresh,
+                    timing: new_timing,
                     ..
                 },
                 Some(_),
-            ) if (mode_w, mode_h, vrefresh) == (new_w, new_h, new_vrefresh) => Some(Self::Position),
+            ) if (mode_w, mode_h, vrefresh, timing) == (new_w, new_h, new_vrefresh, new_timing) => {
+                Some(Self::Position)
+            }
             (ConnectorConfig::Enabled { .. }, ConnectorConfig::Enabled { .. }, Some(_)) => {
                 Some(Self::Mode)
             }
@@ -1320,21 +1287,83 @@ impl PerCrtcChange {
 }
 
 impl KmsBackend {
-    fn record_crtc_config_enabled(
-        &mut self,
+    /// The live configuration of `output_key`: the programmed mode's full
+    /// timing and the CRTC's origin; `Off` without a live route.
+    pub(in crate::kms::render::backend) fn current_connector_config(
+        &self,
         output_key: &OutputKey,
-        mode_spec: yserver_core::backend::ModeSpec,
+    ) -> ConnectorConfig {
+        self.platform
+            .outputs
+            .iter()
+            .find(|layout| layout.key == *output_key)
+            .map_or(ConnectorConfig::Off, |layout| ConnectorConfig::Enabled {
+                mode_w: layout.width,
+                mode_h: layout.height,
+                vrefresh: layout.output.picked.vrefresh,
+                x: layout.x,
+                y: layout.y,
+                timing: ModeIdentity::from(&layout.output.picked),
+            })
+    }
+
+    /// The configuration a request asks for, with the timing it would
+    /// program: a user timing as given, an advertised mode as the
+    /// connector lists it (the live mode when the list no longer has it).
+    pub(in crate::kms::render::backend) fn requested_connector_config(
+        &self,
+        output_key: &OutputKey,
+        mode: Option<yserver_core::backend::ModeSpec>,
         x: i32,
         y: i32,
-    ) {
-        let entry = self.pstate.randr_id_alloc.entry_mut(output_key);
-        entry.config = ConnectorConfig::Enabled {
-            mode_w: mode_spec.width,
-            mode_h: mode_spec.height,
-            vrefresh: mode_spec.vrefresh,
+    ) -> ConnectorConfig {
+        let Some(spec) = mode else {
+            return ConnectorConfig::Off;
+        };
+        let nominal = |candidate: &&crate::platform::drm::Mode| {
+            (candidate.width, candidate.height, candidate.vrefresh)
+                == (spec.width, spec.height, spec.vrefresh)
+        };
+        let live = self
+            .platform
+            .outputs
+            .iter()
+            .find(|layout| layout.key == *output_key);
+        let timing = match spec.user_timing {
+            Some(user) => ModeIdentity::from(&crate::platform::drm::user_timing_mode(&user)),
+            None => self
+                .pstate
+                .randr_id_alloc
+                .entry(output_key)
+                .and_then(|entry| entry.modes.iter().find(nominal))
+                .or_else(|| live.map(|layout| &layout.output.picked).filter(nominal))
+                .or_else(|| live.and_then(|layout| layout.output.modes.iter().find(nominal)))
+                .map_or_else(
+                    || {
+                        ModeIdentity::from(&crate::platform::drm::Mode {
+                            width: spec.width,
+                            height: spec.height,
+                            vrefresh: spec.vrefresh,
+                            ..Default::default()
+                        })
+                    },
+                    ModeIdentity::from,
+                ),
+        };
+        ConnectorConfig::Enabled {
+            mode_w: spec.width,
+            mode_h: spec.height,
+            vrefresh: spec.vrefresh,
             x,
             y,
-        };
+            timing,
+        }
+    }
+
+    fn record_crtc_config_enabled(&mut self, output_key: &OutputKey) {
+        let config = self.current_connector_config(output_key);
+        let entry = self.pstate.randr_id_alloc.entry_mut(output_key);
+        entry.config = config;
         entry.crtc_associated = true;
         entry.client_configured = true;
         entry.connected = true;
@@ -1621,7 +1650,7 @@ impl KmsBackend {
         self.prune_armed_targets_to_live_outputs();
         // A modeset may reset the hardware LUT.
         self.reapply_gamma_for_output(output_key);
-        self.record_crtc_config_enabled(output_key, mode_spec, x, y);
+        self.record_crtc_config_enabled(output_key);
         self.kms_outputs_active =
             kms_outputs_active_after_crtc_config(was_active, true, self.platform.outputs.len());
         self.update_input_extent(self.platform.fb_w, self.platform.fb_h);

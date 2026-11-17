@@ -4,6 +4,9 @@ use yserver_protocol::x11::randr as proto;
 
 use crate::properties::PropertyValue;
 
+mod user_modes;
+pub use user_modes::{RandrUserModes, RandrView, UserMode};
+
 pub use yserver_protocol::x11::randr::transform::{
     CrtcTransform, FIXED_ONE, Filter, IDENTITY_MATRIX, RR_REFLECT_X, RR_REFLECT_Y, RR_ROTATE_0,
     RR_ROTATE_90, RR_ROTATE_180, RR_ROTATE_270, SUPPORTED_ROTATIONS, crtc_matrix,
@@ -98,7 +101,7 @@ pub struct RandrOutput {
 /// Clock*1000; refresh = dotClock / (htotal*vtotal)). `None` on a mode
 /// means "no real timing available" (nested/virtio backends) and the
 /// reply falls back to the historical synthesis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ModeTiming {
     /// Pixel clock in kHz (kernel `drmModeModeInfo.clock`). ModeInfo
     /// `dot_clock` is this × 1000.
@@ -109,17 +112,29 @@ pub struct ModeTiming {
     pub vsync_start: u16,
     pub vsync_end: u16,
     pub vtotal: u16,
-    /// RANDR mode flags. The backend masks the kernel value to the low 6
-    /// bits (`& 0x3F`), where `DRM_MODE_FLAG_*`, `RR_*` and VidMode's
-    /// `V_*` all agree: P/N HSync, P/N VSync, Interlace, DoubleScan.
+    /// Kernel `drmModeModeInfo.hskew`; RANDR `ModeInfo.hSkew` verbatim
+    /// (`drmmode_ConvertFromKMode` copies it into `HSkew`).
+    pub hskew: u16,
+    /// RANDR mode flags: the kernel value masked to [`RR_MODE_FLAG_BITS`],
+    /// where `DRM_MODE_FLAG_*` and `RR_*` are bit-identical
+    /// (`drm_mode.h:71-84`, `randr.h:160-173`). DRM's 3D and aspect bits
+    /// above bit 13 are dropped.
     ///
-    /// The three namespaces diverge above bit 10 (`V_PIXMUX` is 0x1000
-    /// while `RR_PixelMultiplex` is 0x800), so widening that mask would
-    /// need a real DRM→`V_*` mapping before VidMode's `GetModeLine` may
-    /// keep forwarding this field verbatim. Mesa reads `V_INTERLACE`
-    /// (0x10) and `V_DBLSCAN` (0x20) from it to scale the MSC rate.
+    /// VidMode's `V_*` namespace agrees only on the low six bits
+    /// ([`VIDMODE_SHARED_FLAG_BITS`]; `V_PIXMUX` is 0x1000 while
+    /// `RR_PixelMultiplex` is 0x800), so `GetModeLine` masks to those
+    /// itself. Mesa reads `V_INTERLACE` (0x10) and `V_DBLSCAN` (0x20) from
+    /// it to scale the MSC rate.
     pub mode_flags: u32,
 }
+
+/// Xorg's `FLAG_BITS` (`xf86RandR12.c:981-994`): `RR_HSyncPositive` through
+/// `RR_ClockDivideBy2`, the fourteen mode flag bits RANDR and DRM share.
+pub const RR_MODE_FLAG_BITS: u32 = 0x3fff;
+
+/// The mode flag bits RANDR's `RR_*`, DRM's and VidMode's `V_*` all agree
+/// on: P/N HSync, P/N VSync, Interlace, DoubleScan.
+pub const VIDMODE_SHARED_FLAG_BITS: u32 = 0x3f;
 
 /// One unique mode (deduped by dimensions, refresh, and exact timing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,8 +213,7 @@ pub struct EffectiveTiming {
     pub hsync_start: u16,
     pub hsync_end: u16,
     pub htotal: u16,
-    /// Always 0: neither the kernel mode nor the synthesis carries a sync
-    /// skew, and both replies have historically hardcoded it here.
+    /// The kernel's `hskew`; 0 for the synthesis.
     pub hskew: u16,
     pub vsync_start: u16,
     pub vsync_end: u16,
@@ -228,7 +242,7 @@ impl EffectiveTiming {
                 hsync_start: t.hsync_start,
                 hsync_end: t.hsync_end,
                 htotal: t.htotal,
-                hskew: 0,
+                hskew: t.hskew,
                 vsync_start: t.vsync_start,
                 vsync_end: t.vsync_end,
                 vtotal: t.vtotal,
@@ -692,45 +706,20 @@ impl RandrState {
     }
 
     /// Build a `ScreenResources` reply describing every output / CRTC /
-    /// mode currently configured.
+    /// mode currently configured, without user modes. Replies go through
+    /// [`RandrView::screen_resources_current`].
     #[must_use]
     pub fn screen_resources_current(&self) -> proto::ScreenResources {
-        let crtcs: Vec<u32> = self.outputs.iter().map(|o| o.crtc_id).collect();
-        let outputs: Vec<u32> = self.outputs.iter().map(|o| o.output_id).collect();
+        RandrView::new(self, &RandrUserModes::default()).screen_resources_current()
+    }
 
-        let mut mode_names: Vec<u8> = Vec::new();
-        let mut mode_infos: Vec<proto::ModeInfo> = Vec::with_capacity(self.mode_table.len());
-        for m in &self.mode_table {
-            let name = format!("{}x{}", m.width, m.height).into_bytes();
-            #[allow(clippy::cast_possible_truncation)]
-            let name_len = name.len() as u16;
-            // Shared with VidMode's GetModeLine — see `EffectiveTiming`.
-            let t = m.effective_timing();
-            mode_infos.push(proto::ModeInfo {
-                id: m.mode_id,
-                width: m.width,
-                height: m.height,
-                dot_clock: t.dot_clock_hz,
-                hsync_start: t.hsync_start,
-                hsync_end: t.hsync_end,
-                htotal: t.htotal,
-                hskew: t.hskew,
-                vsync_start: t.vsync_start,
-                vsync_end: t.vsync_end,
-                vtotal: t.vtotal,
-                name_len,
-                mode_flags: t.mode_flags,
-            });
-            mode_names.extend_from_slice(&name);
-        }
-        proto::ScreenResources {
-            timestamp: self.timestamp,
-            config_timestamp: self.config_timestamp,
-            crtcs,
-            outputs,
-            modes: mode_infos,
-            mode_names,
-        }
+    /// The CRTC currently assigned to `output_id`, 0 for none.
+    #[must_use]
+    pub fn assigned_crtc(&self, output_id: u32) -> u32 {
+        self.output_crtc_associations
+            .get(&output_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Look up output info by `output_id`.
@@ -791,61 +780,20 @@ impl RandrState {
         })
     }
 
-    /// Validate `SetCrtcConfig` in yserver's order: arity, outputs, then mode.
-    /// Xorg verifies the mode immediately after the CRTC and before outputs
-    /// (`randr/rrcrtc.c:1294-1320`), so if both a mode and output are bad the
-    /// client sees a different error here. Rotation is checked afterward by
-    /// the handler. `check_resource` runs immediately after each output or
-    /// mode resolves. `Ok(None)` = disable; `Ok(Some(mode))` = enable with this
-    /// resolved mode;
-    /// `Err((code, error_value))` = protocol error + field-specific
-    /// `errorValue`.
+    /// [`RandrView::validate_set_crtc_config`] without user modes.
     pub fn validate_set_crtc_config(
         &self,
         crtc_id: u32,
         mode_id: u32,
         outputs: &[u32],
-        mut check_resource: impl FnMut(u32, crate::access::ResourceKind) -> Result<(), (u8, u32)>,
+        check_resource: impl FnMut(u32, crate::access::ResourceKind) -> Result<(), (u8, u32)>,
     ) -> Result<Option<RandrMode>, (u8, u32)> {
-        use yserver_protocol::x11::error;
-        // 1. mode/outputs arity. errorValue = the addressed crtc.
-        if mode_id == 0 {
-            if !outputs.is_empty() {
-                return Err((error::BAD_MATCH, crtc_id));
-            }
-            return Ok(None); // disable
-        }
-        if outputs.is_empty() {
-            return Err((error::BAD_MATCH, crtc_id));
-        }
-        // 2. outputs resolve to known connectors AND drive this crtc (1:1).
-        for &oid in outputs {
-            let Some(out) = self.outputs.iter().find(|o| o.output_id == oid) else {
-                return Err((error::BAD_MATCH, oid)); // unknown output
-            };
-            check_resource(oid, crate::access::ResourceKind::RandrOutput)?;
-            if out.crtc_id != crtc_id {
-                return Err((error::BAD_MATCH, crtc_id)); // output doesn't drive crtc
-            }
-        }
-        // The addressed crtc must belong to one of the named outputs.
-        let out = self
-            .outputs
-            .iter()
-            .find(|o| o.crtc_id == crtc_id && outputs.contains(&o.output_id))
-            .ok_or((error::BAD_MATCH, crtc_id))?;
-        // 3. mode ∈ this output's advertised list. errorValue = bad mode.
-        if !out.mode_ids.contains(&mode_id) {
-            return Err((error::BAD_MATCH, mode_id));
-        }
-        let mode = self
-            .mode_table
-            .iter()
-            .find(|m| m.mode_id == mode_id)
-            .copied()
-            .ok_or((error::BAD_MATCH, mode_id))?;
-        check_resource(mode_id, crate::access::ResourceKind::RandrMode)?;
-        Ok(Some(mode))
+        RandrView::new(self, &RandrUserModes::default()).validate_set_crtc_config(
+            crtc_id,
+            mode_id,
+            outputs,
+            check_resource,
+        )
     }
 
     fn current_mode_table(outputs: &[RandrOutput]) -> Vec<RandrMode> {
@@ -890,62 +838,6 @@ impl RandrState {
     #[must_use]
     pub fn first_output_rotation(&self) -> u16 {
         self.first_output().map_or(RR_ROTATE_0, |o| o.rotation)
-    }
-
-    /// `RR10GetData` (rrscreen.c:664-737): the RANDR 1.0 view of the first
-    /// output. One size per distinct mode width×height in the output's mode
-    /// order, each with its distinct `RRVerticalRefresh` rates; the current
-    /// size and rate are the CRTC's mode. `None` without an output.
-    #[must_use]
-    pub fn rr10_data(&self) -> Option<Rr10Data> {
-        let output = self.first_output()?;
-        let info = self.output_info(output.output_id, 0)?;
-        let (mm_w, mm_h) = if info.width_mm != 0 && info.height_mm != 0 {
-            (info.width_mm, info.height_mm)
-        } else {
-            (self.width_mm, self.height_mm)
-        };
-        let mm = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
-        let mut data = Rr10Data {
-            output_id: output.output_id,
-            crtc_id: output.crtc_id,
-            sizes: Vec::new(),
-            size_id: 0,
-            rate: 0,
-        };
-        for mode in output
-            .mode_ids
-            .iter()
-            .filter_map(|id| self.mode_table.iter().find(|m| m.mode_id == *id))
-        {
-            let rate = vertical_refresh(mode.effective_timing());
-            let index = match data
-                .sizes
-                .iter()
-                .position(|s| (s.width, s.height) == (mode.width, mode.height))
-            {
-                Some(index) => index,
-                None => {
-                    data.sizes.push(Rr10Size {
-                        width: mode.width,
-                        height: mode.height,
-                        mm_width: mm(mm_w),
-                        mm_height: mm(mm_h),
-                        rates: Vec::new(),
-                    });
-                    data.sizes.len() - 1
-                }
-            };
-            let size = &mut data.sizes[index];
-            if !size.rates.iter().any(|(r, _)| *r == rate) {
-                size.rates.push((rate, mode.mode_id));
-            }
-            if mode.mode_id == output.mode_id {
-                data.size_id = u16::try_from(index).unwrap_or(u16::MAX);
-                data.rate = rate;
-            }
-        }
-        Some(data)
     }
 
     /// `RRDeliverScreenEvent`'s rotation, pixel and mm sizes: the first
@@ -1008,7 +900,7 @@ impl RandrState {
     }
 }
 
-/// [`RandrState::rr10_data`]: `RR10DataRec` for the first output.
+/// [`RandrView::rr10_data`]: `RR10DataRec` for the first output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rr10Data {
     pub output_id: u32,
@@ -1028,16 +920,6 @@ pub struct Rr10Size {
     pub mm_width: u16,
     pub mm_height: u16,
     pub rates: Vec<(u16, u32)>,
-}
-
-/// `RRVerticalRefresh` (randr.c:728-739): whole Hz, rounded.
-fn vertical_refresh(timing: EffectiveTiming) -> u16 {
-    let dots = u64::from(timing.htotal) * u64::from(timing.vtotal);
-    if dots == 0 {
-        return 0;
-    }
-    let refresh = (u64::from(timing.dot_clock_hz) + dots / 2) / dots;
-    u16::try_from(refresh).unwrap_or(u16::MAX)
 }
 
 /// Data returned by [`RandrState::output_info`].
@@ -2229,6 +2111,7 @@ mod tests {
             vsync_start: 1443,
             vsync_end: 1448,
             vtotal: 1481,
+            hskew: 0,
             mode_flags: 0,
         };
         let out = RandrOutput {

@@ -1,6 +1,6 @@
 use crate::{
     access::{AccessMode, RequestOpcodes, ResourceKind},
-    backend::{Backend, CrtcConfigApply, ModeSpec},
+    backend::{Backend, CrtcConfigApply, ModeSpec, UserTiming},
     core_loop::process_request::{
         RequestOutcome, check_resource, emit_x11_error_with_minor,
         randr_ext::{
@@ -149,7 +149,7 @@ pub(super) fn handle_randr_get_screen_resources(
             RANDR_MAJOR_OPCODE,
         );
     }
-    let resources = state.randr.screen_resources_current();
+    let resources = state.randr_view().screen_resources_current();
     let buf = x11randr::encode_get_screen_resources_current_reply(byte_order, sequence, &resources);
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
@@ -192,7 +192,7 @@ pub(super) fn handle_randr_get_screen_resources_current(
         ResourceKind::Window,
         AccessMode::GET_ATTR
     );
-    let resources = state.randr.screen_resources_current();
+    let resources = state.randr_view().screen_resources_current();
     let buf = x11randr::encode_get_screen_resources_current_reply(byte_order, sequence, &resources);
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
@@ -284,7 +284,7 @@ pub(super) fn handle_randr_get_screen_info(
     );
     // ProcRRGetScreenInfo (rrscreen.c:760-898) over RR10GetData.
     let has_rate = randr_client_knows_rates(state, client_id);
-    let data = state.randr.rr10_data();
+    let data = state.randr_view().rr10_data();
     let rates: Vec<Vec<u16>> = data.as_ref().map_or_else(Vec::new, |d| {
         d.sizes
             .iter()
@@ -557,7 +557,7 @@ pub(super) fn set_screen_config(
     } else {
         timestamp
     };
-    let Some(data) = state.randr.rr10_data() else {
+    let Some(data) = state.randr_view().rr10_data() else {
         return status_reply(state, STATUS_FAILED);
     };
     if config_timestamp != state.randr.config_timestamp {
@@ -580,15 +580,24 @@ pub(super) fn set_screen_config(
         };
         Some(mode)
     };
-    let Some(mode) = mode_id.and_then(|id| {
-        state
-            .randr
-            .mode_table
-            .iter()
-            .find(|m| m.mode_id == id)
-            .copied()
-    }) else {
+    let Some(mode) = mode_id.and_then(|id| state.randr_view().mode_info(id)) else {
         return status_reply(state, STATUS_FAILED);
+    };
+    // A mode off the output's own list (a user mode, or one added from
+    // another output) is programmed by its timing, as from SetCrtcConfig.
+    let off_list = state
+        .randr
+        .outputs
+        .iter()
+        .find(|o| o.output_id == data.output_id)
+        .is_some_and(|o| !o.mode_ids.contains(&mode.id));
+    let user_timing = off_list.then(|| UserTiming::from_mode_info(&mode));
+    let vrefresh = match user_timing {
+        Some(user) => user.vrefresh(),
+        None => state
+            .randr_view()
+            .backend_mode(mode.id)
+            .map_or(0, |m| m.vrefresh),
     };
     if time < state.randr.timestamp {
         return status_reply(state, STATUS_INVALID_TIME);
@@ -684,7 +693,8 @@ pub(super) fn set_screen_config(
     let mode_spec = ModeSpec {
         width: mode.width,
         height: mode.height,
-        vrefresh: mode.vrefresh,
+        vrefresh,
+        user_timing,
     };
     let connector = target.name.clone();
     start_crtc_config(

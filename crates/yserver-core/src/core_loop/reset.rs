@@ -1626,6 +1626,60 @@ mod tests {
         );
     }
 
+    /// RANDR user modes are server-owned until the server resets
+    /// (`rrmode.c:91-92`; measured on Xvfb: they vanish only when the last
+    /// client leaves), so the fresh state starts without them.
+    #[test]
+    fn reset_generation_frees_randr_user_modes() {
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        let id = state.randr_user_modes.next_free_id().unwrap();
+        state.randr_user_modes.insert(
+            id,
+            b"foo".to_vec(),
+            yserver_protocol::x11::randr::ModeInfo {
+                id: 0,
+                width: 1920,
+                height: 1080,
+                dot_clock: 173_000_000,
+                hsync_start: 2048,
+                hsync_end: 2248,
+                htotal: 2576,
+                hskew: 0,
+                vsync_start: 1083,
+                vsync_end: 1088,
+                vtotal: 1120,
+                name_len: 3,
+                mode_flags: 0x6,
+            },
+        );
+        state.randr_user_modes.add_to_output(0x40, id);
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        )
+        .expect("the reset must proceed: this test holds no overlay claim");
+
+        assert!(state.randr_user_modes.is_empty());
+        assert_eq!(state.randr_user_modes.next_free_id(), Some(id));
+        assert!(
+            state
+                .access_resource_owner(ResourceId(id), crate::access::ResourceKind::RandrMode)
+                .is_none()
+        );
+    }
+
     /// Xorg reopens the default font each generation (`dix/main.c:226`):
     /// the old one is closed on the backend, the new state has its own.
     #[test]

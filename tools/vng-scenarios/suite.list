@@ -19,6 +19,7 @@ xrandr-monitors-2    guest=xrandr-monitors.sh        outputs=2 timeout=400
 xrandr-rotate        guest=xrandr-rotate.sh          timeout=600 gpu=none
 xrandr-rotate-2      guest=xrandr-rotate.sh          outputs=2 timeout=600 gpu=none
 xrandr-orientation   guest=xrandr-orientation.sh     timeout=400
+xrandr-usermode      guest=xrandr-usermode.sh        host=xrandr-usermode-host.sh        timeout=300
 xrandr-scale-cursor  guest=xrandr-scale-cursor.sh    timeout=300 gpu=none
 pointer-scale        guest=pointer-scale.sh          host=pointer-scale-host.sh          timeout=300
 pointer-rotate       guest=pointer-rotate.sh         host=pointer-rotate-host.sh         timeout=400

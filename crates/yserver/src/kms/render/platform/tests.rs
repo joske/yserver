@@ -420,6 +420,7 @@ fn non_picked_mode_lookup_uses_the_carried_connector_handle() {
             width: 1920,
             height: 1080,
             vrefresh: 60,
+            user_timing: None,
         },
         |queried| {
             assert_eq!(queried, connector);
@@ -441,6 +442,7 @@ fn connector_handle_mode_lookup_preserves_query_error_kind() {
             width: 1920,
             height: 1080,
             vrefresh: 60,
+            user_timing: None,
         },
         |_| {
             Err(io::Error::new(
@@ -1274,6 +1276,7 @@ fn failed_enable_never_reaches_deferred_cursor_factory() {
         width: output.picked.width,
         height: output.picked.height,
         vrefresh: output.picked.vrefresh,
+        user_timing: None,
     };
     let calls = Cell::new(0_u32);
 

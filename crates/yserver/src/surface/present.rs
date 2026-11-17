@@ -8,6 +8,7 @@
 use std::io;
 
 use yserver_core::{
+    backend::UserTiming,
     randr::{RR_ROTATE_0, RandrMode, RandrOutput, RandrState},
     server::ServerState,
 };
@@ -31,6 +32,11 @@ const MODE_SIZES: [(u16, u16); 8] = [
 /// `FIRST_FIXED_MODE_ID + i`.
 const CUSTOM_MODE_ID: u32 = 3;
 const FIRST_FIXED_MODE_ID: u32 = 4;
+/// The CRTC's mode while it runs a timing `RRSetCrtcConfig` programmed
+/// from an output's user list: not on the window's own list, so the core's
+/// current-mode match reports the user mode in its place.
+const PROGRAMMED_MODE_ID: u32 = FIRST_FIXED_MODE_ID + MODE_SIZES.len() as u32;
+const _: () = assert!(PROGRAMMED_MODE_ID <= yserver_core::server::SERVER_FIXED_XID_LAST);
 
 impl XBackend<SurfacePlatform> {
     /// `(msc, ust)` of the MSC clock; `(0, 0)` without one.
@@ -64,6 +70,7 @@ impl XBackend<SurfacePlatform> {
             self.platform.output_mm,
             self.platform.max_output,
             refresh,
+            self.platform.output_timing,
         )
     }
 
@@ -111,12 +118,18 @@ impl XBackend<SurfacePlatform> {
 /// RandR for the window: one output `WINDOW-0` on CRTC 2 at (0,0) showing
 /// `size` over `mm` millimetres, which is its preferred mode, followed by
 /// the fixed modes that fit `max_output`.
+///
+/// `programmed`, a user timing of `size` the CRTC was set to, becomes the
+/// CRTC's mode under [`PROGRAMMED_MODE_ID`] with that timing and its
+/// refresh, off the output's list, as the KMS backend reports a kernel mode
+/// the connector does not list.
 #[must_use]
 pub(crate) fn window_randr(
     size: (u16, u16),
     mm: (u32, u32),
     max_output: (u16, u16),
     vrefresh: u32,
+    programmed: Option<UserTiming>,
 ) -> (Vec<RandrOutput>, Vec<RandrMode>) {
     let fixed_id = |i: usize| FIRST_FIXED_MODE_ID + u32::try_from(i).unwrap_or(u32::MAX);
     let mode_id = MODE_SIZES
@@ -143,18 +156,23 @@ pub(crate) fn window_randr(
                 timing: None,
             }),
     );
+    let programmed = programmed.filter(|user| (user.width, user.height) == size);
+    let (current_id, current_vrefresh, timing) = programmed
+        .map_or((mode_id, vrefresh, None), |user| {
+            (PROGRAMMED_MODE_ID, user.vrefresh(), Some(user.timing))
+        });
     let outputs = vec![RandrOutput {
         name: "WINDOW-0".to_string(),
         output_id: 1,
         crtc_id: 2,
-        mode_id,
+        mode_id: current_id,
         connected: true,
         x: 0,
         y: 0,
         width: size.0,
         height: size.1,
-        vrefresh,
-        timing: None,
+        vrefresh: current_vrefresh,
+        timing,
         // 0: unknown; `RandrState::output_info` synthesises 96 DPI.
         mm_width: mm.0,
         mm_height: mm.1,

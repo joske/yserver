@@ -14,7 +14,7 @@ use drm::{
         plane, property,
     },
 };
-use yserver_core::backend::ModeSpec;
+use yserver_core::backend::{ModeSpec, UserTiming};
 
 use crate::drm::{
     Device,
@@ -40,6 +40,8 @@ pub struct Mode {
     pub hsync_start: u16,
     pub hsync_end: u16,
     pub htotal: u16,
+    /// Kernel `hskew`, reported as RANDR `ModeInfo.hSkew`.
+    pub hskew: u16,
     pub vsync_start: u16,
     pub vsync_end: u16,
     pub vtotal: u16,
@@ -56,7 +58,7 @@ pub struct Mode {
 /// clock is projected with synthetic timing, so dormant kernel timing fields
 /// are likewise excluded in that case. The mode name and `vscan` are not
 /// exposed in RANDR's `ModeInfo` timing either.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ModeIdentity {
     width: u16,
     height: u16,
@@ -65,26 +67,29 @@ pub(crate) struct ModeIdentity {
     hsync_start: u16,
     hsync_end: u16,
     htotal: u16,
+    hskew: u16,
     vsync_start: u16,
     vsync_end: u16,
     vtotal: u16,
+    /// The `RR_*` bits, `RR_MODE_FLAG_BITS`.
     flags: u32,
 }
 
 impl From<&Mode> for ModeIdentity {
     fn from(mode: &Mode) -> Self {
-        let (hsync_start, hsync_end, htotal, vsync_start, vsync_end, vtotal, flags) =
+        let (hsync_start, hsync_end, htotal, hskew, vsync_start, vsync_end, vtotal, flags) =
             if mode.clock_khz == 0 {
-                (0, 0, 0, 0, 0, 0, 0)
+                (0, 0, 0, 0, 0, 0, 0, 0)
             } else {
                 (
                     mode.hsync_start,
                     mode.hsync_end,
                     mode.htotal,
+                    mode.hskew,
                     mode.vsync_start,
                     mode.vsync_end,
                     mode.vtotal,
-                    mode.flags & 0x3f,
+                    mode.flags & yserver_core::randr::RR_MODE_FLAG_BITS,
                 )
             };
         Self {
@@ -95,6 +100,7 @@ impl From<&Mode> for ModeIdentity {
             hsync_start,
             hsync_end,
             htotal,
+            hskew,
             vsync_start,
             vsync_end,
             vtotal,
@@ -159,7 +165,7 @@ fn parse_mode_spec(spec: &str) -> Option<(u16, u16)> {
     Some((w, h))
 }
 
-fn local_mode_from(m: &DrmMode) -> Mode {
+pub(crate) fn local_mode_from(m: &DrmMode) -> Mode {
     let (w, h) = m.size();
     // Xorg `drmmode_ConvertFromKMode`: copy kernel timing verbatim.
     let (hsync_start, hsync_end, htotal) = m.hsync();
@@ -174,11 +180,47 @@ fn local_mode_from(m: &DrmMode) -> Mode {
         hsync_start,
         hsync_end,
         htotal,
+        hskew: m.hskew(),
         vsync_start,
         vsync_end,
         vtotal,
         vscan: m.vscan(),
         flags: m.flags().bits(),
+    }
+}
+
+/// The kernel mode for a user timing, as Xorg's `drmmode_ConvertToKMode`
+/// (`hw/xfree86/drivers/modesetting/drmmode_display.c:1413-1435`) builds it
+/// from `xf86RandRModeConvert`'s mode: empty name, `type` 0, `vscan` 0 and
+/// `vrefresh` 0, which the kernel computes itself.
+pub(crate) fn user_timing_drm_mode(user: &UserTiming) -> DrmMode {
+    let t = &user.timing;
+    DrmMode::from(drm_ffi::drm_mode_modeinfo {
+        clock: t.clock_khz,
+        hdisplay: user.width,
+        hsync_start: t.hsync_start,
+        hsync_end: t.hsync_end,
+        htotal: t.htotal,
+        hskew: t.hskew,
+        vdisplay: user.height,
+        vsync_start: t.vsync_start,
+        vsync_end: t.vsync_end,
+        vtotal: t.vtotal,
+        vscan: 0,
+        vrefresh: 0,
+        flags: t.mode_flags & yserver_core::randr::RR_MODE_FLAG_BITS,
+        type_: 0,
+        name: [0; 32],
+    })
+}
+
+/// The local mode record of a user timing: [`user_timing_drm_mode`], with
+/// the refresh the kernel reports for it, so a timing the connector also
+/// lists has the same [`ModeIdentity`].
+pub(crate) fn user_timing_mode(user: &UserTiming) -> Mode {
+    Mode {
+        vrefresh: user.vrefresh(),
+        ..local_mode_from(&user_timing_drm_mode(user))
     }
 }
 
@@ -1192,35 +1234,43 @@ fn finalize_output_with_mode(
     requested_mode: Option<ModeSpec>,
 ) -> io::Result<Output> {
     let local_modes: Vec<Mode> = connector_info.modes().iter().map(local_mode_from).collect();
-    let picked_idx = if let Some(requested) = requested_mode {
-        requested_mode_index(&local_modes, requested).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "connector {} does not advertise requested mode {}x{}@{}",
-                    asg.connector_name, requested.width, requested.height, requested.vrefresh
-                ),
-            )
-        })?
+    // A user timing is programmed as given, whatever the connector lists.
+    let user_timing = requested_mode.and_then(|requested| requested.user_timing);
+    let (picked, drm_mode) = if let Some(user) = user_timing {
+        (user_timing_mode(&user), user_timing_drm_mode(&user))
     } else {
-        let picked = pick_mode(&local_modes).ok_or_else(|| {
-            io::Error::other(format!(
-                "connector {} reports no usable modes",
-                asg.connector_name
-            ))
-        })?;
-        local_modes
-            .iter()
-            .position(|mode| {
-                mode.name == picked.name
-                    && mode.width == picked.width
-                    && mode.height == picked.height
-                    && mode.vrefresh == picked.vrefresh
-            })
-            .expect("picked mode is from local_modes")
+        let picked_idx = if let Some(requested) = requested_mode {
+            requested_mode_index(&local_modes, requested).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "connector {} does not advertise requested mode {}x{}@{}",
+                        asg.connector_name, requested.width, requested.height, requested.vrefresh
+                    ),
+                )
+            })?
+        } else {
+            let picked = pick_mode(&local_modes).ok_or_else(|| {
+                io::Error::other(format!(
+                    "connector {} reports no usable modes",
+                    asg.connector_name
+                ))
+            })?;
+            local_modes
+                .iter()
+                .position(|mode| {
+                    mode.name == picked.name
+                        && mode.width == picked.width
+                        && mode.height == picked.height
+                        && mode.vrefresh == picked.vrefresh
+                })
+                .expect("picked mode is from local_modes")
+        };
+        (
+            local_modes[picked_idx].clone(),
+            connector_info.modes()[picked_idx],
+        )
     };
-    let picked = local_modes[picked_idx].clone();
-    let drm_mode = connector_info.modes()[picked_idx];
 
     let plane_props_map = PropMap::for_object(device, asg.plane)?;
     let plane_fb_id_prop = plane_props_map.id("FB_ID")?;
@@ -2573,6 +2623,103 @@ mod tests {
         }
     }
 
+    /// `cvt 1920 1080 60` as a client sends it to `RRCreateMode`, with a
+    /// sub-kHz clock remainder, a skew, `RR_CSync` and a bit outside
+    /// `FLAG_BITS`.
+    fn user_cvt_1080() -> UserTiming {
+        UserTiming::from_mode_info(&yserver_protocol::x11::randr::ModeInfo {
+            id: 0x8_0000,
+            width: 1920,
+            height: 1080,
+            dot_clock: 173_000_999,
+            hsync_start: 2048,
+            hsync_end: 2248,
+            htotal: 2576,
+            hskew: 7,
+            vsync_start: 1083,
+            vsync_end: 1088,
+            vtotal: 1120,
+            name_len: 3,
+            mode_flags: 0x6 | 0x40 | 0x4000,
+        })
+    }
+
+    #[test]
+    fn a_user_timing_becomes_the_kernel_mode_xorg_builds() {
+        // xf86RandRModeConvert (Clock = dotClock / 1000, Flags & FLAG_BITS,
+        // VScan 0) then drmmode_ConvertToKMode (memset, no name, type 0,
+        // vrefresh left to the kernel).
+        let expected = DrmMode::from(drm_ffi::drm_mode_modeinfo {
+            clock: 173_000,
+            hdisplay: 1920,
+            hsync_start: 2048,
+            hsync_end: 2248,
+            htotal: 2576,
+            hskew: 7,
+            vdisplay: 1080,
+            vsync_start: 1083,
+            vsync_end: 1088,
+            vtotal: 1120,
+            vscan: 0,
+            vrefresh: 0,
+            flags: 0x46,
+            type_: 0,
+            name: [0; 32],
+        });
+        let user = user_cvt_1080();
+        assert_eq!(user_timing_drm_mode(&user), expected);
+
+        // The local record keeps every field and the kernel's refresh:
+        // 173000 kHz / (2576 x 1120) = 59.96 Hz, rounded.
+        let local = user_timing_mode(&user);
+        assert_eq!(local.name, "");
+        assert!(!local.preferred);
+        assert_eq!(
+            (local.width, local.height, local.vrefresh, local.clock_khz),
+            (1920, 1080, 60, 173_000)
+        );
+        assert_eq!(
+            (
+                local.hsync_start,
+                local.hsync_end,
+                local.htotal,
+                local.hskew
+            ),
+            (2048, 2248, 2576, 7)
+        );
+        assert_eq!(
+            (
+                local.vsync_start,
+                local.vsync_end,
+                local.vtotal,
+                local.vscan
+            ),
+            (1083, 1088, 1120, 0)
+        );
+        assert_eq!(local.flags, 0x46);
+    }
+
+    #[test]
+    fn a_user_timing_has_the_identity_of_the_same_listed_timing() {
+        let user = user_cvt_1080();
+        let listed = Mode {
+            name: "1920x1080".to_string(),
+            preferred: true,
+            ..user_timing_mode(&user)
+        };
+        assert_eq!(
+            ModeIdentity::from(&user_timing_mode(&user)),
+            ModeIdentity::from(&listed)
+        );
+        // hskew is part of the identity.
+        let mut skewed = user;
+        skewed.timing.hskew = 0;
+        assert_ne!(
+            ModeIdentity::from(&user_timing_mode(&skewed)),
+            ModeIdentity::from(&listed)
+        );
+    }
+
     #[test]
     fn picks_preferred_when_present() {
         let modes = vec![
@@ -2723,6 +2870,7 @@ mod tests {
                     width: 2560,
                     height: 1440,
                     vrefresh: 165,
+                    user_timing: None,
                 }
             ),
             Some(1)
@@ -2734,6 +2882,7 @@ mod tests {
                     width: 2560,
                     height: 1440,
                     vrefresh: 144,
+                    user_timing: None,
                 }
             ),
             None

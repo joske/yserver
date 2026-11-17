@@ -1,8 +1,9 @@
 //! RANDR and Xinerama requests: `handle_randr_request` hands each RANDR
 //! minor to its own `handle_randr_*` fn. This file holds the CRTC-config
 //! continuation types, the helpers several groups share and the
-//! CreateMode/CreateLease and FreeLease stubs; the rest lives in:
+//! CreateLease and FreeLease stubs; the rest lives in:
 //!
+//! - `mode`: user modes (16–19).
 //! - `screen`: version, SelectInput, screen info, size and resources (0,
 //!   4–8, 25), RANDR 1.0 SetScreenConfig (2).
 //! - `output`: output info and primary (9, 30, 31), output properties
@@ -15,6 +16,7 @@
 //! - `xinerama`: the Xinerama extension.
 
 mod crtc;
+mod mode;
 mod monitor;
 mod output;
 mod provider;
@@ -22,11 +24,14 @@ mod screen;
 mod xinerama;
 
 use crate::{
-    access::{AccessMode, RequestOpcodes, ResourceKind},
     backend::{Backend, CrtcConfigToken},
     core_loop::process_request::{
-        RANDR_REQUEST_COUNT, RequestOutcome, check_resource, emit_x11_error_with_minor,
+        RANDR_REQUEST_COUNT, RequestOutcome, emit_x11_error_with_minor,
         randr_ext::{
+            mode::{
+                handle_randr_add_output_mode, handle_randr_create_mode,
+                handle_randr_delete_output_mode, handle_randr_destroy_mode,
+            },
             monitor::{
                 handle_randr_delete_monitor, handle_randr_get_monitors, handle_randr_set_monitor,
             },
@@ -300,7 +305,19 @@ pub(super) fn handle_randr_request(
         x11randr::RR_SET_CRTC_CONFIG => handle_randr_set_crtc_config(
             state, backend, client_id, sequence, header, body, byte_order,
         ),
-        16 | 45 => handle_randr_create_mode_or_lease(state, client_id, sequence, minor),
+        x11randr::RR_CREATE_MODE => {
+            handle_randr_create_mode(state, client_id, sequence, header, body, byte_order)
+        }
+        x11randr::RR_DESTROY_MODE => {
+            handle_randr_destroy_mode(state, client_id, sequence, header, body)
+        }
+        x11randr::RR_ADD_OUTPUT_MODE => {
+            handle_randr_add_output_mode(state, client_id, sequence, header, body)
+        }
+        x11randr::RR_DELETE_OUTPUT_MODE => {
+            handle_randr_delete_output_mode(state, client_id, sequence, header, body)
+        }
+        45 => handle_randr_create_lease(state, client_id, sequence, minor),
         x11randr::RR_LIST_PROVIDER_PROPERTIES
         | x11randr::RR_QUERY_PROVIDER_PROPERTY
         | x11randr::RR_CONFIGURE_PROVIDER_PROPERTY
@@ -335,69 +352,14 @@ pub(super) fn handle_randr_request(
             u16::from(other),
             header.opcode,
         ),
+        // Every minor below RANDR_REQUEST_COUNT has its own arm.
         other => {
-            let request = RequestOpcodes {
-                major: RANDR_MAJOR_OPCODE,
-                minor: other,
-            };
-            match other {
-                17 => {
-                    let mode = request_xid(body);
-                    if mode != 0 {
-                        check_resource!(
-                            state,
-                            client_id,
-                            sequence,
-                            request,
-                            yserver_protocol::x11::ResourceId(mode),
-                            ResourceKind::RandrMode,
-                            AccessMode::DESTROY
-                        );
-                    }
-                }
-                18 | 19 => {
-                    let output = request_xid(body);
-                    let mode = body
-                        .get(4..8)
-                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
-                        .unwrap_or(0);
-                    if output != 0 {
-                        check_resource!(
-                            state,
-                            client_id,
-                            sequence,
-                            request,
-                            yserver_protocol::x11::ResourceId(output),
-                            ResourceKind::RandrOutput,
-                            AccessMode::READ
-                        );
-                    }
-                    if mode != 0 {
-                        check_resource!(
-                            state,
-                            client_id,
-                            sequence,
-                            request,
-                            yserver_protocol::x11::ResourceId(mode),
-                            ResourceKind::RandrMode,
-                            AccessMode::USE
-                        );
-                    }
-                }
-                _ => {}
-            }
-            let request_name = match other {
-                17 => "DestroyMode",
-                18 => "AddOutputMode",
-                19 => "DeleteOutputMode",
-                _ => "known request",
-            };
             warn_randr_unsupported_once(
                 state,
                 client_id,
                 sequence,
                 other,
-                request_name,
+                "known request",
                 "accepting void request as a compatibility no-op",
             );
             Ok(RequestOutcome::Handled)
@@ -406,23 +368,16 @@ pub(super) fn handle_randr_request(
 }
 
 #[allow(clippy::needless_return)]
-fn handle_randr_create_mode_or_lease(
+fn handle_randr_create_lease(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
     minor: u8,
 ) -> io::Result<RequestOutcome> {
-    // TODO(unimplemented): RRCreateMode (16) / RRCreateLease (45)
-    // are NOT actually implemented. This
+    // TODO(unimplemented): RRCreateLease (45) is NOT implemented. This
     // BadImplementation is a STOPGAP to stop the client hanging on a
     // reply that never comes — it is NOT protocol-correct: Xorg
-    // implements both and returns real data. Replace with real
-    // implementations (custom modes / DRM lease).
-    //
-    // Void unimplemented RANDR requests remain wire-success no-ops
-    // via `other` below — Xorg implements those as success, so
-    // erroring them would be a new Xorg-divergence. Their first use
-    // is nevertheless warned so the unsupported behavior is visible.
+    // implements it (DRM leases) and returns real data.
     return emit_x11_error_with_minor(
         state,
         client_id,

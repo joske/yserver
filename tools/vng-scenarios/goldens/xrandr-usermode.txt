@@ -1,0 +1,68 @@
+==> usermode.log <==
+===== xrandr --newmode um 45.75 1000 1040 1136 1272 700 703 713 723 -hsync +vsync
+exit 0
+===== xrandr --newmode um 45.75 1000 1040 1136 1272 700 703 713 723 -hsync +vsync
+X Error of failed request:  BadName (named color or font does not exist)
+  Major opcode of failed request:  <op> (RANDR)
+  Minor opcode of failed request:  16 (RRCreateMode)
+  Serial number of failed request: <serial>
+  Current serial number in output stream: <serial>
+exit 1
+===== xrandr --addmode Virtual-1 um
+exit 0
+===== xrandr --addmode Virtual-1 um
+exit 0
+Screen 0: minimum 320 x 200, current 1280 x 800, maximum <max>
+Virtual-1 connected primary 1280x800+0+0 (<mode>) normal (normal left inverted right x axis y axis) <mm>
+  1280x800 (<mode>) 107.300MHz -HSync -VSync *current +preferred
+  um (<mode>) 45.750MHz -HSync +VSync
+        h: width  1000 start 1040 end 1136 total 1272 skew    0 clock  35.97KHz
+        v: height  700 start  703 end  713 total  723           clock  49.75Hz
+*0   1280 x 800    ( <mm> )  *75
+ <sz>  1000 x 700    ( <mm> )   50
+  Width: 1280
+  Height: 800
+===== xrandr --output Virtual-1 --mode um
+exit 0
+Screen 0: minimum 320 x 200, current 1000 x 700, maximum <max>
+Virtual-1 connected primary 1000x700+0+0 (<mode>) normal (normal left inverted right x axis y axis) <mm>
+  um (<mode>) 45.750MHz -HSync +VSync *current
+*<sz>  1000 x 700    ( <mm> )  *50
+  Width: 1000
+  Height: 700
+===== xrandr --rmmode um
+X Error of failed request:  BadAccess (attempt to access private resource denied)
+  Major opcode of failed request:  <op> (RANDR)
+  Minor opcode of failed request:  17 (RRDestroyMode)
+  Serial number of failed request: <serial>
+  Current serial number in output stream: <serial>
+exit 1
+===== xrandr --delmode Virtual-1 um
+X Error of failed request:  BadMatch (invalid parameter attributes)
+  Major opcode of failed request:  <op> (RANDR)
+  Minor opcode of failed request:  19 (RRDeleteOutputMode)
+  Serial number of failed request: <serial>
+  Current serial number in output stream: <serial>
+exit 1
+===== xrandr --output Virtual-1 --mode 1280x800
+exit 0
+Screen 0: minimum 320 x 200, current 1280 x 800, maximum <max>
+Virtual-1 connected primary 1280x800+0+0 (<mode>) normal (normal left inverted right x axis y axis) <mm>
+  1280x800 (<mode>) 107.300MHz -HSync -VSync *current +preferred
+  um (<mode>) 45.750MHz -HSync +VSync
+        h: width  1000 start 1040 end 1136 total 1272 skew    0 clock  35.97KHz
+        v: height  700 start  703 end  713 total  723           clock  49.75Hz
+*0   1280 x 800    ( <mm> )  *75
+ <sz>  1000 x 700    ( <mm> )   50
+  Width: 1280
+  Height: 800
+===== xrandr --delmode Virtual-1 um
+exit 0
+===== xrandr --rmmode um
+exit 0
+Screen 0: minimum 320 x 200, current 1280 x 800, maximum <max>
+Virtual-1 connected primary 1280x800+0+0 (<mode>) normal (normal left inverted right x axis y axis) <mm>
+  1280x800 (<mode>) 107.300MHz -HSync -VSync *current +preferred
+*0   1280 x 800    ( <mm> )  *75
+  Width: 1280
+  Height: 800

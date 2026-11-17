@@ -317,6 +317,9 @@ impl KmsBackend {
         let (output_id, crtc_id, mode_id) = *rootless
             .randr_ids
             .get_or_insert_with(|| (alloc.fresh(), alloc.fresh(), alloc.fresh()));
+        if [output_id, crtc_id, mode_id].contains(&super::state::RANDR_ID_EXHAUSTED) {
+            return (Vec::new(), Vec::new());
+        }
         let (refresh, name) = {
             let host = rootless.host.borrow();
             (

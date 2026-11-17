@@ -32,6 +32,7 @@ fn xf86vidmode_v2_mode_line_round_trips_current_randr_timing() {
                 vsync_start: 1443,
                 vsync_end: 1448,
                 vtotal: 1481,
+                hskew: 0,
                 mode_flags: 5,
             }),
             mm_width: 600,
@@ -1164,4 +1165,95 @@ fn xf86vidmode_local_lock_succeeds_and_mode_setting_stays_refused() {
             minor,
         );
     }
+}
+
+/// RANDR mode flags keep all fourteen `RR_*` bits, but VidMode's `V_*`
+/// namespace agrees only on the low six (`V_CSYNC` is 0x40 as `RR_CSync`,
+/// yet `V_PIXMUX` is 0x1000 where `RR_DoubleClock` is). GetModeLine,
+/// GetAllModeLines and ValidateModeLine answer exactly as for the same mode
+/// without the high bits.
+#[test]
+fn xf86vidmode_replies_ignore_rr_flags_above_the_shared_six() {
+    use crate::randr::{ModeTiming, RandrOutput, RandrState};
+    use yserver_protocol::x11::xf86vidmode as x11vm;
+
+    let replies = |mode_flags: u32| {
+        let mut state = ServerState::new();
+        state.randr = RandrState::from_outputs(
+            1,
+            vec![RandrOutput {
+                name: "VGA-1".to_string(),
+                output_id: 1,
+                crtc_id: 2,
+                mode_id: 3,
+                connected: true,
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                vrefresh: 60,
+                timing: Some(ModeTiming {
+                    clock_khz: 173_000,
+                    hsync_start: 2048,
+                    hsync_end: 2248,
+                    htotal: 2576,
+                    hskew: 0,
+                    vsync_start: 1083,
+                    vsync_end: 1088,
+                    vtotal: 1120,
+                    mode_flags,
+                }),
+                mm_width: 600,
+                mm_height: 340,
+                mode_ids: vec![3],
+                num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
+            }],
+        );
+        let mut peer = install_client(&mut state, 1);
+        let mut out = Vec::new();
+        for (sequence, minor) in [(1, x11vm::GET_MODE_LINE), (2, x11vm::GET_ALL_MODE_LINES)] {
+            out.push(dispatch_vidmode(
+                &mut state, &mut peer, sequence, minor, &[0; 4],
+            ));
+        }
+        // The legacy client's ValidateModeLine of the six-bit line.
+        let line = x11vm::ModeLine {
+            dot_clock: 173_000,
+            hdisplay: 1920,
+            hsync_start: 2048,
+            hsync_end: 2248,
+            htotal: 2576,
+            hskew: 0,
+            vdisplay: 1080,
+            vsync_start: 1083,
+            vsync_end: 1088,
+            vtotal: 1120,
+            flags: 0x6,
+        };
+        let body = validate_mode_line_body(line, false, ClientByteOrder::LittleEndian);
+        out.push(dispatch_vidmode(
+            &mut state,
+            &mut peer,
+            3,
+            x11vm::VALIDATE_MODE_LINE,
+            &body,
+        ));
+        out
+    };
+    // -hsync +vsync, plus RR_CSync, RR_DoubleClock, RR_ClockDivideBy2.
+    let plain = replies(0x6);
+    assert_eq!(replies(0x6 | 0x40 | 0x1000 | 0x2000), plain);
+    // sz_xXF86OldVidModeGetModeLineReply, flags at byte 28.
+    assert_eq!(plain[0].len(), 36, "legacy GetModeLine reply");
+    assert_eq!(
+        u32::from_le_bytes(plain[0][28..32].try_into().unwrap()),
+        0x6
+    );
+    assert_eq!(
+        u32::from_le_bytes(plain[2][8..12].try_into().unwrap()),
+        x11vm::MODE_OK
+    );
 }

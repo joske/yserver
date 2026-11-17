@@ -1699,7 +1699,6 @@ impl ScreenFixture {
         x: i16,
         rotation: u16,
     ) -> Result<u8, (u8, u32)> {
-        let output = self.state.randr.outputs[0].clone();
         let mode = self
             .state
             .randr
@@ -1708,6 +1707,12 @@ impl ScreenFixture {
             .find(|m| (m.width, m.height) == size)
             .unwrap_or_else(|| panic!("a {size:?} mode"))
             .mode_id;
+        self.set_crtc_mode(mode, x, rotation)
+    }
+
+    /// RRSetCrtcConfig of the window's CRTC to mode id `mode`.
+    fn set_crtc_mode(&mut self, mode: u32, x: i16, rotation: u16) -> Result<u8, (u8, u32)> {
+        let output = self.state.randr.outputs[0].clone();
         let body = [
             output.crtc_id.to_le_bytes().as_slice(),
             &0u32.to_le_bytes(),
@@ -2176,9 +2181,151 @@ fn a_clamped_window_request_moves_only_the_output() {
     assert_eq!(w.f.sizes()[0], (1280, 800));
 }
 
+/// `cvt 1000 700 50`'s 1000x700 timing at `dot_clock` Hz.
+fn user_mode_info(dot_clock: u32) -> yserver_protocol::x11::randr::ModeInfo {
+    yserver_protocol::x11::randr::ModeInfo {
+        id: 0,
+        width: 1000,
+        height: 700,
+        dot_clock,
+        hsync_start: 1040,
+        hsync_end: 1136,
+        htotal: 1272,
+        hskew: 0,
+        vsync_start: 703,
+        vsync_end: 713,
+        vtotal: 723,
+        name_len: 0,
+        mode_flags: 0x6, // -HSync +VSync
+    }
+}
+
+impl ScreenFixture {
+    /// RRCreateMode `info` named `name`, then RRAddOutputMode to the
+    /// window output; the new mode id.
+    fn add_user_mode(&mut self, name: &[u8], info: yserver_protocol::x11::randr::ModeInfo) -> u32 {
+        let mut body = root_le().to_vec();
+        for field in [info.id, 0, info.dot_clock] {
+            body.extend_from_slice(&field.to_le_bytes());
+        }
+        body[8..10].copy_from_slice(&info.width.to_le_bytes());
+        body[10..12].copy_from_slice(&info.height.to_le_bytes());
+        let name_len = u16::try_from(name.len()).unwrap();
+        for field in [
+            info.hsync_start,
+            info.hsync_end,
+            info.htotal,
+            info.hskew,
+            info.vsync_start,
+            info.vsync_end,
+            info.vtotal,
+            name_len,
+        ] {
+            body.extend_from_slice(&field.to_le_bytes());
+        }
+        body.extend_from_slice(&info.mode_flags.to_le_bytes());
+        body.extend_from_slice(name);
+        body.resize(body.len().next_multiple_of(4), 0);
+        self.received();
+        self.randr(16, &body);
+        let got = self.received();
+        assert!(got.errors.is_empty(), "CreateMode: {:?}", got.errors);
+        let mode = u32::from_le_bytes(got.replies[0][8..12].try_into().unwrap());
+        let output = self.state.randr.outputs[0].output_id;
+        self.randr(18, &[output.to_le_bytes(), mode.to_le_bytes()].concat());
+        assert!(self.received().errors.is_empty(), "AddOutputMode");
+        mode
+    }
+
+    /// The mode RRGetCrtcInfo reports for the window's CRTC.
+    fn crtc_info_mode(&mut self) -> u32 {
+        let crtc = self.state.randr.outputs[0].crtc_id;
+        self.received();
+        self.randr(20, &[crtc.to_le_bytes(), 0u32.to_le_bytes()].concat());
+        let reply = self.received().replies.pop().expect("GetCrtcInfo");
+        u32::from_le_bytes(reply[20..24].try_into().unwrap())
+    }
+}
+
+/// A user mode on the window output resizes the window like the window's
+/// own modes, and the CRTC reports the user mode while its timing is
+/// programmed (`xf86RandR12CrtcNotify`), also for a second user mode of
+/// the same size; the window's own mode of that size reports itself again.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn rr_set_crtc_config_to_a_user_mode_sizes_the_window() {
+    let Some(mut w) = window_or_skip() else {
+        return;
+    };
+    w.frame();
+    w.f.resize(1280, 800);
+    assert!(w.f.b.programs_user_mode_timings());
+    let user =
+        w.f.add_user_mode(b"1000x700_50.00", user_mode_info(45_750_000));
+    let other = w.f.add_user_mode(b"slow", user_mode_info(41_000_000));
+
+    assert_eq!(w.f.set_crtc_mode(user, 0, 1), Ok(0));
+    let events = std::mem::take(&mut w.f.pending);
+    assert_eq!(ScreenFixture::crtc_notifies(&events), [(1000, 700)]);
+    assert_eq!(w.ui.take().last(), Some(&UiCall::ContentSize(1000, 700, 1)));
+    assert_eq!(
+        w.f.sizes(),
+        [(1000, 700), (1000, 700), (1000, 700), (1280, 800)]
+    );
+    assert_eq!(w.f.crtc_info_mode(), user);
+    let output = &w.f.state.randr.outputs[0];
+    assert_eq!(output.vrefresh, 50, "the user timing's refresh");
+    assert!(
+        !output.mode_ids.contains(&output.mode_id),
+        "the programmed timing is off the window's list"
+    );
+    w.frame();
+
+    // Same size, other timing: programmed without a window request.
+    assert_eq!(w.f.set_crtc_mode(other, 0, 1), Ok(0));
+    assert_eq!(w.f.crtc_info_mode(), other);
+    assert!(
+        w.ui.take()
+            .iter()
+            .all(|call| !matches!(call, UiCall::ContentSize(..)))
+    );
+    // Again: nothing changed, no notify.
+    assert_eq!(w.f.set_crtc_mode(other, 0, 1), Ok(0));
+    assert!(ScreenFixture::crtc_notifies(&w.f.pending).is_empty());
+
+    // The window's own 1000x700 mode.
+    let own = w.f.state.randr.outputs[0].mode_ids[0];
+    assert_eq!(w.f.set_crtc_mode(own, 0, 1), Ok(0));
+    assert_eq!(w.f.crtc_info_mode(), own);
+
+    // A user resize of the window drops the user timing.
+    assert_eq!(w.f.set_crtc_mode(user, 0, 1), Ok(0));
+    w.host_resize((900, 600), None);
+    assert_eq!(w.f.b.platform.output_timing, None);
+    let output = &w.f.state.randr.outputs[0];
+    assert_eq!(output.mode_id, output.mode_ids[0]);
+}
+
+#[test]
+fn a_programmed_user_timing_is_the_crtc_mode_off_the_window_list() {
+    let user = yserver_core::backend::UserTiming::from_mode_info(&user_mode_info(45_750_000));
+    let (outputs, modes) =
+        super::present::window_randr((1000, 700), (0, 0), (8192, 8192), 60, Some(user));
+    let output = &outputs[0];
+    assert_eq!(output.mode_id, 12);
+    assert_eq!(output.timing, Some(user.timing));
+    assert_eq!(output.vrefresh, 50, "the timing's own refresh");
+    assert_eq!(output.mode_ids[0], 3, "the window size stays preferred");
+    assert!(!output.mode_ids.contains(&12) && modes.iter().all(|m| m.mode_id != 12));
+    // A timing of another size than the window's is not reported.
+    let (outputs, _) =
+        super::present::window_randr((1024, 768), (0, 0), (8192, 8192), 60, Some(user));
+    assert_eq!((outputs[0].mode_id, outputs[0].timing), (11, None));
+}
+
 #[test]
 fn window_modes_are_the_current_size_then_the_fixed_ones_that_fit() {
-    let (outputs, modes) = super::present::window_randr((1024, 768), (0, 0), (1440, 900), 60);
+    let (outputs, modes) = super::present::window_randr((1024, 768), (0, 0), (1440, 900), 60, None);
     let sizes: Vec<(u32, u16, u16)> = modes
         .iter()
         .map(|m| (m.mode_id, m.width, m.height))
@@ -2187,7 +2334,8 @@ fn window_modes_are_the_current_size_then_the_fixed_ones_that_fit() {
     let output = &outputs[0];
     assert_eq!((output.mode_id, output.num_preferred), (11, 1));
     assert_eq!(output.mode_ids, [11, 9, 10]);
-    let (outputs, modes) = super::present::window_randr((1000, 700), (300, 210), (8192, 8192), 60);
+    let (outputs, modes) =
+        super::present::window_randr((1000, 700), (300, 210), (8192, 8192), 60, None);
     assert_eq!(outputs[0].mode_id, 3, "a size off the list");
     assert_eq!((outputs[0].mm_width, outputs[0].mm_height), (300, 210));
     assert_eq!(modes.len(), 9);

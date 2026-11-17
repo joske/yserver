@@ -51,6 +51,10 @@ pub const RR_CONFIGURE_OUTPUT_PROPERTY: u8 = 12;
 pub const RR_CHANGE_OUTPUT_PROPERTY: u8 = 13;
 pub const RR_DELETE_OUTPUT_PROPERTY: u8 = 14;
 pub const RR_GET_OUTPUT_PROPERTY: u8 = 15;
+pub const RR_CREATE_MODE: u8 = 16;
+pub const RR_DESTROY_MODE: u8 = 17;
+pub const RR_ADD_OUTPUT_MODE: u8 = 18;
+pub const RR_DELETE_OUTPUT_MODE: u8 = 19;
 pub const RR_GET_CRTC_INFO: u8 = 20;
 pub const RR_SET_CRTC_CONFIG: u8 = 21;
 pub const RR_GET_CRTC_GAMMA_SIZE: u8 = 22;
@@ -633,6 +637,38 @@ pub fn parse_set_provider_output_source_request(
     })
 }
 
+/// Parse the fixed part of a `CreateMode` body (window + `xRRModeInfo`,
+/// 36 bytes) after byte-order normalization. The name follows at
+/// [`CREATE_MODE_FIXED_BODY`]; the caller checks `name_len` against the
+/// request length.
+pub fn parse_create_mode_request(body: &[u8]) -> Option<(u32, ModeInfo)> {
+    if body.len() < CREATE_MODE_FIXED_BODY {
+        return None;
+    }
+    let u16_at = |o: usize| read_u16_le(&body[o..]);
+    Some((
+        read_u32_le(body),
+        ModeInfo {
+            id: read_u32_le(&body[4..]),
+            width: u16_at(8),
+            height: u16_at(10),
+            dot_clock: read_u32_le(&body[12..]),
+            hsync_start: u16_at(16),
+            hsync_end: u16_at(18),
+            htotal: u16_at(20),
+            hskew: u16_at(22),
+            vsync_start: u16_at(24),
+            vsync_end: u16_at(26),
+            vtotal: u16_at(28),
+            name_len: u16_at(30),
+            mode_flags: read_u32_le(&body[32..]),
+        },
+    ))
+}
+
+/// `sizeof(xRRCreateModeReq)` minus the 4-byte request header.
+pub const CREATE_MODE_FIXED_BODY: usize = 36;
+
 pub fn parse_change_provider_property_header(body: &[u8]) -> Option<ChangeProviderPropertyHeader> {
     if body.len() < 20 {
         return None;
@@ -649,7 +685,7 @@ pub fn parse_change_provider_property_header(body: &[u8]) -> Option<ChangeProvid
 
 // ── Reply data structs ────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModeInfo {
     pub id: u32,
     pub width: u16,
@@ -1417,6 +1453,9 @@ pub struct ScreenChangeNotify {
     pub config_timestamp: u32,
     pub root: u32,
     pub request_window: u32,
+    /// `RR10CurrentSizeID`: the RANDR 1.0 size of the screen's size,
+    /// `0xffff` without one (`rrscreen.c:107`, `:1135-1157`).
+    pub size_id: u16,
     pub width: u16,
     pub height: u16,
     pub width_mm: u16,
@@ -1485,7 +1524,7 @@ pub fn encode_screen_change_notify_event(
     put(byte_order, &mut buf, event.config_timestamp);
     put(byte_order, &mut buf, event.root);
     put(byte_order, &mut buf, event.request_window);
-    put(byte_order, &mut buf, 0u16);
+    put(byte_order, &mut buf, event.size_id);
     put(byte_order, &mut buf, SUBPIXEL_UNKNOWN);
     put(byte_order, &mut buf, event.width);
     put(byte_order, &mut buf, event.height);
@@ -2770,6 +2809,7 @@ mod tests {
                 config_timestamp: 101,
                 root: 0x100,
                 request_window: 0x101,
+                size_id: 3,
                 width: 1024,
                 height: 768,
                 width_mm: 271,
@@ -2783,6 +2823,7 @@ mod tests {
         assert_eq!(&event[2..4], &11u16.to_le_bytes());
         assert_eq!(&event[4..8], &100u32.to_le_bytes());
         assert_eq!(&event[12..16], &0x100u32.to_le_bytes());
+        assert_eq!(&event[20..22], &3u16.to_le_bytes(), "sizeID");
         assert_eq!(&event[24..26], &1024u16.to_le_bytes());
         assert_eq!(&event[30..32], &203u16.to_le_bytes());
     }
@@ -2916,6 +2957,7 @@ mod tests {
                     config_timestamp: 1,
                     root: 0x100,
                     request_window: 0x100,
+                    size_id: 0,
                     width: 1280,
                     height: 800,
                     width_mm: 338,

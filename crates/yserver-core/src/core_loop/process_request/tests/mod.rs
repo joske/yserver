@@ -40,6 +40,7 @@ mod present_supersede;
 mod props;
 mod randr_crtc;
 mod randr_output;
+mod randr_user_modes;
 mod region_probe;
 mod render;
 mod saver_dpms;

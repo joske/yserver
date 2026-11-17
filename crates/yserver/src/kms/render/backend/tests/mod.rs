@@ -22,6 +22,7 @@ mod scene_wake;
 mod server_scanout;
 mod stacking;
 mod tearing;
+mod user_modes;
 mod vblank_fallback;
 mod vt_session;
 mod window_border;
@@ -419,6 +420,14 @@ fn push_enabled_test_output(
         vrefresh: 60,
         x,
         y,
+        timing: crate::platform::drm::ModeIdentity::from(
+            &b.platform
+                .outputs
+                .last()
+                .expect("pushed output")
+                .output
+                .picked,
+        ),
     };
     key
 }

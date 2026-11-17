@@ -1,6 +1,6 @@
 use crate::{
     access::{AccessMode, RequestOpcodes, ResourceKind},
-    backend::{Backend, CrtcConfigApply, ModeSpec},
+    backend::{Backend, CrtcConfigApply, ModeSpec, UserTiming},
     core_loop::process_request::{
         RANDR_BAD_CRTC, RequestOutcome, check_resource, emit_x11_error_with_minor,
         randr_ext::{
@@ -50,7 +50,7 @@ pub(super) fn handle_randr_get_crtc_info(
             RANDR_MAJOR_OPCODE,
         );
     };
-    let Some(crtc_data) = state.randr.crtc_info(req.crtc, req.config_timestamp) else {
+    let Some(crtc_data) = state.randr_view().crtc_info(req.crtc, req.config_timestamp) else {
         return emit_x11_error_with_minor(
             state,
             client_id,
@@ -676,21 +676,20 @@ pub(super) fn handle_randr_set_crtc_config(
         );
     }
     // (1) arity + output + mode resolution FIRST (Xorg rrcrtc.c order).
-    let resolved = match state
-        .randr
-        .validate_set_crtc_config(crtc, mode, &outputs, |id, kind| {
-            if id == 0 {
-                return Ok(());
-            }
-            validate_resource_if_present(
-                state,
-                client_id,
-                yserver_protocol::x11::ResourceId(id),
-                kind,
-                AccessMode::SET_ATTR,
-                request,
-            )
-        }) {
+    let view = state.randr_view();
+    let resolved = match view.validate_set_crtc_config(crtc, mode, &outputs, |id, kind| {
+        if id == 0 {
+            return Ok(());
+        }
+        validate_resource_if_present(
+            state,
+            client_id,
+            yserver_protocol::x11::ResourceId(id),
+            kind,
+            AccessMode::SET_ATTR,
+            request,
+        )
+    }) {
         Err((code, error_value)) => {
             return emit_x11_error_with_minor(
                 state,
@@ -774,6 +773,12 @@ pub(super) fn handle_randr_set_crtc_config(
     };
     let output_id = output_row.output_id;
     let connector = output_row.name.clone();
+    // A mode only on the output's user list is programmed by its full
+    // timing (`xf86RandRModeConvert`); the connector's list may not have it.
+    let user_timing = (resolved.is_some() && !output_row.mode_ids.contains(&mode))
+        .then(|| state.randr_view().mode_info(mode))
+        .flatten()
+        .map(|info| UserTiming::from_mode_info(&info));
     // A disable keeps the current transform (xf86RandR12CrtcSet
     // only installs one with a mode).
     let apply_transform = (resolved.is_some()
@@ -808,7 +813,8 @@ pub(super) fn handle_randr_set_crtc_config(
     let mode_spec = resolved.map(|m| ModeSpec {
         width: m.width,
         height: m.height,
-        vrefresh: m.vrefresh,
+        vrefresh: user_timing.map_or(m.vrefresh, |t| t.vrefresh()),
+        user_timing,
     });
     // lastSetTime = client timestamp (0/CurrentTime ⇒ server now).
     let set_time = if req_timestamp == 0 {
@@ -839,7 +845,9 @@ pub(super) fn handle_randr_set_crtc_config(
 }
 
 /// Hand one CRTC configuration to the backend and complete it now, or park
-/// it until an asynchronous qualification finishes.
+/// it until an asynchronous qualification finishes. A user timing the
+/// backend cannot program answers `RRSetConfigFailed` without reaching it,
+/// as from a DDX whose `crtcSet` refuses (`rrcrtc.c:1459-1483`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn start_crtc_config(
     state: &mut ServerState,
@@ -851,6 +859,19 @@ pub(super) fn start_crtc_config(
     (x, y): (i32, i32),
     completion: CrtcConfigCompletion,
 ) -> io::Result<RequestOutcome> {
+    if mode_spec.is_some_and(|m| m.user_timing.is_some()) && !backend.programs_user_mode_timings() {
+        return complete_crtc_config(
+            state,
+            backend,
+            client_id,
+            sequence,
+            completion,
+            Err(io::Error::other(format!(
+                "a user timing is not in {connector}'s connector list and the backend \
+                 cannot program one"
+            ))),
+        );
+    }
     match backend.begin_crtc_config(completion.output_id, connector, mode_spec, x, y) {
         Ok(CrtcConfigApply::Applied(changed)) => {
             complete_crtc_config(state, backend, client_id, sequence, completion, Ok(changed))

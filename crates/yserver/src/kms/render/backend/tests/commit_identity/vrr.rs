@@ -109,6 +109,7 @@ fn apply_modeset_replacement(backend: &mut KmsBackend, mode_vrefresh: u32, crtc:
         width: 800,
         height: 600,
         vrefresh: mode_vrefresh,
+        user_timing: None,
     };
     let mut replacement =
         super::super::randr::clone_test_drm_output(&backend.platform.outputs[0].output);

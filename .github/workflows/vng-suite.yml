@@ -92,7 +92,7 @@ jobs:
           ls /usr/share/vulkan/icd.d/
       - name: vng suite (gpu none)
         env:
-          QUICK: '^(xterm|span-paint|pixel-oracle|xrandr-(scale|scale-crop|dpi|monitors|monitors-2|orientation|scale-cursor)|xmodmap-caps-control|xkbcomp-upload|subwindow-move|child-clip|draw-clip|redirected-backing)$'
+          QUICK: '^(xterm|span-paint|pixel-oracle|xrandr-(scale|scale-crop|dpi|monitors|monitors-2|orientation|scale-cursor|usermode)|xmodmap-caps-control|xkbcomp-upload|subwindow-move|child-clip|draw-clip|redirected-backing)$'
           SCENARIOS: ${{ inputs.scenarios }}
         run: |
           if [ -n "$SCENARIOS" ]; then filter=$SCENARIOS

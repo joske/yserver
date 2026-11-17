@@ -1,4 +1,5 @@
 use super::*;
+use crate::kms::render::backend::RANDR_ID_EXHAUSTED;
 
 pub(super) fn test_render_device(
     id: RenderDeviceId,
@@ -24,21 +25,21 @@ pub(super) fn test_render_device(
 }
 
 #[derive(Default)]
-struct TestCrtcConfigProbeState {
-    enqueued: Vec<CrtcConfigToken>,
-    enqueued_requests: Vec<RouteProbeRequest>,
+pub(super) struct TestCrtcConfigProbeState {
+    pub(super) enqueued: Vec<CrtcConfigToken>,
+    pub(super) enqueued_requests: Vec<RouteProbeRequest>,
     cancelled: Vec<CrtcConfigToken>,
-    completions: VecDeque<CrtcConfigProbeCompletion>,
+    pub(super) completions: VecDeque<CrtcConfigProbeCompletion>,
 }
 
-struct TestCrtcConfigProbeExecutor {
+pub(super) struct TestCrtcConfigProbeExecutor {
     state: Rc<RefCell<TestCrtcConfigProbeState>>,
     sender: Option<CoreSender>,
     auto_complete: Option<QualifiedScanoutPlan>,
 }
 
 impl TestCrtcConfigProbeExecutor {
-    fn new(
+    pub(super) fn new(
         state: Rc<RefCell<TestCrtcConfigProbeState>>,
         auto_complete: Option<QualifiedScanoutPlan>,
     ) -> Self {
@@ -128,7 +129,7 @@ pub(super) fn clone_test_drm_output(
     }
 }
 
-fn async_crtc_config_test_backend() -> (KmsBackend, u32, ModeSpec) {
+pub(super) fn async_crtc_config_test_backend() -> (KmsBackend, u32, ModeSpec) {
     let mut backend = KmsBackend::for_tests();
     let display_key = backend.platform.devices[0].key;
     let render_id = RenderDeviceId::DrmRender(test_device_key(128));
@@ -154,6 +155,7 @@ fn async_crtc_config_test_backend() -> (KmsBackend, u32, ModeSpec) {
         width: 1024,
         height: 768,
         vrefresh: 60,
+        user_timing: None,
     };
     backend
         .pstate
@@ -654,9 +656,10 @@ fn randr_rebuild_preserves_primary_while_output_resource_exists() {
 
 #[test]
 fn mode_timing_passes_kernel_timing_and_masks_drm_only_flags() {
-    // A real 2560x1440@59.95 mode: timing must pass through verbatim,
-    // and DRM-only flag bits above the RANDR RR_* range must be masked
-    // so we never advertise a bit RANDR would misinterpret.
+    // A real 2560x1440@59.95 mode: timing must pass through verbatim.
+    // DRM_MODE_FLAG_* bits 0-13 are the RR_* bits (drm_mode.h:61-84,
+    // randr.h:160-173) and are kept; the DRM-only 3D (bits 14-18) and
+    // picture-aspect (bits 19-22) bits are masked off.
     let m = crate::platform::drm::Mode {
         name: "2560x1440".into(),
         width: 2560,
@@ -667,12 +670,14 @@ fn mode_timing_passes_kernel_timing_and_masks_drm_only_flags() {
         hsync_start: 2608,
         hsync_end: 2640,
         htotal: 2720,
+        hskew: 3,
         vsync_start: 1443,
         vsync_end: 1448,
         vtotal: 1481,
         vscan: 1,
-        // PHSYNC(0x1) | PVSYNC(0x4) kept; DBLCLK(0x1000, DRM-only) dropped.
-        flags: 0x1 | 0x4 | 0x1000,
+        // PHSYNC | PVSYNC | CSYNC | DBLCLK kept; 3D_FRAME_PACKING (1<<14)
+        // and PIC_AR_16_9 (2<<19) dropped.
+        flags: 0x1 | 0x4 | 0x40 | 0x1000 | (1 << 14) | (2 << 19),
     };
     let t = mode_timing(&m).expect("real timing => Some");
     assert_eq!(t.clock_khz, 241_500);
@@ -680,7 +685,8 @@ fn mode_timing_passes_kernel_timing_and_masks_drm_only_flags() {
     assert_eq!(t.vtotal, 1481);
     assert_eq!(t.hsync_start, 2608);
     assert_eq!(t.vsync_end, 1448);
-    assert_eq!(t.mode_flags, 0x5, "DRM-only bits masked to RR_* range");
+    assert_eq!(t.hskew, 3);
+    assert_eq!(t.mode_flags, 0x1045, "DRM-only bits masked to RR_* range");
 
     // Synthetic/nested mode (no clock) => None => RANDR synthesises.
     let synthetic = crate::platform::drm::Mode {
@@ -690,6 +696,64 @@ fn mode_timing_passes_kernel_timing_and_masks_drm_only_flags() {
         ..Default::default()
     };
     assert!(mode_timing(&synthetic).is_none(), "clock_khz==0 => None");
+}
+
+#[test]
+fn kernel_hskew_and_high_rr_flags_reach_the_mode_info_reply() {
+    use super::server_scanout::DrmModeInfo;
+    use crate::platform::drm::ModeIdentity;
+
+    // `cvt 1920 1080 60` with a skew and RR_CSync (0x40) as the kernel
+    // would report them (drmmode_ConvertFromKMode copies both).
+    let kernel = |hskew: u16, flags: u32| {
+        crate::drm::modeset::local_mode_from(
+            &DrmModeInfo {
+                clock: 173_000,
+                hdisplay: 1920,
+                hsync_start: 2048,
+                hsync_end: 2248,
+                htotal: 2576,
+                hskew,
+                vdisplay: 1080,
+                vsync_start: 1083,
+                vsync_end: 1088,
+                vtotal: 1120,
+                vscan: 0,
+                vrefresh: 60,
+                flags,
+                type_: 0,
+                name: [0; 32],
+            }
+            .into_mode(),
+        )
+    };
+    let mode = kernel(7, 0x2 | 0x4 | 0x40);
+    assert_eq!(mode.hskew, 7);
+    // Timings differing only in hskew or a flag above bit 5 are distinct
+    // RANDR modes, so they get distinct ids.
+    let identity = ModeIdentity::from(&mode);
+    assert_ne!(identity, ModeIdentity::from(&kernel(0, 0x2 | 0x4 | 0x40)));
+    assert_ne!(identity, ModeIdentity::from(&kernel(7, 0x2 | 0x4)));
+    // Bits the RANDR reply cannot carry do not split a mode.
+    assert_eq!(
+        identity,
+        ModeIdentity::from(&kernel(7, 0x2 | 0x4 | 0x40 | (2 << 19)))
+    );
+
+    let timing = mode_timing(&mode).expect("real timing");
+    let randr_mode = yserver_core::randr::RandrMode {
+        mode_id: 9,
+        width: 1920,
+        height: 1080,
+        vrefresh: 60,
+        timing: Some(timing),
+    };
+    let state =
+        yserver_core::randr::RandrState::from_outputs_with_modes(0, Vec::new(), vec![randr_mode]);
+    let info = state.screen_resources_current().modes[0];
+    assert_eq!(info.dot_clock, 173_000_000);
+    assert_eq!(info.hskew, 7);
+    assert_eq!(info.mode_flags, 0x2 | 0x4 | 0x40);
 }
 
 #[test]
@@ -1090,6 +1154,77 @@ fn randr_ids_are_stable_across_drop() {
     assert_ne!(c.output_id, a.output_id);
     assert_ne!(c.output_id, b.output_id);
     assert_ne!(c.crtc_id, a.crtc_id);
+}
+
+/// Every id the allocator hands out, used up or not, stays out of the fixed
+/// server XIDs and the other ranges of client 0.
+fn assert_backend_randr_id(id: u32) {
+    use yserver_core::server::{RANDR_BACKEND_XID_FIRST, RANDR_BACKEND_XID_LAST};
+    assert!(
+        id == RANDR_ID_EXHAUSTED
+            || (RANDR_BACKEND_XID_FIRST..=RANDR_BACKEND_XID_LAST).contains(&id),
+        "{id:#x} is outside the backend RANDR range"
+    );
+    assert_ne!(id, yserver_core::resources::ROOT_WINDOW.0);
+}
+
+#[test]
+fn randr_ids_never_reach_fixed_server_xids() {
+    // The counter used to start at 1, so its 256th id was the root window.
+    let mut alloc = RandrIdAllocator::default();
+    for i in 0..=yserver_core::resources::ROOT_WINDOW.0 {
+        let ids = alloc.ids_for(&test_output_key(0, &format!("DP-{i}")));
+        assert_backend_randr_id(ids.output_id);
+        assert_backend_randr_id(ids.crtc_id);
+        assert!(ids.output_id > yserver_core::server::SERVER_FIXED_XID_LAST);
+    }
+}
+
+#[test]
+fn randr_ids_stop_at_the_end_of_the_backend_range() {
+    use yserver_core::server::RANDR_BACKEND_XID_LAST;
+    let mut alloc = RandrIdAllocator {
+        next: RANDR_BACKEND_XID_LAST - 2,
+        ..RandrIdAllocator::default()
+    };
+    let provider = alloc.provider_id_for(RandrProviderEndpoint::Kms(test_device_key(0)));
+    let ids = alloc.ids_for(&test_output_key(0, "DP-1"));
+    let mode = alloc.mode_id(&test_advertised_mode(1920, 1080, 60, false));
+    let later = alloc.ids_for(&test_output_key(0, "DP-2"));
+    assert_eq!(
+        [
+            provider,
+            ids.output_id,
+            ids.crtc_id,
+            mode,
+            later.output_id,
+            later.crtc_id
+        ],
+        [
+            RANDR_BACKEND_XID_LAST - 2,
+            RANDR_BACKEND_XID_LAST - 1,
+            RANDR_BACKEND_XID_LAST,
+            RANDR_ID_EXHAUSTED,
+            RANDR_ID_EXHAUSTED,
+            RANDR_ID_EXHAUSTED,
+        ]
+    );
+    for _ in 0..4 {
+        assert_backend_randr_id(alloc.fresh());
+    }
+}
+
+#[test]
+fn used_up_randr_ids_are_not_advertised() {
+    let mut backend = KmsBackend::for_tests();
+    backend.pstate.randr_id_alloc = RandrIdAllocator {
+        next: yserver_core::server::RANDR_BACKEND_XID_LAST + 1,
+        ..RandrIdAllocator::default()
+    };
+    let (outputs, modes) = backend.randr_outputs_and_modes();
+    assert!(outputs.is_empty(), "{outputs:?}");
+    assert!(modes.is_empty(), "{modes:?}");
+    assert!(backend.randr_providers().is_empty());
 }
 
 #[test]
@@ -1798,6 +1933,7 @@ fn split_enable_gate_runs_before_idempotent_active_reassert() {
         width: layout.width,
         height: layout.height,
         vrefresh: layout.output.picked.vrefresh,
+        user_timing: None,
     };
     let (x, y) = (layout.x, layout.y);
     let output_id = backend
@@ -1834,6 +1970,7 @@ fn automatically_bound_live_split_route_passes_gate_before_idempotent_reassert()
         width: layout.width,
         height: layout.height,
         vrefresh: layout.output.picked.vrefresh,
+        user_timing: None,
     };
     let (x, y) = (layout.x, layout.y);
     let output_id = backend
@@ -2282,7 +2419,7 @@ fn connector_only_probe_reconciles_state_and_drops_disconnected_modes() {
 // ── Hotplug: a disconnect keeps the route (#273, superseding the
 // 2026-09-17 P1b relight design) ──────────────────────────────────────
 
-fn relight_test_snapshot(
+pub(super) fn relight_test_snapshot(
     key: &OutputKey,
     modes: Vec<crate::platform::drm::Mode>,
 ) -> ConnectorSnapshot {
@@ -2311,6 +2448,9 @@ fn a_physical_disconnect_keeps_the_route_and_the_reconnect_needs_no_commit() {
         vrefresh: 60,
         x: 0,
         y: 0,
+        timing: crate::platform::drm::ModeIdentity::from(
+            &backend.platform.outputs[0].output.picked,
+        ),
     };
     let snapshot = relight_test_snapshot(&key, vec![test_advertised_mode(1920, 1080, 60, true)]);
 
@@ -3103,7 +3243,7 @@ fn not_live_output_reports_connected_off_vs_disconnected() {
 //   No RRCrtcChangeNotify.
 
 /// Every physical-topology probe answers with the scripted snapshot.
-struct ScriptedConnectorProbe(std::cell::RefCell<Vec<ConnectorSnapshot>>);
+pub(super) struct ScriptedConnectorProbe(pub(super) std::cell::RefCell<Vec<ConnectorSnapshot>>);
 
 impl crate::kms::render::backend::kms::session::VtResumeExecutor for ScriptedConnectorProbe {
     fn acquire_master(

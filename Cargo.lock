@@ -1477,6 +1477,7 @@ dependencies = [
  "crossbeam-channel",
  "dispatch2",
  "drm",
+ "drm-ffi",
  "embed-resource",
  "env_logger",
  "flate2",

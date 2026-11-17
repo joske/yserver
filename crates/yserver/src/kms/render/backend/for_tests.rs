@@ -764,6 +764,7 @@ impl KmsBackend {
                         vrefresh: layout.output.picked.vrefresh,
                         x: layout.x,
                         y: layout.y,
+                        timing: crate::platform::drm::ModeIdentity::from(&layout.output.picked),
                     },
                     layout.output.modes.clone(),
                     layout.output.edid.clone(),

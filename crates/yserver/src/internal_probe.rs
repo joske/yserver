@@ -22,7 +22,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use yserver_core::backend::{CrtcConfigToken, ModeSpec};
+use yserver_core::backend::{CrtcConfigToken, ModeSpec, UserTiming};
 
 use crate::{
     drm::modeset::output_for_exact_probe_assignment,
@@ -51,7 +51,7 @@ const PROTOCOL_VERSION: u16 = 1;
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
 const HEADER_LEN: usize = 12;
-const REQUEST_PAYLOAD_LEN: usize = 136;
+const REQUEST_PAYLOAD_LEN: usize = 164;
 const RESPONSE_PAYLOAD_LEN: usize = 64;
 const REQUEST_FRAME_LEN: usize = HEADER_LEN + REQUEST_PAYLOAD_LEN;
 const RESPONSE_FRAME_LEN: usize = HEADER_LEN + RESPONSE_PAYLOAD_LEN;
@@ -188,6 +188,25 @@ impl RouteProbeRequest {
         put_u32(&mut frame, &mut cursor, self.kms.crtc.into());
         put_u32(&mut frame, &mut cursor, self.kms.plane.into());
         put_u64(&mut frame, &mut cursor, self.fence_timeout_ns);
+        // The user timing goes last, so every earlier offset is unchanged.
+        let timing = self.mode.user_timing.map(|user| user.timing);
+        put_u16(&mut frame, &mut cursor, u16::from(timing.is_some()));
+        put_u16(&mut frame, &mut cursor, 0);
+        let t = timing.unwrap_or_default();
+        put_u32(&mut frame, &mut cursor, t.clock_khz);
+        for value in [
+            t.hsync_start,
+            t.hsync_end,
+            t.htotal,
+            t.hskew,
+            t.vsync_start,
+            t.vsync_end,
+            t.vtotal,
+            0,
+        ] {
+            put_u16(&mut frame, &mut cursor, value);
+        }
+        put_u32(&mut frame, &mut cursor, t.mode_flags);
         debug_assert_eq!(cursor, REQUEST_FRAME_LEN);
         frame
     }
@@ -199,10 +218,11 @@ impl RouteProbeRequest {
         if token.0 == 0 {
             return Err(ProtocolError::ZeroToken);
         }
-        let mode = ModeSpec {
+        let mut mode = ModeSpec {
             width: take_u16(frame, &mut cursor)?,
             height: take_u16(frame, &mut cursor)?,
             vrefresh: take_u32(frame, &mut cursor)?,
+            user_timing: None,
         };
         if mode.width == 0 || mode.height == 0 || mode.vrefresh == 0 {
             return Err(ProtocolError::InvalidMode(mode));
@@ -255,6 +275,41 @@ impl RouteProbeRequest {
         let fence_timeout_ns = take_u64(frame, &mut cursor)?;
         if fence_timeout_ns == 0 {
             return Err(ProtocolError::ZeroFenceTimeout);
+        }
+        let timing_presence = take_u16(frame, &mut cursor)?;
+        let reserved = take_u16(frame, &mut cursor)?;
+        let clock_khz = take_u32(frame, &mut cursor)?;
+        let mut sync = [0_u16; 8];
+        for value in &mut sync {
+            *value = take_u16(frame, &mut cursor)?;
+        }
+        let timing = yserver_core::randr::ModeTiming {
+            clock_khz,
+            hsync_start: sync[0],
+            hsync_end: sync[1],
+            htotal: sync[2],
+            hskew: sync[3],
+            vsync_start: sync[4],
+            vsync_end: sync[5],
+            vtotal: sync[6],
+            mode_flags: take_u32(frame, &mut cursor)?,
+        };
+        if reserved != 0 || sync[7] != 0 {
+            return Err(ProtocolError::NonZeroReserved(u32::from(
+                reserved | sync[7],
+            )));
+        }
+        match timing_presence {
+            0 if timing == yserver_core::randr::ModeTiming::default() => {}
+            0 => return Err(ProtocolError::NonCanonicalAbsentTiming),
+            1 => {
+                mode.user_timing = Some(UserTiming {
+                    width: mode.width,
+                    height: mode.height,
+                    timing,
+                });
+            }
+            value => return Err(ProtocolError::UnknownTimingPresence(value)),
         }
         debug_assert_eq!(cursor, REQUEST_FRAME_LEN);
         Ok(Self {
@@ -474,6 +529,10 @@ enum ProtocolError {
     NonCanonicalUnverifiedRenderIdentity,
     #[error("probe protocol mode is invalid: {0:?}")]
     InvalidMode(ModeSpec),
+    #[error("probe protocol user-timing presence {0} is unknown")]
+    UnknownTimingPresence(u16),
+    #[error("probe protocol absent user timing has non-zero timing data")]
+    NonCanonicalAbsentTiming,
     #[error("probe protocol {0} handle is zero")]
     ZeroKmsHandle(&'static str),
     #[error("probe protocol per-fence timeout is zero")]
@@ -1346,6 +1405,7 @@ mod tests {
                 width: 1600,
                 height: 1200,
                 vrefresh: 42,
+                user_timing: None,
             },
             source_route: ScanoutRoute::new(
                 drm_render(226, 128),
@@ -1567,6 +1627,43 @@ mod tests {
         assert_eq!(
             RouteProbeRequest::decode(&request_frame),
             Err(ProtocolError::UnsupportedVersion(PROTOCOL_VERSION + 1))
+        );
+    }
+
+    #[test]
+    fn a_user_timing_round_trips_and_absent_timing_is_canonical() {
+        let mut timed = request(9, false);
+        timed.mode.user_timing = Some(UserTiming {
+            width: timed.mode.width,
+            height: timed.mode.height,
+            timing: yserver_core::randr::ModeTiming {
+                clock_khz: 173_000,
+                hsync_start: 2048,
+                hsync_end: 2248,
+                htotal: 2576,
+                hskew: 7,
+                vsync_start: 1083,
+                vsync_end: 1088,
+                vtotal: 1120,
+                mode_flags: 0x46,
+            },
+        });
+        let frame = timed.encode();
+        assert_eq!(RouteProbeRequest::decode(&frame), Ok(timed));
+
+        // The timing block is the frame's last 28 bytes.
+        let timing_at = REQUEST_FRAME_LEN - 28;
+        let mut unknown = frame;
+        unknown[timing_at..timing_at + 2].copy_from_slice(&2_u16.to_le_bytes());
+        assert_eq!(
+            RouteProbeRequest::decode(&unknown),
+            Err(ProtocolError::UnknownTimingPresence(2))
+        );
+        let mut absent_with_data = frame;
+        absent_with_data[timing_at..timing_at + 2].copy_from_slice(&0_u16.to_le_bytes());
+        assert_eq!(
+            RouteProbeRequest::decode(&absent_with_data),
+            Err(ProtocolError::NonCanonicalAbsentTiming)
         );
     }
 

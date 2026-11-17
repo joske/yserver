@@ -87,11 +87,12 @@ const MODE_800: ModeSpec = ModeSpec {
     width: 800,
     height: 600,
     vrefresh: 60,
+    user_timing: None,
 };
 
 /// Render on the display device itself: the only route the per-CRTC path
 /// takes.
-fn use_same_device_route(backend: &mut KmsBackend) -> ScanoutRoute {
+pub(super) fn use_same_device_route(backend: &mut KmsBackend) -> ScanoutRoute {
     let display = backend.platform.devices[0].key;
     let render_id = RenderDeviceId::DrmRender(test_device_key(128));
     backend.platform.render_devices = vec![test_render_device(render_id, Some(display))];
@@ -463,6 +464,7 @@ fn mode_change_whose_discovery_moves_the_crtc_takes_the_global_quiesce() {
         width: 640,
         height: 480,
         vrefresh: 60,
+        user_timing: None,
     };
 
     // The fd-less fixture cannot relight; only which path ran matters.
@@ -492,6 +494,7 @@ fn a_flip_that_never_retires_falls_back_to_the_global_quiesce() {
         width: 640,
         height: 480,
         vrefresh: 60,
+        user_timing: None,
     };
 
     // The fd-less fixture cannot relight; only which path ran matters.
@@ -774,6 +777,7 @@ fn mode_change_modesets_only_its_crtc_while_the_other_keeps_presenting() {
         width: 640,
         height: 480,
         vrefresh: 60,
+        user_timing: None,
     };
 
     assert!(
@@ -894,6 +898,7 @@ fn rejected_mode_change_preserves_arm_slots_and_watch_deadlines() {
             width: 800,
             height: 600,
             vrefresh: 75,
+            user_timing: None,
         }),
         800,
         0,
@@ -1059,6 +1064,7 @@ fn same_route_modeset_keeps_the_mark_and_never_rewinds() {
                 width: 800,
                 height: 600,
                 vrefresh: 240,
+                user_timing: None,
             }),
             800,
             0,
@@ -1449,6 +1455,7 @@ fn mode_change_keeps_the_other_crtcs_queued_cursor_move() {
         width: 800,
         height: 600,
         vrefresh: 75,
+        user_timing: None,
     };
 
     assert!(

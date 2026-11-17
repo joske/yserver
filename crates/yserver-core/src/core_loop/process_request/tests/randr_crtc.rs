@@ -793,14 +793,12 @@ fn randr_transform_body(crtc: u32, matrix: [i32; 9], filter_name: &[u8]) -> Vec<
 }
 
 #[test]
-fn randr_create_mode_unimplemented_returns_error_not_hang() {
-    // RRCreateMode (minor 16): reply-bearing, unimplemented → error.
+fn randr_create_mode_short_request_is_bad_length() {
+    // RRCreateMode (minor 16): REQUEST_AT_LEAST_SIZE(xRRCreateModeReq)
+    // (rrmode.c:296) answers a bare header with BadLength.
     let bytes = randr_unimplemented_reply_bearing(16);
-    assert!(
-        bytes.len() >= 32,
-        "expected error, not a hang: {bytes:02x?}"
-    );
-    assert_eq!(bytes[1], x11::error::BAD_IMPLEMENTATION, "code");
+    assert_eq!(bytes.len(), 32, "expected one error: {bytes:02x?}");
+    assert_eq!(bytes[1], x11::error::BAD_LENGTH, "code");
     assert_eq!(&bytes[8..10], &16u16.to_le_bytes(), "minor");
     assert_eq!(bytes[10], 128, "major = RANDR");
 }
@@ -1394,7 +1392,7 @@ fn randr_set_screen_config_rotates_the_first_output_as_xorg() {
         call(&mut state, body(cts, 0, 0, 1, 1)),
         Err(x11::error::BAD_VALUE)
     );
-    let rate = state.randr.rr10_data().unwrap().rate;
+    let rate = state.randr_view().rr10_data().unwrap().rate;
     assert_eq!(
         call(&mut state, body(cts, 600, 0, RR_ROTATE_90, rate)).map(|r| (r.0, r.1)),
         Ok((0, 600)),
@@ -1474,7 +1472,7 @@ fn randr_get_screen_info_lists_mode_sizes_and_rates_by_client_version() {
         read_all_available(peer)
     };
     let u16_at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
-    let rate = state.randr.rr10_data().unwrap().rate;
+    let rate = state.randr_view().rr10_data().unwrap().rate;
     let v10 = get(&mut state, &mut backend, &mut peer);
     assert_eq!(v10[1], 0x3f, "setOfRotations");
     assert_eq!(u16_at(&v10, 20), 1, "nSizes");
@@ -1993,6 +1991,7 @@ fn randr_set_crtc_config_validates_mode_id() {
                     width: 1920,
                     height: 1080,
                     vrefresh: 60,
+                    user_timing: None,
                 }),
                 x: 0,
                 y: 0,

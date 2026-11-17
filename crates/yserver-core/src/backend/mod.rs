@@ -24,8 +24,8 @@ pub use trait_def::{
     CrtcConfigToken, DisplayedCursor, Dri3Caps, Dri3ExportBegin, Dri3ExportToken,
     Dri3ImportModifier, Dri3PixmapExport, HostSocketStatus, KeyboardMappingChange, KeymapLoad,
     ModeSpec, PresentCaps, PresentClockSample, PresentClockSource, PresentScanoutCandidate,
-    PresentSourceWait, PresentWake, RealizeBackground, SyncobjHandle, XkbIndicatorMapsChange,
-    XkbNewKeyboardInfo, XkbSetEvent, XkbSetOutcome, XshmfenceHandle,
+    PresentSourceWait, PresentWake, RealizeBackground, SyncobjHandle, UserTiming,
+    XkbIndicatorMapsChange, XkbNewKeyboardInfo, XkbSetEvent, XkbSetOutcome, XshmfenceHandle,
 };
 
 use yserver_protocol::x11::ClientId;

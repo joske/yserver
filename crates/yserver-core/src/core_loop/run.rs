@@ -3719,7 +3719,9 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
     let timestamp = state.randr.timestamp;
     let config_timestamp = state.randr.config_timestamp;
     let (screen_rotation, width, height, width_mm, height_mm) = state.randr.screen_change_fields();
+    let size_id = state.randr_view().rr10_current_size_id();
     // Resolve each changed output's current crtc/mode for the notify payload.
+    let view = state.randr_view();
     let changed: Vec<(u32, u32, u32, u8, u16)> = changed_outputs
         .iter()
         .filter_map(|id| {
@@ -3732,7 +3734,7 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
                     (
                         o.output_id,
                         if o.mode_id != 0 { o.crtc_id } else { 0 },
-                        o.mode_id,
+                        view.crtc_current_mode(o),
                         if o.connected {
                             x11randr::CONNECTION_CONNECTED
                         } else {
@@ -3769,6 +3771,7 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
                     config_timestamp,
                     root: crate::resources::ROOT_WINDOW.0,
                     request_window: request_window.0,
+                    size_id,
                     width,
                     height,
                     width_mm,
@@ -4128,9 +4131,21 @@ fn emit_randr_change_notifications_split(
 
     const RANDR_FIRST_EVENT: u8 = 89;
 
+    // Mode ids as clients see them (`RandrView`).
+    let view = state.randr_view();
+    let project = |changed: &[(u32, u32, u32)]| -> Vec<(u32, u32, u32)> {
+        changed
+            .iter()
+            .map(|&(output, crtc, mode)| (output, crtc, view.project_crtc_mode(crtc, mode)))
+            .collect()
+    };
+    let crtc_changed = &project(crtc_changed);
+    let output_changed = &project(output_changed);
+
     let timestamp = state.randr.timestamp;
     let config_timestamp = state.randr.config_timestamp;
     let (screen_rotation, width, height, width_mm, height_mm) = state.randr.screen_change_fields();
+    let size_id = state.randr_view().rr10_current_size_id();
     // Per-CRTC geometry (position AND mode size). CrtcChangeNotify must
     // report each CRTC's own mode dimensions — NOT the logical screen
     // size — or a multi-monitor client sees every CRTC as e.g. 5120×1440
@@ -4190,6 +4205,7 @@ fn emit_randr_change_notifications_split(
                     config_timestamp,
                     root: crate::resources::ROOT_WINDOW.0,
                     request_window: request_window.0,
+                    size_id,
                     width,
                     height,
                     width_mm,

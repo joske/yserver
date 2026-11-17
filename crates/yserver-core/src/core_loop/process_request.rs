@@ -235,6 +235,7 @@ const RANDR_REQUEST_COUNT: u8 = 47;
 /// RANDR's fixed first-error base from `extension_metadata("RANDR")`.
 const RANDR_BAD_OUTPUT: u8 = 147;
 const RANDR_BAD_CRTC: u8 = 147 + 1;
+const RANDR_BAD_MODE: u8 = 147 + 2;
 const RANDR_BAD_PROVIDER: u8 = 147 + 3;
 /// XFIXES `BadRegion` and SYNC `BadFence` wire error codes. Their extension
 /// bases are fixed by `nested::extension_metadata`; the resource-specific

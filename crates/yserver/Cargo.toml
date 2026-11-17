@@ -48,6 +48,7 @@ fontconfig = "0.11"
 # The DRM/KMS platform; build.rs emits `cfg(kms)` for the same targets.
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]
 drm.workspace = true
+drm-ffi.workspace = true
 gbm.workspace = true
 input.workspace = true
 # The VRR exclusion list (`vrr_exclusions.rs`).
