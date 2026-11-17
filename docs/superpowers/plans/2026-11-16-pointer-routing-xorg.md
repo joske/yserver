@@ -49,9 +49,9 @@
   - C4: as C1, A also selects core PointerMotion on B's window (core attempt after a rejected XI2 attempt).
   - C4b: as C2 (B XI2 on descendant D of the grab window), A also selects both core PointerMotion and master XI_Motion on D (owner wins inside the XI2 attempt: natural XI2 on D, not fallback on the grab window; no duplicate core).
   - C5: as C1, B selects slave (XTest pointer) XI_Motion: slave form reaches B.
-  - C6: core GrabPointer owner_events=True by A; B XI2 on a window below where A selects core PointerMotion on its parent.
+  - C6: core GrabPointer owner_events=True by A on OUT (a top-level outside W's tree, so natural delivery on W and fallback to the grab window are distinguishable); B XI2 (master XI_Motion) on D, a child of W under the pointer; A selects core PointerMotion on W.
   - C7: core GrabPointer owner_events=True by A; A core PointerMotion on W, B XI2 on W.
-  - C7s: as C6 but B selects slave XI_Motion only (slave-only does not block the core walk).
+  - C7s: as C6 (grab window OUT) but B selects slave XI_Motion only (slave-only does not block the core walk: A gets core on W, not fallback on OUT).
   - C8: reproduce exactly the setup of `implicit_grab_xi2_release_reaches_all_master_selector_xfce` and of the test documented at `pointer_fanout/tests.rs` ~5225 (read both; state in the row which grab, core or XI2 implicit, Xorg activates).
   - C8c: core implicit grab: A selects core ButtonPress|ButtonRelease|PointerMotion on W; B selects master XI_Motion only (no XI2 press) on D, a child of W under the pointer; motion, press, motion, release. Record that Xorg activates a core implicit grab for A (if it does not, stop and report) and whether B receives the Motion during that grab. This is the row for the `core_implicit` exception (`pointer_fanout.rs` ~1887).
   - C9: one client with slave + master XI2 selections (E27 setup of the existing E27 tests): press/release counts per form.
