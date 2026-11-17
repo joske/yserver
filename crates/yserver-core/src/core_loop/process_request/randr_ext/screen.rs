@@ -149,7 +149,7 @@ pub(super) fn handle_randr_get_screen_resources(
             RANDR_MAJOR_OPCODE,
         );
     }
-    let resources = state.randr.screen_resources_current();
+    let resources = state.randr_view().screen_resources_current();
     let buf = x11randr::encode_get_screen_resources_current_reply(byte_order, sequence, &resources);
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
@@ -192,7 +192,7 @@ pub(super) fn handle_randr_get_screen_resources_current(
         ResourceKind::Window,
         AccessMode::GET_ATTR
     );
-    let resources = state.randr.screen_resources_current();
+    let resources = state.randr_view().screen_resources_current();
     let buf = x11randr::encode_get_screen_resources_current_reply(byte_order, sequence, &resources);
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);

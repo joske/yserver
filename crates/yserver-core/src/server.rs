@@ -1158,6 +1158,10 @@ pub struct ServerState {
     /// RANDR 1.5 client-defined monitors in `SetMonitor` order. See
     /// [`crate::randr::ClientMonitor`] for why this lives beside `randr`.
     pub randr_client_monitors: Vec<crate::randr::ClientMonitor>,
+    /// RANDR user modes (`RRCreateMode`) and the per-output user lists.
+    /// Beside `randr` for the same reason as the client monitors: backend
+    /// rebuilds must not touch them, and a server reset clears them.
+    pub randr_user_modes: crate::randr::RandrUserModes,
     /// One bit per RANDR minor opcode whose unsupported behavior has already
     /// produced a warning. Repeated requests remain visible at debug level
     /// without flooding ordinary desktop layout reapplication logs.
@@ -1739,6 +1743,12 @@ impl ServerState {
         crate::access::Decision::Allow
     }
 
+    /// The RANDR state clients see: the backend's plus the user modes.
+    #[must_use]
+    pub fn randr_view(&self) -> crate::randr::RandrView<'_> {
+        crate::randr::RandrView::new(&self.randr, &self.randr_user_modes)
+    }
+
     /// Resolve a resource's owner from the store for its exact resource kind.
     /// This remains separate from `ResourceTable::resource_owner`, whose
     /// narrower lookup is part of KillClient's existing BadValue behavior.
@@ -1801,13 +1811,8 @@ impl ServerState {
                 .iter()
                 .any(|output| output.crtc_id == id.0)
                 .then_some(server_owner),
-            ResourceKind::RandrMode => self
-                .randr
-                .mode_table
-                .iter()
-                .chain(self.randr.modes.iter())
-                .any(|mode| mode.mode_id == id.0)
-                .then_some(server_owner),
+            // User modes belong to the server too (`rrmode.c:91-92`).
+            ResourceKind::RandrMode => self.randr_view().mode_exists(id.0).then_some(server_owner),
             ResourceKind::RandrProvider => self.randr.provider(id.0).map(|_| server_owner),
         }
     }
@@ -2095,6 +2100,7 @@ impl ServerState {
             randr_primary_output_explicit: false,
             randr_output_properties: HashMap::new(),
             randr_client_monitors: Vec::new(),
+            randr_user_modes: crate::randr::RandrUserModes::default(),
             randr_unsupported_warned_mask: 0,
             xkb_clients: HashMap::new(),
             xkb_interests: HashMap::new(),

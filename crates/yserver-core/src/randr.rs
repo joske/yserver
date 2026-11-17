@@ -4,6 +4,9 @@ use yserver_protocol::x11::randr as proto;
 
 use crate::properties::PropertyValue;
 
+mod user_modes;
+pub use user_modes::{RandrUserModes, RandrView, UserMode};
+
 pub use yserver_protocol::x11::randr::transform::{
     CrtcTransform, FIXED_ONE, Filter, IDENTITY_MATRIX, RR_REFLECT_X, RR_REFLECT_Y, RR_ROTATE_0,
     RR_ROTATE_90, RR_ROTATE_180, RR_ROTATE_270, SUPPORTED_ROTATIONS, crtc_matrix,
@@ -692,45 +695,20 @@ impl RandrState {
     }
 
     /// Build a `ScreenResources` reply describing every output / CRTC /
-    /// mode currently configured.
+    /// mode currently configured, without user modes. Replies go through
+    /// [`RandrView::screen_resources_current`].
     #[must_use]
     pub fn screen_resources_current(&self) -> proto::ScreenResources {
-        let crtcs: Vec<u32> = self.outputs.iter().map(|o| o.crtc_id).collect();
-        let outputs: Vec<u32> = self.outputs.iter().map(|o| o.output_id).collect();
+        RandrView::new(self, &RandrUserModes::default()).screen_resources_current()
+    }
 
-        let mut mode_names: Vec<u8> = Vec::new();
-        let mut mode_infos: Vec<proto::ModeInfo> = Vec::with_capacity(self.mode_table.len());
-        for m in &self.mode_table {
-            let name = format!("{}x{}", m.width, m.height).into_bytes();
-            #[allow(clippy::cast_possible_truncation)]
-            let name_len = name.len() as u16;
-            // Shared with VidMode's GetModeLine — see `EffectiveTiming`.
-            let t = m.effective_timing();
-            mode_infos.push(proto::ModeInfo {
-                id: m.mode_id,
-                width: m.width,
-                height: m.height,
-                dot_clock: t.dot_clock_hz,
-                hsync_start: t.hsync_start,
-                hsync_end: t.hsync_end,
-                htotal: t.htotal,
-                hskew: t.hskew,
-                vsync_start: t.vsync_start,
-                vsync_end: t.vsync_end,
-                vtotal: t.vtotal,
-                name_len,
-                mode_flags: t.mode_flags,
-            });
-            mode_names.extend_from_slice(&name);
-        }
-        proto::ScreenResources {
-            timestamp: self.timestamp,
-            config_timestamp: self.config_timestamp,
-            crtcs,
-            outputs,
-            modes: mode_infos,
-            mode_names,
-        }
+    /// The CRTC currently assigned to `output_id`, 0 for none.
+    #[must_use]
+    pub fn assigned_crtc(&self, output_id: u32) -> u32 {
+        self.output_crtc_associations
+            .get(&output_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Look up output info by `output_id`.
@@ -791,61 +769,20 @@ impl RandrState {
         })
     }
 
-    /// Validate `SetCrtcConfig` in yserver's order: arity, outputs, then mode.
-    /// Xorg verifies the mode immediately after the CRTC and before outputs
-    /// (`randr/rrcrtc.c:1294-1320`), so if both a mode and output are bad the
-    /// client sees a different error here. Rotation is checked afterward by
-    /// the handler. `check_resource` runs immediately after each output or
-    /// mode resolves. `Ok(None)` = disable; `Ok(Some(mode))` = enable with this
-    /// resolved mode;
-    /// `Err((code, error_value))` = protocol error + field-specific
-    /// `errorValue`.
+    /// [`RandrView::validate_set_crtc_config`] without user modes.
     pub fn validate_set_crtc_config(
         &self,
         crtc_id: u32,
         mode_id: u32,
         outputs: &[u32],
-        mut check_resource: impl FnMut(u32, crate::access::ResourceKind) -> Result<(), (u8, u32)>,
+        check_resource: impl FnMut(u32, crate::access::ResourceKind) -> Result<(), (u8, u32)>,
     ) -> Result<Option<RandrMode>, (u8, u32)> {
-        use yserver_protocol::x11::error;
-        // 1. mode/outputs arity. errorValue = the addressed crtc.
-        if mode_id == 0 {
-            if !outputs.is_empty() {
-                return Err((error::BAD_MATCH, crtc_id));
-            }
-            return Ok(None); // disable
-        }
-        if outputs.is_empty() {
-            return Err((error::BAD_MATCH, crtc_id));
-        }
-        // 2. outputs resolve to known connectors AND drive this crtc (1:1).
-        for &oid in outputs {
-            let Some(out) = self.outputs.iter().find(|o| o.output_id == oid) else {
-                return Err((error::BAD_MATCH, oid)); // unknown output
-            };
-            check_resource(oid, crate::access::ResourceKind::RandrOutput)?;
-            if out.crtc_id != crtc_id {
-                return Err((error::BAD_MATCH, crtc_id)); // output doesn't drive crtc
-            }
-        }
-        // The addressed crtc must belong to one of the named outputs.
-        let out = self
-            .outputs
-            .iter()
-            .find(|o| o.crtc_id == crtc_id && outputs.contains(&o.output_id))
-            .ok_or((error::BAD_MATCH, crtc_id))?;
-        // 3. mode ∈ this output's advertised list. errorValue = bad mode.
-        if !out.mode_ids.contains(&mode_id) {
-            return Err((error::BAD_MATCH, mode_id));
-        }
-        let mode = self
-            .mode_table
-            .iter()
-            .find(|m| m.mode_id == mode_id)
-            .copied()
-            .ok_or((error::BAD_MATCH, mode_id))?;
-        check_resource(mode_id, crate::access::ResourceKind::RandrMode)?;
-        Ok(Some(mode))
+        RandrView::new(self, &RandrUserModes::default()).validate_set_crtc_config(
+            crtc_id,
+            mode_id,
+            outputs,
+            check_resource,
+        )
     }
 
     fn current_mode_table(outputs: &[RandrOutput]) -> Vec<RandrMode> {

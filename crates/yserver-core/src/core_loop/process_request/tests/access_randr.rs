@@ -1622,7 +1622,7 @@ fn change_output_property_bad_value_precedes_check() {
 }
 
 #[test]
-fn output_mode_stubs_unresolved_ids_are_not_asked() {
+fn output_mode_unresolved_ids_are_not_asked() {
     // Mutation: substitute a live mode id for the request's unknown mode; the deny-all policy must then reject it.
     let mut fixture = randr_access_fixture();
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -1642,11 +1642,21 @@ fn output_mode_stubs_unresolved_ids_are_not_asked() {
             minor,
             &words(&[unknown_output.0, unknown_mode.0]),
         );
-        assert!(
-            bytes.is_empty(),
-            "unsupported mode stub remains a void success"
+        // VERIFY_RR_OUTPUT: BadRROutput carrying the output.
+        assert_eq!(bytes.len(), 32, "one error: {bytes:02x?}");
+        assert_eq!((bytes[0], bytes[1]), (0, 147));
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            unknown_output.0
         );
     }
+    let bytes = run_request(&mut fixture, 128, 17, &words(&[unknown_mode.0]));
+    // VERIFY_RR_MODE: BadRRMode carrying the mode.
+    assert_eq!((bytes[0], bytes[1]), (0, 149));
+    assert_eq!(
+        u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        unknown_mode.0
+    );
     assert!(resource_calls(&calls.lock().unwrap()).is_empty());
 }
 

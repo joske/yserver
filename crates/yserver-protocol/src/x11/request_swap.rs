@@ -449,6 +449,24 @@ const fn randr_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
             u32f!(16),
             Custom(swap_property_data_tail),
         ],
+        // CreateMode: window, then xRRModeInfo. `SProcRRCreateMode`
+        // (rrsdispatch.c:221-246) leaves hSkew (22) unswapped; we match it.
+        // The name is bytes.
+        16 => &[
+            u32f!(0),
+            u32f!(4),
+            u16f!(8),
+            u16f!(10),
+            u32f!(12),
+            u16f!(16),
+            u16f!(18),
+            u16f!(20),
+            u16f!(24),
+            u16f!(26),
+            u16f!(28),
+            u16f!(30),
+            u32f!(32),
+        ],
         // DestroyMode: a lone RRMode. FreeLease: RRLease + terminate byte.
         17 | 46 => &[u32f!(0)],
         // SetCrtcTransform: crtc, nine 16.16 matrix cells, filter-name
@@ -1519,8 +1537,8 @@ mod tests {
     fn randr_leading_resource_id_is_swapped_for_every_validating_minor() {
         const XID: u32 = 0x00de_ad01;
         for minor in [
-            2u8, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 21, 22, 23, 25, 26, 27, 28, 29, 30,
-            31, 32, 33, 42, 43, 44, 46,
+            2u8, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 25, 26,
+            27, 28, 29, 30, 31, 32, 33, 42, 43, 44, 46,
         ] {
             let mut body = vec![0u8; 32];
             body[0..4].copy_from_slice(&XID.to_be_bytes());
@@ -1531,6 +1549,54 @@ mod tests {
                 "minor {minor} must swap its leading resource id",
             );
         }
+    }
+
+    /// `SProcRRCreateMode` (rrsdispatch.c:221-246): window and every
+    /// xRRModeInfo field but hSkew are swapped; the name is bytes.
+    #[test]
+    fn randr_create_mode_swaps_mode_info_but_not_hskew_or_name() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0000_0100u32.to_be_bytes()); // window
+        body.extend_from_slice(&0x0102_0304u32.to_be_bytes()); // id
+        body.extend_from_slice(&1920u16.to_be_bytes());
+        body.extend_from_slice(&1080u16.to_be_bytes());
+        body.extend_from_slice(&173_000_000u32.to_be_bytes());
+        for v in [2048u16, 2248, 2576] {
+            body.extend_from_slice(&v.to_be_bytes());
+        }
+        body.extend_from_slice(&[0x00, 0x05]); // hSkew = 5 in BE
+        for v in [1083u16, 1088, 1120, 3] {
+            body.extend_from_slice(&v.to_be_bytes());
+        }
+        body.extend_from_slice(&0x0000_0006u32.to_be_bytes()); // flags
+        body.extend_from_slice(b"foo\0");
+        swap_request_body(
+            128,
+            crate::x11::randr::RR_CREATE_MODE,
+            ClientByteOrder::BigEndian,
+            &mut body,
+        );
+        let (window, info) = crate::x11::randr::parse_create_mode_request(&body).unwrap();
+        assert_eq!(window, 0x100);
+        assert_eq!(
+            info,
+            crate::x11::randr::ModeInfo {
+                id: 0x0102_0304,
+                width: 1920,
+                height: 1080,
+                dot_clock: 173_000_000,
+                hsync_start: 2048,
+                hsync_end: 2248,
+                htotal: 2576,
+                hskew: 0x0500,
+                vsync_start: 1083,
+                vsync_end: 1088,
+                vtotal: 1120,
+                name_len: 3,
+                mode_flags: 6,
+            }
+        );
+        assert_eq!(&body[36..], b"foo\0");
     }
 
     /// `SProcRRSetMonitor`: every numeric xRRMonitorInfo field and the

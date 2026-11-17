@@ -50,7 +50,7 @@ pub(super) fn handle_randr_get_crtc_info(
             RANDR_MAJOR_OPCODE,
         );
     };
-    let Some(crtc_data) = state.randr.crtc_info(req.crtc, req.config_timestamp) else {
+    let Some(crtc_data) = state.randr_view().crtc_info(req.crtc, req.config_timestamp) else {
         return emit_x11_error_with_minor(
             state,
             client_id,
@@ -676,21 +676,20 @@ pub(super) fn handle_randr_set_crtc_config(
         );
     }
     // (1) arity + output + mode resolution FIRST (Xorg rrcrtc.c order).
-    let resolved = match state
-        .randr
-        .validate_set_crtc_config(crtc, mode, &outputs, |id, kind| {
-            if id == 0 {
-                return Ok(());
-            }
-            validate_resource_if_present(
-                state,
-                client_id,
-                yserver_protocol::x11::ResourceId(id),
-                kind,
-                AccessMode::SET_ATTR,
-                request,
-            )
-        }) {
+    let view = state.randr_view();
+    let resolved = match view.validate_set_crtc_config(crtc, mode, &outputs, |id, kind| {
+        if id == 0 {
+            return Ok(());
+        }
+        validate_resource_if_present(
+            state,
+            client_id,
+            yserver_protocol::x11::ResourceId(id),
+            kind,
+            AccessMode::SET_ATTR,
+            request,
+        )
+    }) {
         Err((code, error_value)) => {
             return emit_x11_error_with_minor(
                 state,
@@ -774,6 +773,10 @@ pub(super) fn handle_randr_set_crtc_config(
     };
     let output_id = output_row.output_id;
     let connector = output_row.name.clone();
+    // A mode only on the output's user list. The backend resolves a mode by
+    // (width, height, refresh) in the connector's own list and could pick a
+    // different timing, so it cannot be programmed yet.
+    let user_listed_only = resolved.is_some() && !output_row.mode_ids.contains(&mode);
     // A disable keeps the current transform (xf86RandR12CrtcSet
     // only installs one with a mode).
     let apply_transform = (resolved.is_some()
@@ -826,6 +829,18 @@ pub(super) fn handle_randr_set_crtc_config(
         apply_rotation,
         reply: CrtcConfigReply::CrtcConfig,
     };
+    if user_listed_only {
+        return complete_crtc_config(
+            state,
+            backend,
+            client_id,
+            sequence,
+            completion,
+            Err(io::Error::other(format!(
+                "mode 0x{mode:x} is not in {connector}'s connector list"
+            ))),
+        );
+    }
     return start_crtc_config(
         state,
         backend,

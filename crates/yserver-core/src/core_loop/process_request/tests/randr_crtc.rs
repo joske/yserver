@@ -793,14 +793,12 @@ fn randr_transform_body(crtc: u32, matrix: [i32; 9], filter_name: &[u8]) -> Vec<
 }
 
 #[test]
-fn randr_create_mode_unimplemented_returns_error_not_hang() {
-    // RRCreateMode (minor 16): reply-bearing, unimplemented → error.
+fn randr_create_mode_short_request_is_bad_length() {
+    // RRCreateMode (minor 16): REQUEST_AT_LEAST_SIZE(xRRCreateModeReq)
+    // (rrmode.c:296) answers a bare header with BadLength.
     let bytes = randr_unimplemented_reply_bearing(16);
-    assert!(
-        bytes.len() >= 32,
-        "expected error, not a hang: {bytes:02x?}"
-    );
-    assert_eq!(bytes[1], x11::error::BAD_IMPLEMENTATION, "code");
+    assert_eq!(bytes.len(), 32, "expected one error: {bytes:02x?}");
+    assert_eq!(bytes[1], x11::error::BAD_LENGTH, "code");
     assert_eq!(&bytes[8..10], &16u16.to_le_bytes(), "minor");
     assert_eq!(bytes[10], 128, "major = RANDR");
 }

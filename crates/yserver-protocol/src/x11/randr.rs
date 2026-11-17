@@ -51,6 +51,10 @@ pub const RR_CONFIGURE_OUTPUT_PROPERTY: u8 = 12;
 pub const RR_CHANGE_OUTPUT_PROPERTY: u8 = 13;
 pub const RR_DELETE_OUTPUT_PROPERTY: u8 = 14;
 pub const RR_GET_OUTPUT_PROPERTY: u8 = 15;
+pub const RR_CREATE_MODE: u8 = 16;
+pub const RR_DESTROY_MODE: u8 = 17;
+pub const RR_ADD_OUTPUT_MODE: u8 = 18;
+pub const RR_DELETE_OUTPUT_MODE: u8 = 19;
 pub const RR_GET_CRTC_INFO: u8 = 20;
 pub const RR_SET_CRTC_CONFIG: u8 = 21;
 pub const RR_GET_CRTC_GAMMA_SIZE: u8 = 22;
@@ -633,6 +637,38 @@ pub fn parse_set_provider_output_source_request(
     })
 }
 
+/// Parse the fixed part of a `CreateMode` body (window + `xRRModeInfo`,
+/// 36 bytes) after byte-order normalization. The name follows at
+/// [`CREATE_MODE_FIXED_BODY`]; the caller checks `name_len` against the
+/// request length.
+pub fn parse_create_mode_request(body: &[u8]) -> Option<(u32, ModeInfo)> {
+    if body.len() < CREATE_MODE_FIXED_BODY {
+        return None;
+    }
+    let u16_at = |o: usize| read_u16_le(&body[o..]);
+    Some((
+        read_u32_le(body),
+        ModeInfo {
+            id: read_u32_le(&body[4..]),
+            width: u16_at(8),
+            height: u16_at(10),
+            dot_clock: read_u32_le(&body[12..]),
+            hsync_start: u16_at(16),
+            hsync_end: u16_at(18),
+            htotal: u16_at(20),
+            hskew: u16_at(22),
+            vsync_start: u16_at(24),
+            vsync_end: u16_at(26),
+            vtotal: u16_at(28),
+            name_len: u16_at(30),
+            mode_flags: read_u32_le(&body[32..]),
+        },
+    ))
+}
+
+/// `sizeof(xRRCreateModeReq)` minus the 4-byte request header.
+pub const CREATE_MODE_FIXED_BODY: usize = 36;
+
 pub fn parse_change_provider_property_header(body: &[u8]) -> Option<ChangeProviderPropertyHeader> {
     if body.len() < 20 {
         return None;
@@ -649,7 +685,7 @@ pub fn parse_change_provider_property_header(body: &[u8]) -> Option<ChangeProvid
 
 // ── Reply data structs ────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModeInfo {
     pub id: u32,
     pub width: u16,

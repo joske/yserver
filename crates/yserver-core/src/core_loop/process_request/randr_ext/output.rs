@@ -75,7 +75,10 @@ pub(super) fn handle_randr_get_output_info(
             RANDR_MAJOR_OPCODE,
         );
     };
-    let Some(info_data) = state.randr.output_info(req.output, req.config_timestamp) else {
+    let Some(info_data) = state
+        .randr_view()
+        .output_info(req.output, req.config_timestamp)
+    else {
         return emit_x11_error_with_minor(
             state,
             client_id,

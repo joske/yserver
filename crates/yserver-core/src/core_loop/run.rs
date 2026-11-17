@@ -3720,6 +3720,7 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
     let config_timestamp = state.randr.config_timestamp;
     let (screen_rotation, width, height, width_mm, height_mm) = state.randr.screen_change_fields();
     // Resolve each changed output's current crtc/mode for the notify payload.
+    let view = state.randr_view();
     let changed: Vec<(u32, u32, u32, u8, u16)> = changed_outputs
         .iter()
         .filter_map(|id| {
@@ -3732,7 +3733,7 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
                     (
                         o.output_id,
                         if o.mode_id != 0 { o.crtc_id } else { 0 },
-                        o.mode_id,
+                        view.crtc_current_mode(o),
                         if o.connected {
                             x11randr::CONNECTION_CONNECTED
                         } else {
@@ -4127,6 +4128,17 @@ fn emit_randr_change_notifications_split(
     use yserver_protocol::x11::{SequenceNumber, randr as x11randr};
 
     const RANDR_FIRST_EVENT: u8 = 89;
+
+    // Mode ids as clients see them (`RandrView`).
+    let view = state.randr_view();
+    let project = |changed: &[(u32, u32, u32)]| -> Vec<(u32, u32, u32)> {
+        changed
+            .iter()
+            .map(|&(output, crtc, mode)| (output, crtc, view.project_crtc_mode(crtc, mode)))
+            .collect()
+    };
+    let crtc_changed = &project(crtc_changed);
+    let output_changed = &project(output_changed);
 
     let timestamp = state.randr.timestamp;
     let config_timestamp = state.randr.config_timestamp;
