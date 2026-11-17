@@ -299,7 +299,12 @@ it encodes; that keeps its current bytes.
 3. `ModeSpec::user_timing`, KMS mode construction and the paths that must keep
    the programmed mode; lift the refusal from commit 1 (3.5).
 4. Surface hosts: confirm the size path, tests.
-5. vng scenario `xrandr-usermode` and its golden.
+5. RANDR 1.0 (GetScreenInfo, SetScreenConfig): `rr10_data()` reads the same
+   projection, so user modes on the output appear as sizes/rates and the
+   current size and rate stay right while a user mode is active, as Xorg's
+   `RR10GetData` (`randr/rrscreen.c`), which collects each output's probed
+   and user modes. Expected replies from that source and an Xvfb run.
+6. vng scenario `xrandr-usermode` and its golden.
 
 ## 5. Tests
 
