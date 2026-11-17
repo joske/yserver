@@ -494,9 +494,12 @@ pub trait Platform: OutputSink + Sized + 'static {
         Err(io::Error::other("DRI3 unsupported on this backend"))
     }
 
-    /// Whether GLX is advertised: only where a GL client stack can use it.
+    /// Whether GLX is advertised. On, as on KMS: a remote Mesa client renders
+    /// in software on its own side and only needs the server's GLX visuals,
+    /// FBConfigs and direct-context bookkeeping, then sends frames with
+    /// PutImage (#366).
     fn glx_available(_b: &XBackend<Self>) -> bool {
-        false
+        true
     }
 
     fn dri3_capabilities(_b: &XBackend<Self>) -> Dri3Caps {

@@ -117,11 +117,11 @@ fn fill(b: &mut XBackend<SurfacePlatform>, xid: u32, pixel: u32, rect: (i16, i16
 
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn headless_backend_advertises_no_glx_dpms_or_dri3() {
+fn headless_backend_advertises_glx_but_no_dpms_or_dri3() {
     let Some(b) = headless_or_skip() else {
         return;
     };
-    assert!(!b.glx_available());
+    assert!(b.glx_available());
     assert!(!b.dpms_capable());
     assert_eq!(b.dri3_capabilities().version, (0, 0));
     assert!(!b.supports_dmabuf_export());
