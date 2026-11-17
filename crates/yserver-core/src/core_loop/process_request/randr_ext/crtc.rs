@@ -779,7 +779,6 @@ pub(super) fn handle_randr_set_crtc_config(
         .then(|| state.randr_view().mode_info(mode))
         .flatten()
         .map(|info| UserTiming::from_mode_info(&info));
-    let user_listed_only = user_timing.is_some() && !backend.programs_user_mode_timings();
     // A disable keeps the current transform (xf86RandR12CrtcSet
     // only installs one with a mode).
     let apply_transform = (resolved.is_some()
@@ -833,19 +832,6 @@ pub(super) fn handle_randr_set_crtc_config(
         apply_rotation,
         reply: CrtcConfigReply::CrtcConfig,
     };
-    if user_listed_only {
-        return complete_crtc_config(
-            state,
-            backend,
-            client_id,
-            sequence,
-            completion,
-            Err(io::Error::other(format!(
-                "mode 0x{mode:x} is not in {connector}'s connector list and the backend \
-                 cannot program a timing"
-            ))),
-        );
-    }
     return start_crtc_config(
         state,
         backend,
@@ -859,7 +845,9 @@ pub(super) fn handle_randr_set_crtc_config(
 }
 
 /// Hand one CRTC configuration to the backend and complete it now, or park
-/// it until an asynchronous qualification finishes.
+/// it until an asynchronous qualification finishes. A user timing the
+/// backend cannot program answers `RRSetConfigFailed` without reaching it,
+/// as from a DDX whose `crtcSet` refuses (`rrcrtc.c:1459-1483`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn start_crtc_config(
     state: &mut ServerState,
@@ -871,6 +859,19 @@ pub(super) fn start_crtc_config(
     (x, y): (i32, i32),
     completion: CrtcConfigCompletion,
 ) -> io::Result<RequestOutcome> {
+    if mode_spec.is_some_and(|m| m.user_timing.is_some()) && !backend.programs_user_mode_timings() {
+        return complete_crtc_config(
+            state,
+            backend,
+            client_id,
+            sequence,
+            completion,
+            Err(io::Error::other(format!(
+                "a user timing is not in {connector}'s connector list and the backend \
+                 cannot program one"
+            ))),
+        );
+    }
     match backend.begin_crtc_config(completion.output_id, connector, mode_spec, x, y) {
         Ok(CrtcConfigApply::Applied(changed)) => {
             complete_crtc_config(state, backend, client_id, sequence, completion, Ok(changed))

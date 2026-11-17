@@ -13,6 +13,7 @@ use yserver_protocol::x11::randr as proto;
 
 use super::{
     CrtcInfoData, OutputInfoReplyData, RR_MODE_FLAG_BITS, RandrMode, RandrOutput, RandrState,
+    Rr10Data, Rr10Size,
 };
 use crate::server::{RANDR_USER_MODE_XID_FIRST, RANDR_USER_MODE_XID_LAST};
 
@@ -213,6 +214,17 @@ pub fn mode_matches_timing(mode: &proto::ModeInfo, current: &proto::ModeInfo) ->
         && mode.vsync_end == current.vsync_end
         && mode.vtotal == current.vtotal
         && (mode.mode_flags & RR_MODE_FLAG_BITS) == (current.mode_flags & RR_MODE_FLAG_BITS)
+}
+
+/// `RRVerticalRefresh` (`randr.c:728-739`): whole Hz, rounded, from the
+/// `xRRModeInfo`; 0 without totals.
+fn vertical_refresh(mode: &proto::ModeInfo) -> u16 {
+    let dots = u64::from(mode.htotal) * u64::from(mode.vtotal);
+    if dots == 0 {
+        return 0;
+    }
+    let refresh = (u64::from(mode.dot_clock) + dots / 2) / dots;
+    u16::try_from(refresh).unwrap_or(u16::MAX)
 }
 
 /// `RandrState` plus the user modes: what clients see.
@@ -449,6 +461,83 @@ impl<'a> RandrView<'a> {
         info.mode_ids.extend(self.output_user_ids(output));
         info.mode_id = self.crtc_current_mode(output);
         Some(info)
+    }
+
+    /// `RR10GetData` (`rrscreen.c:664-737`): the RANDR 1.0 view of the
+    /// first output. Its probed modes then its user modes, one size per
+    /// distinct width×height in that order, each with its distinct
+    /// `RRVerticalRefresh` rates paired with the first mode of that rate.
+    /// The current size and rate are those of the mode the CRTC reports,
+    /// which need not be the first of its rate. `None` without an output.
+    #[must_use]
+    pub fn rr10_data(&self) -> Option<Rr10Data> {
+        let output = self.randr.first_output()?;
+        let info = self.randr.output_info(output.output_id, 0)?;
+        let (mm_w, mm_h) = if info.width_mm != 0 && info.height_mm != 0 {
+            (info.width_mm, info.height_mm)
+        } else {
+            (self.randr.width_mm, self.randr.height_mm)
+        };
+        let mm = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
+        let current = self.crtc_current_mode(output);
+        let mut data = Rr10Data {
+            output_id: output.output_id,
+            crtc_id: output.crtc_id,
+            sizes: Vec::new(),
+            size_id: 0,
+            rate: 0,
+        };
+        let modes = output
+            .mode_ids
+            .iter()
+            .copied()
+            .chain(self.output_user_ids(output))
+            .filter_map(|id| self.mode_info(id));
+        for mode in modes {
+            let rate = vertical_refresh(&mode);
+            let index = match data
+                .sizes
+                .iter()
+                .position(|s| (s.width, s.height) == (mode.width, mode.height))
+            {
+                Some(index) => index,
+                None => {
+                    data.sizes.push(Rr10Size {
+                        width: mode.width,
+                        height: mode.height,
+                        mm_width: mm(mm_w),
+                        mm_height: mm(mm_h),
+                        rates: Vec::new(),
+                    });
+                    data.sizes.len() - 1
+                }
+            };
+            let size = &mut data.sizes[index];
+            if !size.rates.iter().any(|(r, _)| *r == rate) {
+                size.rates.push((rate, mode.id));
+            }
+            if mode.id == current {
+                data.size_id = u16::try_from(index).unwrap_or(u16::MAX);
+                data.rate = rate;
+            }
+        }
+        Some(data)
+    }
+
+    /// `RR10CurrentSizeID` (`rrscreen.c:1135-1157`), the `sizeID` of
+    /// `RRScreenChangeNotify`: the first RANDR 1.0 size of the screen's
+    /// size, `0xffff` without an output or such a size.
+    #[must_use]
+    pub fn rr10_current_size_id(&self) -> u16 {
+        let screen = (self.randr.screen_width, self.randr.screen_height);
+        self.rr10_data()
+            .and_then(|data| {
+                data.sizes
+                    .iter()
+                    .position(|s| (s.width, s.height) == screen)
+            })
+            .and_then(|i| u16::try_from(i).ok())
+            .unwrap_or(u16::MAX)
     }
 
     /// `GetCrtcInfo`.

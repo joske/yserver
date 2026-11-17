@@ -1453,6 +1453,9 @@ pub struct ScreenChangeNotify {
     pub config_timestamp: u32,
     pub root: u32,
     pub request_window: u32,
+    /// `RR10CurrentSizeID`: the RANDR 1.0 size of the screen's size,
+    /// `0xffff` without one (`rrscreen.c:107`, `:1135-1157`).
+    pub size_id: u16,
     pub width: u16,
     pub height: u16,
     pub width_mm: u16,
@@ -1521,7 +1524,7 @@ pub fn encode_screen_change_notify_event(
     put(byte_order, &mut buf, event.config_timestamp);
     put(byte_order, &mut buf, event.root);
     put(byte_order, &mut buf, event.request_window);
-    put(byte_order, &mut buf, 0u16);
+    put(byte_order, &mut buf, event.size_id);
     put(byte_order, &mut buf, SUBPIXEL_UNKNOWN);
     put(byte_order, &mut buf, event.width);
     put(byte_order, &mut buf, event.height);
@@ -2806,6 +2809,7 @@ mod tests {
                 config_timestamp: 101,
                 root: 0x100,
                 request_window: 0x101,
+                size_id: 3,
                 width: 1024,
                 height: 768,
                 width_mm: 271,
@@ -2819,6 +2823,7 @@ mod tests {
         assert_eq!(&event[2..4], &11u16.to_le_bytes());
         assert_eq!(&event[4..8], &100u32.to_le_bytes());
         assert_eq!(&event[12..16], &0x100u32.to_le_bytes());
+        assert_eq!(&event[20..22], &3u16.to_le_bytes(), "sizeID");
         assert_eq!(&event[24..26], &1024u16.to_le_bytes());
         assert_eq!(&event[30..32], &203u16.to_le_bytes());
     }
@@ -2952,6 +2957,7 @@ mod tests {
                     config_timestamp: 1,
                     root: 0x100,
                     request_window: 0x100,
+                    size_id: 0,
                     width: 1280,
                     height: 800,
                     width_mm: 338,

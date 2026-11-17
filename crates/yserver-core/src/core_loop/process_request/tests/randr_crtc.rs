@@ -1392,7 +1392,7 @@ fn randr_set_screen_config_rotates_the_first_output_as_xorg() {
         call(&mut state, body(cts, 0, 0, 1, 1)),
         Err(x11::error::BAD_VALUE)
     );
-    let rate = state.randr.rr10_data().unwrap().rate;
+    let rate = state.randr_view().rr10_data().unwrap().rate;
     assert_eq!(
         call(&mut state, body(cts, 600, 0, RR_ROTATE_90, rate)).map(|r| (r.0, r.1)),
         Ok((0, 600)),
@@ -1472,7 +1472,7 @@ fn randr_get_screen_info_lists_mode_sizes_and_rates_by_client_version() {
         read_all_available(peer)
     };
     let u16_at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
-    let rate = state.randr.rr10_data().unwrap().rate;
+    let rate = state.randr_view().rr10_data().unwrap().rate;
     let v10 = get(&mut state, &mut backend, &mut peer);
     assert_eq!(v10[1], 0x3f, "setOfRotations");
     assert_eq!(u16_at(&v10, 20), 1, "nSizes");

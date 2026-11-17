@@ -840,62 +840,6 @@ impl RandrState {
         self.first_output().map_or(RR_ROTATE_0, |o| o.rotation)
     }
 
-    /// `RR10GetData` (rrscreen.c:664-737): the RANDR 1.0 view of the first
-    /// output. One size per distinct mode width×height in the output's mode
-    /// order, each with its distinct `RRVerticalRefresh` rates; the current
-    /// size and rate are the CRTC's mode. `None` without an output.
-    #[must_use]
-    pub fn rr10_data(&self) -> Option<Rr10Data> {
-        let output = self.first_output()?;
-        let info = self.output_info(output.output_id, 0)?;
-        let (mm_w, mm_h) = if info.width_mm != 0 && info.height_mm != 0 {
-            (info.width_mm, info.height_mm)
-        } else {
-            (self.width_mm, self.height_mm)
-        };
-        let mm = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
-        let mut data = Rr10Data {
-            output_id: output.output_id,
-            crtc_id: output.crtc_id,
-            sizes: Vec::new(),
-            size_id: 0,
-            rate: 0,
-        };
-        for mode in output
-            .mode_ids
-            .iter()
-            .filter_map(|id| self.mode_table.iter().find(|m| m.mode_id == *id))
-        {
-            let rate = vertical_refresh(mode.effective_timing());
-            let index = match data
-                .sizes
-                .iter()
-                .position(|s| (s.width, s.height) == (mode.width, mode.height))
-            {
-                Some(index) => index,
-                None => {
-                    data.sizes.push(Rr10Size {
-                        width: mode.width,
-                        height: mode.height,
-                        mm_width: mm(mm_w),
-                        mm_height: mm(mm_h),
-                        rates: Vec::new(),
-                    });
-                    data.sizes.len() - 1
-                }
-            };
-            let size = &mut data.sizes[index];
-            if !size.rates.iter().any(|(r, _)| *r == rate) {
-                size.rates.push((rate, mode.mode_id));
-            }
-            if mode.mode_id == output.mode_id {
-                data.size_id = u16::try_from(index).unwrap_or(u16::MAX);
-                data.rate = rate;
-            }
-        }
-        Some(data)
-    }
-
     /// `RRDeliverScreenEvent`'s rotation, pixel and mm sizes: the first
     /// CRTC's rotation (`crtcs[0]`), the screen swapped for 90/270
     /// (rrscreen.c:95-121).
@@ -956,7 +900,7 @@ impl RandrState {
     }
 }
 
-/// [`RandrState::rr10_data`]: `RR10DataRec` for the first output.
+/// [`RandrView::rr10_data`]: `RR10DataRec` for the first output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rr10Data {
     pub output_id: u32,
@@ -976,16 +920,6 @@ pub struct Rr10Size {
     pub mm_width: u16,
     pub mm_height: u16,
     pub rates: Vec<(u16, u32)>,
-}
-
-/// `RRVerticalRefresh` (randr.c:728-739): whole Hz, rounded.
-fn vertical_refresh(timing: EffectiveTiming) -> u16 {
-    let dots = u64::from(timing.htotal) * u64::from(timing.vtotal);
-    if dots == 0 {
-        return 0;
-    }
-    let refresh = (u64::from(timing.dot_clock_hz) + dots / 2) / dots;
-    u16::try_from(refresh).unwrap_or(u16::MAX)
 }
 
 /// Data returned by [`RandrState::output_info`].

@@ -1249,3 +1249,263 @@ fn user_timing_refresh_is_the_kernels() {
     user.timing.htotal = 0;
     assert_eq!(user.vrefresh(), 0);
 }
+
+// ── RANDR 1.0: GetScreenInfo and SetScreenConfig (plan commit 5) ────────
+//
+// RR10GetData (`rrscreen.c:664-737`) walks the output's probed modes then
+// its user modes; one size per width×height in that order, one rate per
+// RRVerticalRefresh, the first mode of a rate taking it. Measured on Xvfb
+// with A, B, C and R below added to its single 1920x1200 output (whose
+// one mode has a 0 clock, rate 0): sizes 1920x1200 [0, 50] and 1024x768
+// [60, 75]; `--output --mode R` reports 1024x768 at 60 (R's own rate);
+// SetScreenConfig 1024x768 at 75 programs C, at rate 0 A, 1920x1200 at 50
+// B; each RRScreenChangeNotify carries the new size's index as sizeID.
+// The fixture's probed modes are synthesized at 60 Hz instead.
+
+/// A modeline: clock in kHz, h timings, v timings, flags.
+fn modeline(clock_khz: u32, h: [u16; 4], v: [u16; 4], mode_flags: u32) -> rr::ModeInfo {
+    rr::ModeInfo {
+        id: 0,
+        width: h[0],
+        height: v[0],
+        dot_clock: clock_khz * 1000,
+        hsync_start: h[1],
+        hsync_end: h[2],
+        htotal: h[3],
+        hskew: 0,
+        vsync_start: v[1],
+        vsync_end: v[2],
+        vtotal: v[3],
+        name_len: 0,
+        mode_flags,
+    }
+}
+
+/// `cvt 1024 768 60`: 59.92 Hz, rate 60.
+fn cvt_768_60() -> rr::ModeInfo {
+    modeline(63_500, [1024, 1072, 1176, 1328], [768, 771, 775, 798], 0x6)
+}
+
+/// `cvt 1920 1200 50`: 49.93 Hz, rate 50.
+fn cvt_1200_50() -> rr::ModeInfo {
+    modeline(
+        158_250,
+        [1920, 2040, 2240, 2560],
+        [1200, 1203, 1209, 1238],
+        0x6,
+    )
+}
+
+/// `cvt 1024 768 75`: 74.90 Hz, rate 75.
+fn cvt_768_75() -> rr::ModeInfo {
+    modeline(82_000, [1024, 1088, 1192, 1360], [768, 771, 775, 805], 0x6)
+}
+
+/// `cvt -r 1024 768 60`: 59.87 Hz, rate 60, +hsync -vsync.
+fn cvt_768_60_reduced() -> rr::ModeInfo {
+    modeline(56_000, [1024, 1072, 1104, 1184], [768, 771, 775, 790], 0x9)
+}
+
+/// One RANDR 1.0 size: `(width, height, rates)`.
+type Rr10SizeRates = (u16, u16, Vec<u16>);
+
+impl Fixture {
+    /// A, B, C and R created and added to VGA-1 in that order, for a
+    /// RANDR 1.5 client.
+    fn with_rr10_user_modes(mut self) -> (Self, [u32; 4]) {
+        self.state.randr_client_versions.insert(ClientId(1), (1, 5));
+        let mut ids = [0; 4];
+        for (id, (info, name)) in ids.iter_mut().zip([
+            (cvt_768_60(), &b"A"[..]),
+            (cvt_1200_50(), b"B"),
+            (cvt_768_75(), b"C"),
+            (cvt_768_60_reduced(), b"R"),
+        ]) {
+            *id = self.create_mode(info, name);
+            assert!(self.add_output_mode(VGA, *id).is_empty());
+        }
+        (self, ids)
+    }
+
+    /// GetScreenInfo: `(sizes with their rates, sizeID, rate)`.
+    fn screen_info(&mut self) -> (Vec<Rr10SizeRates>, u16, u16) {
+        let body = self.words(&[ROOT_WINDOW.0]);
+        let r = self.send(rr::RR_GET_SCREEN_INFO, body);
+        assert_eq!(r[0], 1, "GetScreenInfo reply: {r:02x?}");
+        let n_sizes = usize::from(self.read_u16(&r, 20));
+        let (size_id, rate) = (self.read_u16(&r, 22), self.read_u16(&r, 26));
+        let mut rates_at = 32 + 8 * n_sizes;
+        let mut sizes = Vec::new();
+        for i in 0..n_sizes {
+            let n_rates = usize::from(self.read_u16(&r, rates_at));
+            let rates = (0..n_rates)
+                .map(|j| self.read_u16(&r, rates_at + 2 + 2 * j))
+                .collect();
+            rates_at += 2 + 2 * n_rates;
+            sizes.push((
+                self.read_u16(&r, 32 + 8 * i),
+                self.read_u16(&r, 34 + 8 * i),
+                rates,
+            ));
+        }
+        assert_eq!(r.len(), rates_at.next_multiple_of(4));
+        (sizes, size_id, rate)
+    }
+
+    /// SetScreenConfig at `timestamp`, rotation normal: every message
+    /// sent.
+    fn set_screen_config(&mut self, timestamp: u32, size_id: u16, rate: u16) -> Vec<u8> {
+        let config = self.state.randr.config_timestamp;
+        let mut body = self.words(&[ROOT_WINDOW.0, timestamp, config]);
+        for v in [size_id, 1, rate, 0] {
+            body.extend_from_slice(&self.u16b(v));
+        }
+        self.send(rr::RR_SET_SCREEN_CONFIG, body)
+    }
+
+    /// The status of the one reply among `bytes`.
+    fn reply_status(bytes: &[u8]) -> u8 {
+        let replies: Vec<&[u8]> = bytes.chunks_exact(32).filter(|m| m[0] == 1).collect();
+        assert_eq!(replies.len(), 1, "{bytes:02x?}");
+        replies[0][1]
+    }
+
+    /// The modes of every `ApplyCrtcConfig` the backend saw.
+    fn applied_modes(&self) -> Vec<Option<ModeSpec>> {
+        self.backend
+            .calls()
+            .iter()
+            .filter_map(|call| match call {
+                RecordedCall::ApplyCrtcConfig { mode, .. } => Some(*mode),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[test]
+fn rr10_sizes_are_the_probed_then_the_user_modes_deduped_by_size_and_rate() {
+    let (mut f, [a, b, c, r]) = Fixture::new().with_rr10_user_modes();
+    let (sizes, size_id, rate) = f.screen_info();
+    assert_eq!(
+        sizes,
+        vec![(1920, 1200, vec![60, 50]), (1024, 768, vec![60, 75])]
+    );
+    assert_eq!((size_id, rate), (0, 60));
+    // Each rate is the first mode of it: the probed 1024x768, not A or R.
+    let data = f.state.randr_view().rr10_data().unwrap();
+    let pairs: Vec<Vec<(u16, u32)>> = data.sizes.iter().map(|s| s.rates.clone()).collect();
+    assert_eq!(
+        pairs,
+        vec![
+            vec![(60, M1920X1200), (50, b)],
+            vec![(60, M1024X768), (75, c)]
+        ]
+    );
+    // A user mode on another output is not in VGA-1's view.
+    assert!(f.delete_output_mode(VGA, a).is_empty());
+    assert!(f.delete_output_mode(VGA, r).is_empty());
+    assert!(f.add_output_mode(HDMI, a).is_empty());
+    assert_eq!(f.screen_info().0[1], (1024, 768, vec![60, 75]));
+}
+
+#[test]
+fn rr10_current_size_and_rate_are_the_user_mode_the_crtc_reports() {
+    let (mut f, [_, b, c, r]) = Fixture::programming().with_rr10_user_modes();
+    // R shares its rate with the probed 1024x768 but is the current mode:
+    // the rate is R's own (Xvfb `--output screen --mode R`: `*60`).
+    for (mode, expected) in [(r, (1, 60)), (c, (1, 75)), (b, (0, 50))] {
+        let bytes = f.set_crtc_config(VGA_CRTC, mode, &[VGA]);
+        assert!(
+            bytes.chunks_exact(32).any(|m| m[0] == 1 && m[1] == 0),
+            "SetCrtcConfig succeeds: {bytes:02x?}"
+        );
+        assert_eq!(f.crtc_mode(VGA_CRTC), mode);
+        let (_, size_id, rate) = f.screen_info();
+        assert_eq!((size_id, rate), expected, "mode {mode:#x}");
+    }
+}
+
+#[test]
+fn set_screen_config_programs_the_user_mode_xorg_picks() {
+    let (mut f, [_, b, c, _]) = Fixture::programming().with_rr10_user_modes();
+    f.select_all();
+    let user = |info: rr::ModeInfo| {
+        let timing = UserTiming::from_mode_info(&info);
+        Some(ModeSpec {
+            width: info.width,
+            height: info.height,
+            vrefresh: timing.vrefresh(),
+            user_timing: Some(timing),
+        })
+    };
+    // 1024x768 at 75: C, by its timing.
+    let bytes = f.set_screen_config(1000, 1, 75);
+    assert_eq!(Fixture::reply_status(&bytes), 0, "SetScreenConfig succeeds");
+    assert_eq!(
+        f.applied_modes().last().copied().flatten(),
+        user(cvt_768_75())
+    );
+    assert_eq!(f.crtc_mode(VGA_CRTC), c);
+    assert_eq!(f.screen_info().1, 1);
+    // RR10CurrentSizeID: the new screen size's index.
+    let screen: Vec<&[u8]> = bytes
+        .chunks_exact(32)
+        .filter(|e| e[0] == SCREEN_CHANGE_NOTIFY)
+        .collect();
+    assert!(!screen.is_empty());
+    assert!(screen.iter().all(|e| f.read_u16(e, 20) == 1), "sizeID");
+
+    // Rate 0: the first rate of the size, the probed 1024x768 (Xvfb: A,
+    // its first 1024x768 mode).
+    let bytes = f.set_screen_config(1100, 1, 0);
+    assert_eq!(Fixture::reply_status(&bytes), 0, "SetScreenConfig succeeds");
+    let last = f.applied_modes().last().copied().flatten().unwrap();
+    assert_eq!(
+        (last.width, last.height, last.user_timing),
+        (1024, 768, None)
+    );
+    assert_eq!(f.crtc_mode(VGA_CRTC), M1024X768);
+
+    // 1920x1200 at 50: B, a size change through a user mode.
+    let bytes = f.set_screen_config(1200, 0, 50);
+    assert_eq!(Fixture::reply_status(&bytes), 0, "SetScreenConfig succeeds");
+    assert_eq!(
+        f.applied_modes().last().copied().flatten(),
+        user(cvt_1200_50())
+    );
+    assert_eq!(f.crtc_mode(VGA_CRTC), b);
+    assert_eq!(f.screen_info().1, 0);
+
+    // Without B on the output, rate 50 is no rate of the size.
+    let bytes = f.set_screen_config(1300, 0, 60);
+    assert_eq!(Fixture::reply_status(&bytes), 0, "SetScreenConfig succeeds");
+    assert!(f.delete_output_mode(VGA, b).is_empty());
+    let bytes = f.set_screen_config(1400, 0, 50);
+    assert_eq!(
+        f.error(&bytes),
+        (x11::error::BAD_VALUE, 50, rr::RR_SET_SCREEN_CONFIG)
+    );
+}
+
+#[test]
+fn set_screen_config_to_a_user_mode_fails_on_a_backend_without_timings() {
+    let (mut f, _) = Fixture::new().with_rr10_user_modes();
+    let timestamp = f.state.randr.timestamp;
+    let bytes = f.set_screen_config(1000, 0, 50);
+    assert_eq!(bytes.len(), 32, "{bytes:02x?}");
+    assert_eq!((bytes[0], bytes[1]), (1, rr::SET_CONFIG_FAILED));
+    assert_eq!(f.read_u32(&bytes, 8), timestamp, "lastSetTime unchanged");
+    assert!(f.applied_modes().is_empty(), "the backend is not reached");
+}
+
+#[test]
+fn rr10_current_size_id_is_ffff_without_a_size_of_the_screen() {
+    let (mut f, _) = Fixture::new().with_rr10_user_modes();
+    assert_eq!(f.state.randr_view().rr10_current_size_id(), 0);
+    f.state.randr.screen_width = 1000;
+    assert_eq!(f.state.randr_view().rr10_current_size_id(), 0xffff);
+    f.state.randr.screen_width = 1024;
+    f.state.randr.screen_height = 768;
+    assert_eq!(f.state.randr_view().rr10_current_size_id(), 1);
+}
