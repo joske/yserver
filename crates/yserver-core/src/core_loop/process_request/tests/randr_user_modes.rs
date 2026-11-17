@@ -599,7 +599,7 @@ fn a_probed_mode_of_another_output_joins_the_user_list() {
 }
 
 #[test]
-// A backend that cannot program a timing (nested, surface hosts for now).
+// A backend that cannot program a timing (nested, and rootless hosts).
 fn set_crtc_config_to_a_user_mode_fails_without_reaching_the_backend() {
     let mut f = Fixture::new();
     let foo = f.create_mode(cvt_1080(), b"foo");
