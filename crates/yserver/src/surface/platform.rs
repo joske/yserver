@@ -56,6 +56,10 @@ pub(crate) struct SurfacePlatform {
     /// The window output's size (its CRTC mode): the slots and swapchain.
     /// The root's top-left part of this size is shown.
     pub(crate) output_size: (u16, u16),
+    /// The user-mode timing `RRSetCrtcConfig` set the window output to;
+    /// `None` for one of the window's own modes. Any other output size
+    /// clears it.
+    pub(crate) output_timing: Option<yserver_core::backend::UserTiming>,
     /// The largest output the window system shows unclamped: the mode list
     /// offers only modes that fit.
     pub(crate) max_output: (u16, u16),
@@ -133,6 +137,7 @@ impl SurfacePlatform {
             gpu,
             fb_size,
             output_size: fb_size,
+            output_timing: None,
             max_output: (max_screen, max_screen),
             output_mm: (0, 0),
             max_screen,
@@ -575,6 +580,7 @@ impl XBackend<SurfacePlatform> {
                 surface.install_slots(targets, extent);
             }
             self.platform.output_size = output;
+            self.platform.output_timing = None;
             self.scene.install_outputs(scene);
             self.scene.invalidate_all_scanout_damage();
             self.scene.wake_for_damage();
@@ -626,6 +632,8 @@ impl XBackend<SurfacePlatform> {
     /// the window to it. Anything else fails the request with
     /// `RRSetConfigFailed`, as from a DDX whose `crtcSet` refuses
     /// (rrcrtc.c:1462-1465); so does everything when rootless (spec §5).
+    /// A user mode's timing is kept for RandR to report; the window's
+    /// refresh stays the host's.
     fn apply_window_crtc_config(
         &mut self,
         mode: Option<yserver_core::backend::ModeSpec>,
@@ -645,13 +653,16 @@ impl XBackend<SurfacePlatform> {
         }
         let size = (mode.width, mode.height);
         if size == self.platform.output_size {
-            return Ok(false);
+            let changed = self.platform.output_timing != mode.user_timing;
+            self.platform.output_timing = mode.user_timing;
+            return Ok(changed);
         }
         let root = self.platform.fb_size;
         if size.0 > root.0 || size.1 > root.1 {
             return Err(io::Error::other("the mode does not fit the screen"));
         }
         self.resize_screen(root, size)?;
+        self.platform.output_timing = mode.user_timing;
         self.request_window_size(size);
         Ok(true)
     }
@@ -1077,6 +1088,12 @@ impl Platform for SurfacePlatform {
         }
         let output = b.platform.output_size;
         b.resize_screen((w, h), output)
+    }
+
+    /// The window output takes any timing that fits; rootless refuses
+    /// every CRTC set.
+    fn programs_user_mode_timings(b: &XBackend<Self>) -> bool {
+        b.pstate.rootless.is_none()
     }
 
     fn apply_crtc_config(
