@@ -11,7 +11,9 @@ use std::collections::HashMap;
 
 use yserver_protocol::x11::randr as proto;
 
-use super::{CrtcInfoData, OutputInfoReplyData, RandrMode, RandrOutput, RandrState};
+use super::{
+    CrtcInfoData, OutputInfoReplyData, RR_MODE_FLAG_BITS, RandrMode, RandrOutput, RandrState,
+};
 use crate::server::{RANDR_USER_MODE_XID_FIRST, RANDR_USER_MODE_XID_LAST};
 
 /// One mode made by `RRCreateMode`.
@@ -159,12 +161,27 @@ fn backend_mode_name(mode: &RandrMode) -> Vec<u8> {
 }
 
 fn backend_mode_info(mode: &RandrMode, name_len: u16) -> proto::ModeInfo {
-    // Shared with VidMode's GetModeLine — see `EffectiveTiming`.
-    let t = mode.effective_timing();
+    timing_info(
+        mode.mode_id,
+        mode.width,
+        mode.height,
+        mode.effective_timing(),
+        name_len,
+    )
+}
+
+// Shared with VidMode's GetModeLine — see `EffectiveTiming`.
+fn timing_info(
+    id: u32,
+    width: u16,
+    height: u16,
+    t: super::EffectiveTiming,
+    name_len: u16,
+) -> proto::ModeInfo {
     proto::ModeInfo {
-        id: mode.mode_id,
-        width: mode.width,
-        height: mode.height,
+        id,
+        width,
+        height,
         dot_clock: t.dot_clock_hz,
         hsync_start: t.hsync_start,
         hsync_end: t.hsync_end,
@@ -176,6 +193,26 @@ fn backend_mode_info(mode: &RandrMode, name_len: u16) -> proto::ModeInfo {
         name_len,
         mode_flags: t.mode_flags,
     }
+}
+
+/// Xorg `xf86RandRModeMatches` (`xf86RandR12.c:996-1038`): whether the
+/// RANDR mode `mode` has the programmed timing `current`. The clock in
+/// whole kHz (`dotClock / 1000` against `Clock`, truncated), every other
+/// timing field including `hSkew`, and the flags under `FLAG_BITS`. Names
+/// and ids are not compared.
+#[must_use]
+pub fn mode_matches_timing(mode: &proto::ModeInfo, current: &proto::ModeInfo) -> bool {
+    mode.dot_clock / 1000 == current.dot_clock / 1000
+        && mode.width == current.width
+        && mode.hsync_start == current.hsync_start
+        && mode.hsync_end == current.hsync_end
+        && mode.htotal == current.htotal
+        && mode.hskew == current.hskew
+        && mode.height == current.height
+        && mode.vsync_start == current.vsync_start
+        && mode.vsync_end == current.vsync_end
+        && mode.vtotal == current.vtotal
+        && (mode.mode_flags & RR_MODE_FLAG_BITS) == (current.mode_flags & RR_MODE_FLAG_BITS)
 }
 
 /// `RandrState` plus the user modes: what clients see.
@@ -201,10 +238,36 @@ impl<'a> RandrView<'a> {
             .find(|mode| mode.mode_id == id)
     }
 
-    /// Whether `id` names a mode, backend or user.
+    /// Whether `id` names a mode, backend or user. A backend id the
+    /// current-mode match replaced by a user mode does not exist for
+    /// clients: on Xorg there is no such mode.
     #[must_use]
     pub fn mode_exists(&self, id: u32) -> bool {
-        id != 0 && (self.user.get(id).is_some() || self.backend_mode(id).is_some())
+        id != 0
+            && (self.user.get(id).is_some()
+                || (self.backend_mode(id).is_some() && !self.backend_id_replaced(id)))
+    }
+
+    /// The `ModeInfo` of mode `id`, user or backend, without its name.
+    fn mode_info(&self, id: u32) -> Option<proto::ModeInfo> {
+        match self.user.get(id) {
+            Some(user) => Some(user.info),
+            None => self.backend_mode(id).map(|mode| backend_mode_info(mode, 0)),
+        }
+    }
+
+    /// `id` is the backend's current mode of some CRTC that reports a user
+    /// mode instead, and nothing else lists or reports it.
+    fn backend_id_replaced(&self, id: u32) -> bool {
+        let outputs = &self.randr.outputs;
+        outputs
+            .iter()
+            .any(|o| o.mode_id == id && self.crtc_current_mode(o) != id)
+            && !outputs.iter().any(|o| {
+                o.mode_ids.contains(&id)
+                    || self.user.output_list(o.output_id).contains(&id)
+                    || self.crtc_current_mode(o) == id
+            })
     }
 
     /// `output`'s user-list entries that still name a mode and are not in
@@ -215,7 +278,7 @@ impl<'a> RandrView<'a> {
             .output_list(output.output_id)
             .iter()
             .copied()
-            .filter(move |id| !backend.contains(id) && self.mode_exists(*id))
+            .filter(move |&id| !backend.contains(&id) && self.mode_info(id).is_some())
     }
 
     /// Whether `mode` is in `output_id`'s probed or user list.
@@ -230,12 +293,32 @@ impl<'a> RandrView<'a> {
             })
     }
 
-    /// The mode the CRTC of `output`'s row reports. The backend id for
-    /// now; the timing match onto a user mode
-    /// (`xf86RandRModeMatches`, `xf86RandR12.c:996-1038`) goes here.
+    /// The mode the CRTC of `output`'s row reports (`xf86RandR12CrtcNotify`,
+    /// `xf86RandR12.c:1077-1088`): the first mode of the output's probed
+    /// list, then of its user list, whose timing matches the programmed
+    /// one ([`mode_matches_timing`]); the backend id when none does.
     #[must_use]
     pub fn crtc_current_mode(&self, output: &RandrOutput) -> u32 {
-        output.mode_id
+        if output.mode_id == 0 {
+            return 0;
+        }
+        let current = timing_info(
+            output.mode_id,
+            output.width,
+            output.height,
+            output.effective_timing(),
+            0,
+        );
+        output
+            .mode_ids
+            .iter()
+            .copied()
+            .chain(self.output_user_ids(output))
+            .find(|&id| {
+                self.mode_info(id)
+                    .is_some_and(|info| mode_matches_timing(&info, &current))
+            })
+            .unwrap_or(output.mode_id)
     }
 
     /// Project a backend mode id a notification carries for `crtc_id`.
@@ -284,7 +367,9 @@ impl<'a> RandrView<'a> {
                 .mode_table
                 .iter()
                 .chain(self.randr.modes.iter())
-                .any(|mode| backend_mode_name(mode) == name)
+                .any(|mode| {
+                    backend_mode_name(mode) == name && !self.backend_id_replaced(mode.mode_id)
+                })
     }
 
     /// `RRModesForScreen` (`rrmode.c:161-227`), deduped: each output's

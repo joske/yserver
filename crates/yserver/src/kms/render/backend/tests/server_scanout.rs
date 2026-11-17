@@ -63,30 +63,40 @@ fn fake_promoter(
 /// The kernel's `struct drm_mode_modeinfo` (`drm_mode.h`), which
 /// `drm::control::Mode` wraps transparently.
 #[repr(C)]
-struct DrmModeInfo {
-    clock: u32,
-    hdisplay: u16,
-    hsync_start: u16,
-    hsync_end: u16,
-    htotal: u16,
-    hskew: u16,
-    vdisplay: u16,
-    vsync_start: u16,
-    vsync_end: u16,
-    vtotal: u16,
-    vscan: u16,
-    vrefresh: u32,
-    flags: u32,
-    type_: u32,
-    name: [u8; 32],
+pub(super) struct DrmModeInfo {
+    pub(super) clock: u32,
+    pub(super) hdisplay: u16,
+    pub(super) hsync_start: u16,
+    pub(super) hsync_end: u16,
+    pub(super) htotal: u16,
+    pub(super) hskew: u16,
+    pub(super) vdisplay: u16,
+    pub(super) vsync_start: u16,
+    pub(super) vsync_end: u16,
+    pub(super) vtotal: u16,
+    pub(super) vscan: u16,
+    pub(super) vrefresh: u32,
+    pub(super) flags: u32,
+    pub(super) type_: u32,
+    pub(super) name: [u8; 32],
+}
+
+impl DrmModeInfo {
+    /// The `drm::control::Mode` the kernel would hand out for this info.
+    pub(super) fn into_mode(self) -> ::drm::control::Mode {
+        const _: () = assert!(
+            std::mem::size_of::<DrmModeInfo>() == std::mem::size_of::<::drm::control::Mode>()
+        );
+        // SAFETY: `Mode` is `repr(transparent)` over `drm_mode_modeinfo`, whose
+        // layout `DrmModeInfo` reproduces field for field; sizes are asserted.
+        unsafe { std::mem::transmute(self) }
+    }
 }
 
 /// A mode whose `size()` is `(width, height)`; the fixture's outputs carry a
 /// zeroed mode, which M1's root-tiling check rejects.
 fn mode_of_size(width: u16, height: u16) -> ::drm::control::Mode {
-    const _: () =
-        assert!(std::mem::size_of::<DrmModeInfo>() == std::mem::size_of::<::drm::control::Mode>());
-    let info = DrmModeInfo {
+    let mode = DrmModeInfo {
         clock: 0,
         hdisplay: width,
         hsync_start: 0,
@@ -102,10 +112,8 @@ fn mode_of_size(width: u16, height: u16) -> ::drm::control::Mode {
         flags: 0,
         type_: 0,
         name: [0; 32],
-    };
-    // SAFETY: `Mode` is `repr(transparent)` over `drm_mode_modeinfo`, whose
-    // layout `DrmModeInfo` reproduces field for field; sizes are asserted.
-    let mode: ::drm::control::Mode = unsafe { std::mem::transmute(info) };
+    }
+    .into_mode();
     assert_eq!(mode.size(), (width, height));
     mode
 }

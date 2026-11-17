@@ -16,7 +16,7 @@ use super::{
 };
 use crate::{
     access::{AccessMode, Creation, Decision, ResourceKind, ResourceTarget},
-    randr::{RandrMode, RandrOutput, RandrState},
+    randr::{ModeTiming, RandrMode, RandrOutput, RandrState},
     resources::SERVER_OWNER,
     server::RANDR_USER_MODE_XID_FIRST,
 };
@@ -849,4 +849,225 @@ fn a_denied_create_stores_nothing() {
         (denial.code, denial.value, rr::RR_CREATE_MODE)
     );
     assert!(f.state.randr_user_modes.modes().is_empty());
+}
+
+// The CRTC's current mode: Xorg `xf86RandRModeMatches` over the output's
+// probed list, then its user list (`xf86RandR12.c:996-1038`, `:1077-1088`).
+
+/// The backend's id for VGA-1's programmed 1920x1080, a timing not in its
+/// probed list.
+const M1080_KERNEL: u32 = 0x1_0007;
+
+/// `cvt_1080` as the kernel reports a programmed mode: clock in kHz.
+fn cvt_1080_kernel() -> ModeTiming {
+    ModeTiming {
+        clock_khz: 173_000,
+        hsync_start: 2048,
+        hsync_end: 2248,
+        htotal: 2576,
+        hskew: 0,
+        vsync_start: 1083,
+        vsync_end: 1088,
+        vtotal: 1120,
+        mode_flags: 0x6,
+    }
+}
+
+/// VGA-1's CRTC programmed with `timing` at 1920x1080 under
+/// `M1080_KERNEL`; `probed` is VGA-1's probed list.
+fn programmed(timing: ModeTiming, probed: &[u32]) -> Fixture {
+    let mut f = Fixture::new();
+    let mut vga = output(
+        "VGA-1",
+        VGA,
+        VGA_CRTC,
+        Some((M1080_KERNEL, 1920, 1080)),
+        probed,
+    );
+    vga.timing = Some(timing);
+    let current = RandrMode {
+        mode_id: M1080_KERNEL,
+        width: 1920,
+        height: 1080,
+        vrefresh: 60,
+        timing: Some(timing),
+    };
+    f.state.randr = RandrState::from_outputs_with_modes(
+        1,
+        vec![vga, output("HDMI-1", HDMI, HDMI_CRTC, None, &[M1024X768])],
+        vec![
+            mode(M1920X1200, 1920, 1200),
+            mode(M1024X768, 1024, 768),
+            current,
+        ],
+    );
+    f
+}
+
+impl Fixture {
+    /// GetCrtcInfo's mode.
+    fn crtc_mode(&mut self, crtc: u32) -> u32 {
+        let body = self.words(&[crtc, 0]);
+        let r = self.send(rr::RR_GET_CRTC_INFO, body);
+        assert_eq!(r[0], 1, "GetCrtcInfo reply: {r:02x?}");
+        self.read_u32(&r, 20)
+    }
+
+    /// The CRTC VGA-1 reports after adding a user mode with `info`.
+    fn match_user_mode(&mut self, info: rr::ModeInfo) -> (u32, u32) {
+        let id = self.create_mode(info, b"user");
+        assert!(self.add_output_mode(VGA, id).is_empty());
+        (id, self.crtc_mode(VGA_CRTC))
+    }
+}
+
+#[test]
+fn a_user_mode_with_the_programmed_timing_is_the_crtcs_mode_everywhere() {
+    let mut f = programmed(cvt_1080_kernel(), &[M1920X1200, M1024X768]);
+    // Not yet on VGA-1's lists: the backend id.
+    assert_eq!(f.crtc_mode(VGA_CRTC), M1080_KERNEL);
+    let foo = f.create_mode(cvt_1080(), b"foo");
+    assert_eq!(
+        f.crtc_mode(VGA_CRTC),
+        M1080_KERNEL,
+        "only listed modes match"
+    );
+    assert!(f.screen_modes().0.contains(&M1080_KERNEL));
+
+    f.select_all();
+    let events = f.add_output_mode(VGA, foo);
+    assert_eq!(events.len(), 64, "{events:02x?}");
+    assert_eq!(
+        f.read_u32(&events[32..], 24),
+        foo,
+        "OutputChangeNotify mode"
+    );
+    assert_eq!(f.crtc_mode(VGA_CRTC), foo);
+    let (ids, names, _) = f.screen_modes();
+    assert_eq!(ids, vec![M1920X1200, M1024X768, foo]);
+    assert_eq!(names[2], b"foo");
+
+    // A backend change carrying the backend id reaches clients as the user
+    // mode: CrtcChangeNotify and OutputChangeNotify.
+    crate::core_loop::run::emit_randr_change_notifications(
+        &mut f.state,
+        &[(VGA, VGA_CRTC, M1080_KERNEL)],
+    );
+    let events = read_all_available(&mut f.peer);
+    let notifies: Vec<&[u8]> = events
+        .chunks_exact(32)
+        .filter(|e| e[0] == RR_NOTIFY)
+        .collect();
+    let crtc = notifies
+        .iter()
+        .find(|e| e[1] == 0)
+        .expect("CrtcChangeNotify");
+    assert_eq!(f.read_u32(crtc, 12), VGA_CRTC);
+    assert_eq!(f.read_u32(crtc, 16), foo, "CrtcChangeNotify mode");
+    let out = notifies
+        .iter()
+        .find(|e| e[1] == 1)
+        .expect("OutputChangeNotify");
+    assert_eq!(f.read_u32(out, 24), foo, "OutputChangeNotify mode");
+
+    // The backend id is gone: no such mode, its name is free again.
+    let bytes = f.destroy_mode(M1080_KERNEL);
+    assert_eq!(
+        f.error(&bytes),
+        (BAD_RR_MODE, M1080_KERNEL, rr::RR_DESTROY_MODE)
+    );
+    // The user mode is current: referenced, and not deletable from VGA-1.
+    let bytes = f.destroy_mode(foo);
+    assert_eq!(
+        f.error(&bytes),
+        (x11::error::BAD_ACCESS, foo, rr::RR_DESTROY_MODE)
+    );
+    let bytes = f.delete_output_mode(VGA, foo);
+    assert_eq!(
+        f.error(&bytes),
+        (x11::error::BAD_MATCH, foo, rr::RR_DELETE_OUTPUT_MODE)
+    );
+}
+
+#[test]
+fn a_probed_mode_with_the_same_timing_wins_over_a_user_mode() {
+    let mut f = programmed(cvt_1080_kernel(), &[M1080_KERNEL, M1920X1200]);
+    let (foo, crtc) = f.match_user_mode(cvt_1080());
+    assert_eq!(crtc, M1080_KERNEL);
+    // VGA-1 probed then user, HDMI-1 probed.
+    assert_eq!(
+        f.screen_modes().0,
+        vec![M1080_KERNEL, M1920X1200, foo, M1024X768]
+    );
+}
+
+#[test]
+fn hskew_or_a_flag_above_bit_five_is_part_of_the_match() {
+    let mut skewed = cvt_1080();
+    skewed.hskew = 1;
+    assert_eq!(
+        programmed(cvt_1080_kernel(), &[]).match_user_mode(skewed).1,
+        M1080_KERNEL
+    );
+    let mut csync = cvt_1080();
+    csync.mode_flags |= RR_CSYNC;
+    assert_eq!(
+        programmed(cvt_1080_kernel(), &[]).match_user_mode(csync).1,
+        M1080_KERNEL
+    );
+    // Both programmed: they match.
+    let mut kernel = cvt_1080_kernel();
+    kernel.hskew = 1;
+    kernel.mode_flags |= RR_CSYNC;
+    let mut both = cvt_1080();
+    both.hskew = 1;
+    both.mode_flags |= RR_CSYNC;
+    let (id, crtc) = programmed(kernel, &[]).match_user_mode(both);
+    assert_eq!(crtc, id);
+}
+
+#[test]
+fn flags_outside_flag_bits_are_ignored_by_the_match() {
+    // `modeFlags & FLAG_BITS` on both sides; FLAG_BITS ends at
+    // RR_ClockDivideBy2 (0x2000).
+    let mut high = cvt_1080();
+    high.mode_flags |= 0x4000;
+    let (id, crtc) = programmed(cvt_1080_kernel(), &[]).match_user_mode(high);
+    assert_eq!(crtc, id);
+}
+
+#[test]
+fn the_dot_clock_matches_in_whole_khz() {
+    // `dotClock / 1000 != Clock`: 173_000_400 and 173_000_900 Hz are both
+    // 173000 kHz; 173_001_000 is not.
+    for (dot_clock, matches) in [
+        (173_000_400, true),
+        (173_000_900, true),
+        (172_999_999, false),
+        (173_001_000, false),
+    ] {
+        let mut info = cvt_1080();
+        info.dot_clock = dot_clock;
+        let (id, crtc) = programmed(cvt_1080_kernel(), &[]).match_user_mode(info);
+        let expected = if matches { id } else { M1080_KERNEL };
+        assert_eq!(crtc, expected, "dotClock {dot_clock}");
+    }
+}
+
+#[test]
+fn the_first_matching_user_mode_in_add_order_wins() {
+    let mut f = programmed(cvt_1080_kernel(), &[]);
+    let mut a = cvt_1080();
+    a.dot_clock = 173_000_400;
+    let mut b = cvt_1080();
+    b.dot_clock = 173_000_900;
+    let a = f.create_mode(a, b"a");
+    let b = f.create_mode(b, b"b");
+    assert!(f.add_output_mode(VGA, b).is_empty());
+    assert!(f.add_output_mode(VGA, a).is_empty());
+    assert_eq!(f.crtc_mode(VGA_CRTC), b);
+    // VGA-1's user list, HDMI-1's probed list, then the unreferenced
+    // backend mode; never the replaced M1080_KERNEL.
+    let (ids, ..) = f.screen_modes();
+    assert_eq!(ids, vec![b, a, M1024X768, M1920X1200]);
 }

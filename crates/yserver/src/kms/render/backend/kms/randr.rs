@@ -121,9 +121,9 @@ pub(in crate::kms::render::backend) fn reconcile_connector_probe(
 /// parity), so the reported dot clock / blanking reproduce the exact
 /// fractional refresh (e.g. 59.95) GNOME/MATE store in `monitors.xml`.
 /// `clock_khz == 0` (synthetic/nested modes) → `None`, so the RANDR layer
-/// falls back to synthesised blanking. The low 6 `DRM_MODE_FLAG_*` bits
-/// (sync polarity / interlace / doublescan) coincide with the RANDR
-/// `RR_*` flag bits; higher DRM-only bits are masked off.
+/// falls back to synthesised blanking. `DRM_MODE_FLAG_*` bits 0-13 are the
+/// RANDR `RR_*` bits (`drm_mode.h:61-84`); the DRM-only 3D and aspect bits
+/// above them are masked off.
 pub(in crate::kms::render::backend) fn mode_timing(
     m: &crate::platform::drm::Mode,
 ) -> Option<yserver_core::randr::ModeTiming> {
@@ -135,10 +135,11 @@ pub(in crate::kms::render::backend) fn mode_timing(
         hsync_start: m.hsync_start,
         hsync_end: m.hsync_end,
         htotal: m.htotal,
+        hskew: m.hskew,
         vsync_start: m.vsync_start,
         vsync_end: m.vsync_end,
         vtotal: m.vtotal,
-        mode_flags: m.flags & 0x3F,
+        mode_flags: m.flags & yserver_core::randr::RR_MODE_FLAG_BITS,
     })
 }
 

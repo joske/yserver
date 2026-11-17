@@ -40,6 +40,8 @@ pub struct Mode {
     pub hsync_start: u16,
     pub hsync_end: u16,
     pub htotal: u16,
+    /// Kernel `hskew`, reported as RANDR `ModeInfo.hSkew`.
+    pub hskew: u16,
     pub vsync_start: u16,
     pub vsync_end: u16,
     pub vtotal: u16,
@@ -65,26 +67,29 @@ pub(crate) struct ModeIdentity {
     hsync_start: u16,
     hsync_end: u16,
     htotal: u16,
+    hskew: u16,
     vsync_start: u16,
     vsync_end: u16,
     vtotal: u16,
+    /// The `RR_*` bits, `RR_MODE_FLAG_BITS`.
     flags: u32,
 }
 
 impl From<&Mode> for ModeIdentity {
     fn from(mode: &Mode) -> Self {
-        let (hsync_start, hsync_end, htotal, vsync_start, vsync_end, vtotal, flags) =
+        let (hsync_start, hsync_end, htotal, hskew, vsync_start, vsync_end, vtotal, flags) =
             if mode.clock_khz == 0 {
-                (0, 0, 0, 0, 0, 0, 0)
+                (0, 0, 0, 0, 0, 0, 0, 0)
             } else {
                 (
                     mode.hsync_start,
                     mode.hsync_end,
                     mode.htotal,
+                    mode.hskew,
                     mode.vsync_start,
                     mode.vsync_end,
                     mode.vtotal,
-                    mode.flags & 0x3f,
+                    mode.flags & yserver_core::randr::RR_MODE_FLAG_BITS,
                 )
             };
         Self {
@@ -95,6 +100,7 @@ impl From<&Mode> for ModeIdentity {
             hsync_start,
             hsync_end,
             htotal,
+            hskew,
             vsync_start,
             vsync_end,
             vtotal,
@@ -159,7 +165,7 @@ fn parse_mode_spec(spec: &str) -> Option<(u16, u16)> {
     Some((w, h))
 }
 
-fn local_mode_from(m: &DrmMode) -> Mode {
+pub(crate) fn local_mode_from(m: &DrmMode) -> Mode {
     let (w, h) = m.size();
     // Xorg `drmmode_ConvertFromKMode`: copy kernel timing verbatim.
     let (hsync_start, hsync_end, htotal) = m.hsync();
@@ -174,6 +180,7 @@ fn local_mode_from(m: &DrmMode) -> Mode {
         hsync_start,
         hsync_end,
         htotal,
+        hskew: m.hskew(),
         vsync_start,
         vsync_end,
         vtotal,

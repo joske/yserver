@@ -112,17 +112,29 @@ pub struct ModeTiming {
     pub vsync_start: u16,
     pub vsync_end: u16,
     pub vtotal: u16,
-    /// RANDR mode flags. The backend masks the kernel value to the low 6
-    /// bits (`& 0x3F`), where `DRM_MODE_FLAG_*`, `RR_*` and VidMode's
-    /// `V_*` all agree: P/N HSync, P/N VSync, Interlace, DoubleScan.
+    /// Kernel `drmModeModeInfo.hskew`; RANDR `ModeInfo.hSkew` verbatim
+    /// (`drmmode_ConvertFromKMode` copies it into `HSkew`).
+    pub hskew: u16,
+    /// RANDR mode flags: the kernel value masked to [`RR_MODE_FLAG_BITS`],
+    /// where `DRM_MODE_FLAG_*` and `RR_*` are bit-identical
+    /// (`drm_mode.h:71-84`, `randr.h:160-173`). DRM's 3D and aspect bits
+    /// above bit 13 are dropped.
     ///
-    /// The three namespaces diverge above bit 10 (`V_PIXMUX` is 0x1000
-    /// while `RR_PixelMultiplex` is 0x800), so widening that mask would
-    /// need a real DRM→`V_*` mapping before VidMode's `GetModeLine` may
-    /// keep forwarding this field verbatim. Mesa reads `V_INTERLACE`
-    /// (0x10) and `V_DBLSCAN` (0x20) from it to scale the MSC rate.
+    /// VidMode's `V_*` namespace agrees only on the low six bits
+    /// ([`VIDMODE_SHARED_FLAG_BITS`]; `V_PIXMUX` is 0x1000 while
+    /// `RR_PixelMultiplex` is 0x800), so `GetModeLine` masks to those
+    /// itself. Mesa reads `V_INTERLACE` (0x10) and `V_DBLSCAN` (0x20) from
+    /// it to scale the MSC rate.
     pub mode_flags: u32,
 }
+
+/// Xorg's `FLAG_BITS` (`xf86RandR12.c:981-994`): `RR_HSyncPositive` through
+/// `RR_ClockDivideBy2`, the fourteen mode flag bits RANDR and DRM share.
+pub const RR_MODE_FLAG_BITS: u32 = 0x3fff;
+
+/// The mode flag bits RANDR's `RR_*`, DRM's and VidMode's `V_*` all agree
+/// on: P/N HSync, P/N VSync, Interlace, DoubleScan.
+pub const VIDMODE_SHARED_FLAG_BITS: u32 = 0x3f;
 
 /// One unique mode (deduped by dimensions, refresh, and exact timing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,8 +213,7 @@ pub struct EffectiveTiming {
     pub hsync_start: u16,
     pub hsync_end: u16,
     pub htotal: u16,
-    /// Always 0: neither the kernel mode nor the synthesis carries a sync
-    /// skew, and both replies have historically hardcoded it here.
+    /// The kernel's `hskew`; 0 for the synthesis.
     pub hskew: u16,
     pub vsync_start: u16,
     pub vsync_end: u16,
@@ -231,7 +242,7 @@ impl EffectiveTiming {
                 hsync_start: t.hsync_start,
                 hsync_end: t.hsync_end,
                 htotal: t.htotal,
-                hskew: 0,
+                hskew: t.hskew,
                 vsync_start: t.vsync_start,
                 vsync_end: t.vsync_end,
                 vtotal: t.vtotal,
@@ -2166,6 +2177,7 @@ mod tests {
             vsync_start: 1443,
             vsync_end: 1448,
             vtotal: 1481,
+            hskew: 0,
             mode_flags: 0,
         };
         let out = RandrOutput {

@@ -58,7 +58,8 @@ pub(super) fn current_vidmode_output(state: &ServerState) -> Option<CurrentVidMo
             vsync_start: timing.vsync_start,
             vsync_end: timing.vsync_end,
             vtotal: timing.vtotal,
-            flags: timing.mode_flags,
+            // `V_*` agrees with `RR_*` only on the low six bits.
+            flags: timing.mode_flags & crate::randr::VIDMODE_SHARED_FLAG_BITS,
         },
     })
 }

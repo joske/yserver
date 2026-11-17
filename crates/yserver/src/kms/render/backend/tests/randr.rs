@@ -655,9 +655,10 @@ fn randr_rebuild_preserves_primary_while_output_resource_exists() {
 
 #[test]
 fn mode_timing_passes_kernel_timing_and_masks_drm_only_flags() {
-    // A real 2560x1440@59.95 mode: timing must pass through verbatim,
-    // and DRM-only flag bits above the RANDR RR_* range must be masked
-    // so we never advertise a bit RANDR would misinterpret.
+    // A real 2560x1440@59.95 mode: timing must pass through verbatim.
+    // DRM_MODE_FLAG_* bits 0-13 are the RR_* bits (drm_mode.h:61-84,
+    // randr.h:160-173) and are kept; the DRM-only 3D (bits 14-18) and
+    // picture-aspect (bits 19-22) bits are masked off.
     let m = crate::platform::drm::Mode {
         name: "2560x1440".into(),
         width: 2560,
@@ -668,12 +669,14 @@ fn mode_timing_passes_kernel_timing_and_masks_drm_only_flags() {
         hsync_start: 2608,
         hsync_end: 2640,
         htotal: 2720,
+        hskew: 3,
         vsync_start: 1443,
         vsync_end: 1448,
         vtotal: 1481,
         vscan: 1,
-        // PHSYNC(0x1) | PVSYNC(0x4) kept; DBLCLK(0x1000, DRM-only) dropped.
-        flags: 0x1 | 0x4 | 0x1000,
+        // PHSYNC | PVSYNC | CSYNC | DBLCLK kept; 3D_FRAME_PACKING (1<<14)
+        // and PIC_AR_16_9 (2<<19) dropped.
+        flags: 0x1 | 0x4 | 0x40 | 0x1000 | (1 << 14) | (2 << 19),
     };
     let t = mode_timing(&m).expect("real timing => Some");
     assert_eq!(t.clock_khz, 241_500);
@@ -681,7 +684,8 @@ fn mode_timing_passes_kernel_timing_and_masks_drm_only_flags() {
     assert_eq!(t.vtotal, 1481);
     assert_eq!(t.hsync_start, 2608);
     assert_eq!(t.vsync_end, 1448);
-    assert_eq!(t.mode_flags, 0x5, "DRM-only bits masked to RR_* range");
+    assert_eq!(t.hskew, 3);
+    assert_eq!(t.mode_flags, 0x1045, "DRM-only bits masked to RR_* range");
 
     // Synthetic/nested mode (no clock) => None => RANDR synthesises.
     let synthetic = crate::platform::drm::Mode {
@@ -691,6 +695,64 @@ fn mode_timing_passes_kernel_timing_and_masks_drm_only_flags() {
         ..Default::default()
     };
     assert!(mode_timing(&synthetic).is_none(), "clock_khz==0 => None");
+}
+
+#[test]
+fn kernel_hskew_and_high_rr_flags_reach_the_mode_info_reply() {
+    use super::server_scanout::DrmModeInfo;
+    use crate::platform::drm::ModeIdentity;
+
+    // `cvt 1920 1080 60` with a skew and RR_CSync (0x40) as the kernel
+    // would report them (drmmode_ConvertFromKMode copies both).
+    let kernel = |hskew: u16, flags: u32| {
+        crate::drm::modeset::local_mode_from(
+            &DrmModeInfo {
+                clock: 173_000,
+                hdisplay: 1920,
+                hsync_start: 2048,
+                hsync_end: 2248,
+                htotal: 2576,
+                hskew,
+                vdisplay: 1080,
+                vsync_start: 1083,
+                vsync_end: 1088,
+                vtotal: 1120,
+                vscan: 0,
+                vrefresh: 60,
+                flags,
+                type_: 0,
+                name: [0; 32],
+            }
+            .into_mode(),
+        )
+    };
+    let mode = kernel(7, 0x2 | 0x4 | 0x40);
+    assert_eq!(mode.hskew, 7);
+    // Timings differing only in hskew or a flag above bit 5 are distinct
+    // RANDR modes, so they get distinct ids.
+    let identity = ModeIdentity::from(&mode);
+    assert_ne!(identity, ModeIdentity::from(&kernel(0, 0x2 | 0x4 | 0x40)));
+    assert_ne!(identity, ModeIdentity::from(&kernel(7, 0x2 | 0x4)));
+    // Bits the RANDR reply cannot carry do not split a mode.
+    assert_eq!(
+        identity,
+        ModeIdentity::from(&kernel(7, 0x2 | 0x4 | 0x40 | (2 << 19)))
+    );
+
+    let timing = mode_timing(&mode).expect("real timing");
+    let randr_mode = yserver_core::randr::RandrMode {
+        mode_id: 9,
+        width: 1920,
+        height: 1080,
+        vrefresh: 60,
+        timing: Some(timing),
+    };
+    let state =
+        yserver_core::randr::RandrState::from_outputs_with_modes(0, Vec::new(), vec![randr_mode]);
+    let info = state.screen_resources_current().modes[0];
+    assert_eq!(info.dot_clock, 173_000_000);
+    assert_eq!(info.hskew, 7);
+    assert_eq!(info.mode_flags, 0x2 | 0x4 | 0x40);
 }
 
 #[test]
