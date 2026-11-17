@@ -1,4 +1,5 @@
 use super::*;
+use crate::kms::render::backend::RANDR_ID_EXHAUSTED;
 
 pub(super) fn test_render_device(
     id: RenderDeviceId,
@@ -1090,6 +1091,77 @@ fn randr_ids_are_stable_across_drop() {
     assert_ne!(c.output_id, a.output_id);
     assert_ne!(c.output_id, b.output_id);
     assert_ne!(c.crtc_id, a.crtc_id);
+}
+
+/// Every id the allocator hands out, used up or not, stays out of the fixed
+/// server XIDs and the other ranges of client 0.
+fn assert_backend_randr_id(id: u32) {
+    use yserver_core::server::{RANDR_BACKEND_XID_FIRST, RANDR_BACKEND_XID_LAST};
+    assert!(
+        id == RANDR_ID_EXHAUSTED
+            || (RANDR_BACKEND_XID_FIRST..=RANDR_BACKEND_XID_LAST).contains(&id),
+        "{id:#x} is outside the backend RANDR range"
+    );
+    assert_ne!(id, yserver_core::resources::ROOT_WINDOW.0);
+}
+
+#[test]
+fn randr_ids_never_reach_fixed_server_xids() {
+    // The counter used to start at 1, so its 256th id was the root window.
+    let mut alloc = RandrIdAllocator::default();
+    for i in 0..=yserver_core::resources::ROOT_WINDOW.0 {
+        let ids = alloc.ids_for(&test_output_key(0, &format!("DP-{i}")));
+        assert_backend_randr_id(ids.output_id);
+        assert_backend_randr_id(ids.crtc_id);
+        assert!(ids.output_id > yserver_core::server::SERVER_FIXED_XID_LAST);
+    }
+}
+
+#[test]
+fn randr_ids_stop_at_the_end_of_the_backend_range() {
+    use yserver_core::server::RANDR_BACKEND_XID_LAST;
+    let mut alloc = RandrIdAllocator {
+        next: RANDR_BACKEND_XID_LAST - 2,
+        ..RandrIdAllocator::default()
+    };
+    let provider = alloc.provider_id_for(RandrProviderEndpoint::Kms(test_device_key(0)));
+    let ids = alloc.ids_for(&test_output_key(0, "DP-1"));
+    let mode = alloc.mode_id(&test_advertised_mode(1920, 1080, 60, false));
+    let later = alloc.ids_for(&test_output_key(0, "DP-2"));
+    assert_eq!(
+        [
+            provider,
+            ids.output_id,
+            ids.crtc_id,
+            mode,
+            later.output_id,
+            later.crtc_id
+        ],
+        [
+            RANDR_BACKEND_XID_LAST - 2,
+            RANDR_BACKEND_XID_LAST - 1,
+            RANDR_BACKEND_XID_LAST,
+            RANDR_ID_EXHAUSTED,
+            RANDR_ID_EXHAUSTED,
+            RANDR_ID_EXHAUSTED,
+        ]
+    );
+    for _ in 0..4 {
+        assert_backend_randr_id(alloc.fresh());
+    }
+}
+
+#[test]
+fn used_up_randr_ids_are_not_advertised() {
+    let mut backend = KmsBackend::for_tests();
+    backend.pstate.randr_id_alloc = RandrIdAllocator {
+        next: yserver_core::server::RANDR_BACKEND_XID_LAST + 1,
+        ..RandrIdAllocator::default()
+    };
+    let (outputs, modes) = backend.randr_outputs_and_modes();
+    assert!(outputs.is_empty(), "{outputs:?}");
+    assert!(modes.is_empty(), "{modes:?}");
+    assert!(backend.randr_providers().is_empty());
 }
 
 #[test]

@@ -31,6 +31,10 @@ const MODE_SIZES: [(u16, u16); 8] = [
 /// `FIRST_FIXED_MODE_ID + i`.
 const CUSTOM_MODE_ID: u32 = 3;
 const FIRST_FIXED_MODE_ID: u32 = 4;
+const _: () = assert!(
+    FIRST_FIXED_MODE_ID + MODE_SIZES.len() as u32 - 1
+        <= yserver_core::server::SERVER_FIXED_XID_LAST
+);
 
 impl XBackend<SurfacePlatform> {
     /// `(msc, ust)` of the MSC clock; `(0, 0)` without one.

@@ -4,7 +4,8 @@ use crate::{
         render::{
             backend::{
                 ConnectorConfig, ConnectorRegistryDelta, GammaLut, KmsBackend, NotLiveConnector,
-                ProjectedRandrOutputState, RandrIdAllocator, RandrProviderEndpoint,
+                ProjectedRandrOutputState, RANDR_ID_EXHAUSTED, RandrIdAllocator,
+                RandrProviderEndpoint,
             },
             platform::ConnectorSnapshot,
         },
@@ -676,6 +677,7 @@ impl KmsBackend {
             _ => None,
         };
         let endpoints = self.randr_provider_endpoints();
+        // A provider whose id could not be allocated is left out.
         let provider_ids: HashMap<_, _> = endpoints
             .iter()
             .copied()
@@ -683,6 +685,7 @@ impl KmsBackend {
                 let id = self.pstate.randr_id_alloc.provider_id_for(endpoint);
                 (endpoint, id)
             })
+            .filter(|&(_, id)| id != RANDR_ID_EXHAUSTED)
             .collect();
         let kms_with_connector_inventory: HashSet<_> = self
             .pstate
@@ -730,11 +733,15 @@ impl KmsBackend {
         let mut providers = Vec::with_capacity(endpoints.len());
         for device in &self.platform.devices {
             let endpoint = RandrProviderEndpoint::Kms(device.key);
-            let provider_id = provider_ids[&endpoint];
+            let Some(&provider_id) = provider_ids.get(&endpoint) else {
+                continue;
+            };
             let mut crtcs = Vec::new();
             let mut outputs = Vec::new();
             for (key, entry) in self.pstate.randr_id_alloc.entries() {
-                if key.device_key != device.key {
+                if key.device_key != device.key
+                    || [entry.ids.output_id, entry.ids.crtc_id].contains(&RANDR_ID_EXHAUSTED)
+                {
                     continue;
                 }
                 crtcs.push(entry.ids.crtc_id);
@@ -761,9 +768,11 @@ impl KmsBackend {
                     .unwrap_or_default(),
             });
         }
-        if let Some((endpoint, name)) = distinct_renderer {
+        if let Some((endpoint, name)) = distinct_renderer
+            && let Some(&provider_id) = provider_ids.get(&endpoint)
+        {
             providers.push(RandrProvider {
-                provider_id: provider_ids[&endpoint],
+                provider_id,
                 name,
                 capabilities: PROVIDER_CAPABILITY_SOURCE_OUTPUT,
                 is_gpu: false,
@@ -871,11 +880,15 @@ impl KmsBackend {
                     entry.connector_type.clone(),
                 )
             };
+            let mode_id = self.pstate.randr_id_alloc.mode_id(&layout.output.picked);
+            // Ids used up: leave the output out rather than advertise None.
+            if [ids.output_id, ids.crtc_id, mode_id].contains(&RANDR_ID_EXHAUSTED) {
+                continue;
+            }
             self.pstate
                 .output_key_by_id
                 .insert(ids.output_id, output_key.clone());
             self.pstate.crtc_key_by_id.insert(ids.crtc_id, output_key);
-            let mode_id = self.pstate.randr_id_alloc.mode_id(&layout.output.picked);
             if connected {
                 self.pstate
                     .output_identity_by_id
@@ -887,7 +900,7 @@ impl KmsBackend {
                 let mode_id = self.pstate.randr_id_alloc.mode_id(mode);
                 // A connector can advertise the same exact resource more
                 // than once. List each XID only once (issue #48).
-                if mode_ids.contains(&mode_id) {
+                if mode_id == RANDR_ID_EXHAUSTED || mode_ids.contains(&mode_id) {
                     continue;
                 }
                 mode_ids.push(mode_id);
@@ -938,7 +951,7 @@ impl KmsBackend {
         for mode in current_modes.into_iter().chain(advertised_modes) {
             let identity = ModeIdentity::from(&mode);
             let mode_id = self.pstate.randr_id_alloc.mode_id(&mode);
-            if mode_identities.insert(identity) {
+            if mode_id != RANDR_ID_EXHAUSTED && mode_identities.insert(identity) {
                 modes.push(RandrMode {
                     mode_id,
                     width: mode.width,
@@ -976,12 +989,15 @@ impl KmsBackend {
             })
             .collect();
         for connector in not_live {
+            if [connector.ids.output_id, connector.ids.crtc_id].contains(&RANDR_ID_EXHAUSTED) {
+                continue;
+            }
             let mut mode_ids = Vec::with_capacity(connector.modes.len());
             let mut num_preferred: u16 = 0;
             for mode in connector.modes {
                 let mode_id = self.pstate.randr_id_alloc.mode_id(&mode);
                 // See the live-output loop: list each exact XID once.
-                if mode_ids.contains(&mode_id) {
+                if mode_id == RANDR_ID_EXHAUSTED || mode_ids.contains(&mode_id) {
                     continue;
                 }
                 mode_ids.push(mode_id);

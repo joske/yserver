@@ -24,6 +24,47 @@ use crate::{
 pub const FIRST_CLIENT_BASE: u32 = 0x0010_0000;
 pub const PER_CLIENT_MASK: u32 = 0x000F_FFFF;
 
+// Client 0's XID space (`0..FIRST_CLIENT_BASE`) in bounded ranges, so no
+// allocator can grow into another's ids.
+
+/// Fixed server XIDs (root, colormaps, visuals, COW, ...) and the small
+/// fixed RANDR ids of the surface and nested backends.
+pub const SERVER_FIXED_XID_FIRST: u32 = 0x0000_0001;
+pub const SERVER_FIXED_XID_LAST: u32 = 0x0000_0FFF;
+/// RANDR providers, outputs, CRTCs and modes a backend allocates (KMS).
+pub const RANDR_BACKEND_XID_FIRST: u32 = 0x0001_0000;
+pub const RANDR_BACKEND_XID_LAST: u32 = 0x0007_FFFF;
+/// RANDR user modes (CreateMode).
+pub const RANDR_USER_MODE_XID_FIRST: u32 = 0x0008_0000;
+pub const RANDR_USER_MODE_XID_LAST: u32 = 0x000F_FFFF;
+
+const _: () = {
+    assert!(SERVER_FIXED_XID_FIRST <= SERVER_FIXED_XID_LAST);
+    assert!(SERVER_FIXED_XID_LAST < RANDR_BACKEND_XID_FIRST);
+    assert!(RANDR_BACKEND_XID_FIRST <= RANDR_BACKEND_XID_LAST);
+    assert!(RANDR_BACKEND_XID_LAST < RANDR_USER_MODE_XID_FIRST);
+    assert!(RANDR_USER_MODE_XID_FIRST <= RANDR_USER_MODE_XID_LAST);
+    assert!(RANDR_USER_MODE_XID_LAST < FIRST_CLIENT_BASE);
+    let fixed = [
+        crate::resources::ROOT_WINDOW,
+        crate::resources::ROOT_COLORMAP,
+        crate::resources::ROOT_VISUAL,
+        crate::resources::COMPOSITE_OVERLAY_WINDOW,
+        crate::resources::ARGB_VISUAL,
+        crate::resources::ARGB_COLORMAP,
+        crate::resources::GLMARK_VISUAL,
+        crate::resources::SCREEN_SAVER_WINDOW,
+        crate::resources::ROOTLESS_WM_CHECK_WINDOW,
+        crate::resources::ROOTLESS_SELECTION_WINDOW,
+        crate::resources::DEFAULT_FONT,
+    ];
+    let mut i = 0;
+    while i < fixed.len() {
+        assert!(fixed[i].0 >= SERVER_FIXED_XID_FIRST && fixed[i].0 <= SERVER_FIXED_XID_LAST);
+        i += 1;
+    }
+};
+
 /// First event code reserved for the XInput extension (XI1 + XI2 share
 /// one contiguous block; the constant has an `XI2_` prefix in
 /// [`crate::nested`] for historical reasons). Re-exported here under an
