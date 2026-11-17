@@ -120,42 +120,45 @@ fn copy_request(fixture: &mut NotifyFixture, case: CopyCase) -> Vec<u8> {
 }
 
 fn assert_copy_wire(bytes: &[u8], case: CopyCase) {
-    if !case.graphics_exposures {
-        assert!(bytes.is_empty(), "graphics_exposures=False sends no event");
-        return;
-    }
-    assert_eq!(bytes.len() % 32, 0, "complete direct event frames");
-    let frames: Vec<_> = bytes.chunks_exact(32).collect();
-    if case.partial_source {
-        assert_eq!(frames.len(), 2, "two missing source bands");
-        for (index, expected_count) in [1_u16, 0].into_iter().enumerate() {
-            let frame = frames[index];
-            assert_eq!(frame[0], 13, "GraphicsExpose");
-            assert_eq!(u16::from_le_bytes(frame[2..4].try_into().unwrap()), 0x2a);
-            assert_eq!(
-                u32::from_le_bytes(frame[4..8].try_into().unwrap()),
+    let expected = if !case.graphics_exposures {
+        Vec::new()
+    } else if case.partial_source {
+        let graphics_expose = |x, y, width, height, count| {
+            let mut event = literal_event_header(13, 0, 0x2a, ClientByteOrder::LittleEndian);
+            append_event_u32(
+                &mut event,
+                ClientByteOrder::LittleEndian,
                 COPY_DESTINATION.0,
-                "destination drawable"
             );
-            assert_eq!(
-                u16::from_le_bytes(frame[18..20].try_into().unwrap()),
-                expected_count,
-                "decreasing GraphicsExpose count"
-            );
-            assert_eq!(frame[20], case.opcode, "originating Copy opcode");
-        }
+            append_event_u16(&mut event, ClientByteOrder::LittleEndian, x);
+            append_event_u16(&mut event, ClientByteOrder::LittleEndian, y);
+            append_event_u16(&mut event, ClientByteOrder::LittleEndian, width);
+            append_event_u16(&mut event, ClientByteOrder::LittleEndian, height);
+            append_event_u16(&mut event, ClientByteOrder::LittleEndian, 0); // minor opcode
+            append_event_u16(&mut event, ClientByteOrder::LittleEndian, count);
+            event.push(case.opcode);
+            finish_literal_event(event)
+        };
+        [
+            graphics_expose(5, 7, 40, 10, 1),
+            graphics_expose(5, 17, 10, 30, 0),
+        ]
+        .concat()
     } else {
-        assert_eq!(frames.len(), 1);
-        let frame = frames[0];
-        assert_eq!(frame[0], 14, "NoExpose");
-        assert_eq!(u16::from_le_bytes(frame[2..4].try_into().unwrap()), 0x2a);
-        assert_eq!(
-            u32::from_le_bytes(frame[4..8].try_into().unwrap()),
+        let mut event = literal_event_header(14, 0, 0x2a, ClientByteOrder::LittleEndian);
+        append_event_u32(
+            &mut event,
+            ClientByteOrder::LittleEndian,
             COPY_DESTINATION.0,
-            "destination drawable"
         );
-        assert_eq!(frame[10], case.opcode, "originating Copy opcode");
-    }
+        append_event_u16(&mut event, ClientByteOrder::LittleEndian, 0); // minor opcode
+        event.push(case.opcode);
+        finish_literal_event(event)
+    };
+    assert_eq!(
+        bytes, expected,
+        "complete no-policy copy-result event frames: {case:?}"
+    );
 }
 
 fn copy_run(
@@ -216,6 +219,20 @@ impl MappingCase {
 
     const fn expects_reply(self) -> bool {
         matches!(self, Self::Pointer | Self::Modifier | Self::XiModifier)
+    }
+
+    const fn expected_reply_status(self) -> u8 {
+        match self {
+            Self::XiModifier => 27,
+            Self::Pointer | Self::Modifier | Self::Keyboard | Self::XiKeyboard => 0,
+        }
+    }
+
+    const fn expected_mapping_range(self) -> (u8, u8) {
+        match self {
+            Self::Keyboard | Self::XiKeyboard => (8, 1),
+            Self::Pointer | Self::Modifier | Self::XiModifier => (0, 0),
+        }
     }
 }
 
@@ -311,29 +328,95 @@ fn mapping_run(case: MappingCase, deny_receive: bool) -> MappingRun {
 }
 
 fn assert_mapping_wire(run: &MappingRun, case: MappingCase) {
-    for (client_index, bytes) in run.outputs.iter().enumerate() {
-        assert_eq!(bytes.len() % 32, 0, "{} complete frames", case.name());
-        let frames: Vec<_> = bytes.chunks_exact(32).collect();
-        assert_eq!(
-            frames.iter().filter(|frame| frame[0] == 34).count(),
-            1,
-            "{} MappingNotify for client {client_index}",
-            case.name()
-        );
-        let mapping = frames.iter().find(|frame| frame[0] == 34).unwrap();
-        assert_eq!(
-            mapping[4],
-            case.expected_mapping_request(),
-            "{}",
-            case.name()
-        );
-        assert_eq!(
-            frames.iter().filter(|frame| frame[0] == 1).count(),
-            usize::from(client_index == 0 && case.expects_reply()),
-            "{} direct reply placement",
-            case.name()
-        );
-    }
+    let (first_keycode, count) = case.expected_mapping_range();
+    let sender_mapping =
+        literal_mapping_notify(0x2b, case.expected_mapping_request(), first_keycode, count);
+    let receiver_mapping =
+        literal_mapping_notify(0, case.expected_mapping_request(), first_keycode, count);
+    let sender_reply = if case.expects_reply() {
+        literal_empty_reply(0x2b, case.expected_reply_status())
+    } else {
+        Vec::new()
+    };
+    assert_eq!(
+        run.outputs[0],
+        [sender_mapping, sender_reply].concat(),
+        "{} complete no-policy sender frames and reply",
+        case.name()
+    );
+    assert_eq!(
+        run.outputs[1],
+        receiver_mapping,
+        "{} complete no-policy receiver frame",
+        case.name()
+    );
+    assert_eq!(
+        run.outputs[2],
+        receiver_mapping,
+        "{} complete no-policy second receiver frame",
+        case.name()
+    );
+}
+
+fn literal_mapping_notify(sequence: u16, request: u8, first_keycode: u8, count: u8) -> Vec<u8> {
+    let mut event = literal_event_header(34, 0, sequence, ClientByteOrder::LittleEndian);
+    event.extend_from_slice(&[request, first_keycode, count]);
+    finish_literal_event(event)
+}
+
+fn literal_empty_reply(sequence: u16, status: u8) -> Vec<u8> {
+    let mut reply = vec![0; 32];
+    reply[0] = 1;
+    reply[1] = status;
+    reply[2..4].copy_from_slice(&sequence.to_le_bytes());
+    reply
+}
+
+fn literal_xi1_mapping_notify(sequence: u16) -> Vec<u8> {
+    let event_type = crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET;
+    let mut event = literal_event_header(
+        event_type,
+        crate::xinput::DEVICEID_MASTER_KEYBOARD as u8,
+        sequence,
+        ClientByteOrder::LittleEndian,
+    );
+    event.extend_from_slice(&[1, 8, 1, 0]); // keyboard mapping, first keycode, count, pad
+    append_event_u32(&mut event, ClientByteOrder::LittleEndian, 0); // fixture timestamp
+    event.extend_from_slice(&[0; 20]);
+    finish_literal_event(event)
+}
+
+fn literal_present_configure(sequence: u16) -> Vec<u8> {
+    let mut event = [0_u8; 40];
+    event[0] = 35; // GenericEvent
+    event[1] = 145; // Present extension major opcode
+    event[2..4].copy_from_slice(&sequence.to_le_bytes());
+    event[4..8].copy_from_slice(&2_u32.to_le_bytes()); // two extra XGE words
+    event[8..10].copy_from_slice(&u16::from(x11present::EVENT_CONFIGURE_NOTIFY).to_le_bytes());
+    event[12..16].copy_from_slice(&0x0062_0042_u32.to_le_bytes());
+    event[16..20].copy_from_slice(&NOTIFY_WINDOW.0.to_le_bytes());
+    event[20..22].copy_from_slice(&610_i16.to_le_bytes());
+    event[22..24].copy_from_slice(&250_i16.to_le_bytes());
+    event[24..26].copy_from_slice(&50_u16.to_le_bytes());
+    event[26..28].copy_from_slice(&50_u16.to_le_bytes());
+    event[32..34].copy_from_slice(&50_u16.to_le_bytes());
+    event[34..36].copy_from_slice(&50_u16.to_le_bytes());
+    event.to_vec()
+}
+
+fn literal_core_configure(sequence: u16) -> Vec<u8> {
+    let mut event = literal_event_header(22, 0, sequence, ClientByteOrder::LittleEndian);
+    append_event_u32(&mut event, ClientByteOrder::LittleEndian, NOTIFY_WINDOW.0);
+    append_event_u32(&mut event, ClientByteOrder::LittleEndian, NOTIFY_WINDOW.0);
+    append_event_u32(&mut event, ClientByteOrder::LittleEndian, 0);
+    event.extend_from_slice(&610_i16.to_le_bytes());
+    event.extend_from_slice(&250_i16.to_le_bytes());
+    append_event_u16(&mut event, ClientByteOrder::LittleEndian, 50);
+    append_event_u16(&mut event, ClientByteOrder::LittleEndian, 50);
+    append_event_u16(&mut event, ClientByteOrder::LittleEndian, 0);
+    event.push(0); // override_redirect
+    event.extend_from_slice(&[0; 5]);
+    finish_literal_event(event)
 }
 
 fn receive_calls(calls: &[RecordedExtensionCheck]) -> Vec<&RecordedExtensionCheck> {
@@ -343,52 +426,8 @@ fn receive_calls(calls: &[RecordedExtensionCheck]) -> Vec<&RecordedExtensionChec
         .collect()
 }
 
-fn present_configure_bytes(allow_policy: bool) -> Vec<u8> {
-    const WINDOW: ResourceId = ResourceId(0x200);
-    const PRESENT_EID: u32 = 0x0010_0042;
-    let (mut state, mut peer) = two_children_under_root();
-    state
-        .clients
-        .get_mut(&1)
-        .unwrap()
-        .event_masks
-        .insert(WINDOW, 0x0002_0000);
-    state.present_event_selections.insert(
-        PRESENT_EID,
-        PresentEventSelection {
-            owner: ClientId(1),
-            window: WINDOW,
-            event_mask: x11present::EVENT_MASK_CONFIGURE_NOTIFY,
-        },
-    );
-    let _ = read_all_available(&mut peer);
-    if allow_policy {
-        state.install_access_policy(std::sync::Arc::new(
-            super::extensions::RecordingExtensionPolicy::new(
-                Decision::Allow,
-                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            ),
-        ));
-    }
-    let body = cw_restack_body(WINDOW.0, 0x0003, &[610, 250]);
-    let mut backend = RecordingBackend::new();
-    handle_configure_window(
-        &mut state,
-        &mut backend,
-        None,
-        ClientId(1),
-        SequenceNumber(1),
-        crate::access::RequestOpcodes {
-            major: 12,
-            minor: 0,
-        },
-        &body,
-    )
-    .expect("handle_configure_window for Present parity");
-    read_all_available(&mut peer)
-}
-
-// Mutations: add Receive before emit_copy_exposures' mutable client borrow;
+// Mutations: change a no-policy GraphicsExpose/NoExpose/MappingNotify field
+// or padding; add Receive before emit_copy_exposures' mutable client borrow;
 // check MappingNotify at its fanout caller; classify failure SelectionNotify as a notification.
 #[test]
 fn receive_exempt_results_and_mapping_bypass_policy() {
@@ -467,10 +506,6 @@ fn receive_exempt_results_and_mapping_bypass_policy() {
             denied.calls
         );
     }
-
-    // Task 7's dispatch fixture pins that the absent/denied-owner direct
-    // SelectionNotify(None) answer receives no code-31 Receive check.
-    super::access_notify_selection::run_denied_owner_refusal_fixture();
 }
 
 fn buffered_property_output(allow_policy: bool) -> Vec<u8> {
@@ -548,11 +583,14 @@ fn buffered_property_output(allow_policy: bool) -> Vec<u8> {
     let expected = literal_property_notify(ClientByteOrder::LittleEndian, 0x5678, property);
     assert!(
         queued.ends_with(&expected),
-        "PropertyNotify is present at the end of buffered output"
+        "buffered output ends with the complete literal PropertyNotify frame"
     );
     let output = fixture.drain(NOTIFY_RECEIVER_ALLOWED);
-    assert_eq!(&output[..32 * 1024], vec![0xa5; 32 * 1024]);
-    assert_eq!(&output[32 * 1024..], expected);
+    let expected_output = [vec![0xa5; 32 * 1024], expected].concat();
+    assert_eq!(
+        output, expected_output,
+        "complete buffered and drained output"
+    );
     output
 }
 
@@ -620,57 +658,26 @@ fn synthetic_selection_notify(allow_policy: bool) -> (Vec<u8>, Vec<RecordedExten
     (output, calls)
 }
 
-// Mutations: force synthetic-bit/sequence fields to constants; gate the old
-// writers; drop a later extension event; suppress N38 ColormapNotify only
-// when no policy is installed. Every advertised site includes an empty-policy
-// run, independent expected bytes, and recording-Allow parity.
+// Mutations: clear the synthetic SelectionNotify bit or change a buffered
+// no-policy PropertyNotify byte or padding.
 #[test]
-fn receive_no_policy_core_bytes_match_baseline() {
-    let fixtures: &[(&str, fn())] = &[
-        (
-            "N01–N30 window notifications and redirects",
-            super::access_notify_windows::run_no_policy_parity_fixtures,
-        ),
-        (
-            "N31–N36 destruction and COW notifications",
-            super::access_notify_lifecycle::run_no_policy_parity_fixtures,
-        ),
-        (
-            "N37–N38/N47 focus, colormap, and property",
-            super::access_notify_objects::run_no_policy_parity_fixtures,
-        ),
-        (
-            "N39 property fanout",
-            super::access_notify_egress::run_no_policy_parity_fixtures,
-        ),
-        (
-            "N40–N46 selection and rootless notifications",
-            super::access_notify_selection::run_no_policy_parity_fixtures,
-        ),
-        (
-            "Present before core ConfigureNotify",
-            super::present_pixmap::run_no_policy_parity_fixtures,
-        ),
-    ];
-    assert_eq!(fixtures.len(), 6, "enumerated no-policy fixture groups");
+fn receive_no_policy_aggregate_paths_match_expected_bytes() {
     let (synthetic_baseline, _) = synthetic_selection_notify(false);
     let (synthetic_allow, synthetic_calls) = synthetic_selection_notify(true);
-    assert_eq!(synthetic_allow, synthetic_baseline);
+    assert_eq!(
+        synthetic_allow, synthetic_baseline,
+        "recording-Allow synthetic SelectionNotify parity"
+    );
     assert_eq!(receive_calls(&synthetic_calls).len(), 1);
     assert_eq!(
         receive_calls(&synthetic_calls)[0].events,
         Some(vec![EventDescription::core(31)])
     );
-    for (_row, run) in fixtures {
-        run();
-    }
-    receive_exempt_results_and_mapping_bypass_policy();
-    receive_deny_all_keeps_later_extension_writers();
-    buffered_property_output(false);
-    buffered_property_output(true);
+    let buffered_baseline = buffered_property_output(false);
+    let buffered_allow = buffered_property_output(true);
     assert_eq!(
-        present_configure_bytes(false),
-        present_configure_bytes(true)
+        buffered_allow, buffered_baseline,
+        "recording-Allow buffered PropertyNotify parity"
     );
 }
 
@@ -868,50 +875,84 @@ fn run_present_configure(
     (output, receives, position)
 }
 
-// Mutation: suppress XI1/XKB/Present/XFIXES output in the shared old writers
-// when Receive denies the neighboring core notification.
+// Mutations: change any no-policy XI1/XKB/Present/XFIXES event byte or padding;
+// suppress XI1/XKB/Present/XFIXES output when Receive denies the core event.
 #[test]
 fn receive_deny_all_keeps_later_extension_writers() {
     let (xi_baseline, _) = run_xi_mapping(false);
+    let xi_sender_expected = [
+        literal_mapping_notify(2, 1, 8, 1),
+        literal_xi1_mapping_notify(2),
+    ]
+    .concat();
+    let xi_receiver_expected = literal_mapping_notify(0, 1, 8, 1);
+    assert_eq!(
+        xi_baseline[0], xi_sender_expected,
+        "complete no-policy XI1 and core event frames"
+    );
+    assert_eq!(
+        xi_baseline[1], xi_receiver_expected,
+        "complete no-policy core event frame for receiver"
+    );
+    assert_eq!(
+        xi_baseline[2], xi_receiver_expected,
+        "complete no-policy core event frame for second receiver"
+    );
     let (xi_denied, xi_calls) = run_xi_mapping(true);
     assert_eq!(xi_denied, xi_baseline, "XI device mapping event survives");
-    let xi_sender_frames: Vec<_> = xi_denied[0]
-        .chunks_exact(32)
-        .map(|frame| frame[0])
-        .collect();
-    assert_eq!(
-        xi_sender_frames[0], 34,
-        "core MappingNotify precedes XI1 event"
-    );
-    assert_eq!(
-        xi_sender_frames[1],
-        crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
-        "XI DeviceMappingNotify follows core MappingNotify"
-    );
     assert!(
         receive_calls(&xi_calls).is_empty(),
         "XI/core mapping exemptions add no hooks"
     );
 
     let (xkb_baseline, _) = run_xkb_mapping(false);
+    let mut expected_new_keyboard = [0_u8; 32];
+    expected_new_keyboard[0] = 85;
+    expected_new_keyboard[2..4].copy_from_slice(&3_u16.to_le_bytes());
+    expected_new_keyboard[8] = 1; // device ID
+    expected_new_keyboard[9] = 1; // old device ID
+    expected_new_keyboard[10] = 8;
+    expected_new_keyboard[11] = 255;
+    expected_new_keyboard[12] = 8;
+    expected_new_keyboard[13] = 255;
+    expected_new_keyboard[14] = 136; // XkbGetKbdByName major opcode
+    expected_new_keyboard[15] = 23; // XkbGetKbdByName minor opcode
+    expected_new_keyboard[16..18].copy_from_slice(&1_u16.to_le_bytes());
+    let xkb_sender_events = [
+        literal_mapping_notify(3, 1, 8, 248),
+        literal_mapping_notify(3, 0, 0, 0),
+        expected_new_keyboard.to_vec(),
+    ]
+    .concat();
+    let xkb_sender_expected = [xkb_sender_events, literal_empty_reply(3, 0)].concat();
+    let mut expected_new_keyboard_receiver = expected_new_keyboard;
+    expected_new_keyboard_receiver[2..4].fill(0);
+    let xkb_receiver_expected = [
+        literal_mapping_notify(0, 1, 8, 248),
+        literal_mapping_notify(0, 0, 0, 0),
+        expected_new_keyboard_receiver.to_vec(),
+    ]
+    .concat();
+    assert_eq!(
+        xkb_baseline[0], xkb_sender_expected,
+        "complete no-policy XKB event and reply frames"
+    );
+    assert_eq!(
+        xkb_baseline[1], xkb_receiver_expected,
+        "complete no-policy XKB legacy frames for receiver"
+    );
+    assert_eq!(
+        xkb_baseline[2], xkb_receiver_expected,
+        "complete no-policy XKB legacy frames for second receiver"
+    );
     let (xkb_denied, xkb_calls) = run_xkb_mapping(true);
     assert_eq!(
         xkb_denied, xkb_baseline,
         "XKB and direct reply bytes survive"
     );
     assert_eq!(
-        xkb_denied[0][0], 34,
-        "XKB path starts with core MappingNotify: {:02x?}",
-        xkb_denied[0]
-    );
-    assert_eq!(
-        xkb_denied[0][32], 34,
-        "modifier MappingNotify remains second"
-    );
-    assert_eq!(xkb_denied[0][64], 85, "XkbNewKeyboardNotify remains third");
-    assert_eq!(
-        xkb_denied[0][96], 1,
-        "request reply remains after notifications"
+        xkb_denied[0], xkb_sender_expected,
+        "XKB output stays complete"
     );
     assert!(
         receive_calls(&xkb_calls).is_empty(),
@@ -919,18 +960,12 @@ fn receive_deny_all_keeps_later_extension_writers() {
     );
 
     let (present_baseline, _, baseline_position) = run_present_configure(None);
+    let present_expected = [literal_present_configure(4), literal_core_configure(4)].concat();
+    assert_eq!(
+        present_baseline, present_expected,
+        "complete no-policy Present and core ConfigureNotify frames"
+    );
     let (present_allow, allow_calls, allow_position) = run_present_configure(Some(false));
-    assert_eq!(
-        present_baseline.len(),
-        72,
-        "Present then core ConfigureNotify"
-    );
-    assert_eq!(present_baseline[0], 35, "Present GenericEvent first");
-    assert_eq!(
-        present_baseline[40] & 0x7f,
-        22,
-        "core ConfigureNotify follows Present"
-    );
     assert_eq!(
         receive_calls(&allow_calls).len(),
         1,
@@ -939,11 +974,10 @@ fn receive_deny_all_keeps_later_extension_writers() {
     assert_eq!(allow_position, baseline_position);
     let (present_denied, deny_calls, denied_position) = run_present_configure(Some(true));
     assert_eq!(
-        present_denied.len(),
-        40,
-        "Present event still reaches its selector"
+        present_denied,
+        literal_present_configure(4),
+        "complete Present frame survives Receive denial"
     );
-    assert_eq!(present_denied[0], 35, "Present GenericEvent retained");
     assert_eq!(
         receive_calls(&deny_calls).len(),
         1,

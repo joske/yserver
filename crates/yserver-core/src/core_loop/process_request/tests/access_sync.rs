@@ -234,25 +234,52 @@ fn assert_sync_error(bytes: &[u8], code: u8, value: u32, minor: u8, sequence: u1
 fn expected_sync_resource_checks(
     calls: &[RecordedExtensionCheck],
 ) -> Vec<RecordedResourceExpectation> {
-    let resources = calls
-        .iter()
-        .filter(|call| call.hook == ExtensionHook::Resource)
-        .cloned()
-        .collect::<Vec<_>>();
-    expected_resource_checks(&resources)
+    expected_resource_checks(calls)
 }
 
 fn expected_sync_resource_checks_after(
     calls: &[RecordedExtensionCheck],
     start: usize,
 ) -> Vec<RecordedResourceExpectation> {
-    let resources = calls
+    expected_resource_checks(
+        calls
+            .get(start..)
+            .expect("SYNC resource-check start is within the recorded stream"),
+    )
+}
+
+fn sync_resource_calls(
+    calls: &[RecordedExtensionCheck],
+    expected_dispatches: &[(ClientId, u8)],
+) -> Vec<RecordedExtensionCheck> {
+    let mut resources = Vec::new();
+    let mut dispatches = Vec::new();
+    for call in calls {
+        match call.hook {
+            ExtensionHook::Resource => resources.push(call.clone()),
+            ExtensionHook::Dispatch => dispatches.push(call),
+            hook => panic!("unexpected {hook:?} for request {:?}", call.request),
+        }
+    }
+    let actual_dispatches = dispatches
         .iter()
-        .filter(|call| call.hook == ExtensionHook::Resource)
-        .skip(start)
-        .cloned()
+        .map(|call| (call.client, call.extension.as_str(), call.request))
         .collect::<Vec<_>>();
-    expected_resource_checks(&resources)
+    let expected_dispatches = expected_dispatches
+        .iter()
+        .map(|(client, minor)| {
+            (
+                *client,
+                "SYNC",
+                Some(RequestOpcodes {
+                    major: 142,
+                    minor: *minor,
+                }),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual_dispatches, expected_dispatches);
+    resources
 }
 
 struct DenyRow {
@@ -846,7 +873,10 @@ fn await_denied_second_counter_installs_nothing() {
     );
     assert_eq!(backend.calls(), backend_before);
     assert_eq!(
-        expected_sync_resource_checks(&calls.lock().unwrap()),
+        expected_sync_resource_checks(&sync_resource_calls(
+            &calls.lock().unwrap(),
+            &[(CLIENT, sync::AWAIT)],
+        )),
         [
             (
                 CLIENT,
@@ -870,6 +900,60 @@ fn await_denied_second_counter_installs_nothing() {
             ),
         ]
     );
+}
+
+#[test]
+#[should_panic(expected = "unexpected Receive")]
+fn sync_await_resource_checks_reject_unexpected_receive() {
+    // Mutation: restore the Resource-only prefilter in expected_sync_resource_checks; this must stop panicking.
+    use yserver_protocol::x11::sync;
+
+    let mut fixture = sync_access_fixture();
+    let create = counter_body(COUNTER, 0);
+    let created = sync_access_request(&mut fixture, sync::CREATE_COUNTER, &create);
+    assert_no_error(&created, "Await counter fixture");
+
+    let calls = Arc::new(Mutex::new(vec![RecordedExtensionCheck {
+        hook: ExtensionHook::Receive,
+        client: CLIENT,
+        extension: "TEST".to_owned(),
+        request: Some(RequestOpcodes {
+            major: 142,
+            minor: sync::AWAIT,
+        }),
+        peer: None,
+        admission: None,
+        target: None,
+        property: None,
+        mode: None,
+        send: None,
+        receive: Some(crate::access::EventSubject::Window(PRIORITY_WINDOW)),
+        events: None,
+        owner: None,
+        target_owner: None,
+    }]));
+    fixture
+        .state
+        .install_access_policy(Arc::new(RecordingExtensionPolicy::denying_resource(
+            Arc::clone(&calls),
+            COUNTER,
+            Some(AccessMode::READ),
+            DENY_ERROR,
+        )));
+
+    let await_body = words(&[
+        COUNTER.0,
+        sync::VALUE_TYPE_ABSOLUTE,
+        0,
+        100,
+        sync::TEST_POSITIVE_COMPARISON,
+        0,
+        0,
+    ]);
+    let bytes = sync_access_request(&mut fixture, sync::AWAIT, &await_body);
+
+    assert_sync_error(&bytes, DENY_ERROR.code, DENY_ERROR.value, sync::AWAIT, 1);
+    expected_sync_resource_checks(&calls.lock().unwrap());
 }
 
 #[test]
@@ -906,7 +990,10 @@ fn create_alarm_denied_creation_creates_nothing() {
     assert_eq!(backend.calls(), backend_before);
     let recorded = calls.lock().unwrap();
     assert_eq!(
-        expected_sync_resource_checks(&recorded),
+        expected_sync_resource_checks(&sync_resource_calls(
+            &recorded,
+            &[(CLIENT, sync::CREATE_ALARM)],
+        )),
         [(
             CLIENT,
             ALARM,
@@ -1024,7 +1111,10 @@ fn change_alarm_denied_counter_keeps_todays_partial_effects() {
     assert_eq!(state.sync_alarms[&DENIED_ALARM.0], baseline_state);
     assert_eq!(backend.calls(), backend_before);
     assert_eq!(
-        expected_sync_resource_checks(&calls.lock().unwrap()),
+        expected_sync_resource_checks(&sync_resource_calls(
+            &calls.lock().unwrap(),
+            &[(OTHER_CLIENT, sync::CHANGE_ALARM)],
+        )),
         [
             (
                 OTHER_CLIENT,
@@ -1128,12 +1218,7 @@ fn sync_alarm_resource_denials_match_modes_and_stop_before_effects() {
         10,
     );
     assert_eq!(
-        calls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|call| call.hook == ExtensionHook::Resource)
-            .count(),
+        sync_resource_calls(&calls.lock().unwrap(), &[(CLIENT, sync::CREATE_ALARM)],).len(),
         calls_before,
         "BadCounter precedes the counter check"
     );
@@ -1158,7 +1243,13 @@ fn sync_alarm_resource_denials_match_modes_and_stop_before_effects() {
     );
     assert!(!state.sync_alarms.contains_key(&CREATE_COUNTER_ALARM.0));
     assert_eq!(
-        expected_sync_resource_checks_after(&calls.lock().unwrap(), calls_before),
+        expected_sync_resource_checks_after(
+            &sync_resource_calls(
+                &calls.lock().unwrap(),
+                &[(CLIENT, sync::CREATE_ALARM), (CLIENT, sync::CREATE_ALARM),],
+            ),
+            calls_before,
+        ),
         [(
             CLIENT,
             COUNTER,
@@ -1191,7 +1282,17 @@ fn sync_alarm_resource_denials_match_modes_and_stop_before_effects() {
     );
     assert_eq!(state.sync_alarms[&ALARM.0], before_alarm);
     assert_eq!(
-        expected_sync_resource_checks_after(&calls.lock().unwrap(), calls_before + 1),
+        expected_sync_resource_checks_after(
+            &sync_resource_calls(
+                &calls.lock().unwrap(),
+                &[
+                    (CLIENT, sync::CREATE_ALARM),
+                    (CLIENT, sync::CREATE_ALARM),
+                    (CLIENT, sync::CHANGE_ALARM),
+                ],
+            ),
+            calls_before + 1,
+        ),
         [(
             CLIENT,
             ALARM,
@@ -1222,7 +1323,18 @@ fn sync_alarm_resource_denials_match_modes_and_stop_before_effects() {
     );
     assert_eq!(state.sync_alarms[&ALARM.0], before_alarm);
     assert_eq!(
-        expected_sync_resource_checks_after(&calls.lock().unwrap(), calls_before + 2),
+        expected_sync_resource_checks_after(
+            &sync_resource_calls(
+                &calls.lock().unwrap(),
+                &[
+                    (CLIENT, sync::CREATE_ALARM),
+                    (CLIENT, sync::CREATE_ALARM),
+                    (CLIENT, sync::CHANGE_ALARM),
+                    (CLIENT, sync::QUERY_ALARM),
+                ],
+            ),
+            calls_before + 2,
+        ),
         [(
             CLIENT,
             ALARM,
@@ -1254,7 +1366,19 @@ fn sync_alarm_resource_denials_match_modes_and_stop_before_effects() {
     assert_eq!(state.sync_alarms[&ALARM.0], before_alarm);
     assert_eq!(backend.calls(), backend_before);
     assert_eq!(
-        expected_sync_resource_checks_after(&calls.lock().unwrap(), calls_before + 3),
+        expected_sync_resource_checks_after(
+            &sync_resource_calls(
+                &calls.lock().unwrap(),
+                &[
+                    (CLIENT, sync::CREATE_ALARM),
+                    (CLIENT, sync::CREATE_ALARM),
+                    (CLIENT, sync::CHANGE_ALARM),
+                    (CLIENT, sync::QUERY_ALARM),
+                    (CLIENT, sync::DESTROY_ALARM),
+                ],
+            ),
+            calls_before + 3,
+        ),
         [(
             CLIENT,
             ALARM,
@@ -1384,8 +1508,19 @@ fn sync_alarm_resource_requests_present_expected_checks() {
     );
 
     let request = |minor| Some(RequestOpcodes { major: 142, minor });
+    let recorded = calls.lock().unwrap();
+    let resource_calls = sync_resource_calls(
+        &recorded,
+        &[
+            (CLIENT, sync::AWAIT),
+            (CLIENT, sync::CREATE_ALARM),
+            (CLIENT, sync::CHANGE_ALARM),
+            (CLIENT, sync::QUERY_ALARM),
+            (CLIENT, sync::DESTROY_ALARM),
+        ],
+    );
     assert_eq!(
-        expected_sync_resource_checks(&calls.lock().unwrap()),
+        expected_sync_resource_checks(&resource_calls),
         [
             (
                 CLIENT,
@@ -1445,7 +1580,6 @@ fn sync_alarm_resource_requests_present_expected_checks() {
             ),
         ]
     );
-    let recorded = calls.lock().unwrap();
     let creation = recorded
         .iter()
         .find(|call| call.target.is_some_and(|target| target.id == CREATED_ALARM))

@@ -16,7 +16,7 @@ the first delivery, also stops the walk. No behaviour a client can observe chang
 **Spec:** `docs/superpowers/specs/2026-10-30-access-control-layer-design.md` (series row 4; "Who is checked"; "Where the
 checks go" → Receive / Send).
 
-**Reference:** Xorg (MIT) xorg-server 21.1.24 at `/data/Projects/xorg-21.1.24`; paths below are relative to it. Where
+**Reference:** Xorg (MIT) `../xserver` at tag `xorg-server-21.1.24`; paths below are relative to it. Where
 the spec decides, it binds; where it is silent, Xorg is followed.
 
 **Review being addressed:** joske on PR #363 (merged as `ab880d30`), items 1–6 listed in the Tasks below.
@@ -111,7 +111,7 @@ the spec decides, it binds; where it is silent, Xorg is followed.
   `.../tests/access_send.rs` and the SendEvent tests of `.../tests/core_misc.rs`
 - Modify: `crates/yserver-core/src/randr.rs` (doc comment of `validate_set_crtc_config`)
 
-- [ ] **Step 1:** Check every Xorg `file:line` citation in the files above against `/data/Projects/xorg-21.1.24` and
+- [ ] **Step 1:** Check every Xorg `file:line` citation in the files above against `../xserver` and
   correct the file or line range where it does not point at the code the sentence describes. Known: `ProcSendEvent`'s
   type range check is `dix/events.c:5568-5574`, its propagate check `:5617-5620`, its send checks and delivery
   `:5622-5641`; `ProcConvertSelection` writes its events at `dix/selection.c:290-311`; XI's `SendEvent` is

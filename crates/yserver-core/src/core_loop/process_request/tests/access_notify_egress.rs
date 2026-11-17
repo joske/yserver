@@ -59,6 +59,7 @@ fn receive_checks(calls: &[RecordedExtensionCheck]) -> Vec<&RecordedExtensionChe
 
 // Mutation: bypass Receive in checked fanout, deny the whole fanout on one denial,
 // or record requestor ownership in place of the subject-window owner.
+// Mutation: change the PropertyNotify atom field in production.
 #[test]
 fn receive_property_fanout_is_per_recipient() {
     let (mut baseline, property) = property_fixture();
@@ -137,12 +138,6 @@ fn receive_property_fanout_is_per_recipient() {
         recipients,
         [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED]
     );
-}
-
-// Keep the existing fixture test private while letting Task 8 rerun its
-// established no-policy/Allow byte comparison from a sibling module.
-pub(super) fn run_no_policy_parity_fixtures() {
-    receive_property_fanout_is_per_recipient();
 }
 
 // Mutation: cache the first Receive Allow and reuse it for the next delivery.

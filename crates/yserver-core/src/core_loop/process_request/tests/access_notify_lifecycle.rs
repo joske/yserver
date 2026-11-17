@@ -50,19 +50,58 @@ fn received_sites(calls: &[&RecordedExtensionCheck], client: ClientId) -> Vec<(E
         .collect()
 }
 
-fn event_tuples(bytes: &[u8]) -> Vec<(u8, u32, u32)> {
-    assert_eq!(bytes.len() % 32, 0, "whole 32-byte protocol packets");
-    bytes
-        .chunks_exact(32)
-        .filter(|packet| packet[0] != 1 && packet[0] != 0)
-        .map(|event| {
-            (
-                event[0] & 0x7f,
-                u32::from_le_bytes(event[4..8].try_into().unwrap()),
-                u32::from_le_bytes(event[8..12].try_into().unwrap()),
-            )
+fn literal_destroy_stream(events: &[(u8, u32, u32)], sequence: u16) -> Vec<u8> {
+    events
+        .iter()
+        .flat_map(|(event_type, event_window, window)| {
+            let mut event =
+                literal_event_header(*event_type, 0, sequence, ClientByteOrder::LittleEndian);
+            append_event_u32(&mut event, ClientByteOrder::LittleEndian, *event_window);
+            append_event_u32(&mut event, ClientByteOrder::LittleEndian, *window);
+            if *event_type == 18 {
+                event.push(0); // from_configure
+            }
+            finish_literal_event(event)
         })
         .collect()
+}
+
+fn literal_cow_create_and_map(sequence: u16, width: u16, height: u16) -> Vec<u8> {
+    let mut create = literal_event_header(16, 0, sequence, ClientByteOrder::LittleEndian);
+    append_event_u32(&mut create, ClientByteOrder::LittleEndian, ROOT_WINDOW.0);
+    append_event_u32(
+        &mut create,
+        ClientByteOrder::LittleEndian,
+        COMPOSITE_OVERLAY_WINDOW.0,
+    );
+    append_event_u16(&mut create, ClientByteOrder::LittleEndian, 0); // x
+    append_event_u16(&mut create, ClientByteOrder::LittleEndian, 0); // y
+    append_event_u16(&mut create, ClientByteOrder::LittleEndian, width);
+    append_event_u16(&mut create, ClientByteOrder::LittleEndian, height);
+    append_event_u16(&mut create, ClientByteOrder::LittleEndian, 0); // border_width
+    create.push(1); // override_redirect
+
+    let mut map = literal_event_header(19, 0, sequence, ClientByteOrder::LittleEndian);
+    append_event_u32(&mut map, ClientByteOrder::LittleEndian, ROOT_WINDOW.0);
+    append_event_u32(
+        &mut map,
+        ClientByteOrder::LittleEndian,
+        COMPOSITE_OVERLAY_WINDOW.0,
+    );
+    map.push(1); // override_redirect
+    [finish_literal_event(create), finish_literal_event(map)].concat()
+}
+
+fn literal_cow_release(sequence: u16) -> Vec<u8> {
+    literal_destroy_stream(
+        &[
+            (18, COMPOSITE_OVERLAY_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
+            (18, ROOT_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
+            (17, COMPOSITE_OVERLAY_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
+            (17, ROOT_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
+        ],
+        sequence,
+    )
 }
 
 fn destroy_fixture() -> NotifyFixture {
@@ -228,8 +267,10 @@ fn install_destroy_policy(
     })
 }
 
-// Mutations: return from the destroy loop on denial; perform the receive
-// check after deleting subscriptions/resources; use the top subject for every descendant.
+// Mutations: increment a no-policy DestroyNotify sequence, change another
+// no-policy event field in production, return from the
+// destroy loop on denial, perform the receive check after resource deletion,
+// or use the top subject for every descendant.
 #[test]
 fn receive_destroy_denial_keeps_cleanup() {
     for opcode in [4, 5] {
@@ -238,6 +279,41 @@ fn receive_destroy_denial_keeps_cleanup() {
         run_destroy_request(&mut baseline, opcode);
         let baseline_denied_stream = baseline.drain(NOTIFY_RECEIVER_DENIED);
         let baseline_allowed_stream = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+        let expected_no_policy_denied = if opcode == 4 {
+            vec![
+                (18, DESTROY_PARENT.0, DESTROY_PARENT.0),
+                (17, DESTROY_GRANDCHILD.0, DESTROY_GRANDCHILD.0),
+                (17, DESTROY_CHILD.0, DESTROY_GRANDCHILD.0),
+                (17, DESTROY_CHILD.0, DESTROY_CHILD.0),
+                (17, DESTROY_PARENT.0, DESTROY_CHILD.0),
+                (17, DESTROY_PARENT.0, DESTROY_PARENT.0),
+            ]
+        } else {
+            vec![
+                (18, DESTROY_CHILD.0, DESTROY_CHILD.0),
+                (18, DESTROY_PARENT.0, DESTROY_CHILD.0),
+                (17, DESTROY_GRANDCHILD.0, DESTROY_GRANDCHILD.0),
+                (17, DESTROY_CHILD.0, DESTROY_GRANDCHILD.0),
+                (17, DESTROY_CHILD.0, DESTROY_CHILD.0),
+                (17, DESTROY_PARENT.0, DESTROY_CHILD.0),
+            ]
+        };
+        let mut expected_no_policy_allowed = expected_no_policy_denied.clone();
+        if opcode == 4 {
+            expected_no_policy_allowed.insert(1, (18, ROOT_WINDOW.0, DESTROY_PARENT.0));
+            expected_no_policy_allowed.push((17, ROOT_WINDOW.0, DESTROY_PARENT.0));
+        }
+        let expected_no_policy_allowed_bytes =
+            literal_destroy_stream(&expected_no_policy_allowed, 0);
+        let expected_no_policy_denied_bytes = literal_destroy_stream(&expected_no_policy_denied, 0);
+        assert_eq!(
+            baseline_allowed_stream, expected_no_policy_allowed_bytes,
+            "no-policy allowed destruction frames for opcode {opcode}"
+        );
+        assert_eq!(
+            baseline_denied_stream, expected_no_policy_denied_bytes,
+            "no-policy denied destruction frames for opcode {opcode}"
+        );
 
         let mut control = destroy_fixture();
         install_destroy_policy(&mut control, false);
@@ -299,31 +375,8 @@ fn receive_destroy_denial_keeps_cleanup() {
                 (17, DESTROY_CHILD.0, DESTROY_CHILD.0),
             ]
         };
-        assert_eq!(event_tuples(&denied_stream), expected_denied);
-        assert_eq!(
-            event_tuples(&control_allowed_stream),
-            if opcode == 4 {
-                vec![
-                    (18, DESTROY_PARENT.0, DESTROY_PARENT.0),
-                    (18, ROOT_WINDOW.0, DESTROY_PARENT.0),
-                    (17, DESTROY_GRANDCHILD.0, DESTROY_GRANDCHILD.0),
-                    (17, DESTROY_CHILD.0, DESTROY_GRANDCHILD.0),
-                    (17, DESTROY_CHILD.0, DESTROY_CHILD.0),
-                    (17, DESTROY_PARENT.0, DESTROY_CHILD.0),
-                    (17, DESTROY_PARENT.0, DESTROY_PARENT.0),
-                    (17, ROOT_WINDOW.0, DESTROY_PARENT.0),
-                ]
-            } else {
-                vec![
-                    (18, DESTROY_CHILD.0, DESTROY_CHILD.0),
-                    (18, DESTROY_PARENT.0, DESTROY_CHILD.0),
-                    (17, DESTROY_GRANDCHILD.0, DESTROY_GRANDCHILD.0),
-                    (17, DESTROY_CHILD.0, DESTROY_GRANDCHILD.0),
-                    (17, DESTROY_CHILD.0, DESTROY_CHILD.0),
-                    (17, DESTROY_PARENT.0, DESTROY_CHILD.0),
-                ]
-            }
-        );
+        assert_eq!(denied_stream, literal_destroy_stream(&expected_denied, 0));
+        assert_eq!(control_allowed_stream, expected_no_policy_allowed_bytes);
         let calls = calls.lock().unwrap();
         let receives = receives(&calls);
         let request = Some(RequestOpcodes {
@@ -466,9 +519,19 @@ fn receive_disconnect_destroy_notifies_survivors() {
         !control_denied_stream.is_empty(),
         "the allow control has selected events"
     );
-    assert_eq!(
-        event_tuples(&control_allowed_stream),
-        vec![
+    let expected_disconnect_denied = literal_destroy_stream(
+        &[
+            (18, DESTROY_PARENT.0, DESTROY_PARENT.0),
+            (17, DESTROY_GRANDCHILD.0, DESTROY_GRANDCHILD.0),
+            (17, DESTROY_CHILD.0, DESTROY_GRANDCHILD.0),
+            (17, DESTROY_CHILD.0, DESTROY_CHILD.0),
+            (17, DESTROY_PARENT.0, DESTROY_CHILD.0),
+            (17, DESTROY_PARENT.0, DESTROY_PARENT.0),
+        ],
+        0,
+    );
+    let expected_disconnect_allowed = literal_destroy_stream(
+        &[
             (18, DESTROY_PARENT.0, DESTROY_PARENT.0),
             (18, ROOT_WINDOW.0, DESTROY_PARENT.0),
             (17, DESTROY_GRANDCHILD.0, DESTROY_GRANDCHILD.0),
@@ -477,8 +540,18 @@ fn receive_disconnect_destroy_notifies_survivors() {
             (17, DESTROY_PARENT.0, DESTROY_CHILD.0),
             (17, DESTROY_PARENT.0, DESTROY_PARENT.0),
             (17, ROOT_WINDOW.0, DESTROY_PARENT.0),
-        ]
+        ],
+        0,
     );
+    assert_eq!(
+        baseline_allowed_stream, expected_disconnect_allowed,
+        "no-policy disconnect destruction frames"
+    );
+    assert_eq!(
+        baseline_denied_stream, expected_disconnect_denied,
+        "no-policy denied-recipient disconnect destruction frames"
+    );
+    assert_eq!(control_allowed_stream, expected_disconnect_allowed);
 
     let calls = calls.lock().unwrap();
     let receives = receives(&calls);
@@ -583,8 +656,9 @@ fn install_cow_policy(fixture: &mut NotifyFixture) -> Arc<Mutex<Vec<RecordedExte
     })
 }
 
-// Mutations: lose the extension minor; gate the reply/claim with Receive;
-// exempt core events solely because the producer is COMPOSITE.
+// Mutations: change a no-policy CreateNotify/MapNotify field or padding, lose
+// the extension minor, gate the reply/claim with Receive, or exempt core
+// events solely because the producer is COMPOSITE.
 #[test]
 fn receive_cow_notifications_keep_extension_request() {
     let mut baseline = NotifyFixture::new();
@@ -593,6 +667,28 @@ fn receive_cow_notifications_keep_extension_request() {
     dispatch_composite(&mut baseline, NOTIFY_SENDER, 70, 7);
     let baseline_requestor_get = baseline.drain(NOTIFY_SENDER);
     let baseline_create_events = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+    let root = baseline.state.resources.window(ROOT_WINDOW).unwrap();
+    let baseline_create_frames = literal_cow_create_and_map(0, root.width, root.height);
+    let expected_baseline_requestor = [literal_cow_create_and_map(70, root.width, root.height), {
+        let mut reply = literal_event_header(1, 0, 70, ClientByteOrder::LittleEndian);
+        append_event_u32(&mut reply, ClientByteOrder::LittleEndian, 0); // reply length
+        append_event_u32(
+            &mut reply,
+            ClientByteOrder::LittleEndian,
+            COMPOSITE_OVERLAY_WINDOW.0,
+        );
+        reply.extend_from_slice(&[0; 20]);
+        reply
+    }]
+    .concat();
+    assert_eq!(
+        baseline_create_events, baseline_create_frames,
+        "no-policy CreateNotify and MapNotify frames"
+    );
+    assert_eq!(
+        baseline_requestor_get, expected_baseline_requestor,
+        "no-policy COW frames and GetOverlayWindow reply"
+    );
 
     let mut control = NotifyFixture::new();
     select_cow_notifications(&mut control);
@@ -602,13 +698,7 @@ fn receive_cow_notifications_keep_extension_request() {
     let control_create_events = control.drain(NOTIFY_RECEIVER_ALLOWED);
     assert_eq!(control_requestor_get, baseline_requestor_get);
     assert_eq!(control_create_events, baseline_create_events);
-    assert_eq!(
-        event_tuples(&control_create_events),
-        vec![
-            (16, ROOT_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
-            (19, ROOT_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
-        ]
-    );
+    assert_eq!(control_create_events, baseline_create_frames);
     let control_cow = cow_snapshot(&control);
     assert_eq!(control_cow.0, vec![NOTIFY_SENDER]);
 
@@ -660,24 +750,8 @@ fn receive_cow_notifications_keep_extension_request() {
     dispatch_composite(&mut control, NOTIFY_SENDER, 71, 8);
     let control_release_requestor = control.drain(NOTIFY_SENDER);
     let control_release_allowed = control.drain(NOTIFY_RECEIVER_ALLOWED);
-    assert_eq!(
-        event_tuples(&control_release_requestor),
-        vec![
-            (18, COMPOSITE_OVERLAY_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
-            (18, ROOT_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
-            (17, COMPOSITE_OVERLAY_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
-            (17, ROOT_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
-        ]
-    );
-    assert_eq!(
-        event_tuples(&control_release_allowed),
-        vec![
-            (18, COMPOSITE_OVERLAY_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
-            (18, ROOT_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
-            (17, COMPOSITE_OVERLAY_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
-            (17, ROOT_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
-        ]
-    );
+    assert_eq!(control_release_requestor, literal_cow_release(71));
+    assert_eq!(control_release_allowed, literal_cow_release(0));
     assert_eq!(cow_snapshot(&control), (Vec::new(), None, false));
 
     dispatch_composite(&mut denied, NOTIFY_SENDER, 71, 8);
@@ -761,7 +835,8 @@ fn receive_cow_notifications_keep_extension_request() {
     }
 }
 
-// Mutation: reuse the previous COMPOSITE request context for COW server teardown.
+// Mutations: increment a no-policy DestroyNotify sequence or reuse the
+// previous COMPOSITE request context for COW server teardown.
 #[test]
 fn receive_last_cow_claim_disconnect_uses_no_request() {
     let mut baseline = NotifyFixture::new();
@@ -781,6 +856,11 @@ fn receive_last_cow_claim_disconnect_uses_no_request() {
     }
     process_disconnect(&mut baseline.state, &mut baseline.backend, NOTIFY_SENDER);
     let baseline_release_allowed = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+    assert_eq!(
+        baseline_release_allowed,
+        literal_cow_release(0),
+        "no-policy COW UnmapNotify and DestroyNotify frames"
+    );
 
     let mut control = NotifyFixture::new();
     select_cow_notifications(&mut control);
@@ -800,15 +880,7 @@ fn receive_last_cow_claim_disconnect_uses_no_request() {
     process_disconnect(&mut control.state, &mut control.backend, NOTIFY_SENDER);
     let control_release_allowed = control.drain(NOTIFY_RECEIVER_ALLOWED);
     assert_eq!(control_release_allowed, baseline_release_allowed);
-    assert_eq!(
-        event_tuples(&control_release_allowed),
-        vec![
-            (18, COMPOSITE_OVERLAY_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
-            (18, ROOT_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
-            (17, COMPOSITE_OVERLAY_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
-            (17, ROOT_WINDOW.0, COMPOSITE_OVERLAY_WINDOW.0),
-        ]
-    );
+    assert_eq!(control_release_allowed, literal_cow_release(0));
 
     let mut denied = NotifyFixture::new();
     select_cow_notifications(&mut denied);
@@ -849,13 +921,4 @@ fn receive_last_cow_claim_disconnect_uses_no_request() {
     );
     assert!(receives.iter().all(|call| call.request.is_none()));
     assert!(receives.iter().all(|call| call.client != NOTIFY_SENDER));
-}
-
-// Keep existing fixture tests private while letting the Task 8 parity test
-// rerun these established no-policy/Allow comparisons from its sibling module.
-pub(super) fn run_no_policy_parity_fixtures() {
-    receive_destroy_denial_keeps_cleanup();
-    receive_disconnect_destroy_notifies_survivors();
-    receive_cow_notifications_keep_extension_request();
-    receive_last_cow_claim_disconnect_uses_no_request();
 }

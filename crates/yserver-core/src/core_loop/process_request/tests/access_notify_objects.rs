@@ -64,19 +64,40 @@ fn wire_frames(bytes: &[u8]) -> Vec<Vec<u8>> {
     frames
 }
 
-fn focus_fields(bytes: &[u8]) -> Vec<(u8, u8, ResourceId, u8)> {
-    wire_frames(bytes)
-        .into_iter()
-        .filter(|frame| matches!(frame[0] & 0x7f, 9 | 10))
-        .map(|frame| {
-            (
-                frame[0] & 0x7f,
-                frame[1],
-                ResourceId(u32::from_le_bytes(frame[4..8].try_into().unwrap())),
-                frame[8],
-            )
-        })
-        .collect()
+fn literal_focus_frame(
+    event_type: u8,
+    detail: u8,
+    sequence: u16,
+    window: ResourceId,
+    mode: u8,
+) -> Vec<u8> {
+    let mut event =
+        literal_event_header(event_type, detail, sequence, ClientByteOrder::LittleEndian);
+    append_event_u32(&mut event, ClientByteOrder::LittleEndian, window.0);
+    event.push(mode);
+    finish_literal_event(event)
+}
+
+fn literal_xi2_focus_frame(evtype: u16, sequence: u16, window: ResourceId, detail: u8) -> Vec<u8> {
+    let mut event = vec![35, 137]; // GenericEvent, XI2 major opcode
+    append_event_u16(&mut event, ClientByteOrder::LittleEndian, sequence);
+    append_event_u32(&mut event, ClientByteOrder::LittleEndian, 11); // XGE length
+    append_event_u16(&mut event, ClientByteOrder::LittleEndian, evtype);
+    append_event_u16(&mut event, ClientByteOrder::LittleEndian, 3); // master keyboard
+    append_event_u32(&mut event, ClientByteOrder::LittleEndian, 0); // time
+    append_event_u16(&mut event, ClientByteOrder::LittleEndian, 3); // sourceid
+    event.extend_from_slice(&[0, detail]); // mode, detail
+    append_event_u32(&mut event, ClientByteOrder::LittleEndian, ROOT_WINDOW.0);
+    append_event_u32(&mut event, ClientByteOrder::LittleEndian, window.0);
+    append_event_u32(&mut event, ClientByteOrder::LittleEndian, 0); // child
+    for _ in 0..4 {
+        append_event_u32(&mut event, ClientByteOrder::LittleEndian, 0); // FP1616 coordinate
+    }
+    event.extend_from_slice(&[1, 0]); // same_screen, focus
+    append_event_u16(&mut event, ClientByteOrder::LittleEndian, 1); // buttons_len
+    event.extend_from_slice(&[0; 24]); // modifiers, group, and button mask
+    assert_eq!(event.len(), 76, "complete XI2 focus frame");
+    event
 }
 
 fn focus_state(state: &ServerState) -> (u32, u8, u32) {
@@ -281,14 +302,40 @@ fn assert_only_focus_event_removed(
     );
 }
 
-// Mutations: use the final focus for every subject; suppress XI2 with core denial;
-// skip checks for NotifyGrab/Ungrab/server mode.
+// Mutations: increment a core focus-event sequence or change another no-policy
+// focus-frame field in production, use the final focus
+// for every subject, suppress XI2 with core denial, or skip NotifyGrab/Ungrab
+// and server-mode checks.
 #[test]
 fn receive_focus_checks_transition_windows_and_keeps_xi2() {
     let mut baseline = access_notify_focus_fixture();
     assert!(!baseline.state.policies_installed());
     set_focus_to_new_child(&mut baseline);
     let baseline_focus = clear_focus_streams(&mut baseline);
+    let expected_transition = vec![
+        literal_focus_frame(10, 3, 0, FOCUS_OLD_CHILD, 0),
+        literal_focus_frame(10, 4, 0, FOCUS_OLD_TOP, 0),
+        literal_focus_frame(9, 4, 0, FOCUS_NEW_TOP, 0),
+        literal_focus_frame(9, 3, 0, FOCUS_NEW_CHILD, 0),
+    ];
+    let expected_denied_transition = [
+        expected_transition.clone(),
+        vec![
+            literal_xi2_focus_frame(10, 0, FOCUS_OLD_CHILD, 3),
+            literal_xi2_focus_frame(9, 0, FOCUS_NEW_CHILD, 3),
+        ],
+    ]
+    .concat();
+    assert_eq!(
+        wire_frames(stream(&baseline_focus, NOTIFY_RECEIVER_ALLOWED)),
+        expected_transition,
+        "no-policy allowed-recipient FocusOut/FocusIn frames"
+    );
+    assert_eq!(
+        wire_frames(stream(&baseline_focus, NOTIFY_RECEIVER_DENIED)),
+        expected_denied_transition,
+        "no-policy denied-recipient FocusOut/FocusIn frames"
+    );
 
     let mut control = access_notify_focus_fixture();
     let control_calls = focus_policy(&mut control, false);
@@ -306,13 +353,8 @@ fn receive_focus_checks_transition_windows_and_keeps_xi2() {
         );
     }
     assert_eq!(
-        focus_fields(stream(&control_focus, NOTIFY_RECEIVER_ALLOWED)),
-        [
-            (10, 3, FOCUS_OLD_CHILD, 0),
-            (10, 4, FOCUS_OLD_TOP, 0),
-            (9, 4, FOCUS_NEW_TOP, 0),
-            (9, 3, FOCUS_NEW_CHILD, 0),
-        ]
+        stream(&control_focus, NOTIFY_RECEIVER_ALLOWED),
+        stream(&baseline_focus, NOTIFY_RECEIVER_ALLOWED)
     );
     let xi2: Vec<_> = wire_frames(stream(&control_focus, NOTIFY_RECEIVER_DENIED))
         .into_iter()
@@ -340,13 +382,22 @@ fn receive_focus_checks_transition_windows_and_keeps_xi2() {
         stream(&control_focus, NOTIFY_RECEIVER_ALLOWED),
         stream(&denied_focus, NOTIFY_RECEIVER_ALLOWED)
     );
+    let expected_denied_focus = [
+        vec![
+            literal_focus_frame(10, 3, 0, FOCUS_OLD_CHILD, 0),
+            literal_focus_frame(9, 4, 0, FOCUS_NEW_TOP, 0),
+            literal_focus_frame(9, 3, 0, FOCUS_NEW_CHILD, 0),
+        ],
+        vec![
+            literal_xi2_focus_frame(10, 0, FOCUS_OLD_CHILD, 3),
+            literal_xi2_focus_frame(9, 0, FOCUS_NEW_CHILD, 3),
+        ],
+    ]
+    .concat();
     assert_eq!(
-        focus_fields(stream(&denied_focus, NOTIFY_RECEIVER_DENIED)),
-        [
-            (10, 3, FOCUS_OLD_CHILD, 0),
-            (9, 4, FOCUS_NEW_TOP, 0),
-            (9, 3, FOCUS_NEW_CHILD, 0),
-        ]
+        wire_frames(stream(&denied_focus, NOTIFY_RECEIVER_DENIED)),
+        expected_denied_focus,
+        "denied core focus plus complete no-policy XI2 frames"
     );
     assert_eq!(focus_state(&control.state), focus_state(&denied.state));
     assert_eq!(
@@ -380,6 +431,20 @@ fn receive_focus_checks_transition_windows_and_keeps_xi2() {
                 "grab transition no-policy bytes match recording-Allow"
             );
         }
+        let expected_grab_frames = vec![
+            literal_focus_frame(10, 3, 0, FOCUS_NEW_CHILD, expected_mode),
+            literal_focus_frame(9, 3, 0, FOCUS_NEW_CHILD, expected_mode),
+        ];
+        assert_eq!(
+            wire_frames(stream(&baseline_streams, NOTIFY_RECEIVER_ALLOWED)),
+            expected_grab_frames,
+            "no-policy FocusIn/FocusOut NotifyGrab/Ungrab frames"
+        );
+        assert_eq!(
+            wire_frames(stream(&baseline_streams, NOTIFY_RECEIVER_DENIED)),
+            expected_grab_frames,
+            "no-policy denied-recipient NotifyGrab/Ungrab frames"
+        );
         focus_grab(&mut denied, opcode, sequence);
         let denied_streams = clear_focus_streams(&mut denied);
         assert_only_focus_event_removed(
@@ -397,9 +462,10 @@ fn receive_focus_checks_transition_windows_and_keeps_xi2() {
             stream(&control_streams, NOTIFY_RECEIVER_ALLOWED),
             stream(&denied_streams, NOTIFY_RECEIVER_ALLOWED)
         );
-        let focus = focus_fields(stream(&control_streams, NOTIFY_RECEIVER_ALLOWED));
-        assert_eq!(focus.len(), 2);
-        assert!(focus.iter().all(|event| event.3 == expected_mode));
+        assert_eq!(
+            stream(&control_streams, NOTIFY_RECEIVER_ALLOWED),
+            stream(&baseline_streams, NOTIFY_RECEIVER_ALLOWED)
+        );
         assert_eq!(
             keyboard_grab_state(&control.state),
             keyboard_grab_state(&denied.state)
@@ -418,6 +484,24 @@ fn receive_focus_checks_transition_windows_and_keeps_xi2() {
         RequestOutcome::Handled
     ));
     let baseline_destroy = clear_focus_streams(&mut baseline);
+    let expected_destroy_frames = vec![
+        literal_focus_frame(10, 0, 0, FOCUS_NEW_CHILD, 0),
+        literal_focus_frame(9, 2, 0, FOCUS_NEW_TOP, 0),
+    ];
+    assert_eq!(
+        wire_frames(stream(&baseline_destroy, NOTIFY_RECEIVER_ALLOWED)),
+        expected_destroy_frames,
+        "no-policy DestroyWindow focus frames"
+    );
+    assert_eq!(
+        wire_frames(stream(&baseline_destroy, NOTIFY_RECEIVER_DENIED)),
+        [
+            expected_destroy_frames.clone(),
+            vec![literal_xi2_focus_frame(10, 0, FOCUS_NEW_CHILD, 0)],
+        ]
+        .concat(),
+        "no-policy denied-recipient DestroyWindow core and XI2 focus frames"
+    );
     for client in [
         NOTIFY_SENDER,
         NOTIFY_RECEIVER_DENIED,
@@ -441,8 +525,8 @@ fn receive_focus_checks_transition_windows_and_keeps_xi2() {
         10,
     );
     assert_eq!(
-        focus_fields(stream(&control_destroy, NOTIFY_RECEIVER_ALLOWED)),
-        [(10, 0, FOCUS_NEW_CHILD, 0), (9, 2, FOCUS_NEW_TOP, 0)]
+        stream(&control_destroy, NOTIFY_RECEIVER_ALLOWED),
+        stream(&baseline_destroy, NOTIFY_RECEIVER_ALLOWED)
     );
     assert_eq!(
         stream(&control_destroy, NOTIFY_RECEIVER_ALLOWED),
@@ -590,6 +674,16 @@ fn receive_focus_checks_transition_windows_and_keeps_xi2() {
     );
     let host_baseline_denied = host_baseline.drain(NOTIFY_RECEIVER_DENIED);
     let host_baseline_allowed = host_baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+    let expected_host_focus = vec![
+        literal_focus_frame(10, 5, 0, HOST_TOP, 0),
+        literal_focus_frame(9, 3, 0, HOST_TOP, 0),
+    ];
+    assert_eq!(
+        wire_frames(&host_baseline_allowed),
+        expected_host_focus,
+        "no-policy host activation focus frames"
+    );
+    assert_eq!(wire_frames(&host_baseline_denied), expected_host_focus);
 
     let (mut host, id) = host_fixture();
     let host_calls = host.install_policy(|_, _| Decision::Allow);
@@ -610,10 +704,7 @@ fn receive_focus_checks_transition_windows_and_keeps_xi2() {
     let host_recorded = host_calls.lock().unwrap();
     let host_receive_checks = receives(&host_recorded);
     assert_eq!(host_receive_checks.len(), 4, "{host_receive_checks:#?}");
-    assert_eq!(
-        focus_fields(&host_allowed),
-        [(10, 5, HOST_TOP, 0), (9, 3, HOST_TOP, 0)]
-    );
+    assert_eq!(wire_frames(&host_allowed), expected_host_focus);
 }
 
 fn colormap_fixture() -> NotifyFixture {
@@ -695,7 +786,8 @@ fn colormap_install_output(allow_policy: bool) -> (Vec<u8>, Vec<u8>) {
 }
 
 // Mutation: suppress N38 ColormapNotify only when no access policy is installed.
-fn assert_colormap_no_policy_parity() {
+#[test]
+fn receive_colormap_no_policy_matches_independent_bytes() {
     let (without_policy_denied, without_policy_allowed) = colormap_install_output(false);
     let (allow_denied, allow_allowed) = colormap_install_output(true);
     let expected = [
@@ -1116,6 +1208,20 @@ fn rootless_property_fixture() -> (NotifyFixture, AtomId) {
             .event_masks
             .insert(NOTIFY_WINDOW, PROPERTY_CHANGE_MASK);
     }
+    let denied = fixture
+        .state
+        .clients
+        .get_mut(&NOTIFY_RECEIVER_DENIED.0)
+        .unwrap();
+    denied.byte_order = ClientByteOrder::BigEndian;
+    denied.last_sequence.store(0x1234, Ordering::Relaxed);
+    let allowed = fixture
+        .state
+        .clients
+        .get_mut(&NOTIFY_RECEIVER_ALLOWED.0)
+        .unwrap();
+    allowed.byte_order = ClientByteOrder::LittleEndian;
+    allowed.last_sequence.store(0x5678, Ordering::Relaxed);
     fixture.state.start_instant = std::time::Instant::now() + std::time::Duration::from_secs(30);
     rootless::selection::watch_properties(&mut fixture.state, NOTIFY_WINDOW, true);
     let property = fixture.state.atoms.intern("TASK6_ROOTLESS_PROPERTY", false);
@@ -1130,7 +1236,8 @@ fn rootless_change(fixture: &mut NotifyFixture, window: ResourceId, property: At
     ));
 }
 
-// Mutations: check after push, deny the entire emitter, or ask the bridge on an unwatched window.
+// Mutations: change a no-policy PropertyNotify byte or padding, check after
+// push, deny the entire emitter, or ask the bridge on an unwatched window.
 #[test]
 fn receive_bridge_property_denial_keeps_clients_and_property() {
     let (mut control, control_property) = rootless_property_fixture();
@@ -1138,13 +1245,26 @@ fn receive_bridge_property_denial_keeps_clients_and_property() {
     rootless_change(&mut control, NOTIFY_WINDOW, control_property, 71);
     let control_denied_client = control.drain(NOTIFY_RECEIVER_DENIED);
     let control_allowed_client = control.drain(NOTIFY_RECEIVER_ALLOWED);
-    assert_eq!(control_denied_client.len(), 32);
-    assert_eq!(control_allowed_client.len(), 32);
-    assert!(matches!(
-        rootless::selection::take_selection_events(&mut control.state).as_slice(),
-        [SelectionEvent::Property { window, property, .. }]
-            if *window == NOTIFY_WINDOW && *property == control_property
-    ));
+    assert_eq!(
+        control_denied_client,
+        literal_property_notify(ClientByteOrder::BigEndian, 0x1234, control_property),
+        "no-policy bridge PropertyNotify for the big-endian client"
+    );
+    assert_eq!(
+        control_allowed_client,
+        literal_property_notify(ClientByteOrder::LittleEndian, 0x5678, control_property),
+        "no-policy bridge PropertyNotify for the little-endian client"
+    );
+    assert_eq!(
+        rootless::selection::take_selection_events(&mut control.state),
+        [SelectionEvent::Property {
+            window: NOTIFY_WINDOW,
+            property: control_property,
+            time: 0,
+            deleted: false,
+        }],
+        "complete no-policy bridge PropertyNotify record"
+    );
 
     let (mut allow, allow_property) = rootless_property_fixture();
     assert_eq!(allow_property, control_property);
@@ -1254,14 +1374,4 @@ fn receive_bridge_property_denial_keeps_clients_and_property() {
             .iter()
             .any(|call| call.hook == ExtensionHook::Send)
     );
-}
-
-// Keep existing fixture tests private while letting the Task 8 parity test
-// rerun these established no-policy/Allow comparisons from its sibling module.
-pub(super) fn run_no_policy_parity_fixtures() {
-    receive_focus_checks_transition_windows_and_keeps_xi2();
-    receive_colormap_uses_each_subscribing_window();
-    assert_colormap_no_policy_parity();
-    receive_get_property_delete_keeps_reply();
-    receive_bridge_property_denial_keeps_clients_and_property();
 }

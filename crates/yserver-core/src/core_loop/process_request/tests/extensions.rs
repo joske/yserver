@@ -188,8 +188,10 @@ impl RecordingExtensionPolicy {
             admission: ctx.admission(client).cloned(),
             owner: target
                 .and_then(|target| ctx.owner(target.id, target.kind))
-                .or_else(|| match receive {
-                    Some(EventSubject::Window(window)) => ctx.owner(window, ResourceKind::Window),
+                .or_else(|| match (hook, receive) {
+                    (ExtensionHook::Receive, Some(EventSubject::Window(window))) => {
+                        ctx.owner(window, ResourceKind::Window)
+                    }
                     _ => None,
                 }),
             target_owner: target.and_then(|target| ctx.target_owner(&target)),
