@@ -1269,6 +1269,7 @@ fn p1_gamma_reapplies_after_modeset_and_vt_resume() {
             width: layout.width,
             height: layout.height,
             vrefresh: layout.output.picked.vrefresh.saturating_sub(1),
+            user_timing: None,
         };
         let connector = layout.key.connector_name.clone();
         let output_key = layout.key.clone();

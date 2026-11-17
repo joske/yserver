@@ -1,6 +1,6 @@
 use crate::{
     access::{AccessMode, RequestOpcodes, ResourceKind},
-    backend::{Backend, CrtcConfigApply, ModeSpec},
+    backend::{Backend, CrtcConfigApply, ModeSpec, UserTiming},
     core_loop::process_request::{
         RANDR_BAD_CRTC, RequestOutcome, check_resource, emit_x11_error_with_minor,
         randr_ext::{
@@ -773,10 +773,13 @@ pub(super) fn handle_randr_set_crtc_config(
     };
     let output_id = output_row.output_id;
     let connector = output_row.name.clone();
-    // A mode only on the output's user list. The backend resolves a mode by
-    // (width, height, refresh) in the connector's own list and could pick a
-    // different timing, so it cannot be programmed yet.
-    let user_listed_only = resolved.is_some() && !output_row.mode_ids.contains(&mode);
+    // A mode only on the output's user list is programmed by its full
+    // timing (`xf86RandRModeConvert`); the connector's list may not have it.
+    let user_timing = (resolved.is_some() && !output_row.mode_ids.contains(&mode))
+        .then(|| state.randr_view().mode_info(mode))
+        .flatten()
+        .map(|info| UserTiming::from_mode_info(&info));
+    let user_listed_only = user_timing.is_some() && !backend.programs_user_mode_timings();
     // A disable keeps the current transform (xf86RandR12CrtcSet
     // only installs one with a mode).
     let apply_transform = (resolved.is_some()
@@ -811,7 +814,8 @@ pub(super) fn handle_randr_set_crtc_config(
     let mode_spec = resolved.map(|m| ModeSpec {
         width: m.width,
         height: m.height,
-        vrefresh: m.vrefresh,
+        vrefresh: user_timing.map_or(m.vrefresh, |t| t.vrefresh()),
+        user_timing,
     });
     // lastSetTime = client timestamp (0/CurrentTime ⇒ server now).
     let set_time = if req_timestamp == 0 {
@@ -837,7 +841,8 @@ pub(super) fn handle_randr_set_crtc_config(
             sequence,
             completion,
             Err(io::Error::other(format!(
-                "mode 0x{mode:x} is not in {connector}'s connector list"
+                "mode 0x{mode:x} is not in {connector}'s connector list and the backend \
+                 cannot program a timing"
             ))),
         );
     }

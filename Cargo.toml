@@ -19,6 +19,8 @@ license = "MIT"
 ash = "0.38"
 crossbeam-channel = "0.5"
 drm = "0.15"
+# `drm_mode_modeinfo`, the raw kernel mode a user timing is built as.
+drm-ffi = "0.9"
 env_logger = "0.11"
 freetype-rs = "0.38"
 gbm = { version = "0.18", default-features = false }

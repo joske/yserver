@@ -656,6 +656,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 vrefresh: 60,
+                user_timing: None,
             },
             source_route: ScanoutRoute::new(
                 RenderDeviceId::DrmRender(DrmDeviceKey {

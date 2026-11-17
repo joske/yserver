@@ -33,6 +33,65 @@ pub struct ModeSpec {
     pub width: u16,
     pub height: u16,
     pub vrefresh: u32,
+    /// The full timing to program, for a mode that is not in the output's
+    /// own list (a user mode, or another output's mode added with
+    /// `RRAddOutputMode`). `None`: the backend finds the mode by width,
+    /// height and refresh in the connector's list.
+    pub user_timing: Option<UserTiming>,
+}
+
+/// A RANDR mode converted for programming as Xorg's `xf86RandRModeConvert`
+/// does (`hw/xfree86/modes/xf86RandR12.c:1102-1128`): the clock in kHz,
+/// `dotClock / 1000` truncated, every sync field and `hSkew` verbatim, and
+/// the flags masked to `FLAG_BITS`, which RANDR and DRM share bit for bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserTiming {
+    pub width: u16,
+    pub height: u16,
+    pub timing: crate::randr::ModeTiming,
+}
+
+impl UserTiming {
+    #[must_use]
+    pub fn from_mode_info(info: &yserver_protocol::x11::randr::ModeInfo) -> Self {
+        Self {
+            width: info.width,
+            height: info.height,
+            timing: crate::randr::ModeTiming {
+                clock_khz: info.dot_clock / 1000,
+                hsync_start: info.hsync_start,
+                hsync_end: info.hsync_end,
+                htotal: info.htotal,
+                hskew: info.hskew,
+                vsync_start: info.vsync_start,
+                vsync_end: info.vsync_end,
+                vtotal: info.vtotal,
+                mode_flags: info.mode_flags & crate::randr::RR_MODE_FLAG_BITS,
+            },
+        }
+    }
+
+    /// The refresh the kernel reports for this timing (`drm_mode_vrefresh`):
+    /// clock over the totals, rounded to nearest, doubled for interlace and
+    /// halved for doublescan; 0 without totals.
+    #[must_use]
+    pub fn vrefresh(&self) -> u32 {
+        const INTERLACE: u32 = 1 << 4;
+        const DBLSCAN: u32 = 1 << 5;
+        let t = &self.timing;
+        let mut num = u64::from(t.clock_khz) * 1000;
+        let mut den = u64::from(t.htotal) * u64::from(t.vtotal);
+        if den == 0 {
+            return 0;
+        }
+        if t.mode_flags & INTERLACE != 0 {
+            num *= 2;
+        }
+        if t.mode_flags & DBLSCAN != 0 {
+            den *= 2;
+        }
+        u32::try_from((num + den / 2) / den).unwrap_or(u32::MAX)
+    }
 }
 
 /// Opaque identity of an asynchronous CRTC configuration operation.
@@ -822,6 +881,14 @@ pub trait Backend {
     /// which only fires on a real change; notifying on a redundant
     /// re-assert makes RANDR clients re-apply in a loop). Default
     /// `Ok(false)` no-op for nested/recording backends.
+    /// Whether [`Self::apply_crtc_config`] programs [`ModeSpec::user_timing`].
+    /// Without it, `SetCrtcConfig` to a mode only on an output's user list
+    /// answers `RRSetConfigFailed` before reaching the backend, as from a
+    /// DDX whose `crtcSet` refuses (`rrcrtc.c:1459-1483`).
+    fn programs_user_mode_timings(&self) -> bool {
+        false
+    }
+
     fn apply_crtc_config(
         &mut self,
         _output_id: u32,

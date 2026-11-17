@@ -249,7 +249,8 @@ impl<'a> RandrView<'a> {
     }
 
     /// The `ModeInfo` of mode `id`, user or backend, without its name.
-    fn mode_info(&self, id: u32) -> Option<proto::ModeInfo> {
+    #[must_use]
+    pub fn mode_info(&self, id: u32) -> Option<proto::ModeInfo> {
         match self.user.get(id) {
             Some(user) => Some(user.info),
             None => self.backend_mode(id).map(|mode| backend_mode_info(mode, 0)),

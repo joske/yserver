@@ -422,6 +422,12 @@ pub trait Platform: OutputSink + Sized + 'static {
 
     fn cancel_crtc_config(_b: &mut XBackend<Self>, _token: CrtcConfigToken) {}
 
+    /// [`Backend::programs_user_mode_timings`]; nothing programs a timing
+    /// unless the platform says so.
+    fn programs_user_mode_timings(_b: &XBackend<Self>) -> bool {
+        false
+    }
+
     fn apply_crtc_config(
         _b: &mut XBackend<Self>,
         _output_id: u32,

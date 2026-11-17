@@ -320,6 +320,56 @@ impl PlatformBackend {
             )));
         }
 
+        if let Some(user) = mode_spec.user_timing {
+            // Programmed by its timing, as Xorg's modesetting driver does: the
+            // connector need not list it, and the kernel's atomic check is
+            // the only validation (`drmmode_set_mode_major`).
+            output.mode = crate::platform::drm::user_timing_drm_mode(&user);
+            output.picked = crate::platform::drm::user_timing_mode(&user);
+        } else {
+            Self::resolve_advertised_mode(&device, &mut output, mode_spec)?;
+        }
+
+        let existing_idx = self
+            .outputs
+            .iter()
+            .position(|layout| &layout.key == output_key);
+        if let Some(index) = existing_idx
+            && (index >= self.scanout_pools.len() || index >= self.bo_generations.len())
+        {
+            return Err(io::Error::other(format!(
+                "enable_connector {connector}: active output index {index} has no paired scanout-pool/generation slot"
+            )));
+        }
+        let needs_pool_realloc = scanout_pool_needs_reallocation(
+            existing_idx.and_then(|idx| self.outputs.get(idx)),
+            existing_idx
+                .and_then(|idx| self.scanout_pools.get(idx))
+                .and_then(Option::as_ref)
+                .map(OutputScanout::route),
+            mode_spec.width,
+            mode_spec.height,
+            scanout_route,
+        );
+
+        Ok(ResolvedConnectorEnable {
+            connector,
+            device,
+            output,
+            scanout_route,
+            existing_idx,
+            needs_pool_realloc,
+        })
+    }
+
+    /// Find an advertised `mode_spec` by width, height and refresh in the
+    /// connector's list and install the kernel's own mode for it.
+    fn resolve_advertised_mode(
+        device: &crate::drm::Device,
+        output: &mut crate::platform::drm::Output,
+        mode_spec: yserver_core::backend::ModeSpec,
+    ) -> io::Result<()> {
+        let connector = output.connector_name.clone();
         let matched = output
             .modes
             .iter()
@@ -371,37 +421,7 @@ impl PlatformBackend {
             output.mode = drm_mode;
             output.picked = mode_local;
         }
-
-        let existing_idx = self
-            .outputs
-            .iter()
-            .position(|layout| &layout.key == output_key);
-        if let Some(index) = existing_idx
-            && (index >= self.scanout_pools.len() || index >= self.bo_generations.len())
-        {
-            return Err(io::Error::other(format!(
-                "enable_connector {connector}: active output index {index} has no paired scanout-pool/generation slot"
-            )));
-        }
-        let needs_pool_realloc = scanout_pool_needs_reallocation(
-            existing_idx.and_then(|idx| self.outputs.get(idx)),
-            existing_idx
-                .and_then(|idx| self.scanout_pools.get(idx))
-                .and_then(Option::as_ref)
-                .map(OutputScanout::route),
-            mode_spec.width,
-            mode_spec.height,
-            scanout_route,
-        );
-
-        Ok(ResolvedConnectorEnable {
-            connector,
-            device,
-            output,
-            scanout_route,
-            existing_idx,
-            needs_pool_realloc,
-        })
+        Ok(())
     }
 
     /// Enable (or reconfigure) a single connector at `(x, y)` with

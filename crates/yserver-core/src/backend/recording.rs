@@ -513,6 +513,10 @@ pub struct RecordingBackend {
     /// following `refresh_randr_state_set_time` installs it into
     /// `state.randr`, carrying client-owned state as the KMS rebuild does.
     pub apply_crtc_configs: bool,
+    /// [`Backend::programs_user_mode_timings`]. An applied user timing is
+    /// reported as the KMS backend does: the programmed timing under a
+    /// backend mode id, new unless the table already has that timing.
+    pub program_user_mode_timings: bool,
     applied_crtc_config: Option<(u32, Option<ModeSpec>, i32, i32)>,
     pub ready_crtc_configs: Vec<CrtcConfigToken>,
     pub crtc_config_results:
@@ -814,6 +818,7 @@ impl RecordingBackend {
             provider_output_source_error: None,
             pending_crtc_config: None,
             apply_crtc_configs: false,
+            program_user_mode_timings: false,
             applied_crtc_config: None,
             ready_crtc_configs: Vec::new(),
             crtc_config_results: std::collections::HashMap::new(),
@@ -1628,6 +1633,10 @@ impl Backend for RecordingBackend {
         256
     }
 
+    fn programs_user_mode_timings(&self) -> bool {
+        self.program_user_mode_timings
+    }
+
     fn apply_crtc_config(
         &mut self,
         output_id: u32,
@@ -1659,12 +1668,34 @@ impl Backend for RecordingBackend {
         };
         let prev = &state.randr;
         let mut outputs = prev.outputs.clone();
+        let mut mode_table = prev.mode_table.clone();
         if let Some(output) = outputs.iter_mut().find(|o| o.output_id == output_id) {
-            let resolved = mode.and_then(|m| {
-                prev.mode_table.iter().find(|t| {
-                    output.mode_ids.contains(&t.mode_id)
-                        && (t.width, t.height, t.vrefresh) == (m.width, m.height, m.vrefresh)
-                })
+            let resolved = mode.and_then(|m| match m.user_timing {
+                Some(user) => {
+                    let existing = mode_table.iter().find(|t| {
+                        (t.width, t.height, t.timing)
+                            == (user.width, user.height, Some(user.timing))
+                    });
+                    Some(existing.copied().unwrap_or_else(|| {
+                        let programmed = crate::randr::RandrMode {
+                            mode_id: mode_table.iter().map(|t| t.mode_id).max().unwrap_or(0) + 1,
+                            width: user.width,
+                            height: user.height,
+                            vrefresh: m.vrefresh,
+                            timing: Some(user.timing),
+                        };
+                        mode_table.push(programmed);
+                        programmed
+                    }))
+                }
+                None => prev
+                    .mode_table
+                    .iter()
+                    .find(|t| {
+                        output.mode_ids.contains(&t.mode_id)
+                            && (t.width, t.height, t.vrefresh) == (m.width, m.height, m.vrefresh)
+                    })
+                    .copied(),
             });
             // An off KMS output reports mode 0 at 0,0 with no size.
             let (mode_id, width, height, vrefresh) =
@@ -1674,6 +1705,7 @@ impl Backend for RecordingBackend {
             output.width = width;
             output.height = height;
             output.vrefresh = vrefresh;
+            output.timing = resolved.and_then(|m| m.timing);
             output.x = i16::try_from(x).unwrap_or(i16::MAX);
             output.y = i16::try_from(y).unwrap_or(i16::MAX);
         }
@@ -1684,7 +1716,6 @@ impl Backend for RecordingBackend {
             prev.height_mm,
         );
         let transforms = prev.crtc_transforms();
-        let mode_table = prev.mode_table.clone();
         state.randr =
             crate::randr::RandrState::from_outputs_with_modes(set_time, outputs, mode_table);
         state.randr.restore_crtc_transforms(transforms);

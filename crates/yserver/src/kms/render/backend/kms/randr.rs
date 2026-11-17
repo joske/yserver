@@ -288,6 +288,7 @@ impl KmsBackend {
                         vrefresh: layout.output.picked.vrefresh,
                         x: layout.x,
                         y: layout.y,
+                        timing: ModeIdentity::from(&layout.output.picked),
                     },
                 )
             })
@@ -864,6 +865,7 @@ impl KmsBackend {
                         vrefresh,
                         x: layout.x,
                         y: layout.y,
+                        timing: ModeIdentity::from(&layout.output.picked),
                     };
                     entry.crtc_associated = true;
                 }

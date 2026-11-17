@@ -22,7 +22,7 @@ pub(crate) use crate::{
     drm::modeset::{
         ConnectorProbe, ConnectorSnapshotProbe, Mode, ModeIdentity, Output,
         connector_is_non_desktop, discover_output_for_connector, discover_outputs,
-        probe_connector_snapshots, probe_connectors,
+        probe_connector_snapshots, probe_connectors, user_timing_drm_mode, user_timing_mode,
     },
     kms::vk::device::DrmDeviceKey,
 };

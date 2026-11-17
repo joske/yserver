@@ -101,7 +101,7 @@ pub struct RandrOutput {
 /// Clock*1000; refresh = dotClock / (htotal*vtotal)). `None` on a mode
 /// means "no real timing available" (nested/virtio backends) and the
 /// reply falls back to the historical synthesis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ModeTiming {
     /// Pixel clock in kHz (kernel `drmModeModeInfo.clock`). ModeInfo
     /// `dot_clock` is this × 1000.

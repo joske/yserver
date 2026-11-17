@@ -389,6 +389,10 @@ impl<P: Platform> Backend for XBackend<P> {
         P::cancel_crtc_config(self, token)
     }
 
+    fn programs_user_mode_timings(&self) -> bool {
+        P::programs_user_mode_timings(self)
+    }
+
     fn apply_crtc_config(
         &mut self,
         output_id: u32,

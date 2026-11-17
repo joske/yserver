@@ -1991,6 +1991,7 @@ fn randr_set_crtc_config_validates_mode_id() {
                     width: 1920,
                     height: 1080,
                     vrefresh: 60,
+                    user_timing: None,
                 }),
                 x: 0,
                 y: 0,

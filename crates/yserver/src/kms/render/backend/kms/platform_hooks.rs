@@ -709,6 +709,11 @@ impl Platform for PlatformBackend {
         KmsBackend::backend_randr_cancel_crtc_config(b, token)
     }
 
+    /// A rootless server has no CRTC of its own to program.
+    fn programs_user_mode_timings(b: &KmsBackend) -> bool {
+        !b.rootless_active()
+    }
+
     fn apply_crtc_config(
         b: &mut KmsBackend,
         output_id: u32,

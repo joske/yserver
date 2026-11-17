@@ -16,6 +16,7 @@ use super::{
 };
 use crate::{
     access::{AccessMode, Creation, Decision, ResourceKind, ResourceTarget},
+    backend::{ModeSpec, UserTiming},
     randr::{ModeTiming, RandrMode, RandrOutput, RandrState},
     resources::SERVER_OWNER,
     server::RANDR_USER_MODE_XID_FIRST,
@@ -598,6 +599,7 @@ fn a_probed_mode_of_another_output_joins_the_user_list() {
 }
 
 #[test]
+// A backend that cannot program a timing (nested, surface hosts for now).
 fn set_crtc_config_to_a_user_mode_fails_without_reaching_the_backend() {
     let mut f = Fixture::new();
     let foo = f.create_mode(cvt_1080(), b"foo");
@@ -1070,4 +1072,180 @@ fn the_first_matching_user_mode_in_add_order_wins() {
     // backend mode; never the replaced M1080_KERNEL.
     let (ids, ..) = f.screen_modes();
     assert_eq!(ids, vec![b, a, M1024X768, M1920X1200]);
+}
+
+// ── SetCrtcConfig programs a user mode (plan commit 3) ──────────────────
+
+impl Fixture {
+    /// A backend that programs user timings and reports them back.
+    fn programming() -> Self {
+        let mut f = Self::new();
+        f.backend.program_user_mode_timings = true;
+        f.backend.apply_crtc_configs = true;
+        f
+    }
+
+    /// The mode of the one `ApplyCrtcConfig` the backend saw.
+    fn applied_mode(&self) -> Option<ModeSpec> {
+        let applied: Vec<Option<ModeSpec>> = self
+            .backend
+            .calls()
+            .iter()
+            .filter_map(|call| match call {
+                RecordedCall::ApplyCrtcConfig { mode, .. } => Some(*mode),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applied.len(), 1, "{applied:?}");
+        applied[0]
+    }
+}
+
+#[test]
+fn set_crtc_config_to_a_user_mode_programs_its_converted_timing() {
+    let mut f = Fixture::programming();
+    let mut info = cvt_1080();
+    // Below one kHz, a skew, `RR_CSync` and a bit outside FLAG_BITS.
+    info.dot_clock = 173_000_999;
+    info.hskew = 7;
+    info.mode_flags = 0x6 | RR_CSYNC | 0x4000;
+    let foo = f.create_mode(info, b"foo");
+    assert!(f.add_output_mode(VGA, foo).is_empty());
+    f.select_all();
+
+    let bytes = f.set_crtc_config(VGA_CRTC, foo, &[VGA]);
+    let reply = bytes
+        .chunks_exact(32)
+        .find(|chunk| chunk[0] == 1)
+        .expect("SetCrtcConfig reply");
+    assert_eq!(reply[1], 0, "SetCrtcConfig succeeds");
+
+    // xf86RandRModeConvert: Clock = dotClock / 1000, Flags & FLAG_BITS;
+    // the kernel's refresh for 173000 kHz over 2576x1120 rounds to 60.
+    let expected = UserTiming {
+        width: 1920,
+        height: 1080,
+        timing: ModeTiming {
+            clock_khz: 173_000,
+            hsync_start: 2048,
+            hsync_end: 2248,
+            htotal: 2576,
+            hskew: 7,
+            vsync_start: 1083,
+            vsync_end: 1088,
+            vtotal: 1120,
+            mode_flags: 0x6 | RR_CSYNC,
+        },
+    };
+    assert_eq!(
+        f.applied_mode(),
+        Some(ModeSpec {
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+            user_timing: Some(expected),
+        })
+    );
+
+    // The backend reports the programmed timing under its own id; clients
+    // see the user mode everywhere.
+    let notifies: Vec<&[u8]> = bytes
+        .chunks_exact(32)
+        .filter(|e| e[0] == RR_NOTIFY)
+        .collect();
+    let crtc = notifies
+        .iter()
+        .find(|e| e[1] == 0)
+        .expect("CrtcChangeNotify");
+    assert_eq!(f.read_u32(crtc, 16), foo, "CrtcChangeNotify mode");
+    let out = notifies
+        .iter()
+        .find(|e| e[1] == 1)
+        .expect("OutputChangeNotify");
+    assert_eq!(f.read_u32(out, 24), foo, "OutputChangeNotify mode");
+    assert_eq!(f.crtc_mode(VGA_CRTC), foo);
+    assert_ne!(f.state.randr.outputs[0].mode_id, foo, "a backend id");
+
+    // Current: DestroyMode BadAccess, DeleteOutputMode BadMatch
+    // (rrmode.c:332-347, rroutput.c:238-262).
+    let bytes = f.destroy_mode(foo);
+    assert_eq!(
+        f.error(&bytes),
+        (x11::error::BAD_ACCESS, foo, rr::RR_DESTROY_MODE)
+    );
+    let bytes = f.delete_output_mode(VGA, foo);
+    assert_eq!(
+        f.error(&bytes),
+        (x11::error::BAD_MATCH, foo, rr::RR_DELETE_OUTPUT_MODE)
+    );
+    assert_eq!(f.crtc_mode(VGA_CRTC), foo);
+}
+
+#[test]
+fn another_outputs_probed_mode_is_programmed_by_its_timing() {
+    let mut f = Fixture::programming();
+    // HDMI-1 does not list 1920x1200; AddOutputMode puts it on its user
+    // list, and the backend gets the timing the replies advertise.
+    assert!(f.add_output_mode(HDMI, M1920X1200).is_empty());
+    let (_, _, infos) = f.screen_modes();
+    let advertised = *infos.iter().find(|m| m.id == M1920X1200).unwrap();
+
+    let bytes = f.set_crtc_config(HDMI_CRTC, M1920X1200, &[HDMI]);
+    assert!(
+        bytes
+            .chunks_exact(32)
+            .any(|chunk| chunk[0] == 1 && chunk[1] == 0),
+        "SetCrtcConfig succeeds: {bytes:02x?}"
+    );
+    let user = f
+        .applied_mode()
+        .and_then(|mode| mode.user_timing)
+        .expect("programmed by timing");
+    assert_eq!((user.width, user.height), (1920, 1200));
+    assert_eq!(user.timing.clock_khz, advertised.dot_clock / 1000);
+    assert_eq!(
+        (user.timing.htotal, user.timing.vtotal),
+        (advertised.htotal, advertised.vtotal)
+    );
+}
+
+#[test]
+fn a_probed_mode_is_found_in_the_connector_list() {
+    let mut f = Fixture::programming();
+    let bytes = f.set_crtc_config(VGA_CRTC, M1024X768, &[VGA]);
+    assert!(
+        bytes
+            .chunks_exact(32)
+            .any(|chunk| chunk[0] == 1 && chunk[1] == 0),
+        "SetCrtcConfig succeeds: {bytes:02x?}"
+    );
+    assert_eq!(
+        f.applied_mode(),
+        Some(ModeSpec {
+            width: 1024,
+            height: 768,
+            vrefresh: 60,
+            user_timing: None,
+        })
+    );
+}
+
+#[test]
+fn user_timing_refresh_is_the_kernels() {
+    // drm_mode_vrefresh: clock * 1000 / (htotal * vtotal), rounded, x2 for
+    // interlace, /2 for doublescan. CEA 1080i60: 74250 kHz, 2200x1125.
+    let mut user = UserTiming::from_mode_info(&cvt_1080());
+    assert_eq!(user.vrefresh(), 60);
+    user.timing = ModeTiming {
+        clock_khz: 74_250,
+        htotal: 2200,
+        vtotal: 1125,
+        mode_flags: 0x5 | 0x10,
+        ..user.timing
+    };
+    assert_eq!(user.vrefresh(), 60);
+    user.timing.mode_flags = 0x5 | 0x20;
+    assert_eq!(user.vrefresh(), 15);
+    user.timing.htotal = 0;
+    assert_eq!(user.vrefresh(), 0);
 }

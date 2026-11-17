@@ -25,21 +25,21 @@ pub(super) fn test_render_device(
 }
 
 #[derive(Default)]
-struct TestCrtcConfigProbeState {
-    enqueued: Vec<CrtcConfigToken>,
-    enqueued_requests: Vec<RouteProbeRequest>,
+pub(super) struct TestCrtcConfigProbeState {
+    pub(super) enqueued: Vec<CrtcConfigToken>,
+    pub(super) enqueued_requests: Vec<RouteProbeRequest>,
     cancelled: Vec<CrtcConfigToken>,
-    completions: VecDeque<CrtcConfigProbeCompletion>,
+    pub(super) completions: VecDeque<CrtcConfigProbeCompletion>,
 }
 
-struct TestCrtcConfigProbeExecutor {
+pub(super) struct TestCrtcConfigProbeExecutor {
     state: Rc<RefCell<TestCrtcConfigProbeState>>,
     sender: Option<CoreSender>,
     auto_complete: Option<QualifiedScanoutPlan>,
 }
 
 impl TestCrtcConfigProbeExecutor {
-    fn new(
+    pub(super) fn new(
         state: Rc<RefCell<TestCrtcConfigProbeState>>,
         auto_complete: Option<QualifiedScanoutPlan>,
     ) -> Self {
@@ -129,7 +129,7 @@ pub(super) fn clone_test_drm_output(
     }
 }
 
-fn async_crtc_config_test_backend() -> (KmsBackend, u32, ModeSpec) {
+pub(super) fn async_crtc_config_test_backend() -> (KmsBackend, u32, ModeSpec) {
     let mut backend = KmsBackend::for_tests();
     let display_key = backend.platform.devices[0].key;
     let render_id = RenderDeviceId::DrmRender(test_device_key(128));
@@ -155,6 +155,7 @@ fn async_crtc_config_test_backend() -> (KmsBackend, u32, ModeSpec) {
         width: 1024,
         height: 768,
         vrefresh: 60,
+        user_timing: None,
     };
     backend
         .pstate
@@ -1932,6 +1933,7 @@ fn split_enable_gate_runs_before_idempotent_active_reassert() {
         width: layout.width,
         height: layout.height,
         vrefresh: layout.output.picked.vrefresh,
+        user_timing: None,
     };
     let (x, y) = (layout.x, layout.y);
     let output_id = backend
@@ -1968,6 +1970,7 @@ fn automatically_bound_live_split_route_passes_gate_before_idempotent_reassert()
         width: layout.width,
         height: layout.height,
         vrefresh: layout.output.picked.vrefresh,
+        user_timing: None,
     };
     let (x, y) = (layout.x, layout.y);
     let output_id = backend
@@ -2416,7 +2419,7 @@ fn connector_only_probe_reconciles_state_and_drops_disconnected_modes() {
 // ── Hotplug: a disconnect keeps the route (#273, superseding the
 // 2026-09-17 P1b relight design) ──────────────────────────────────────
 
-fn relight_test_snapshot(
+pub(super) fn relight_test_snapshot(
     key: &OutputKey,
     modes: Vec<crate::platform::drm::Mode>,
 ) -> ConnectorSnapshot {
@@ -2445,6 +2448,9 @@ fn a_physical_disconnect_keeps_the_route_and_the_reconnect_needs_no_commit() {
         vrefresh: 60,
         x: 0,
         y: 0,
+        timing: crate::platform::drm::ModeIdentity::from(
+            &backend.platform.outputs[0].output.picked,
+        ),
     };
     let snapshot = relight_test_snapshot(&key, vec![test_advertised_mode(1920, 1080, 60, true)]);
 
@@ -3237,7 +3243,7 @@ fn not_live_output_reports_connected_off_vs_disconnected() {
 //   No RRCrtcChangeNotify.
 
 /// Every physical-topology probe answers with the scripted snapshot.
-struct ScriptedConnectorProbe(std::cell::RefCell<Vec<ConnectorSnapshot>>);
+pub(super) struct ScriptedConnectorProbe(pub(super) std::cell::RefCell<Vec<ConnectorSnapshot>>);
 
 impl crate::kms::render::backend::kms::session::VtResumeExecutor for ScriptedConnectorProbe {
     fn acquire_master(

@@ -685,6 +685,7 @@ pub(super) fn set_screen_config(
         width: mode.width,
         height: mode.height,
         vrefresh: mode.vrefresh,
+        user_timing: None,
     };
     let connector = target.name.clone();
     start_crtc_config(

@@ -1120,6 +1120,9 @@ pub(crate) enum ConnectorConfig {
         vrefresh: u32,
         x: i32,
         y: i32,
+        /// The full timing: a user mode can share size and refresh with
+        /// the mode it replaces.
+        timing: crate::platform::drm::ModeIdentity,
     },
 }
 
