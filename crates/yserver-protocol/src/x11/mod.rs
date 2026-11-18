@@ -2225,6 +2225,7 @@ pub fn encode_xi2_motion_with_scroll(
     time: u32,
     root: ResourceId,
     event: ResourceId,
+    child: ResourceId,
     root_x: i16,
     root_y: i16,
     event_x: i16,
@@ -2252,7 +2253,7 @@ pub fn encode_xi2_motion_with_scroll(
     write_u32(byte_order, out, 0); // detail = 0 for motion
     write_u32(byte_order, out, root.0);
     write_u32(byte_order, out, event.0);
-    write_u32(byte_order, out, 0); // child
+    write_u32(byte_order, out, child.0);
 
     write_u32(byte_order, out, (i32::from(root_x) << 16) as u32);
     write_u32(byte_order, out, (i32::from(root_y) << 16) as u32);

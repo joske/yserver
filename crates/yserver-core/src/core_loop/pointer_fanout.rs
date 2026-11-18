@@ -2145,8 +2145,48 @@ fn pointer_event_fanout_to_state_inner(
             xi_source.slave_deviceid,
         );
         let mut motion_targets = natural_targets.clone();
+        let active_xi2_motion_grab = active_source_grab.filter(|grab| grab.via_xi2);
         let active_motion_grab = active_source_grab
             .filter(|grab| grab.via_xi2 && grab.xi2_mask & (1_u64 << XI_MOTION_EVENT) != 0);
+        let owner_events_master_motion_route = if !xi2_grab_delivery
+            && let Some(grab) = grab_for_form(state, xi_source, Xi2PointerForm::Master)
+            && grab.via_xi2
+            && grab.owner_events
+            // active_source_grab prefers an exact slave grab. Apply this
+            // route only when that source-level grab is the same master grab.
+            // The grab mask gates fallback delivery below, not the natural
+            // owner-events attempt which rejects foreign selectors.
+            && active_xi2_motion_grab.is_some_and(|active| {
+                active.owner == grab.owner
+                    && active.grab_window == grab.grab_window
+                    && active.event_mask == grab.event_mask
+                    && active.owner_events == grab.owner_events
+                    && active.via_xi2 == grab.via_xi2
+                    && active.implicit == grab.implicit
+                    && active.passive == grab.passive
+                    && active.xi2_mask == grab.xi2_mask
+            })
+            && let Some((_, grab_client, _, _, true, true, _)) =
+                active_pointer_grab_target(state, grab)
+        {
+            Some((
+                grab,
+                owner_events_route(
+                    state,
+                    Xi2PointerForm::Master,
+                    xi_source.slave_deviceid,
+                    grab_client,
+                    target,
+                    target_x,
+                    target_y,
+                    0,
+                    Some(XI_MOTION_EVENT),
+                    None,
+                ),
+            ))
+        } else {
+            None
+        };
         let mut motion_grab_window_target = None;
         let mut exclusive_master_motion_owner = None;
         let mut exclusive_slave_motion_owner = None;
@@ -2168,10 +2208,12 @@ fn pointer_event_fanout_to_state_inner(
                 motion_grab_window_target = active_pointer_grab_target(state, grab).map(
                     |(window, owner, gx, gy, _, _, _)| {
                         (
+                            Xi2PointerForm::Slave,
                             owner,
                             window,
                             clamp_grab_coord(event.root_x, gx),
                             clamp_grab_coord(event.root_y, gy),
+                            false,
                         )
                     },
                 );
@@ -2191,10 +2233,39 @@ fn pointer_event_fanout_to_state_inner(
                 motion_grab_window_target = active_pointer_grab_target(state, grab).map(
                     |(window, owner, gx, gy, _, _, _)| {
                         (
+                            Xi2PointerForm::Master,
                             owner,
                             window,
                             clamp_grab_coord(event.root_x, gx),
                             clamp_grab_coord(event.root_y, gy),
+                            false,
+                        )
+                    },
+                );
+            }
+        } else if let Some((grab, route)) = owner_events_master_motion_route {
+            // The smooth-scroll Motion is a separate event from its wheel
+            // ButtonPress. Resolve its own owner-events attempt. This event
+            // has no core form, so core selections must not prevent the
+            // XI2 fallback (`../xserver/dix/eventconvert.c:113-122`).
+            if (!matches!(route, OwnerEventsRoute::Fallback)
+                || grab.xi2_mask & (1_u64 << XI_MOTION_EVENT) != 0)
+                && !motion_targets.contains(&grab.owner)
+            {
+                motion_targets.push(grab.owner);
+            }
+            if matches!(route, OwnerEventsRoute::Fallback)
+                && grab.xi2_mask & (1_u64 << XI_MOTION_EVENT) != 0
+            {
+                motion_grab_window_target = active_pointer_grab_target(state, grab).map(
+                    |(window, owner, gx, gy, _, _, _)| {
+                        (
+                            Xi2PointerForm::Master,
+                            owner,
+                            window,
+                            clamp_grab_coord(event.root_x, gx),
+                            clamp_grab_coord(event.root_y, gy),
+                            true,
                         )
                     },
                 );
@@ -2214,11 +2285,28 @@ fn pointer_event_fanout_to_state_inner(
             motion_targets.push(grab.owner);
             motion_grab_window_target = active_grab_target_for_source(state, xi_source).and_then(
                 |(window, owner, gx, gy, _, via_xi2, _)| {
-                    (via_xi2 && owner == grab.owner).then_some((
+                    if !via_xi2 || owner != grab.owner {
+                        return None;
+                    }
+                    let form = if xi_source.slave_deviceid.is_some_and(|device_id| {
+                        state
+                            .xi2_pointer_grabs
+                            .get(&device_id)
+                            .is_some_and(|source_grab| {
+                                source_grab.owner == grab.owner && source_grab.via_xi2
+                            })
+                    }) {
+                        Xi2PointerForm::Slave
+                    } else {
+                        Xi2PointerForm::Master
+                    };
+                    Some((
+                        form,
                         owner,
                         window,
                         clamp_grab_coord(event.root_x, gx),
                         clamp_grab_coord(event.root_y, gy),
+                        true,
                     ))
                 },
             );
@@ -2226,7 +2314,7 @@ fn pointer_event_fanout_to_state_inner(
 
         for cid in motion_targets {
             let fallback_grab_target =
-                motion_grab_window_target.filter(|(owner, ..)| *owner == cid);
+                motion_grab_window_target.filter(|(_, owner, ..)| *owner == cid);
             let grab_scoped = (xi2_grab_delivery
                 && active_motion_grab.is_some_and(|g| g.owner == cid))
                 || fallback_grab_target.is_some();
@@ -2252,7 +2340,11 @@ fn pointer_event_fanout_to_state_inner(
                 wants_master = false;
                 wants_slave = true;
             }
-            let send_master = if let Some(owner) = exclusive_master_motion_owner {
+            let send_master = if let Some((grab, route)) = owner_events_master_motion_route {
+                cid == grab.owner
+                    && (!matches!(route, OwnerEventsRoute::Fallback)
+                        || grab.xi2_mask & (1_u64 << XI_MOTION_EVENT) != 0)
+            } else if let Some(owner) = exclusive_master_motion_owner {
                 cid == owner
             } else if exclusive_slave_motion_owner.is_some() {
                 false
@@ -2273,13 +2365,28 @@ fn pointer_event_fanout_to_state_inner(
             }
 
             for (device_id, is_slave) in forms {
+                let form_fallback_target = fallback_grab_target.filter(|(form, ..)| {
+                    *form
+                        == if is_slave {
+                            Xi2PointerForm::Slave
+                        } else {
+                            Xi2PointerForm::Master
+                        }
+                });
                 let fixed_geometry =
-                    fallback_grab_target.map(|(_, window, x, y)| (window, ResourceId(0), x, y));
+                    form_fallback_target.map(|(_, _, window, x, y, fixup_child)| {
+                        let child = if fixup_child {
+                            xi2_child_toward(state, window, target)
+                        } else {
+                            ResourceId(0)
+                        };
+                        (window, child, x, y)
+                    });
                 let fixed_geometry = fixed_geometry.or_else(|| {
                     (xi2_grab_delivery && active_motion_grab.is_some_and(|g| g.owner == cid))
                         .then_some((nested_id, ResourceId(0), event_x, event_y))
                 });
-                let (event_window, _child, x, y) = fixed_geometry.unwrap_or_else(|| {
+                let (event_window, child, x, y) = fixed_geometry.unwrap_or_else(|| {
                     let window = xi2_route_window_for_source(
                         state,
                         target,
@@ -2324,6 +2431,7 @@ fn pointer_event_fanout_to_state_inner(
                             event.time,
                             ROOT_WINDOW,
                             event_window,
+                            child,
                             event.root_x,
                             event.root_y,
                             x,
@@ -2866,6 +2974,7 @@ pub fn emit_scroll_stop_to_state(
                         time,
                         ROOT_WINDOW,
                         target,
+                        ResourceId(0),
                         root_x,
                         root_y,
                         event_x,

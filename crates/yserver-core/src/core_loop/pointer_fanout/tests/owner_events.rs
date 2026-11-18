@@ -1328,6 +1328,271 @@ fn owner_events_ungrab_restores_natural_xi2_delivery() {
 }
 
 #[test]
+fn owner_events_scroll_motion_routed_independently_of_wheel_press() {
+    // Smooth-scroll Motion is a separate event from the wheel press. Xorg
+    // routes it through its own owner-events attempt and falls back when the
+    // only natural selector belongs to another client
+    // (../xserver/dix/getevents.c:1646-1692;
+    // ../xserver/dix/events.c:2071-2075,4431-4462). C2 measures child D
+    // on this same W fallback, and Xorg applies FixUpEventFromWindow to the
+    // scroll Motion as well (../xserver/dix/events.c:4388-4389).
+    const SOURCE: u64 = 0xA7533;
+    let mut f = fixture();
+    let pointer = pointer_source(&mut f.state, SOURCE, true);
+    select_xi2(&mut f, GRABBER, CHILD, XI_MASTER, 1 << 4);
+    select_xi2(&mut f, OTHER, CHILD, XI_MASTER, XI_MOTION);
+    grab_xi2_with_options(&mut f, WINDOW, true, XI_MOTION | (1 << 4));
+
+    let dropped = pointer_event_fanout_to_state(
+        &mut f.state,
+        &mut f.backend,
+        &f.xid_map,
+        HostPointerEvent {
+            origin: crate::core_loop::InputOrigin::Physical(crate::xinput::InputSourceId(SOURCE)),
+            kind: PointerEventKind::ButtonPress,
+            host_xid: HOST_WINDOW,
+            detail: 5,
+            time: 55,
+            root_x: 150,
+            root_y: 150,
+            event_x: 50,
+            event_y: 50,
+            ..motion_event()
+        },
+        true,
+        false,
+    );
+    assert!(dropped.is_empty());
+
+    let grabber_bytes = read_all_capture_available(&mut f.grabber);
+    assert_eq!(
+        decode_deliveries(&grabber_bytes),
+        vec![
+            Delivery {
+                xi2: true,
+                kind: 6,
+                window: WINDOW,
+                child: CHILD,
+            },
+            Delivery {
+                xi2: true,
+                kind: 4,
+                window: CHILD,
+                child: 0,
+            },
+        ],
+        "the Motion falls back to W while the wheel press is delivered naturally on D"
+    );
+    assert_eq!(
+        xi2_event_ids(&grabber_bytes),
+        vec![(6, XI_MASTER, pointer), (4, XI_MASTER, pointer)]
+    );
+    assert!(
+        read_all_capture_available(&mut f.other).is_empty(),
+        "B's Motion selection on D is rejected by the owner-events grab"
+    );
+}
+
+#[test]
+fn owner_events_scroll_motion_has_no_core_attempt() {
+    // A wheel-only Motion has no X/Y and Xorg rejects its core conversion
+    // (../xserver/dix/eventconvert.c:113-122). Its owner-events walk must
+    // still fall back to the grab window when B owns the XI2 Motion attempt.
+    // C2 measures child D for that W fallback; the same Xorg fixup applies
+    // to smooth-scroll Motion (../xserver/dix/events.c:4388-4389).
+    const SOURCE: u64 = 0xA7534;
+    let mut f = fixture();
+    let pointer = pointer_source(&mut f.state, SOURCE, true);
+    select_xi2(&mut f, GRABBER, CHILD, XI_MASTER, 1 << 4);
+    select_core(&mut f, GRABBER, CHILD, CORE_MOTION);
+    select_xi2(&mut f, OTHER, CHILD, XI_MASTER, XI_MOTION);
+    grab_xi2_with_options(&mut f, WINDOW, true, XI_MOTION | (1 << 4));
+
+    let dropped = pointer_event_fanout_to_state(
+        &mut f.state,
+        &mut f.backend,
+        &f.xid_map,
+        HostPointerEvent {
+            origin: crate::core_loop::InputOrigin::Physical(crate::xinput::InputSourceId(SOURCE)),
+            kind: PointerEventKind::ButtonPress,
+            host_xid: HOST_WINDOW,
+            detail: 5,
+            time: 55,
+            root_x: 150,
+            root_y: 150,
+            event_x: 50,
+            event_y: 50,
+            ..motion_event()
+        },
+        true,
+        false,
+    );
+    assert!(dropped.is_empty());
+
+    let grabber_bytes = read_all_capture_available(&mut f.grabber);
+    assert_eq!(
+        decode_deliveries(&grabber_bytes),
+        vec![
+            Delivery {
+                xi2: true,
+                kind: 6,
+                window: WINDOW,
+                child: CHILD,
+            },
+            Delivery {
+                xi2: true,
+                kind: 4,
+                window: CHILD,
+                child: 0,
+            },
+        ],
+        "the scroll Motion is XI2-only and falls back to W despite A's core selection on D"
+    );
+    assert_eq!(
+        xi2_event_ids(&grabber_bytes),
+        vec![(6, XI_MASTER, pointer), (4, XI_MASTER, pointer)]
+    );
+    assert!(
+        read_all_capture_available(&mut f.other).is_empty(),
+        "B's Motion selection on D is rejected by the owner-events grab"
+    );
+}
+
+#[test]
+fn owner_events_scroll_master_fallback_keeps_slave_geometry() {
+    // C2 measures child D on the master fallback to W; C5 establishes that
+    // an ungrabbed slave form keeps its own natural delivery independently
+    // of the master grab. The scroll Motion uses the same Xorg grabbed-event
+    // fixup (../xserver/dix/events.c:4388-4389), and Xorg computes event
+    // coordinates relative to each reported window (../xserver/dix/events.c:2634-2637).
+    const SOURCE: u64 = 0xA7535;
+    let mut f = fixture();
+    let pointer = pointer_source(&mut f.state, SOURCE, true);
+    select_xi2(&mut f, GRABBER, CHILD, pointer, XI_MOTION);
+    select_xi2(&mut f, GRABBER, CHILD, XI_MASTER, 1 << 4);
+    select_xi2(&mut f, OTHER, CHILD, XI_MASTER, XI_MOTION);
+    grab_xi2_with_options(&mut f, WINDOW, true, XI_MOTION | (1 << 4));
+
+    let dropped = pointer_event_fanout_to_state(
+        &mut f.state,
+        &mut f.backend,
+        &f.xid_map,
+        HostPointerEvent {
+            origin: crate::core_loop::InputOrigin::Physical(crate::xinput::InputSourceId(SOURCE)),
+            kind: PointerEventKind::ButtonPress,
+            host_xid: HOST_WINDOW,
+            detail: 5,
+            time: 55,
+            root_x: 150,
+            root_y: 150,
+            event_x: 50,
+            event_y: 50,
+            ..motion_event()
+        },
+        true,
+        false,
+    );
+    assert!(dropped.is_empty());
+
+    let grabber_bytes = read_all_capture_available(&mut f.grabber);
+    assert_eq!(
+        decode_deliveries(&grabber_bytes),
+        vec![
+            Delivery {
+                xi2: true,
+                kind: 6,
+                window: CHILD,
+                child: 0,
+            },
+            Delivery {
+                xi2: true,
+                kind: 6,
+                window: WINDOW,
+                child: CHILD,
+            },
+            Delivery {
+                xi2: true,
+                kind: 4,
+                window: CHILD,
+                child: 0,
+            },
+        ],
+        "only the master Motion uses W fallback geometry; A's slave Motion stays on D"
+    );
+    assert_eq!(
+        xi2_event_ids(&grabber_bytes),
+        vec![
+            (6, pointer, pointer),
+            (6, XI_MASTER, pointer),
+            (4, XI_MASTER, pointer),
+        ]
+    );
+    assert_eq!(
+        xi2_geometry(&grabber_bytes),
+        vec![
+            (CHILD, 0, 150, 150, 30, 30),
+            (WINDOW, CHILD, 150, 150, 50, 50),
+            (CHILD, 0, 150, 150, 30, 30),
+        ],
+        "the slave stays D-relative while the master fallback is W-relative"
+    );
+    assert!(
+        read_all_capture_available(&mut f.other).is_empty(),
+        "B's master Motion attempt is rejected by the owner-events grab"
+    );
+}
+
+#[test]
+fn owner_events_scroll_motion_mask_can_reject_fallback_without_leaking() {
+    // Xorg rejects foreign natural delivery before applying the grab's XI2
+    // mask to fallback (../xserver/dix/events.c:4357-4365,4395-4397,4431-4462).
+    const SOURCE: u64 = 0xA7536;
+    let mut f = fixture();
+    let pointer = pointer_source(&mut f.state, SOURCE, true);
+    select_xi2(&mut f, GRABBER, CHILD, XI_MASTER, 1 << 4);
+    select_xi2(&mut f, OTHER, CHILD, XI_MASTER, XI_MOTION);
+    grab_xi2_with_options(&mut f, WINDOW, true, 1 << 4);
+
+    let dropped = pointer_event_fanout_to_state(
+        &mut f.state,
+        &mut f.backend,
+        &f.xid_map,
+        HostPointerEvent {
+            origin: crate::core_loop::InputOrigin::Physical(crate::xinput::InputSourceId(SOURCE)),
+            kind: PointerEventKind::ButtonPress,
+            host_xid: HOST_WINDOW,
+            detail: 5,
+            time: 55,
+            root_x: 150,
+            root_y: 150,
+            event_x: 50,
+            event_y: 50,
+            ..motion_event()
+        },
+        true,
+        false,
+    );
+    assert!(dropped.is_empty());
+
+    let grabber_bytes = read_all_capture_available(&mut f.grabber);
+    assert_eq!(
+        decode_deliveries(&grabber_bytes),
+        vec![Delivery {
+            xi2: true,
+            kind: 4,
+            window: CHILD,
+            child: 0,
+        }],
+        "the button remains natural while the grab mask rejects fallback Motion"
+    );
+    assert_eq!(xi2_event_ids(&grabber_bytes), vec![(4, XI_MASTER, pointer)]);
+    assert!(
+        read_all_capture_available(&mut f.other).is_empty(),
+        "B's natural Motion is rejected even though the grab mask excludes Motion"
+    );
+}
+
+#[test]
 fn exclusive_master_grab_scroll_motion_reaches_only_grab_owner() {
     // Source-backed exclusive case: ../xserver/dix/events.c:4431-4462
     // filters a grabbed event through the grab mask, and
