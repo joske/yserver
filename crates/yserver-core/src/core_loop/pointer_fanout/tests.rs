@@ -1544,11 +1544,19 @@ fn xi_owner_events_fallback_preserves_other_recipients_root_geometry() {
     let _ = read_all_capture_available(&mut grabber);
     let _ = read_all_capture_available(&mut selector);
 
+    // C1 measures that a foreign master selector is suppressed during the
+    // owner's XIGrabDevice routing. C5 measures that an attached-slave
+    // selector still receives its independent slave form. Keep both forms
+    // selected here so this regression continues to cover root geometry on
+    // the surviving slave event.
     let mut select = Vec::new();
     select.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
-    select.extend_from_slice(&1u16.to_le_bytes());
+    select.extend_from_slice(&2u16.to_le_bytes());
     select.extend_from_slice(&[0; 2]);
     select.extend_from_slice(&2u16.to_le_bytes());
+    select.extend_from_slice(&1u16.to_le_bytes());
+    select.extend_from_slice(&XI_MOTION.to_le_bytes());
+    select.extend_from_slice(&pointer.to_le_bytes());
     select.extend_from_slice(&1u16.to_le_bytes());
     select.extend_from_slice(&XI_MOTION.to_le_bytes());
     request(&mut state, &mut backend, SELECTOR, 2, 46, &select);
@@ -1594,8 +1602,18 @@ fn xi_owner_events_fallback_preserves_other_recipients_root_geometry() {
     let grabber_bytes = read_all_capture_available(&mut grabber);
     assert_eq!(selector_bytes[0], 35, "selector receives XI_Motion");
     assert_eq!(
+        xi2_event_ids(&selector_bytes),
+        vec![(6, pointer, pointer)],
+        "only the selected slave form is delivered"
+    );
+    assert_eq!(
         u16::from_le_bytes([selector_bytes[8], selector_bytes[9]]),
         6
+    );
+    assert_eq!(
+        u16::from_le_bytes([selector_bytes[10], selector_bytes[11]]),
+        pointer,
+        "the surviving event is the selected slave form"
     );
     assert_eq!(
         u32::from_le_bytes(selector_bytes[24..28].try_into().unwrap()),
@@ -6049,5 +6067,6 @@ fn implicit_grab_multi_button_lifecycle() {
     );
 }
 
+mod owner_events;
 mod passive_grab_activation;
 mod server_events;
