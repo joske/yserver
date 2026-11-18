@@ -1755,3 +1755,412 @@ fn core_owner_events_release_follows_press_to_owned_window() {
     );
     assert!(read_deliveries(&mut f.other).is_empty());
 }
+
+#[test]
+fn xi_owner_events_fallback_preserves_other_recipients_root_geometry() {
+    use crate::{core_loop::InputOrigin, resources::ROOT_VISUAL};
+    use yserver_protocol::x11::{RequestHeader, SequenceNumber};
+
+    const GRABBER: u32 = 0xA745;
+    const SELECTOR: u32 = 0xA746;
+    const SOURCE: u64 = 0xA7451;
+    const HOST_XID: u32 = 0xCAFE_A745;
+    const CHILD: u32 = 0x0010_A745;
+    const XI_MOTION: u32 = 1 << 6;
+
+    fn request(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        sequence: u16,
+        minor: u8,
+        body: &[u8],
+    ) {
+        crate::core_loop::process_request::process_request(
+            state,
+            backend,
+            ClientId(client),
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: 137,
+                data: minor,
+                length_units: u32::try_from((body.len() + 4) / 4).unwrap(),
+            },
+            body,
+            None,
+        )
+        .expect("production XI2 request dispatch");
+    }
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    let mut grabber = install_capture_client(&mut state, GRABBER);
+    let mut selector = install_capture_client(&mut state, SELECTOR);
+    let pointer = pointer_source(&mut state, SOURCE, true);
+
+    state.resources.create_window(
+        ClientId(SELECTOR),
+        yserver_protocol::x11::CreateWindowRequest {
+            depth: 24,
+            window: ResourceId(CHILD),
+            parent: ROOT_WINDOW,
+            x: 20,
+            y: 30,
+            width: 100,
+            height: 100,
+            border_width: 0,
+            class: 1,
+            visual: ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    let _ = state.resources.map_window(ResourceId(CHILD));
+    let mut xid_map = HostXidMap::new();
+    xid_map.insert(HOST_XID, ResourceId(CHILD));
+
+    for client in [GRABBER, SELECTOR] {
+        request(&mut state, &mut backend, client, 1, 47, &[2, 0, 4, 0]);
+    }
+    let _ = read_all_capture_available(&mut grabber);
+    let _ = read_all_capture_available(&mut selector);
+
+    // C1 measures that a foreign master selector is suppressed during the
+    // owner's XIGrabDevice routing. C5 measures that an attached-slave
+    // selector still receives its independent slave form. Keep both forms
+    // selected here so this regression continues to cover root geometry on
+    // the surviving slave event.
+    let mut select = Vec::new();
+    select.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+    select.extend_from_slice(&2u16.to_le_bytes());
+    select.extend_from_slice(&[0; 2]);
+    select.extend_from_slice(&2u16.to_le_bytes());
+    select.extend_from_slice(&1u16.to_le_bytes());
+    select.extend_from_slice(&XI_MOTION.to_le_bytes());
+    select.extend_from_slice(&pointer.to_le_bytes());
+    select.extend_from_slice(&1u16.to_le_bytes());
+    select.extend_from_slice(&XI_MOTION.to_le_bytes());
+    request(&mut state, &mut backend, SELECTOR, 2, 46, &select);
+    let _ = read_all_capture_available(&mut selector);
+
+    let mut grab = Vec::new();
+    grab.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+    grab.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    grab.extend_from_slice(&0u32.to_le_bytes()); // no cursor
+    grab.extend_from_slice(&2u16.to_le_bytes()); // master pointer
+    grab.extend_from_slice(&[1, 1, 1, 0]); // async, async paired, owner_events=true
+    grab.extend_from_slice(&1u16.to_le_bytes());
+    grab.extend_from_slice(&XI_MOTION.to_le_bytes());
+    request(&mut state, &mut backend, GRABBER, 2, 51, &grab);
+    let _ = read_all_capture_available(&mut grabber);
+    assert!(
+        state
+            .active_pointer_grab
+            .is_some_and(|active| { active.owner == ClientId(GRABBER) && active.owner_events })
+    );
+
+    let dropped = pointer_event_fanout_to_state(
+        &mut state,
+        &mut backend,
+        &xid_map,
+        HostPointerEvent {
+            origin: InputOrigin::Physical(crate::xinput::InputSourceId(SOURCE)),
+            kind: PointerEventKind::MotionNotify,
+            host_xid: HOST_XID,
+            root_x: 45,
+            root_y: 65,
+            event_x: 25,
+            event_y: 35,
+            time: 50,
+            ..motion_event()
+        },
+        true,
+        false,
+    );
+    assert!(dropped.is_empty());
+
+    let selector_bytes = read_all_capture_available(&mut selector);
+    let grabber_bytes = read_all_capture_available(&mut grabber);
+    assert_eq!(selector_bytes[0], 35, "selector receives XI_Motion");
+    assert_eq!(
+        xi2_event_ids(&selector_bytes),
+        vec![(6, pointer, pointer)],
+        "only the selected slave form is delivered"
+    );
+    assert_eq!(
+        u16::from_le_bytes([selector_bytes[8], selector_bytes[9]]),
+        6
+    );
+    assert_eq!(
+        u16::from_le_bytes([selector_bytes[10], selector_bytes[11]]),
+        pointer,
+        "the surviving event is the selected slave form"
+    );
+    assert_eq!(
+        u32::from_le_bytes(selector_bytes[24..28].try_into().unwrap()),
+        ROOT_WINDOW.0,
+        "other recipients keep the root event window under owner-events fallback"
+    );
+    assert_eq!(
+        u32::from_le_bytes(selector_bytes[28..32].try_into().unwrap()),
+        CHILD,
+        "the selected root event retains its child path"
+    );
+    assert_eq!(
+        i16::from_le_bytes(selector_bytes[42..44].try_into().unwrap()),
+        45,
+        "root selection receives root-local event_x"
+    );
+    assert_eq!(
+        i16::from_le_bytes(selector_bytes[46..48].try_into().unwrap()),
+        65,
+        "root selection receives root-local event_y"
+    );
+    assert_eq!(
+        grabber_bytes[0], 35,
+        "fallback grab owner receives XI_Motion"
+    );
+    assert_eq!(
+        u32::from_le_bytes(grabber_bytes[24..28].try_into().unwrap()),
+        ROOT_WINDOW.0,
+        "grab owner gets its grab window"
+    );
+    assert_eq!(
+        u32::from_le_bytes(grabber_bytes[28..32].try_into().unwrap()),
+        CHILD,
+        "C2: Xorg fallback reports the child toward the pointer"
+    );
+    assert_eq!(
+        i16::from_le_bytes(grabber_bytes[42..44].try_into().unwrap()),
+        45
+    );
+    assert_eq!(
+        i16::from_le_bytes(grabber_bytes[46..48].try_into().unwrap()),
+        65
+    );
+    assert_eq!(state.pointer_root, (45, 65));
+    assert_eq!(
+        state.xi_devices.device(pointer).unwrap().attached_master,
+        Some(2)
+    );
+    assert!(state.sync_pending.is_empty());
+    assert_eq!(state.buttons_down, 0);
+    assert_eq!(state.xi_devices.device(pointer).unwrap().buttons_down, 0);
+    assert_eq!(state.active_pointer_grab.unwrap().owner, ClientId(GRABBER));
+}
+
+/// Regression (HW-confirmed 2026-07-10, Telegram/Qt on silence):
+/// a client selecting `XIAllDevices(0)` receives every pointer event
+/// in BOTH slave- and master-stamped forms, and the SLAVE form MUST be
+/// emitted first — matching Xorg's `mieqProcessDeviceEvent`
+/// ("process slave first, then master", mi/mieq.c). Qt compresses
+/// consecutive XI_Motion keeping only the last (qxcbconnection.cpp) and
+/// drops the slave-deviceid copy (qxcbconnection_xi2.cpp:689). With the
+/// old master-first order every master copy was trailed by its slave
+/// copy → compressed away → and the surviving slave copy dropped, so
+/// ZERO motion (and thus zero smooth-scroll, which rides XI_Motion)
+/// reached the widget: hover-scrollbars + wheel dead while clicks
+/// (not motion-compressed) worked. Slave-first leaves the master copy
+/// — the one Qt keeps — trailing, so it survives compression.
+/// Issue #94 follow-up: an XI2 client holding an active `XIGrabDevice`
+/// (`owner_events=true`) must receive the grabbed `ButtonRelease` even
+/// when the pointer is over a window it never `XISelectEvents`'d on —
+/// Xorg `DeliverGrabbedEvent` falls back to grab-window delivery using
+/// the grab mask. CEF grabs the pointer on mousedown and holds it to
+/// mouseup; the release fires over a window it holds only via the grab,
+/// so without the fallback the mouse-up reaches nobody and clicks never
+/// complete (Steam nav/menus/close all dead post-crash-fix).
+#[test]
+fn xi2_grabbed_button_release_reaches_grab_owner_via_grab_window() {
+    use crate::server::ActivePointerGrab;
+    use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+    const GC: u32 = 2; // grab owner (CEF-like)
+    let grab_win = ResourceId(0x0020_0001); // GC's window == grab window
+    let hit_win = ResourceId(0x0020_0002); // child GC owns but did NOT select on
+
+    let mut state = ServerState::new();
+    let mut backend = crate::backend::recording::RecordingBackend::default();
+    let mut gc_peer = install_client(&mut state, GC);
+
+    state.resources.create_window(
+        ClientId(GC),
+        CreateWindowRequest {
+            depth: 24,
+            window: grab_win,
+            parent: crate::resources::ROOT_WINDOW,
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+            border_width: 0,
+            class: 1,
+            visual: crate::resources::ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    state.resources.create_window(
+        ClientId(GC),
+        CreateWindowRequest {
+            depth: 24,
+            window: hit_win,
+            parent: grab_win,
+            x: 10,
+            y: 10,
+            width: 40,
+            height: 40,
+            border_width: 0,
+            class: 1,
+            visual: crate::resources::ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    let _ = state.resources.map_window(grab_win);
+    let _ = state.resources.map_window(hit_win);
+
+    // Active XI2 grab held by GC (matching CEF's XIGrabDevice device=2,
+    // async, owner_events=true). GC has NO XISelectEvents mask anywhere
+    // — it holds the pointer purely via the grab.
+    state.active_pointer_grab = Some(ActivePointerGrab {
+        owner: ClientId(GC),
+        grab_window: grab_win,
+        event_mask: 0xFFFF,
+        cursor: ResourceId(0),
+        time: 0,
+        owner_events: true,
+        via_xi2: true,
+        implicit: false,
+        passive: false,
+        xi2_mask: u64::MAX,
+    });
+
+    let mut xid_map = HostXidMap::new();
+    xid_map.insert(0xCAFE_u32, grab_win);
+
+    let mut rel = motion_event();
+    rel.kind = PointerEventKind::ButtonRelease;
+    rel.host_xid = 0xCAFE;
+    rel.detail = 1;
+    rel.root_x = 20;
+    rel.root_y = 20;
+    rel.event_x = 20;
+    rel.event_y = 20;
+
+    let mut press = rel;
+    press.kind = PointerEventKind::ButtonPress;
+    press.state = 0;
+    let _ = pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
+    let _ = read_all_available(&mut gc_peer);
+
+    let _ = pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, rel, true, false);
+
+    let bytes = read_all_available(&mut gc_peer);
+    let mut found = None;
+    let mut off = 0usize;
+    while off + 32 <= bytes.len() {
+        if bytes[off] == 35 && u16::from_le_bytes([bytes[off + 8], bytes[off + 9]]) == 5 {
+            found = Some(u32::from_le_bytes(
+                bytes[off + 24..off + 28].try_into().unwrap(),
+            ));
+            break;
+        }
+        let length = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize;
+        off += 32 + length * 4;
+    }
+    assert!(
+        found.is_some(),
+        "grab owner must receive the grabbed XI2 ButtonRelease (Xorg grab-window fallback); got none"
+    );
+    assert_eq!(
+        found.unwrap(),
+        grab_win.0,
+        "grabbed release must be reported on the grab window"
+    );
+}
+
+/// Core grabs use the same grab-window fallback as XI2 grabs: when
+/// owner-events delivery finds no selected natural target, the grab
+/// owner still receives the event on the grab window.
+#[test]
+fn core_grabbed_button_release_reaches_grab_owner_via_grab_window() {
+    use crate::server::ActivePointerGrab;
+    use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+
+    const OWNER: u32 = 2;
+    let grab_win = ResourceId(0x0020_0001);
+    let hit_win = ResourceId(0x0020_0002);
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::default();
+    let mut owner_peer = install_client(&mut state, OWNER);
+
+    for (window, parent, x, y, width, height) in [
+        (grab_win, ROOT_WINDOW, 0, 0, 100, 100),
+        (hit_win, grab_win, 10, 10, 40, 40),
+    ] {
+        state.resources.create_window(
+            ClientId(OWNER),
+            CreateWindowRequest {
+                depth: 24,
+                window,
+                parent,
+                x,
+                y,
+                width,
+                height,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+    }
+    let _ = state.resources.map_window(grab_win);
+    let _ = state.resources.map_window(hit_win);
+
+    // No core event mask is selected on either window. Delivery must
+    // therefore fall back to the grab's event mask and grab window.
+    state.active_pointer_grab = Some(ActivePointerGrab {
+        owner: ClientId(OWNER),
+        grab_window: grab_win,
+        event_mask: 0xFFFF,
+        cursor: ResourceId(0),
+        time: 0,
+        owner_events: true,
+        via_xi2: false,
+        implicit: false,
+        passive: false,
+        xi2_mask: 0,
+    });
+
+    let mut xid_map = HostXidMap::new();
+    xid_map.insert(0xCAFE, hit_win);
+
+    let mut release = motion_event();
+    release.kind = PointerEventKind::ButtonRelease;
+    release.host_xid = 0xCAFE;
+    release.detail = 1;
+    release.root_x = 20;
+    release.root_y = 20;
+    release.event_x = 10;
+    release.event_y = 10;
+
+    let mut press = release;
+    press.kind = PointerEventKind::ButtonPress;
+    press.state = 0;
+    let _ = pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
+    let _ = read_all_available(&mut owner_peer);
+
+    let _ = pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, release, true, false);
+
+    // Core ButtonRelease is event code 5 and its event window occupies
+    // bytes 12..16 of the fixed 32-byte event.
+    let bytes = read_all_available(&mut owner_peer);
+    let event_window = bytes.chunks_exact(32).find_map(|event| {
+        (event[0] & 0x7F == 5)
+            .then(|| u32::from_le_bytes(event[12..16].try_into().expect("event window bytes")))
+    });
+    assert_eq!(
+        event_window,
+        Some(grab_win.0),
+        "grabbed core release must be reported on the grab window",
+    );
+}
