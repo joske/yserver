@@ -5,27 +5,143 @@ use super::{
     ClientId, PointerXiSource, ROOT_WINDOW, ResourceId, ServerState, XI2_MAJOR_OPCODE,
     XI2_MASTER_POINTER_DEVICE_ID, Xi2PointerForm, clamp_grab_coord, fanout_event_to_clients, x11,
     xi1_window_selectors, xi2_child_toward, xi2_form_targets_for_source,
+    xi2_route_window_for_source,
 };
 
-/// Route one XI 1.x device input event through grab + freeze + selection
-/// semantics. The single entry point shared by the pointer/key fanouts
-/// and the AllowDeviceEvents thaw path:
-///
-/// 1. Frozen device → queue the event, deliver nothing.
-/// 2. Active device grab → deliver to the grab owner addressed to the
-///    grab window (owner_events keeps natural delivery when the natural
-///    target would already report to the owner); a synchronous grab
-///    re-freezes after each key/button event (`allow_freeze`).
-///    A passive-activated grab auto-releases on its matching release.
-/// 3. Otherwise a press may activate a matching passive grab
-///    (GrabDeviceKey / GrabDeviceButton): sets the active grab, updates
-///    last-device-grab time (XTS XGrabDeviceKey-3), delivers to the
-///    owner, and freezes when synchronous.
-/// 4. Otherwise: SelectExtensionEvent selection walk.
-///
-/// NOTE: deliberately NO implicit grab from a plain DeviceButtonPress
-/// selection — per the XInput 1.x spec (XTS XSelectExtensionEvent-5)
-/// automatic grabs are opt-in via the DeviceButtonPressGrab class.
+/// One recipient/form decision for smooth-scroll update and stop motions.
+pub(super) struct Xi2MotionTarget {
+    pub(super) client: ClientId,
+    pub(super) form: Xi2PointerForm,
+    pub(super) deviceid: u16,
+    pub(super) window: ResourceId,
+    pub(super) child: ResourceId,
+    pub(super) x: i16,
+    pub(super) y: i16,
+}
+
+/// Resolve smooth-scroll Motion recipients independently for each XI2 device
+/// form. A grab owns its form's decision; an ungrabbed form keeps normal
+/// selection propagation.
+pub(super) fn xi2_motion_targets_for_source(
+    state: &ServerState,
+    source: PointerXiSource,
+    target: ResourceId,
+    nested: ResourceId,
+    event_x: i16,
+    event_y: i16,
+    root_x: i16,
+    root_y: i16,
+    source_accepted: bool,
+) -> Vec<Xi2MotionTarget> {
+    const XI_MOTION: u16 = 6;
+    if !source_accepted {
+        return Vec::new();
+    }
+
+    let mut forms = Vec::with_capacity(2);
+    if let Some(deviceid) = source.slave_deviceid {
+        forms.push((Xi2PointerForm::Slave, deviceid));
+    }
+    if source.attached_master == Some(XI2_MASTER_POINTER_DEVICE_ID) {
+        forms.push((Xi2PointerForm::Master, XI2_MASTER_POINTER_DEVICE_ID));
+    }
+
+    let mut targets = Vec::new();
+    for (form, deviceid) in forms {
+        if let Some(grab) = grab_for_form(state, source, form) {
+            let natural = if grab.owner_events {
+                owner_events_route(
+                    state,
+                    form,
+                    source.slave_deviceid,
+                    grab.owner,
+                    target,
+                    event_x,
+                    event_y,
+                    0,
+                    Some(XI_MOTION),
+                    None,
+                )
+            } else {
+                OwnerEventsRoute::Fallback
+            };
+            if let OwnerEventsRoute::Natural {
+                protocol: OwnerProtocol::Xi2,
+                window,
+                x,
+                y,
+                child,
+            } = natural
+            {
+                targets.push(Xi2MotionTarget {
+                    client: grab.owner,
+                    form,
+                    deviceid,
+                    window,
+                    child,
+                    x,
+                    y,
+                });
+                continue;
+            }
+            if grab.via_xi2
+                && grab.xi2_mask & (1_u64 << XI_MOTION) != 0
+                && let Some((grab_window, _, gx, gy, ..)) =
+                    super::active_pointer_grab_target(state, grab)
+            {
+                let child = if grab.owner_events || grab.implicit || grab.passive {
+                    xi2_child_toward(state, grab_window, target)
+                } else {
+                    ResourceId(0)
+                };
+                targets.push(Xi2MotionTarget {
+                    client: grab.owner,
+                    form,
+                    deviceid,
+                    window: grab_window,
+                    child,
+                    x: clamp_grab_coord(root_x, gx),
+                    y: clamp_grab_coord(root_y, gy),
+                });
+            }
+            // A grab suppresses foreign natural recipients for this form,
+            // even when its mask does not include Motion.
+            continue;
+        }
+
+        let Some(window) =
+            xi2_route_window_for_source(state, target, form, XI_MOTION, source.slave_deviceid)
+        else {
+            continue;
+        };
+        let child = xi2_child_toward(state, window, target);
+        let (x, y) = if window == nested {
+            (event_x, event_y)
+        } else {
+            let (window_x, window_y) = state.resources.window_absolute_position(window);
+            (
+                clamp_grab_coord(root_x, window_x),
+                clamp_grab_coord(root_y, window_y),
+            )
+        };
+        for client in
+            xi2_form_targets_for_source(state, window, form, XI_MOTION, source.slave_deviceid)
+        {
+            targets.push(Xi2MotionTarget {
+                client,
+                form,
+                deviceid,
+                window,
+                child,
+                x,
+                y,
+            });
+        }
+    }
+    targets
+}
+
+/// Filtering action for XI1 selections under an XI2 slave grab.
 #[derive(Clone, Copy)]
 pub(super) enum Xi1SelectionFilter {
     Unrestricted,

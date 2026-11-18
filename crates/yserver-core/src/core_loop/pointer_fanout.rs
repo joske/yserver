@@ -20,7 +20,7 @@ mod tests;
 mod owner_events;
 use owner_events::{
     OwnerEventsRoute, OwnerProtocol, Xi1SelectionFilter, grab_for_form, owner_events_route,
-    xi1_selection_filter_for_slave_grab, xi2_direct_xtest_motion,
+    xi1_selection_filter_for_slave_grab, xi2_direct_xtest_motion, xi2_motion_targets_for_source,
 };
 
 use yserver_protocol::x11::{self, ClientId, ResourceId, SequenceNumber};
@@ -424,7 +424,17 @@ pub fn replay_frozen_pointer_event_to_state(
     let dropped = pointer_event_fanout_to_state_inner(
         state, backend, xid_map, event, false, false, true, false, &mut info,
     );
-    implicit_pointer_grab_lifecycle(state, &event, &info);
+    // C19: ReplayDevice of a synchronous slave XI2 passive grab replays the
+    // natural slave event stream. It must not synthesize a master implicit
+    // grab from that slave-only delivery; that would add a master release to
+    // the otherwise balanced slave press/release pair.
+    let slave_only_replay_press = event.kind == PointerEventKind::ButtonPress
+        && info.core_press.is_none()
+        && info.xi2_master_press.is_none()
+        && info.xi2_slave_press.is_some();
+    if !slave_only_replay_press {
+        implicit_pointer_grab_lifecycle(state, &event, &info);
+    }
     if !info.queued {
         release_passive_grab_on_button_release(state, event.kind, event.origin);
     }
@@ -460,17 +470,23 @@ struct ImplicitGrabFanoutInfo {
     queued: bool,
     master_button_transition: bool,
     core_press: Option<DeliveredPress>,
-    xi2_press: Option<DeliveredPress>,
+    xi2_master_press: Option<DeliveredPress>,
+    xi2_slave_press: Option<DeliveredPress>,
 }
 
 impl ImplicitGrabFanoutInfo {
     fn consider_xi2_press(
         &mut self,
         resources: &crate::resources::ResourceTable,
+        form: Xi2PointerForm,
         candidate: DeliveredPress,
     ) {
-        let Some(current) = self.xi2_press else {
-            self.xi2_press = Some(candidate);
+        let slot = match form {
+            Xi2PointerForm::Master => &mut self.xi2_master_press,
+            Xi2PointerForm::Slave => &mut self.xi2_slave_press,
+        };
+        let Some(current) = *slot else {
+            *slot = Some(candidate);
             return;
         };
         let replace = if candidate.window == current.window {
@@ -486,7 +502,7 @@ impl ImplicitGrabFanoutInfo {
             false
         };
         if replace {
-            self.xi2_press = Some(candidate);
+            *slot = Some(candidate);
         }
     }
 
@@ -494,7 +510,27 @@ impl ImplicitGrabFanoutInfo {
         &self,
         resources: &crate::resources::ResourceTable,
     ) -> Option<DeliveredPress> {
-        match (self.core_press, self.xi2_press) {
+        let xi2_press = match (self.xi2_slave_press, self.xi2_master_press) {
+            (Some(slave), Some(master)) => {
+                let replace = if master.window == slave.window {
+                    resources.window_owner(master.window) == Some(master.owner)
+                        && resources.window_owner(slave.window) != Some(slave.owner)
+                } else if resources.is_descendant_of(master.window, slave.window) {
+                    true
+                } else {
+                    debug_assert!(
+                        resources.is_descendant_of(slave.window, master.window),
+                        "natural XI2 implicit-grab forms must share the hit ancestor chain"
+                    );
+                    false
+                };
+                Some(if replace { master } else { slave })
+            }
+            (Some(slave), None) => Some(slave),
+            (None, Some(master)) => Some(master),
+            (None, None) => None,
+        };
+        match (self.core_press, xi2_press) {
             // Same window, both forms delivered: the CORE press wins. Xorg
             // `DeliverEventsToWindow` delivers core first and activates the
             // implicit grab from that call, so `ActivateImplicitGrab` types
@@ -1457,33 +1493,36 @@ fn pointer_event_fanout_to_state_inner(
             // whenever the grab window is not at the origin.  Marco then
             // mistakes ordinary Steam content clicks for frame actions and
             // starts a toplevel move.
-            let (gx, gy) = state.resources.window_absolute_position(grab.grab_window);
-            let event_x = clamp_grab_coord(event.root_x, gx);
-            let event_y = clamp_grab_coord(event.root_y, gy);
-            let focus = state.crossing_has_focus(grab.grab_window);
-            // As an active grab's (FixUpEventFromWindow).
-            let grab_child = xi2_child_toward(state, grab.grab_window, target);
-            let extras = fanout_core_pointer_event_ordered(
-                state,
-                &mut deferred_core_events,
-                &[grab_target],
-                grab.grab_window,
-                grab_child,
-                event,
-                event_x,
-                event_y,
-                focus,
-                xi_source,
-                target,
-                top_level_id_opt.unwrap_or(ROOT_WINDOW),
-                is_replay,
-            );
-            merge_dropped(&mut dropped, extras);
-            delivered = true;
-        }
-        if delivered && grab.pointer_mode == 0 {
-            state.xi1_frozen.entry(sync_device).or_default().stored =
-                Some(crate::server::QueuedInputEvent::HostPointer(event));
+            if grab.via_xi2 && dynamic_device {
+                // The XI2 fanout below emits this activating slave press in
+                // XI2 form on the grab window. The core passive-grab path
+                // must not substitute a core ButtonPress for that event.
+                delivered = true;
+            } else {
+                let (gx, gy) = state.resources.window_absolute_position(grab.grab_window);
+                let event_x = clamp_grab_coord(event.root_x, gx);
+                let event_y = clamp_grab_coord(event.root_y, gy);
+                let focus = state.crossing_has_focus(grab.grab_window);
+                // As an active grab's (FixUpEventFromWindow).
+                let grab_child = xi2_child_toward(state, grab.grab_window, target);
+                let extras = fanout_core_pointer_event_ordered(
+                    state,
+                    &mut deferred_core_events,
+                    &[grab_target],
+                    grab.grab_window,
+                    grab_child,
+                    event,
+                    event_x,
+                    event_y,
+                    focus,
+                    xi_source,
+                    target,
+                    top_level_id_opt.unwrap_or(ROOT_WINDOW),
+                    is_replay,
+                );
+                merge_dropped(&mut dropped, extras);
+                delivered = true;
+            }
         }
         // Xorg ActivatePointerGrab → CheckGrabForSyncs: a sync
         // pointer_mode freezes the pointer's device stream; a sync
@@ -1497,6 +1536,16 @@ fn pointer_event_fanout_to_state_inner(
             grab.pointer_mode == 0,
             grab.keyboard_mode == 0,
         );
+        // Like XI1 passive activation below, this event has already been
+        // delivered to the grab owner and is the event ReplayDevice must
+        // reprocess at the natural target (FrozenWithEvent).
+        if delivered && grab.pointer_mode == 0 {
+            let sync = state.xi1_frozen.entry(sync_device).or_default();
+            if sync.state == crate::server::Xi1SyncState::FrozenNoEvent {
+                sync.state = crate::server::Xi1SyncState::FrozenWithEvent;
+                sync.stored = Some(crate::server::QueuedInputEvent::HostPointer(event));
+            }
+        }
         // ConfineCursorToWindow — record the confinement and pull
         // the pointer inside the confine window (XGrabButton-23/24).
         state.pointer_confine_to = grab.confine_to;
@@ -1744,7 +1793,14 @@ fn pointer_event_fanout_to_state_inner(
             .xi1_frozen
             .get(&source_device_id)
             .is_some_and(|freeze| freeze.stored.is_some());
-    let owner_events_slave_route = if !xi2_grab_delivery
+    let owner_events_slave_route = if xi2_grab_delivery
+        && let Some(grab) = grab_for_form(state, xi_source, Xi2PointerForm::Slave)
+        && grab.passive
+    {
+        // ActivatePassiveGrab delivers the initial event on the grab window,
+        // independent of owner_events; later events use the normal resolver.
+        Some((grab, OwnerEventsRoute::Fallback))
+    } else if !xi2_grab_delivery
         && !matches!(
             event.kind,
             PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
@@ -2137,320 +2193,53 @@ fn pointer_event_fanout_to_state_inner(
         );
     }
 
-    // Xorg builds the smooth-scroll MotionNotify before it generates the
-    // separate legacy wheel-button transitions (dix/getevents.c:1646-1697,
-    // 1703-1718). Route that Motion by XI_Motion selections and grab masks;
-    // it is independent of the emulated ButtonPress's master aggregation.
+    // Xorg builds smooth-scroll Motion before its separate legacy wheel
+    // transitions (dix/getevents.c:1646-1697, 1703-1718). Resolve each device
+    // form through the same grab/owner-events decision used by scroll-stop.
     if let Some((axis, axis_idx)) = scroll_axis_info {
-        const XI_MOTION_EVENT: u16 = 6;
-        let natural_targets = compute_xi2_targets_for_source(
+        for route in xi2_motion_targets_for_source(
             state,
+            xi_source,
             target,
-            top_level_id,
-            XI_MOTION_EVENT,
-            xi_source.slave_deviceid,
-        );
-        let mut motion_targets = natural_targets.clone();
-        let active_xi2_motion_grab = active_source_grab.filter(|grab| grab.via_xi2);
-        let active_motion_grab = active_source_grab
-            .filter(|grab| grab.via_xi2 && grab.xi2_mask & (1_u64 << XI_MOTION_EVENT) != 0);
-        let owner_events_master_motion_route = if !xi2_grab_delivery
-            && let Some(grab) = grab_for_form(state, xi_source, Xi2PointerForm::Master)
-            && grab.via_xi2
-            && grab.owner_events
-            // active_source_grab prefers an exact slave grab. Apply this
-            // route only when that source-level grab is the same master grab.
-            // The grab mask gates fallback delivery below, not the natural
-            // owner-events attempt which rejects foreign selectors.
-            && active_xi2_motion_grab.is_some_and(|active| {
-                active.owner == grab.owner
-                    && active.grab_window == grab.grab_window
-                    && active.event_mask == grab.event_mask
-                    && active.owner_events == grab.owner_events
-                    && active.via_xi2 == grab.via_xi2
-                    && active.implicit == grab.implicit
-                    && active.passive == grab.passive
-                    && active.xi2_mask == grab.xi2_mask
-            })
-            && let Some((_, grab_client, _, _, true, true, _)) =
-                active_pointer_grab_target(state, grab)
-        {
-            Some((
-                grab,
-                owner_events_route(
-                    state,
-                    Xi2PointerForm::Master,
-                    xi_source.slave_deviceid,
-                    grab_client,
-                    target,
-                    target_x,
-                    target_y,
-                    0,
-                    Some(XI_MOTION_EVENT),
-                    None,
-                ),
-            ))
-        } else {
-            None
-        };
-        let mut motion_grab_window_target = None;
-        let mut exclusive_master_motion_owner = None;
-        let mut exclusive_slave_motion_owner = None;
-        if xi2_grab_delivery {
-            motion_targets.clear();
-            if let Some(grab) = active_motion_grab {
-                motion_targets.push(grab.owner);
-            }
-        } else if let Some((grab, OwnerEventsRoute::Fallback)) = owner_events_slave_route
-            && !grab.owner_events
-        {
-            // An exclusive slave grab owns this source's smooth Motion too.
-            // Keep it on the slave form and use the grab window even though
-            // the paired ButtonPress already passed through ordinary routing.
-            motion_targets.clear();
-            if grab.via_xi2 && grab.xi2_mask & (1_u64 << XI_MOTION_EVENT) != 0 {
-                exclusive_slave_motion_owner = Some(grab.owner);
-                motion_targets.push(grab.owner);
-                motion_grab_window_target = active_pointer_grab_target(state, grab).map(
-                    |(window, owner, gx, gy, _, _, _)| {
-                        (
-                            Xi2PointerForm::Slave,
-                            owner,
-                            window,
-                            clamp_grab_coord(event.root_x, gx),
-                            clamp_grab_coord(event.root_y, gy),
-                            false,
-                        )
-                    },
-                );
-            }
-        } else if let Some((grab, OwnerEventsRoute::Fallback)) = owner_events_master_route
-            && !grab.owner_events
-        {
-            // Reuse the master-form decision above: every exclusive grab
-            // suppresses natural master delivery for this distinct Motion.
-            // XI2 grabs can receive it through their mask; core grabs cannot
-            // convert a wheel-only Motion (../xserver/dix/eventconvert.c:113-122).
-            // Owner-events routing for this Motion is Task 5.
-            motion_targets.clear();
-            if grab.via_xi2 && grab.xi2_mask & (1_u64 << XI_MOTION_EVENT) != 0 {
-                exclusive_master_motion_owner = Some(grab.owner);
-                motion_targets.push(grab.owner);
-                motion_grab_window_target = active_pointer_grab_target(state, grab).map(
-                    |(window, owner, gx, gy, _, _, _)| {
-                        (
-                            Xi2PointerForm::Master,
-                            owner,
-                            window,
-                            clamp_grab_coord(event.root_x, gx),
-                            clamp_grab_coord(event.root_y, gy),
-                            false,
-                        )
-                    },
-                );
-            }
-        } else if let Some((grab, route)) = owner_events_master_motion_route {
-            // The smooth-scroll Motion is a separate event from its wheel
-            // ButtonPress. Resolve its own owner-events attempt. This event
-            // has no core form, so core selections must not prevent the
-            // XI2 fallback (`../xserver/dix/eventconvert.c:113-122`).
-            if (!matches!(route, OwnerEventsRoute::Fallback)
-                || grab.xi2_mask & (1_u64 << XI_MOTION_EVENT) != 0)
-                && !motion_targets.contains(&grab.owner)
-            {
-                motion_targets.push(grab.owner);
-            }
-            if matches!(route, OwnerEventsRoute::Fallback)
-                && grab.xi2_mask & (1_u64 << XI_MOTION_EVENT) != 0
-            {
-                motion_grab_window_target = active_pointer_grab_target(state, grab).map(
-                    |(window, owner, gx, gy, _, _, _)| {
-                        (
-                            Xi2PointerForm::Master,
-                            owner,
-                            window,
-                            clamp_grab_coord(event.root_x, gx),
-                            clamp_grab_coord(event.root_y, gy),
-                            true,
-                        )
-                    },
-                );
-            }
-        } else if let Some(grab) = active_motion_grab
-            && grab.owner_events
-            && !natural_targets.contains(&grab.owner)
-        {
-            // This smooth-scroll Motion is a distinct event from the
-            // emulated wheel ButtonPress handled above. Xorg's
-            // DeliverGrabbedEvent performs owner-events delivery per event,
-            // then falls back to the grab window only when this Motion
-            // reached no natural owner selection (dix/events.c:4431-4464).
-            // Do not key it from `xi2_grab_window_target`: that marker is
-            // derived from the paired ButtonPress and can disagree with the
-            // Motion selection.
-            motion_targets.push(grab.owner);
-            motion_grab_window_target = active_grab_target_for_source(state, xi_source).and_then(
-                |(window, owner, gx, gy, _, via_xi2, _)| {
-                    if !via_xi2 || owner != grab.owner {
-                        return None;
-                    }
-                    let form = if xi_source.slave_deviceid.is_some_and(|device_id| {
-                        state
-                            .xi2_pointer_grabs
-                            .get(&device_id)
-                            .is_some_and(|source_grab| {
-                                source_grab.owner == grab.owner && source_grab.via_xi2
-                            })
-                    }) {
-                        Xi2PointerForm::Slave
-                    } else {
-                        Xi2PointerForm::Master
-                    };
-                    Some((
-                        form,
-                        owner,
-                        window,
-                        clamp_grab_coord(event.root_x, gx),
-                        clamp_grab_coord(event.root_y, gy),
-                        true,
-                    ))
+            nested_id,
+            target_x,
+            target_y,
+            event.root_x,
+            event.root_y,
+            button_transition.source_accepted,
+        ) {
+            let value = xi_source
+                .slave_deviceid
+                .and_then(|source_id| state.xi_devices.device(source_id))
+                .map_or(state.scroll_axis_value[axis_idx], |device| {
+                    device.scroll_axis_values[axis_idx]
+                });
+            let extras = fanout_event_to_clients(
+                state,
+                std::slice::from_ref(&route.client),
+                |buf, seq, order| {
+                    x11::encode_xi2_motion_with_scroll(
+                        buf,
+                        order,
+                        seq,
+                        XI2_MAJOR_OPCODE,
+                        route.deviceid,
+                        event.time,
+                        ROOT_WINDOW,
+                        route.window,
+                        route.child,
+                        event.root_x,
+                        event.root_y,
+                        route.x,
+                        route.y,
+                        event.state,
+                        xi_source.sourceid,
+                        axis,
+                        value,
+                    );
                 },
             );
-        }
-
-        for cid in motion_targets {
-            let fallback_grab_target =
-                motion_grab_window_target.filter(|(_, owner, ..)| *owner == cid);
-            let grab_scoped = (xi2_grab_delivery
-                && active_motion_grab.is_some_and(|g| g.owner == cid))
-                || fallback_grab_target.is_some();
-            let mut forms = Vec::with_capacity(2);
-            let (mut wants_master, mut wants_slave) = xi2_pointer_forms_for_source(
-                state,
-                cid,
-                target,
-                top_level_id,
-                XI_MOTION_EVENT,
-                xi_source.slave_deviceid,
-            );
-            let exact_slave_grab = grab_scoped
-                && active_motion_grab.is_some_and(|grab| grab.owner == cid)
-                && xi_source.slave_deviceid.is_some_and(|device_id| {
-                    state.xi2_pointer_grabs.get(&device_id).is_some_and(|grab| {
-                        grab.owner == cid
-                            && grab.via_xi2
-                            && grab.xi2_mask & (1_u64 << XI_MOTION_EVENT) != 0
-                    })
-                });
-            if exact_slave_grab {
-                wants_master = false;
-                wants_slave = true;
-            }
-            let send_master = if let Some((grab, route)) = owner_events_master_motion_route {
-                cid == grab.owner
-                    && (!matches!(route, OwnerEventsRoute::Fallback)
-                        || grab.xi2_mask & (1_u64 << XI_MOTION_EVENT) != 0)
-            } else if let Some(owner) = exclusive_master_motion_owner {
-                cid == owner
-            } else if exclusive_slave_motion_owner.is_some() {
-                false
-            } else {
-                wants_master || !wants_slave
-            };
-            if let Some(device_id) = xi_source.slave_deviceid
-                && wants_slave
-                && button_transition.source_accepted
-            {
-                forms.push((device_id, true));
-            }
-            if send_master
-                && button_transition.source_accepted
-                && xi_source.attached_master == Some(XI2_MASTER_POINTER_DEVICE_ID)
-            {
-                forms.push((XI2_MASTER_POINTER_DEVICE_ID, false));
-            }
-
-            for (device_id, is_slave) in forms {
-                let form_fallback_target = fallback_grab_target.filter(|(form, ..)| {
-                    *form
-                        == if is_slave {
-                            Xi2PointerForm::Slave
-                        } else {
-                            Xi2PointerForm::Master
-                        }
-                });
-                let fixed_geometry =
-                    form_fallback_target.map(|(_, _, window, x, y, fixup_child)| {
-                        let child = if fixup_child {
-                            xi2_child_toward(state, window, target)
-                        } else {
-                            ResourceId(0)
-                        };
-                        (window, child, x, y)
-                    });
-                let fixed_geometry = fixed_geometry.or_else(|| {
-                    (xi2_grab_delivery && active_motion_grab.is_some_and(|g| g.owner == cid))
-                        .then_some((nested_id, ResourceId(0), event_x, event_y))
-                });
-                let (event_window, child, x, y) = fixed_geometry.unwrap_or_else(|| {
-                    let window = xi2_route_window_for_source(
-                        state,
-                        target,
-                        if is_slave {
-                            Xi2PointerForm::Slave
-                        } else {
-                            Xi2PointerForm::Master
-                        },
-                        XI_MOTION_EVENT,
-                        xi_source.slave_deviceid,
-                    )
-                    .unwrap_or(target);
-                    if window == nested_id {
-                        (nested_id, ResourceId(0), event_x, event_y)
-                    } else {
-                        let child = xi2_child_toward(state, window, target);
-                        let (ox, oy) = state.resources.window_absolute_position(window);
-                        (
-                            window,
-                            child,
-                            clamp_grab_coord(event.root_x, ox),
-                            clamp_grab_coord(event.root_y, oy),
-                        )
-                    }
-                });
-                let value = xi_source
-                    .slave_deviceid
-                    .and_then(|source_id| state.xi_devices.device(source_id))
-                    .map_or(state.scroll_axis_value[axis_idx], |device| {
-                        device.scroll_axis_values[axis_idx]
-                    });
-                let extras = fanout_event_to_clients(
-                    state,
-                    std::slice::from_ref(&cid),
-                    |buf, seq, order| {
-                        x11::encode_xi2_motion_with_scroll(
-                            buf,
-                            order,
-                            seq,
-                            XI2_MAJOR_OPCODE,
-                            device_id,
-                            event.time,
-                            ROOT_WINDOW,
-                            event_window,
-                            child,
-                            event.root_x,
-                            event.root_y,
-                            x,
-                            y,
-                            event.state,
-                            xi_source.sourceid,
-                            axis,
-                            value,
-                        );
-                    },
-                );
-                merge_dropped(&mut dropped, extras);
-            }
+            merge_dropped(&mut dropped, extras);
         }
     }
 
@@ -2620,7 +2409,7 @@ fn pointer_event_fanout_to_state_inner(
                     OwnerEventsRoute::Fallback => xi2_slave_grab_window_target
                         .filter(|(owner, ..)| owner == cid)
                         .map(|(_, window, x, y)| {
-                            let child = if grab.owner_events || grab.implicit {
+                            let child = if grab.owner_events || grab.implicit || grab.passive {
                                 xi2_child_toward(state, window, target)
                             } else {
                                 ResourceId(0)
@@ -2757,7 +2546,11 @@ fn pointer_event_fanout_to_state_inner(
                 });
             let delivered = !extras.contains(cid);
             merge_dropped(&mut dropped, extras);
-            if event.kind == PointerEventKind::ButtonPress && button_want && delivered {
+            if event.kind == PointerEventKind::ButtonPress
+                && button_want
+                && delivered
+                && grab_for_form(state, xi_source, form).is_none()
+            {
                 // Under a grab this records the grab owner, and the
                 // lifecycle's no-grab gate discards it. Natural delivery is
                 // the only path that can install. Merge every client's mask
@@ -2782,6 +2575,7 @@ fn pointer_event_fanout_to_state_inner(
                     .fold(0u64, |m, v| m | v);
                 info.consider_xi2_press(
                     &state.resources,
+                    form,
                     DeliveredPress {
                         owner: *cid,
                         window: ev_win,
@@ -2820,6 +2614,19 @@ fn implicit_pointer_grab_lifecycle(
     {
         return;
     }
+    if event.kind == PointerEventKind::ButtonPress {
+        let source_has_xi2_grab = resolve_pointer_xi_source(state, event.origin, event.tree_change)
+            .and_then(|source| source.slave_deviceid)
+            .is_some_and(|device_id| state.xi2_pointer_grabs.contains_key(&device_id));
+        if state.active_pointer_grab.is_some()
+            || source_has_xi2_grab
+            || state
+                .xi1_active_grabs
+                .contains_key(&crate::xinput::DEVICEID_XTEST_POINTER)
+        {
+            return;
+        }
+    }
     match event.kind {
         PointerEventKind::ButtonPress => {
             // Xorg's whole gate is `if (deliveries) if (!grab ...)`: a
@@ -2830,18 +2637,6 @@ fn implicit_pointer_grab_lifecycle(
             let Some(press) = info.delivered_press(&state.resources) else {
                 return;
             };
-            let source_has_xi2_grab =
-                resolve_pointer_xi_source(state, event.origin, event.tree_change)
-                    .and_then(|source| source.slave_deviceid)
-                    .is_some_and(|device_id| state.xi2_pointer_grabs.contains_key(&device_id));
-            if state.active_pointer_grab.is_some()
-                || source_has_xi2_grab
-                || state
-                    .xi1_active_grabs
-                    .contains_key(&crate::xinput::DEVICEID_XTEST_POINTER)
-            {
-                return;
-            }
             state.set_pointer_grab(crate::server::ActivePointerGrab {
                 owner: press.owner,
                 grab_window: press.window,
@@ -2896,7 +2691,6 @@ pub fn emit_scroll_stop_to_state(
     state_mask: u16,
     time: u32,
 ) {
-    const XI_MOTION: u16 = 6;
     let Some(xi_source) = resolve_pointer_xi_source(state, origin, false) else {
         return;
     };
@@ -2928,44 +2722,29 @@ pub fn emit_scroll_stop_to_state(
         .unwrap_or(ROOT_WINDOW);
     let (target, event_x, event_y) = root_hit.unwrap_or((top_level_id, root_x, root_y));
 
-    let xi2_targets = compute_xi2_targets_for_source(
+    for route in xi2_motion_targets_for_source(
         state,
+        xi_source,
         target,
         top_level_id,
-        XI_MOTION,
-        xi_source.slave_deviceid,
-    );
-    if xi2_targets.is_empty() {
-        return;
-    }
-    for cid in &xi2_targets {
-        let (wants_master, wants_slave) = xi2_pointer_forms_for_source(
+        event_x,
+        event_y,
+        root_x,
+        root_y,
+        true,
+    ) {
+        let scroll = if route.form == Xi2PointerForm::Slave {
+            state
+                .xi_devices
+                .device(route.deviceid)
+                .map_or(state.scroll_axis_value, |device| device.scroll_axis_values)
+        } else {
+            state.scroll_axis_value
+        };
+        let _ = fanout_event_to_clients(
             state,
-            *cid,
-            target,
-            top_level_id,
-            XI_MOTION,
-            xi_source.slave_deviceid,
-        );
-        let mut forms = Vec::with_capacity(2);
-        if let Some(device_id) = xi_source.slave_deviceid
-            && wants_slave
-        {
-            forms.push((device_id, true));
-        }
-        if wants_master || !wants_slave {
-            forms.push((XI2_MASTER_POINTER_DEVICE_ID, false));
-        }
-        for (deviceid, is_slave) in forms {
-            let scroll = if is_slave {
-                state
-                    .xi_devices
-                    .device(deviceid)
-                    .map_or(state.scroll_axis_value, |device| device.scroll_axis_values)
-            } else {
-                state.scroll_axis_value
-            };
-            let _ = fanout_event_to_clients(state, std::slice::from_ref(cid), |buf, seq, order| {
+            std::slice::from_ref(&route.client),
+            |buf, seq, order| {
                 // Current cumulative valuator per axis (unchanged → delta
                 // 0 → is_stop). Index 0 is vertical axis 2; index 1 is
                 // horizontal axis 3.
@@ -2976,26 +2755,32 @@ pub fn emit_scroll_stop_to_state(
                         order,
                         seq,
                         XI2_MAJOR_OPCODE,
-                        deviceid,
+                        route.deviceid,
                         time,
                         ROOT_WINDOW,
-                        target,
-                        ResourceId(0),
+                        route.window,
+                        route.child,
                         root_x,
                         root_y,
-                        event_x,
-                        event_y,
+                        route.x,
+                        route.y,
                         state_mask,
                         xi_source.sourceid,
                         axis,
                         value,
                     );
                 }
-            });
-        }
+            },
+        );
     }
 }
 
+/// Route one XI 1.x device input event through grab, freeze, and selection
+/// semantics. Pointer and key fanouts and the AllowDeviceEvents thaw path
+/// share this entry point. Synchronous grabs re-freeze after each key/button
+/// event, passive grabs auto-release on their matching release, and ordinary
+/// DeviceButtonPress selections do not create an implicit grab (XTS
+/// XSelectExtensionEvent-5).
 pub(crate) fn xi1_route_device_event(
     state: &mut ServerState,
     q: crate::server::Xi1QueuedEvent,
@@ -3811,21 +3596,6 @@ fn active_grab_for_source(
     (source.sourceid == XI2_MASTER_POINTER_DEVICE_ID)
         .then_some(state.active_pointer_grab)
         .flatten()
-}
-
-fn active_grab_target_for_source(
-    state: &ServerState,
-    source: PointerXiSource,
-) -> Option<(
-    yserver_protocol::x11::ResourceId,
-    ClientId,
-    i32,
-    i32,
-    bool,
-    bool,
-    u32,
-)> {
-    active_pointer_grab_target(state, active_grab_for_source(state, source)?)
 }
 
 fn active_pointer_grab_target(
