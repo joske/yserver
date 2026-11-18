@@ -1,6 +1,6 @@
 # Pointer-routing measurements against Xvfb 21.1.24
 
-Status: **Task 6 branch remeasurement complete; C18's direct-XTest sprite geometry remains a documented follow-up, and the layout gate passes after the behavior-preserving extraction in Fix round 2.** The matrix has 22 case ids: 21 Xvfb/branch client comparisons plus C15, measured on Xvfb and covered on yserver by its named Rust regression. All 21 client comparisons match within the scoped exclusions below. C18's child and event/root coordinates are excluded by the coordinator ruling; recipient, event, window, device/source, and valuator payload still match.
+Status: **Final review measurements complete; C18's direct-XTest sprite geometry remains a documented follow-up.** The matrix has 24 case ids: 23 Xvfb/yserver client comparisons plus C15, measured on Xvfb and covered on yserver by its named Rust regression. The fixed branch matches all 23 client comparisons within the scoped exclusions below. C18's child and event/root coordinates are excluded by the coordinator ruling; recipient, event, window, device/source, and valuator payload still match.
 
 Oracle: `/data/Projects/xorg-21.1.24`, cited as `../xserver` (tag `xorg-server-21.1.24`). Xvfb ran on `:97` and reported vendor release `12101024` (21.1.24). Its master pointer was 2, XTest pointer 4, and Xvfb mouse slave 6. The original baseline rows used yserver `d8d3416b` (binary `368d688caac3`). Task 6 rebuilt branch HEAD `ba1f031c6c9b`; yserver ran on `:98`, reported `10900000`, and logged `llvmpipe (LLVM 21.1.8, 256 bits)`. Its device list had master pointer 2 and XTest pointer 4. The original baseline source is unchanged from `d8d3416b`; the current branch includes the routing changes measured below.
 
@@ -159,6 +159,27 @@ leaving at least 100 lines of headroom without a layout exception. The final
 nonfatal device-name diagnostics during the lavapipe ignored suite. No
 `/dev/dri` device or input device was opened, and no Git write was run.
 
+
+## Final review oracle additions (C19-C20; 2026-11-18)
+
+The oracle client added C19 for a synchronous slave XI2 passive ButtonPress
+grab with a fast release and ReplayDevice, and C20 for a natural slave press on
+a sibling window while the master form falls back to an owner-events grab.
+Both cases ran against Xvfb 21.1.24 and the fixed headless yserver. The raw
+captures are preserved under `oracle/results/xvfb-final-fix/` and
+`oracle/results/yserver-final-fix/`; the original yserver captures are under
+`oracle/results/yserver-final-fix-base/`.
+
+| case id | Xvfb 21.1.24 measured result | pre-fix branch HEAD `644bb386` | fixed yserver branch |
+|---|---|---|---|
+| C19 | A gets activating XI_ButtonPress/4 d4/s4 W/D e=(45,45) r=(145,145). Before ReplayDevice B gets nothing; replay gives B one XI_ButtonPress/4 and XI_ButtonRelease/5, d4/s4 D/None e=(25,25) r=(145,145). | A got a core ButtonPress on W/D. Replay gave B the slave press/release plus an extra master-form release. Raw: `oracle/results/yserver-final-fix-base/C19.txt`. | Same XI2 activation and balanced slave replay stream as Xvfb, with no extra master release. Raw: `oracle/results/yserver-final-fix/C19.txt`. |
+| C20 | With W owned by A and sibling OUT owned by B, A gets master d2/s4 press/release on W/None e=(550,50) r=(650,150); B gets slave d4/s4 press/release on OUT/None e=(100,50) r=(650,150). | Server panicked on `XI2 implicit-grab candidates must share the hit ancestor chain` before either button edge was delivered. Client and server captures: `oracle/results/yserver-final-fix-base/C20-client.txt`, `oracle/results/yserver-final-fix-base/C20-server.log`. | Same two recipients, forms, windows, and coordinates as Xvfb. Additional Enter/Leave crossings remain excluded by the existing scope. Raw: `oracle/results/yserver-final-fix/C20.txt`. |
+
+The client source and runner appendix below include C19/C20. `run-cases.sh`
+wrote 24 result files per server (C15 is the documented yserver placeholder).
+Xvfb reported vendor release `12101024`; yserver reported `10900000` and
+started with llvmpipe under `--headless`.
+
 ## C10 raw XI1 wire packets
 
 Each `hex` value is the full 32-byte wire packet captured before libXi conversion. The decoded values are copied from that packet; the client also logs the normalized event.
@@ -259,6 +280,7 @@ struct Setup {
     int xtest_pointer;
     int xvfb_mouse;
     int child_owned_by_b;
+    int outside_owned_by_b;
     int xi1_motion_type;
     int xi1_button_press_type;
     int xi1_valuator_type;
@@ -382,18 +404,20 @@ static void init_setup(struct Setup *s, const char *display_name, const char *ca
     s->grab = XCreateSimpleWindow(s->a, s->root, 100, 100, 300, 300, 0,
                                   BlackPixel(s->a, s->screen), WhitePixel(s->a, s->screen));
     s->child_owned_by_b = !strcmp(case_id, "C8");
+    s->outside_owned_by_b = !strcmp(case_id, "C20");
     if (s->child_owned_by_b) XSync(s->a, False);
     Display *child_owner = s->child_owned_by_b ? s->b : s->a;
     s->child = XCreateSimpleWindow(child_owner, s->grab, 20, 20, 180, 180, 0,
                                    BlackPixel(s->a, s->screen), WhitePixel(s->a, s->screen));
-    s->outside = XCreateSimpleWindow(s->a, s->root, 550, 100, 300, 300, 0,
+    Display *outside_owner = s->outside_owned_by_b ? s->b : s->a;
+    s->outside = XCreateSimpleWindow(outside_owner, s->root, 550, 100, 300, 300, 0,
                                      BlackPixel(s->a, s->screen), WhitePixel(s->a, s->screen));
     XStoreName(s->a, s->grab, "W");
     XStoreName(child_owner, s->child, "D");
-    XStoreName(s->a, s->outside, "OUT");
+    XStoreName(outside_owner, s->outside, "OUT");
     XMapWindow(child_owner, s->child);
     XMapWindow(s->a, s->grab);
-    XMapWindow(s->a, s->outside);
+    XMapWindow(outside_owner, s->outside);
     XSync(s->a, False);
     XSync(s->b, False);
     g_setup = s;
@@ -403,10 +427,11 @@ static void init_setup(struct Setup *s, const char *display_name, const char *ca
     Bool same_screen = XQueryPointer(s->a, s->root, &pointer_root, &pointer_child,
                                      &root_x, &root_y, &window_x, &window_y,
                                      &pointer_mask);
-    printf("CASE %s display=%s master=%d xtest_pointer=%d xvfb_mouse=%d root=0x%lx W=0x%lx D=0x%lx OUT=0x%lx window_owners=W:A,D:%s,OUT:A\n",
+    printf("CASE %s display=%s master=%d xtest_pointer=%d xvfb_mouse=%d root=0x%lx W=0x%lx D=0x%lx OUT=0x%lx window_owners=W:A,D:%s,OUT:%s\n",
            case_id, display_name, s->master, s->xtest_pointer, s->xvfb_mouse,
            s->root, s->grab, s->child, s->outside,
-           s->child_owned_by_b ? "B" : "A");
+           s->child_owned_by_b ? "B" : "A",
+           s->outside_owned_by_b ? "B" : "A");
     printf("POINTER_INITIAL root=%d,%d window=%s child=%s same_screen=%d mask=0x%x\n",
            root_x, root_y, window_name(pointer_root), window_name(pointer_child),
            same_screen, pointer_mask);
@@ -469,6 +494,37 @@ static void fake_motion(struct Setup *s, int x, int y) {
     printf("INJECT XTestFakeMotionEvent source=Virtual-core-XTEST-pointer root=%d,%d\n", x, y);
 }
 
+static void fake_device_motion(struct Setup *s, int first_axis, int *axes, int count) {
+    int xtest_event_base, xtest_error_base, xtest_opcode;
+    int xi_opcode, xi_event_base, xi_error_base;
+    if (!XQueryExtension(s->inj, "XTEST", &xtest_opcode,
+                         &xtest_event_base, &xtest_error_base) ||
+        !XQueryExtension(s->inj, "XInputExtension", &xi_opcode,
+                         &xi_event_base, &xi_error_base)) {
+        fprintf(stderr, "XTest or XInput extension unavailable\n");
+        exit(2);
+    }
+    unsigned char events[64] = {0};
+    events[0] = (unsigned char)(xi_event_base + XI_DeviceMotionNotify);
+    events[31] = (unsigned char)s->xtest_pointer | 0x80;
+    events[32] = (unsigned char)(xi_event_base + XI_DeviceValuator);
+    events[33] = (unsigned char)s->xtest_pointer;
+    events[38] = (unsigned char)count;
+    events[39] = (unsigned char)first_axis;
+    for (int i = 0; i < count; i++)
+        memcpy(events + 40 + i * 4, &axes[i], sizeof(axes[i]));
+
+    LockDisplay(s->inj);
+    unsigned char *request = _XGetRequest(s->inj, (CARD8)xtest_opcode, 68);
+    request[1] = 2; /* XTestFakeInput */
+    memcpy(request + 4, events, sizeof(events));
+    UnlockDisplay(s->inj);
+    XSync(s->inj, False);
+    printf("INJECT XTestFakeDeviceMotionEvent device=%d first_axis=%d count=%d", s->xtest_pointer, first_axis, count);
+    for (int i = 0; i < count; i++) printf(" axis%d=%d", first_axis + i, axes[i]);
+    printf("\n");
+}
+
 static void fake_button(struct Setup *s, Bool press, unsigned int button) {
     XTestFakeButtonEvent(s->inj, button, press, 0);
     XSync(s->inj, False);
@@ -492,6 +548,26 @@ static void print_xi2_event(const char *client, XGenericEventCookie *cookie) {
            client, xi2_name(cookie->evtype), cookie->evtype, ev->deviceid,
            ev->sourceid, window_name(ev->event), window_name(ev->child),
            ev->event_x, ev->event_y, ev->root_x, ev->root_y, ev->detail);
+    if (cookie->evtype == XI_Motion) {
+        unsigned int value_index = 0;
+        uint64_t value_mask = 0;
+        for (int axis = 0; axis < ev->valuators.mask_len * 8; axis++) {
+            if (XIMaskIsSet(ev->valuators.mask, axis)) {
+                if (axis < 64) value_mask |= UINT64_C(1) << axis;
+                value_index++;
+            }
+        }
+        printf("VALUATORS client=%s mask=0x%llx values=", client,
+               (unsigned long long)value_mask);
+        value_index = 0;
+        for (int axis = 0; axis < ev->valuators.mask_len * 8; axis++) {
+            if (XIMaskIsSet(ev->valuators.mask, axis)) {
+                printf("%s%d:%.3f", value_index ? "," : "", axis, ev->valuators.values[value_index]);
+                value_index++;
+            }
+        }
+        printf("\n");
+    }
 }
 
 static void print_core_event(const char *client, XEvent *event) {
@@ -601,8 +677,9 @@ static void raw_xi1_begin(struct Setup *s, Display *dpy) {
     prev_valuator_wire = XESetWireToEvent(dpy, s->xi1_valuator_type, valuator_wire);
     raw_count = 0;
     raw_capture_enabled = 1;
-    printf("SELECT XI1 client=B window=W device=%d events=DeviceMotionNotify|DeviceButtonPress types=%d,%d valuator_type=%d wire_hooks=DeviceMotionNotify|DeviceButtonPress|DeviceValuator\n",
-           s->xtest_pointer, motion_type, press_type, s->xi1_valuator_type);
+    printf("SELECT XI1 client=%s window=W device=%d events=DeviceMotionNotify|DeviceButtonPress types=%d,%d valuator_type=%d wire_hooks=DeviceMotionNotify|DeviceButtonPress|DeviceValuator\n",
+           dpy == g_setup->a ? "A" : "B", s->xtest_pointer, motion_type,
+           press_type, s->xi1_valuator_type);
 }
 
 static const char *raw_xi1_name(struct Setup *s, unsigned int wire_type) {
@@ -817,6 +894,90 @@ static void run_case(struct Setup *s, const char *case_id) {
         select_xi2(s->b, s->child, s->master, motion);
         grab_xi2(s, s->grab, s->xvfb_mouse, True, XI_GRAB_BITS);
         inject_motion_and_drain(s, 150, 150);
+    } else if (!strcmp(case_id, "C16")) {
+        if (s->xtest_pointer < 0) {
+            puts("BLOCKED no XTest pointer device");
+            return;
+        }
+        fake_motion(s, 150, 150);
+        drain_all_for(s, 50);
+        raw_xi1_begin(s, s->a);
+        select_xi2(s->a, s->grab, s->xtest_pointer, motion);
+        grab_xi2(s, s->grab, s->xtest_pointer, True, motion);
+        int axes[2] = {150, 150};
+        fake_device_motion(s, 0, axes, 2);
+        drain_all_for(s, 100);
+        raw_xi1_dump(s);
+    } else if (!strcmp(case_id, "C17")) {
+        if (s->xtest_pointer < 0) {
+            puts("BLOCKED no XTest pointer device");
+            return;
+        }
+        fake_motion(s, 150, 150);
+        drain_all_for(s, 50);
+        raw_xi1_begin(s, s->a);
+        grab_xi2(s, s->grab, s->xtest_pointer, False, motion);
+        int axes[2] = {150, 150};
+        fake_device_motion(s, 0, axes, 2);
+        drain_all_for(s, 100);
+        raw_xi1_dump(s);
+    } else if (!strcmp(case_id, "C18")) {
+        if (s->xtest_pointer < 0) {
+            puts("BLOCKED no XTest pointer device");
+            return;
+        }
+        fake_motion(s, 150, 150);
+        drain_all_for(s, 50);
+        raw_xi1_begin(s, s->a);
+        select_xi2(s->a, s->grab, s->xtest_pointer, motion);
+        grab_xi2(s, s->grab, s->xtest_pointer, True, motion);
+        int axis_value = 175;
+        fake_device_motion(s, 1, &axis_value, 1);
+        drain_all_for(s, 100);
+        raw_xi1_dump(s);
+    } else if (!strcmp(case_id, "C19")) {
+        if (s->xtest_pointer < 0) {
+            puts("BLOCKED no XTest pointer device");
+            return;
+        }
+        unsigned char mask[XIMaskLen(XI_LASTEVENT)];
+        memset(mask, 0, sizeof(mask));
+        XISetMask(mask, XI_ButtonPress);
+        XISetMask(mask, XI_ButtonRelease);
+        XIEventMask event_mask = {
+            .deviceid = s->xtest_pointer,
+            .mask_len = sizeof(mask),
+            .mask = mask,
+        };
+        XIGrabModifiers modifiers = { .modifiers = XIAnyModifier };
+        int status = XIGrabButton(s->a, s->xtest_pointer, 1, s->grab, None,
+                                  GrabModeSync, GrabModeAsync, False,
+                                  &event_mask, 1, &modifiers);
+        XSync(s->a, False);
+        printf("GRAB XIGrabButton client=A window=W device=%d button=1 owner_events=0 mode=sync mask=ButtonPress|ButtonRelease status=%d modifier_status=%d\n",
+               s->xtest_pointer, status, modifiers.status);
+        select_xi2(s->b, s->child, s->xtest_pointer, buttons);
+        fake_button(s, True, 1);
+        drain_all_for(s, 75);
+        fake_button(s, False, 1);
+        drain_all_for(s, 75);
+        XIAllowEvents(s->a, s->xtest_pointer, XIReplayDevice, CurrentTime);
+        XSync(s->a, False);
+        puts("ALLOW XIAllowEvents client=A device=XTEST-pointer mode=ReplayDevice");
+        drain_all_for(s, 125);
+    } else if (!strcmp(case_id, "C20")) {
+        if (s->xtest_pointer < 0) {
+            puts("BLOCKED no XTest pointer device");
+            return;
+        }
+        fake_motion(s, 650, 150);
+        drain_all_for(s, 75);
+        select_xi2(s->b, s->outside, s->xtest_pointer, buttons);
+        grab_xi2(s, s->grab, s->master, True, buttons);
+        fake_button(s, True, 1);
+        drain_all_for(s, 75);
+        fake_button(s, False, 1);
+        drain_all_for(s, 100);
     } else {
         fprintf(stderr, "unknown case id: %s\n", case_id);
         exit(2);
@@ -858,7 +1019,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 CLIENT="$SCRIPT_DIR/clients/pointer-oracle"
 OUTDIR="$SCRIPT_DIR/results/$LABEL"
 mkdir -p "$OUTDIR"
-CASES=(C1 C2 C3 C4 C4b C5 C6 C7 C7s C8 C8c C9 C9e C10 C11 C12 C13 C14 C15)
+CASES=(C1 C2 C3 C4 C4b C5 C6 C7 C7s C8 C8c C9 C9e C10 C11 C12 C13 C14 C15 C16 C17 C18 C19 C20)
 
 for case_id in "${CASES[@]}"; do
   result="$OUTDIR/$case_id.txt"
