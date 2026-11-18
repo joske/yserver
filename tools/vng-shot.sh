@@ -288,6 +288,22 @@ if [ "$gpu" = none ]; then
 else
     qemu_opts="-display egl-headless"
     qemu_opts="$qemu_opts -device virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G,max_hostmem=4G,max_outputs=$outputs"
+    # Venus needs honor-guest-pat on Intel hosts with a discrete AMD GPU, or
+    # guest writes to blob memory can miss the GPU (docs.mesa3d.org venus).
+    # virtme passes -machine accel=kvm:tcg, which QEMU refuses next to -accel.
+    qemu_bin=$out/qemu-pat
+    cat > "$qemu_bin" <<EOF
+#!/bin/sh
+for a; do
+    shift
+    [ "\$a" = accel=kvm:tcg ] && a=kvm,honor-guest-pat=on && set -- "\$@" -accel "\$a" && continue
+    [ "\$a" = -machine ] && [ "\$1" = accel=kvm:tcg ] && continue
+    set -- "\$@" "\$a"
+done
+exec $(command -v qemu-system-x86_64) "\$@"
+EOF
+    chmod +x "$qemu_bin"
+    appends+=(--qemu "$qemu_bin")
 fi
 # vmport=off: the VMware VMMouse ignores relative mouse_move; plain PS/2 doesn't.
 qemu_opts="$qemu_opts -machine vmport=off -monitor unix:$mon,server=on,wait=off"
