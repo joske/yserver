@@ -464,6 +464,108 @@ fn pointer_source_selection_uses_resolved_xi1_and_xi2_facets() {
 }
 
 #[test]
+fn xi1_motion_with_valuator_keeps_more_events_bit() {
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    let mut peer = install_capture_client(&mut state, 7);
+    let device_id = crate::xinput::DEVICEID_XTEST_POINTER;
+    let motion_class = (u32::from(device_id) << 8)
+        | u32::from(crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET);
+    let button_press_class = (u32::from(device_id) << 8)
+        | u32::from(crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET);
+
+    // C10: the real XI1 SelectExtensionEvent request selects XTEST device 4.
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+    body.extend_from_slice(&2u16.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&motion_class.to_le_bytes());
+    body.extend_from_slice(&button_press_class.to_le_bytes());
+    crate::core_loop::process_request::process_request(
+        &mut state,
+        &mut backend,
+        ClientId(7),
+        yserver_protocol::x11::SequenceNumber(1),
+        yserver_protocol::x11::RequestHeader {
+            opcode: 137,
+            data: 6,
+            length_units: 5,
+        },
+        &body,
+        None,
+    )
+    .unwrap();
+    assert!(
+        read_all_capture_available(&mut peer).is_empty(),
+        "SelectExtensionEvent has no reply"
+    );
+
+    let mut motion = motion_event();
+    motion.root_x = 150;
+    motion.root_y = 150;
+    motion.event_x = 150;
+    motion.event_y = 150;
+    let _dropped = pointer_event_fanout_to_state(
+        &mut state,
+        &mut backend,
+        &HostXidMap::new(),
+        motion,
+        true,
+        false,
+    );
+    let motion_wire = read_all_capture_available(&mut peer);
+    assert_eq!(motion_wire.len(), 64, "motion plus DeviceValuator");
+    assert_eq!(
+        motion_wire[0],
+        crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET
+    );
+    // C10 measures motion byte 31 as 0x84 while the DeviceValuator follows.
+    assert_eq!(motion_wire[31], 4 | crate::xinput::XI1_MORE_EVENTS);
+    assert_eq!(
+        motion_wire[32],
+        crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_VALUATOR_OFFSET
+    );
+    assert_eq!(motion_wire[33], device_id as u8, "DeviceValuator device id");
+    assert_eq!(motion_wire[38], 2, "two valuators follow");
+    assert_eq!(motion_wire[39], 0, "first valuator is axis zero");
+    assert_eq!(
+        i32::from_le_bytes(motion_wire[40..44].try_into().unwrap()),
+        150
+    );
+    assert_eq!(
+        i32::from_le_bytes(motion_wire[44..48].try_into().unwrap()),
+        150
+    );
+
+    let mut press = source_button_event(
+        PointerEventKind::ButtonPress,
+        crate::core_loop::InputOrigin::XTest(4),
+        1,
+        2,
+    );
+    press.root_x = 150;
+    press.root_y = 150;
+    press.event_x = 150;
+    press.event_y = 150;
+    let _dropped = pointer_event_fanout_to_state(
+        &mut state,
+        &mut backend,
+        &HostXidMap::new(),
+        press,
+        true,
+        false,
+    );
+    let press_wire = read_all_capture_available(&mut peer);
+    assert_eq!(press_wire.len(), 32, "button press is a standalone event");
+    assert_eq!(
+        press_wire[0],
+        crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET
+    );
+    // C10 measures a DeviceButtonPress without a valuator continuation.
+    assert_eq!(press_wire[31], 0x04);
+}
+
+#[test]
 fn pointer_source_selection_aggregates_holds_and_preserves_slave_release_cookies() {
     let mut state = ServerState::new();
     let mut backend = RecordingBackend::new();

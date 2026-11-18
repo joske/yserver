@@ -1355,8 +1355,8 @@ fn write_i16(byte_order: ClientByteOrder, out: &mut Vec<u8>, value: i16) {
 /// DeviceKeyPress/Release, DeviceButtonPress/Release and
 /// DeviceMotionNotify all share this 32-byte layout. `event_type` is
 /// the absolute wire code (`first_event + offset`). The deviceid top
-/// bit (MORE_EVENTS) stays clear — we never append deviceValuator
-/// follow-ups.
+/// bit (MORE_EVENTS) is preserved when the caller appends a
+/// DeviceValuator follow-up, matching `../xserver/dix/eventconvert.c:369-370`.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_xi1_device_input_event(
     out: &mut Vec<u8>,
@@ -1389,7 +1389,7 @@ pub fn encode_xi1_device_input_event(
     write_u16(byte_order, out, state); // bytes 28-29
     out.push(1); // byte 30: same_screen = true
     #[allow(clippy::cast_possible_truncation)]
-    out.push((deviceid as u8) & 0x7f); // byte 31: deviceid, MORE_EVENTS clear
+    out.push(deviceid as u8); // byte 31: deviceid, including MORE_EVENTS
 }
 
 /// Encode an XI 1.x `deviceFocus` wire event (XIproto.h:1590-1603):
