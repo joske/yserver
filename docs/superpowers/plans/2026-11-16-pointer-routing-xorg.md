@@ -54,7 +54,8 @@
   - C7s: as C6 (grab window OUT) but B selects slave XI_Motion only (slave-only does not block the core walk: A gets core on W, not fallback on OUT).
   - C8: reproduce exactly the setup of `implicit_grab_xi2_release_reaches_all_master_selector_xfce` and of the test documented at `pointer_fanout/tests.rs` ~5225 (read both; state in the row which grab, core or XI2 implicit, Xorg activates).
   - C8c: core implicit grab: A selects core ButtonPress|ButtonRelease|PointerMotion on W; B selects master XI_Motion only (no XI2 press) on D, a child of W under the pointer; motion, press, motion, release. Record that Xorg activates a core implicit grab for A (if it does not, stop and report) and whether B receives the Motion during that grab. This is the row for the `core_implicit` exception (`pointer_fanout.rs` ~1887).
-  - C9: one client with slave + master XI2 selections (E27 setup of the existing E27 tests): press/release counts per form.
+  - C9: one client with slave + master XI2 press/release selections (dual-XI2 case): press/release counts and fields per form.
+  - C9e: the E27 regression setup of `pointer_fanout/tests.rs` ~5348-5413: one client selects core ButtonPress|ButtonRelease and slave XI2 ButtonPress|ButtonRelease on the same window, no master XI2 selection: which implicit grab activates and that the core release arrives.
   - C10: XI1 DeviceMotionNotify + DeviceButtonPress selected via XSelectExtensionEvent on the XTest pointer: raw 32-byte events; record byte 31 (deviceid | MORE_EVENTS) and what follows.
   - C11: as C1, then XIUngrabDevice between two motions.
   - C12: XIGrabDevice owner_events=True by A with the pointer outside the grab window's tree: fallback event window, child, event_x/y.
@@ -87,7 +88,7 @@
 - Test: new `crates/yserver-core/src/core_loop/pointer_fanout/tests/owner_events.rs`, registered in the tests module
 
 **Interfaces:**
-- Consumes: Task 1 rows C1-C4b, C6-C7s, C8, C8c, C9, C11, C14.
+- Consumes: Task 1 rows C1-C4b, C6-C7s, C8, C8c, C9, C9e, C11, C14.
 - Produces, in `pointer_fanout.rs`:
   - `enum OwnerEventsRoute { Natural { window: ResourceId, x: i16, y: i16, child: ResourceId, protocol: OwnerProtocol }, Fallback }`, `enum OwnerProtocol { Xi2, Xi1, Core }`.
   - `fn owner_events_route(state: &ServerState, form: Xi2PointerForm, slave_deviceid: Option<u16>, grab_client: ClientId, start: ResourceId, x: i16, y: i16, core_mask: u32, xi2_evtype: Option<u16>, xi1_mask: Option<u32>) -> OwnerEventsRoute` — walks from `start` toward the root; on each window tries XI2 for this form (`xi2_form_targets_for_source`), then XI1 (slave form only), then core (master form only, `subscribers_by_id`). In an attempt, the grab client present → `Natural` with that protocol; only other clients present → the attempt is rejected and the remaining protocols are still tried on this window; if nothing was delivered on a window where any attempt was rejected → `Fallback`; if no protocol matched at all, continue to the parent. `grabbed_natural_target` is replaced by this function (delete it; its callers use `owner_events_route` with `form = Master`).
@@ -136,7 +137,7 @@
 - Modify: `docs/superpowers/findings/2026-11-16-pointer-routing-xorg-measurements.md` (add column "yserver branch")
 - Modify: `docs/status.md` (one entry for this PR)
 
-- [ ] **Step 1: Re-run** the Task 1 script against the branch build headless. Expected: every row matches Xvfb.
+- [ ] **Step 1: Re-run** the Task 1 script against the branch build headless. Expected: every row is a scoped match with Xvfb (the findings doc lists the scoped exclusions: Enter/Leave crossings, a spec non-goal, and any other exclusion recorded there with its reason); the full streams stay recorded.
 - [ ] **Step 2: Load runs**: `cargo test -p yserver-core pointer_fanout`, `xi2_grabs` and `grab` 5 times under 16 busy loops. Expected: 5/5 pass.
 - [ ] **Step 3: Full gate**: `cargo test --workspace`, the CI `--workspace --features xdmcp -- --ignored` lavapipe suite, FreeBSD cross clippy, `tools/check-layout.sh`, `just man`. Expected: all pass.
 - [ ] **Step 4: Update** the findings column and a `docs/status.md` entry (dated, one paragraph, no "as Xorg" phrasing for our own rulings; second master noted as unreachable non-goal). Commit `docs: pointer routing measured on the branch`.
