@@ -108,9 +108,9 @@
 - Test: `pointer_fanout/tests/owner_events.rs`
 
 **Interfaces:**
-- Consumes: `owner_events_route`, `grab_for_form` (Task 3); `xi2_child_toward`; rows C2, C5, C12, C13, C15.
+- Consumes: `owner_events_route`, `grab_for_form` (Task 3); `xi2_child_toward`; rows C2, C5, C9, C9e, C12, C13, C15.
 
-- [ ] **Step 1: Failing tests**: `owner_events_master_grab_leaves_slave_form_to_selectors` (C5), `slave_grab_leaves_master_form_from_other_source` (C15, Review Focus 2), `owner_events_fallback_child_toward_pointer` (C2/C13: fallback XI2 event has the child Xorg reports, not 0), `owner_events_fallback_outside_tree_geometry` (C12, Review Focus 4). Update `pointer_fanout/tests.rs` ~1527-1530 (pinned child 0) to row C2's value, naming the row. Mutations: apply the master grab to the slave form (C5 fails); force child 0 (C2/C13 fail).
+- [ ] **Step 1: Failing tests**: `owner_events_master_grab_leaves_slave_form_to_selectors` (C5), `slave_grab_leaves_master_form_from_other_source` (C15, Review Focus 2), `owner_events_fallback_child_toward_pointer` (C2/C13: fallback XI2 event has the child Xorg reports, not 0), `owner_events_fallback_outside_tree_geometry` (C12, Review Focus 4), `e27_release_child_toward_pointer` (C9: release child as the row, not None), `e27_slave_xi2_delivered_before_master_core` (C9e: the slave-form XI2 event reaches the client before the master-form core event, `../xserver/mi/mieq.c:502-508`). Update `pointer_fanout/tests.rs` ~1527-1530 (pinned child 0) to row C2's value, naming the row. Mutations: apply the master grab to the slave form (C5 fails); force child 0 (C2/C13 fail).
 - [ ] **Step 2: Run**. Expected: C2/C13 child and C5 (if the row differs) fail.
 - [ ] **Step 3: Implement**: decide each form with `grab_for_form` and `owner_events_route` separately; keep per-form fallback flags and geometry (no shared override across forms); compute the fallback child with `xi2_child_toward(grab_window, pointer_window)`.
 - [ ] **Step 4: Run** new tests, E27 tests, gate. Expected: PASS.
