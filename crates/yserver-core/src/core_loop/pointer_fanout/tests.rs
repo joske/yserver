@@ -299,18 +299,32 @@ fn xi2_event_ids(bytes: &[u8]) -> Vec<(u16, u16, u16)> {
     let mut result = Vec::new();
     let mut offset = 0;
     while offset + 32 <= bytes.len() {
-        assert_eq!(bytes[offset], 35, "expected GenericEvent");
-        let extra = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
-        let evtype = u16::from_le_bytes(bytes[offset + 8..offset + 10].try_into().unwrap());
-        let deviceid = u16::from_le_bytes(bytes[offset + 10..offset + 12].try_into().unwrap());
-        let source_offset = if matches!(evtype, 13..=17) { 20 } else { 52 };
-        let sourceid = u16::from_le_bytes(
-            bytes[offset + source_offset..offset + source_offset + 2]
-                .try_into()
-                .unwrap(),
-        );
-        result.push((evtype, deviceid, sourceid));
-        offset += 32 + extra as usize * 4;
+        if bytes[offset] == 35 {
+            let extra = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+            let evtype = u16::from_le_bytes([bytes[offset + 8], bytes[offset + 9]]);
+            let deviceid = u16::from_le_bytes([bytes[offset + 10], bytes[offset + 11]]);
+            let source_offset = if matches!(evtype, 13..=17) { 20 } else { 52 };
+            let sourceid = u16::from_le_bytes(
+                bytes[offset + source_offset..offset + source_offset + 2]
+                    .try_into()
+                    .unwrap(),
+            );
+            result.push((evtype, deviceid, sourceid));
+            offset += 32 + extra as usize * 4;
+        } else {
+            let event_type = bytes[offset] & 0x7f;
+            let is_xi1_device_event = event_type
+                == crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_VALUATOR_OFFSET
+                || (crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET
+                    ..=crate::server::XI_FIRST_EVENT
+                        + crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET)
+                    .contains(&event_type);
+            assert!(
+                (2..=34).contains(&event_type) || is_xi1_device_event,
+                "expected a core or XI1 device event beside XI2, got event type {event_type}"
+            );
+            offset += 32;
+        }
     }
     assert_eq!(offset, bytes.len(), "event stream fully consumed");
     result
@@ -347,6 +361,8 @@ fn xi1_device_event_ids(bytes: &[u8]) -> Vec<(u8, u8)> {
             if (crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET
                 ..=crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_BUTTON_RELEASE_OFFSET)
                 .contains(&event_type)
+                || event_type
+                    == crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET
             {
                 result.push((event_type, bytes[offset + 31] & 0x7f));
             }
@@ -1646,8 +1662,8 @@ fn xi_owner_events_fallback_preserves_other_recipients_root_geometry() {
     );
     assert_eq!(
         u32::from_le_bytes(grabber_bytes[28..32].try_into().unwrap()),
-        0,
-        "grab-owner fallback has no child"
+        CHILD,
+        "C2: Xorg fallback reports the child toward the pointer"
     );
     assert_eq!(
         i16::from_le_bytes(grabber_bytes[42..44].try_into().unwrap()),

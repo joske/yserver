@@ -1,6 +1,6 @@
 # Pointer-routing measurements against Xvfb 21.1.24
 
-Status: **Measured.** The matrix has 19 cases: 18 Xvfb/yserver comparisons and C15, which is Xvfb-only. No Rust code was changed.
+Status: **Measured.** The original matrix has 19 cases: 18 Xvfb/yserver comparisons and C15, which is Xvfb-only. Round two adds the Xvfb-only direct FakeInput cases C16/C17; round three adds partial-axis case C18 below. No Rust code was changed during these measurements.
 
 Oracle: `/data/Projects/xorg-21.1.24`, cited as `../xserver` (tag `xorg-server-21.1.24`). Xvfb ran on `:97` and reported vendor release `12101024` (21.1.24). Its master pointer was 2, XTest pointer 4, and Xvfb mouse slave 6. yserver ran on `:98`; the binary reported `368d688caac3`, Vulkan used `llvmpipe (LLVM 21.1.8, 256 bits)`, and its device list had master pointer 2 and XTest pointer 4. Source under `crates/yserver` and `crates/yserver-core` is unchanged from `d8d3416b`; the checked-out branch was `feat/pointer-routing-xorg` at `252395ed`.
 
@@ -59,6 +59,53 @@ Results: 2 full-stream matches (C8, C14), 16 full-stream differences, and C15 N/
 - C9e is the separate E27 core-plus-slave case. Both servers deliver core and slave XI2 press/release edges; both core releases arrive. Xorg's internal grab type is not queryable by this client; the measured core ButtonPress takes Xorg's CORE implicit-grab path (`../xserver/dix/events.c:2158-2177,2417-2424`), while the slave XI2 edge is separately observed. The same client's queue order differs between servers, as recorded.
 - C10 captures five XI1 wire packets per server: two DeviceMotionNotify, their two DeviceValuator follow-ups, and one DeviceButtonPress. Both DeviceButtonPress byte31 values are `0x04` and have no following packet. Xvfb motion byte31 is `0x84`; yserver motion byte31 is `0x04`.
 - All explicit grabs succeeded (status 0); there are no XERROR or BLOCKED records in measured cases. C15 yserver is intentionally not run.
+
+## Round-two oracle additions: direct XI1 FakeInput under a slave grab
+
+These Xvfb-only cases isolate the Task 4 review's direct
+`XTestFakeDeviceMotionEvent` caller. The client positions the pointer at
+`(150,150)`, selects XI1 `DeviceMotionNotify` on W for device 4, then sends a
+real device-motion fake with valuators `(150,150)`. C16 also selects XI2
+`XI_Motion` on W; C17 relies on the exclusive XI2 grab's Motion mask.
+
+| case id | grab and selections | Xvfb 21.1.24 result | raw result |
+|---|---|---|---|
+| C16 | A: XIGrabDevice on slave 4 at W, owner_events=true, Motion mask; A selects XI1 DeviceMotionNotify and XI2 Motion on W for device 4. | A: XI_Motion/6 d4/s4 W/D e=(50,50) r=(150,150); no XI1 wire packets. | `oracle/results/xvfb/C16.txt` |
+| C17 | A: XIGrabDevice on slave 4 at W, owner_events=false, Motion mask; A selects XI1 DeviceMotionNotify on W for device 4. | A: XI_Motion/6 d4/s4 W/D e=(50,50) r=(150,150); no XI1 wire packets. The exclusive fallback still reports child D. | `oracle/results/xvfb/C17.txt` |
+
+The direct XTest request goes through `XTestFakeInput` in Xorg and produces the
+grabbed XI2 event even though the server-side XTest caller also has the XI1
+valuator chain available. Task 4's Rust regression sends the equivalent 64-byte
+FakeInput request through production request dispatch. Against Task 4's HEAD
+implementation it fails because the direct caller emits no XI2 event; the
+expected recipient, child, geometry, and absence of XI1 packets above come only
+from C16/C17's Xvfb results.
+
+## Round-three oracle addition: partial-axis direct FakeInput (C18)
+
+C18 uses the C16 setup and the same `pointer-oracle` client and `run-cases.sh`.
+After positioning the XTest pointer at `(150,150)`, A selects XI1
+`DeviceMotionNotify` and XI2 `XI_Motion` on W for device 4, then installs an
+owner-events XIGrabDevice on device 4 with a Motion mask. The client sends a
+valid XTestFakeInput request containing one DeviceValuator with
+`first_valuator=1`, `num_valuators=1`, and value `175`.
+
+| case id | Xvfb 21.1.24 result | raw result |
+|---|---|---|
+| C18 | A: XI_Motion/6 d4/s4 W/None e=(50,-100) r=(150,0), valuator mask `0x2`, axis 1 value `0`; no XI1 wire packets. B: none. | `oracle/results/xvfb/C18.txt` |
+
+The measured output preserves only the requested Y valuator bit, but Xvfb emits
+its value as zero even though the request carried `175`. Xorg's FakeInput parser
+writes the request values at the global `base` index (`../xserver/Xext/xtest.c:248-284`),
+then `valuator_mask_set_range` reads that range from zero-based array offsets
+(`../xserver/dix/inpututils.c:452-462`). For C18, the input lands at index 1,
+while the one-axis range copy reads index 0. This measurement means the
+compatible XI2 packet has mask bit 1 and value 0. The packet's coordinates and
+fallback child also reflect the resulting Xorg pointer position at `(150,0)`.
+
+The oracle was rebuilt with `-Wall -Wextra -Werror` and run against the supplied
+Xvfb 21.1.24 installation on display `:124`; `xdpyinfo` reports vendor release
+`12101024`. `run-cases.sh :124 xvfb` wrote C18 alongside the existing Xvfb rows.
 
 ## C10 raw XI1 wire packets
 

@@ -2047,11 +2047,12 @@ pub fn encode_xi2_device_event(
     detail: u32,
     sourceid: u16,
     flags: u32,
+    motion_valuators: Option<(u8, &[i32])>,
 ) {
     // Per the X.Org reference trace (thunar inside MATE, sampled
     // 2026-05-15), XI2 Button events carry NO axis values: valuator
     // mask is all-zero and no axisvalues follow. Only Motion events
-    // carry the X/Y axes. Per X11 spec, valuator events should reflect
+    // carry valuators. Per X11 spec, valuator events should reflect
     // only the axes that actually changed since the last event; for
     // Press/Release the cursor hasn't moved (libinput delivers
     // motion+button as separate events), so the mask is empty.
@@ -2068,7 +2069,7 @@ pub fn encode_xi2_device_event(
     // Match Xorg's wire-format widths byte-for-byte: 8 u32s of buttons
     // mask (covers 256 buttons; we only use bits 1..7 but pad to match
     // Xorg's modesetting/evdev declaration) and 2 u32s of valuators
-    // mask (covers 64 valuators; we use bits 0..3 in the first u32).
+    // mask (covers 64 valuators).
     //
     // Release Chrome (Ozone X11 path) crashes on yserver scroll when
     // event widths differ from Xorg's — our 1 u32 of buttons mask + 0
@@ -2080,14 +2081,32 @@ pub fn encode_xi2_device_event(
     // mate xtrace diff identified the width mismatch).
     const BUTTONS_LEN_U16: u16 = 8;
     const VALUATORS_LEN_U16: u16 = 2;
-    let valuator_mask: u32 = if include_axes { 0x0000_0003 } else { 0 };
+    let (valuator_mask, axis_values) = if include_axes {
+        if let Some((first, values)) = motion_valuators {
+            let mut mask = [0_u32; 2];
+            let mut axis_values = Vec::with_capacity(values.len());
+            for (offset, value) in values.iter().copied().enumerate() {
+                let axis = usize::from(first) + offset;
+                if axis < 64 {
+                    mask[axis / 32] |= 1_u32 << (axis % 32);
+                    axis_values.push(value);
+                }
+            }
+            (mask, axis_values)
+        } else {
+            ([0x0000_0003, 0], vec![i32::from(root_x), i32::from(root_y)])
+        }
+    } else {
+        ([0, 0], Vec::new())
+    };
     // Tail layout: 4*FP1616(coords) + 12 (lens/sourceid/pad/flags) +
     //   16 (mods) + 4 (group) + 4*BUTTONS_LEN_U16 (buttons mask) +
     //   4*VALUATORS_LEN_U16 (valuator mask) +
-    //   {2*FP3232 axisvalues if include_axes, else 0}.
+    //   {one FP3232 value for each set valuator bit}.
     let extra_bytes: u32 =
         16 + 12 + 16 + 4 + 4 * u32::from(BUTTONS_LEN_U16) + 4 * u32::from(VALUATORS_LEN_U16);
-    let axes_bytes: u32 = if include_axes { 16 } else { 0 };
+    let axes_bytes =
+        u32::try_from(axis_values.len()).expect("XI2 valuator mask caps the value count at 64") * 8;
     let length_units = (extra_bytes + axes_bytes) / 4;
 
     let start = out.len();
@@ -2167,23 +2186,20 @@ pub fn encode_xi2_device_event(
         write_u32(byte_order, out, 0);
     }
 
-    // Valuator mask of VALUATORS_LEN_U16 u32s. Bit 0 (X), 1 (Y), 2/3
-    // (scroll axes) live in the first u32; second u32 is always 0.
-    // Motion events set X/Y bits; button/crossing events set no bits
-    // (mask = 0).
-    write_u32(byte_order, out, valuator_mask);
-    for _ in 1..VALUATORS_LEN_U16 {
-        write_u32(byte_order, out, 0);
+    // Valuator mask of VALUATORS_LEN_U16 u32s. Bits 0 (X), 1 (Y), and
+    // 2/3 (scroll axes) are in the first u32; bits 32..63 use the second.
+    // Motion events carry either the supplied valuator range or the usual
+    // X/Y pair; button/crossing events set no bits (mask = 0).
+    for mask_word in valuator_mask {
+        write_u32(byte_order, out, mask_word);
     }
-    if include_axes {
-        // Axis values: FP3232 (signed i32 integer + u32 fraction).
-        // Master pointer is in absolute mode; X/Y carry the
-        // root-relative position. Fraction is 0 because libinput
-        // reports integer coords post-clamp.
-        write_u32(byte_order, out, i32::from(root_x) as u32);
-        write_u32(byte_order, out, 0); // X fraction
-        write_u32(byte_order, out, i32::from(root_y) as u32);
-        write_u32(byte_order, out, 0); // Y fraction
+    debug_assert_eq!(usize::from(VALUATORS_LEN_U16), valuator_mask.len());
+    // Axis values: FP3232 (signed i32 integer + u32 fraction). Physical
+    // motion uses root-relative integer X/Y; explicit device motion uses
+    // the supplied valuator sequence.
+    for value in axis_values {
+        write_u32(byte_order, out, value as u32);
+        write_u32(byte_order, out, 0);
     }
 
     debug_assert_eq!(out.len() - start, 32 + (length_units as usize) * 4);
