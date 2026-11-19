@@ -1,12 +1,12 @@
 # Per-device implicit pointer grabs
 
-Status: draft, revision 2 (sol review r1: R4-R6 and R1's XI2 part folded in; XI1 moved out pending the user's decision). Stacked on PR #373 (`feat/pointer-routing-xorg`, `48f69aab`).
+Status: draft, revision 3 (sol review r1: R4-R6 and R1's XI2 part folded in; XI1 implicit grabs moved to their own PR by the user's decision, which settles R1's XI1 part, R2 and R3). Stacked on PR #373 (`feat/pointer-routing-xorg`, `48f69aab`).
 Measurements: `docs/superpowers/findings/2026-11-19-per-device-implicit-grabs-measurements.md` (cases I1-I8).
 
 ## Intent
 
-Suppose a user presses in a window, drags over another client's window, and releases there. Clients that select slave-form XI2 events (Qt6 with XIAllDevices, Enlightenment 0.27 with explicit slave ids) or XI1 device events must see the whole press/motion/release sequence on the window where the press happened. Xorg 21.1.24 does this, and yserver does not.
-- **Lost slave release.** yserver sends the slave release and the slave drag motion to whatever window is under the pointer (I1, I1a, I5, I7).
+Suppose a user presses in a window, drags over another client's window, and releases there. Clients that select slave-form XI2 events (Qt6 with XIAllDevices, Enlightenment 0.27 with explicit slave ids) must see the whole press/motion/release sequence on the window where the press happened. Xorg 21.1.24 does this, and yserver does not.
+- **Lost slave release.** yserver sends the slave release and the slave drag motion to whatever window is under the pointer (I1, I1a, I7).
 - **Leaked master events.** yserver hands master-form (d2) events to a client that never selected the master (I2, I3, I6, I8).
 - **Wrong grab status.** It answers XIGrabDevice with the wrong status during a drag (I4).
 
@@ -101,7 +101,7 @@ Invariants:
 - Which windows a press is delivered to: this PR takes the existing deliveries as given and only changes which grab they activate.
 - Enter/Leave crossings for implicit grabs; attached-slave coordinate timing; C18.
 - Touch, keyboard.
-- XI1 implicit grabs (I5), pending the user's decision.
+- XI1 implicit grabs (I5): their own PR. They need an activation-time XI1 mask snapshot, an implicit-only XI1 filter, and cross-protocol suppression between XI1 and XI2 slave routing (review r1, R1-R3). No measured client uses XI1 device buttons; Qt6 and Enlightenment use XI2. In this PR an XI1 DeviceButtonPress delivery still activates no grab, as today.
 
 ## Anti-goals
 
@@ -125,8 +125,6 @@ Invariants:
 Behaviour is taken from Xorg server 21.1.24 (MIT/X11 licence) source citations and Xvfb measurements. No code is copied.
 
 ## Left to the plan
-
-- The XI1 section, if the user keeps XI1 in this PR (see review r1, R1-R3).
 
 - Where the per-slave release check lives. The existing passive per-device release at `pointer_fanout.rs` ~3245 is the reuse candidate.
 - Test fixture reuse.
