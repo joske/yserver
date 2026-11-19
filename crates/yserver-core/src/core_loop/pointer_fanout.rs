@@ -2409,11 +2409,7 @@ fn pointer_event_fanout_to_state_inner(
                     OwnerEventsRoute::Fallback => xi2_slave_grab_window_target
                         .filter(|(owner, ..)| owner == cid)
                         .map(|(_, window, x, y)| {
-                            let child = if grab.owner_events || grab.implicit || grab.passive {
-                                xi2_child_toward(state, window, target)
-                            } else {
-                                ResourceId(0)
-                            };
+                            let child = xi2_child_toward(state, window, target);
                             (window, child, x, y)
                         }),
                     OwnerEventsRoute::Natural { .. } => None,
@@ -2422,13 +2418,7 @@ fn pointer_event_fanout_to_state_inner(
                 && let Some((_, window, x, y)) =
                     xi2_grab_window_target.filter(|(owner, ..)| owner == cid)
             {
-                let child = if owner_events_master_route
-                    .is_some_and(|(grab, _)| grab.owner_events || grab.implicit)
-                {
-                    xi2_child_toward(state, window, target)
-                } else {
-                    ResourceId(0)
-                };
+                let child = xi2_child_toward(state, window, target);
                 Some((window, child, x, y))
             } else if form == Xi2PointerForm::Master
                 && let Some((
@@ -2723,15 +2713,7 @@ pub fn emit_scroll_stop_to_state(
     let (target, event_x, event_y) = root_hit.unwrap_or((top_level_id, root_x, root_y));
 
     for route in xi2_motion_targets_for_source(
-        state,
-        xi_source,
-        target,
-        top_level_id,
-        event_x,
-        event_y,
-        root_x,
-        root_y,
-        true,
+        state, xi_source, target, target, event_x, event_y, root_x, root_y, true,
     ) {
         let scroll = if route.form == Xi2PointerForm::Slave {
             state

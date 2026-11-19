@@ -1054,8 +1054,47 @@ fn exclusive_slave_grab_suppresses_foreign_xi1_selection() {
 }
 
 #[test]
+fn exclusive_slave_grab_physical_motion_reports_child_under_pointer() {
+    // C17: Xorg FixUpEventFromWindow reports child D for exclusive XI2 grab
+    // fallback, independent of owner_events (../xserver/dix/events.c:4389).
+    const SOURCE: u64 = 0xA7565;
+    let mut f = fixture();
+    let pointer = pointer_source(&mut f.state, SOURCE, true);
+    grab_xi2_device_with_options(&mut f, WINDOW, pointer, false, XI_MOTION);
+
+    inject_from_origin(
+        &mut f,
+        crate::core_loop::InputOrigin::Physical(crate::xinput::InputSourceId(SOURCE)),
+        PointerEventKind::MotionNotify,
+        150,
+        150,
+        HOST_WINDOW,
+    );
+
+    let owner = read_all_capture_available(&mut f.grabber);
+    assert_eq!(
+        decode_deliveries(&owner),
+        vec![Delivery {
+            xi2: true,
+            kind: 6,
+            window: WINDOW,
+            child: CHILD,
+        }],
+        "the exclusive slave-form grab reports the child under the pointer"
+    );
+    assert_eq!(
+        xi2_geometry(&owner),
+        vec![(WINDOW, CHILD, 150, 150, 50, 50)]
+    );
+    assert!(read_all_capture_available(&mut f.other).is_empty());
+    assert_eq!(xi2_event_ids(&owner), vec![(6, pointer, pointer)]);
+}
+
+#[test]
 fn exclusive_slave_grab_scroll_motion_reaches_only_grab_owner() {
-    // Xorg creates the smooth Motion before the wheel button edge and sends
+    // C17 measured child D for exclusive fallback; Xorg always calls
+    // FixUpEventFromWindow on the grab window (../xserver/dix/events.c:4389).
+    // Xorg creates smooth Motion before the wheel button edge and sends
     // grabbed XI2 events through the grab's Motion mask and window
     // (../xserver/dix/getevents.c:1646-1697, 1703-1718;
     // ../xserver/dix/events.c:4354-4394, 4431-4462).
@@ -1098,12 +1137,12 @@ fn exclusive_slave_grab_scroll_motion_reaches_only_grab_owner() {
             xi2: true,
             kind: 6,
             window: WINDOW,
-            child: 0,
+            child: CHILD,
         }]
     );
     assert_eq!(
         xi2_geometry(&owner_bytes),
-        vec![(WINDOW, 0, 150, 150, 50, 50)],
+        vec![(WINDOW, CHILD, 150, 150, 50, 50)],
         "the exclusive slave Motion uses grab-window-relative geometry"
     );
     assert!(
@@ -1679,9 +1718,48 @@ fn owner_events_scroll_motion_mask_can_reject_fallback_without_leaking() {
 }
 
 #[test]
+fn exclusive_master_grab_physical_motion_reports_child_under_pointer() {
+    // C17: Xorg FixUpEventFromWindow reports child D for exclusive XI2 grab
+    // fallback, independent of owner_events (../xserver/dix/events.c:4389).
+    const SOURCE: u64 = 0xA7532;
+    let mut f = fixture();
+    let pointer = pointer_source(&mut f.state, SOURCE, true);
+    grab_xi2_with_options(&mut f, WINDOW, false, XI_MOTION);
+
+    inject_from_origin(
+        &mut f,
+        crate::core_loop::InputOrigin::Physical(crate::xinput::InputSourceId(SOURCE)),
+        PointerEventKind::MotionNotify,
+        150,
+        150,
+        HOST_WINDOW,
+    );
+
+    let owner = read_all_capture_available(&mut f.grabber);
+    assert_eq!(
+        decode_deliveries(&owner),
+        vec![Delivery {
+            xi2: true,
+            kind: 6,
+            window: WINDOW,
+            child: CHILD,
+        }],
+        "the exclusive master-form grab reports the child under the pointer"
+    );
+    assert_eq!(
+        xi2_geometry(&owner),
+        vec![(WINDOW, CHILD, 150, 150, 50, 50)]
+    );
+    assert!(read_all_capture_available(&mut f.other).is_empty());
+    assert_eq!(xi2_event_ids(&owner), vec![(6, XI_MASTER, pointer)]);
+}
+
+#[test]
 fn exclusive_master_grab_scroll_motion_reaches_only_grab_owner() {
-    // Source-backed exclusive case: ../xserver/dix/events.c:4431-4462
-    // filters a grabbed event through the grab mask, and
+    // C17 measured child D for exclusive fallback; Xorg always calls
+    // FixUpEventFromWindow on the grab window (../xserver/dix/events.c:4389).
+    // ../xserver/dix/events.c:4431-4462 filters a grabbed event through
+    // the grab mask, and
     // ../xserver/dix/getevents.c:1646-1697, 1703-1718 creates the separate
     // smooth-scroll Motion before the wheel ButtonPress.
     const SOURCE: u64 = 0xA7531;
@@ -1719,13 +1797,13 @@ fn exclusive_master_grab_scroll_motion_reaches_only_grab_owner() {
                 xi2: true,
                 kind: 6,
                 window: WINDOW,
-                child: 0
+                child: CHILD
             },
             Delivery {
                 xi2: true,
                 kind: 4,
                 window: WINDOW,
-                child: 0
+                child: CHILD
             },
         ],
         "the exclusive grab redirects both the smooth Motion and wheel press to W"
@@ -2074,7 +2152,9 @@ fn slave_owner_events_scroll_grab_uses_its_mask_and_blocks_foreign_motion() {
 
 #[test]
 fn exclusive_master_scroll_grab_preserves_ungrabbed_slave_motion() {
-    // Source-backed form independence: ../xserver/mi/mieq.c:484-508 and
+    // C17 plus FixUpEventFromWindow at ../xserver/dix/events.c:4389 establish
+    // child D on exclusive grab fallback. Form independence comes from
+    // ../xserver/mi/mieq.c:484-508 and
     // ../xserver/dix/events.c:4431-4462. The exclusive master grab owns its
     // master Motion while the ungrabbed slave form keeps B's natural target.
     const SOURCE: u64 = 0xA75C4;
@@ -2087,9 +2167,45 @@ fn exclusive_master_scroll_grab_preserves_ungrabbed_slave_motion() {
     let owner = read_all_capture_available(&mut f.grabber);
     let natural = read_all_capture_available(&mut f.other);
     assert_eq!(xi2_motion_forms(&owner), vec![(XI_MASTER, pointer)]);
-    assert_eq!(xi2_motion_windows(&owner), vec![(WINDOW, 0)]);
+    assert_eq!(xi2_motion_windows(&owner), vec![(WINDOW, CHILD)]);
     assert_eq!(xi2_motion_forms(&natural), vec![(pointer, pointer)]);
     assert_eq!(xi2_motion_windows(&natural), vec![(CHILD, 0)]);
+}
+
+#[test]
+fn ungrabbed_parent_scroll_update_and_stop_share_child_geometry() {
+    // Xorg walks per-window targets for ordinary Motion, computes child D,
+    // and fixes event coordinates relative to W via FixUpEventFromWindow
+    // (../xserver/dix/events.c:2623-2637, 2897-2931).
+    const SOURCE: u64 = 0xA75C6;
+    let mut f = fixture();
+    let pointer = pointer_source(&mut f.state, SOURCE, true);
+    select_xi2(&mut f, GRABBER, WINDOW, XI_MASTER, XI_MOTION);
+
+    inject_physical_wheel(&mut f, SOURCE, 106);
+    let update = read_all_capture_available(&mut f.grabber);
+    assert_eq!(xi2_motion_forms(&update), vec![(XI_MASTER, pointer)]);
+    let update_geometry = xi2_geometry(&update);
+    assert_eq!(update_geometry, vec![(WINDOW, CHILD, 150, 150, 50, 50)]);
+
+    super::super::emit_scroll_stop_to_state(
+        &mut f.state,
+        &f.xid_map,
+        crate::core_loop::InputOrigin::Physical(crate::xinput::InputSourceId(SOURCE)),
+        HOST_WINDOW,
+        150,
+        150,
+        0,
+        107,
+    );
+
+    let stop = read_all_capture_available(&mut f.grabber);
+    assert_eq!(
+        xi2_geometry(&stop),
+        vec![update_geometry[0]; 2],
+        "both stop axes preserve the update's window, child, event and root coordinates"
+    );
+    assert!(read_all_capture_available(&mut f.other).is_empty());
 }
 
 #[test]

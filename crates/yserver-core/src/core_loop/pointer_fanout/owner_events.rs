@@ -89,11 +89,7 @@ pub(super) fn xi2_motion_targets_for_source(
                 && let Some((grab_window, _, gx, gy, ..)) =
                     super::active_pointer_grab_target(state, grab)
             {
-                let child = if grab.owner_events || grab.implicit || grab.passive {
-                    xi2_child_toward(state, grab_window, target)
-                } else {
-                    ResourceId(0)
-                };
+                let child = xi2_child_toward(state, grab_window, target);
                 targets.push(Xi2MotionTarget {
                     client: grab.owner,
                     form,
