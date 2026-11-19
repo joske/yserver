@@ -1,6 +1,6 @@
 # Per-device implicit pointer grabs
 
-Status: draft, revision 4 (sol review r1: R4-R6 and R1's XI2 part folded in; XI1 implicit grabs moved to their own PR by the user's decision, which settles R1's XI1 part, R2 and R3; sol review r2: R7 folded in as invariant 10; sol review r3: R8 removed the wrong second-button passive requirement). Stacked on PR #373 (`feat/pointer-routing-xorg`, `48f69aab`).
+Status: draft, revision 4 (sol review r1: R4-R6 and R1's XI2 part folded in; XI1 implicit grabs moved to their own PR by the user's decision, which settles R1's XI1 part, R2 and R3; sol review r2: R7 folded in as invariant 10; sol review r3: R8 removed the wrong second-button passive requirement; sol review r4: APPROVED). Stacked on PR #373 (`feat/pointer-routing-xorg`, `48f69aab`).
 Measurements: `docs/superpowers/findings/2026-11-19-per-device-implicit-grabs-measurements.md` (cases I1-I8).
 
 ## Intent
@@ -84,7 +84,7 @@ Invariants:
    - **Core GrabPointer and XIGrabDevice on the master:** ignore slave implicit grabs (I4).
 
 10. **No single grab per source.** A slave implicit grab is attached, so the master form and the core event of the same physical event still exist and belong to the master's grab state. `active_grab_for_source` (`pointer_fanout.rs` ~3566) returns the slave's entry first, which was safe only while every slave entry detached the slave. While a slave implicit grab is held, no decision about the master form or the core event may be taken from the slave's grab. Affected consumer:
-    - the wheel encoder's suppression of the emulated XI_ButtonPress for a Motion-only grab (`pointer_fanout.rs` ~2510) must use the grab of the form being encoded (`grab_for_form` or the per-form route already computed). Example: A holds the slave implicit grab, B holds master 2 with only XI_Motion; a wheel step must give B the scroll Motion and no XI_ButtonPress (`../xserver/dix/getevents.c:1646`, `:1703`; `../xserver/dix/events.c:4364`, `:4396`);
+    - the wheel encoder's suppression of the emulated XI_ButtonPress for a Motion-only grab (`pointer_fanout.rs` ~2510) must use the grab of the form being encoded (`grab_for_form` or the per-form route already computed). Example: A holds the slave implicit grab, B holds master 2 with only XI_Motion; a wheel step must give B the scroll Motion and no XI_ButtonPress (`../xserver/dix/getevents.c:1646`, `:1703`; `../xserver/dix/events.c:4364`, `:4396`).
 
     Unaffected consumers: those gated on `grab.passive` (~1791, ~1975, ~2313), because an implicit grab is never passive; and the core passive-grab gate (~1410), because a slave implicit grab means a master button is held, and the first-button rule already in `ServerState::find_passive_grab` (`server.rs` ~4065, Xorg `CheckDeviceGrabs`, `../xserver/dix/events.c:4200`) blocks passive activation on any further button. That rule stays.
 
