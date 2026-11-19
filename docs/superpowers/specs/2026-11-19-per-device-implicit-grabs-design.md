@@ -1,6 +1,6 @@
 # Per-device implicit pointer grabs
 
-Status: draft, revision 3 (sol review r1: R4-R6 and R1's XI2 part folded in; XI1 implicit grabs moved to their own PR by the user's decision, which settles R1's XI1 part, R2 and R3). Stacked on PR #373 (`feat/pointer-routing-xorg`, `48f69aab`).
+Status: draft, revision 4 (sol review r1: R4-R6 and R1's XI2 part folded in; XI1 implicit grabs moved to their own PR by the user's decision, which settles R1's XI1 part, R2 and R3; sol review r2: R7 folded in as invariant 10). Stacked on PR #373 (`feat/pointer-routing-xorg`, `48f69aab`).
 Measurements: `docs/superpowers/findings/2026-11-19-per-device-implicit-grabs-measurements.md` (cases I1-I8).
 
 ## Intent
@@ -38,7 +38,7 @@ PR #373 named this as follow-up "finding 3". joske's #373 review placed the C19 
 **Reuse first.**
 - **Slave grab:** stored in the existing per-slave table `ServerState::xi2_pointer_grabs`, as an `ActivePointerGrab` with `implicit: true` (the field exists).
 - **Master grab:** stays in `active_pointer_grab`.
-- **Routing:** the per-form routing reads the slave's grab through `grab_for_form(Slave)`, so the owner-events walk of #373 applies unchanged. This covers ordinary and smooth-scroll Motion and the `xi1_selection_filter_for_slave_grab` filter.
+- **Routing:** the per-form routing reads the slave's grab through `grab_for_form(Slave)`, so the owner-events walk of #373 applies unchanged. This covers ordinary and smooth-scroll Motion and the `xi1_selection_filter_for_slave_grab` filter. The decisions that still read one grab per source are corrected by invariant 10.
 - **Cleanup:** the existing request and cleanup paths apply too, with the implicit-aware removal of invariant 7.
 - **Anti-goal:** a new table or a parallel lifecycle.
 
@@ -83,13 +83,20 @@ Invariants:
    - **XIUngrabDevice by the owner:** ends the grab (I8).
    - **Core GrabPointer and XIGrabDevice on the master:** ignore slave implicit grabs (I4).
 
+10. **No single grab per source.** A slave implicit grab is attached, so the master form and the core event of the same physical event still exist and belong to the master's grab state. `active_grab_for_source` (`pointer_fanout.rs` ~3566) returns the slave's entry first, which was safe only while every slave entry detached the slave. While a slave implicit grab is held, no decision about the master form or the core event may be taken from the slave's grab. Known consumers:
+    - the wheel encoder's suppression of the emulated XI_ButtonPress for a Motion-only grab (`pointer_fanout.rs` ~2510) must use the grab of the form being encoded (`grab_for_form` or the per-form route already computed). Example: A holds the slave implicit grab, B holds master 2 with only XI_Motion; a wheel step must give B the scroll Motion and no XI_ButtonPress (`../xserver/dix/getevents.c:1646`, `:1703`; `../xserver/dix/events.c:4364`, `:4396`);
+    - the core passive-grab match gate (`pointer_fanout.rs` ~1410) must ask whether the master holds a grab, not the source. A second button pressed while only the slave is grabbed still checks the master's passive grabs, as Xorg checks each device's grabs separately.
+
+    The consumers gated on `grab.passive` (~1791, ~1975, ~2313) are unaffected because an implicit grab is never passive.
+
 ## Goals
 
 - I1-I8 match Xvfb in recipient, event type, device/source and event window, under the exclusions of the measurement doc.
 - Rust regression tests drive real requests and the production input entry points (`pointer_event_fanout_to_state`) for: I1/I1a, I2, I3, I4, I6 (UnmapWindow and UnmapSubwindows), I7, I8. Further tests cover:
   - differing slave and master masks on the press window (invariant 3);
   - removing a slave implicit grab leaves a live master grab's paired freeze hold and cursor intact (invariant 7);
-  - XI1 GrabDevice over an XI2 implicit grab (invariant 9).
+  - XI1 GrabDevice over an XI2 implicit grab (invariant 9);
+  - the wheel case of invariant 10 (scroll-capable source, Motion-only master grab by another client: no XI_ButtonPress) and a core passive grab activating on the second button while only the slave is grabbed.
 
   Each test must be seen failing on `48f69aab`.
 - No regression in the #373 matrix C1-C20.
