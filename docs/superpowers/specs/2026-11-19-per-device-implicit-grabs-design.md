@@ -1,6 +1,6 @@
 # Per-device implicit pointer grabs
 
-Status: draft for review. Stacked on PR #373 (`feat/pointer-routing-xorg`, `48f69aab`).
+Status: draft, revision 2 (sol review r1: R4-R6 and R1's XI2 part folded in; XI1 moved out pending the user's decision). Stacked on PR #373 (`feat/pointer-routing-xorg`, `48f69aab`).
 Measurements: `docs/superpowers/findings/2026-11-19-per-device-implicit-grabs-measurements.md` (cases I1-I8).
 
 ## Intent
@@ -35,36 +35,63 @@ PR #373 named this as follow-up "finding 3". joske's #373 review placed the C19 
 
 ## Design
 
-**Reuse first:**
-- **Slave grab:** stored in the existing per-slave table `ServerState::xi2_pointer_grabs`, as an `ActivePointerGrab` with `implicit: true` (field exists).
-- **XI1 implicit grab:** stored in the existing `xi1_active_grabs`, with an implicit marker on `Xi1ActiveGrab`.
+**Reuse first.**
+- **Slave grab:** stored in the existing per-slave table `ServerState::xi2_pointer_grabs`, as an `ActivePointerGrab` with `implicit: true` (the field exists).
 - **Master grab:** stays in `active_pointer_grab`.
-- **Consequence:** existing request and cleanup paths (XIGrabDevice AlreadyGrabbed, XIUngrabDevice, unmap, window destroy, disconnect, device removal) and the existing per-form routing (`grab_for_form`, the owner-events walk of #373, `xi1_selection_filter_for_slave_grab`) apply to implicit slave grabs without new mechanisms. A new table or a parallel lifecycle is an anti-goal.
+- **Routing:** the per-form routing reads the slave's grab through `grab_for_form(Slave)`, so the owner-events walk of #373 applies unchanged. This covers ordinary and smooth-scroll Motion and the `xi1_selection_filter_for_slave_grab` filter.
+- **Cleanup:** the existing request and cleanup paths apply too, with the implicit-aware removal of invariant 7.
+- **Anti-goal:** a new table or a parallel lifecycle.
 
-**Invariants:**
-1. **Master activation.** The master implicit grab is built only from master-side deliveries (core press, XI2 master form). A press whose only delivery was a slave form or XI1 leaves `active_pointer_grab` empty.
-2. **Slave activation.** A slave implicit grab is built only from that slave's deliveries (XI2 slave form, XI1), and only when that slave has no grab.
-   - If both an XI2 slave delivery and an XI1 delivery happened, the deeper window wins. On the same window, XI2 wins (Xorg tries XI2 before XI1 per window).
-   - The XI2 case lives in `xi2_pointer_grabs`; the XI1 case lives in `xi1_active_grabs`.
-   - At most one implicit grab exists per slave, in exactly one of the two tables.
-3. **Independence.** Master activation does not depend on whether the source slave holds an implicit grab, and vice versa.
-   - The existing early return for a source slave with an XI2 grab must keep holding for explicit and passive slave grabs, which detach the slave.
-   - It must not suppress the master's implicit grab when the slave's grab is implicit.
-4. **No detach.** Installing or removing an implicit slave grab never calls `detach_xi2_slave`. `xi2_detached_masters` is unchanged across its lifetime.
-5. **Release.** A slave implicit grab is removed after the release that leaves that slave's per-device buttons-down set empty. The master implicit grab keeps its current rule: the master aggregate `buttons_down` reaches zero.
-6. **Routing.** While a slave implicit grab exists, that slave's XI2 slave-form events and XI1 events go only to its owner on its window (I1, I2, I5, I7). This is the same routing an exclusive (non-owner-events) explicit grab of that protocol gets today. Master-form and core events follow the master's grab state only.
-7. **Teardown.** Ending a slave implicit grab by request, unmap, destroy, disconnect or device removal leaves no `xi2_pointer_grabs` or `xi1_active_grabs` entry.
-   - The next slave event routes naturally (I6, I8).
-   - Teardown thaws no freeze, since an implicit grab is always async. It also reattaches nothing, since the slave never detached.
-8. **Requests.**
-   - XIGrabDevice on a slave held implicitly by another client: AlreadyGrabbed.
-   - By the same client: it replaces the grab and becomes explicit, with the detach that explicit slave grabs already do.
-   - Core GrabPointer and XIGrabDevice on the master ignore slave implicit grabs (I4).
+Invariants:
+
+1. **Master activation.** The master implicit grab is built only from master-side deliveries: core press and XI2 master form.
+   - A press whose only delivery was a slave form leaves `active_pointer_grab` empty.
+2. **Slave activation.** A slave implicit grab is built only from that slave's XI2 slave-form press delivery.
+   - It activates only when that slave has no grab in either `xi2_pointer_grabs` or `xi1_active_grabs`.
+   - The candidate choice among several slave-form deliveries is the existing `consider_xi2_press` rule.
+3. **Per-device mask snapshot.** Each implicit grab's `xi2_mask` is the merged selection of its window as seen by THAT device. This follows `xi2mask_isset`, `../xserver/dix/inpututils.c:1153`, as used by grab delivery at `../xserver/dix/events.c:4364`:
+   - for the slave: the union over all clients of the window's selections for the slave's id plus XIAllDevices (0);
+   - for the master: the master's id (2) plus XIAllDevices (0) plus XIAllMasterDevices (1).
+   - Today's capture ORs all four into both grabs; that is a defect for both grabs.
+   - The core `event_mask` of the master grab is unchanged.
+4. **Independence.** Master activation does not depend on whether the source slave holds an implicit grab, and vice versa.
+   - The existing early return when the source slave has an XI2 grab keeps holding for explicit and passive slave grabs, which detach the slave.
+   - It must not suppress the master implicit grab when the slave's grab is implicit.
+5. **No detach.** Installing or removing an implicit slave grab never calls `detach_xi2_slave` or `reattach_xi2_slave`. `xi2_detached_masters` is unchanged across its lifetime.
+6. **Release.** A slave implicit grab is removed after delivering the release that leaves that slave's per-device buttons-down set empty. The master implicit grab keeps its rule: removed once the master aggregate `buttons_down` reaches zero.
+7. **Implicit-aware removal.** Every path that removes a `xi2_pointer_grabs` entry removes an implicit one with a bare removal, as the master implicit grab already does today. Xorg's `DeactivatePointerGrab` clears only holds that point at the dying grab (`../xserver/dix/events.c:1698-1701`), and an implicit grab is async and owns none. The bare removal must not:
+   - release freeze bridges or other holds (`xi1_core_grab_bridge_release`, `xi1_frozen` owner fields);
+   - clear the backend grab cursor;
+   - reattach the slave.
+
+   The paths that must use it:
+   - XIUngrabDevice (`deactivate_xi2_device_grab`);
+   - window destroy;
+   - disconnect (`release_active_grabs`);
+   - source and facet removal (`xi_cleanup_source`, `xi_unregister_facet`, `xi_unregister_source`);
+   - the per-device release of invariant 6.
+
+   One shared helper used by all of them is preferred over per-site branches.
+8. **Unviewable windows.** Making a grab window unviewable ends every `xi2_pointer_grabs` entry on it, implicit or not (I6). This holds for UnmapWindow, UnmapSubwindows and the unmap of an ancestor. Xorg reaches it through `DeleteWindowFromAnyEvents` at unrealize (`../xserver/dix/window.c:2806`, `../xserver/dix/events.c:5926`).
+   - Today, unmap releases `xi1_active_grabs` and the master slots but not `xi2_pointer_grabs`.
+   - The fix extends the existing shared unviewable cleanup (`release_core_grabs_for_unviewable`, `process_request/grabs.rs`), which both unmap requests already call.
+   - Explicit slave grabs gain the same Xorg-matching release.
+9. **Requests.** As in Xorg `GrabDevice` (`../xserver/dix/events.c:5288-5291`):
+   - **XIGrabDevice on a slave held implicitly by another client:** AlreadyGrabbed.
+   - **XIGrabDevice by the same client:** it replaces the grab, which becomes explicit and detaches like any explicit slave grab.
+   - **XI1 GrabDevice on a slave whose implicit grab is XI2:** AlreadyGrabbed, even for the same client, because the protocols differ. The XI1 GrabDevice occupancy check therefore also consults `xi2_pointer_grabs`.
+   - **XIUngrabDevice by the owner:** ends the grab (I8).
+   - **Core GrabPointer and XIGrabDevice on the master:** ignore slave implicit grabs (I4).
 
 ## Goals
 
 - I1-I8 match Xvfb in recipient, event type, device/source and event window, under the exclusions of the measurement doc.
-- Rust regression tests drive real requests and the production input entry points (`pointer_event_fanout_to_state`) for: I1/I1a, I2, I3, I4, I5, I6, I7, I8. Each test must be seen failing on `48f69aab`.
+- Rust regression tests drive real requests and the production input entry points (`pointer_event_fanout_to_state`) for: I1/I1a, I2, I3, I4, I6 (UnmapWindow and UnmapSubwindows), I7, I8. Further tests cover:
+  - differing slave and master masks on the press window (invariant 3);
+  - removing a slave implicit grab leaves a live master grab's paired freeze hold and cursor intact (invariant 7);
+  - XI1 GrabDevice over an XI2 implicit grab (invariant 9).
+
+  Each test must be seen failing on `48f69aab`.
 - No regression in the #373 matrix C1-C20.
 
 ## Non-goals
@@ -74,6 +101,7 @@ PR #373 named this as follow-up "finding 3". joske's #373 review placed the C19 
 - Which windows a press is delivered to: this PR takes the existing deliveries as given and only changes which grab they activate.
 - Enter/Leave crossings for implicit grabs; attached-slave coordinate timing; C18.
 - Touch, keyboard.
+- XI1 implicit grabs (I5), pending the user's decision.
 
 ## Anti-goals
 
@@ -98,7 +126,7 @@ Behaviour is taken from Xorg server 21.1.24 (MIT/X11 licence) source citations a
 
 ## Left to the plan
 
-- The exact shape of the implicit marker on `Xi1ActiveGrab`.
-- How the XI1 press delivery is reported to the lifecycle, in the same way `ImplicitGrabFanoutInfo` reports XI2 deliveries.
+- The XI1 section, if the user keeps XI1 in this PR (see review r1, R1-R3).
+
 - Where the per-slave release check lives. The existing passive per-device release at `pointer_fanout.rs` ~3245 is the reuse candidate.
 - Test fixture reuse.
