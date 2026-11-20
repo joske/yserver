@@ -11,6 +11,7 @@ const CLIENT_A: u32 = 0xA753;
 const CLIENT_B: u32 = 0xA754;
 const W: u32 = 0x0010_A753;
 const D: u32 = 0x0020_A753;
+const P: u32 = 0x0050_A753;
 const OUT: u32 = 0x0010_A754;
 const HOST_W: u32 = 0xCAFE_A753;
 const HOST_OUT: u32 = 0xCAFE_A754;
@@ -31,6 +32,8 @@ const CORE_GRAB_POINTER: u8 = 26;
 const CORE_UNGRAB_POINTER: u8 = 27;
 const CORE_CREATE_PIXMAP: u8 = 53;
 const CORE_CREATE_CURSOR: u8 = 93;
+const CORE_UNMAP_WINDOW: u8 = 10;
+const CORE_UNMAP_SUBWINDOWS: u8 = 11;
 const GRAB_PIXMAP_A: u32 = 0x0030_A753;
 const GRAB_CURSOR_A: u32 = 0x0040_A753;
 const GRAB_PIXMAP_B: u32 = 0x0030_A754;
@@ -81,6 +84,21 @@ fn fixture() -> Fixture {
 
     let _ = read_all_capture_available(&mut f.client_a);
     let _ = read_all_capture_available(&mut f.client_b);
+    f
+}
+
+/// Rebuilds W below a mapped top-level parent while keeping the measured
+/// root geometry. The ordinary fixture makes W a root child, so the
+/// UnmapSubwindows ancestor case needs this request-dispatched variant.
+fn fixture_with_parent() -> Fixture {
+    let mut f = fixture();
+    dispatch(&mut f, CLIENT_A, 4, 0, &W.to_le_bytes()); // DestroyWindow
+    create_window(&mut f, CLIENT_A, P, 0, 100, 100, 300, 300);
+    map_window(&mut f, CLIENT_A, P);
+    create_window(&mut f, CLIENT_A, W, P, 0, 0, 300, 300);
+    map_window(&mut f, CLIENT_A, W);
+    create_window(&mut f, CLIENT_A, D, W, 20, 20, 100, 100);
+    map_window(&mut f, CLIENT_A, D);
     f
 }
 
@@ -177,6 +195,8 @@ fn grab_xi2_device(
     window: u32,
     device: u16,
     owner_events: bool,
+    pointer_mode: u8,
+    paired_device_mode: u8,
     mask: u32,
 ) {
     let mut body = Vec::with_capacity(24);
@@ -184,7 +204,7 @@ fn grab_xi2_device(
     body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
     body.extend_from_slice(&0u32.to_le_bytes()); // no cursor
     body.extend_from_slice(&device.to_le_bytes());
-    body.extend_from_slice(&[1, 1, u8::from(owner_events), 0]); // async, async, owner_events
+    body.extend_from_slice(&[pointer_mode, paired_device_mode, u8::from(owner_events), 0]);
     body.extend_from_slice(&1u16.to_le_bytes()); // one mask word
     body.extend_from_slice(&mask.to_le_bytes());
     dispatch(f, client, XI2_OPCODE, XI_GRAB_DEVICE, &body);
@@ -623,7 +643,7 @@ fn motion_only_master_grab_gets_no_wheel_press_during_slave_grab() {
     assert!(f.state.xi2_detached_masters.is_empty());
     let _ = read_packets(&mut f.client_a);
 
-    grab_xi2_device(&mut f, CLIENT_B, OUT, XI_MASTER, false, XI_MOTION);
+    grab_xi2_device(&mut f, CLIENT_B, OUT, XI_MASTER, false, 1, 1, XI_MOTION);
     let grab_reply = read_all_capture_available(&mut f.client_b);
     assert_eq!(
         xi2_grab_reply_status(&grab_reply),
@@ -1223,4 +1243,145 @@ fn destroy_grab_window_ends_slave_implicit_grab() {
     final_motion(&mut f, origin);
     assert_eq!(read_packets(&mut f.client_b), vec![xi(6, 4, 4, OUT)]);
     assert_end_state(&f);
+}
+
+#[test]
+fn i6_unmap_grab_window_ends_slave_implicit_grab() {
+    let mut f = fixture();
+    select_xi2(&mut f, CLIENT_A, W, XI_XTEST, XI_GRAB_MASK);
+    select_xi2(&mut f, CLIENT_B, OUT, XI_XTEST, XI_GRAB_MASK);
+    let origin = InputOrigin::XTest(XI_XTEST);
+
+    press_over_d(&mut f, origin, 1);
+    assert_slave_implicit(&f, XI_XTEST, CLIENT_A, W);
+    assert!(f.state.active_pointer_grab.is_none());
+    assert!(f.state.xi2_detached_masters.is_empty());
+    let mut packets_a = read_packets(&mut f.client_a);
+    assert_eq!(packets_a, vec![xi(4, XI_XTEST, XI_XTEST, W)]);
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    move_to_out(&mut f, origin);
+    let drag = read_packets(&mut f.client_a);
+    assert_eq!(drag, vec![xi(6, XI_XTEST, XI_XTEST, W)]);
+    packets_a.extend(drag);
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    dispatch(&mut f, CLIENT_A, CORE_UNMAP_WINDOW, 0, &W.to_le_bytes());
+    assert_eq!(
+        f.state.resources.window(ResourceId(W)).unwrap().map_state,
+        crate::resources::MapState::Unmapped
+    );
+    assert!(
+        !f.state.xi2_pointer_grabs.contains_key(&XI_XTEST),
+        "unmapping the grab window ends its slave implicit grab"
+    );
+
+    final_motion(&mut f, origin);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(6, XI_XTEST, XI_XTEST, OUT)]
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    release(&mut f, origin, 1);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(5, XI_XTEST, XI_XTEST, OUT)]
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(
+        packets_a
+            .iter()
+            .all(|packet| !packet.xi2 || packet.device != XI_MASTER),
+        "client A receives no d2 events at any point"
+    );
+    assert_end_state(&f);
+}
+
+#[test]
+fn unmap_subwindows_of_ancestor_ends_slave_implicit_grab() {
+    let mut f = fixture_with_parent();
+    select_xi2(&mut f, CLIENT_A, W, XI_XTEST, XI_GRAB_MASK);
+    select_xi2(&mut f, CLIENT_B, OUT, XI_XTEST, XI_GRAB_MASK);
+    let origin = InputOrigin::XTest(XI_XTEST);
+
+    press_over_d(&mut f, origin, 1);
+    assert_slave_implicit(&f, XI_XTEST, CLIENT_A, W);
+    assert!(f.state.active_pointer_grab.is_none());
+    assert!(f.state.xi2_detached_masters.is_empty());
+    let mut packets_a = read_packets(&mut f.client_a);
+    assert_eq!(packets_a, vec![xi(4, XI_XTEST, XI_XTEST, W)]);
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    move_to_out(&mut f, origin);
+    let drag = read_packets(&mut f.client_a);
+    assert_eq!(drag, vec![xi(6, XI_XTEST, XI_XTEST, W)]);
+    packets_a.extend(drag);
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    dispatch(&mut f, CLIENT_A, CORE_UNMAP_SUBWINDOWS, 0, &P.to_le_bytes());
+    assert_eq!(
+        f.state.resources.window(ResourceId(W)).unwrap().map_state,
+        crate::resources::MapState::Unmapped
+    );
+    assert!(
+        !f.state.xi2_pointer_grabs.contains_key(&XI_XTEST),
+        "unmapping an ancestor's subwindows ends the descendant grab"
+    );
+
+    final_motion(&mut f, origin);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(6, XI_XTEST, XI_XTEST, OUT)]
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    release(&mut f, origin, 1);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(5, XI_XTEST, XI_XTEST, OUT)]
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(
+        packets_a
+            .iter()
+            .all(|packet| !packet.xi2 || packet.device != XI_MASTER),
+        "client A receives no d2 events at any point"
+    );
+    assert_end_state(&f);
+}
+
+#[test]
+fn unmap_ends_explicit_slave_grab_with_full_teardown() {
+    let mut f = fixture();
+    grab_xi2_device(&mut f, CLIENT_A, W, XI_XTEST, false, 0, 1, XI_GRAB_MASK);
+    assert_eq!(
+        xi2_grab_reply_status(&read_all_capture_available(&mut f.client_a)),
+        0
+    );
+    let grab = f
+        .state
+        .xi2_pointer_grabs
+        .get(&XI_XTEST)
+        .expect("XIGrabDevice installs the explicit slave grab");
+    assert_eq!(grab.owner, ClientId(CLIENT_A));
+    assert_eq!(grab.grab_window, ResourceId(W));
+    assert!(!grab.owner_events);
+    assert!(!grab.implicit);
+    assert!(f.state.xi2_detached_masters.contains_key(&XI_XTEST));
+    assert_eq!(
+        f.state.xi1_frozen[&XI_XTEST].state,
+        crate::server::Xi1SyncState::FrozenNoEvent
+    );
+
+    dispatch(&mut f, CLIENT_A, CORE_UNMAP_WINDOW, 0, &W.to_le_bytes());
+    assert!(
+        !f.state.xi2_pointer_grabs.contains_key(&XI_XTEST),
+        "unmapping the explicit grab window ends its slave grab"
+    );
+    assert!(f.state.active_pointer_grab.is_none());
+    assert!(f.state.xi2_detached_masters.is_empty());
+    assert_eq!(f.state.xi1_frozen.len(), 1);
+    let freeze = &f.state.xi1_frozen[&XI_XTEST];
+    assert_eq!(freeze.state, crate::server::Xi1SyncState::Thawed);
+    assert_eq!(freeze.other, None);
+    assert!(freeze.stored.is_none());
 }

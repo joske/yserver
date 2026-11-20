@@ -1629,6 +1629,23 @@ pub(super) fn release_core_grabs_for_unviewable(
     {
         deactivate_core_keyboard_grab(state, g.owner);
     }
+
+    let mut xi2_pointer_grabs: Vec<(u16, ClientId, bool)> = state
+        .xi2_pointer_grabs
+        .iter()
+        .filter(|(_, grab)| !viewable(state, grab.grab_window))
+        .map(|(&device, grab)| (device, grab.owner, grab.implicit))
+        .collect();
+    xi2_pointer_grabs.sort_unstable_by_key(|(device, _, _)| *device);
+    for (device, owner, implicit) in xi2_pointer_grabs {
+        if implicit {
+            state.remove_implicit_xi2_pointer_grab(device);
+        } else {
+            super::xi::deactivate_xi2_device_grab(
+                state, backend, None, owner, device, false, false,
+            );
+        }
+    }
 }
 
 pub(super) fn handle_grab_key(
