@@ -1955,6 +1955,23 @@ impl ServerState {
         self.active_pointer_grab = None;
     }
 
+    /// Remove an implicit XI2 slave grab without applying explicit-grab
+    /// teardown to freezes, cursors, or device attachment.
+    pub fn remove_implicit_xi2_pointer_grab(
+        &mut self,
+        device_id: u16,
+    ) -> Option<ActivePointerGrab> {
+        if self
+            .xi2_pointer_grabs
+            .get(&device_id)
+            .is_some_and(|grab| grab.implicit)
+        {
+            self.xi2_pointer_grabs.remove(&device_id)
+        } else {
+            None
+        }
+    }
+
     /// Temporarily float a slave for an explicit XI2 grab, saving its
     /// attachment so deactivation and disconnect can restore it. XTEST 4/5
     /// have no physical facet, but are slaves like the dynamic facets. Xorg

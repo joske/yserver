@@ -5674,6 +5674,7 @@ fn implicit_grab_multi_button_lifecycle() {
     );
 }
 
+mod implicit_grabs;
 mod owner_events;
 mod passive_grab_activation;
 mod server_events;
