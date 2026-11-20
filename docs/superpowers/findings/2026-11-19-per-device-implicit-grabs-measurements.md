@@ -934,3 +934,16 @@ int main(int argc, char **argv) {
     return 0;
 }
 ```
+
+## Branch result (2026-11-20)
+
+Branch `feat/per-device-implicit-grabs` at `4ae68315`, headless on `:96` with lavapipe. In the same session the same client ran against Xvfb 21.1.24 on `:97` and against a fresh `48f69aab` build. Rows were compared on recipient, event type, device/source, event window and grab status. Crossings, coordinates, the child and raw wire bytes (timestamps) were excluded, as above. The Xvfb rerun reproduced the first measurement for every I-row.
+
+| rows | branch vs Xvfb | branch vs `48f69aab` |
+|---|---|---|
+| I1, I1a, I2, I3, I4, I6, I7, I8 | match | changed (the fix) |
+| I5 (XI1, a non-goal) | differs, as on `48f69aab` | unchanged |
+| C1-C14, C16-C20 | match (C10 differs only in raw bytes) | unchanged |
+| C15 | not run: headless yserver has no second pointer slave; the Rust test from #373 still covers it | unchanged |
+
+Gate on the branch: `cargo test --workspace --features xdmcp` 5085 passed, the lavapipe `--ignored` suite 774 passed. fmt, clippy, `tools/check-layout.sh` and `just man` were clean. `pointer_fanout`, `grab` and `xi2_grabs` each ran 5 times under 16 busy loops with 0 failures.
