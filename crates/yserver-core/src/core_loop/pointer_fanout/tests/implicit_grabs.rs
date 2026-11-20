@@ -1416,6 +1416,71 @@ fn unmap_ends_explicit_slave_grab_with_full_teardown() {
     assert!(freeze.stored.is_none());
 }
 
+fn assert_unmap_replays_explicit_slave_input(f: &mut Fixture, unmap_subwindows: bool) {
+    select_xi2(f, CLIENT_B, OUT, XI_XTEST, XI_GRAB_MASK);
+    let original_master = f.state.xi_devices.device(XI_XTEST).unwrap().attached_master;
+    assert!(original_master.is_some());
+
+    grab_xi2_device(f, CLIENT_A, W, XI_XTEST, false, 0, 1, XI_GRAB_MASK);
+    assert_eq!(
+        grab_reply_status(&read_all_capture_available(&mut f.client_a)),
+        0
+    );
+    assert!(f.state.xi2_detached_masters.contains_key(&XI_XTEST));
+    assert_eq!(
+        f.state.xi1_frozen[&XI_XTEST].state,
+        crate::server::Xi1SyncState::FrozenNoEvent
+    );
+
+    let origin = InputOrigin::XTest(XI_XTEST);
+    send(f, origin, PointerEventKind::ButtonPress, 1, 650, 150);
+    send(f, origin, PointerEventKind::ButtonRelease, 1, 650, 150);
+    assert_eq!(f.state.sync_pending.len(), 2);
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    if unmap_subwindows {
+        dispatch(f, CLIENT_A, CORE_UNMAP_SUBWINDOWS, 0, &P.to_le_bytes());
+    } else {
+        dispatch(f, CLIENT_A, CORE_UNMAP_WINDOW, 0, &W.to_le_bytes());
+    }
+
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![
+            xi(4, XI_XTEST, XI_XTEST, OUT),
+            xi(5, XI_XTEST, XI_XTEST, OUT),
+        ],
+        "unmapping releases and immediately delivers the queued slave events"
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(f.state.sync_pending.is_empty());
+    assert!(!f.state.xi2_pointer_grabs.contains_key(&XI_XTEST));
+    assert!(f.state.active_pointer_grab.is_none());
+    assert!(f.state.xi2_detached_masters.is_empty());
+    assert_eq!(
+        f.state.xi_devices.device(XI_XTEST).unwrap().attached_master,
+        original_master,
+        "unmapping reattaches device 4 before replaying input"
+    );
+    let freeze = &f.state.xi1_frozen[&XI_XTEST];
+    assert_eq!(freeze.state, crate::server::Xi1SyncState::Thawed);
+    assert_eq!(freeze.other, None);
+    assert!(freeze.stored.is_none());
+}
+
+#[test]
+fn unmap_explicit_slave_grab_replays_queued_input() {
+    let mut f = fixture();
+    assert_unmap_replays_explicit_slave_input(&mut f, false);
+}
+
+#[test]
+fn unmap_subwindows_explicit_slave_grab_replays_queued_input() {
+    let mut f = fixture_with_parent();
+    assert_unmap_replays_explicit_slave_input(&mut f, true);
+}
+
 #[test]
 fn i4_grab_statuses_during_slave_implicit_grab() {
     let mut f = fixture();

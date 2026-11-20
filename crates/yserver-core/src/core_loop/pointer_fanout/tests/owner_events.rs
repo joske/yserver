@@ -2,6 +2,7 @@ use super::*;
 
 use crate::{
     backend::recording::RecordingBackend,
+    core_loop::{DeviceInfo, message::LibinputConfigSnapshot},
     resources::{ROOT_VISUAL, ROOT_WINDOW},
 };
 use yserver_protocol::x11::{RequestHeader, ResourceId, SequenceNumber};
@@ -11,6 +12,7 @@ const OTHER: u32 = 0xA754;
 const WINDOW: u32 = 0x0010_A753;
 const CHILD: u32 = 0x0020_A753;
 const OUTSIDE: u32 = 0x0010_A754;
+const PARENT: u32 = 0x0050_A753;
 const HOST_WINDOW: u32 = 0xCAFE_A753;
 const HOST_OUTSIDE: u32 = 0xCAFE_A754;
 const XI2_OPCODE: u8 = 137;
@@ -20,6 +22,8 @@ const XI_GRAB_DEVICE: u8 = 51;
 const XI_UNGRAB_DEVICE: u8 = 52;
 const XI_ALLOW_EVENTS: u8 = 53;
 const XI_PASSIVE_GRAB_DEVICE: u8 = 54;
+const CORE_UNMAP_WINDOW: u8 = 10;
+const CORE_UNMAP_SUBWINDOWS: u8 = 11;
 const XI_SELECT_EXTENSION_EVENT: u8 = 6;
 const XI_MOTION: u32 = 1 << 6;
 const XI_BUTTONS: u32 = (1 << 4) | (1 << 5);
@@ -57,12 +61,50 @@ fn fixture_with_child_owner(child_owner: u32) -> Fixture {
 }
 
 fn fixture_with_window_owners(child_owner: u32, outside_owner: u32) -> Fixture {
+    fixture_with_window_owners_and_parent(child_owner, outside_owner, false)
+}
+
+fn fixture_with_parent() -> Fixture {
+    fixture_with_window_owners_and_parent(OTHER, GRABBER, true)
+}
+
+fn fixture_with_window_owners_and_parent(
+    child_owner: u32,
+    outside_owner: u32,
+    parented: bool,
+) -> Fixture {
     let mut state = ServerState::new();
     let grabber = install_capture_client(&mut state, GRABBER);
     let other = install_capture_client(&mut state, OTHER);
     let backend = RecordingBackend::new();
+    if parented {
+        state.resources.create_window(
+            ClientId(GRABBER),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(PARENT),
+                parent: ROOT_WINDOW,
+                x: 100,
+                y: 100,
+                width: 200,
+                height: 200,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(PARENT));
+    }
+    let window_parent = if parented {
+        ResourceId(PARENT)
+    } else {
+        ROOT_WINDOW
+    };
+    let window_x = if parented { 0 } else { 100 };
+    let window_y = if parented { 0 } else { 100 };
     for (owner, window, parent, x, y, width, height) in [
-        (GRABBER, WINDOW, ROOT_WINDOW, 100, 100, 200, 200),
+        (GRABBER, WINDOW, window_parent, window_x, window_y, 200, 200),
         (child_owner, CHILD, ResourceId(WINDOW), 20, 20, 100, 100),
         (outside_owner, OUTSIDE, ROOT_WINDOW, 550, 100, 300, 300),
     ] {
@@ -94,6 +136,33 @@ fn fixture_with_window_owners(child_owner: u32, outside_owner: u32) -> Fixture {
         grabber,
         other,
     }
+}
+
+fn register_test_pointer_source(
+    f: &mut Fixture,
+    source_id: u64,
+) -> (crate::xinput::InputSourceId, u16) {
+    let source = crate::xinput::InputSourceId(source_id);
+    let info = DeviceInfo {
+        source_id: source,
+        enabled: true,
+        resume_key: None,
+        capabilities: crate::xinput::InputCapabilities {
+            keyboard: false,
+            pointer: true,
+            touch: false,
+        },
+        name: "unmap queue test pointer".to_owned(),
+        device_node: "/dev/input/unmap-queue-test".to_owned(),
+        sysname: "unmap-queue-test".to_owned(),
+        vendor_id: 0,
+        product_id: 0,
+        is_touchpad: false,
+        config: LibinputConfigSnapshot::default(),
+    };
+    let devices = f.state.xi_register_source(&info);
+    assert_eq!(devices.len(), 1, "test source registers one pointer facet");
+    (source, devices[0])
 }
 
 fn dispatch(f: &mut Fixture, client: u32, sequence: u16, opcode: u8, data: u8, body: &[u8]) {
@@ -222,12 +291,19 @@ fn grab_xi2_device_with_options(
     let _ = read_all_capture_available(&mut f.other);
 }
 
-fn grab_xi2_passive_button_sync(f: &mut Fixture, window: u32, device: u16, event_mask: u32) {
+fn grab_xi2_passive_button_sync(
+    f: &mut Fixture,
+    client: u32,
+    window: u32,
+    device: u16,
+    button: u32,
+    event_mask: u32,
+) {
     let mut body = Vec::with_capacity(36);
     body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
     body.extend_from_slice(&window.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes()); // no cursor
-    body.extend_from_slice(&1u32.to_le_bytes()); // button 1
+    body.extend_from_slice(&button.to_le_bytes());
     body.extend_from_slice(&device.to_le_bytes());
     body.extend_from_slice(&1u16.to_le_bytes()); // AnyModifier
     body.extend_from_slice(&1u16.to_le_bytes()); // one XI2 event-mask word
@@ -235,8 +311,12 @@ fn grab_xi2_passive_button_sync(f: &mut Fixture, window: u32, device: u16, event
     body.extend_from_slice(&[0; 2]); // pad
     body.extend_from_slice(&event_mask.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes()); // AnyModifier
-    dispatch(f, GRABBER, 2, XI2_OPCODE, XI_PASSIVE_GRAB_DEVICE, &body);
-    let _ = read_all_capture_available(&mut f.grabber); // reply
+    dispatch(f, client, 2, XI2_OPCODE, XI_PASSIVE_GRAB_DEVICE, &body);
+    let _ = read_all_capture_available(if client == GRABBER {
+        &mut f.grabber
+    } else {
+        &mut f.other
+    }); // reply
     let _ = read_all_capture_available(&mut f.other);
 }
 
@@ -305,6 +385,26 @@ fn inject_from_origin(
     y: i16,
     host_xid: u32,
 ) {
+    let detail = if matches!(
+        kind,
+        PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
+    ) {
+        1
+    } else {
+        0
+    };
+    inject_from_origin_with_detail(f, origin, kind, detail, x, y, host_xid);
+}
+
+fn inject_from_origin_with_detail(
+    f: &mut Fixture,
+    origin: crate::core_loop::InputOrigin,
+    kind: PointerEventKind,
+    detail: u8,
+    x: i16,
+    y: i16,
+    host_xid: u32,
+) {
     let (host_x, host_y) = if host_xid == HOST_OUTSIDE {
         (550, 100)
     } else {
@@ -318,21 +418,14 @@ fn inject_from_origin(
             origin,
             kind,
             host_xid,
-            detail: if matches!(
-                kind,
-                PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
-            ) {
-                1
-            } else {
-                0
-            },
+            detail,
             time: 50,
             root_x: x,
             root_y: y,
             event_x: x - host_x,
             event_y: y - host_y,
             state: if kind == PointerEventKind::ButtonRelease {
-                0x100
+                1u16 << (7 + detail)
             } else {
                 0
             },
@@ -1927,7 +2020,7 @@ fn xi_sync_slave_passive_grab_delivers_activating_press_before_replay() {
     // B then gets a balanced slave press/release on D.
     let mut f = fixture();
     select_xi2(&mut f, OTHER, CHILD, XI_XTEST, XI_BUTTONS);
-    grab_xi2_passive_button_sync(&mut f, WINDOW, XI_XTEST, XI_BUTTONS);
+    grab_xi2_passive_button_sync(&mut f, GRABBER, WINDOW, XI_XTEST, 1, XI_BUTTONS);
 
     inject(&mut f, PointerEventKind::ButtonPress, 145, 145, HOST_WINDOW);
     let activating = read_all_capture_available(&mut f.grabber);
@@ -2008,6 +2101,229 @@ fn xi_sync_slave_passive_grab_delivers_activating_press_before_replay() {
     assert!(!f.state.xi1_frozen[&XI_XTEST].frozen());
     assert!(f.state.xi2_pointer_grabs.is_empty());
     assert_eq!(f.state.buttons_down, 0);
+}
+
+fn assert_passive_sync_unmap_replays_only_released_device(f: &mut Fixture, unmap_subwindows: bool) {
+    let (unrelated_source, unrelated_device) = register_test_pointer_source(f, 0xD15);
+    assert_ne!(unrelated_device, XI_XTEST);
+    select_xi2(f, OTHER, OUTSIDE, XI_XTEST, XI_GRAB_MASK);
+    select_xi2(f, OTHER, OUTSIDE, unrelated_device, XI_GRAB_MASK);
+
+    grab_xi2_passive_button_sync(f, GRABBER, WINDOW, XI_XTEST, 1, XI_GRAB_MASK);
+    inject(f, PointerEventKind::ButtonPress, 145, 145, HOST_WINDOW);
+    let activating = read_all_capture_available(&mut f.grabber);
+    assert_eq!(
+        decode_deliveries(&activating)
+            .iter()
+            .map(|event| (event.xi2, event.kind, event.window))
+            .collect::<Vec<_>>(),
+        vec![(true, 4, WINDOW)],
+        "the activating press goes to the target passive-grab owner once"
+    );
+    assert_eq!(xi2_event_ids(&activating), vec![(4, XI_XTEST, XI_XTEST)]);
+    assert!(f.state.xi1_frozen[&XI_XTEST].frozen());
+    assert!(f.state.xi1_frozen[&XI_XTEST].stored.is_some());
+    assert!(f.state.xi2_pointer_grabs[&XI_XTEST].passive);
+
+    inject(f, PointerEventKind::MotionNotify, 650, 150, HOST_OUTSIDE);
+    inject(f, PointerEventKind::ButtonRelease, 650, 150, HOST_OUTSIDE);
+    let target_pending: Vec<_> = f
+        .state
+        .sync_pending
+        .iter()
+        .filter(|pending| pending.device == XI_XTEST)
+        .collect();
+    assert_eq!(
+        target_pending.len(),
+        3,
+        "pending events: {:?}",
+        target_pending
+    );
+    assert!(target_pending.iter().any(|pending| matches!(
+        pending.event,
+        crate::server::QueuedInputEvent::HostPointer(HostPointerEvent {
+            kind: PointerEventKind::MotionNotify,
+            ..
+        })
+    )));
+    assert!(target_pending.iter().any(|pending| matches!(
+        pending.event,
+        crate::server::QueuedInputEvent::HostPointer(HostPointerEvent {
+            kind: PointerEventKind::ButtonRelease,
+            ..
+        })
+    )));
+    assert!(read_all_capture_available(&mut f.other).is_empty());
+
+    // Keep a second client's sync hold alive on an independent physical
+    // pointer so the post-unmap computation must leave that queue untouched.
+    grab_xi2_passive_button_sync(f, OTHER, OUTSIDE, unrelated_device, 1, XI_GRAB_MASK);
+    inject_from_origin_with_detail(
+        f,
+        crate::core_loop::InputOrigin::Physical(unrelated_source),
+        PointerEventKind::ButtonPress,
+        1,
+        650,
+        150,
+        HOST_OUTSIDE,
+    );
+    let unrelated_activation = read_all_capture_available(&mut f.other);
+    assert_eq!(
+        decode_deliveries(&unrelated_activation),
+        vec![Delivery {
+            xi2: true,
+            kind: 4,
+            window: OUTSIDE,
+            child: 0,
+        }],
+        "the other client's independent passive grab activates on OUT"
+    );
+    assert_eq!(
+        xi2_event_ids(&unrelated_activation),
+        vec![(4, unrelated_device, unrelated_device)]
+    );
+    assert!(f.state.xi1_frozen[&unrelated_device].frozen());
+    assert!(f.state.xi1_frozen[&unrelated_device].stored.is_some());
+
+    inject_from_origin(
+        f,
+        crate::core_loop::InputOrigin::Physical(unrelated_source),
+        PointerEventKind::MotionNotify,
+        650,
+        150,
+        HOST_OUTSIDE,
+    );
+    inject_from_origin_with_detail(
+        f,
+        crate::core_loop::InputOrigin::Physical(unrelated_source),
+        PointerEventKind::ButtonRelease,
+        1,
+        650,
+        150,
+        HOST_OUTSIDE,
+    );
+    assert_eq!(f.state.sync_pending.len(), 6);
+    let unrelated_pending: Vec<_> = f
+        .state
+        .sync_pending
+        .iter()
+        .filter(|pending| pending.device == unrelated_device)
+        .collect();
+    assert_eq!(unrelated_pending.len(), 3);
+    assert!(unrelated_pending.iter().any(|pending| matches!(
+        pending.event,
+        crate::server::QueuedInputEvent::HostPointer(HostPointerEvent {
+            kind: PointerEventKind::MotionNotify,
+            ..
+        })
+    )));
+    assert!(unrelated_pending.iter().any(|pending| matches!(
+        pending.event,
+        crate::server::QueuedInputEvent::HostPointer(HostPointerEvent {
+            kind: PointerEventKind::ButtonRelease,
+            ..
+        })
+    )));
+    assert_eq!(
+        f.state
+            .sync_pending
+            .iter()
+            .filter(|pending| pending.device == XI_XTEST)
+            .count(),
+        3
+    );
+    assert_eq!(
+        f.state
+            .sync_pending
+            .iter()
+            .filter(|pending| pending.device == unrelated_device)
+            .count(),
+        3
+    );
+    assert!(read_all_capture_available(&mut f.grabber).is_empty());
+    assert!(read_all_capture_available(&mut f.other).is_empty());
+
+    if unmap_subwindows {
+        dispatch(
+            f,
+            GRABBER,
+            3,
+            CORE_UNMAP_SUBWINDOWS,
+            0,
+            &PARENT.to_le_bytes(),
+        );
+    } else {
+        dispatch(f, GRABBER, 3, CORE_UNMAP_WINDOW, 0, &WINDOW.to_le_bytes());
+    }
+
+    let replayed = read_all_capture_available(&mut f.other);
+    assert_eq!(
+        decode_deliveries(&replayed),
+        vec![
+            Delivery {
+                xi2: true,
+                kind: 6,
+                window: OUTSIDE,
+                child: 0,
+            },
+            Delivery {
+                xi2: true,
+                kind: 5,
+                window: OUTSIDE,
+                child: 0,
+            },
+        ],
+        "unmapping delivers only the released device's queued motion/release; the activating press is discarded"
+    );
+    assert_eq!(
+        xi2_event_ids(&replayed),
+        vec![(6, XI_XTEST, XI_XTEST), (5, XI_XTEST, XI_XTEST)]
+    );
+    assert!(
+        read_deliveries(&mut f.grabber).is_empty(),
+        "unmap must not replay the discarded activating press to its grab owner"
+    );
+    assert_eq!(f.state.sync_pending.len(), 3);
+    assert!(
+        f.state
+            .sync_pending
+            .iter()
+            .all(|pending| pending.device == unrelated_device)
+    );
+
+    assert!(!f.state.xi2_pointer_grabs.contains_key(&XI_XTEST));
+    let surviving_grab = &f.state.xi2_pointer_grabs[&unrelated_device];
+    assert_eq!(surviving_grab.owner, ClientId(OTHER));
+    assert!(!surviving_grab.implicit);
+    assert!(surviving_grab.passive);
+    assert!(f.state.active_pointer_grab.is_none());
+    assert_eq!(
+        f.state.xi_devices.device(XI_XTEST).unwrap().attached_master,
+        Some(XI_MASTER),
+        "the unmap restores the released device's live attachment"
+    );
+    assert!(!f.state.xi2_detached_masters.contains_key(&XI_XTEST));
+    assert!(f.state.xi2_detached_masters.contains_key(&unrelated_device));
+    let released_freeze = &f.state.xi1_frozen[&XI_XTEST];
+    assert_eq!(released_freeze.state, crate::server::Xi1SyncState::Thawed);
+    assert_eq!(released_freeze.other, None);
+    assert!(released_freeze.stored.is_none());
+    let surviving_freeze = &f.state.xi1_frozen[&unrelated_device];
+    assert!(
+        surviving_freeze.frozen(),
+        "the unrelated hold survives unmap"
+    );
+    assert!(surviving_freeze.stored.is_some());
+}
+
+#[test]
+fn implicit_grabs_passive_sync_unmap_window_replays_queued_input() {
+    assert_passive_sync_unmap_replays_only_released_device(&mut fixture(), false);
+}
+
+#[test]
+fn implicit_grabs_passive_sync_unmap_subwindows_replays_queued_input() {
+    assert_passive_sync_unmap_replays_only_released_device(&mut fixture_with_parent(), true);
 }
 
 #[test]
