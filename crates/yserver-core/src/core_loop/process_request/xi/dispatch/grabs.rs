@@ -1147,11 +1147,14 @@ pub(super) fn handle_xi1_grab_device(
             .resources
             .window(ResourceId(win))
             .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
-        let status: u8 = if state
-            .xi1_active_grabs
-            .get(&dev)
-            .is_some_and(|g| g.owner != client_id)
+        let status: u8 = if state.xi2_pointer_grabs.contains_key(&dev)
+            || state
+                .xi1_active_grabs
+                .get(&dev)
+                .is_some_and(|g| g.owner != client_id)
         {
+            // Xorg's single device grab rejects replacement by a different
+            // protocol even for the same client (../xserver/dix/events.c:5288-5292).
             1 // AlreadyGrabbed
         } else if !viewable {
             3 // GrabNotViewable

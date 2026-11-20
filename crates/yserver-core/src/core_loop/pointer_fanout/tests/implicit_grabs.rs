@@ -17,6 +17,7 @@ const HOST_W: u32 = 0xCAFE_A753;
 const HOST_OUT: u32 = 0xCAFE_A754;
 const XI2_OPCODE: u8 = 137;
 const XI_SELECT_EVENTS: u8 = 46;
+const XI1_GRAB_DEVICE: u8 = 13;
 const XI_GRAB_DEVICE: u8 = 51;
 const XI_UNGRAB_DEVICE: u8 = 52;
 const XI_MOTION: u32 = 1 << 6;
@@ -210,7 +211,7 @@ fn grab_xi2_device(
     dispatch(f, client, XI2_OPCODE, XI_GRAB_DEVICE, &body);
 }
 
-fn xi2_grab_reply_status(bytes: &[u8]) -> u8 {
+fn grab_reply_status(bytes: &[u8]) -> u8 {
     let mut offset = 0;
     while offset + 32 <= bytes.len() {
         match bytes[offset] {
@@ -222,7 +223,23 @@ fn xi2_grab_reply_status(bytes: &[u8]) -> u8 {
             _ => offset += 32,
         }
     }
-    panic!("XIGrabDevice status reply is missing from the client stream");
+    panic!("grab status reply is missing from the client stream");
+}
+
+fn grab_xi1_device(f: &mut Fixture, client: u32, window: u32, device: u8) -> u8 {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&window.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    body.extend_from_slice(&0u16.to_le_bytes()); // no event classes
+    body.extend_from_slice(&[1, 1, 0, device]); // async modes, owner_events=false
+    body.extend_from_slice(&[0; 2]);
+    dispatch(f, client, XI2_OPCODE, XI1_GRAB_DEVICE, &body);
+    let peer = if client == CLIENT_A {
+        &mut f.client_a
+    } else {
+        &mut f.client_b
+    };
+    grab_reply_status(&read_all_capture_available(peer))
 }
 
 fn grab_button(f: &mut Fixture, client: u32, window: u32, keyboard_mode: u8) {
@@ -272,6 +289,10 @@ fn assert_master_implicit(f: &Fixture, owner: u32, window: u32) {
 }
 
 fn assert_end_state(f: &Fixture) {
+    assert_end_state_with_xi1_entries(f, &[]);
+}
+
+fn assert_end_state_with_xi1_entries(f: &Fixture, expected_devices: &[u16]) {
     assert!(
         f.state.xi2_pointer_grabs.is_empty(),
         "all slave grabs ended"
@@ -281,10 +302,19 @@ fn assert_end_state(f: &Fixture) {
         f.state.xi2_detached_masters.is_empty(),
         "no slave was detached"
     );
-    assert!(
-        f.state.xi1_frozen.is_empty(),
-        "implicit grabs add no XI1 freezes"
+    let actual_devices: std::collections::BTreeSet<_> =
+        f.state.xi1_frozen.keys().copied().collect();
+    let expected_devices: std::collections::BTreeSet<_> =
+        expected_devices.iter().copied().collect();
+    assert_eq!(
+        actual_devices, expected_devices,
+        "XI1 sync entries match the requests used by this scenario"
     );
+    assert!(f.state.xi1_frozen.values().all(|freeze| {
+        freeze.state == crate::server::Xi1SyncState::Thawed
+            && freeze.other.is_none()
+            && freeze.stored.is_none()
+    }));
 }
 
 fn send(f: &mut Fixture, origin: InputOrigin, kind: PointerEventKind, detail: u8, x: i16, y: i16) {
@@ -646,7 +676,7 @@ fn motion_only_master_grab_gets_no_wheel_press_during_slave_grab() {
     grab_xi2_device(&mut f, CLIENT_B, OUT, XI_MASTER, false, 1, 1, XI_MOTION);
     let grab_reply = read_all_capture_available(&mut f.client_b);
     assert_eq!(
-        xi2_grab_reply_status(&grab_reply),
+        grab_reply_status(&grab_reply),
         0,
         "B's master XIGrabDevice succeeds"
     );
@@ -1354,7 +1384,7 @@ fn unmap_ends_explicit_slave_grab_with_full_teardown() {
     let mut f = fixture();
     grab_xi2_device(&mut f, CLIENT_A, W, XI_XTEST, false, 0, 1, XI_GRAB_MASK);
     assert_eq!(
-        xi2_grab_reply_status(&read_all_capture_available(&mut f.client_a)),
+        grab_reply_status(&read_all_capture_available(&mut f.client_a)),
         0
     );
     let grab = f
@@ -1384,4 +1414,149 @@ fn unmap_ends_explicit_slave_grab_with_full_teardown() {
     assert_eq!(freeze.state, crate::server::Xi1SyncState::Thawed);
     assert_eq!(freeze.other, None);
     assert!(freeze.stored.is_none());
+}
+
+#[test]
+fn i4_grab_statuses_during_slave_implicit_grab() {
+    let mut f = fixture();
+    select_xi2(&mut f, CLIENT_A, W, XI_XTEST, XI_GRAB_MASK);
+    select_xi2(&mut f, CLIENT_B, OUT, XI_XTEST, XI_GRAB_MASK);
+    let origin = InputOrigin::XTest(XI_XTEST);
+
+    press_over_d(&mut f, origin, 1);
+    assert_slave_implicit(&f, XI_XTEST, CLIENT_A, W);
+    assert!(f.state.active_pointer_grab.is_none());
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(4, XI_XTEST, XI_XTEST, W)]
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    move_to_out(&mut f, origin);
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(6, XI_XTEST, XI_XTEST, W)]
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    grab_xi2_device(&mut f, CLIENT_B, OUT, XI_XTEST, false, 1, 1, XI_BUTTONS);
+    assert_eq!(
+        grab_reply_status(&read_all_capture_available(&mut f.client_b)),
+        1,
+        "another client cannot grab a slave held by an implicit grab"
+    );
+    assert_slave_implicit(&f, XI_XTEST, CLIENT_A, W);
+
+    grab_xi2_device(&mut f, CLIENT_B, OUT, XI_MASTER, false, 1, 1, XI_BUTTONS);
+    assert_eq!(
+        grab_reply_status(&read_all_capture_available(&mut f.client_b)),
+        0,
+        "the master pointer remains independently grabbable"
+    );
+    assert!(f.state.active_pointer_grab.is_some_and(|grab| {
+        grab.owner == ClientId(CLIENT_B) && grab.grab_window == ResourceId(OUT) && !grab.implicit
+    }));
+
+    release(&mut f, origin, 1);
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(5, XI_XTEST, XI_XTEST, W)]
+    );
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(5, XI_MASTER, XI_XTEST, OUT)]
+    );
+    ungrab_xi2_device(&mut f, CLIENT_B, XI_MASTER);
+    assert_end_state_with_xi1_entries(
+        &f,
+        &[
+            crate::xinput::DEVICEID_MASTER_POINTER,
+            crate::xinput::DEVICEID_MASTER_KEYBOARD,
+        ],
+    );
+}
+
+#[test]
+fn same_client_xigrabdevice_replaces_implicit_with_explicit() {
+    let mut f = fixture();
+    select_xi2(&mut f, CLIENT_A, W, XI_XTEST, XI_BUTTONS);
+    let origin = InputOrigin::XTest(XI_XTEST);
+    let original_master = f.state.xi_devices.device(XI_XTEST).unwrap().attached_master;
+    assert!(original_master.is_some());
+
+    press_over_d(&mut f, origin, 1);
+    assert_slave_implicit(&f, XI_XTEST, CLIENT_A, W);
+    assert!(f.state.active_pointer_grab.is_none());
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(4, XI_XTEST, XI_XTEST, W)]
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    grab_xi2_device(&mut f, CLIENT_A, W, XI_XTEST, false, 1, 1, XI_BUTTONS);
+    assert_eq!(
+        grab_reply_status(&read_all_capture_available(&mut f.client_a)),
+        0,
+        "the implicit grab owner can replace it with an explicit grab"
+    );
+    let grab = f.state.xi2_pointer_grabs.get(&XI_XTEST).unwrap();
+    assert_eq!(grab.owner, ClientId(CLIENT_A));
+    assert_eq!(grab.grab_window, ResourceId(W));
+    assert!(!grab.implicit);
+    assert!(f.state.xi2_detached_masters.contains_key(&XI_XTEST));
+    assert_eq!(
+        f.state.xi_devices.device(XI_XTEST).unwrap().attached_master,
+        None,
+        "the successful explicit slave grab leaves device 4 floating"
+    );
+
+    release(&mut f, origin, 1);
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(5, XI_XTEST, XI_XTEST, W)]
+    );
+    assert!(f.state.xi2_pointer_grabs.contains_key(&XI_XTEST));
+    assert!(f.state.xi2_detached_masters.contains_key(&XI_XTEST));
+    assert!(f.state.active_pointer_grab.is_none());
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    ungrab_xi2_device(&mut f, CLIENT_A, XI_XTEST);
+    assert_eq!(
+        f.state.xi_devices.device(XI_XTEST).unwrap().attached_master,
+        original_master,
+        "XIUngrabDevice restores device 4's original master attachment"
+    );
+    assert_end_state_with_xi1_entries(&f, &[XI_XTEST]);
+}
+
+#[test]
+fn xi1_grab_device_over_xi2_implicit_is_already_grabbed() {
+    let mut f = fixture();
+    select_xi2(&mut f, CLIENT_A, W, XI_XTEST, XI_BUTTONS);
+    let origin = InputOrigin::XTest(XI_XTEST);
+
+    press_over_d(&mut f, origin, 1);
+    assert_slave_implicit(&f, XI_XTEST, CLIENT_A, W);
+    assert!(f.state.active_pointer_grab.is_none());
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(4, XI_XTEST, XI_XTEST, W)]
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    assert_eq!(
+        grab_xi1_device(&mut f, CLIENT_A, W, XI_XTEST as u8),
+        1,
+        "XI1 and XI2 are separate protocols, so the XI2 grab is occupied even by its owner"
+    );
+    assert!(f.state.xi1_active_grabs.is_empty());
+    assert_slave_implicit(&f, XI_XTEST, CLIENT_A, W);
+
+    release(&mut f, origin, 1);
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(5, XI_XTEST, XI_XTEST, W)]
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+    assert_end_state(&f);
 }
