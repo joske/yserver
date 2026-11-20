@@ -16,6 +16,7 @@ const HOST_W: u32 = 0xCAFE_A753;
 const HOST_OUT: u32 = 0xCAFE_A754;
 const XI2_OPCODE: u8 = 137;
 const XI_SELECT_EVENTS: u8 = 46;
+const XI_GRAB_DEVICE: u8 = 51;
 const XI_MOTION: u32 = 1 << 6;
 const XI_BUTTON_PRESS: u32 = 1 << 4;
 const XI_BUTTON_RELEASE: u32 = 1 << 5;
@@ -43,6 +44,7 @@ struct Packet {
     device: u16,
     source: u16,
     window: u32,
+    scroll_value: Option<i32>,
 }
 
 fn fixture() -> Fixture {
@@ -158,6 +160,40 @@ fn select_core(f: &mut Fixture, client: u32, window: u32, mask: u32) {
         Some(&mask),
         "ChangeWindowAttributes must register the test's real selection"
     );
+}
+
+fn grab_xi2_device(
+    f: &mut Fixture,
+    client: u32,
+    window: u32,
+    device: u16,
+    owner_events: bool,
+    mask: u32,
+) {
+    let mut body = Vec::with_capacity(24);
+    body.extend_from_slice(&window.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    body.extend_from_slice(&0u32.to_le_bytes()); // no cursor
+    body.extend_from_slice(&device.to_le_bytes());
+    body.extend_from_slice(&[1, 1, u8::from(owner_events), 0]); // async, async, owner_events
+    body.extend_from_slice(&1u16.to_le_bytes()); // one mask word
+    body.extend_from_slice(&mask.to_le_bytes());
+    dispatch(f, client, XI2_OPCODE, XI_GRAB_DEVICE, &body);
+}
+
+fn xi2_grab_reply_status(bytes: &[u8]) -> u8 {
+    let mut offset = 0;
+    while offset + 32 <= bytes.len() {
+        match bytes[offset] {
+            1 => return bytes[offset + 8],
+            35 => {
+                let units = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+                offset += 32 + usize::try_from(units).unwrap() * 4;
+            }
+            _ => offset += 32,
+        }
+    }
+    panic!("XIGrabDevice status reply is missing from the client stream");
 }
 
 fn grab_button(f: &mut Fixture, client: u32, window: u32, keyboard_mode: u8) {
@@ -280,6 +316,9 @@ fn read_packets(peer: &mut crate::transport::CapturedPeer) -> Vec<Packet> {
                     device: u16::from_le_bytes([bytes[offset + 10], bytes[offset + 11]]) & 0x7fff,
                     source: u16::from_le_bytes(bytes[offset + 52..offset + 54].try_into().unwrap()),
                     window: u32::from_le_bytes(bytes[offset + 24..offset + 28].try_into().unwrap()),
+                    scroll_value: (kind == 6 && extra == 28).then(|| {
+                        i32::from_le_bytes(bytes[offset + 136..offset + 140].try_into().unwrap())
+                    }),
                 });
             }
             offset += 32 + usize::try_from(extra).unwrap() * 4;
@@ -292,6 +331,7 @@ fn read_packets(peer: &mut crate::transport::CapturedPeer) -> Vec<Packet> {
                     device: 0,
                     source: 0,
                     window: u32::from_le_bytes(bytes[offset + 12..offset + 16].try_into().unwrap()),
+                    scroll_value: None,
                 });
             }
             offset += 32;
@@ -308,6 +348,7 @@ fn xi(kind: u16, device: u16, source: u16, window: u32) -> Packet {
         device,
         source,
         window,
+        scroll_value: None,
     }
 }
 
@@ -318,7 +359,82 @@ fn core(kind: u16, window: u32) -> Packet {
         device: 0,
         source: 0,
         window,
+        scroll_value: None,
     }
+}
+
+#[test]
+fn motion_only_master_grab_gets_no_wheel_press_during_slave_grab() {
+    const SOURCE: u64 = 0xA7566;
+    let mut f = fixture();
+    let source_device = pointer_source(&mut f.state, SOURCE, true);
+    let origin = InputOrigin::Physical(crate::xinput::InputSourceId(SOURCE));
+    select_xi2(&mut f, CLIENT_A, W, source_device, XI_BUTTONS | XI_MOTION);
+
+    press_over_d(&mut f, origin, 1);
+    assert_slave_implicit(&f, source_device, CLIENT_A, W);
+    assert!(
+        f.state.active_pointer_grab.is_none(),
+        "the slave-only press does not create a master grab"
+    );
+    assert!(f.state.xi2_detached_masters.is_empty());
+    let _ = read_packets(&mut f.client_a);
+
+    grab_xi2_device(&mut f, CLIENT_B, OUT, XI_MASTER, false, XI_MOTION);
+    let grab_reply = read_all_capture_available(&mut f.client_b);
+    assert_eq!(
+        xi2_grab_reply_status(&grab_reply),
+        0,
+        "B's master XIGrabDevice succeeds"
+    );
+    assert!(f.state.active_pointer_grab.is_some_and(|grab| {
+        grab.owner == ClientId(CLIENT_B)
+            && grab.grab_window == ResourceId(OUT)
+            && !grab.owner_events
+            && grab.via_xi2
+            && !grab.implicit
+            && grab.xi2_mask == u64::from(XI_MOTION)
+    }));
+
+    send(&mut f, origin, PointerEventKind::ButtonPress, 5, 150, 150);
+    send(&mut f, origin, PointerEventKind::ButtonRelease, 5, 150, 150);
+
+    let b_packets = read_packets(&mut f.client_b);
+    assert_eq!(
+        b_packets,
+        vec![Packet {
+            scroll_value: Some(1),
+            ..xi(6, XI_MASTER, source_device, OUT)
+        }],
+        "B gets exactly the master scroll Motion and no emulated ButtonPress"
+    );
+
+    release(&mut f, origin, 1);
+    assert!(f.state.xi2_pointer_grabs.is_empty());
+    assert!(f.state.active_pointer_grab.is_some_and(|grab| {
+        grab.owner == ClientId(CLIENT_B)
+            && grab.grab_window == ResourceId(OUT)
+            && grab.xi2_mask == u64::from(XI_MOTION)
+            && !grab.implicit
+    }));
+    assert!(f.state.xi2_detached_masters.is_empty());
+    let live_freeze_devices: std::collections::BTreeSet<_> =
+        f.state.xi1_frozen.keys().copied().collect();
+    assert_eq!(
+        live_freeze_devices,
+        [
+            crate::xinput::DEVICEID_MASTER_KEYBOARD,
+            crate::xinput::DEVICEID_MASTER_POINTER,
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert!(f.state.xi1_frozen.values().all(|freeze| {
+        freeze.state == crate::server::Xi1SyncState::Thawed
+            && freeze.other.is_none()
+            && freeze.stored.is_none()
+    }));
+    assert!(read_packets(&mut f.client_b).is_empty());
 }
 
 fn run_i1(selection_device: u16) {

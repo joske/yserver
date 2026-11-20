@@ -2465,6 +2465,11 @@ fn pointer_event_fanout_to_state_inner(
             // (dix/getevents.c:265-286), then copies the slave event to its
             // master (mi/mieq.c:422-425). Keep both XI forms on that same
             // source counter so a source switch cannot create a false delta.
+            let scroll_motion_only_grab = match form {
+                Xi2PointerForm::Slave => xi2_scroll_slave_grab_motion_only,
+                Xi2PointerForm::Master => xi2_scroll_master_grab_motion_only,
+            } && grab_for_form(state, xi_source, form)
+                .is_some_and(|grab| grab.owner == *cid);
             let extras =
                 fanout_event_to_clients(state, std::slice::from_ref(cid), |buf, seq, order| {
                     if is_crossing_evt {
@@ -2503,11 +2508,6 @@ fn pointer_event_fanout_to_state_inner(
                         } else {
                             0
                         };
-                        let scroll_motion_only_grab = match form {
-                            Xi2PointerForm::Slave => xi2_scroll_slave_grab_motion_only,
-                            Xi2PointerForm::Master => xi2_scroll_master_grab_motion_only,
-                        } && active_source_grab
-                            .is_some_and(|grab| grab.owner == *cid);
                         if button_want && !scroll_motion_only_grab {
                             x11::encode_xi2_device_event(
                                 buf,
