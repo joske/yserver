@@ -401,6 +401,9 @@ pub struct RecordingBackend {
     /// Number of `get_image` calls, kept separate from the general call log
     /// so tests can assert denied readbacks without changing existing log snapshots.
     pub get_image_calls: usize,
+    /// Grab-cursor overrides, kept separate from the general call log so
+    /// lifecycle tests can observe cursor teardown without changing snapshots.
+    pub grab_cursor_calls: Vec<Option<u32>>,
     /// What `get_image` answers (a core GetImage reply: 32-byte header,
     /// then the image). `None` answers no image.
     pub get_image_reply: Option<Vec<u8>>,
@@ -782,6 +785,7 @@ impl RecordingBackend {
         Self {
             calls: Mutex::new(Vec::new()),
             get_image_calls: 0,
+            grab_cursor_calls: Vec::new(),
             get_image_reply: None,
             displayed_cursor_change: None,
             active_cursor_image: None,
@@ -1025,6 +1029,15 @@ impl crate::backend::SyncobjHandle for RecordingSyncobjHandle {
 }
 
 impl Backend for RecordingBackend {
+    fn set_grab_cursor(
+        &mut self,
+        _origin: Option<OriginContext>,
+        cursor_host_xid: Option<u32>,
+    ) -> io::Result<()> {
+        self.grab_cursor_calls.push(cursor_host_xid);
+        Ok(())
+    }
+
     fn displayed_cursor_hidden(&self) -> bool {
         self.displayed_cursor_hidden
     }

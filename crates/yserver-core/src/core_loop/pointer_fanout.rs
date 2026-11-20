@@ -3260,10 +3260,15 @@ pub fn xi_cleanup_source(
     for device_id in device_ids {
         xi1_deactivate_device_grab(state, device_id);
 
-        let pointer_owner = state
-            .xi2_pointer_grabs
-            .remove(&device_id)
+        let pointer_grab = state.xi2_pointer_grabs.get(&device_id).copied();
+        let pointer_owner = pointer_grab
+            .filter(|grab| !grab.implicit)
             .map(|grab| grab.owner);
+        if pointer_grab.is_some_and(|grab| grab.implicit) {
+            state.remove_implicit_xi2_pointer_grab(device_id);
+        } else if pointer_grab.is_some() {
+            state.xi2_pointer_grabs.remove(&device_id);
+        }
         let keyboard_owner = state
             .xi2_keyboard_grabs
             .remove(&device_id)

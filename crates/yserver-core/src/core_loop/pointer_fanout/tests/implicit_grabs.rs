@@ -17,6 +17,7 @@ const HOST_OUT: u32 = 0xCAFE_A754;
 const XI2_OPCODE: u8 = 137;
 const XI_SELECT_EVENTS: u8 = 46;
 const XI_GRAB_DEVICE: u8 = 51;
+const XI_UNGRAB_DEVICE: u8 = 52;
 const XI_MOTION: u32 = 1 << 6;
 const XI_BUTTON_PRESS: u32 = 1 << 4;
 const XI_BUTTON_RELEASE: u32 = 1 << 5;
@@ -26,6 +27,14 @@ const XI_MASTER: u16 = 2;
 const XI_XTEST: u16 = 4;
 const XI_ALL_DEVICES: u16 = 0;
 const CORE_POINTER: u32 = 0x4c;
+const CORE_GRAB_POINTER: u8 = 26;
+const CORE_UNGRAB_POINTER: u8 = 27;
+const CORE_CREATE_PIXMAP: u8 = 53;
+const CORE_CREATE_CURSOR: u8 = 93;
+const GRAB_PIXMAP_A: u32 = 0x0030_A753;
+const GRAB_CURSOR_A: u32 = 0x0040_A753;
+const GRAB_PIXMAP_B: u32 = 0x0030_A754;
+const GRAB_CURSOR_B: u32 = 0x0040_A754;
 
 struct Fixture {
     state: ServerState,
@@ -301,6 +310,70 @@ fn final_motion(f: &mut Fixture, origin: InputOrigin) {
     send(f, origin, PointerEventKind::MotionNotify, 0, 660, 160);
 }
 
+fn ungrab_xi2_device(f: &mut Fixture, client: u32, device: u16) {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    body.extend_from_slice(&device.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes());
+    dispatch(f, client, XI2_OPCODE, XI_UNGRAB_DEVICE, &body);
+}
+
+fn grab_core_with_sync_keyboard(
+    f: &mut Fixture,
+    client: u32,
+    window: u32,
+) -> (crate::server::ActivePointerGrab, u32) {
+    let (pixmap, cursor) = if client == CLIENT_A {
+        (GRAB_PIXMAP_A, GRAB_CURSOR_A)
+    } else {
+        (GRAB_PIXMAP_B, GRAB_CURSOR_B)
+    };
+    let mut pixmap_body = Vec::with_capacity(12);
+    pixmap_body.extend_from_slice(&pixmap.to_le_bytes());
+    pixmap_body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+    pixmap_body.extend_from_slice(&(1u32 | (1 << 16)).to_le_bytes()); // 1x1
+    dispatch(f, client, CORE_CREATE_PIXMAP, 1, &pixmap_body);
+
+    let mut cursor_body = Vec::with_capacity(24);
+    cursor_body.extend_from_slice(&cursor.to_le_bytes());
+    cursor_body.extend_from_slice(&pixmap.to_le_bytes());
+    cursor_body.extend_from_slice(&[0; 20]); // colors, hotspot, protocol padding
+    dispatch(f, client, CORE_CREATE_CURSOR, 0, &cursor_body);
+    let cursor_host_xid = f
+        .state
+        .resources
+        .cursor_host_xid(ResourceId(cursor))
+        .expect("CreateCursor through process_request installs a host cursor");
+
+    let mut grab_body = Vec::with_capacity(20);
+    grab_body.extend_from_slice(&window.to_le_bytes());
+    grab_body.extend_from_slice(&0u16.to_le_bytes()); // no core events
+    grab_body.extend_from_slice(&[1, 0]); // async pointer, sync keyboard
+    grab_body.extend_from_slice(&0u32.to_le_bytes()); // no confinement
+    grab_body.extend_from_slice(&cursor.to_le_bytes());
+    grab_body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    dispatch(f, client, CORE_GRAB_POINTER, 0, &grab_body);
+
+    let grab = f
+        .state
+        .active_pointer_grab
+        .expect("GrabPointer through process_request installs the grab");
+    assert_eq!(grab.owner, ClientId(client));
+    assert_eq!(grab.grab_window, ResourceId(window));
+    assert_eq!(grab.cursor, ResourceId(cursor));
+    assert!(!grab.implicit);
+    assert_eq!(
+        f.state.xi1_frozen[&crate::xinput::DEVICEID_MASTER_KEYBOARD].other,
+        Some(ClientId(client)),
+        "sync keyboard mode holds the paired keyboard"
+    );
+    (grab, cursor_host_xid)
+}
+
+fn ungrab_core_pointer(f: &mut Fixture, client: u32) {
+    dispatch(f, client, CORE_UNGRAB_POINTER, 0, &0u32.to_le_bytes());
+}
+
 fn read_packets(peer: &mut crate::transport::CapturedPeer) -> Vec<Packet> {
     let bytes = read_all_capture_available(peer);
     let mut packets = Vec::new();
@@ -361,6 +434,176 @@ fn core(kind: u16, window: u32) -> Packet {
         window,
         scroll_value: None,
     }
+}
+
+#[derive(Clone, Copy)]
+enum SlaveGrabEnd {
+    Release,
+    Ungrab,
+    PhysicalRemoval,
+}
+
+fn check_slave_implicit_removal_subcase(ending: SlaveGrabEnd) -> Vec<&'static str> {
+    const SOURCE: u64 = 0xA75_300;
+    let mut f = fixture();
+    let (device, origin) = match ending {
+        SlaveGrabEnd::PhysicalRemoval => {
+            let device = pointer_source(&mut f.state, SOURCE, true);
+            (
+                device,
+                InputOrigin::Physical(crate::xinput::InputSourceId(SOURCE)),
+            )
+        }
+        SlaveGrabEnd::Release | SlaveGrabEnd::Ungrab => (XI_XTEST, InputOrigin::XTest(XI_XTEST)),
+    };
+    select_xi2(&mut f, CLIENT_A, W, device, XI_GRAB_MASK);
+    let (master_before, _) = grab_core_with_sync_keyboard(&mut f, CLIENT_A, OUT);
+    let cursor_call_start = f.backend.grab_cursor_calls.len();
+    let detached_before = f.state.xi2_detached_masters.clone();
+
+    press_over_d(&mut f, origin, 1);
+    assert_slave_implicit(&f, device, CLIENT_A, W);
+    assert!(f.state.active_pointer_grab.is_some_and(|grab| {
+        grab.owner == ClientId(CLIENT_A) && grab.grab_window == ResourceId(OUT) && !grab.implicit
+    }));
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(4, device, device, W)]
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    match ending {
+        SlaveGrabEnd::Release => {
+            release(&mut f, origin, 1);
+            assert_eq!(
+                read_packets(&mut f.client_a),
+                vec![xi(5, device, device, W)]
+            );
+            assert!(read_packets(&mut f.client_b).is_empty());
+        }
+        SlaveGrabEnd::Ungrab => {
+            ungrab_xi2_device(&mut f, CLIENT_A, device);
+            move_to_out(&mut f, origin);
+            release(&mut f, origin, 1);
+            assert!(read_packets(&mut f.client_a).is_empty());
+            assert!(read_packets(&mut f.client_b).is_empty());
+        }
+        SlaveGrabEnd::PhysicalRemoval => {
+            let source = crate::xinput::InputSourceId(SOURCE);
+            xi_cleanup_source(&mut f.state, &mut f.backend, source);
+
+            // DeviceRemoved drains physical button holds before calling
+            // xi_cleanup_source (portable/devices.rs:754-760). This direct
+            // cleanup probe deliberately leaves the active implicit grab in
+            // place so it can verify cleanup removes it itself. The release
+            // below only balances this manually driven fixture after the
+            // cleanup boundary has been checked.
+            assert!(!f.state.xi2_pointer_grabs.contains_key(&device));
+            assert!(f.state.active_pointer_grab.is_some_and(|grab| {
+                grab.owner == master_before.owner
+                    && grab.grab_window == master_before.grab_window
+                    && grab.event_mask == master_before.event_mask
+                    && grab.cursor == master_before.cursor
+                    && grab.time == master_before.time
+                    && grab.owner_events == master_before.owner_events
+                    && grab.via_xi2 == master_before.via_xi2
+                    && grab.implicit == master_before.implicit
+                    && grab.passive == master_before.passive
+                    && grab.xi2_mask == master_before.xi2_mask
+            }));
+            assert_eq!(
+                f.state.xi1_frozen[&crate::xinput::DEVICEID_MASTER_KEYBOARD].other,
+                Some(ClientId(CLIENT_A))
+            );
+            assert!(
+                !f.backend.grab_cursor_calls[cursor_call_start..].contains(&None),
+                "implicit cleanup must preserve the master grab cursor"
+            );
+            assert_eq!(f.state.xi2_detached_masters, detached_before);
+            assert!(
+                !f.state.xi1_frozen.contains_key(&device),
+                "implicit cleanup must not create slave freeze state"
+            );
+
+            release(&mut f, origin, 1);
+            assert_eq!(
+                read_packets(&mut f.client_a),
+                vec![xi(5, device, device, W)]
+            );
+            assert!(read_packets(&mut f.client_b).is_empty());
+            assert!(
+                f.state.xi_unregister_facet(device).is_some(),
+                "production removes a facet only after xi_cleanup_source"
+            );
+
+            // Unregister must not be needed to erase state left by cleanup.
+            assert!(!f.state.xi2_pointer_grabs.contains_key(&device));
+            assert!(f.state.active_pointer_grab.is_some_and(|grab| {
+                grab.owner == master_before.owner
+                    && grab.grab_window == master_before.grab_window
+                    && grab.event_mask == master_before.event_mask
+                    && grab.cursor == master_before.cursor
+                    && grab.time == master_before.time
+                    && grab.owner_events == master_before.owner_events
+                    && grab.via_xi2 == master_before.via_xi2
+                    && grab.implicit == master_before.implicit
+                    && grab.passive == master_before.passive
+                    && grab.xi2_mask == master_before.xi2_mask
+            }));
+            assert_eq!(
+                f.state.xi1_frozen[&crate::xinput::DEVICEID_MASTER_KEYBOARD].other,
+                Some(ClientId(CLIENT_A))
+            );
+            assert!(
+                !f.backend.grab_cursor_calls[cursor_call_start..].contains(&None),
+                "facet unregister must preserve the master grab cursor"
+            );
+            assert_eq!(f.state.xi2_detached_masters, detached_before);
+            assert!(!f.state.xi1_frozen.contains_key(&device));
+        }
+    }
+
+    let mut failures = Vec::new();
+    if f.state.xi2_pointer_grabs.contains_key(&device) {
+        failures.push("slave entry remains after its requested end");
+    }
+    if !f.state.active_pointer_grab.is_some_and(|grab| {
+        grab.owner == ClientId(CLIENT_A) && grab.grab_window == ResourceId(OUT) && !grab.implicit
+    }) {
+        failures.push("master core grab did not survive");
+    }
+    if f.state
+        .xi1_frozen
+        .get(&crate::xinput::DEVICEID_MASTER_KEYBOARD)
+        .and_then(|freeze| freeze.other)
+        != Some(ClientId(CLIENT_A))
+    {
+        failures.push("paired keyboard hold did not survive");
+    }
+    if f.backend.grab_cursor_calls[cursor_call_start..].contains(&None) {
+        failures.push("slave teardown cleared the master grab cursor");
+    }
+    if f.state.xi1_frozen.contains_key(&device) {
+        failures.push("slave teardown wrote XI1 freeze state");
+    }
+    if f.state.xi2_detached_masters != detached_before {
+        failures.push("slave teardown changed its attachment");
+    }
+
+    // Finish the independent core grab through its normal request path so
+    // every fresh-fixture subcase also checks the fully released end state.
+    ungrab_core_pointer(&mut f, CLIENT_A);
+    if !f.state.xi2_pointer_grabs.is_empty()
+        || f.state.active_pointer_grab.is_some()
+        || !f.state.xi2_detached_masters.is_empty()
+        || f.state
+            .xi1_frozen
+            .values()
+            .any(|freeze| freeze.frozen() || freeze.other.is_some() || freeze.stored.is_some())
+    {
+        failures.push("subcase did not finish with an empty grab/freeze state");
+    }
+    failures
 }
 
 #[test]
@@ -776,4 +1019,208 @@ fn slave_release_also_ends_async_core_passive_grab() {
 #[test]
 fn slave_release_clears_sync_keyboard_hold_of_core_passive_grab() {
     core_passive_grab_and_slave_implicit_grab_release(0);
+}
+
+#[test]
+fn i8_owner_ungrab_ends_slave_implicit_grab() {
+    let mut f = fixture();
+    select_xi2(&mut f, CLIENT_A, W, XI_XTEST, XI_GRAB_MASK);
+    select_xi2(&mut f, CLIENT_B, OUT, XI_XTEST, XI_GRAB_MASK);
+
+    let origin = InputOrigin::XTest(XI_XTEST);
+    press_over_d(&mut f, origin, 1);
+    assert_slave_implicit(&f, XI_XTEST, CLIENT_A, W);
+    assert!(f.state.active_pointer_grab.is_none());
+    assert!(f.state.xi2_detached_masters.is_empty());
+    assert_eq!(read_packets(&mut f.client_a), vec![xi(4, 4, 4, W)]);
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    move_to_out(&mut f, origin);
+    assert_eq!(read_packets(&mut f.client_a), vec![xi(6, 4, 4, W)]);
+    assert!(read_packets(&mut f.client_b).is_empty());
+    ungrab_xi2_device(&mut f, CLIENT_A, XI_XTEST);
+    assert!(!f.state.xi2_pointer_grabs.contains_key(&XI_XTEST));
+    assert!(f.state.active_pointer_grab.is_none());
+
+    release(&mut f, origin, 1);
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_eq!(read_packets(&mut f.client_b), vec![xi(5, 4, 4, OUT)]);
+    final_motion(&mut f, origin);
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_eq!(read_packets(&mut f.client_b), vec![xi(6, 4, 4, OUT)]);
+    assert_end_state(&f);
+}
+
+#[test]
+fn foreign_ungrab_leaves_slave_implicit_grab() {
+    let mut f = fixture();
+    select_xi2(&mut f, CLIENT_A, W, XI_XTEST, XI_GRAB_MASK);
+    select_xi2(&mut f, CLIENT_B, OUT, XI_XTEST, XI_GRAB_MASK);
+
+    let origin = InputOrigin::XTest(XI_XTEST);
+    press_over_d(&mut f, origin, 1);
+    assert_slave_implicit(&f, XI_XTEST, CLIENT_A, W);
+    assert!(f.state.active_pointer_grab.is_none());
+    assert_eq!(read_packets(&mut f.client_a), vec![xi(4, 4, 4, W)]);
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    move_to_out(&mut f, origin);
+    assert_eq!(read_packets(&mut f.client_a), vec![xi(6, 4, 4, W)]);
+    assert!(read_packets(&mut f.client_b).is_empty());
+    ungrab_xi2_device(&mut f, CLIENT_B, XI_XTEST);
+    assert_slave_implicit(&f, XI_XTEST, CLIENT_A, W);
+
+    release(&mut f, origin, 1);
+    assert_eq!(read_packets(&mut f.client_a), vec![xi(5, 4, 4, W)]);
+    assert!(read_packets(&mut f.client_b).is_empty());
+    final_motion(&mut f, origin);
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_eq!(read_packets(&mut f.client_b), vec![xi(6, 4, 4, OUT)]);
+    assert_end_state(&f);
+}
+
+#[test]
+fn slave_implicit_removal_keeps_master_grab_state() {
+    let cases = [
+        (
+            "last slave release",
+            check_slave_implicit_removal_subcase(SlaveGrabEnd::Release),
+        ),
+        (
+            "owner XIUngrabDevice",
+            check_slave_implicit_removal_subcase(SlaveGrabEnd::Ungrab),
+        ),
+        (
+            "physical source cleanup then facet unregister",
+            check_slave_implicit_removal_subcase(SlaveGrabEnd::PhysicalRemoval),
+        ),
+    ];
+    let failures: Vec<_> = cases
+        .iter()
+        .filter(|(_, failures)| !failures.is_empty())
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "master-grab preservation failures: {failures:?}"
+    );
+}
+
+#[test]
+fn same_client_holds_both_grabs_ungrab_slave_keeps_master() {
+    let mut f = fixture();
+    select_xi2(&mut f, CLIENT_A, W, XI_XTEST, XI_GRAB_MASK);
+    select_xi2(&mut f, CLIENT_A, W, XI_MASTER, XI_GRAB_MASK);
+    let origin = InputOrigin::XTest(XI_XTEST);
+
+    press_over_d(&mut f, origin, 1);
+    assert_slave_implicit(&f, XI_XTEST, CLIENT_A, W);
+    assert_master_implicit(&f, CLIENT_A, W);
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(4, 4, 4, W), xi(4, 2, 4, W)]
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    let master_before = f.state.active_pointer_grab.expect("master implicit grab");
+    move_to_out(&mut f, origin);
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(6, 4, 4, W), xi(6, 2, 4, W)]
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+    ungrab_xi2_device(&mut f, CLIENT_A, XI_XTEST);
+    assert!(!f.state.xi2_pointer_grabs.contains_key(&XI_XTEST));
+    assert!(f.state.active_pointer_grab.is_some_and(|grab| {
+        grab.owner == master_before.owner
+            && grab.grab_window == master_before.grab_window
+            && grab.implicit
+    }));
+
+    release(&mut f, origin, 1);
+    assert_eq!(read_packets(&mut f.client_a), vec![xi(5, 2, 4, W)]);
+    assert!(read_packets(&mut f.client_b).is_empty());
+    final_motion(&mut f, origin);
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_end_state(&f);
+}
+
+#[test]
+fn owner_disconnect_keeps_other_clients_hold() {
+    let mut f = fixture();
+    let _ = grab_core_with_sync_keyboard(&mut f, CLIENT_B, OUT);
+    let cursor_call_start = f.backend.grab_cursor_calls.len();
+    select_xi2(&mut f, CLIENT_A, W, XI_XTEST, XI_GRAB_MASK);
+    select_xi2(&mut f, CLIENT_B, OUT, XI_XTEST, XI_GRAB_MASK);
+    let origin = InputOrigin::XTest(XI_XTEST);
+
+    press_over_d(&mut f, origin, 1);
+    assert_slave_implicit(&f, XI_XTEST, CLIENT_A, W);
+    assert!(f.state.active_pointer_grab.is_some_and(|grab| {
+        grab.owner == ClientId(CLIENT_B) && grab.grab_window == ResourceId(OUT) && !grab.implicit
+    }));
+    assert_eq!(
+        f.state.xi1_frozen[&crate::xinput::DEVICEID_MASTER_KEYBOARD].other,
+        Some(ClientId(CLIENT_B))
+    );
+    let detached_before = f.state.xi2_detached_masters.clone();
+    assert_eq!(read_packets(&mut f.client_a), vec![xi(4, 4, 4, W)]);
+    let _ = read_packets(&mut f.client_b);
+
+    crate::core_loop::process_disconnect::process_disconnect(
+        &mut f.state,
+        &mut f.backend,
+        ClientId(CLIENT_A),
+    );
+    assert!(!f.state.xi2_pointer_grabs.contains_key(&XI_XTEST));
+    assert!(f.state.active_pointer_grab.is_some_and(|grab| {
+        grab.owner == ClientId(CLIENT_B) && grab.grab_window == ResourceId(OUT) && !grab.implicit
+    }));
+    assert_eq!(
+        f.state.xi1_frozen[&crate::xinput::DEVICEID_MASTER_KEYBOARD].other,
+        Some(ClientId(CLIENT_B)),
+        "disconnect must preserve B's paired keyboard hold"
+    );
+    assert!(!f.backend.grab_cursor_calls[cursor_call_start..].contains(&None));
+    assert_eq!(f.state.xi2_detached_masters, detached_before);
+
+    move_to_out(&mut f, origin);
+    assert_eq!(read_packets(&mut f.client_b), vec![xi(6, 4, 4, OUT)]);
+    release(&mut f, origin, 1);
+    assert_eq!(read_packets(&mut f.client_b), vec![xi(5, 4, 4, OUT)]);
+    ungrab_core_pointer(&mut f, CLIENT_B);
+    assert!(f.state.xi2_pointer_grabs.is_empty());
+    assert!(f.state.active_pointer_grab.is_none());
+    assert!(f.state.xi2_detached_masters.is_empty());
+    assert!(
+        f.state.xi1_frozen.values().all(|freeze| {
+            !freeze.frozen() && freeze.other.is_none() && freeze.stored.is_none()
+        })
+    );
+}
+
+#[test]
+fn destroy_grab_window_ends_slave_implicit_grab() {
+    let mut f = fixture();
+    select_xi2(&mut f, CLIENT_A, W, XI_XTEST, XI_GRAB_MASK);
+    select_xi2(&mut f, CLIENT_B, OUT, XI_XTEST, XI_GRAB_MASK);
+    let origin = InputOrigin::XTest(XI_XTEST);
+
+    press_over_d(&mut f, origin, 1);
+    assert_slave_implicit(&f, XI_XTEST, CLIENT_A, W);
+    assert!(f.state.active_pointer_grab.is_none());
+    assert!(f.state.xi2_detached_masters.is_empty());
+    assert_eq!(read_packets(&mut f.client_a), vec![xi(4, 4, 4, W)]);
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    dispatch(&mut f, CLIENT_A, 4, 0, &W.to_le_bytes()); // DestroyWindow
+    assert!(f.state.resources.window(ResourceId(W)).is_none());
+    assert!(!f.state.xi2_pointer_grabs.contains_key(&XI_XTEST));
+    move_to_out(&mut f, origin);
+    assert_eq!(read_packets(&mut f.client_b), vec![xi(6, 4, 4, OUT)]);
+    release(&mut f, origin, 1);
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_eq!(read_packets(&mut f.client_b), vec![xi(5, 4, 4, OUT)]);
+    final_motion(&mut f, origin);
+    assert_eq!(read_packets(&mut f.client_b), vec![xi(6, 4, 4, OUT)]);
+    assert_end_state(&f);
 }
