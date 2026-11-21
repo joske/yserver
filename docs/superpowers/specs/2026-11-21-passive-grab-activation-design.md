@@ -1,6 +1,6 @@
 # Passive grab activation and replay (C19)
 
-Status: draft, revision 2 (sol review r1: F1 P4b diagnosis corrected and P4c added, F2 master-state invariant 3a, F3 C15 exception). Stacked on PR #374 (`feat/per-device-implicit-grabs`, `af690cdf`, rebased on master with #376; the measurements were taken on its pre-rebase tree `d479e443`, and #376 changed only GLX).
+Status: revision 3, sol review r2 APPROVED; awaiting the user's approval (sol review r1: F1 P4b diagnosis corrected and P4c added, F2 master-state invariant 3a, F3 C15 exception). Stacked on PR #374 (`feat/per-device-implicit-grabs`, `af690cdf`, rebased on master with #376; the measurements were taken on its pre-rebase tree `d479e443`, and #376 changed only GLX).
 Measurements: `docs/superpowers/findings/2026-11-21-passive-grab-activation-measurements.md` (cases P1-P5, P4b and P4c; one fresh server per case).
 
 ## Intent
@@ -103,5 +103,6 @@ Behaviour is taken from Xorg server 21.1.24 (MIT/X11 licence) source citations, 
 
 - How the two passes are expressed: one lookup that takes the pass, or two calls from the activation site.
 - How the activation block suppresses the master and core forms after a slave activation, and how the replay limits itself to the frozen device's forms. The existing per-form routing is the reuse candidate.
+- Request paths (sol r2): Xorg replaces with `GrabsAreIdentical` (`../xserver/dix/grabs.c:495-501`, `:551-555`), which also requires identical devices, and deletes with `GrabMatchesSecond` (`:615-619`). Both reject a different grab type. yserver's core `GrabButton` replacement (`process_request/grabs.rs` ~1186) and core `UngrabButton` (~1260) both omit the protocol; both must keep the other protocol's grab for P4c to pass. Keep matching and replacement distinct for XI2 wildcard devices.
 - Test fixture reuse from the #373 and #374 test modules.
 - Test design for joske's owner-events point: an async slave grab with owner_events where the natural walk would deliver to a different window of another client (P1), so a walk-routed activation is distinguishable from the grab-window delivery.
