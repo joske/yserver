@@ -6,21 +6,25 @@ Oracle: `/data/Projects/xorg-21.1.24` (tag `xorg-server-21.1.24`), cited as `../
 
 **Comparison.** Recipient, event type, device/source and event window, plus grab statuses. Crossings and coordinates are excluded, as in the earlier measurement docs.
 
+**Fresh server per case.** Each case runs on its own freshly started Xvfb and yserver, so every case starts with no button held (`POINTER_INITIAL ... mask=0x0` on both). A first run of all cases on one yserver instance left the master button logically held after P1, and P1m then started with `mask=0x100`; that run is discarded.
+
 | case | setup | Xvfb 21.1.24 | yserver (#374) |
 |---|---|---|---|
 | P1 | A: async XI2 passive grab (XIGrabButton, button 1, XIAnyModifier) on W for slave 4, owner_events=1, Motion/Press/Release. B selects slave 4 and master 2 on D. Press, move, release over D. | A gets press d4, motion d4 and release d4 on W. B gets no press or release: the activation detached slave 4, so no master event exists. | Same, plus B gets **XI_ButtonPress d2** on D. |
-| P1m | As P1, grab on master 2. | A gets XI_ButtonPress d2 on W, then motion/release d2 on W. B gets the slave forms d4 on D. | A gets a **core ButtonPress** on W instead of XI_ButtonPress; the rest matches. |
+| P1m | As P1, grab on master 2. | A gets XI_ButtonPress d2 on W, then motion/release d2 on W. B gets the slave forms d4 on D. | A gets **core ButtonPress and XI_ButtonPress d2** for the one activation; the rest matches. |
 | P2 | A: sync XI2 passive grab on W for slave 4, owner_events=0, mask **ButtonRelease only**. B selects slave 4 and master 2 on D. Press; XIAllowEvents AsyncDevice; release. | A gets press d4 (outside its mask) and release d4 on W. | Same. |
 | P2r | As P2, then ReplayDevice instead of AsyncDevice. | A gets press d4 on W; the replay gives B press d4 and release d4 on D. | Same, plus B gets **press d2 and release d2** on D. |
 | P2m | As P2 with the grab on master 2. | A gets XI_ButtonPress d2 and XI_ButtonRelease d2 on W; B gets d4 press/release on D. | A gets **core ButtonPress and XI_ButtonPress d2** for the one activation. |
 | P3 (C19 gate) | A: core sync GrabButton (AnyButton, AnyModifier) on W. B selects slave 4 only on D. Press; XAllowEvents ReplayPointer; move to OUT; release. | A gets core ButtonPress on W. B gets press d4 on D once, **before** the replay (the slave is processed first and the core grab lives on the master); the replay replays only the master event. B gets motion d4 and release d4 on D. | B gets **press d4 twice**: at activation and again from the replay. |
 | P4 (xfwm4) | A: core sync GrabButton (AnyButton, AnyModifier) on D, **then** XI2 sync XIGrabButton (master 2, XIAnyButton, XIAnyModifier, Press/Release) on D; B selects master 2 Press/Release on D. Press; one XAllowEvents ReplayPointer; release. | A gets only **XI_ButtonPress d2** (the newer grab wins). B gets press d2 and release d2 on D. | A gets **core ButtonPress and XI_ButtonPress d2**. |
-| P4b | As P4 with the XI2 grab created first. | A gets only a core ButtonPress (the newer, core grab wins). | Same output, but by two compensating errors: yserver picks the XI2 grab (device specificity), then delivers it in core form (as P1m). |
+| P4b | As P4 with the XI2 grab created first. | A gets only a core ButtonPress. | Same. yserver reaches it differently: its core GrabButton request deleted A's XI2 grab on the same window, button and modifiers, so only the core grab exists at the press (see P4c). |
+| P4c | A: XI2 sync XIGrabButton (master 2, XIAnyButton, XIAnyModifier, Press/Release) on D, then core sync GrabButton (AnyButton, AnyModifier) on D, then XUngrabButton (AnyButton, AnyModifier) on D. B selects master 2 Press/Release on D. Press; XIAllowEvents ReplayDevice; release. | The XI2 grab survives both core requests: A gets XI_ButtonPress d2 on D; B gets press d2 and release d2. | A gets nothing: the core GrabButton removed the XI2 grab, so no grab activates; B gets press d2 and release d2. |
 | P5 | A: core async GrabButton (AnyButton, AnyModifier) on W. B: async XI2 XIGrabButton for slave 4, button 1, on D (a descendant of W); B also selects master 2 Press/Release on D. Press and release over D. | B's slave grab wins: B gets press d4 and release d4 on D. A gets nothing: the slave pass runs over the whole tree before the master pass, and the detached slave produces no master event. | A's core grab on the ancestor wins: A gets core press and release on W; B gets nothing. |
 
 **P4 is xfwm4 4.18 click-to-focus.** Traced with x11trace on Xvfb and on yserver (real KMS, NVIDIA and AMD, 2026-11-21): on every client window xfwm4 issues a core sync `GrabButton` (AnyButton, AnyModifier) and then an XI2 sync `XIPassiveGrabDevice` (master 2, XIAnyButton, XIAnyModifier, mask Press/Release). On Xvfb xfwm4 receives one XI2 press and sends one ReplayPointer; on yserver it receives the press in core and XI2 form and sends two ReplayPointer, on #373 and on #374 alike.
 
 **Source.**
+- A passive grab request replaces an existing grab only when `GrabMatchesSecond` holds, which first requires the same grab type (`../xserver/dix/grabs.c`, `GrabMatchesSecond`: `pFirstGrab->grabtype != pSecondGrab->grabtype` returns FALSE; used by `AddPassiveGrabToList`, `:551-565`). A core GrabButton and an XI2 XIPassiveGrabDevice on the same window, button and modifiers therefore coexist (P4b, P4c).
 - `CheckDeviceGrabs` (`../xserver/dix/events.c:4187`) runs for each device event, slave first, then master (`../xserver/mi/mieq.c:502-508`). Core grabs match only on the master pass (`checkCore`, `CheckPassiveGrab`, `../xserver/dix/events.c` `MatchForType(..., CORE, ...)` under `checkCore`).
 - On one window the first grab in `wPassiveGrabs` that matches wins (`CheckPassiveGrabsOnWindow`). `AddPassiveGrabToList` prepends (`../xserver/dix/grabs.c:564-565`), so the newest matching grab wins.
 - `ActivatePassiveGrab` (`../xserver/dix/events.c:3833`) converts the event to the grab's type only (CORE, XI or XI2), activates the grab, and delivers once to the grab client on `grab->window` with the event's own filter as mask, whatever the grab's event mask or owner_events.
@@ -33,7 +37,7 @@ The client is `implicit-oracle.c` from `2026-11-19-per-device-implicit-grabs-mea
 
 ```sh
 cc -std=c11 -O2 -Wall -Wextra -Werror passive-oracle.c -o passive-oracle $(pkg-config --cflags --libs x11 xi xtst)
-for c in P1 P1m P2 P2r P2m P3 P4 P4b P5; do ./passive-oracle :97 $c; ./passive-oracle :96 $c; done
+for c in P1 P1m P2 P2r P2m P3 P4 P4b P4c P5; do   # one fresh server per case ./passive-oracle :97 $c; ./passive-oracle :96 $c; done
 ```
 
 ```diff
@@ -82,7 +86,7 @@ for c in P1 P1m P2 P2r P2m P3 P4 P4b P5; do ./passive-oracle :97 $c; ./passive-o
  static void run_case(struct Setup *s, const char *case_id) {
      const unsigned int motion = 1u << XI_Motion;
      const unsigned int buttons = (1u << XI_ButtonPress) | (1u << XI_ButtonRelease);
-@@ -868,6 +893,61 @@
+@@ -868,6 +893,72 @@
          drain_all_for(s, 75);
          release_b(s, 1);
          move_to(s, 660, 160);
@@ -126,6 +130,17 @@ for c in P1 P1m P2 P2r P2m P3 P4 P4b P5; do ./passive-oracle :97 $c; ./passive-o
 +            move_to(s, 150, 150); press_at(s, 1);
 +            XAllowEvents(s->a, ReplayPointer, CurrentTime); XSync(s->a, False);
 +            puts("ALLOW XAllowEvents client=A mode=ReplayPointer");
++            drain_all_for(s, 100); release_b(s, 1); move_to(s, 165, 165);
++        } else if (!strcmp(case_id, "P4c")) {
++            puts("SCENARIO P4c A XI2 sync XIGrabButton(master,any,XIAnyModifier,Press|Release) on D, then core sync GrabButton(any,AnyModifier) on D, then XUngrabButton(core); B master XI2 Press|Release on D; press; XIAllowEvents ReplayDevice; release");
++            select_xi2(s->b, s->child, s->master, (1u << XI_ButtonPress) | (1u << XI_ButtonRelease));
++            pgrab_xi2_button(s, s->master, XIAnyButton, s->child, GrabModeSync, False, (1u << XI_ButtonPress) | (1u << XI_ButtonRelease), &anymod);
++            pgrab_core(s, s->child, AnyButton);
++            XUngrabButton(s->a, AnyButton, AnyModifier, s->child); XSync(s->a, False);
++            puts("REQUEST XUngrabButton client=A window=D button=any modifiers=AnyModifier");
++            move_to(s, 150, 150); press_at(s, 1);
++            XIAllowEvents(s->a, s->master, XIReplayDevice, CurrentTime); XSync(s->a, False);
++            puts("ALLOW XIAllowEvents client=A device=master mode=ReplayDevice");
 +            drain_all_for(s, 100); release_b(s, 1); move_to(s, 165, 165);
 +        } else if (!strcmp(case_id, "P5")) {
 +            puts("SCENARIO P5 A core async GrabButton(any,AnyModifier) on W (ancestor); B async XI2 XIGrabButton slave 4 button 1 on D (descendant); press, release over D");
