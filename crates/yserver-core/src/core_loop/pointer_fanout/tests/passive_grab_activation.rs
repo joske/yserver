@@ -2,8 +2,8 @@
 
 use super::{
     implicit_grabs::{
-        Fixture, assert_end_state, assert_end_state_with_xi1_entries, create_window, dispatch,
-        map_window, press_over_d, read_packets, release, select_xi2, send, xi,
+        Fixture, assert_end_state, assert_end_state_with_xi1_entries, core, create_window,
+        dispatch, map_window, press_over_d, read_packets, release, select_xi2, send, xi,
     },
     *,
 };
@@ -32,6 +32,7 @@ const RECORD_CONTEXT: u32 = 0x0300_0001;
 const XI_MASTER: u16 = 2;
 const XI_MASTER_KEYBOARD: u16 = 3;
 const XI_XTEST: u16 = 4;
+const XI_ALL_DEVICES: u16 = 0;
 const XI_MOTION: u32 = 1 << 6;
 const XI_BUTTON_PRESS: u32 = 1 << 4;
 const XI_BUTTON_RELEASE: u32 = 1 << 5;
@@ -103,9 +104,10 @@ pub(super) fn ungrab_button_core(
     button: u8,
     modifiers: u16,
 ) {
-    let mut body = Vec::with_capacity(6);
+    let mut body = Vec::with_capacity(8);
     body.extend_from_slice(&window.to_le_bytes());
     body.extend_from_slice(&modifiers.to_le_bytes());
+    body.extend_from_slice(&[0; 2]); // request padding
     dispatch(f, client, 29, button, &body);
 }
 
@@ -711,4 +713,213 @@ fn held_master_button_survives_slave_grab() {
     release(&mut f, InputOrigin::Physical(source), 3);
     assert!(read_packets(&mut f.client_b).is_empty());
     assert_task1_end_state(&f, &[XI_XTEST]);
+}
+
+#[test]
+fn p4c_core_requests_keep_xi2_grab() {
+    let mut f = p_fixture();
+    select_xi2(&mut f, CLIENT_B, D, XI_MASTER, XI_BUTTONS);
+    xi_grab_button(
+        &mut f, CLIENT_A, XI_MASTER, D, ANY_BUTTON, 0, false, XI_BUTTONS,
+    );
+    grab_button_core(&mut f, CLIENT_A, D, ANY_BUTTON, ANY_MODIFIER, 0, false);
+
+    let same_window_grabs: Vec<_> = f
+        .state
+        .button_grabs
+        .iter()
+        .filter(|grab| grab.owner == ClientId(CLIENT_A) && grab.grab_window == ResourceId(D))
+        .collect();
+    assert_eq!(same_window_grabs.len(), 2, "core and XI2 grabs coexist");
+
+    ungrab_button_core(&mut f, CLIENT_A, D, ANY_BUTTON, ANY_MODIFIER);
+    let remaining: Vec<_> = f
+        .state
+        .button_grabs
+        .iter()
+        .filter(|grab| grab.owner == ClientId(CLIENT_A) && grab.grab_window == ResourceId(D))
+        .collect();
+    assert_eq!(
+        remaining.len(),
+        1,
+        "UngrabButton removes only the core grab"
+    );
+    assert!(remaining[0].via_xi2 && remaining[0].device_id == XI_MASTER);
+
+    press_over_d(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert!(f.state.active_pointer_grab.is_some_and(|grab| {
+        grab.owner == ClientId(CLIENT_A)
+            && grab.grab_window == ResourceId(D)
+            && grab.via_xi2
+            && grab.passive
+            && !grab.implicit
+    }));
+    assert!(f.state.xi2_pointer_grabs.is_empty());
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(4, XI_MASTER, XI_XTEST, D)]
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    xi_allow_events(&mut f, CLIENT_A, XI_MASTER, 2); // ReplayDevice
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(4, XI_MASTER, XI_XTEST, D)]
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    release(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(5, XI_MASTER, XI_XTEST, D)]
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
+#[test]
+fn p4b_older_xi2_newer_core_core_wins() {
+    let mut f = p_fixture();
+    select_xi2(&mut f, CLIENT_B, D, XI_MASTER, XI_BUTTONS);
+    xi_grab_button(
+        &mut f, CLIENT_A, XI_MASTER, D, ANY_BUTTON, 0, false, XI_BUTTONS,
+    );
+    grab_button_core(&mut f, CLIENT_A, D, ANY_BUTTON, ANY_MODIFIER, 0, false);
+    assert_eq!(
+        f.state
+            .button_grabs
+            .iter()
+            .filter(|grab| grab.owner == ClientId(CLIENT_A) && grab.grab_window == ResourceId(D))
+            .count(),
+        2,
+        "both registrations exist before the press"
+    );
+
+    press_over_d(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert!(f.state.active_pointer_grab.is_some_and(|grab| {
+        grab.owner == ClientId(CLIENT_A)
+            && grab.grab_window == ResourceId(D)
+            && !grab.via_xi2
+            && grab.passive
+            && !grab.implicit
+    }));
+    assert!(f.state.xi2_pointer_grabs.is_empty());
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(read_packets(&mut f.client_a), vec![core(4, D)]);
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    allow_events_core(&mut f, CLIENT_A, 2); // ReplayPointer
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(4, XI_MASTER, XI_XTEST, D)]
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    release(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(5, XI_MASTER, XI_XTEST, D)]
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
+#[test]
+fn p5_slave_grab_on_descendant_beats_core_grab_on_ancestor() {
+    let mut f = p_fixture();
+    select_xi2(&mut f, CLIENT_B, D, XI_MASTER, XI_BUTTONS);
+    grab_button_core(&mut f, CLIENT_A, W, ANY_BUTTON, ANY_MODIFIER, 1, false);
+    xi_grab_button(&mut f, CLIENT_B, XI_XTEST, D, 1, 1, false, XI_BUTTONS);
+
+    press_over_d(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert!(
+        f.state
+            .xi2_pointer_grabs
+            .get(&XI_XTEST)
+            .is_some_and(|grab| {
+                grab.owner == ClientId(CLIENT_B)
+                    && grab.grab_window == ResourceId(D)
+                    && grab.via_xi2
+                    && grab.passive
+                    && !grab.implicit
+            })
+    );
+    assert!(f.state.active_pointer_grab.is_none());
+    assert_eq!(f.state.buttons_down, 0);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(4, XI_XTEST, XI_XTEST, D)]
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+
+    release(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(5, XI_XTEST, XI_XTEST, D)]
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_task1_end_state(&f, &[XI_XTEST]);
+}
+
+#[test]
+fn xiall_devices_grab_activates_on_slave_pass() {
+    let mut f = p_fixture();
+    xi_grab_button(&mut f, CLIENT_A, XI_ALL_DEVICES, W, 1, 1, false, XI_BUTTONS);
+
+    press_over_d(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert!(
+        f.state
+            .xi2_pointer_grabs
+            .get(&XI_XTEST)
+            .is_some_and(|grab| {
+                grab.owner == ClientId(CLIENT_A)
+                    && grab.grab_window == ResourceId(W)
+                    && grab.via_xi2
+                    && grab.passive
+                    && !grab.implicit
+            })
+    );
+    assert_eq!(
+        f.state.xi2_detached_masters.get(&XI_XTEST),
+        Some(&XI_MASTER)
+    );
+    assert!(f.state.active_pointer_grab.is_none());
+    assert_eq!(f.state.buttons_down, 0);
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(4, XI_XTEST, XI_XTEST, W)]
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    release(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(5, XI_XTEST, XI_XTEST, W)]
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+    assert_task1_end_state(&f, &[XI_XTEST]);
+}
+
+#[test]
+fn each_ungrab_removes_only_its_protocol() {
+    let mut f = p_fixture();
+    grab_button_core(&mut f, CLIENT_A, W, 1, ANY_MODIFIER, 1, false);
+    xi_grab_button(&mut f, CLIENT_A, XI_MASTER, W, 1, 1, false, XI_BUTTONS);
+    assert_eq!(f.state.button_grabs.len(), 2);
+
+    xi_ungrab_button(&mut f, CLIENT_A, XI_MASTER, W, 1);
+    assert_eq!(f.state.button_grabs.len(), 1);
+    assert!(!f.state.button_grabs[0].via_xi2);
+
+    xi_grab_button(&mut f, CLIENT_A, XI_MASTER, W, 1, 1, false, XI_BUTTONS);
+    assert_eq!(f.state.button_grabs.len(), 2);
+    ungrab_button_core(&mut f, CLIENT_A, W, 1, ANY_MODIFIER);
+    assert_eq!(
+        f.state.button_grabs.len(),
+        1,
+        "ungrab state: {:?}",
+        f.state.button_grabs
+    );
+    assert!(f.state.button_grabs[0].via_xi2);
+    assert_eq!(f.state.button_grabs[0].device_id, XI_MASTER);
+    assert_task1_end_state(&f, &[]);
 }

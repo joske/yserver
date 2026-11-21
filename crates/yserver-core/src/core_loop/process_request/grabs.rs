@@ -1185,6 +1185,7 @@ pub(super) fn handle_grab_button(
         }
         state.button_grabs.retain(|g| {
             !(g.owner == client_id
+                && !g.via_xi2
                 && g.grab_window == grab_window
                 && g.button == button
                 && g.modifiers == modifiers)
@@ -1259,6 +1260,7 @@ pub(super) fn handle_ungrab_button(
         }
         state.button_grabs.retain(|g| {
             !(g.owner == client_id
+                && !g.via_xi2
                 && g.grab_window == grab_window
                 && (g.button == button || button == 0)
                 && (g.modifiers == modifiers || modifiers == 0x8000))

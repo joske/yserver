@@ -1019,13 +1019,9 @@ fn pointer_event_fanout_to_state_inner(
     } else {
         None
     };
-    let passive_slave_activation = passive_grab_match.as_ref().is_some_and(|(grab, _)| {
-        grab.device_id != 0
-            && matches!(
-                state.xi_devices.role(grab.device_id),
-                Some(crate::xinput::XiDeviceRole::SlavePointer)
-            )
-    });
+    let passive_slave_activation = passive_grab_match
+        .as_ref()
+        .is_some_and(|(_, _, pass)| matches!(pass, crate::server::PassiveGrabPass::Slave(_)));
     if passive_slave_activation {
         // The source transition must precede lookup so its first-button
         // predicate sees the pressed slave bit. Roll back the aggregate
@@ -1466,7 +1462,7 @@ fn pointer_event_fanout_to_state_inner(
         && handle_grabs
         && event.kind == PointerEventKind::ButtonPress
         && button_transition.source_accepted
-        && let Some((grab, _hit_window)) = passive_grab_match.take()
+        && let Some((grab, _hit_window, pass)) = passive_grab_match.take()
     {
         log::debug!(
             "pointer_fanout: PASSIVE-GRAB match button={} grab_owner={:?} grab_window=0x{:x} mode={} owner_events={}",
@@ -1493,19 +1489,15 @@ fn pointer_event_fanout_to_state_inner(
                 0
             },
         };
-        let dynamic_device = grab.device_id != 0
-            && matches!(
-                state.xi_devices.role(grab.device_id),
-                Some(crate::xinput::XiDeviceRole::SlavePointer)
-            );
-        let sync_device = if grab.device_id == 0 {
-            crate::xinput::DEVICEID_MASTER_POINTER
-        } else {
-            grab.device_id
+        let (dynamic_device, sync_device) = match pass {
+            crate::server::PassiveGrabPass::Slave(device_id) => (true, device_id),
+            crate::server::PassiveGrabPass::Master => {
+                (false, crate::xinput::DEVICEID_MASTER_POINTER)
+            }
         };
         if dynamic_device {
-            state.xi2_pointer_grabs.insert(grab.device_id, active_grab);
-            let _ = state.detach_xi2_slave(grab.device_id);
+            state.xi2_pointer_grabs.insert(sync_device, active_grab);
+            let _ = state.detach_xi2_slave(sync_device);
         } else {
             state.set_pointer_grab(active_grab);
         }
@@ -3983,6 +3975,7 @@ fn try_match_passive_grab(
 ) -> Option<(
     crate::server::PassiveButtonGrab,
     yserver_protocol::x11::ResourceId,
+    crate::server::PassiveGrabPass,
 )> {
     // Same generation-time target rule as delivery (passive button
     // grabs are a button context): match the grab against the window
@@ -3991,14 +3984,14 @@ fn try_match_passive_grab(
     let (hit_window, _, _) = resolve_pointer_hit(state, xid_map, &event)?;
     let source = resolve_pointer_xi_source(state, event.origin, false)?;
     let device_id = source.slave_deviceid.unwrap_or(source.sourceid);
-    let grab = state.find_passive_grab(
+    let (grab, pass) = state.find_passive_grab(
         hit_window,
         event.detail,
         event.state,
         device_id,
         source.attached_master,
     )?;
-    Some((grab, hit_window))
+    Some((grab, hit_window, pass))
 }
 
 fn pointer_mask_bit(kind: PointerEventKind, state_mask: u16) -> u32 {

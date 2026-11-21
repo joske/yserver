@@ -330,6 +330,12 @@ pub struct PassiveButtonGrab {
     pub via_xi2: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassiveGrabPass {
+    Slave(u16),
+    Master,
+}
+
 #[derive(Debug, Clone)]
 pub struct KeyGrab {
     pub owner: ClientId,
@@ -4082,11 +4088,10 @@ impl ServerState {
         state_mask: u16,
         device_id: u16,
         master_device_id: Option<u16>,
-    ) -> Option<PassiveButtonGrab> {
-        // Xorg CheckDeviceGrabs walks the sprite trace TOP-DOWN (root
-        // first): a grab on an ancestor takes precedence over the same
-        // grab deeper in the tree (XTS XGrabButton-4), and root-window
-        // WM grabs match clicks anywhere.
+    ) -> Option<(PassiveButtonGrab, PassiveGrabPass)> {
+        // Xorg checks the slave device over the whole sprite trace before
+        // checking the master (`../xserver/dix/grabs.c:439-458`). Within a
+        // pass, CheckDeviceGrabs walks root-first (`XGrabButton-4`).
         let mut chain = vec![window];
         let mut current = window;
         for _ in 0..256 {
@@ -4099,62 +4104,79 @@ impl ServerState {
             chain.push(w.parent);
             current = w.parent;
         }
-        for current in chain.into_iter().rev() {
-            let attached_master =
-                master_device_id.or_else(|| self.xi_devices.attachment(device_id));
-            let matching = self.button_grabs.iter().filter_map(|grab| {
-                if grab.grab_window != current {
-                    return None;
-                }
-                let button_match = grab.button == 0 || grab.button == button;
-                let mod_match = grab.modifiers == 0x8000 || grab.modifiers == (state_mask & 0x00ff);
-                let device_match = (grab.device_id == 0 && attached_master.is_some())
-                    || grab.device_id == device_id
-                    || Some(grab.device_id) == attached_master;
-                // Xorg checks the first-button rule on the device pass that
-                // owns this candidate (`events.c:4200`). A slave XI2 grab,
-                // including XIAllDevices on its slave pass, sees only that
-                // source's held buttons. Core and master candidates see the
-                // master's aggregate state.
-                let slave_candidate = grab.via_xi2
-                    && self.xi_devices.role(device_id)
-                        == Some(crate::xinput::XiDeviceRole::SlavePointer)
-                    && (grab.device_id == 0 || grab.device_id == device_id);
-                let held_buttons = if slave_candidate {
-                    self.xi_devices
-                        .device(device_id)
-                        .map_or(0, |device| device.buttons_down)
-                } else {
-                    self.buttons_down
-                };
-                let no_other_buttons = match button {
-                    0 => true,
-                    1..=16 => held_buttons & !(1u16 << (button - 1)) == 0,
-                    _ => held_buttons == 0,
-                };
-                // Xorg ActivatePointerGrab fails when confine_to is
-                // not viewable — the grab does not activate
-                // (XGrabButton-3).
-                let confine_ok = grab.confine_to.0 == 0
-                    || self
-                        .resources
-                        .window(grab.confine_to)
-                        .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
-                (button_match && mod_match && device_match && no_other_buttons && confine_ok).then(
-                    || {
-                        let specificity = if grab.device_id == device_id && grab.device_id != 0 {
-                            3
-                        } else if grab.device_id != 0 {
-                            2
-                        } else {
-                            1
-                        };
-                        (specificity, grab)
-                    },
-                )
+        chain.reverse();
+
+        let master_id = master_device_id
+            .or_else(|| self.xi_devices.attachment(device_id))
+            .or_else(|| {
+                (self.xi_devices.role(device_id)
+                    == Some(crate::xinput::XiDeviceRole::MasterPointer))
+                .then_some(device_id)
             });
-            if let Some((_, grab)) = matching.max_by_key(|(specificity, _)| *specificity) {
-                return Some(grab.clone());
+        let mut passes = Vec::with_capacity(2);
+        if self.xi_devices.role(device_id) == Some(crate::xinput::XiDeviceRole::SlavePointer) {
+            passes.push(PassiveGrabPass::Slave(device_id));
+        }
+        if master_id.is_some() {
+            passes.push(PassiveGrabPass::Master);
+        }
+
+        for pass in passes {
+            for current in &chain {
+                let matching = self.button_grabs.iter().rev().find(|grab| {
+                    if grab.grab_window != *current {
+                        return false;
+                    }
+                    let device_match = match pass {
+                        PassiveGrabPass::Slave(slave_id) => {
+                            grab.via_xi2 && (grab.device_id == slave_id || grab.device_id == 0)
+                        }
+                        PassiveGrabPass::Master => {
+                            if grab.via_xi2 {
+                                master_id.is_some_and(|master_id| {
+                                    grab.device_id == master_id
+                                        || grab.device_id == 1
+                                        || grab.device_id == 0
+                                })
+                            } else {
+                                true
+                            }
+                        }
+                    };
+                    let button_match = grab.button == 0 || grab.button == button;
+                    let mod_match =
+                        grab.modifiers == 0x8000 || grab.modifiers == (state_mask & 0x00ff);
+                    // Xorg checks the first-button rule on the device pass that
+                    // owns this candidate (`events.c:4200`). A slave XI2 grab,
+                    // including XIAllDevices on its slave pass, sees only that
+                    // source's held buttons. Core and master candidates see the
+                    // master's aggregate state.
+                    let slave_candidate = matches!(pass, PassiveGrabPass::Slave(_));
+                    let held_buttons = if slave_candidate {
+                        self.xi_devices
+                            .device(device_id)
+                            .map_or(0, |device| device.buttons_down)
+                    } else {
+                        self.buttons_down
+                    };
+                    let no_other_buttons = match button {
+                        0 => true,
+                        1..=16 => held_buttons & !(1u16 << (button - 1)) == 0,
+                        _ => held_buttons == 0,
+                    };
+                    // Xorg ActivatePointerGrab fails when confine_to is
+                    // not viewable — the grab does not activate
+                    // (XGrabButton-3).
+                    let confine_ok = grab.confine_to.0 == 0
+                        || self
+                            .resources
+                            .window(grab.confine_to)
+                            .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
+                    button_match && mod_match && device_match && no_other_buttons && confine_ok
+                });
+                if let Some(grab) = matching {
+                    return Some((grab.clone(), pass));
+                }
             }
         }
         None
@@ -4531,7 +4553,7 @@ fn pointer_event_fanout_inner(
                 xi_pointer_device_id,
                 None,
             )
-            .map(|grab| (grab, hit_window))
+            .map(|(grab, _pass)| (grab, hit_window))
         });
         if let Some(grab) = matched {
             let (grab, hit_window) = grab;
