@@ -46,15 +46,33 @@ fn glx_fb_configs_advertise_pbuffer() {
 }
 
 #[test]
-fn glx_visuals_have_one_unambiguous_double_buffered_config() {
+fn glx_visuals_have_one_unambiguous_config_each() {
     use yserver_protocol::x11::glx as g;
 
     let visuals = synthesise_glx_visual_configs();
-    assert_eq!(visuals.len(), 3);
-    assert!(visuals.iter().all(|visual| visual.double_buffer));
+    assert_eq!(visuals.len(), 4);
+    assert_eq!(
+        visuals.iter().filter(|visual| visual.double_buffer).count(),
+        3
+    );
+    assert_eq!(
+        visuals
+            .iter()
+            .filter(|visual| visual.visual_id == crate::resources::SINGLE_BUFFER_VISUAL.0)
+            .count(),
+        1,
+        "the single-buffered visual must be advertised exactly once"
+    );
+    assert!(
+        visuals
+            .iter()
+            .find(|visual| visual.visual_id == crate::resources::SINGLE_BUFFER_VISUAL.0)
+            .is_some_and(|visual| !visual.double_buffer),
+        "SINGLE_BUFFER_VISUAL must carry a single-buffered GLX config"
+    );
 
     let configs = synthesise_glx_fb_configs(false);
-    assert_eq!(configs.len(), 4);
+    assert_eq!(configs.len(), 5);
     let mut visual_ids = HashSet::new();
     for config in configs {
         let get = |attr: u32| config.iter().find(|(a, _)| *a == attr).map(|(_, v)| *v);
@@ -67,10 +85,29 @@ fn glx_visuals_have_one_unambiguous_double_buffered_config() {
                 visual_ids.insert(visual_id),
                 "duplicate visual 0x{visual_id:x}"
             );
-            assert_eq!(get(g::GLX_DOUBLEBUFFER), Some(1));
+            let expected_double_buffer =
+                u32::from(visual_id != crate::resources::SINGLE_BUFFER_VISUAL.0);
+            assert_eq!(get(g::GLX_DOUBLEBUFFER), Some(expected_double_buffer));
         }
     }
-    assert_eq!(visual_ids.len(), 3);
+    assert_eq!(visual_ids.len(), 4);
+
+    let single_fbconfig = glx_visual_fbconfig(crate::resources::SINGLE_BUFFER_VISUAL.0)
+        .expect("the single-buffered visual must map to an FBConfig");
+    assert_eq!(
+        glx_fbconfig_visual(single_fbconfig),
+        crate::resources::SINGLE_BUFFER_VISUAL.0
+    );
+    let config = synthesise_glx_fb_configs(false)
+        .into_iter()
+        .find(|config| {
+            config.iter().any(|(attribute, value)| {
+                *attribute == g::GLX_FBCONFIG_ID && *value == single_fbconfig
+            })
+        })
+        .expect("single-buffered FBConfig present");
+    let get = |attr: u32| config.iter().find(|(a, _)| *a == attr).map(|(_, v)| *v);
+    assert_eq!(get(g::GLX_DOUBLEBUFFER), Some(0));
 }
 
 // glmark2 2023.01 defaults to stencil=0 and rejects any positive
@@ -158,6 +195,7 @@ fn qtwebengine_can_choose_an_isolated_single_buffered_pixmap_config() {
 fn glx_fbconfig_depth_tracks_visual() {
     assert_eq!(glx_fbconfig_depth(0x101), 24);
     assert_eq!(glx_fbconfig_depth(0x103), 32);
+    assert_eq!(glx_fbconfig_depth(0x106), 24);
     // Unknown fbconfig falls back to the depth-24 default.
     assert_eq!(glx_fbconfig_depth(0xDEAD), 24);
 }

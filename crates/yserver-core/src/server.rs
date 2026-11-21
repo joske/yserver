@@ -53,6 +53,7 @@ const _: () = {
         crate::resources::ARGB_VISUAL,
         crate::resources::ARGB_COLORMAP,
         crate::resources::GLMARK_VISUAL,
+        crate::resources::SINGLE_BUFFER_VISUAL,
         crate::resources::SCREEN_SAVER_WINDOW,
         crate::resources::ROOTLESS_WM_CHECK_WINDOW,
         crate::resources::ROOTLESS_SELECTION_WINDOW,

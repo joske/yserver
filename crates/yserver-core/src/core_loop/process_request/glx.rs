@@ -125,13 +125,30 @@ pub(super) fn synthesise_glx_visual_configs() -> Vec<yserver_protocol::x11::glx:
     // X11 visual class 4 == TrueColor, matching the class we put in the
     // setup-reply visual list.
     const TRUE_COLOR: u32 = 4;
-    let mut out: Vec<VisualConfig> = Vec::with_capacity(3);
-    for &(visual_id, alpha_bits, rgb_bits, stencil_bits) in &[
+    let mut out: Vec<VisualConfig> = Vec::with_capacity(4);
+    for &(visual_id, alpha_bits, rgb_bits, stencil_bits, double_buffer) in &[
         // Must match the client driver's configs (see synthesise_glx_fb_configs):
         // radeonsi advertises alpha-8 / 32-bit-buffer for both depths.
-        (0x102_u32, 8_u32, 32_u32, 8_u32), // ROOT_VISUAL — TrueColor (GL alpha 8)
-        (0x103_u32, 8_u32, 32_u32, 8_u32), // ARGB_VISUAL — TrueColor RGBA
-        (crate::resources::GLMARK_VISUAL.0, 8_u32, 32_u32, 0_u32),
+        (0x102_u32, 8_u32, 32_u32, 8_u32, true), // ROOT_VISUAL — TrueColor (GL alpha 8)
+        (0x103_u32, 8_u32, 32_u32, 8_u32, true), // ARGB_VISUAL — TrueColor RGBA
+        (
+            crate::resources::GLMARK_VISUAL.0,
+            8_u32,
+            32_u32,
+            0_u32,
+            true,
+        ),
+        // GLX 1.0 glXChooseVisual defaults doubleBufferMode to False. Without
+        // a single-buffered visual, pixmap clients such as spectrum-wallpaper
+        // cannot select one and render into a back buffer that glXSwapBuffers
+        // never presents (it is a no-op for GLXPixmaps).
+        (
+            crate::resources::SINGLE_BUFFER_VISUAL.0,
+            8_u32,
+            32_u32,
+            8_u32,
+            false,
+        ),
     ] {
         out.push(VisualConfig {
             visual_id,
@@ -141,7 +158,7 @@ pub(super) fn synthesise_glx_visual_configs() -> Vec<yserver_protocol::x11::glx:
             green_bits: 8,
             blue_bits: 8,
             alpha_bits,
-            double_buffer: true,
+            double_buffer,
             stereo: false,
             rgb_bits,
             depth_bits: 24,
@@ -184,9 +201,9 @@ pub(super) fn glx_extension_string(tfp_supported: bool) -> String {
 
 pub(super) fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u32)>> {
     use yserver_protocol::x11::glx as g;
-    let mut out = Vec::with_capacity(4);
+    let mut out = Vec::with_capacity(5);
     let depth = 24;
-    for &(visual_id, fbconfig_id, alpha_size, total_buffer_size, stencil) in &[
+    for &(visual_id, fbconfig_id, alpha_size, total_buffer_size, stencil, double_buffer) in &[
         // (X visual id, FBConfig id, alpha bits, total color buffer bits)
         //
         // These MUST match the client driver's __DRIconfig attributes
@@ -197,16 +214,17 @@ pub(super) fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u3
         // 32-bit-buffer (the GL backbuffer is BGRA8 regardless of the X
         // visual's opacity), so we mirror that for both. The depth-24 X
         // visual stays opaque on screen; the alpha is GL-side only.
-        (0x102_u32, 0x101_u32, 8_u32, 32_u32, 8_u32), // ROOT_VISUAL — TrueColor
+        (0x102_u32, 0x101_u32, 8_u32, 32_u32, 8_u32, 1_u32), // ROOT_VISUAL — TrueColor
         // Preserve the IDs of the two double-buffered configurations while
         // dropping the ambiguous single-buffered 0x102 and 0x104 entries.
-        (0x103_u32, 0x103_u32, 8_u32, 32_u32, 8_u32), // ARGB_VISUAL — TrueColor RGBA
+        (0x103_u32, 0x103_u32, 8_u32, 32_u32, 8_u32, 1_u32), // ARGB_VISUAL — TrueColor RGBA
         (
             crate::resources::GLMARK_VISUAL.0,
             0x105_u32,
             8_u32,
             32_u32,
             0_u32,
+            1_u32,
         ),
     ] {
         let mut config = vec![
@@ -226,7 +244,7 @@ pub(super) fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u3
             (g::GLX_X_RENDERABLE, 1),
             (g::GLX_BUFFER_SIZE, total_buffer_size),
             (g::GLX_LEVEL, 0),
-            (g::GLX_DOUBLEBUFFER, 1),
+            (g::GLX_DOUBLEBUFFER, double_buffer),
             (g::GLX_STEREO, 0),
             (g::GLX_AUX_BUFFERS, 0),
             (g::GLX_RED_SIZE, 8),
@@ -298,6 +316,27 @@ pub(super) fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u3
         }
     }
     out.push(native_pixmap);
+
+    // A single-buffered visual of its own: see SINGLE_BUFFER_VISUAL and
+    // synthesise_glx_visual_configs. Keep the visual unique to this config
+    // (the #96 rule) and the GL attributes identical to the root config so
+    // mesa's driConfigEqual accepts radeonsi's single-buffered __DRIconfig.
+    //
+    // Append it after `native_pixmap`: QtWebEngine chooses the visual-less
+    // 0x104 native-pixmap config by FBConfig id, and that config must remain
+    // the first single-buffered match. glXChooseVisual uses the visual-config
+    // list, where this is the only single-buffered entry, so its position
+    // here does not affect legacy visual selection.
+    let mut single_buffer = out[0].clone();
+    for (attribute, value) in &mut single_buffer {
+        match *attribute {
+            g::GLX_VISUAL_ID => *value = crate::resources::SINGLE_BUFFER_VISUAL.0,
+            g::GLX_FBCONFIG_ID => *value = 0x106,
+            g::GLX_DOUBLEBUFFER => *value = 0,
+            _ => {}
+        }
+    }
+    out.push(single_buffer);
     out
 }
 

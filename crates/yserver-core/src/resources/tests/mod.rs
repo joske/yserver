@@ -342,6 +342,12 @@ fn visual_table_seeds_all_advertised_visuals() {
     assert_eq!(glmark.depth, 24);
     assert_eq!(glmark.alpha_mask, 0);
     assert_eq!(glmark.host_visual_xid, None);
+    let single = t
+        .visual(SINGLE_BUFFER_VISUAL)
+        .expect("single-buffered GLX visual seeded");
+    assert_eq!(single.depth, 24);
+    assert_eq!(single.alpha_mask, 0);
+    assert_eq!(single.host_visual_xid, None);
 }
 
 #[test]
@@ -388,6 +394,7 @@ fn is_known_visual_distinguishes_table_entries() {
     assert!(t.is_known_visual(ROOT_VISUAL));
     assert!(t.is_known_visual(ARGB_VISUAL));
     assert!(t.is_known_visual(GLMARK_VISUAL));
+    assert!(t.is_known_visual(SINGLE_BUFFER_VISUAL));
     // 0 is the wire encoding for CopyFromParent — not in the table; the
     // CreateWindow handler validates separately and never queries this.
     assert!(!t.is_known_visual(ResourceId(0)));

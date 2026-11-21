@@ -45,6 +45,17 @@ pub const ARGB_COLORMAP: ResourceId = ResourceId(0x104);
 /// Opaque depth-24 visual dedicated to the stencil-free GLX FBConfig used by
 /// glmark2. It must not share ROOT_VISUAL with the stencil-8 configuration.
 pub const GLMARK_VISUAL: ResourceId = ResourceId(0x105);
+/// Opaque depth-24 visual dedicated to the single-buffered GLX configuration.
+///
+/// GLX 1.0 `glXChooseVisual` defaults to `doubleBufferMode = False`, so a
+/// client that does not ask for `GLX_DOUBLEBUFFER` (notably GLXPixmap clients)
+/// can only select a single-buffered visual. A GLXPixmap created from a
+/// double-buffered visual renders into Mesa's private back buffer, and
+/// `glXSwapBuffers` is a protocol-mandated no-op for GLXPixmaps, so the X
+/// pixmap would never be updated. Keep this visual distinct from
+/// ROOT_VISUAL/GLMARK_VISUAL so each visual still maps to exactly one FBConfig
+/// (the #96 ambiguity).
+pub const SINGLE_BUFFER_VISUAL: ResourceId = ResourceId(0x109);
 /// The MIT-SCREEN-SAVER window, server-owned: Xorg allocates
 /// `pScreen->screensaver.wid` once per screen and reports it in
 /// `QueryInfo` and `ScreenSaverNotify` whether or not it exists
@@ -200,6 +211,21 @@ impl Default for ResourceTable {
             GLMARK_VISUAL.0,
             Visual {
                 id: GLMARK_VISUAL,
+                class: VISUAL_CLASS_TRUE_COLOR,
+                depth: 24,
+                bits_per_rgb: 8,
+                colormap_entries: 256,
+                red_mask: 0x00ff_0000,
+                green_mask: 0x0000_ff00,
+                blue_mask: 0x0000_00ff,
+                alpha_mask: 0,
+                host_visual_xid: None,
+            },
+        );
+        visuals.insert(
+            SINGLE_BUFFER_VISUAL.0,
+            Visual {
+                id: SINGLE_BUFFER_VISUAL,
                 class: VISUAL_CLASS_TRUE_COLOR,
                 depth: 24,
                 bits_per_rgb: 8,
