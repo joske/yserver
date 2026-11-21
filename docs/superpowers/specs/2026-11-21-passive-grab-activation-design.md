@@ -1,6 +1,6 @@
 # Passive grab activation and replay (C19), XI1 implicit grabs, XTest device motion
 
-Status: revision 5 (sol r3: F1 XI1 mask snapshot, F2 one grab per device / master independence). Revision 4: the user folded the XI1 implicit grabs (I5) and the XTest device-motion sprite (C18) into this PR; revision 3 (C19/passive part) was APPROVED by sol r2 (sol review r1: F1 P4b diagnosis corrected and P4c added, F2 master-state invariant 3a, F3 C15 exception). Stacked on PR #374 (`feat/per-device-implicit-grabs`, `af690cdf`, rebased on master with #376; the measurements were taken on its pre-rebase tree `d479e443`, and #376 changed only GLX).
+Status: revision 5, sol r4 APPROVED; awaiting the user's approval (sol r3: F1 XI1 mask snapshot, F2 one grab per device / master independence). Revision 4: the user folded the XI1 implicit grabs (I5) and the XTest device-motion sprite (C18) into this PR; revision 3 (C19/passive part) was APPROVED by sol r2 (sol review r1: F1 P4b diagnosis corrected and P4c added, F2 master-state invariant 3a, F3 C15 exception). Stacked on PR #374 (`feat/per-device-implicit-grabs`, `af690cdf`, rebased on master with #376; the measurements were taken on its pre-rebase tree `d479e443`, and #376 changed only GLX).
 Measurements: `docs/superpowers/findings/2026-11-21-passive-grab-activation-measurements.md` (cases P1-P5, P4b and P4c, then I5 and X1-X3; one fresh server per case).
 
 ## Intent
