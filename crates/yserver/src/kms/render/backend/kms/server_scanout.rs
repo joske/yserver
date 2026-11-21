@@ -89,8 +89,9 @@ impl KmsBackendState {
         self.scanout_m1.remove(id);
         let members = self.complete_rotation_members_with(id);
         if self.server_scanout.retire(id) {
-            // Promoted server-owned sources are admitted as Root candidates only, so
-            // this state-only callback cannot reference a queued Output first entry.
+            // Promoted server-owned sources are admitted as Root candidates only. A
+            // queued Root first entry revalidates against the dropped M1 entry and
+            // takes Copy when the scheduler next dispatches it.
             for scope in self.direct_scopes_referencing_drawables(&members) {
                 self.mark_direct_unflip_for(scope, "server_source_retired");
             }

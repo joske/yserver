@@ -2165,11 +2165,6 @@ fn a_failed_source_fence_takes_copy_and_unflips() {
 fn a_present_that_falls_to_copy_after_its_fence_counts_nothing() {
     let (a_xid, b_xid) = (0x0066_0081, 0x0066_0082);
     let (mut b, _, _) = flipping_double_buffer(a_xid, b_xid);
-    b.scene.test_set_flip_in_flight(true);
-    assert!(
-        !present(&mut b, 10, a_xid, STAGE),
-        "a scene flip is pending"
-    );
     let counts = |b: &KmsBackend| {
         let server = &b.pstate.scanout_m0.server;
         (
@@ -2177,9 +2172,22 @@ fn a_present_that_falls_to_copy_after_its_fence_counts_nothing() {
             server.fence_none + server.fence_explicit + server.fence_cpu_wait,
         )
     };
+    // The first entry waits behind the pending scene flip with its fence
+    // taken, then an unflip cause sends it to Copy before submission.
+    b.scene.test_set_flip_in_flight(true);
+    assert!(present(&mut b, 10, a_xid, STAGE), "queued behind the flip");
+    assert!(b.pstate.direct.root().queued_successor.is_some());
+    b.request_direct_unflip_for(DirectScope::Root, "test_cancel");
+    assert!(
+        !b.pstate.direct.root().active(),
+        "the queued entry took Copy"
+    );
     assert_eq!(counts(&b), (0, 0));
     b.scene.test_set_flip_in_flight(false);
-    assert!(present(&mut b, 11, a_xid, STAGE));
+    // The Copy fallback restarts probation, as for any declined entry.
+    let probation = [b_xid, a_xid, b_xid, a_xid, b_xid, a_xid, b_xid];
+    assert_eq!(present_all(&mut b, 11, &probation, STAGE), 0);
+    assert!(present(&mut b, 18, a_xid, STAGE));
     assert_eq!(counts(&b), (1, 1));
 }
 
