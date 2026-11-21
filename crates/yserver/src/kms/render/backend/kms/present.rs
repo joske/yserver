@@ -194,16 +194,13 @@ impl KmsBackend {
             )
     }
 
-    /// Recheck an Output first-entry frame against the same eligibility gate
-    /// used by Present admission after it waited in the successor slot.
-    pub(in crate::kms::render::backend) fn queued_output_candidate_eligible(
+    /// Recheck a first-entry frame against the same eligibility gate used by
+    /// Present admission after it waited in the successor slot.
+    pub(in crate::kms::render::backend) fn queued_entry_candidate_eligible(
         &self,
         frame: &DirectPresentFrame,
         scope: DirectScope,
     ) -> bool {
-        let DirectScope::Output(_) = scope else {
-            return false;
-        };
         let host_xid = frame.candidate.paint_dst_host_xid;
         let Some(leaf_id) = self.store.lookup(host_xid) else {
             return false;
@@ -1492,10 +1489,12 @@ impl KmsBackend {
             fence_tally,
         };
 
-        if self.pstate.direct.get(scope).is_some_and(|owner| {
-            owner.pending.is_some()
-                || (matches!(scope, DirectScope::Output(_)) && owner.queued_successor.is_some())
-        }) {
+        if self
+            .pstate
+            .direct
+            .get(scope)
+            .is_some_and(|owner| owner.pending.is_some() || owner.queued_successor.is_some())
+        {
             // Keep an occupied successor slot authoritative until dispatch.
             // A newer Present must replace it even when its predecessor just
             // retired and both admission busy gates have become free.
@@ -1508,7 +1507,16 @@ impl KmsBackend {
             .iter()
             .any(|&output_idx| self.scene.has_pending_page_flip(output_idx))
         {
-            if matches!(scope, DirectScope::Output(_)) {
+            // Like Xorg's present_execute, a flip-eligible first entry waits
+            // for the in-flight flip instead of taking Copy. A Copy here
+            // queues the next composed flip, which the next Present then
+            // finds pending, so a steady stream would never enter direct.
+            let first_entry = self
+                .pstate
+                .direct
+                .get(scope)
+                .is_some_and(|owner| owner.current.is_none());
+            if matches!(scope, DirectScope::Output(_)) || first_entry {
                 self.retain_direct_present_wake(&frame.event);
                 self.queue_direct_successor(scope, frame);
                 return Ok(true);
