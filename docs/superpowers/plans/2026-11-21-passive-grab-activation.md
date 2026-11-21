@@ -87,7 +87,7 @@ Spec invariants 2, 3 and 3a. Cases P1, P1m, P2, P2m and P4. Each case's winning 
   - the activation block (~1410-1545);
   - the XI2 form emission for `via_xi2` grabs;
   - `pointer_button_transition` and its call site (~277-300, ~615-647).
-- Modify: `crates/yserver-core/src/server.rs` `find_passive_grab` (~4083-4087): the first-button rule checks the processed device's own held buttons (that source's set, which `pointer_button_transition` maintains), not the master's `buttons_down`. This is Xorg's per-device `buttonsDown` (`../xserver/dix/events.c:4200`). The rule stays for each pass.
+- Modify: `crates/yserver-core/src/server.rs` `find_passive_grab` (~4083-4087): the first-button rule follows the device of the pass that a candidate belongs to (`../xserver/dix/events.c:4200`, `../xserver/mi/mieq.c:502-508`): slave candidates (XI2 grabs on the slave or XIAllDevices matched for it) check that source's own held buttons (the set `pointer_button_transition` maintains); master and core candidates keep checking the master's aggregate `buttons_down`. Task 2 keeps the two predicates, one per pass (sol plan r3).
 - Modify: `crates/yserver-core/src/core_loop/pointer_fanout/tests/implicit_grabs.rs` (visibility only).
 - Test: `crates/yserver-core/src/core_loop/pointer_fanout/tests/passive_grab_activation.rs` (the fixture and the request helpers above).
 
@@ -118,6 +118,7 @@ Spec invariants 2, 3 and 3a. Cases P1, P1m, P2, P2m and P4. Each case's winning 
     - A core sync GrabButton (AnyButton, AnyModifier) on D, then A XIGrabButton (master 2, AnyButton, AnyModifier, sync, Press|Release) on D. B selects master 2 Press|Release on D.
     - Press. Post-press: `active_pointer_grab.via_xi2` is true, and A has exactly one packet, XI_ButtonPress d2.
     - XAllowEvents ReplayPointer once, release. B gets press d2 and release d2 on D. End state.
+  - `held_button_blocks_core_grab_on_master_pass`: register a physical source; A core async GrabButton (button 1, AnyModifier) on W; nobody selects button 3. Physical press of button 3; XTest press of button 1 over D: `active_pointer_grab` is `None` (the master already has button 3 down). Releases; end state. GUARD on the base.
   - `held_master_button_survives_slave_grab` (Review Focus 3):
     - Register a physical source as in `implicit_grabs.rs::two_slaves_end_their_grabs_separately`. A async XIGrabButton (slave 4, button 1) on W.
     - Physical press of button 3: master bit 3 is set.
@@ -141,7 +142,8 @@ Spec invariants 2, 3 and 3a. Cases P1, P1m, P2, P2m and P4. Each case's winning 
   | (b) emit the master XI2 form after a slave activation | `p1_...` |
   | (c) apply the master button transition before a slave activation | `p1_...`, `p2_...`, `held_master_...` |
   | (d) clear all of `buttons_down` instead of the slave's bit on rollback/deferral | `held_master_...` |
-  | (e) the first-button rule reads the master's `buttons_down` again | `held_master_...` |
+  | (e) the first-button rule reads the master's `buttons_down` for slave candidates again | `held_master_...` |
+  | (f) master/core candidates read the source's held set | `held_button_blocks_core_grab_...` |
 
   The grab-mask independence of activation (P2, P2m) cannot be mutated through requests, because XIPassiveGrabDevice stores `0xFFFF_FFFF` (out of scope). The P2 and P2m tests pin the delivered press. No mutation is claimed for it.
 - [ ] **Step 6: Commit** `fix(grabs): passive activation delivers one form; a slave activation leaves the master untouched (P1, P1m, P2, P2m, P4)`.
