@@ -80,13 +80,14 @@
 
 ### Task 1: Activation delivery and the detached slave
 
-Spec invariants 2, 3 and 3a. Cases P1, P1m, P2 and P2m. Every case has a single grab, so the current selection is enough.
+Spec invariants 2, 3 and 3a. Cases P1, P1m, P2, P2m and P4. Each case's winning grab is already the one the current selection picks; the only selection change here is the first-button rule becoming per device (sol plan r2 F1).
 
 **Files:**
 - Modify: `crates/yserver-core/src/core_loop/pointer_fanout.rs`:
   - the activation block (~1410-1545);
   - the XI2 form emission for `via_xi2` grabs;
   - `pointer_button_transition` and its call site (~277-300, ~615-647).
+- Modify: `crates/yserver-core/src/server.rs` `find_passive_grab` (~4083-4087): the first-button rule checks the processed device's own held buttons (that source's set, which `pointer_button_transition` maintains), not the master's `buttons_down`. This is Xorg's per-device `buttonsDown` (`../xserver/dix/events.c:4200`). The rule stays for each pass.
 - Modify: `crates/yserver-core/src/core_loop/pointer_fanout/tests/implicit_grabs.rs` (visibility only).
 - Test: `crates/yserver-core/src/core_loop/pointer_fanout/tests/passive_grab_activation.rs` (the fixture and the request helpers above).
 
@@ -113,6 +114,10 @@ Spec invariants 2, 3 and 3a. Cases P1, P1m, P2 and P2m. Every case has a single 
     - Press, XIAllowEvents AsyncDevice (device 4), release.
     - A gets press d4 and release d4 on W. B gets nothing. End state.
   - `p2m_master_sync_release_only_mask_single_press`: P2 with device 2. A gets exactly one XI_ButtonPress d2 (no core) and XI_ButtonRelease d2 on W. B gets press and release d4 on D. End state.
+  - `p4_xfwm4_core_then_xi2_grab_single_xi2_press`:
+    - A core sync GrabButton (AnyButton, AnyModifier) on D, then A XIGrabButton (master 2, AnyButton, AnyModifier, sync, Press|Release) on D. B selects master 2 Press|Release on D.
+    - Press. Post-press: `active_pointer_grab.via_xi2` is true, and A has exactly one packet, XI_ButtonPress d2.
+    - XAllowEvents ReplayPointer once, release. B gets press d2 and release d2 on D. End state.
   - `held_master_button_survives_slave_grab` (Review Focus 3):
     - Register a physical source as in `implicit_grabs.rs::two_slaves_end_their_grabs_separately`. A async XIGrabButton (slave 4, button 1) on W.
     - Physical press of button 3: master bit 3 is set.
@@ -121,9 +126,9 @@ Spec invariants 2, 3 and 3a. Cases P1, P1m, P2 and P2m. Every case has a single 
     - Physical release of button 3. End state.
 - [ ] **Step 2: Run** `cargo test -p yserver-core passive_grab_activation`. Expected FAIL:
   - `p1_...`: the extra d2 press to B, and the master bit.
-  - `p1m_...` and `p2m_...`: core plus XI2.
+  - `p1m_...`, `p2m_...` and `p4_...`: core plus XI2.
   - `p2_...`: the packets match the measurement, but the end state fails with the master bit left held.
-  - `held_master_...`: the button-1 bit.
+  - `held_master_...`: the master-wide first-button rule refuses the activation (and the button-1 bit).
 - [ ] **Step 3: Implement** the rules.
   - Reuse `fanout_core_pointer_event_ordered` and the existing XI2 form emitter.
   - Delete the `grab.via_xi2 && dynamic_device` special case (~1503), which the single-form rule replaces.
@@ -132,17 +137,18 @@ Spec invariants 2, 3 and 3a. Cases P1, P1m, P2 and P2m. Every case has a single 
 
   | Mutation | Must fail |
   |---|---|
-  | (a) emit the core form again for a `via_xi2` master grab | `p1m_...`, `p2m_...` |
+  | (a) emit the core form again for a `via_xi2` master grab | `p1m_...`, `p2m_...`, `p4_...` |
   | (b) emit the master XI2 form after a slave activation | `p1_...` |
   | (c) apply the master button transition before a slave activation | `p1_...`, `p2_...`, `held_master_...` |
   | (d) clear all of `buttons_down` instead of the slave's bit on rollback/deferral | `held_master_...` |
+  | (e) the first-button rule reads the master's `buttons_down` again | `held_master_...` |
 
   The grab-mask independence of activation (P2, P2m) cannot be mutated through requests, because XIPassiveGrabDevice stores `0xFFFF_FFFF` (out of scope). The P2 and P2m tests pin the delivered press. No mutation is claimed for it.
-- [ ] **Step 6: Commit** `fix(grabs): passive activation delivers one form; a slave activation leaves the master untouched (P1, P1m, P2, P2m)`.
+- [ ] **Step 6: Commit** `fix(grabs): passive activation delivers one form; a slave activation leaves the master untouched (P1, P1m, P2, P2m, P4)`.
 
 ### Task 2: Grab selection and request replacement
 
-Spec invariant 1. Cases P4, P4b, P4c and P5.
+Spec invariant 1. Cases P4b, P4c and P5; P4 (Task 1) guards newest-wins.
 
 **Files:**
 - Modify: `crates/yserver-core/src/server.rs`: `find_passive_grab` (~4075-4140) and its caller (~4506).
@@ -164,7 +170,7 @@ Spec invariant 1. Cases P4, P4b, P4c and P5.
   - Master pass: XI2 grabs whose `device_id` is the master, 1 (XIAllMasterDevices) or 0, plus core grabs (`!via_xi2`).
   - The slave pass runs over the whole chain, root first, before the master pass.
   - On one window, the last matching `button_grabs` entry wins: requests append, so the last entry is the newest. The "specificity" ranking is removed.
-  - The first-button rule and the `confine_to` check stay.
+  - The per-device first-button rule (Task 1) and the `confine_to` check stay.
 - **Requests.**
   - The core GrabButton replacement and the UngrabButton removal add `!g.via_xi2`.
   - The XIPassiveGrabDevice replacement already matches `via_xi2` and `device_id`, and stays.
@@ -176,10 +182,6 @@ Spec invariant 1. Cases P4, P4b, P4c and P5.
     - A UngrabButton (AnyButton, AnyModifier) on D. Assert exactly the XI2 entry remains.
     - B selects master 2 Press|Release on D. Press over D. Post-press: `active_pointer_grab` = `{A, D, via_xi2, passive}`, and A got one XI_ButtonPress d2 on D.
     - XIAllowEvents ReplayDevice, release. B gets press d2 and release d2 on D. End state.
-  - `p4_xfwm4_core_then_xi2_grab_single_xi2_press`:
-    - A core sync GrabButton (AnyButton, AnyModifier) on D, then A XIGrabButton (master 2, AnyButton, AnyModifier, sync, Press|Release) on D. B selects master 2 Press|Release on D.
-    - Press. Post-press: `active_pointer_grab.via_xi2` is true, and A has exactly one packet, XI_ButtonPress d2.
-    - XAllowEvents ReplayPointer once, release. B gets press d2 and release d2 on D. End state.
   - `p4b_older_xi2_newer_core_core_wins`:
     - P4 with the XI2 grab created first. Both registrations exist before the press.
     - Post-press: `active_pointer_grab` = `{A, D, via_xi2: false, passive}`, and A has exactly one core ButtonPress.
@@ -198,23 +200,22 @@ Spec invariant 1. Cases P4, P4b, P4c and P5.
     - Recreate the XI2 grab. UngrabButton: only the XI2 entry remains.
 - [ ] **Step 2: Run.** Expected FAIL on assertions:
   - `p4c_...`, `p4b_...`: the coexistence assertion;
-  - `p4_...`: two packets;
   - `p5_...`;
   - `each_ungrab_...`.
   - `xiall_...` FAILs if the base activates XIAllDevices on the master. If it passes, record that and keep it as GUARD.
 - [ ] **Step 3: Implement** the passes, newest-wins, the pass plumbing and the two `!g.via_xi2` checks.
-- [ ] **Step 4: Run** the task's tests and Task 1's, then the gate. Expected: PASS.
+- [ ] **Step 4: Run** the task's tests and Task 1's (P4 included), then the gate. Expected: PASS.
 - [ ] **Step 5: Mutations:**
 
   | Mutation | Must fail |
   |---|---|
-  | (a) drop `!g.via_xi2` from the GrabButton replacement | `p4c_...`, `p4b_...`, `p4_...` |
+  | (a) drop `!g.via_xi2` from the GrabButton replacement | `p4c_...`, `p4b_...` |
   | (b) drop it from UngrabButton | `p4c_...`, `each_ungrab_...` |
   | (c) master pass before slave pass | `p5_...` |
-  | (d) first matching entry wins | `p4_...`, `p4b_...` |
+  | (d) first matching entry wins | `p4b_...`, and Task 1's `p4_...` |
   | (e) device 0 only on the master pass | `xiall_...` |
 
-- [ ] **Step 6: Commit** `fix(grabs): passive grab selection by pass and newest-wins; core requests keep XI2 grabs (P4, P4b, P4c, P5)`.
+- [ ] **Step 6: Commit** `fix(grabs): passive grab selection by pass and newest-wins; core requests keep XI2 grabs (P4b, P4c, P5)`.
 
 ### Task 3: Replay of the frozen device and the C19 guard
 
@@ -374,7 +375,7 @@ Spec invariant 7. Cases X1, X2 and X3. C16, C17 and C18 keep their measured payl
 - Modify: `crates/yserver-core/src/core_loop/pointer_fanout/owner_events.rs`.
   - The valuator copy of `xi2_direct_xtest_motion` (~202-225) becomes `pub(in crate::core_loop) fn xtest_wire_valuators(axes: crate::server::Xi1MotionAxes) -> (u8, Vec<i32>)`. The XI2 encoder in `pointer_fanout.rs` uses it.
   - `xi2_direct_xtest_motion` and its call site (`pointer_fanout.rs` ~2943-2955) are deleted, so each packet is delivered once.
-- Test: new module `crates/yserver/src/kms/render/backend/tests/xtest_device_motion.rs`. It reuses the client and drain helpers of `tests/crossings.rs` (~515-540, made `pub(super)`).
+- Test: new module `crates/yserver/src/kms/render/backend/tests/xtest_device_motion.rs`. It reuses the parent module's `kbd_map_client_id` and `kbd_map_drain` (`tests/mod.rs` ~1332, ~1375). Selections are dispatched through requests.
   - The existing `xtest_device_motion_owner_events_and_exclusive_grabs_route_xi2` and `xtest_device_motion_preserves_partial_valuator_range` (`pointer_fanout/tests/owner_events.rs` ~967, ~1077) move into this module with their assertions unchanged. Only the harness changes: `KmsBackend::for_tests()` and dispatch.
 
 **Interfaces:**
