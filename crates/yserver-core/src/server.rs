@@ -4083,11 +4083,6 @@ impl ServerState {
         device_id: u16,
         master_device_id: Option<u16>,
     ) -> Option<PassiveButtonGrab> {
-        // X11 GrabButton: the grab activates only when "no other
-        // buttons ... are logically down" (XGrabButton-1).
-        if button >= 1 && self.buttons_down & !(1u16 << (button - 1)) != 0 {
-            return None;
-        }
         // Xorg CheckDeviceGrabs walks the sprite trace TOP-DOWN (root
         // first): a grab on an ancestor takes precedence over the same
         // grab deeper in the tree (XTS XGrabButton-4), and root-window
@@ -4116,6 +4111,27 @@ impl ServerState {
                 let device_match = (grab.device_id == 0 && attached_master.is_some())
                     || grab.device_id == device_id
                     || Some(grab.device_id) == attached_master;
+                // Xorg checks the first-button rule on the device pass that
+                // owns this candidate (`events.c:4200`). A slave XI2 grab,
+                // including XIAllDevices on its slave pass, sees only that
+                // source's held buttons. Core and master candidates see the
+                // master's aggregate state.
+                let slave_candidate = grab.via_xi2
+                    && self.xi_devices.role(device_id)
+                        == Some(crate::xinput::XiDeviceRole::SlavePointer)
+                    && (grab.device_id == 0 || grab.device_id == device_id);
+                let held_buttons = if slave_candidate {
+                    self.xi_devices
+                        .device(device_id)
+                        .map_or(0, |device| device.buttons_down)
+                } else {
+                    self.buttons_down
+                };
+                let no_other_buttons = match button {
+                    0 => true,
+                    1..=16 => held_buttons & !(1u16 << (button - 1)) == 0,
+                    _ => held_buttons == 0,
+                };
                 // Xorg ActivatePointerGrab fails when confine_to is
                 // not viewable — the grab does not activate
                 // (XGrabButton-3).
@@ -4124,16 +4140,18 @@ impl ServerState {
                         .resources
                         .window(grab.confine_to)
                         .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
-                (button_match && mod_match && device_match && confine_ok).then(|| {
-                    let specificity = if grab.device_id == device_id && grab.device_id != 0 {
-                        3
-                    } else if grab.device_id != 0 {
-                        2
-                    } else {
-                        1
-                    };
-                    (specificity, grab)
-                })
+                (button_match && mod_match && device_match && no_other_buttons && confine_ok).then(
+                    || {
+                        let specificity = if grab.device_id == device_id && grab.device_id != 0 {
+                            3
+                        } else if grab.device_id != 0 {
+                            2
+                        } else {
+                            1
+                        };
+                        (specificity, grab)
+                    },
+                )
             });
             if let Some((_, grab)) = matching.max_by_key(|(specificity, _)| *specificity) {
                 return Some(grab.clone());

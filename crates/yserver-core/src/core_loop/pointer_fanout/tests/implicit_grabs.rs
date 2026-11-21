@@ -40,25 +40,52 @@ const GRAB_CURSOR_A: u32 = 0x0040_A753;
 const GRAB_PIXMAP_B: u32 = 0x0030_A754;
 const GRAB_CURSOR_B: u32 = 0x0040_A754;
 
-struct Fixture {
-    state: ServerState,
-    backend: RecordingBackend,
-    xid_map: HostXidMap,
-    client_a: crate::transport::CapturedPeer,
-    client_b: crate::transport::CapturedPeer,
-    pointer: (i16, i16),
-    time: u32,
+pub(super) struct Fixture {
+    pub(super) state: ServerState,
+    pub(super) backend: RecordingBackend,
+    pub(super) xid_map: HostXidMap,
+    pub(super) client_a: crate::transport::CapturedPeer,
+    pub(super) client_b: crate::transport::CapturedPeer,
+    pub(super) pointer: (i16, i16),
+    pub(super) time: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Packet {
-    xi2: bool,
-    kind: u16,
-    device: u16,
-    source: u16,
-    window: u32,
-    scroll_value: Option<i32>,
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Packet {
+    pub(super) xi2: bool,
+    pub(super) kind: u16,
+    pub(super) device: u16,
+    pub(super) source: u16,
+    pub(super) window: u32,
+    pub(super) scroll_value: Option<i32>,
+    pub(super) child: u32,
+    pub(super) event_x: i16,
+    pub(super) event_y: i16,
 }
+
+// Packet equality covers event routing. Tests that care about FixUpEvent
+// geometry assert child and event coordinates explicitly.
+impl PartialEq for Packet {
+    fn eq(&self, other: &Self) -> bool {
+        (
+            self.xi2,
+            self.kind,
+            self.device,
+            self.source,
+            self.window,
+            self.scroll_value,
+        ) == (
+            other.xi2,
+            other.kind,
+            other.device,
+            other.source,
+            other.window,
+            other.scroll_value,
+        )
+    }
+}
+
+impl Eq for Packet {}
 
 fn fixture() -> Fixture {
     let mut state = ServerState::new();
@@ -103,7 +130,7 @@ fn fixture_with_parent() -> Fixture {
     f
 }
 
-fn dispatch(f: &mut Fixture, client: u32, opcode: u8, data: u8, body: &[u8]) {
+pub(super) fn dispatch(f: &mut Fixture, client: u32, opcode: u8, data: u8, body: &[u8]) {
     crate::core_loop::process_request::process_request(
         &mut f.state,
         &mut f.backend,
@@ -120,7 +147,7 @@ fn dispatch(f: &mut Fixture, client: u32, opcode: u8, data: u8, body: &[u8]) {
     .expect("production request dispatch");
 }
 
-fn create_window(
+pub(super) fn create_window(
     f: &mut Fixture,
     client: u32,
     window: u32,
@@ -145,7 +172,7 @@ fn create_window(
     assert!(f.state.resources.window(ResourceId(window)).is_some());
 }
 
-fn map_window(f: &mut Fixture, client: u32, window: u32) {
+pub(super) fn map_window(f: &mut Fixture, client: u32, window: u32) {
     dispatch(f, client, 8, 0, &window.to_le_bytes()); // MapWindow
     assert_eq!(
         f.state
@@ -157,7 +184,7 @@ fn map_window(f: &mut Fixture, client: u32, window: u32) {
     );
 }
 
-fn select_xi2(f: &mut Fixture, client: u32, window: u32, device: u16, mask: u32) {
+pub(super) fn select_xi2(f: &mut Fixture, client: u32, window: u32, device: u16, mask: u32) {
     let mut body = Vec::with_capacity(20);
     body.extend_from_slice(&window.to_le_bytes());
     body.extend_from_slice(&1u16.to_le_bytes());
@@ -175,7 +202,7 @@ fn select_xi2(f: &mut Fixture, client: u32, window: u32, device: u16, mask: u32)
     );
 }
 
-fn select_core(f: &mut Fixture, client: u32, window: u32, mask: u32) {
+pub(super) fn select_core(f: &mut Fixture, client: u32, window: u32, mask: u32) {
     let mut body = Vec::with_capacity(12);
     body.extend_from_slice(&window.to_le_bytes());
     body.extend_from_slice(&(1u32 << 11).to_le_bytes()); // CWEventMask
@@ -288,11 +315,11 @@ fn assert_master_implicit(f: &Fixture, owner: u32, window: u32) {
     assert!(grab.implicit);
 }
 
-fn assert_end_state(f: &Fixture) {
+pub(super) fn assert_end_state(f: &Fixture) {
     assert_end_state_with_xi1_entries(f, &[]);
 }
 
-fn assert_end_state_with_xi1_entries(f: &Fixture, expected_devices: &[u16]) {
+pub(super) fn assert_end_state_with_xi1_entries(f: &Fixture, expected_devices: &[u16]) {
     assert!(
         f.state.xi2_pointer_grabs.is_empty(),
         "all slave grabs ended"
@@ -302,6 +329,7 @@ fn assert_end_state_with_xi1_entries(f: &Fixture, expected_devices: &[u16]) {
         f.state.xi2_detached_masters.is_empty(),
         "no slave was detached"
     );
+    assert!(f.state.xi1_active_grabs.is_empty(), "all XI1 grabs ended");
     let actual_devices: std::collections::BTreeSet<_> =
         f.state.xi1_frozen.keys().copied().collect();
     let expected_devices: std::collections::BTreeSet<_> =
@@ -317,7 +345,14 @@ fn assert_end_state_with_xi1_entries(f: &Fixture, expected_devices: &[u16]) {
     }));
 }
 
-fn send(f: &mut Fixture, origin: InputOrigin, kind: PointerEventKind, detail: u8, x: i16, y: i16) {
+pub(super) fn send(
+    f: &mut Fixture,
+    origin: InputOrigin,
+    kind: PointerEventKind,
+    detail: u8,
+    x: i16,
+    y: i16,
+) {
     let host_xid = if x >= 550 { HOST_OUT } else { HOST_W };
     let time = f.time;
     f.time += 1;
@@ -340,23 +375,23 @@ fn send(f: &mut Fixture, origin: InputOrigin, kind: PointerEventKind, detail: u8
     f.pointer = (x, y);
 }
 
-fn press_over_d(f: &mut Fixture, origin: InputOrigin, button: u8) {
+pub(super) fn press_over_d(f: &mut Fixture, origin: InputOrigin, button: u8) {
     send(f, origin, PointerEventKind::MotionNotify, 0, 150, 150);
     let _ = read_all_capture_available(&mut f.client_a);
     let _ = read_all_capture_available(&mut f.client_b);
     send(f, origin, PointerEventKind::ButtonPress, button, 150, 150);
 }
 
-fn move_to_out(f: &mut Fixture, origin: InputOrigin) {
+pub(super) fn move_to_out(f: &mut Fixture, origin: InputOrigin) {
     send(f, origin, PointerEventKind::MotionNotify, 0, 650, 150);
 }
 
-fn release(f: &mut Fixture, origin: InputOrigin, button: u8) {
+pub(super) fn release(f: &mut Fixture, origin: InputOrigin, button: u8) {
     let (x, y) = f.pointer;
     send(f, origin, PointerEventKind::ButtonRelease, button, x, y);
 }
 
-fn final_motion(f: &mut Fixture, origin: InputOrigin) {
+pub(super) fn final_motion(f: &mut Fixture, origin: InputOrigin) {
     send(f, origin, PointerEventKind::MotionNotify, 0, 660, 160);
 }
 
@@ -424,7 +459,7 @@ fn ungrab_core_pointer(f: &mut Fixture, client: u32) {
     dispatch(f, client, CORE_UNGRAB_POINTER, 0, &0u32.to_le_bytes());
 }
 
-fn read_packets(peer: &mut crate::transport::CapturedPeer) -> Vec<Packet> {
+pub(super) fn read_packets(peer: &mut crate::transport::CapturedPeer) -> Vec<Packet> {
     let bytes = read_all_capture_available(peer);
     let mut packets = Vec::new();
     let mut offset = 0;
@@ -442,6 +477,17 @@ fn read_packets(peer: &mut crate::transport::CapturedPeer) -> Vec<Packet> {
                     scroll_value: (kind == 6 && extra == 28).then(|| {
                         i32::from_le_bytes(bytes[offset + 136..offset + 140].try_into().unwrap())
                     }),
+                    child: u32::from_le_bytes(bytes[offset + 28..offset + 32].try_into().unwrap()),
+                    event_x: i16::try_from(
+                        i32::from_le_bytes(bytes[offset + 40..offset + 44].try_into().unwrap())
+                            >> 16,
+                    )
+                    .expect("XI2 event x coordinate fits i16"),
+                    event_y: i16::try_from(
+                        i32::from_le_bytes(bytes[offset + 44..offset + 48].try_into().unwrap())
+                            >> 16,
+                    )
+                    .expect("XI2 event y coordinate fits i16"),
                 });
             }
             offset += 32 + usize::try_from(extra).unwrap() * 4;
@@ -455,6 +501,9 @@ fn read_packets(peer: &mut crate::transport::CapturedPeer) -> Vec<Packet> {
                     source: 0,
                     window: u32::from_le_bytes(bytes[offset + 12..offset + 16].try_into().unwrap()),
                     scroll_value: None,
+                    child: u32::from_le_bytes(bytes[offset + 16..offset + 20].try_into().unwrap()),
+                    event_x: i16::from_le_bytes([bytes[offset + 24], bytes[offset + 25]]),
+                    event_y: i16::from_le_bytes([bytes[offset + 26], bytes[offset + 27]]),
                 });
             }
             offset += 32;
@@ -464,7 +513,7 @@ fn read_packets(peer: &mut crate::transport::CapturedPeer) -> Vec<Packet> {
     packets
 }
 
-fn xi(kind: u16, device: u16, source: u16, window: u32) -> Packet {
+pub(super) fn xi(kind: u16, device: u16, source: u16, window: u32) -> Packet {
     Packet {
         xi2: true,
         kind,
@@ -472,10 +521,13 @@ fn xi(kind: u16, device: u16, source: u16, window: u32) -> Packet {
         source,
         window,
         scroll_value: None,
+        child: 0,
+        event_x: 0,
+        event_y: 0,
     }
 }
 
-fn core(kind: u16, window: u32) -> Packet {
+pub(super) fn core(kind: u16, window: u32) -> Packet {
     Packet {
         xi2: false,
         kind,
@@ -483,6 +535,9 @@ fn core(kind: u16, window: u32) -> Packet {
         source: 0,
         window,
         scroll_value: None,
+        child: 0,
+        event_x: 0,
+        event_y: 0,
     }
 }
 

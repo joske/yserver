@@ -49,6 +49,7 @@ struct PointerXiSource {
 struct PointerButtonTransition {
     source_accepted: bool,
     master_accepted: bool,
+    master_changed: bool,
 }
 
 /// Whether a pointer origin can still produce input. KMS calls this before
@@ -222,6 +223,7 @@ fn pointer_button_transition(
         return PointerButtonTransition {
             source_accepted: true,
             master_accepted: true,
+            master_changed: false,
         };
     }
 
@@ -248,6 +250,7 @@ fn pointer_button_transition(
         return PointerButtonTransition {
             source_accepted: false,
             master_accepted: false,
+            master_changed: false,
         };
     }
 
@@ -284,6 +287,7 @@ fn pointer_button_transition(
         return PointerButtonTransition {
             source_accepted: true,
             master_accepted: false,
+            master_changed: false,
         };
     }
 
@@ -292,12 +296,14 @@ fn pointer_button_transition(
             return PointerButtonTransition {
                 source_accepted: true,
                 master_accepted: false,
+                master_changed: false,
             };
         }
         state.buttons_down |= bit;
         return PointerButtonTransition {
             source_accepted: true,
             master_accepted: true,
+            master_changed: true,
         };
     }
 
@@ -308,17 +314,27 @@ fn pointer_button_transition(
         PointerButtonTransition {
             source_accepted: true,
             master_accepted: false,
+            master_changed: false,
         }
     } else if state.buttons_down & bit != 0 {
         state.buttons_down &= !bit;
         PointerButtonTransition {
             source_accepted: true,
             master_accepted: true,
+            master_changed: true,
         }
     } else {
+        // TEMPORARY (Task 3 removes): replay currently reprocesses the
+        // attached master form and creates a master implicit grab while its
+        // button bitmap is clear. Accept the source's final release so it can
+        // clear that replay-created grab; Task 3 will replay only the frozen
+        // device and remove this exception.
+        let releases_master_implicit =
+            state.buttons_down == 0 && state.active_pointer_grab.is_some_and(|grab| grab.implicit);
         PointerButtonTransition {
             source_accepted: true,
-            master_accepted: false,
+            master_accepted: releases_master_implicit,
+            master_changed: false,
         }
     }
 }
@@ -612,7 +628,7 @@ fn pointer_event_fanout_to_state_inner(
     // onto delivered events: the backend cooks the authoritative
     // modifier/button state into `event.state` (see the modifier
     // source-of-truth note in `key_fanout`).
-    let button_transition = if matches!(
+    let mut button_transition = if matches!(
         event.kind,
         PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
     ) {
@@ -633,6 +649,7 @@ fn pointer_event_fanout_to_state_inner(
             PointerButtonTransition {
                 source_accepted: true,
                 master_accepted: true,
+                master_changed: transition.master_changed,
             }
         } else {
             transition
@@ -641,6 +658,7 @@ fn pointer_event_fanout_to_state_inner(
         PointerButtonTransition {
             source_accepted: true,
             master_accepted: true,
+            master_changed: false,
         }
     };
     info.source_button_transition = button_transition.source_accepted;
@@ -961,16 +979,6 @@ fn pointer_event_fanout_to_state_inner(
     // Step 1 — translate host-screen coords to ynest-root coords.
     let event = translate_host_event(state, xid_map, event);
 
-    // Xorg `GetPointerEvents` calls UpdateFromMaster before the raw and
-    // device forms. A replay has already passed that generation point and
-    // must not announce a source switch a second time.
-    if button_transition.source_accepted {
-        merge_dropped(
-            &mut dropped,
-            update_from_pointer_master(state, xi_source, !is_replay && !suppress_raw, true),
-        );
-    }
-
     // Resolve the same unified freeze predicate here that the enqueue path
     // below uses. Xorg calls DeviceEventCallback while enqueueing a frozen
     // input event (dix/events.c:1166), before later duplicate suppression;
@@ -994,6 +1002,52 @@ fn pointer_event_fanout_to_state_inner(
             event.kind,
             PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify,
         );
+
+    // Resolve passive activation before master processing. Xorg's
+    // `mieqProcessDeviceEvent` skips the master pass when a slave activation
+    // detaches that slave (`../xserver/mi/mieq.c:502-508`); in particular,
+    // RECORD's device-event callback must not see a core event for it.
+    // Keep the matched grab for the activation block below so this remains
+    // the only activation path.
+    let mut passive_grab_match = if !queued_while_frozen
+        && handle_grabs
+        && event.kind == PointerEventKind::ButtonPress
+        && button_transition.source_accepted
+        && active_grab_for_source(state, xi_source).is_none()
+    {
+        try_match_passive_grab(state, xid_map, event)
+    } else {
+        None
+    };
+    let passive_slave_activation = passive_grab_match.as_ref().is_some_and(|(grab, _)| {
+        grab.device_id != 0
+            && matches!(
+                state.xi_devices.role(grab.device_id),
+                Some(crate::xinput::XiDeviceRole::SlavePointer)
+            )
+    });
+    if passive_slave_activation {
+        // The source transition must precede lookup so its first-button
+        // predicate sees the pressed slave bit. Roll back the aggregate
+        // master bit before any master side effect or RECORD callback.
+        if button_transition.master_changed && (1..=16).contains(&event.detail) {
+            state.buttons_down &= !(1u16 << (event.detail - 1));
+            button_transition.master_changed = false;
+        }
+        button_transition.master_accepted = false;
+        info.master_button_transition = false;
+    }
+
+    // Xorg `GetPointerEvents` calls UpdateFromMaster before the raw and
+    // device forms. A replay has already passed that generation point and
+    // must not announce a source switch a second time. Detached-slave
+    // activations skip this master-side bookkeeping with the master pass.
+    if button_transition.source_accepted && !passive_slave_activation {
+        merge_dropped(
+            &mut dropped,
+            update_from_pointer_master(state, xi_source, !is_replay && !suppress_raw, true),
+        );
+    }
 
     // RECORD sees each physical pointer event once, before grabs and
     // delivery, and not again when a frozen queue replays it (Xorg
@@ -1412,7 +1466,7 @@ fn pointer_event_fanout_to_state_inner(
         && handle_grabs
         && event.kind == PointerEventKind::ButtonPress
         && button_transition.source_accepted
-        && let Some((grab, _hit_window)) = try_match_passive_grab(state, xid_map, event)
+        && let Some((grab, _hit_window)) = passive_grab_match.take()
     {
         log::debug!(
             "pointer_fanout: PASSIVE-GRAB match button={} grab_owner={:?} grab_window=0x{:x} mode={} owner_events={}",
@@ -1492,10 +1546,10 @@ fn pointer_event_fanout_to_state_inner(
             // whenever the grab window is not at the origin.  Marco then
             // mistakes ordinary Steam content clicks for frame actions and
             // starts a toplevel move.
-            if grab.via_xi2 && dynamic_device {
-                // The XI2 fanout below emits this activating slave press in
-                // XI2 form on the grab window. The core passive-grab path
-                // must not substitute a core ButtonPress for that event.
+            if grab.via_xi2 {
+                // XI2 passive activation is delivered by the XI2 form path
+                // below. Never also substitute a core ButtonPress, whether
+                // this grab belongs to a slave or the master.
                 delivered = true;
             } else {
                 let (gx, gy) = state.resources.window_absolute_position(grab.grab_window);

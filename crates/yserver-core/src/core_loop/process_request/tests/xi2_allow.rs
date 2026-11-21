@@ -2204,7 +2204,7 @@ fn xi_passive_grab_owner_events_redirects_foreign_descendant_press_to_grab_clien
         .event_masks
         .insert(ResourceId(CHILD_WIN), 0x0000_0004);
     state.button_grabs.push(PassiveButtonGrab {
-        device_id: 0,
+        device_id: crate::xinput::DEVICEID_MASTER_POINTER,
         owner: ClientId(GRAB_CLIENT_ID),
         grab_window: ResourceId(GRAB_WIN),
         button: 1,
@@ -2248,9 +2248,21 @@ fn xi_passive_grab_owner_events_redirects_foreign_descendant_press_to_grab_clien
              delivery to the GRAB client (Xorg dix/events.c:2069 aborts the \
              natural walk on a foreign subscriber); got {grab_read:?}",
     );
-    assert_eq!(buf[0], 4, "core ButtonPress to the grab client");
+    // P1m: Xorg ActivatePassiveGrab delivers an XI2 grab's activation in
+    // XI2 form (`../xserver/dix/events.c:3833`); inspect the first packet.
+    assert_eq!(buf[0], 35, "XI2 event to the grab client");
     assert_eq!(
-        &buf[12..16],
+        u16::from_le_bytes([buf[8], buf[9]]),
+        4,
+        "XI_ButtonPress to the grab client"
+    );
+    assert_eq!(
+        u16::from_le_bytes([buf[10], buf[11]]) & 0x7fff,
+        crate::xinput::DEVICEID_MASTER_POINTER,
+        "the exact master grab remains on the master form"
+    );
+    assert_eq!(
+        &buf[24..28],
         &GRAB_WIN.to_le_bytes(),
         "press reported on the grab window",
     );
