@@ -160,3 +160,87 @@ for c in P1 P1m P2 P2r P2m P3 P4 P4b P4c P5; do   # one fresh server per case ./
          fprintf(stderr, "unknown case id: %s\n", case_id);
          exit(2);
 ```
+
+## XI1 implicit grabs (I5) and direct XTest device motion (C18)
+
+Added 2026-11-21 when the user folded both follow-ups into this PR. Same Xvfb and yserver build as above, one fresh server per case; every case starts with `mask=0x0`.
+
+**I5** is the case of the same name in `2026-11-19-per-device-implicit-grabs-measurements.md`, re-run unchanged with `implicit-oracle` on the #374 tree. **X1-X3** extend C18 of `2026-11-16-pointer-routing-xorg-measurements.md`: that case excluded the sprite because yserver does not move it. Here the sprite is the measured quantity. A selects XI2 Motion for master 2 and core PointerMotion on W; B selects the same on OUT. The pointer is at `(150,150)` over D. The injector sends one XTestFakeInput DeviceMotionNotify for XTest pointer 4, then `XQueryPointer` reports the sprite.
+
+| case | input | Xvfb 21.1.24 | yserver (#374) |
+|---|---|---|---|
+| I5 | XI1: A selects DeviceMotionNotify/DeviceButtonPress/DeviceButtonRelease for device 4 on W, B the same on OUT. Press over D, drag to OUT, release, move. | A gets DeviceButtonPress, the drag DeviceMotionNotify and DeviceButtonRelease on W (XI1 implicit grab on device 4). B gets only the motion after the release, on OUT. | A gets the press only. The drag motion and the **release go to B** on OUT. |
+| X1 | absolute (detail 0), axes 0-1 = `(650,150)` | Sprite moves to `(650,150)`, child OUT. B gets XI_Motion d2/s4 on OUT. | Sprite stays at `(150,150)`, child W. **No event to anyone.** |
+| X2 | relative (detail 1), axes 0-1 = `(+500,0)` | Same as X1. | Same as X1: no movement, no event. |
+| X3 | absolute, one axis: `first_valuator=1`, value 175 | Sprite moves to `(150,0)`, child None: Xorg's FakeInput parser stores the value at index 1 and `valuator_mask_set_range` reads index 0 (C18). No client selected the root, so no event. | Sprite stays at `(150,150)`. |
+
+Core MotionNotify is absent on Xvfb in X1/X2 because the same client's XI2 selection on the same window takes the event first; this is #373's walk, not part of the change.
+
+**Source.**
+- **XI1 implicit grab.** `ActivateImplicitGrab` (`../xserver/dix/events.c:2152-2196`) types a DeviceButtonPress delivery as an `XI` grab and activates it on the delivering device with `ImplicitGrabMask`, so a slave is not detached (`:1622-1624`). It is called from `DeliverEventsToWindow` (`:2423`) for any delivered press when no grab is active. It ends with the release that leaves the device's `buttonsDown` at zero (`../xserver/Xi/exevents.c:1928-1955`), as for #374's XI2 slave grabs.
+- **History.** R6.6 (`ded6147bf`) grabbed on DeviceButtonPress only for the DeviceButtonPressGrab class (`CheckDeviceGrabAndHintWindow`). MPX commit `a511c445d` (2007-09-28, "Remove generation of core events, long live XI!") made the implicit grab apply to `DeviceButtonPress` as to `ButtonPress`. XTS `xts5/XI/XSelectExtensionEvent.m` assertion 5 ("automatic passive grabs are not done") checks the pre-MPX rule; by the source above and I5, Xorg fails its checks 5 and 6. yserver follows XTS today on purpose (`pointer_fanout.rs` doc of `xi1_route_device_event`).
+- **XTest device motion.** `ProcXTestFakeInput` (`../xserver/Xext/xtest.c:225-241`) sets `POINTER_ABSOLUTE` when detail is 0 and leaves the motion relative otherwise, copies the valuators (`:248-284`, `valuator_mask_set_range` at `:417`), and calls `GetPointerEvents` on the XTest slave. `fill_pointer_events` (`../xserver/dix/getevents.c:1399-1440`) moves the sprite through `positionSprite` for both modes, and the events go through `mieqProcessDeviceEvent` (`xtest.c:434`), slave then master, like any other motion.
+- **yserver.** The DeviceMotionNotify branch of `dispatch_fake_input_with_body` (`process_request/xtest.rs` ~505) only calls `xi1_route_device_event`. Its comment claims Xorg does not move the sprite, which X1-X3 contradict. The core FakeInput MotionNotify branch (~600-635) already moves the sprite through `HostInputEvent::PointerMotion` for absolute and relative fakes.
+
+**Reproduction.** `xtest-oracle.c` is `pointer-oracle.c` from the 2026-11-16 measurements with the patch below. I5 uses `implicit-oracle` unchanged.
+
+```sh
+cc -std=c11 -O2 -Wall -Wextra -Werror xtest-oracle.c -o xtest-oracle $(pkg-config --cflags --libs x11 xi xtst)
+for c in X1 X2 X3; do   # one fresh server per case
+  ./xtest-oracle :97 $c; ./xtest-oracle :96 $c; done
+./implicit-oracle :97 I5; ./implicit-oracle :96 I5
+```
+
+```diff
+--- pointer-oracle.c
++++ xtest-oracle.c
+@@ -252,6 +252,7 @@
+     printf("INJECT XTestFakeMotionEvent source=Virtual-core-XTEST-pointer root=%d,%d\n", x, y);
+ }
+ 
++static int g_relative;
+ static void fake_device_motion(struct Setup *s, int first_axis, int *axes, int count) {
+     int xtest_event_base, xtest_error_base, xtest_opcode;
+     int xi_opcode, xi_event_base, xi_error_base;
+@@ -264,6 +265,7 @@
+     }
+     unsigned char events[64] = {0};
+     events[0] = (unsigned char)(xi_event_base + XI_DeviceMotionNotify);
++    events[1] = (unsigned char)g_relative;
+     events[31] = (unsigned char)s->xtest_pointer | 0x80;
+     events[32] = (unsigned char)(xi_event_base + XI_DeviceValuator);
+     events[33] = (unsigned char)s->xtest_pointer;
+@@ -278,7 +280,7 @@
+     memcpy(request + 4, events, sizeof(events));
+     UnlockDisplay(s->inj);
+     XSync(s->inj, False);
+-    printf("INJECT XTestFakeDeviceMotionEvent device=%d first_axis=%d count=%d", s->xtest_pointer, first_axis, count);
++    printf("INJECT XTestFakeDeviceMotionEvent device=%d relative=%d first_axis=%d count=%d", s->xtest_pointer, g_relative, first_axis, count);
+     for (int i = 0; i < count; i++) printf(" axis%d=%d", first_axis + i, axes[i]);
+     printf("\n");
+ }
+@@ -736,6 +738,23 @@
+         drain_all_for(s, 75);
+         fake_button(s, False, 1);
+         drain_all_for(s, 100);
++    } else if (!strcmp(case_id, "X1") || !strcmp(case_id, "X2") || !strcmp(case_id, "X3")) {
++        /* direct XTest DeviceMotion: does it move the sprite, and which forms reach whom */
++        if (s->xtest_pointer < 0) { puts("BLOCKED no XTest pointer device"); return; }
++        fake_motion(s, 150, 150);
++        drain_all_for(s, 50);
++        unsigned int mo = 1u << XI_Motion;
++        select_xi2(s->a, s->grab, s->master, mo);
++        select_core(s->a, s->grab, PointerMotionMask);
++        select_xi2(s->b, s->outside, s->master, mo);
++        select_core(s->b, s->outside, PointerMotionMask);
++        if (!strcmp(case_id, "X1")) { int ax[2] = {650, 150}; fake_device_motion(s, 0, ax, 2); }
++        else if (!strcmp(case_id, "X2")) { g_relative = 1; int ax[2] = {500, 0}; fake_device_motion(s, 0, ax, 2); }
++        else { int v = 175; fake_device_motion(s, 1, &v, 1); }
++        drain_all_for(s, 100);
++        Window r, c; int rx, ry, wx, wy; unsigned int m;
++        XQueryPointer(s->a, DefaultRootWindow(s->a), &r, &c, &rx, &ry, &wx, &wy, &m);
++        printf("QUERY sprite root=%d,%d child=%s\n", rx, ry, window_name(c));
+     } else {
+         fprintf(stderr, "unknown case id: %s\n", case_id);
+         exit(2);
+```
