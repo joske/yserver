@@ -113,6 +113,7 @@ pub struct Screen {
     pub root_visual: ResourceId,
     pub argb_visual: ResourceId,
     pub glmark_visual: ResourceId,
+    pub single_buffer_visual: ResourceId,
     pub root_depth: u8,
 }
 
@@ -810,12 +811,15 @@ fn write_screen(byte_order: ClientByteOrder, out: &mut Vec<u8>, screen: Screen) 
     write_u16(byte_order, out, 0);
     write_u32(byte_order, out, 0);
 
-    // depth=24, 2 visuals: the root stencil-8 GLX visual plus glmark's
-    // stencil-0 GLX visual. They are distinct IDs even though their X pixel
-    // format is identical, matching Xorg's per-FBConfig visual model.
+    // depth=24, 3 visuals: the root stencil-8 GLX visual, glmark's stencil-0
+    // GLX visual, and the single-buffered GLX visual. They are distinct IDs
+    // even though their X pixel format is identical, matching Xorg's
+    // per-FBConfig visual model. The third one is what lets GLX 1.0
+    // `glXChooseVisual` clients that omit GLX_DOUBLEBUFFER (GLXPixmap
+    // clients) get a visual whose rendering reaches the X pixmap.
     out.push(24);
     out.push(0);
-    write_u16(byte_order, out, 2);
+    write_u16(byte_order, out, 3);
     write_u32(byte_order, out, 0);
     write_u32(byte_order, out, screen.root_visual.0);
     out.push(4); // TrueColor
@@ -826,6 +830,14 @@ fn write_screen(byte_order: ClientByteOrder, out: &mut Vec<u8>, screen: Screen) 
     write_u32(byte_order, out, 0x0000_00ff);
     write_u32(byte_order, out, 0);
     write_u32(byte_order, out, screen.glmark_visual.0);
+    out.push(4); // TrueColor
+    out.push(8); // bits per rgb
+    write_u16(byte_order, out, 256);
+    write_u32(byte_order, out, 0x00ff_0000);
+    write_u32(byte_order, out, 0x0000_ff00);
+    write_u32(byte_order, out, 0x0000_00ff);
+    write_u32(byte_order, out, 0);
+    write_u32(byte_order, out, screen.single_buffer_visual.0);
     out.push(4); // TrueColor
     out.push(8); // bits per rgb
     write_u16(byte_order, out, 256);
@@ -4616,16 +4628,17 @@ pub fn write_render_query_pict_formats_reply(
     root_visual: ResourceId,
     argb_visual: ResourceId,
     glmark_visual: ResourceId,
+    single_buffer_visual: ResourceId,
 ) -> io::Result<()> {
     // 5 formats × 28 bytes = 140 bytes
     // 1 screen: 8-byte prelude + 2 depth sections (8-byte header +
-    //   two depth-24 and one depth-32 8-byte visual-format pairs) = 48 bytes
-    // Total body = 188 bytes = 47 × 4-byte units
+    //   three depth-24 and one depth-32 8-byte visual-format pairs) = 56 bytes
+    // Total body = 196 bytes = 49 × 4-byte units
     let num_formats: u32 = 5;
     let num_screens: u32 = 1;
     let num_depths: u32 = 2;
-    let num_visuals: u32 = 3;
-    let body_units: u32 = (140 + 48) / 4; // 47
+    let num_visuals: u32 = 4;
+    let body_units: u32 = (140 + 56) / 4; // 49
 
     let mut out = Vec::new();
     out.push(1u8); // Reply
@@ -4719,14 +4732,16 @@ pub fn write_render_query_pict_formats_reply(
     // Screen info: 1 screen with 2 depths
     write_u32(byte_order, &mut out, num_depths); // nDepth per screen
     write_u32(byte_order, &mut out, RENDER_FMT_RGB24); // fallback
-    // Depth 24 entry: 8-byte header + 2 visuals (16 bytes)
+    // Depth 24 entry: 8-byte header + 3 visuals (24 bytes)
     out.push(24);
     out.push(0);
-    write_u16(byte_order, &mut out, 2); // 2 visuals
+    write_u16(byte_order, &mut out, 3); // 3 visuals
     write_u32(byte_order, &mut out, 0); // pad
     write_u32(byte_order, &mut out, root_visual.0);
     write_u32(byte_order, &mut out, RENDER_FMT_RGB24);
     write_u32(byte_order, &mut out, glmark_visual.0);
+    write_u32(byte_order, &mut out, RENDER_FMT_RGB24);
+    write_u32(byte_order, &mut out, single_buffer_visual.0);
     write_u32(byte_order, &mut out, RENDER_FMT_RGB24);
     // Depth 32 entry: the ARGB visual has exactly one format association.
     // Xorg also reports each VisualID once; mapping this visual again to

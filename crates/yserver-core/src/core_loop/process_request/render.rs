@@ -230,6 +230,7 @@ pub(super) fn handle_render_request(
                 crate::resources::ROOT_VISUAL,
                 ARGB_VISUAL,
                 crate::resources::GLMARK_VISUAL,
+                crate::resources::SINGLE_BUFFER_VISUAL,
             )?;
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);

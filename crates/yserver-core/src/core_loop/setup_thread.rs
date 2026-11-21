@@ -39,7 +39,9 @@ use crate::{
         sender::BoundSender,
     },
     peer::PeerIdentity,
-    resources::{ARGB_VISUAL, GLMARK_VISUAL, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW},
+    resources::{
+        ARGB_VISUAL, GLMARK_VISUAL, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW, SINGLE_BUFFER_VISUAL,
+    },
     transport::Transport,
 };
 
@@ -258,6 +260,7 @@ fn run_setup(
                 root_visual: ROOT_VISUAL,
                 argb_visual: ARGB_VISUAL,
                 glmark_visual: GLMARK_VISUAL,
+                single_buffer_visual: SINGLE_BUFFER_VISUAL,
                 root_depth: crate::resources::ROOT_DEPTH,
             },
         },

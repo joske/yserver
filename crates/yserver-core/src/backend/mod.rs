@@ -165,7 +165,9 @@ pub fn install_backend_root_bindings(
     state: &mut crate::server::ServerState,
     backend: &dyn Backend,
 ) {
-    use crate::resources::{ARGB_COLORMAP, ARGB_VISUAL, GLMARK_VISUAL, ROOT_VISUAL, ROOT_WINDOW};
+    use crate::resources::{
+        ARGB_COLORMAP, ARGB_VISUAL, GLMARK_VISUAL, ROOT_VISUAL, ROOT_WINDOW, SINGLE_BUFFER_VISUAL,
+    };
 
     if let Some(root) = state.resources.window_mut(ROOT_WINDOW) {
         root.host_xid = WindowHandle::from_raw(backend.window_id());
@@ -176,6 +178,9 @@ pub fn install_backend_root_bindings(
     state
         .resources
         .set_visual_host_xid(GLMARK_VISUAL, backend.root_visual_xid());
+    state
+        .resources
+        .set_visual_host_xid(SINGLE_BUFFER_VISUAL, backend.root_visual_xid());
     if let Some(host_colormap) = backend.argb_colormap_xid() {
         state
             .resources
