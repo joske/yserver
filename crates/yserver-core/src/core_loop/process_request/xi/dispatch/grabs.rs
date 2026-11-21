@@ -492,6 +492,12 @@ pub(in crate::core_loop::process_request) fn deactivate_xi2_device_grab(
             .filter(|grab| grab.owner == owner)
             .map(|grab| grab.grab_window)
     };
+    let implicit_slave_pointer_grab = !is_keyboard
+        && !is_master
+        && state
+            .xi2_pointer_grabs
+            .get(&deviceid)
+            .is_some_and(|grab| grab.owner == owner && grab.implicit);
     if grab_window_for_event.is_some() {
         if is_keyboard && is_master {
             state.active_keyboard_grab = None;
@@ -499,20 +505,24 @@ pub(in crate::core_loop::process_request) fn deactivate_xi2_device_grab(
             state.xi2_keyboard_grabs.remove(&deviceid);
         } else if is_master {
             state.clear_pointer_grab();
+        } else if implicit_slave_pointer_grab {
+            state.remove_implicit_xi2_pointer_grab(deviceid);
         } else {
             state.xi2_pointer_grabs.remove(&deviceid);
         }
-        state.xi1_frozen.entry(deviceid).or_default().stored = None;
-        crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(state, deviceid, owner);
-        if !is_master {
-            state.reattach_xi2_slave(deviceid);
-        }
-        if !is_keyboard {
-            // Clear any grab-cursor sprite override, as
-            // `deactivate_core_pointer_grab` does — a core
-            // XGrabPointer(cursor) torn down via XIUngrabDevice
-            // must not strand the grab cursor on the sprite.
-            let _ = backend.set_grab_cursor(None, None);
+        if !implicit_slave_pointer_grab {
+            state.xi1_frozen.entry(deviceid).or_default().stored = None;
+            crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(state, deviceid, owner);
+            if !is_master {
+                state.reattach_xi2_slave(deviceid);
+            }
+            if !is_keyboard {
+                // Clear any grab-cursor sprite override, as
+                // `deactivate_core_pointer_grab` does — a core
+                // XGrabPointer(cursor) torn down via XIUngrabDevice
+                // must not strand the grab cursor on the sprite.
+                let _ = backend.set_grab_cursor(None, None);
+            }
         }
     }
     if let Some(grab_window) = grab_window_for_event {
@@ -1137,11 +1147,14 @@ pub(super) fn handle_xi1_grab_device(
             .resources
             .window(ResourceId(win))
             .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
-        let status: u8 = if state
-            .xi1_active_grabs
-            .get(&dev)
-            .is_some_and(|g| g.owner != client_id)
+        let status: u8 = if state.xi2_pointer_grabs.contains_key(&dev)
+            || state
+                .xi1_active_grabs
+                .get(&dev)
+                .is_some_and(|g| g.owner != client_id)
         {
+            // Xorg's single device grab rejects replacement by a different
+            // protocol even for the same client (../xserver/dix/events.c:5288-5292).
             1 // AlreadyGrabbed
         } else if !viewable {
             3 // GrabNotViewable

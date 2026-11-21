@@ -1629,6 +1629,34 @@ pub(super) fn release_core_grabs_for_unviewable(
     {
         deactivate_core_keyboard_grab(state, g.owner);
     }
+
+    let mut xi2_pointer_grabs: Vec<(u16, ClientId, bool)> = state
+        .xi2_pointer_grabs
+        .iter()
+        .filter(|(_, grab)| !viewable(state, grab.grab_window))
+        .map(|(&device, grab)| (device, grab.owner, grab.implicit))
+        .collect();
+    xi2_pointer_grabs.sort_unstable_by_key(|(device, _, _)| *device);
+    let mut released_non_implicit_slave_grab = false;
+    for (device, owner, implicit) in xi2_pointer_grabs {
+        if implicit {
+            state.remove_implicit_xi2_pointer_grab(device);
+        } else {
+            released_non_implicit_slave_grab = true;
+            super::xi::deactivate_xi2_device_grab(
+                state, backend, None, owner, device, false, false,
+            );
+        }
+    }
+    if released_non_implicit_slave_grab {
+        // Xorg DeactivatePointerGrab calls ComputeFreezes after
+        // ReattachToOldMaster (`../xserver/dix/events.c:1718-1721`),
+        // which plays newly released input
+        // (`../xserver/dix/events.c:1366-1369`). Run it once after this
+        // unmap has torn down all of its non-implicit slave grabs.
+        let xid_map = backend.xid_map().clone();
+        crate::core_loop::pointer_fanout::xi1_compute_freezes(state, backend, &xid_map);
+    }
 }
 
 pub(super) fn handle_grab_key(
