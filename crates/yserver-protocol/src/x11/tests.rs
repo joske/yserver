@@ -142,6 +142,7 @@ fn xi2_device_event_encodes_group_from_state() {
         29,     // detail keycode
         3,      // sourceid
         0,      // flags
+        None,
     );
     // group quartet: base=0, latched=0, locked=1, effective=1
     assert_eq!(
@@ -171,6 +172,7 @@ fn xi2_device_event_encodes_group_from_state() {
         29,
         3,
         0,
+        None,
     );
     assert_eq!(
         buf.len(),
@@ -1289,6 +1291,7 @@ fn xi2_motion_event_carries_axes() {
         0, // detail = 0 for motion
         2,
         0, // flags
+        None,
     );
 
     // Width-padded to match Xorg byte-for-byte: 32 header + 16 coords
@@ -1334,6 +1337,7 @@ fn xi2_button_event_has_no_axes() {
         1,
         2,
         0, // flags
+        None,
     );
 
     // Width-padded to match Xorg: 32 header + 16 coords + 12 lens +

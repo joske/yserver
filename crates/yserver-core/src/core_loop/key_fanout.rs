@@ -1002,6 +1002,7 @@ fn encode_key_xi2_for_device(
         } else {
             0
         },
+        None,
     );
 }
 

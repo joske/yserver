@@ -4887,6 +4887,7 @@ fn pointer_event_fanout_inner(
                 u32::from(event.detail),
                 xi_pointer_device_id,
                 xi2_flags,
+                None,
             );
         }
         if let Ok(mut w) = target.writer.lock() {
