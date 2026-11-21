@@ -192,11 +192,17 @@ pub fn process_disconnect_reporting(
     state.xi1_passive_grabs.retain(|g| g.owner != client_id);
     let released_xi1 =
         crate::core_loop::process_request::release_active_grabs(state, backend, client_id);
-    if !released_xi1 && state.xi1_active_grabs.is_empty() {
-        // No active grabs anywhere, yet freezes linger (e.g. a sync
-        // passive grab's owner died between activation and release):
-        // clear them, or device events queue forever and every later
-        // client waiting on input hangs.
+    if !released_xi1
+        && state.active_pointer_grab.is_none()
+        && state.active_keyboard_grab.is_none()
+        && state.xi2_pointer_grabs.is_empty()
+        && state.xi2_keyboard_grabs.is_empty()
+        && state.xi1_active_grabs.is_empty()
+    {
+        // No active grabs in any core, XI2 or XI1 slot, yet freezes
+        // linger (e.g. a sync passive grab's owner died between
+        // activation and release): clear them, or device events queue
+        // forever and every later client waiting on input hangs.
         let devs: Vec<u16> = state
             .xi1_frozen
             .iter()
