@@ -4,111 +4,95 @@
 
 **Goal:** A Present with `PresentOptionAsync` whose target is in the future when it arrives is handed to scanout as a synced request, as Xorg's `sync_flip` (#23).
 
-**Architecture:**
-- **Decide at arrival.** The decision is taken where both PresentPixmap variants build their `PendingPresentPixmap`, with the same general-clock msc that computes the effective target.
-- **Keep it.** It is stored on the pending request and survives every deferral.
-- **Apply it at execution.** `execute_present_pixmap_copy` applies it to the `PresentScanoutCandidate` options it hands to scanout. Execution timing, parking, wakeups, completion stamping and the KMS backend stay unchanged.
+**Architecture:** The decision is taken where both PresentPixmap variants build their `PendingPresentPixmap`, with the general-clock msc that computes the effective target. It is stored on the pending request, survives every deferral, and is applied by `execute_present_pixmap_copy` to the `PresentScanoutCandidate` options only. Execution timing, parking, wakeups, completion stamping and the KMS backend are unchanged; Task 2 proves on the KMS backend that a candidate without Async produces a synced commit even while tearing is admitted, with VRR unchanged.
 
-**Tech Stack:** Rust (yserver-core); `RecordingBackend` candidate observation.
+**Tech Stack:** Rust (yserver-core, yserver KMS backend tests).
 
 **Spec:** `docs/superpowers/specs/2026-11-21-async-present-target-design.md` (revision 3, approved by the user 2026-11-21).
 
 ## Global Constraints
 
-- **Base:** branch `fix/async-present-target` on master `3ef6570b` plus the docs commits.
-- **Citations:** cite Xorg as `../xserver` (tag xorg-server-21.1.24): `present/present_vblank.c:110-122`, `present/present_scmd.c:232,579,770-771`. Cite Mesa `loader_dri3_helper.c:1118-1159` and `wsi_common_x11.c:1827,2632`. No copyleft code.
-- **Reuse first:** no new scheduling, parking, wake or completion path. `classify_msc_due` stays unchanged. The KMS backend stays unchanged: it already treats a candidate without Async as synced (`kms/present.rs` ~340-400, `kms/scanout.rs` ~1812).
-- **No new `YSERVER_*` environment variables.**
-- **Out of scope (spec Non-goals):**
-  - composed-scene async rejection;
-  - the completion sweep's stamping policy;
-  - synced timing, supersession policy, VRR, and the idle/blackout ladder.
-- **Tests (rules A/B/C):**
-  - **Location:** in `crates/yserver-core/src/core_loop/process_request/tests/present_pixmap.rs`.
-  - **Inputs:** requests go through `process_request` dispatch (PresentPixmap / PresentPixmapSynced bodies via the existing `pixmap_body`, `pixmap_synced_body`, `dispatch_present_body` and `future_present_pixmap_request` helpers). Deferral and execution go through the core loop's existing drivers (`run_core_present_wait_drain`, `run_core_present_request_and_wait`).
-  - **Observation:** `RecordingBackend::present_direct_candidates`, plus the pending entry's stored decision.
-  - **End state:** every scenario ends with the end-state check: `present_pending_exec` and `present_pending_complete` empty (or the expected live set), and no pins left.
-  - **No injected state:** no hand-built pending entries, and no direct calls to `execute_present_pixmap_copy`.
-- **Red runs and mutations:** every new test is seen failing on the base for its stated reason. Tests marked GUARD must pass on the base. Every production change has a mutation, listed with the tests it must turn red.
-- **Commits:** signed (`-S`), explicit paths, trailers `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` and `Implemented-By: codex (gpt-6-luna xhigh)`.
-- **No hardware or server runs by the implementer.** No hardware and no yserver binary.
-- **Per-task gate:**
-  - `cargo +nightly fmt`;
-  - `cargo clippy --workspace --all-targets -- -D warnings`;
-  - `cargo test -p yserver-core present`;
-  - `cargo test -p yserver kms::render::backend::tests::present_scanout`;
-  - `tools/check-layout.sh`;
-  - rule F: `cargo test -p yserver-core present` five times under `nproc` busy loops.
+- Base: branch `fix/async-present-target` on master `3ef6570b` plus docs commits.
+- Cite Xorg as `../xserver` (tag xorg-server-21.1.24): `present/present_vblank.c:110-122`, `present/present_scmd.c:232,579,770-771`; Mesa `loader_dri3_helper.c:1118-1159`, `wsi_common_x11.c:1827,2632`. No copyleft code.
+- Reuse first: no new scheduling, parking, wake or completion path; `classify_msc_due` unchanged; no KMS backend production change is expected (it already maps a candidate without Async to Vsync timing and exits tearing, `kms/present.rs` ~340-400, ~1558; `kms/scanout.rs` ~1812). If Task 2 finds otherwise, stop and report.
+- No new `YSERVER_*` environment variables.
+- Out of scope (spec Non-goals): composed-scene async rejection, the completion sweep's stamping policy, synced timing, supersession policy, VRR design, idle/blackout ladder.
+- Tests (rules A/B/C): requests through `process_request` dispatch; core-loop drivers that already exist (`run_core_present_wait_drain`, `run_core_present_request_and_wait`); KMS through the `Backend` trait entries (`note_present_scanout_candidate`, `try_present_direct`, retirement) of the recording-scene fixture. No hand-built pending entries; no direct calls to `execute_present_pixmap_copy`; `_VARIABLE_REFRESH` set by ChangeProperty dispatch.
+- End-state check for every core scenario: `present_pending_exec`, `present_pending_complete` and `present_complete_gate` empty (or the expected live set), backend-held completions drained, no pins left.
+- Red runs: behavioural assertions (candidate options, completion options, commit kind) are written and seen failing on the base **before** the new field exists; assertions on `future_target_sync` are added after Step 3 (they cannot compile on the base). GUARDs pass on the base. Every production change has a mutation listed with the tests it must turn red.
+- Commits: signed (`-S`), explicit paths, trailers `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` and `Implemented-By: codex (gpt-6-luna xhigh)`.
+- Implementers run no hardware and no yserver binary. The completion-derived target sequence (Mesa adaptive / Vulkan FIFO_RELAXED) needs real retirements; it is validated on hardware in Task 3, never by injecting completion samples.
+- Per-task gate: `cargo +nightly fmt`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test -p yserver-core present`; `cargo test -p yserver kms::render::backend::tests::present_scanout` plus `-- --ignored` for the recording-scene tests with the lavapipe environment of the repo's CI; `tools/check-layout.sh`; rule F: `cargo test -p yserver-core present` five times under `nproc` busy loops.
 
 ## Review Focus
 
-1. **A late Async request after an on-time one.** The late request (target ≤ msc at arrival) keeps Async; the on-time request before it does not. Test in Task 1 (`async_late_after_on_time_keeps_async`).
-2. **Same-target supersession.** An Async future-target request superseded by a successor with the same target reports the skipped completion exactly as today, and the successor's candidate is synced. Test in Task 1.
-3. **PresentPixmapSynced deferred by its acquire point past the target.** It is still synced when it executes. Test in Task 1.
-4. **VRR window.** The `variable_refresh` of the candidate is unchanged by the decision. Test in Task 1.
-5. **Client disconnect with a parked Async future-target request.** The existing teardown (`process_disconnect.rs` ~913) still works with the new field. Test in Task 1.
+1. A late Async request right after an on-time one: the late one (target ≤ msc at arrival) keeps Async, the on-time one is synced. Task 1 (`async_late_after_on_time_keeps_async`).
+2. Same-target supersession keeps today's Skip behaviour and the successor is synced. Task 1.
+3. PresentPixmapSynced deferred by its acquire point past the target stays synced. Task 1.
+4. VRR: a synced future-target candidate on a VRR window still gets VRR, with the same submission timing. Task 2.
+5. Client disconnect with a parked Async future-target entry: teardown unchanged. Task 1.
 
 ---
 
-### Task 1: Arrival-time sync decision for Async future targets
+### Task 1: Arrival-time sync decision (yserver-core)
 
-Spec Design rules 1-4.
+Spec Design rules 1-2.
 
 **Files:**
-- Modify: `crates/yserver-core/src/server.rs`: `PendingPresentPixmap` (~3017) gains `pub future_target_sync: bool`.
-- Modify: `crates/yserver-core/src/core_loop/process_request/present_ext.rs`:
-  - the two arrival constructors (~2151 PresentPixmap, ~2596 PresentPixmapSynced) set the field from `domain.raw_msc` and the computed `effective_target_msc`;
-  - `execute_present_pixmap_copy` (~948-1015) applies it to the candidate options.
-- Modify: every other `PendingPresentPixmap` constructor (14 sites in total, including `process_disconnect.rs` ~913 and tests). Each passes the value it should; any non-arrival constructor carries over the original request's value.
+- Modify: `crates/yserver-core/src/server.rs` `PendingPresentPixmap` (~3017): `pub future_target_sync: bool`.
+- Modify: `crates/yserver-core/src/core_loop/process_request/present_ext.rs`: arrival constructors (~2151 PresentPixmap, ~2596 PresentPixmapSynced) compute it from `domain.raw_msc` and the computed `effective_target_msc`; `execute_present_pixmap_copy` (~948 destructuring — bind the field; ~983 candidate) applies it.
+- Modify the other initializers: nine full initializers in total besides the two arrival sites — `process_disconnect.rs` ~913 (test code), `run/tests.rs` ~4648, `tests/present_pixmap.rs` ~2622 and ~2751, `tests/mod.rs` ~903, ~965, ~1136 — pass `false` (their inputs are non-Async); the two struct-update constructions in `tests/present_supersede.rs` ~900, ~927 inherit through `..pred`.
 - Test: `crates/yserver-core/src/core_loop/process_request/tests/present_pixmap.rs`.
 
 **Interfaces:**
-- Produces: `PendingPresentPixmap::future_target_sync: bool`. It is `true` exactly when `masked_options & PRESENT_OPTION_ASYNC != 0` and the effective target is `Some(eff)` with `msc_is_after(eff, domain.raw_msc)` at arrival.
-- `execute_present_pixmap_copy`: the candidate's `options` are `masked_options & !PRESENT_OPTION_ASYNC` when the flag is set, otherwise `masked_options`. The `CompletedPresentEvent` options and every other use of `masked_options` are unchanged.
+- Produces: `PendingPresentPixmap::future_target_sync: bool` — true exactly when `masked_options & PRESENT_OPTION_ASYNC != 0` and the effective target is `Some(eff)` with `msc_is_after(eff, domain.raw_msc)` at arrival.
+- `execute_present_pixmap_copy`: candidate `options = masked_options & !PRESENT_OPTION_ASYNC` when the flag is set, else `masked_options`. `CompletedPresentEvent.options` and every other use of `masked_options` unchanged.
 
-- [ ] **Step 1: Write the tests.** Each dispatches real requests and drives the core loop with the existing drivers.
-  - `async_next_target_present_is_synced`: Async PresentPixmap, target = current msc + 1, source ready, no flip in flight. It executes at arrival, and the recorded candidate's options lack Async. End state.
-  - `async_current_target_keeps_async`: Async with target = current msc. The candidate keeps Async. GUARD.
-  - `async_late_after_on_time_keeps_async` (Review Focus 1): first an Async request at msc + 1, then an Async request whose target ≤ msc at its arrival. The first candidate is synced and the second keeps Async.
-  - `async_future_target_fence_deferred_past_target_stays_synced`: Async target msc + 1, with a producer fence that signals only after the clock reached the target (advance the clock through the backend's existing test sequence path). The executed candidate lacks Async.
-  - `async_synced_variant_acquire_deferred_stays_synced` (Review Focus 3): the same through PresentPixmapSynced with an acquire syncobj.
-  - `async_distant_target_idle_fallback_is_synced`: Async with target msc + 20 on an idle display (the `present_ext.rs` ~867 fallback executes it now). The candidate lacks Async. The completion stamp is whatever today's sweep gives, as in the spec's exemption; assert only the candidate.
-  - `async_distant_target_failed_arm_is_synced`: the same with a failed shared-wake arm (`run.rs` ~3373), using the `RecordingBackend` arm-failure control if one exists. If none exists, report it and cover it with the idle case only.
-  - `synced_present_unchanged` (GUARD): non-Async at msc + 1. The candidate options equal `masked_options`.
-  - `async_same_target_supersession_unchanged` (Review Focus 2): two Async presents with the same future target while the first waits. The first completes as skipped exactly as today, and the second's candidate lacks Async.
-  - `async_future_target_keeps_variable_refresh` (Review Focus 4): with `_VARIABLE_REFRESH` set on the window, the synced candidate's `variable_refresh` is true.
-  - `async_future_target_pending_survives_disconnect` (Review Focus 5): a parked Async future-target request, then client disconnect. The entry and pin are gone. GUARD.
-  - `fifo_relaxed_shaped_sequence_never_repeats_target`: three Async presents, each targeting the msc the previous completion reported + 1, as Vulkan FIFO_RELAXED and Mesa adaptive do. All candidates are synced, and the targets strictly increase. Note in the report which completion msc the `RecordingBackend` reports; equality with the target is validated on hardware (Task 2).
-- [ ] **Step 2: Run** `cargo test -p yserver-core present`. Expected: every non-GUARD test FAILs on an assertion (Async present in the candidate), and the GUARDs pass.
-- [ ] **Step 3: Implement** as in Files and Interfaces.
-- [ ] **Step 4: Run** the task's tests, then the gate. Expected: PASS.
-- [ ] **Step 5: Mutations:**
+- [ ] **Step 1: Write the behavioural tests** (base-compilable; candidates from `RecordingBackend::present_direct_candidates`, completion options from the recorded Copy-path completion event where stated):
+  - `async_next_target_present_is_synced`: Async PresentPixmap, target = clock + 1, source ready, no flip in flight → executes at arrival; candidate options lack Async; the Copy-path completion event (direct result disabled so the copy path runs and records its completion) keeps Async in its options. End state.
+  - `async_current_target_keeps_async` (GUARD): target = clock → candidate keeps Async.
+  - `async_late_after_on_time_keeps_async`: two explicit arrivals: Async at clock + 1, then (clock advanced through the recording backend's per-CRTC clock) Async with target ≤ clock → first candidate synced, second keeps Async.
+  - `async_future_target_fence_deferred_past_target_stays_synced`: schedule: dispatch Async target = clock + 1 with a producer wait (existing deferred-source path) → assert the pending entry exists and nothing executed → set the backend general clock past the target → publish the ready wait id → run the core drain → candidate lacks Async.
+  - `async_synced_variant_acquire_deferred_stays_synced`: same schedule through PresentPixmapSynced with a seeded acquire syncobj.
+  - `async_distant_target_idle_fallback_is_synced`: Async target = clock + 20, absolute-vblank arming unsupported, idle display → the `present_ext.rs` ~867 fallback executes it now → candidate lacks Async (completion stamp not asserted — spec exemption).
+  - `async_distant_target_failed_arm_is_synced`: Async target = clock + 20, arming supported, `arm_present_shared_wake_result = Some(Ok(false))` and, in a second sub-case, `Some(Err(..))` (as the existing tests at ~4846 do), display not idle so the idle fallback does not take it first → assert the arm was attempted and the `run.rs` ~3373 branch executed it → candidate lacks Async.
+  - `synced_present_unchanged` (GUARD): non-Async at clock + 1 → candidate options == masked options.
+  - `async_same_target_supersession_unchanged`: schedule: flip in flight (recording backend control) so the first Async target = clock + 1 request classifies `Park`; dispatch the second Async request with the same target; expected (today's behaviour, assert it on the base for the first): the first completes as Skip before the second executes; after the flip retires the second executes → its candidate lacks Async.
+  - `async_future_target_pending_survives_disconnect` (GUARD): dispatch creates a parked Async future-target entry with a pin (assert it), then client disconnect through the production path → entry and pin gone.
+- [ ] **Step 2: Run** `cargo test -p yserver-core present`. Expected: every non-GUARD test FAILs on its Async assertion; GUARDs PASS.
+- [ ] **Step 3: Implement** as in Files/Interfaces.
+- [ ] **Step 4: Add the field assertions** (post-press-style checks after dispatch: the pending entry's `future_target_sync` is true for the future-target cases and false for current/late/synced), then run the task's tests and the gate. Expected: PASS.
+- [ ] **Step 5: Mutations** (each alone, by line, reverted):
 
   | Mutation | Must fail |
   |---|---|
-  | (a) decide at execution instead of arrival (`msc_is_after(eff, clock_at_execution)`) | `async_future_target_fence_deferred_past_target_stays_synced`, `async_synced_variant_acquire_deferred_stays_synced` |
+  | (a) decide at execution (`msc_is_after(eff, clock_at_execution)`) | `..._fence_deferred_past_target_...`, `..._acquire_deferred_...` |
   | (b) ignore the flag in `execute_present_pixmap_copy` | `async_next_target_present_is_synced` |
   | (c) set the flag for every Async request | `async_current_target_keeps_async`, `async_late_after_on_time_keeps_async` |
-  | (d) strip Async from `masked_options` itself (completion options change) | a completion-options assertion in `async_next_target_present_is_synced` |
+  | (d) strip Async from `masked_options` itself | `async_next_target_present_is_synced` (Copy-path completion options) |
 
 - [ ] **Step 6: Commit** `fix(present): an Async present with a future target flips in sync, as Xorg's sync_flip (#23)`.
 
-### Task 2: Hardware check and docs (coordinator)
+### Task 2: KMS backend evidence — synced commit, tearing exit, VRR unchanged
 
-The coordinator does this task, not codex.
+Spec Design rules 3-4 and the composed-path case. No production change expected.
 
-- [ ] **Gate:**
-  - workspace `cargo test --features xdmcp`;
-  - the lavapipe `--ignored` suite;
-  - `just man`;
-  - check-layout;
-  - rule F, five runs under load for `present`.
-- [ ] **AMD, after asking the user.** Install the branch build as the tty1 session's yserver per the user's procedure, then run `~/Games/stk-tests/stk-normal.sh` against the base build and the branch build. For the on-time adaptive presents, from the run's `yserver.log`:
-  - throughput near 60/s;
-  - completion msc equal to target;
-  - no repeated target;
-  - no `kind=async` commit for future-target presents.
+**Files:**
+- Test: `crates/yserver/src/kms/render/backend/tests/present_scanout_a3.rs` (reuse `a3_output_fixture`, `a3_offer_output_candidate_after_probation`, `a3_offer_direct_present`, `a3_records_since`, `a3_retire_records`, `a3_has_scene_commit_for`; `#[ignore = "needs live Vulkan ICD (lavapipe)"]` like its neighbours).
 
-  Late frames may still be async. The user also gives his judgment of the lag.
-- [ ] **Docs:** add a `docs/status.md` entry. Draft the reply to craftfever with a request to test the branch on the HD 4000; the user posts it.
-- [ ] **Commit** `docs: async present future target status (#23)`.
+**Interfaces:** Consumes Task 1's rule: a future-target Async request reaches the backend as a candidate without Async.
+
+- [ ] **Step 1: Write the tests** (device `async_page_flip = true` as in `unpaced_output_client_enters_direct_on_first_retirement`):
+  - `async_candidates_admit_tearing_then_synced_candidate_commits_vsync`: admit tearing through probation with Async candidates (assert the recorded direct commit carries the async flag); then offer the same window's next candidate **without** Async → the recorded commit has no async flag, tearing state is Off, and its retirement stamps the completion with the retirement msc. GUARD on the base (the backend already behaves so) — it pins the backend half of the fix.
+  - `synced_candidate_on_vrr_window_keeps_vrr_and_timing`: window with `_VARIABLE_REFRESH` set through ChangeProperty dispatch on the fixture's state; Async candidate vs. candidate without Async → both direct commits carry the VRR enable and are submitted at offer time (ready-driven); only the async flag differs. GUARD; record in the report that VRR selection (`scanout.rs` ~1445) does not read Async.
+  - `synced_candidate_not_direct_eligible_composes_vsync`: a candidate that is not direct-eligible (overlapped window) without Async → Copy fallback, a composed scene commit without async flag (`a3_has_scene_commit_for`). GUARD.
+- [ ] **Step 2: Run** them with `--ignored` under the lavapipe environment. Expected: PASS on the base (they are GUARDs of the backend contract Task 1 relies on). If any fails, stop and report — the spec's "no backend change" assumption would be wrong.
+- [ ] **Step 3: Mutation:** in `direct_frame_flip_timing` (`kms/scanout.rs` ~1812) drop the `options & ASYNC` condition → the first test fails (synced candidate still async while tearing).
+- [ ] **Step 4: Commit** `test(present): KMS commits a synced flip for a candidate without Async, VRR unchanged (#23)`.
+
+### Task 3: Hardware check and docs (coordinator)
+
+- [ ] Gate: workspace `cargo test --features xdmcp`, lavapipe `--ignored`, `just man`, check-layout, rule F ×5 under load for `present`.
+- [ ] AMD (ask the user first): install the branch build as the tty1 session's yserver per the user's procedure; run `~/Games/stk-tests/stk-normal.sh` on the base and on the branch build. From each run's `yserver.log`, for the on-time adaptive presents (target = arrival msc + 1): throughput near 60/s; completion msc = target; no client present targets the same msc as its predecessor while on time; no `kind=async` commit for them. Late presents may stay async. The user's judgment of the lag.
+- [ ] `docs/status.md` entry; draft the craftfever reply asking him to test the branch on the HD 4000 (the user posts it).
+- [ ] Commit `docs: async present future target status (#23)`.
