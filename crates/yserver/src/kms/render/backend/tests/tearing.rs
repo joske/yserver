@@ -5008,6 +5008,7 @@ fn task5_cursor_only_motion_recomposes_at_most_once_per_refresh() {
                 dx: 0,
                 dy: 0,
                 motion_delta: None,
+                device_axes: None,
             },
         );
         Backend::maybe_composite(&mut backend).expect("XTest cursor-only cap tick");

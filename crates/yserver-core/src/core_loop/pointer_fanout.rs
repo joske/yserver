@@ -18,9 +18,10 @@
 mod tests;
 
 mod owner_events;
+pub(in crate::core_loop) use owner_events::xtest_wire_valuators;
 use owner_events::{
     OwnerEventsRoute, OwnerProtocol, Xi1SelectionFilter, grab_for_form, owner_events_route,
-    xi1_selection_filter_for_slave_grab, xi2_direct_xtest_motion, xi2_motion_targets_for_source,
+    xi1_selection_filter_for_slave_grab, xi2_motion_targets_for_source,
 };
 
 use yserver_protocol::x11::{self, ClientId, ResourceId, SequenceNumber};
@@ -1954,7 +1955,7 @@ fn pointer_event_fanout_to_state_inner(
             // plain selection walk (Xorg ProcessOtherEvent only
             // routes keyboard events through DeliverFocusedEvent).
             focus_route: crate::server::Xi1FocusRoute::Walk,
-            axes: None,
+            axes: event.device_axes,
             replay_floor: None,
         };
         if event.kind == PointerEventKind::ButtonPress
@@ -1984,6 +1985,9 @@ fn pointer_event_fanout_to_state_inner(
     };
     let xi2_evtype = xi2_evtype(event.kind);
     let xi2_raw_evtype = xi2_raw_evtype(event.kind);
+    let xi2_motion_valuators = event
+        .device_axes
+        .map(|axes| xtest_wire_valuators(axes, Some((event.root_x, event.root_y))));
 
     // Start with the hit target. Normal XI2 device forms resolve their
     // first selected ancestor below; grabs and crossings override it.
@@ -2656,7 +2660,9 @@ fn pointer_event_fanout_to_state_inner(
                                 u32::from(event.detail),
                                 xi_source.sourceid,
                                 xi2_flags,
-                                None,
+                                xi2_motion_valuators
+                                    .as_ref()
+                                    .map(|(first, values)| (*first, values.as_slice())),
                             );
                         }
                     }
@@ -2844,6 +2850,7 @@ pub fn emit_scroll_stop_to_state(
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let root_hit = resolve_pointer_hit(state, xid_map, &probe);
     let top_level_id = root_hit
@@ -3107,21 +3114,8 @@ pub(crate) fn xi1_route_device_event(
     // 4. Selection delivery, gated by the device-focus route
     // (DeliverFocusedEvent for keyboard devices; plain walk for
     // pointer devices).
-    let (selection_filter, direct_grab_route) = xi1_selection_filter_for_slave_grab(state, &q);
+    let (selection_filter, _direct_grab_route) = xi1_selection_filter_for_slave_grab(state, &q);
     let mut dropped = Vec::new();
-    if q.axes.is_some()
-        && q.evcode == first + crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET
-        && let Some((grab, route)) = direct_grab_route
-    {
-        // XTest's XI1 DeviceMotionNotify request enters this router directly;
-        // unlike the pointer fanout caller it has no later XI2 pass. Reuse
-        // the owner-events decision for both protocol suppression and the
-        // selected XI2 delivery (Xvfb C16/C17).
-        merge_dropped(
-            &mut dropped,
-            xi2_direct_xtest_motion(state, &q, grab, route),
-        );
-    }
     let hit = if is_button_press
         && let Some(delivery) = slave_press_delivery
         && matches!(selection_filter, Xi1SelectionFilter::Unrestricted)

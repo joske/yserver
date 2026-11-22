@@ -2222,6 +2222,7 @@ fn xi_source_removal_releases_source_holds_before_unregister_and_drops_stale_reu
             dx: 0,
             dy: 0,
             motion_delta: None,
+            device_axes: None,
         },
     );
     backend.on_host_input(

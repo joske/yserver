@@ -292,6 +292,7 @@ fn xi_owner_events_scroll_fixture() -> (
             dx: 0,
             dy: 0,
             motion_delta: None,
+            device_axes: None,
         },
     );
 
@@ -724,6 +725,7 @@ fn xi_dynamic_owner_events_grab_fallback_preserves_slave_button_and_motion_ident
             dx: 0,
             dy: 0,
             motion_delta: None,
+            device_axes: None,
         },
     );
     let motion = xi2_events(&kbd_map_drain(&mut peer));
@@ -1951,6 +1953,7 @@ fn xi_slave_switch_scroll_stop_next_motion_and_query_share_current_source_value(
         dx: 0,
         dy: 0,
         motion_delta: None,
+        device_axes: None,
     };
     let mut backend = KmsBackend::for_tests();
     let mut state = ServerState::new();
@@ -2158,6 +2161,7 @@ fn xi_slave_switch_kms_suspend_and_removal_clear_last_source() {
         dx: 0,
         dy: 0,
         motion_delta: None,
+        device_axes: None,
     };
     let events = |bytes: &[u8]| {
         let mut result = Vec::new();
@@ -2718,6 +2722,7 @@ fn xi_master_classes_store_last_slave_shape_after_removal_then_xtest_switch() {
             dx: 0,
             dy: 0,
             motion_delta: None,
+            device_axes: None,
         },
     );
     let physical_changed = xi_master_changed_summaries(&kbd_map_drain(&mut peer));
@@ -2796,6 +2801,7 @@ fn xi_master_classes_store_last_slave_shape_after_removal_then_xtest_switch() {
             dx: 0,
             dy: 0,
             motion_delta: None,
+            device_axes: None,
         },
     );
     let xtest_changed = xi_master_changed_summaries(&kbd_map_drain(&mut peer));

@@ -1324,6 +1324,7 @@ fn rootless_xtest_motion_warps_the_host_pointer() {
             dx: 0,
             dy: 0,
             motion_delta: None,
+            device_axes: None,
         },
     );
     b.resync_input_position();

@@ -503,9 +503,11 @@ fn dispatch_fake_input_with_body(
                 );
             }
             crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET => {
-                // Device-motion fakes are DEVICE-coordinate space and do
-                // NOT move the sprite — Xorg uses POINTER_ABSOLUTE without
-                // POINTER_DESKTOP (Xext/xtest.c:265).
+                // Xorg's FakeInput path routes device motion through the
+                // ordinary pointer motion pipeline. Preserve the requested
+                // axes on that event; Xorg's range copy reads each output
+                // range from a zero-based slice (Xext/xtest.c:248-284,
+                // dix/inpututils.c:452-462), including its first-axis quirk.
                 let mut axes = crate::server::Xi1MotionAxes {
                     first: 0,
                     count: 0,
@@ -534,28 +536,63 @@ fn dispatch_fake_input_with_body(
                     }
                     chunk += 32;
                 }
-                let target = crate::core_loop::key_fanout::deepest_window_at_pointer(state);
-                let (root_x, root_y) = state.pointer_root;
-                let _ = crate::core_loop::pointer_fanout::xi1_route_device_event(
-                    state,
-                    crate::server::Xi1QueuedEvent {
-                        deviceid: target_device_id,
-                        evcode: crate::server::XI_FIRST_EVENT
-                            + crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET,
-                        detail: 0,
-                        synthetic_repeat: false,
-                        time: fi.time,
-                        root_x,
-                        root_y,
-                        state_mask: 0,
-                        natural_target: target,
-                        focus_route: crate::server::Xi1FocusRoute::Walk,
-                        axes: (axes.count != 0).then_some(axes),
-                        replay_floor: None,
+                let device_axes = (axes.count != 0).then_some(axes);
+                let copied_valuators = device_axes
+                    .map(|axes| crate::core_loop::pointer_fanout::xtest_wire_valuators(axes, None));
+                let copied_axis = |axis: u8| {
+                    copied_valuators.as_ref().and_then(|(first, values)| {
+                        axis.checked_sub(*first)
+                            .and_then(|offset| values.get(usize::from(offset)))
+                            .copied()
+                    })
+                };
+                let floating_device =
+                    crate::core_loop::pointer_fanout::floating_pointer_device_id(state, origin);
+                let floating_position = floating_device
+                    .and_then(|device| state.floating_pointer_positions.get(&device).copied());
+                #[allow(clippy::cast_possible_truncation)]
+                let (current_x, current_y) = floating_position.map_or_else(
+                    || {
+                        (
+                            i32::from(state.pointer_root.0),
+                            i32::from(state.pointer_root.1),
+                        )
                     },
-                    true,
-                    None,
+                    |(x, y)| (x as i32, y as i32),
                 );
+                let relative = fi.detail == 1;
+                let (x, y, dx, dy) = if relative {
+                    let dx = copied_axis(0).unwrap_or(0);
+                    let dy = copied_axis(1).unwrap_or(0);
+                    (
+                        current_x.saturating_add(dx),
+                        current_y.saturating_add(dy),
+                        dx,
+                        dy,
+                    )
+                } else {
+                    (
+                        copied_axis(0).unwrap_or(current_x),
+                        copied_axis(1).unwrap_or(current_y),
+                        0,
+                        0,
+                    )
+                };
+                backend.on_host_input(
+                    state,
+                    HostInputEvent::PointerMotion {
+                        origin,
+                        x,
+                        y,
+                        time: fi.time,
+                        relative,
+                        dx,
+                        dy,
+                        motion_delta: None,
+                        device_axes,
+                    },
+                );
+                backend.resync_input_position();
             }
             _ => unreachable!("XI event type was validated before injection"),
         }
@@ -616,6 +653,7 @@ fn dispatch_fake_input_with_body(
                     dx: 0,
                     dy: 0,
                     motion_delta: None,
+                    device_axes: None,
                 }
             } else {
                 let (x, y) = state.pointer_root;
@@ -629,6 +667,7 @@ fn dispatch_fake_input_with_body(
                     dx,
                     dy,
                     motion_delta: None,
+                    device_axes: None,
                 }
             };
             backend.on_host_input(state, motion);

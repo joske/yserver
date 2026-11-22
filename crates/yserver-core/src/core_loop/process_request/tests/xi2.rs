@@ -2150,6 +2150,7 @@ fn xi_slave_switch_bootstrap_uses_last_pointer_slave_or_master_classes() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let _dropped = pointer_event_fanout_to_state(
         &mut state,

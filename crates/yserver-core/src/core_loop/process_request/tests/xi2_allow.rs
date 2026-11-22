@@ -421,6 +421,7 @@ fn xi_allow_events_replay_device_replays_frozen_button_press_to_target() {
                 raw_dx: 0,
                 raw_dy: 0,
                 tree_change: false,
+                device_axes: None,
             },
         ));
     }
@@ -601,6 +602,7 @@ fn active_grab_owner_events_natural_delivery_to_sibling_window_owned_by_grab_cli
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let xid_map = backend.xid_map().clone();
     let _ = pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, motion, true, false);
@@ -739,6 +741,7 @@ fn xi_allow_events_replay_device_drains_queued_release_after_press() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     {
         let f = state
@@ -978,6 +981,7 @@ fn xi_allow_events_async_device_thaws_freeze_and_replays_queue() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     {
         let f = state
@@ -1262,6 +1266,7 @@ fn out_of_band_pointer_thaw_replays_withheld_release() {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         }),
     });
 
@@ -1383,6 +1388,7 @@ fn compute_freezes_replays_global_queue_in_arrival_order() {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         }),
     });
 
@@ -1506,6 +1512,7 @@ fn frozen_pointer_replay_maps_button_exactly_once() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let _ = crate::core_loop::pointer_fanout::pointer_event_fanout_to_state(
         &mut state,
@@ -1651,6 +1658,7 @@ fn xi_allow_events_sync_device_thaws_and_drains_queue() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     {
         let f = state
@@ -1807,6 +1815,7 @@ fn xi_allow_events_replay_device_releases_active_pointer_grab() {
                 raw_dx: 0,
                 raw_dy: 0,
                 tree_change: false,
+                device_axes: None,
             },
         ));
     }
@@ -1925,6 +1934,7 @@ fn xi_sync_passive_grab_replays_xi2_press_to_target_only_after_allow_events() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let xid_map = backend.xid_map().clone();
     let _dropped =
@@ -2064,6 +2074,7 @@ fn xi_sync_passive_grab_release_during_freeze_queues_for_replay() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let xid_map = backend.xid_map().clone();
     let _dropped =
@@ -2260,6 +2271,7 @@ fn xi_passive_grab_owner_events_redirects_foreign_descendant_press_to_grab_clien
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let xid_map = backend.xid_map().clone();
     let _dropped =
@@ -2426,6 +2438,7 @@ fn xi_active_device_grab_funnels_button_release_to_grab_owner_not_window_under_c
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let xid_map = backend.xid_map().clone();
     let press = HostPointerEvent {
@@ -2562,6 +2575,7 @@ fn core_pointer_grab_does_not_send_xi2_to_grab_owner() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let xid_map = backend.xid_map().clone();
     let _dropped =

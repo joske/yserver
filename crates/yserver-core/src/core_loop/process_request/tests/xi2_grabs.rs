@@ -225,6 +225,7 @@ fn xi_dynamic_pointer_event(
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     }
 }
 
@@ -1015,6 +1016,7 @@ fn xi_dynamic_grabs_slave_pointer_replay_reattaches_and_replays_to_natural_targe
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let _ = pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
 
@@ -1518,6 +1520,7 @@ fn xi_dynamic_grabs_passive_button_is_scoped_to_its_device() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let xid_map = backend.xid_map().clone();
     for kind in [
@@ -1916,6 +1919,7 @@ fn xi_dynamic_grabs_disconnect_reattaches_only_the_owners_slave() {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         },
         true,
         false,
@@ -2286,6 +2290,7 @@ fn xi_replay_device_then_queued_release_follows_implicit_grab() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     {
         let f = state
@@ -2604,6 +2609,7 @@ fn xi_replay_device_press_then_tree_mutation_release_follows_grab() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     {
         let f = state
@@ -2796,6 +2802,7 @@ fn xi_client_grab_device_mid_click_delivers_release_xorg_conn019() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let _ = pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
     let after_press = xge(&read_all_available(&mut app_peer));
@@ -2989,6 +2996,7 @@ fn xi_repeated_grab_dance_clicks_stay_balanced_xorg_conn019() {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
@@ -3201,6 +3209,7 @@ fn xi_grab_device_by_other_client_must_not_steal_held_grab_cinnamon_xtrace() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let _ = pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
     let _ = read_all_available(&mut steam_peer);
@@ -3358,6 +3367,7 @@ fn run_cinnamon_passive_grab_replay(passive_device_id: u16) {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let _ = pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
     let slave_pass = passive_device_id == 0;
@@ -3751,6 +3761,7 @@ fn mate_combo_implicit_grab_attributed_to_app_leaf_xi2() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let _ = pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
     assert_eq!(

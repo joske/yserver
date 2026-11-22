@@ -253,6 +253,7 @@ fn motion_event() -> HostPointerEvent {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     }
 }
 
@@ -2224,6 +2225,7 @@ fn xi2_device_event_stops_at_deepest_selected_window() {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         },
         true,
         false,
@@ -2629,6 +2631,7 @@ fn button_target_locked_at_generation_survives_restack() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
 
     // Precondition: A is on top; the press resolves to A.
@@ -3221,6 +3224,7 @@ fn passive_sync_grab_on_foreign_window_delivers_to_grab_client_and_freezes() {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         },
         true,
         false,
@@ -3377,6 +3381,7 @@ fn passive_sync_grab_reports_activating_press_on_grab_window_not_owned_descendan
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         },
         true,
         false,
@@ -3489,6 +3494,7 @@ fn passive_sync_grab_delivers_activating_press_outside_grab_mask() {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
             origin: crate::core_loop::message::InputOrigin::XTest(4),
         },
         true,
@@ -3595,6 +3601,7 @@ fn passive_grab_activation_emits_notify_grab_leave_on_the_sprite_widget() {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         },
         true,
         false,
@@ -3711,6 +3718,7 @@ fn normal_crossing_leave_delivers_on_left_sibling_not_live_hit() {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         },
         true,
         false,
@@ -3735,6 +3743,7 @@ fn normal_crossing_leave_delivers_on_left_sibling_not_live_hit() {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         },
         true,
         false,
@@ -3988,6 +3997,7 @@ fn active_grab_owner_events_uses_grab_client_filtered_propagation() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let xid_map = backend.xid_map().clone();
     let dropped =
@@ -4129,6 +4139,7 @@ fn active_grab_buttonmotion_mask_suppresses_no_button_motion() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let dropped = pointer_event_fanout_to_state(
         &mut state,
@@ -4167,6 +4178,7 @@ fn active_grab_buttonmotion_mask_suppresses_no_button_motion() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let dropped = pointer_event_fanout_to_state(
         &mut state,
@@ -4207,6 +4219,7 @@ fn active_grab_buttonmotion_mask_suppresses_no_button_motion() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let dropped =
         pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);

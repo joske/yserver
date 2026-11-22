@@ -303,6 +303,7 @@ fn passive_grab_activating_press_skips_owner_events_walk() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let fields = |bytes: &[u8], code: u8| -> Vec<(u32, u32, i16, i16)> {
         bytes

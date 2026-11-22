@@ -34,6 +34,7 @@ mod xi_xtest;
 mod xkb;
 mod xkb_locks;
 mod xkb_repeat_controls;
+mod xtest_device_motion;
 
 use super::{
     CrtcConfigProbeCompletion, CrtcConfigProbeExecutor, CrtcConfigProbeJob, KmsBackend,

@@ -1145,6 +1145,7 @@ fn xi_device_enabled_write_disables_only_requested_facet_and_drops_its_input() {
             dx: 0,
             dy: 0,
             motion_delta: None,
+            device_axes: None,
         },
     );
     Backend::on_host_input(

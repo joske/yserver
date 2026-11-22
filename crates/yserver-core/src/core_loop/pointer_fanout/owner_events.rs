@@ -1,11 +1,9 @@
-//! Grab-owner selection and fallback routing shared by pointer fanout and
-//! XI 1.x direct FakeInput delivery.
+//! Grab-owner selection and fallback routing shared by pointer fanout.
 
 use super::{
-    ClientId, PointerReplay, PointerXiSource, ROOT_WINDOW, ResourceId, ServerState,
-    XI2_MAJOR_OPCODE, XI2_MASTER_POINTER_DEVICE_ID, Xi2PointerForm, clamp_grab_coord,
-    fanout_event_to_clients, x11, xi1_window_selectors, xi2_child_toward,
-    xi2_form_targets_for_source, xi2_route_window_for_source,
+    ClientId, PointerReplay, PointerXiSource, ResourceId, ServerState,
+    XI2_MASTER_POINTER_DEVICE_ID, Xi2PointerForm, clamp_grab_coord, xi1_window_selectors,
+    xi2_child_toward, xi2_form_targets_for_source, xi2_route_window_for_source,
 };
 
 /// One recipient/form decision for smooth-scroll update and stop motions.
@@ -212,80 +210,33 @@ pub(super) fn xi1_selection_filter_for_slave_grab(
     (filter, Some((grab, route)))
 }
 
-pub(super) fn xi2_direct_xtest_motion(
-    state: &mut ServerState,
-    q: &crate::server::Xi1QueuedEvent,
-    grab: crate::server::ActivePointerGrab,
-    route: OwnerEventsRoute,
-) -> Vec<ClientId> {
-    const XI_MOTION: u16 = 6;
+pub(in crate::core_loop) fn xtest_wire_valuators(
+    axes: crate::server::Xi1MotionAxes,
+    completed_position: Option<(i16, i16)>,
+) -> (u8, Vec<i32>) {
     // Xorg's FakeInput path writes explicit values at their global axis
     // index, then copies the range from a zero-based slice (C18;
     // `../xserver/Xext/xtest.c:248-284`,
     // `../xserver/dix/inpututils.c:452-462`). Match the resulting wire
-    // valuators, including its nonzero-first-axis behavior.
-    let motion_valuators = q.axes.map(|axes| {
-        let count = usize::from(axes.count.min(6));
-        let first = usize::from(axes.first);
-        let values = (0..count)
-            .map(|output_offset| {
-                output_offset
+    // valuators, including its nonzero-first-axis behavior. Xorg then writes
+    // the completed pointer position back to present X/Y axes after motion
+    // accumulation and confinement (`../xserver/dix/getevents.c:786,976`,
+    // `../xserver/dix/eventconvert.c:738`).
+    let count = usize::from(axes.count.min(6));
+    let first = usize::from(axes.first);
+    let values = (0..count)
+        .map(
+            |output_offset| match (first + output_offset, completed_position) {
+                (0, Some((x, _))) => i32::from(x),
+                (1, Some((_, y))) => i32::from(y),
+                _ => output_offset
                     .checked_sub(first)
                     .filter(|request_offset| *request_offset < count)
-                    .map_or(0, |request_offset| axes.values[request_offset])
-            })
-            .collect::<Vec<_>>();
-        (axes.first, values)
-    });
-    let (window, child, event_x, event_y) = match route {
-        OwnerEventsRoute::Natural {
-            window,
-            x,
-            y,
-            child,
-            protocol: OwnerProtocol::Xi2,
-        } => (window, child, x, y),
-        OwnerEventsRoute::Fallback if grab.xi2_mask & (1_u64 << XI_MOTION) != 0 => {
-            let (window_x, window_y) = state.resources.window_absolute_position(grab.grab_window);
-            let child = xi2_child_toward(state, grab.grab_window, q.natural_target);
-            (
-                grab.grab_window,
-                child,
-                clamp_grab_coord(q.root_x, window_x),
-                clamp_grab_coord(q.root_y, window_y),
-            )
-        }
-        OwnerEventsRoute::Natural { .. } | OwnerEventsRoute::Fallback => return Vec::new(),
-    };
-    fanout_event_to_clients(
-        state,
-        std::slice::from_ref(&grab.owner),
-        |buf, seq, order| {
-            x11::encode_xi2_device_event(
-                buf,
-                order,
-                seq,
-                XI2_MAJOR_OPCODE,
-                XI_MOTION,
-                q.deviceid,
-                q.time,
-                ROOT_WINDOW,
-                window,
-                child,
-                q.root_x,
-                q.root_y,
-                event_x,
-                event_y,
-                q.state_mask,
-                0,
-                q.deviceid,
-                0,
-                motion_valuators
-                    .as_ref()
-                    .map(|(first, values)| (*first, values.as_slice())),
-            );
-        },
-    )
+                    .map_or(0, |request_offset| axes.values[request_offset]),
+            },
+        )
+        .collect();
+    (axes.first, values)
 }
 
 /// Return the grab attached to this device form. A master grab controls the
