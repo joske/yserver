@@ -296,13 +296,37 @@ pub(super) fn grab_for_form(
     form: Xi2PointerForm,
     replay: Option<PointerReplay>,
 ) -> Option<crate::server::ActivePointerGrab> {
+    let slave_grab = |device_id| {
+        state
+            .xi2_pointer_grabs
+            .get(&device_id)
+            .copied()
+            .or_else(|| {
+                state
+                    .xi1_active_grabs
+                    .get(&device_id)
+                    .filter(|grab| grab.implicit)
+                    .map(|grab| crate::server::ActivePointerGrab {
+                        owner: grab.owner,
+                        grab_window: grab.grab_window,
+                        event_mask: 0,
+                        cursor: ResourceId(0),
+                        time: state.xi1_last_grab_time,
+                        owner_events: grab.owner_events,
+                        via_xi2: false,
+                        implicit: true,
+                        passive: false,
+                        xi2_mask: 0,
+                    })
+            })
+    };
     if let Some(replay) = replay {
         return match (state.xi_devices.role(replay.device), form) {
             (Some(crate::xinput::XiDeviceRole::MasterPointer), Xi2PointerForm::Master) => {
                 state.active_pointer_grab
             }
             (Some(crate::xinput::XiDeviceRole::SlavePointer), Xi2PointerForm::Slave) => {
-                state.xi2_pointer_grabs.get(&replay.device).copied()
+                slave_grab(replay.device)
             }
             _ => None,
         };
@@ -312,9 +336,7 @@ pub(super) fn grab_for_form(
             || source.attached_master == Some(XI2_MASTER_POINTER_DEVICE_ID))
         .then_some(state.active_pointer_grab)
         .flatten(),
-        Xi2PointerForm::Slave => source
-            .slave_deviceid
-            .and_then(|device_id| state.xi2_pointer_grabs.get(&device_id).copied()),
+        Xi2PointerForm::Slave => source.slave_deviceid.and_then(slave_grab),
     }
 }
 

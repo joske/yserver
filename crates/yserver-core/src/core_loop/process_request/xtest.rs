@@ -554,6 +554,7 @@ fn dispatch_fake_input_with_body(
                         replay_floor: None,
                     },
                     true,
+                    None,
                 );
             }
             _ => unreachable!("XI event type was validated before injection"),

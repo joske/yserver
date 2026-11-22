@@ -28,6 +28,8 @@ fn xi1_sync_state_machine_pins() {
             owner_events: false,
             this_mode: 0,
             other_mode: 0,
+            implicit: false,
+            device_mask: 0,
             passive_detail: None,
         },
     );
@@ -4569,7 +4571,7 @@ fn xi2_split_device_wildcards_deliver_button_press_issue_72() {
     // XI_ButtonPress (4) is selected ONLY under XIAllDevices(0). Under
     // the old first-match semantics device 1 matched first and had no
     // button bit -> empty targets -> the click reached no client.
-    let press_targets = compute_xi2_targets_for_source(&state, window, window, 4, Some(4));
+    let press_targets = compute_xi2_targets_for_source(&state, window, window, 4, Some(4), None);
     assert!(
         press_targets.contains(&ClientId(11)),
         "issue #72: XI_ButtonPress selected under XIAllDevices(0) must be \
@@ -4577,7 +4579,7 @@ fn xi2_split_device_wildcards_deliver_button_press_issue_72() {
     );
 
     // XI_ButtonRelease (5) is likewise only under XIAllDevices(0).
-    let release_targets = compute_xi2_targets_for_source(&state, window, window, 5, Some(4));
+    let release_targets = compute_xi2_targets_for_source(&state, window, window, 5, Some(4), None);
     assert!(
         release_targets.contains(&ClientId(11)),
         "issue #72: XI_ButtonRelease under XIAllDevices(0) must be delivered"
@@ -4585,7 +4587,7 @@ fn xi2_split_device_wildcards_deliver_button_press_issue_72() {
 
     // Sanity: XI_Motion (6) — selected under BOTH wildcards — still
     // reaches the client (this arm passed even under first-match).
-    let motion_targets = compute_xi2_targets_for_source(&state, window, window, 6, Some(4));
+    let motion_targets = compute_xi2_targets_for_source(&state, window, window, 6, Some(4), None);
     assert!(
         motion_targets.contains(&ClientId(11)),
         "XI_Motion must continue to be delivered"
@@ -4624,13 +4626,13 @@ fn xi2_pointer_forms_all_devices_selector_gets_both_forms_issue_72() {
     // core issue-#72 fix: it was false under master-only bucketing.
     set_masks(&mut state, &[(1u16, 0x381c_00c0u32), (0u16, 0x19f2u32)]);
     assert_eq!(
-        xi2_pointer_forms_for_source(&state, ClientId(11), win, win, MOTION, Some(4)),
+        xi2_pointer_forms_for_source(&state, ClientId(11), win, win, MOTION, Some(4), None),
         (true, true),
         "issue #72: an XIAllDevices(0) selector must get BOTH forms for \
              Motion so SDL3 can parse smooth scroll off the slave-stamped motion"
     );
     assert_eq!(
-        xi2_pointer_forms_for_source(&state, ClientId(11), win, win, BUTTON_PRESS, Some(4)),
+        xi2_pointer_forms_for_source(&state, ClientId(11), win, win, BUTTON_PRESS, Some(4), None),
         (true, true),
         "ButtonPress selected under XIAllDevices(0) must also yield BOTH forms"
     );
@@ -4639,7 +4641,7 @@ fn xi2_pointer_forms_all_devices_selector_gets_both_forms_issue_72() {
     // covers master devices only, so master form yes, slave form no.
     set_masks(&mut state, &[(1u16, 0x0000_0040u32)]);
     assert_eq!(
-        xi2_pointer_forms_for_source(&state, ClientId(11), win, win, MOTION, Some(4)),
+        xi2_pointer_forms_for_source(&state, ClientId(11), win, win, MOTION, Some(4), None),
         (true, false),
         "XIAllMasterDevices(1) covers master devices only: master form, NO slave form"
     );
@@ -4648,7 +4650,7 @@ fn xi2_pointer_forms_all_devices_selector_gets_both_forms_issue_72() {
     // slave form yes, master form no; preserves core delivery.
     set_masks(&mut state, &[(XI2_XTEST_POINTER_DEVICE_ID, 0x0000_0040u32)]);
     assert_eq!(
-        xi2_pointer_forms_for_source(&state, ClientId(11), win, win, MOTION, Some(4)),
+        xi2_pointer_forms_for_source(&state, ClientId(11), win, win, MOTION, Some(4), None),
         (false, true),
         "a concrete slave-pointer selector gets the slave form only"
     );
@@ -4657,7 +4659,7 @@ fn xi2_pointer_forms_all_devices_selector_gets_both_forms_issue_72() {
     // slave, so both forms.
     set_masks(&mut state, &[(0u16, 0x0000_0040u32)]);
     assert_eq!(
-        xi2_pointer_forms_for_source(&state, ClientId(11), win, win, MOTION, Some(4)),
+        xi2_pointer_forms_for_source(&state, ClientId(11), win, win, MOTION, Some(4), None),
         (true, true),
         "XIAllDevices(0) matches both master and slave: BOTH forms"
     );

@@ -1289,6 +1289,7 @@ fn pointer_event_fanout_to_state_inner(
             top_level_id,
             xi2_evt,
             xi_source.slave_deviceid,
+            None,
         );
         let label_clients = |cs: &[ClientId]| -> String {
             if cs.is_empty() {
@@ -1743,6 +1744,7 @@ fn pointer_event_fanout_to_state_inner(
                     dedup_top_level,
                     xi2_evt,
                     xi_source.slave_deviceid,
+                    None,
                 );
                 // Only the MASTER-pointer XI2 form duplicates the core
                 // event, so shadow core only for those clients (Chromium's
@@ -1926,6 +1928,7 @@ fn pointer_event_fanout_to_state_inner(
     } else {
         None
     };
+    let mut slave_press_delivery = None;
     if let Some(offset) = xi1_offset
         && replay_has_slave_form
         && button_transition.source_accepted
@@ -1937,27 +1940,33 @@ fn pointer_event_fanout_to_state_inner(
         } else {
             event.detail
         };
-        let extras = xi1_route_device_event(
-            state,
-            crate::server::Xi1QueuedEvent {
-                deviceid,
-                evcode,
-                detail,
-                synthetic_repeat: false,
-                time: event.time,
-                root_x: event.root_x,
-                root_y: event.root_y,
-                state_mask: event.state,
-                natural_target: target,
-                // Pointer devices have no focus class — always the
-                // plain selection walk (Xorg ProcessOtherEvent only
-                // routes keyboard events through DeliverFocusedEvent).
-                focus_route: crate::server::Xi1FocusRoute::Walk,
-                axes: None,
-                replay_floor: None,
-            },
-            true,
-        );
+        let q = crate::server::Xi1QueuedEvent {
+            deviceid,
+            evcode,
+            detail,
+            synthetic_repeat: false,
+            time: event.time,
+            root_x: event.root_x,
+            root_y: event.root_y,
+            state_mask: event.state,
+            natural_target: target,
+            // Pointer devices have no focus class — always the
+            // plain selection walk (Xorg ProcessOtherEvent only
+            // routes keyboard events through DeliverFocusedEvent).
+            focus_route: crate::server::Xi1FocusRoute::Walk,
+            axes: None,
+            replay_floor: None,
+        };
+        if event.kind == PointerEventKind::ButtonPress
+            && state.xi_devices.role(deviceid) == Some(crate::xinput::XiDeviceRole::SlavePointer)
+            && !state.xi1_active_grabs.contains_key(&deviceid)
+            && !state.xi2_pointer_grabs.contains_key(&deviceid)
+        {
+            slave_press_delivery = Some(resolve_slave_press_delivery(
+                state, target, deviceid, q.evcode,
+            ));
+        }
+        let extras = xi1_route_device_event(state, q, true, slave_press_delivery.as_ref());
         merge_dropped(&mut dropped, extras);
     }
 
@@ -2018,6 +2027,7 @@ fn pointer_event_fanout_to_state_inner(
             top_level_id,
             xi2_evtype,
             xi_source.slave_deviceid,
+            slave_press_delivery.as_ref(),
         )
     };
     let (xi2_raw_slave_targets, xi2_raw_master_targets) = xi2_raw_evtype
@@ -2397,6 +2407,7 @@ fn pointer_event_fanout_to_state_inner(
             top_level_id,
             xi2_evtype,
             xi_source.slave_deviceid,
+            slave_press_delivery.as_ref(),
         );
         // An exact slave grab uses the grab's XI2 mask and device identity
         // for grab delivery. There need not be a separate XISelectEvents
@@ -2537,14 +2548,33 @@ fn pointer_event_fanout_to_state_inner(
                 None
             };
             let (ev_win, ev_child, ev_x, ev_y) = fixed_geometry.unwrap_or_else(|| {
-                let win = xi2_route_window_for_source(
-                    state,
-                    target,
-                    form,
-                    xi2_evtype,
-                    xi_source.slave_deviceid,
-                )
-                .unwrap_or(target);
+                let win = if form == Xi2PointerForm::Slave {
+                    match slave_press_delivery.as_ref() {
+                        Some(SlavePressDelivery::Xi2 { window, recipients })
+                            if recipients.contains(cid) =>
+                        {
+                            *window
+                        }
+                        Some(_) => target,
+                        None => xi2_route_window_for_source(
+                            state,
+                            target,
+                            form,
+                            xi2_evtype,
+                            xi_source.slave_deviceid,
+                        )
+                        .unwrap_or(target),
+                    }
+                } else {
+                    xi2_route_window_for_source(
+                        state,
+                        target,
+                        form,
+                        xi2_evtype,
+                        xi_source.slave_deviceid,
+                    )
+                    .unwrap_or(target)
+                };
                 if win == nested_id {
                     (nested_id, ResourceId(0), event_x, event_y)
                 } else {
@@ -2697,14 +2727,11 @@ fn implicit_pointer_grab_lifecycle(
                 };
                 if state.active_pointer_grab.is_none()
                     && !source_has_non_implicit_xi2_grab
-                    && !state
-                        .xi1_active_grabs
-                        .contains_key(&crate::xinput::DEVICEID_XTEST_POINTER)
                     && let Some(press) = info.delivered_master_press(&state.resources)
                 {
                     // Master implicit grabs come only from core and XI2
-                    // master-form deliveries. A slave-form delivery is
-                    // activated independently below.
+                    // master-form deliveries. An XI1 grab keyed by the
+                    // source slave occupies its own per-device slot.
                     state.set_pointer_grab(crate::server::ActivePointerGrab {
                         owner: press.owner,
                         grab_window: press.window,
@@ -2870,16 +2897,35 @@ pub fn emit_scroll_stop_to_state(
     }
 }
 
+/// Resolved natural delivery for one attached slave ButtonPress. Xorg's
+/// DeliverDeviceEvents checks XI2 and then XI1 at each window, stopping at
+/// the first protocol/window with recipients; the press delivery and XI1
+/// implicit-grab activation both consume this result.
+#[derive(Debug)]
+pub(crate) enum SlavePressDelivery {
+    Xi2 {
+        window: ResourceId,
+        recipients: Vec<ClientId>,
+    },
+    Xi1 {
+        window: ResourceId,
+        recipients: Vec<ClientId>,
+    },
+    None,
+}
+
 /// Route one XI 1.x device input event through grab, freeze, and selection
 /// semantics. Pointer and key fanouts and the AllowDeviceEvents thaw path
 /// share this entry point. Synchronous grabs re-freeze after each key/button
-/// event, passive grabs auto-release on their matching release, and ordinary
-/// DeviceButtonPress selections do not create an implicit grab (XTS
-/// XSelectExtensionEvent-5).
+/// event, passive grabs auto-release on their matching release, and a delivered
+/// DeviceButtonPress selection creates an implicit grab (Xorg
+/// `ActivateImplicitGrab`, `../xserver/dix/events.c:2152-2196`; MPX
+/// `a511c445d` postdates XTS XSelectExtensionEvent assertion 5).
 pub(crate) fn xi1_route_device_event(
     state: &mut ServerState,
     q: crate::server::Xi1QueuedEvent,
     allow_freeze: bool,
+    slave_press_delivery: Option<&SlavePressDelivery>,
 ) -> Vec<ClientId> {
     use crate::xinput::{
         XI_DEVICE_BUTTON_PRESS_OFFSET, XI_DEVICE_BUTTON_RELEASE_OFFSET, XI_DEVICE_KEY_PRESS_OFFSET,
@@ -2891,6 +2937,8 @@ pub(crate) fn xi1_route_device_event(
         || q.evcode == first + XI_DEVICE_BUTTON_PRESS_OFFSET;
     let is_release = q.evcode == first + XI_DEVICE_KEY_RELEASE_OFFSET
         || q.evcode == first + XI_DEVICE_BUTTON_RELEASE_OFFSET;
+    let is_button_press = q.evcode == first + XI_DEVICE_BUTTON_PRESS_OFFSET;
+    let is_button_release = q.evcode == first + XI_DEVICE_BUTTON_RELEASE_OFFSET;
 
     // 1. Frozen → queue (Xorg FreezeThaw switching processInputProc
     // to the enqueue proc: NOTHING is delivered while frozen, not
@@ -2972,7 +3020,12 @@ pub(crate) fn xi1_route_device_event(
             event_window.0,
             q.detail,
         );
-        let dropped = xi1_fan_device_event(state, &targets, event_window, &q);
+        let deliver = !grab.implicit || grab.device_mask & xi1_event_mask_bit(q.evcode) != 0;
+        let dropped = if deliver {
+            xi1_fan_device_event(state, &targets, event_window, &q)
+        } else {
+            Vec::new()
+        };
         // Sync-state transition on a delivered key/button event (Xorg
         // FreezeThisEventIfNeededForSyncGrab) — the FreezeNextEvent /
         // FreezeBothNextEvent armed states trip to FrozenWithEvent
@@ -2981,7 +3034,13 @@ pub(crate) fn xi1_route_device_event(
         if allow_freeze && (is_press || is_release) {
             xi1_freeze_this_event_if_needed(state, q.deviceid, grab.owner, &q);
         }
-        if is_release && grab.passive_detail == Some(q.detail) {
+        let implicit_grab_ended = grab.implicit
+            && is_button_release
+            && state
+                .xi1_device_input_state
+                .get(&q.deviceid)
+                .is_none_or(|device| device.buttons_down.iter().all(|byte| *byte == 0));
+        if (is_release && grab.passive_detail == Some(q.detail)) || implicit_grab_ended {
             xi1_deactivate_device_grab(state, q.deviceid);
         }
         return dropped;
@@ -3014,6 +3073,8 @@ pub(crate) fn xi1_route_device_event(
                     owner_events: g.owner_events,
                     this_mode: g.this_mode,
                     other_mode: g.other_mode,
+                    implicit: false,
+                    device_mask: 0,
                     passive_detail: Some(q.detail),
                 },
             );
@@ -3061,15 +3122,33 @@ pub(crate) fn xi1_route_device_event(
             xi2_direct_xtest_motion(state, &q, grab, route),
         );
     }
-    let hit = match selection_filter {
-        Xi1SelectionFilter::Suppress => None,
-        Xi1SelectionFilter::Unrestricted => compute_xi1_route_targets(state, &q),
-        Xi1SelectionFilter::Client(client) => {
-            compute_xi1_route_targets(state, &q).and_then(|(targets, window)| {
-                targets.contains(&client).then_some((vec![client], window))
-            })
+    let hit = if is_button_press
+        && let Some(delivery) = slave_press_delivery
+        && matches!(selection_filter, Xi1SelectionFilter::Unrestricted)
+    {
+        match delivery {
+            SlavePressDelivery::Xi1 { window, recipients } => Some((recipients.clone(), *window)),
+            SlavePressDelivery::Xi2 { .. } | SlavePressDelivery::None => None,
+        }
+    } else {
+        match selection_filter {
+            Xi1SelectionFilter::Suppress => None,
+            Xi1SelectionFilter::Unrestricted => compute_xi1_route_targets(state, &q),
+            Xi1SelectionFilter::Client(client) => {
+                compute_xi1_route_targets(state, &q).and_then(|(targets, window)| {
+                    targets.contains(&client).then_some((vec![client], window))
+                })
+            }
         }
     };
+    let xi1_implicit_press = is_button_press
+        && !state.xi1_active_grabs.contains_key(&q.deviceid)
+        && !state.xi2_pointer_grabs.contains_key(&q.deviceid)
+        && match slave_press_delivery {
+            Some(SlavePressDelivery::Xi1 { recipients, .. }) => !recipients.is_empty(),
+            Some(SlavePressDelivery::Xi2 { .. } | SlavePressDelivery::None) => false,
+            None => matches!(selection_filter, Xi1SelectionFilter::Unrestricted) && hit.is_some(),
+        };
     log::debug!(
         "xi1_route: evcode={} target=0x{:x} route={:?} hit={:?}",
         q.evcode,
@@ -3078,11 +3157,31 @@ pub(crate) fn xi1_route_device_event(
         hit.as_ref()
             .map(|(t, w)| (t.iter().map(|c| c.0).collect::<Vec<_>>(), w.0)),
     );
-    let xi1_dropped = match hit {
-        Some((targets, w)) => xi1_fan_device_event(state, &targets, w, &q),
-        None => Vec::new(),
-    };
+    let xi1_dropped = hit.as_ref().map_or_else(Vec::new, |(targets, w)| {
+        xi1_fan_device_event(state, targets, *w, &q)
+    });
     merge_dropped(&mut dropped, xi1_dropped);
+    if xi1_implicit_press
+        && let Some((targets, grab_window)) = hit.as_ref()
+        && let Some(owner) = targets.first().copied()
+    {
+        let device_mask = xi1_device_mask_on_window(state, *grab_window, q.deviceid);
+        state.xi1_active_grabs.insert(
+            q.deviceid,
+            crate::server::Xi1ActiveGrab {
+                owner,
+                deviceid: q.deviceid,
+                grab_window: *grab_window,
+                owner_events: false,
+                this_mode: 1,
+                other_mode: 1,
+                implicit: true,
+                device_mask,
+                passive_detail: None,
+            },
+        );
+        state.xi1_last_grab_time = q.time;
+    }
     // A BRIDGED core grab (no XI1 grab, but the core pointer/keyboard
     // grab controls this device) must still trip an armed
     // FreezeNextEvent / FreezeBothNextEvent on key/button events —
@@ -3123,6 +3222,47 @@ fn compute_xi1_route_targets(
     }
 }
 
+fn resolve_slave_press_delivery(
+    state: &ServerState,
+    target: ResourceId,
+    deviceid: u16,
+    xi1_evcode: u8,
+) -> SlavePressDelivery {
+    let mut window = target;
+    for _ in 0..256 {
+        let xi2_recipients = xi2_form_targets_for_source(
+            state,
+            window,
+            Xi2PointerForm::Slave,
+            xi2_evtype(PointerEventKind::ButtonPress),
+            Some(deviceid),
+        );
+        if !xi2_recipients.is_empty() {
+            return SlavePressDelivery::Xi2 {
+                window,
+                recipients: xi2_recipients,
+            };
+        }
+
+        let xi1_recipients = xi1_window_selectors(state, window, xi1_evcode, deviceid);
+        if !xi1_recipients.is_empty() {
+            return SlavePressDelivery::Xi1 {
+                window,
+                recipients: xi1_recipients,
+            };
+        }
+
+        if window == ROOT_WINDOW {
+            break;
+        }
+        let Some(parent) = state.resources.parent_of(window) else {
+            break;
+        };
+        window = parent;
+    }
+    SlavePressDelivery::None
+}
+
 /// Clients that selected `(deviceid << 8) | evcode` on exactly `window`.
 fn xi1_window_selectors(
     state: &ServerState,
@@ -3141,6 +3281,27 @@ fn xi1_window_selectors(
         })
         .map(|(id, _)| ClientId(*id))
         .collect()
+}
+
+fn xi1_event_mask_bit(event_type: u8) -> u32 {
+    let Some(offset) = event_type.checked_sub(crate::server::XI_FIRST_EVENT) else {
+        return 0;
+    };
+    if offset < 32 { 1_u32 << offset } else { 0 }
+}
+
+fn xi1_device_mask_on_window(state: &ServerState, window: ResourceId, deviceid: u16) -> u32 {
+    state
+        .clients
+        .values()
+        .filter_map(|client| client.xi1_window_event_classes.get(&window))
+        .flatten()
+        .filter(|class| **class >> 8 == u32::from(deviceid))
+        .fold(0, |mask, class| {
+            mask | xi1_event_mask_bit(
+                u8::try_from(*class & 0xff).expect("XI1 event code fits one byte"),
+            )
+        })
 }
 
 /// True when `grab_window` is `target` or one of its ancestors.
@@ -3335,7 +3496,7 @@ pub(crate) fn xi1_compute_freezes(
                 );
             }
             crate::server::QueuedInputEvent::Xi1Routed(event) => {
-                let _ = xi1_route_device_event(state, event, true);
+                let _ = xi1_route_device_event(state, event, true, None);
             }
             crate::server::QueuedInputEvent::RawKey(event) => {
                 let _ = crate::core_loop::key_fanout::deliver_raw_key_master(state, event);
@@ -3490,9 +3651,10 @@ pub(crate) fn xi1_freeze_this_event_if_needed(
 }
 
 /// Deactivate the active XI1 grab on `deviceid` (UngrabDevice, passive
-/// release auto-end, disconnect teardown): reset its sync state,
-/// release the paired device if it was held on this grab's behalf, and
-/// flush (Xorg DeactivateKeyboard/PointerGrab tail).
+/// release auto-end, disconnect teardown): reset its sync state and
+/// release a paired-device hold owned by this grab (Xorg
+/// DeactivateKeyboard/PointerGrab clears only `sync.other` references to
+/// the departing grab, `../xserver/dix/events.c:1698-1700,1799-1801`).
 pub(crate) fn xi1_deactivate_device_grab(state: &mut ServerState, deviceid: u16) {
     let Some(grab) = state.xi1_active_grabs.remove(&deviceid) else {
         return;
@@ -3501,7 +3663,12 @@ pub(crate) fn xi1_deactivate_device_grab(state: &mut ServerState, deviceid: u16)
         sync.state = crate::server::Xi1SyncState::Thawed;
         sync.stored = None;
     }
-    let other_dev = xi1_other_input_device(state, deviceid);
+    // DeviceButtonPress implicit grabs are created on slave devices with
+    // asynchronous paired-device mode. They never own a paired hold, so
+    // an `other` hold from another same-client master grab must survive.
+    let other_dev = (!grab.implicit)
+        .then(|| xi1_other_input_device(state, deviceid))
+        .flatten();
     if let Some(other) = other_dev.and_then(|id| state.xi1_frozen.get_mut(&id))
         && other.other == Some(grab.owner)
     {
@@ -3804,6 +3971,7 @@ fn fanout_core_pointer_event_ordered(
                     top_level,
                     xi2_evtype(event.kind),
                     Some(slave_deviceid),
+                    None,
                 )
                 .1
             });
@@ -4289,6 +4457,7 @@ fn compute_xi2_targets_for_source(
     _top_level_id: yserver_protocol::x11::ResourceId,
     xi2_evtype: u16,
     slave_deviceid: Option<u16>,
+    slave_press_delivery: Option<&SlavePressDelivery>,
 ) -> Vec<ClientId> {
     let mut xi2_targets: Vec<ClientId> = Vec::new();
     if xi2_evtype == 0 {
@@ -4300,11 +4469,46 @@ fn compute_xi2_targets_for_source(
         [None, Some(Xi2PointerForm::Master)]
     };
     for form in forms.into_iter().flatten() {
-        if let Some(window) =
-            xi2_route_window_for_source(state, target, form, xi2_evtype, slave_deviceid)
-        {
-            for cid in xi2_form_targets_for_source(state, window, form, xi2_evtype, slave_deviceid)
-            {
+        let route = if form == Xi2PointerForm::Slave {
+            match slave_press_delivery {
+                Some(SlavePressDelivery::Xi2 { window, recipients }) => {
+                    Some((*window, recipients.clone()))
+                }
+                Some(SlavePressDelivery::Xi1 { .. } | SlavePressDelivery::None) => None,
+                None => {
+                    xi2_route_window_for_source(state, target, form, xi2_evtype, slave_deviceid)
+                        .map(|window| {
+                            (
+                                window,
+                                xi2_form_targets_for_source(
+                                    state,
+                                    window,
+                                    form,
+                                    xi2_evtype,
+                                    slave_deviceid,
+                                ),
+                            )
+                        })
+                }
+            }
+        } else {
+            xi2_route_window_for_source(state, target, form, xi2_evtype, slave_deviceid).map(
+                |window| {
+                    (
+                        window,
+                        xi2_form_targets_for_source(
+                            state,
+                            window,
+                            form,
+                            xi2_evtype,
+                            slave_deviceid,
+                        ),
+                    )
+                },
+            )
+        };
+        if let Some((_window, recipients)) = route {
+            for cid in recipients {
                 if !xi2_targets.contains(&cid) {
                     xi2_targets.push(cid);
                 }
@@ -4427,6 +4631,7 @@ fn xi2_pointer_forms_for_source(
     _top_level: ResourceId,
     evtype: u16,
     slave_deviceid: Option<u16>,
+    slave_press_delivery: Option<&SlavePressDelivery>,
 ) -> (bool, bool) {
     let Some(client) = state.clients.get(&cid.0) else {
         return (false, false);
@@ -4447,24 +4652,28 @@ fn xi2_pointer_forms_for_source(
             slave_deviceid,
         )
     });
-    let slave = slave_deviceid.is_some_and(|device_id| {
-        xi2_route_window_for_source(
-            state,
-            target,
-            Xi2PointerForm::Slave,
-            evtype,
-            Some(device_id),
-        )
-        .is_some_and(|window| {
-            xi2_form_selected_on_for_source(
-                client,
-                window,
+    let slave = match slave_press_delivery {
+        Some(SlavePressDelivery::Xi2 { recipients, .. }) => recipients.contains(&cid),
+        Some(SlavePressDelivery::Xi1 { .. } | SlavePressDelivery::None) => false,
+        None => slave_deviceid.is_some_and(|device_id| {
+            xi2_route_window_for_source(
+                state,
+                target,
                 Xi2PointerForm::Slave,
                 evtype,
                 Some(device_id),
             )
-        })
-    });
+            .is_some_and(|window| {
+                xi2_form_selected_on_for_source(
+                    client,
+                    window,
+                    Xi2PointerForm::Slave,
+                    evtype,
+                    Some(device_id),
+                )
+            })
+        }),
+    };
     (master, slave)
 }
 

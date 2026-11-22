@@ -420,6 +420,10 @@ pub struct Xi1ActiveGrab {
     pub owner_events: bool,
     pub this_mode: u8,
     pub other_mode: u8,
+    /// True when a DeviceButtonPress selection created the grab implicitly.
+    pub implicit: bool,
+    /// Union of the grab window's XI1 event classes at implicit activation.
+    pub device_mask: u32,
     /// Some(detail) when activated from a passive key/button grab —
     /// auto-released when that detail is released.
     pub passive_detail: Option<u8>,

@@ -4027,6 +4027,8 @@ fn xi1_grab_holding_the_paired_keyboard(win: u32) -> (ServerState, RecordingBack
             owner_events: false,
             this_mode: 1,
             other_mode: 0,
+            implicit: false,
+            device_mask: 0,
             passive_detail: None,
         },
     );

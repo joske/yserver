@@ -180,10 +180,11 @@ pub(super) fn handle_xi_grab_device(
             )
         } else {
             u8::from(
-                state
-                    .xi2_pointer_grabs
-                    .get(&deviceid)
-                    .is_some_and(|grab| grab.owner != client_id),
+                state.xi1_active_grabs.contains_key(&deviceid)
+                    || state
+                        .xi2_pointer_grabs
+                        .get(&deviceid)
+                        .is_some_and(|grab| grab.owner != client_id),
             )
         };
         if grab_status == 0 {
@@ -1170,6 +1171,8 @@ pub(super) fn handle_xi1_grab_device(
                     owner_events: owner_events != 0,
                     this_mode,
                     other_mode,
+                    implicit: false,
+                    device_mask: 0,
                     passive_detail: None,
                 },
             );
@@ -1938,7 +1941,7 @@ pub(super) fn handle_xi1_allow_device_events(
                         match stored {
                             crate::server::QueuedInputEvent::Xi1Routed(mut q) => {
                                 q.replay_floor = replay_floor;
-                                let _ = xi1_route_device_event(state, q, true);
+                                let _ = xi1_route_device_event(state, q, true, None);
                             }
                             crate::server::QueuedInputEvent::HostPointer(event) => {
                                 let xid_map = backend.xid_map().clone();
