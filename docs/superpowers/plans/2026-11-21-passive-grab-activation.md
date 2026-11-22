@@ -417,6 +417,25 @@ Spec invariant 7. Cases X1, X2 and X3. C16, C17 and C18 keep their measured payl
 
 - [ ] **Step 6: Commit** `fix(xtest): DeviceMotionNotify moves the sprite through the pointer motion path (C18, X1-X3)`.
 
+### Task 5b: Per-device pointer freeze (spec invariant 8, added 2026-11-22)
+
+Implementer: Sonnet (codex out of quota), coordinator review; sol re-review when codex is back.
+
+**Files:** `crates/yserver-core/src/core_loop/pointer_fanout.rs` (the queue-while-frozen gate ~1018-1036 and ~1186-1210, the thaw path that replays `sync_pending` HostPointer entries), `crates/yserver-core/src/server.rs` (`PendingSyncEvent` / `QueuedInputEvent` only if a master-only marker is needed). Tests: `crates/yserver/src/kms/render/backend/tests/xtest_device_motion.rs` (XTS reproductions) and `crates/yserver-core/src/core_loop/pointer_fanout/tests/passive_grab_activation.rs` (physical-source case).
+
+**Interfaces:** reuse Task 3's device restriction (`PointerReplay`-style "only this device's forms") for the queued master part; no second fanout.
+
+- [ ] **Step 1: Tests (fail on HEAD 678e4136):**
+  - `xts_ade3_double_grab_async_this_device_thaws` — XTS TP3: client selects XI1 DeviceMotionNotify/Press/Release for device 4 on W, pointer at W(1,1); core GrabPointer (sync, sync) and GrabKeyboard (sync, sync) on W; AllowDeviceEvents(device 4, AsyncThisDevice); XTestFakeInput DeviceMotion (absolute, 1 axis, value 0) → the client receives DeviceMotionNotify. Ungrab; end state.
+  - `xts_ade4_not_frozen_async_this_device` (TP4), `xts_ade6_sync_this_device_no_freeze` (TP6), `xts_ade9_replay_this_device_not_frozen` (TP9): each scenario as its XTS purpose (`/home/ariel_santangelo/Projects/claude-scratch/xts/xts5/XI/AllowDeviceEvents.m`) → DeviceMotionNotify delivered; end state.
+  - `master_frozen_slave_xi2_form_delivered_master_form_queued` (physical source): A core sync GrabPointer on W (master frozen); B selects XI2 slave Motion on W; physical motion → B gets the slave XI_Motion now; A gets nothing; A AllowEvents AsyncPointer → A's master/core motion delivered then, exactly once; B gets no duplicate. End state.
+  - `slave_frozen_queues_whole_event` (GUARD): XIGrabDevice sync on slave 4 → motion queued entirely as today.
+- [ ] **Step 2:** red run on HEAD (assertion failures).
+- [ ] **Step 3:** implement spec invariant 8.
+- [ ] **Step 4:** green + gate (fmt, clippy, yserver-core pointer_fanout/grab/xi2_grabs/xi1/xtest/record, yserver kms::render::backend::tests, check-layout; rule F ×5 under load).
+- [ ] **Step 5: Mutations:** (a) queue the whole event when the master is frozen again → the four XTS tests and `master_frozen_slave_...` fail; (b) replay the slave forms again at master thaw → `master_frozen_slave_...` fails on the duplicate.
+- [ ] **Step 6:** coordinator re-runs XTS XI/Xlib13 A/B (AllowDeviceEvents back to Xvfb) and the xfwm4/marco hardware scenes.
+
 ### Task 6: Oracle, docs and status (coordinator)
 
 The coordinator does this task, not codex.

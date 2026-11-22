@@ -1,6 +1,6 @@
 # Passive grab activation and replay (C19), XI1 implicit grabs, XTest device motion
 
-Status: revision 5, sol r4 APPROVED; awaiting the user's approval (sol r3: F1 XI1 mask snapshot, F2 one grab per device / master independence). Revision 4: the user folded the XI1 implicit grabs (I5) and the XTest device-motion sprite (C18) into this PR; revision 3 (C19/passive part) was APPROVED by sol r2 (sol review r1: F1 P4b diagnosis corrected and P4c added, F2 master-state invariant 3a, F3 C15 exception). Stacked on PR #374 (`feat/per-device-implicit-grabs`, `af690cdf`, rebased on master with #376; the measurements were taken on its pre-rebase tree `d479e443`, and #376 changed only GLX).
+Status: revision 6 (invariant 8 per-device freeze, the user's decision 2026-11-22); revision 5 was sol r4 APPROVED and approved by the user (sol r3: F1 XI1 mask snapshot, F2 one grab per device / master independence). Revision 4: the user folded the XI1 implicit grabs (I5) and the XTest device-motion sprite (C18) into this PR; revision 3 (C19/passive part) was APPROVED by sol r2 (sol review r1: F1 P4b diagnosis corrected and P4c added, F2 master-state invariant 3a, F3 C15 exception). Stacked on PR #374 (`feat/per-device-implicit-grabs`, `af690cdf`, rebased on master with #376; the measurements were taken on its pre-rebase tree `d479e443`, and #376 changed only GLX).
 Measurements: `docs/superpowers/findings/2026-11-21-passive-grab-activation-measurements.md` (cases P1-P5, P4b and P4c, then I5 and X1-X3; one fresh server per case).
 
 ## Intent
@@ -75,7 +75,12 @@ Invariants:
    - It reuses the path the core FakeInput MotionNotify already takes (`process_request/xtest.rs` ~600-635, `HostInputEvent::PointerMotion`), not a new one.
    - An axis the request leaves out keeps its current value. The axes it carries take the values Xorg's valuator copy produces, so X3 moves the sprite to y=0 (the user chose Xorg here).
    - The XI1 DeviceMotionNotify and XI2 valuator payload stay as #373 measured them (C16-C18 match).
-8. **Unchanged:** the crossing chain on activation (NotifyGrab), sync freeze and keyboard hold (`xi1_check_grab_for_syncs`), confine-to, detach and reattach of slave grabs, AllowEvents modes other than replay, and release-time deactivation.
+8. **Per-device freeze (revision 6, the user's decision 2026-11-22 after the coordinator's XTS A/B).** Routing XTest device motion through the pointer path (invariant 7) exposed a pre-existing divergence: the pointer fanout queues the whole event when either the slave or its master is frozen (`pointer_fanout.rs` ~1022-1036, ~1188-1210), so a master frozen by a synchronous core grab also withholds the slave's XI2/XI1 forms. Xorg freezes per device: the slave pass runs first and is delivered unless the slave itself is frozen; only the master's event is enqueued while the master is frozen (`../xserver/mi/mieq.c:502-508`, `../xserver/dix/events.c` `FreezeThaw`/`ComputeFreezes`). XTS `XAllowDeviceEvents` purposes 3, 4, 6, 9, 10, 12, 13, 15 and 17 pass on Xvfb 21.1.24 and master and fail on the branch for this reason. Rule:
+   - slave frozen: the event is queued as today (the master pass happens only when the slave's event is processed);
+   - slave not frozen, master frozen: the slave's forms (XI2 slave, XI1) and the slave's state are processed and delivered now; only the master's forms (XI2 master, core) and the master's state are queued for the master, and when the master thaws they are processed for the master only, without repeating the slave forms (the device restriction of invariant 4 is the reuse candidate);
+   - neither frozen: unchanged.
+   This applies to physical and XTest input alike. Clients that select slave events now receive them while the master is frozen, as on Xorg.
+9. **Unchanged:** the crossing chain on activation (NotifyGrab), keyboard hold (`xi1_check_grab_for_syncs`), confine-to, detach and reattach of slave grabs, AllowEvents modes other than replay, and release-time deactivation.
 
 ## Goals
 
