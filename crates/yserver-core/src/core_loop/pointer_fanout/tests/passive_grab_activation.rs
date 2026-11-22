@@ -20,6 +20,7 @@ const CLIENT_C: u32 = 0xA756;
 const W: u32 = 0x0010_A753;
 const D: u32 = 0x0020_A753;
 const OUT: u32 = 0x0010_A754;
+const TP14_WIN: u32 = 0x0010_A757;
 const HOST_W: u32 = 0xCAFE_A753;
 const HOST_OUT: u32 = 0xCAFE_A754;
 const XI2_OPCODE: u8 = 137;
@@ -1386,4 +1387,1101 @@ fn master_xi2_passive_grab_activates_on_replay_after_detach() {
     assert!(read_packets(&mut f.client_a).is_empty());
     assert!(read_all_capture_available(&mut client_c).is_empty());
     assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD, XI_XTEST]);
+}
+
+/// Core GrabPointer through `process_request`, synchronous pointer mode,
+/// asynchronous keyboard mode, core PointerMotion in the grab mask.
+fn grab_core_pointer_sync(f: &mut Fixture, client: u32, window: u32) {
+    let mut body = Vec::with_capacity(20);
+    body.extend_from_slice(&window.to_le_bytes());
+    body.extend_from_slice(&(1u16 << 6).to_le_bytes()); // PointerMotion
+    body.extend_from_slice(&[0, 1]); // sync pointer, async keyboard
+    body.extend_from_slice(&0u32.to_le_bytes()); // no confinement
+    body.extend_from_slice(&0u32.to_le_bytes()); // no cursor
+    body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    dispatch(f, client, 26, 0, &body); // GrabPointer
+    assert!(
+        f.state.active_pointer_grab.is_some_and(|grab| {
+            grab.owner == ClientId(client)
+                && grab.grab_window == ResourceId(window)
+                && !grab.implicit
+                && !grab.passive
+                && !grab.via_xi2
+        }),
+        "GrabPointer must install A's explicit core grab"
+    );
+}
+
+fn ungrab_core_pointer_request(f: &mut Fixture, client: u32) {
+    dispatch(f, client, 27, 0, &0u32.to_le_bytes()); // UngrabPointer
+}
+
+fn grab_xi2_slave_sync(f: &mut Fixture, client: u32, window: u32, device: u16, mask: u32) {
+    let mut body = Vec::with_capacity(24);
+    body.extend_from_slice(&window.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    body.extend_from_slice(&0u32.to_le_bytes()); // no cursor
+    body.extend_from_slice(&device.to_le_bytes());
+    body.extend_from_slice(&[0, 1, 0, 0]); // sync device, async paired, owner_events=false
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&mask.to_le_bytes());
+    dispatch(f, client, XI2_OPCODE, 51, &body); // XIGrabDevice
+    assert!(
+        f.state
+            .xi2_pointer_grabs
+            .get(&device)
+            .is_some_and(|grab| grab.owner == ClientId(client)),
+        "XIGrabDevice must install the slave grab"
+    );
+}
+
+/// Spec invariant 8 (`../xserver/mi/mieq.c:502-508`, `dix/events.c`
+/// `ComputeFreezes`): a frozen master withholds only the master's forms.
+/// The slave's XI2 form is delivered at once; the master's core form is
+/// queued and delivered once, at thaw, without repeating the slave form.
+#[test]
+fn master_frozen_slave_xi2_form_delivered_master_form_queued() {
+    let mut f = p_fixture();
+    let source = crate::xinput::InputSourceId(0xABCD);
+    let device = super::pointer_source(&mut f.state, source.0, true);
+    let origin = InputOrigin::Physical(source);
+    select_xi2(&mut f, CLIENT_B, W, device, XI_MOTION);
+    send(&mut f, origin, PointerEventKind::MotionNotify, 0, 150, 150);
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+
+    grab_core_pointer_sync(&mut f, CLIENT_A, W);
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+    assert!(
+        f.state
+            .xi1_frozen
+            .get(&XI_MASTER)
+            .is_some_and(crate::server::Xi1Freeze::frozen),
+        "the synchronous core grab freezes the master pointer"
+    );
+
+    send(&mut f, origin, PointerEventKind::MotionNotify, 0, 155, 155);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(6, device, device, W)],
+        "the slave's XI2 form is delivered while only the master is frozen"
+    );
+    assert!(
+        read_packets(&mut f.client_a).is_empty(),
+        "the master's core form stays queued"
+    );
+
+    allow_events_core(&mut f, CLIENT_A, 0); // AsyncPointer
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![core(6, W)],
+        "the master's core form is delivered at thaw"
+    );
+    assert!(
+        read_packets(&mut f.client_b).is_empty(),
+        "thaw does not repeat the slave form"
+    );
+    assert!(f.state.sync_pending.is_empty(), "the queue is drained");
+    ungrab_core_pointer_request(&mut f, CLIENT_A);
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(read_packets(&mut f.client_b).is_empty());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
+/// GUARD: when the slave itself is frozen, the whole event stays queued
+/// (spec invariant 8, first rule; the master pass runs when the slave's
+/// event is processed).
+#[test]
+fn slave_frozen_queues_whole_event() {
+    let mut f = p_fixture();
+    select_xi2(&mut f, CLIENT_B, W, XI_XTEST, XI_MOTION);
+    send(
+        &mut f,
+        InputOrigin::XTest(XI_XTEST),
+        PointerEventKind::MotionNotify,
+        0,
+        150,
+        150,
+    );
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+
+    grab_xi2_slave_sync(&mut f, CLIENT_A, W, XI_XTEST, XI_MOTION);
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+    send(
+        &mut f,
+        InputOrigin::XTest(XI_XTEST),
+        PointerEventKind::MotionNotify,
+        0,
+        155,
+        155,
+    );
+    assert!(read_packets(&mut f.client_a).is_empty(), "queued entirely");
+    assert!(read_packets(&mut f.client_b).is_empty(), "queued entirely");
+    assert_eq!(f.state.sync_pending.len(), 1);
+
+    xi_allow_events(&mut f, CLIENT_A, XI_XTEST, 0); // AsyncDevice
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(6, XI_XTEST, XI_XTEST, W)],
+        "the grabber receives the queued motion at thaw"
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+    assert!(f.state.sync_pending.is_empty());
+
+    let mut ungrab_body = Vec::with_capacity(8);
+    ungrab_body.extend_from_slice(&0u32.to_le_bytes());
+    ungrab_body.extend_from_slice(&XI_XTEST.to_le_bytes());
+    ungrab_body.extend_from_slice(&0u16.to_le_bytes());
+    dispatch(&mut f, CLIENT_A, XI2_OPCODE, 52, &ungrab_body); // XIUngrabDevice
+    assert_task1_end_state(&f, &[XI_XTEST]);
+}
+
+/// Spec invariant 8 for a press: with only the master frozen (a synchronous
+/// keyboard grab holds the pointer, no pointer grab exists), the slave's XI2
+/// press is delivered now, the master's bitmap is untouched, and the
+/// master's passive-grab search and core press happen when the master thaws
+/// (`../xserver/mi/mieq.c:502-508`, `dix/events.c` `ComputeFreezes`).
+#[test]
+fn master_frozen_press_slave_form_now_master_passive_check_at_thaw() {
+    let mut f = p_fixture();
+    let source = crate::xinput::InputSourceId(0xABCD);
+    let device = super::pointer_source(&mut f.state, source.0, true);
+    let origin = InputOrigin::Physical(source);
+    select_xi2(&mut f, CLIENT_B, W, device, XI_BUTTONS);
+    grab_button_core(&mut f, CLIENT_B, D, 1, ANY_MODIFIER, 1, false);
+    send(&mut f, origin, PointerEventKind::MotionNotify, 0, 150, 150);
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+
+    // A's GrabKeyboard(pointer sync, keyboard async) freezes the master
+    // pointer on A's behalf without any pointer grab.
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&W.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    body.extend_from_slice(&[0, 1, 0, 0]); // sync pointer, async keyboard
+    dispatch(&mut f, CLIENT_A, 31, 0, &body);
+    assert!(f.state.active_pointer_grab.is_none());
+    assert!(
+        f.state
+            .xi1_frozen
+            .get(&XI_MASTER)
+            .is_some_and(crate::server::Xi1Freeze::frozen),
+        "A's keyboard grab freezes the master pointer"
+    );
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+
+    send(&mut f, origin, PointerEventKind::ButtonPress, 1, 150, 150);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(4, device, device, W)],
+        "the slave's XI2 press is delivered now, no core press yet"
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_eq!(f.state.buttons_down, 0, "the master's bitmap waits");
+    assert!(f.state.active_pointer_grab.is_none());
+    let slave_grab = f
+        .state
+        .xi2_pointer_grabs
+        .get(&device)
+        .expect("the delivered slave press creates its implicit grab before thaw");
+    assert_eq!(slave_grab.owner, ClientId(CLIENT_B));
+    assert_eq!(slave_grab.grab_window, ResourceId(W));
+    assert!(slave_grab.via_xi2 && slave_grab.implicit && !slave_grab.passive);
+    assert_eq!(f.state.sync_pending.len(), 1, "the master part is queued");
+
+    dispatch(&mut f, CLIENT_A, 32, 0, &0u32.to_le_bytes()); // UngrabKeyboard
+    assert_eq!(f.state.buttons_down, BUTTON_1, "the master press ran");
+    assert!(
+        f.state.active_pointer_grab.is_some_and(|grab| {
+            grab.owner == ClientId(CLIENT_B)
+                && grab.grab_window == ResourceId(D)
+                && grab.passive
+                && !grab.via_xi2
+        }),
+        "B's passive core grab on D is found by the master pass at thaw"
+    );
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![core(4, D)],
+        "the master's core press reaches the passive grab owner once"
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(f.state.sync_pending.is_empty());
+
+    release(&mut f, origin, 1);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(5, device, device, W), core(5, D)]
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
+/// Reproduce XTS XAllowDeviceEvents-12's unresolved early return followed by
+/// TP14's no-grab SyncAll/button/motion probe. The TP12 button press is queued
+/// on the frozen master; its XTest slave motion still reaches the XI1 client,
+/// so the XTS helper reports that the device was not frozen and exits through
+/// grab-window cleanup. That cleanup must not let the delayed button press
+/// install a synchronous core grab on a window that is being destroyed.
+#[test]
+fn xts_ade12_cleanup_does_not_leave_sync_core_grab_for_ade14() {
+    let mut f = p_fixture();
+    select_xi1_pointer_events(&mut f, W);
+
+    // XTS grabstartup warps to (1,1) in grabwin before TP12's synchronous
+    // keyboard grab and synchronous core Button1 passive grab.
+    send(
+        &mut f,
+        InputOrigin::XTest(XI_XTEST),
+        PointerEventKind::MotionNotify,
+        0,
+        101,
+        101,
+    );
+    let _ = read_packets(&mut f.client_a);
+    let mut keyboard_grab = Vec::with_capacity(12);
+    keyboard_grab.extend_from_slice(&W.to_le_bytes());
+    keyboard_grab.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    keyboard_grab.extend_from_slice(&[0, 1, 1, 0]); // sync pointer + keyboard
+    dispatch(&mut f, CLIENT_A, 31, 0, &keyboard_grab); // GrabKeyboard
+    assert!(f.state.active_keyboard_grab.is_some());
+    assert!(f.state.xi1_frozen[&XI_MASTER].frozen());
+
+    let mut button_grab = Vec::with_capacity(20);
+    button_grab.extend_from_slice(&W.to_le_bytes());
+    button_grab.extend_from_slice(&0x0040u16.to_le_bytes()); // PointerMotionMask
+    button_grab.extend_from_slice(&[1, 1]); // sync pointer + keyboard
+    button_grab.extend_from_slice(&0u32.to_le_bytes()); // no confine window
+    button_grab.extend_from_slice(&0u32.to_le_bytes()); // no cursor
+    button_grab.extend_from_slice(&[1, 0]); // Button1, pad
+    button_grab.extend_from_slice(&0u16.to_le_bytes()); // no modifiers
+    dispatch(&mut f, CLIENT_A, 28, 0, &button_grab); // GrabButton
+
+    send(
+        &mut f,
+        InputOrigin::XTest(XI_XTEST),
+        PointerEventKind::ButtonPress,
+        1,
+        101,
+        101,
+    );
+    assert!(f.state.active_pointer_grab.is_none());
+    assert_eq!(
+        f.state.sync_pending.len(),
+        1,
+        "the master press is deferred"
+    );
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi1_packet(4, XI_XTEST, W)],
+        "TP12's button's slave form is reported before its master pass"
+    );
+
+    // XTS ispfrozen(): absolute device motion to x=0, retaining y=1. This is
+    // visible on the slave, so TP12 returns early without its SyncAll path.
+    send(
+        &mut f,
+        InputOrigin::XTest(XI_XTEST),
+        PointerEventKind::MotionNotify,
+        0,
+        0,
+        101,
+    );
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi1_packet(6, XI_XTEST, W)],
+        "the TP12 probe makes the XTS purpose unresolved"
+    );
+
+    // TET's per-purpose grabcleanup destroys grabwin after TP12's early
+    // return. TP13 then grabs the XI1 device and keyboard, allows SyncAll,
+    // probes motion, and ungrabs both. This intervening purpose is needed to
+    // reproduce the suite's exact TP12→TP14 state transition.
+    dispatch(&mut f, CLIENT_A, 4, 0, &W.to_le_bytes()); // DestroyWindow
+    let tp12_cleanup = (
+        f.state.active_pointer_grab,
+        f.state.active_keyboard_grab,
+        f.state.xi1_frozen.values().all(|freeze| !freeze.frozen()),
+        f.state.sync_pending.len(),
+        f.state.master_sprite_root,
+    );
+    select_xi1_pointer_events(&mut f, OUT);
+
+    let device_classes: Vec<u32> = [
+        crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET,
+        crate::xinput::XI_DEVICE_BUTTON_RELEASE_OFFSET,
+        crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET,
+    ]
+    .into_iter()
+    .map(|offset| (u32::from(XI_XTEST) << 8) | u32::from(crate::server::XI_FIRST_EVENT + offset))
+    .collect();
+    let mut device_grab = Vec::with_capacity(16 + device_classes.len() * 4);
+    device_grab.extend_from_slice(&OUT.to_le_bytes());
+    device_grab.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    device_grab.extend_from_slice(&u16::try_from(device_classes.len()).unwrap().to_le_bytes());
+    device_grab.extend_from_slice(&[1, 0, 1, u8::try_from(XI_XTEST).unwrap()]); // sync, async, owner
+    device_grab.extend_from_slice(&[0; 2]);
+    for class in device_classes {
+        device_grab.extend_from_slice(&class.to_le_bytes());
+    }
+    dispatch(&mut f, CLIENT_A, XI2_OPCODE, 13, &device_grab); // TP13 GrabDevice
+    let mut keyboard_grab = Vec::with_capacity(12);
+    keyboard_grab.extend_from_slice(&OUT.to_le_bytes());
+    keyboard_grab.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    keyboard_grab.extend_from_slice(&[0, 1, 1, 0]); // sync pointer + keyboard
+    dispatch(&mut f, CLIENT_A, 31, 0, &keyboard_grab); // TP13 GrabKeyboard
+
+    let mut allow_body = Vec::with_capacity(8);
+    allow_body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    allow_body.extend_from_slice(&XI_XTEST.to_le_bytes());
+    allow_body.extend_from_slice(&[5, 0]); // SyncAll
+    dispatch(
+        &mut f,
+        CLIENT_A,
+        XI2_OPCODE,
+        XI_XI_ALLOW_EVENTS,
+        &allow_body,
+    );
+    send(
+        &mut f,
+        InputOrigin::XTest(XI_XTEST),
+        PointerEventKind::MotionNotify,
+        0,
+        0,
+        101,
+    ); // TP13 ispfrozen() probe while GrabDevice is active
+    assert!(
+        read_packets(&mut f.client_a)
+            .iter()
+            .any(|packet| packet.kind == 6 && packet.device == XI_XTEST && packet.window == OUT),
+        "TP13 SyncAll releases its device before ispfrozen()"
+    );
+
+    dispatch(&mut f, CLIENT_A, 32, 0, &0u32.to_le_bytes()); // TP13 UngrabKeyboard
+    let mut ungrab_body = Vec::with_capacity(8);
+    ungrab_body.extend_from_slice(&0u32.to_le_bytes());
+    ungrab_body.extend_from_slice(&[u8::try_from(XI_XTEST).unwrap(), 0, 0, 0]);
+    dispatch(&mut f, CLIENT_A, XI2_OPCODE, 14, &ungrab_body); // TP13 UngrabDevice
+    let _ = read_packets(&mut f.client_a);
+    dispatch(&mut f, CLIENT_A, 4, 0, &OUT.to_le_bytes()); // TP13 grabcleanup
+
+    // TP14's grabstartup creates a fresh window and selects DeviceMotionNotify
+    // there. The absolute x=0 probe can route to root, so the test also selects
+    // root as an observer; this does not install a grab or change thaw state.
+    create_window(&mut f, CLIENT_A, TP14_WIN, 0, 0, 0, 200, 200);
+    map_window(&mut f, CLIENT_A, TP14_WIN);
+    f.xid_map.insert(HOST_W, ResourceId(TP14_WIN));
+    select_xi1_pointer_events(&mut f, TP14_WIN);
+    // Observe the x=0 absolute probe even when it is outside the test window;
+    // this is only a test observer, while XTS observes its grab window.
+    select_xi1_pointer_events(&mut f, crate::resources::ROOT_WINDOW.0);
+    send(
+        &mut f,
+        InputOrigin::XTest(XI_XTEST),
+        PointerEventKind::MotionNotify,
+        0,
+        1,
+        1,
+    ); // grabstartup warp
+    let _ = read_packets(&mut f.client_a);
+
+    // TP14 runs XAllowDeviceEvents(SyncAll) with no grabs, presses the
+    // XTest button at (1,1), then checks whether its absolute x=0 probe is
+    // delivered on TP14_WIN.
+    let mut allow_body = Vec::with_capacity(8);
+    allow_body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    allow_body.extend_from_slice(&XI_XTEST.to_le_bytes());
+    allow_body.extend_from_slice(&[5, 0]); // SyncAll
+    dispatch(
+        &mut f,
+        CLIENT_A,
+        XI2_OPCODE,
+        XI_XI_ALLOW_EVENTS,
+        &allow_body,
+    );
+    send(
+        &mut f,
+        InputOrigin::XTest(XI_XTEST),
+        PointerEventKind::ButtonPress,
+        1,
+        1,
+        1,
+    );
+    send(
+        &mut f,
+        InputOrigin::XTest(XI_XTEST),
+        PointerEventKind::MotionNotify,
+        0,
+        0,
+        1,
+    );
+    let packets = read_packets(&mut f.client_a);
+    assert!(
+        packets.iter().any(|packet| {
+            !packet.xi2
+                && packet.kind == 6
+                && packet.device == XI_XTEST
+                && (packet.window == TP14_WIN || packet.window == crate::resources::ROOT_WINDOW.0)
+        }),
+        "TP14's button must not freeze the device after SyncAll; packets={packets:?}; active={:?}; freezes={:?}; queue={:?}",
+        f.state.active_pointer_grab,
+        f.state.xi1_frozen,
+        f.state.sync_pending
+    );
+    assert!(
+        tp12_cleanup.0.is_none(),
+        "TP12 cleanup state: pointer={:?}, keyboard={:?}, xi1_thawed={}, queued={}, master_sprite_root={:?}",
+        tp12_cleanup.0,
+        tp12_cleanup.1,
+        tp12_cleanup.2,
+        tp12_cleanup.3,
+        tp12_cleanup.4
+    );
+    assert!(
+        tp12_cleanup.1.is_none(),
+        "TP12 cleanup left a keyboard grab"
+    );
+    assert!(tp12_cleanup.2, "TP12 cleanup left an XI1 device frozen");
+    assert_eq!(tp12_cleanup.3, 0, "TP12 cleanup left queued master events");
+    assert_eq!(tp12_cleanup.4, (0, 101), "TP12 probe sprite root");
+    assert!(
+        f.state.active_pointer_grab.is_none(),
+        "TP12 cleanup left active pointer grab {:?}; keyboard {:?}; XI1 freezes {:?}; queue {:?}",
+        f.state.active_pointer_grab,
+        f.state.active_keyboard_grab,
+        f.state.xi1_frozen,
+        f.state.sync_pending
+    );
+    assert!(f.state.sync_pending.is_empty());
+    assert!(f.state.xi1_frozen.values().all(|freeze| !freeze.frozen()));
+    send(
+        &mut f,
+        InputOrigin::XTest(XI_XTEST),
+        PointerEventKind::ButtonRelease,
+        1,
+        0,
+        1,
+    ); // XTS devicerelbuttons() cleanup
+    assert_eq!(f.state.buttons_down, 0);
+    assert_eq!(f.state.xi_devices.device(XI_XTEST).unwrap().buttons_down, 0);
+    assert!(f.state.sync_pending.is_empty());
+}
+
+fn select_xi1_pointer_events(f: &mut Fixture, window: u32) {
+    let classes: Vec<u32> = [
+        crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET,
+        crate::xinput::XI_DEVICE_BUTTON_RELEASE_OFFSET,
+        crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET,
+    ]
+    .into_iter()
+    .map(|offset| (u32::from(XI_XTEST) << 8) | u32::from(crate::server::XI_FIRST_EVENT + offset))
+    .collect();
+    let mut body = Vec::with_capacity(8 + classes.len() * 4);
+    body.extend_from_slice(&window.to_le_bytes());
+    body.extend_from_slice(&u16::try_from(classes.len()).unwrap().to_le_bytes());
+    body.extend_from_slice(&[0; 2]);
+    for class in classes {
+        body.extend_from_slice(&class.to_le_bytes());
+    }
+    dispatch(f, CLIENT_A, XI2_OPCODE, 6, &body); // XI1 SelectExtensionEvent
+}
+
+fn xi1_packet(kind: u16, device: u16, window: u32) -> super::implicit_grabs::Packet {
+    super::implicit_grabs::Packet {
+        xi2: false,
+        kind,
+        device,
+        source: device,
+        window,
+        scroll_value: None,
+        child: 0,
+        event_x: 0,
+        event_y: 0,
+    }
+}
+
+fn grab_keyboard_sync_pointer(f: &mut Fixture, client: u32, window: u32) {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&window.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    body.extend_from_slice(&[0, 1, 0, 0]); // sync pointer, async keyboard
+    dispatch(f, client, 31, 0, &body);
+}
+
+fn ungrab_keyboard(f: &mut Fixture, client: u32) {
+    dispatch(f, client, 32, 0, &0u32.to_le_bytes());
+}
+
+/// Xorg's deferred master pass drops a transition already held by another
+/// source before passive-grab matching or delivery
+/// (`../xserver/Xi/exevents.c:944-982,1848-1850`). Replaying a processed
+/// activating event remains Task 3's separate path.
+#[test]
+fn queued_duplicate_master_press_is_dropped_before_passive_activation() {
+    let mut f = p_fixture();
+    let source_a = crate::xinput::InputSourceId(0xABCD);
+    let source_b = crate::xinput::InputSourceId(0xABCE);
+    let _device_a = super::pointer_source(&mut f.state, source_a.0, true);
+    let device_b = super::pointer_source(&mut f.state, source_b.0, true);
+    let origin_a = InputOrigin::Physical(source_a);
+    let origin_b = InputOrigin::Physical(source_b);
+    select_xi2(&mut f, CLIENT_B, W, device_b, XI_BUTTONS);
+    grab_button_core(&mut f, CLIENT_B, D, 1, ANY_MODIFIER, 1, false);
+
+    // Source A holds button 1 outside D, so it cannot activate B's passive grab.
+    send(&mut f, origin_a, PointerEventKind::ButtonPress, 1, 650, 150);
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+    grab_keyboard_sync_pointer(&mut f, CLIENT_A, W);
+    assert!(f.state.xi1_frozen[&XI_MASTER].frozen());
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+
+    send(&mut f, origin_b, PointerEventKind::ButtonPress, 1, 150, 150);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(4, device_b, device_b, W)],
+        "the live slave pass delivers before the queued master transition"
+    );
+    assert_eq!(f.state.sync_pending.len(), 1);
+
+    ungrab_keyboard(&mut f, CLIENT_A);
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert!(
+        f.state.active_pointer_grab.is_none(),
+        "a duplicate master press must not activate B's passive core grab"
+    );
+    assert!(
+        read_packets(&mut f.client_b).is_empty(),
+        "the rejected master transition has no second form"
+    );
+
+    send(
+        &mut f,
+        origin_b,
+        PointerEventKind::ButtonRelease,
+        1,
+        150,
+        150,
+    );
+    send(
+        &mut f,
+        origin_a,
+        PointerEventKind::ButtonRelease,
+        1,
+        650,
+        150,
+    );
+    assert_eq!(f.state.buttons_down, 0);
+    assert_eq!(f.state.xi_devices.device(device_b).unwrap().buttons_down, 0);
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
+/// Xorg also drops a queued release when another attached source still holds
+/// the aggregate master button (`../xserver/Xi/exevents.c:944-982`).
+#[test]
+fn queued_aggregate_release_is_not_delivered_until_last_source_releases() {
+    let mut f = p_fixture();
+    let source_a = crate::xinput::InputSourceId(0xABCF);
+    let source_b = crate::xinput::InputSourceId(0xABD0);
+    let device_a = super::pointer_source(&mut f.state, source_a.0, true);
+    let device_b = super::pointer_source(&mut f.state, source_b.0, true);
+    let origin_a = InputOrigin::Physical(source_a);
+    let origin_b = InputOrigin::Physical(source_b);
+    select_xi2(&mut f, CLIENT_B, W, XI_MASTER, XI_BUTTON_RELEASE);
+
+    send(&mut f, origin_a, PointerEventKind::ButtonPress, 1, 150, 150);
+    send(&mut f, origin_b, PointerEventKind::ButtonPress, 1, 150, 150);
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(
+        f.state.xi_devices.device(device_a).unwrap().buttons_down,
+        BUTTON_1
+    );
+    assert_eq!(
+        f.state.xi_devices.device(device_b).unwrap().buttons_down,
+        BUTTON_1
+    );
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+
+    grab_keyboard_sync_pointer(&mut f, CLIENT_A, W);
+    assert!(f.state.xi1_frozen[&XI_MASTER].frozen());
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+    send(
+        &mut f,
+        origin_b,
+        PointerEventKind::ButtonRelease,
+        1,
+        150,
+        150,
+    );
+    assert_eq!(f.state.xi_devices.device(device_b).unwrap().buttons_down, 0);
+    assert!(read_packets(&mut f.client_b).is_empty());
+    assert_eq!(f.state.sync_pending.len(), 1);
+
+    ungrab_keyboard(&mut f, CLIENT_A);
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert!(
+        read_packets(&mut f.client_b).is_empty(),
+        "the queued aggregate release is rejected while source A holds button 1"
+    );
+
+    send(
+        &mut f,
+        origin_a,
+        PointerEventKind::ButtonRelease,
+        1,
+        150,
+        150,
+    );
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(5, XI_MASTER, device_a, W)],
+        "the last source's release changes and delivers the master transition"
+    );
+    assert_eq!(f.state.buttons_down, 0);
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
+/// The physical scroll conversion belongs to the live slave pass. Its cooked
+/// master Motion waits with the master part and carries the already-generated
+/// valuator through thaw, so the source counter advances once.
+#[test]
+fn master_frozen_scroll_waits_for_thaw_without_advancing_slave_twice() {
+    let mut f = p_fixture();
+    let source = crate::xinput::InputSourceId(0xABD1);
+    let device = super::pointer_source(&mut f.state, source.0, true);
+    let origin = InputOrigin::Physical(source);
+    select_xi2(&mut f, CLIENT_B, W, device, XI_MOTION);
+    select_xi2(&mut f, CLIENT_A, W, XI_MASTER, XI_MOTION);
+    grab_keyboard_sync_pointer(&mut f, CLIENT_A, W);
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+
+    send(&mut f, origin, PointerEventKind::ButtonPress, 5, 150, 150);
+    let mut slave_scroll = xi(6, device, device, W);
+    slave_scroll.scroll_value = Some(1);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![slave_scroll],
+        "slave cooked scroll Motion is processed during the slave pass"
+    );
+    assert!(
+        read_packets(&mut f.client_a).is_empty(),
+        "the master's cooked scroll Motion waits behind the pointer freeze"
+    );
+    assert_eq!(
+        f.state
+            .xi_devices
+            .device(device)
+            .unwrap()
+            .scroll_axis_values,
+        [1, 0],
+        "the source scroll counter advances in the slave pass"
+    );
+
+    ungrab_keyboard(&mut f, CLIENT_A);
+    let mut master_scroll = xi(6, XI_MASTER, device, W);
+    master_scroll.scroll_value = Some(1);
+    assert_eq!(read_packets(&mut f.client_a), vec![master_scroll]);
+    assert!(
+        read_packets(&mut f.client_b).is_empty(),
+        "thaw emits no second slave Motion"
+    );
+    assert_eq!(
+        f.state
+            .xi_devices
+            .device(device)
+            .unwrap()
+            .scroll_axis_values,
+        [1, 0],
+        "processing the queued master part does not mutate slave scroll state"
+    );
+
+    send(&mut f, origin, PointerEventKind::ButtonRelease, 5, 150, 150);
+    assert_eq!(f.state.buttons_down, 0);
+    assert_eq!(f.state.xi_devices.device(device).unwrap().buttons_down, 0);
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
+/// Xorg builds smooth scroll Motion before the emulated legacy button events
+/// (`../xserver/dix/getevents.c:1646-1718`). Rejecting a duplicate master
+/// button transition at thaw must not discard its already-saved Motion.
+#[test]
+fn queued_duplicate_wheel_press_does_not_suppress_master_scroll_motion() {
+    let mut f = p_fixture();
+    let source_a = crate::xinput::InputSourceId(0xABD7);
+    let source_b = crate::xinput::InputSourceId(0xABD8);
+    let _device_a = super::pointer_source(&mut f.state, source_a.0, true);
+    let device_b = super::pointer_source(&mut f.state, source_b.0, true);
+    let origin_a = InputOrigin::Physical(source_a);
+    let origin_b = InputOrigin::Physical(source_b);
+    select_xi2(&mut f, CLIENT_B, W, device_b, XI_MOTION | XI_BUTTONS);
+    select_xi2(&mut f, CLIENT_A, W, XI_MASTER, XI_MOTION);
+    grab_button_core(&mut f, CLIENT_B, D, 5, ANY_MODIFIER, 1, false);
+
+    // Source A already holds button 5. Its location is outside W, so it
+    // cannot activate B's passive grab on D.
+    send(&mut f, origin_a, PointerEventKind::ButtonPress, 5, 650, 150);
+    assert_eq!(f.state.buttons_down, 1 << 4);
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+
+    grab_keyboard_sync_pointer(&mut f, CLIENT_A, W);
+    assert!(f.state.xi1_frozen[&XI_MASTER].frozen());
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+
+    send(&mut f, origin_b, PointerEventKind::ButtonPress, 5, 150, 150);
+    let mut slave_scroll = xi(6, device_b, device_b, W);
+    slave_scroll.scroll_value = Some(1);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![slave_scroll, xi(4, device_b, device_b, W)],
+        "the live slave pass reports its cooked scroll and legacy button"
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_eq!(
+        f.state
+            .xi_devices
+            .device(device_b)
+            .unwrap()
+            .scroll_axis_values,
+        [1, 0]
+    );
+    assert_eq!(f.state.sync_pending.len(), 1);
+
+    ungrab_keyboard(&mut f, CLIENT_A);
+    let mut master_scroll = xi(6, XI_MASTER, device_b, W);
+    master_scroll.scroll_value = Some(1);
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![master_scroll],
+        "the saved master scroll Motion is independent of duplicate button rejection"
+    );
+    assert!(
+        read_packets(&mut f.client_b).is_empty(),
+        "the rejected master button has no second delivery"
+    );
+    assert!(
+        f.state.active_pointer_grab.is_none(),
+        "the duplicate master press does not activate B's passive core grab"
+    );
+    assert_eq!(f.state.buttons_down, 1 << 4);
+    assert_eq!(
+        f.state
+            .xi_devices
+            .device(device_b)
+            .unwrap()
+            .scroll_axis_values,
+        [1, 0],
+        "master thaw does not advance the slave scroll counter again"
+    );
+
+    send(
+        &mut f,
+        origin_b,
+        PointerEventKind::ButtonRelease,
+        5,
+        150,
+        150,
+    );
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+    send(
+        &mut f,
+        origin_a,
+        PointerEventKind::ButtonRelease,
+        5,
+        650,
+        150,
+    );
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
+/// Slave recipients are resolved from the pre-move window, while an explicit
+/// master grab independently receives the master form even when that client
+/// only has a natural slave selection on the old window.
+#[test]
+fn earlier_slave_selection_does_not_veto_master_grab_delivery() {
+    let mut f = p_fixture();
+    let source = crate::xinput::InputSourceId(0xABD2);
+    let device = super::pointer_source(&mut f.state, source.0, true);
+    let origin = InputOrigin::Physical(source);
+    send(&mut f, origin, PointerEventKind::MotionNotify, 0, 150, 150);
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+    select_xi2(&mut f, CLIENT_A, W, device, XI_MOTION);
+
+    let mut grab_body = Vec::with_capacity(24);
+    grab_body.extend_from_slice(&W.to_le_bytes());
+    grab_body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    grab_body.extend_from_slice(&0u32.to_le_bytes()); // no cursor
+    grab_body.extend_from_slice(&XI_MASTER.to_le_bytes());
+    grab_body.extend_from_slice(&[1, 1, 0, 0]); // async pointer and paired device
+    grab_body.extend_from_slice(&1u16.to_le_bytes());
+    grab_body.extend_from_slice(&XI_MOTION.to_le_bytes());
+    dispatch(&mut f, CLIENT_A, XI2_OPCODE, 51, &grab_body); // XIGrabDevice
+    assert!(f.state.active_pointer_grab.is_some_and(|grab| {
+        grab.owner == ClientId(CLIENT_A)
+            && grab.grab_window == ResourceId(W)
+            && grab.via_xi2
+            && !grab.passive
+            && !grab.implicit
+    }));
+    let _ = read_packets(&mut f.client_a); // successful XIGrabDevice reply
+
+    send(&mut f, origin, PointerEventKind::MotionNotify, 0, 650, 150);
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(6, device, device, W), xi(6, XI_MASTER, device, W),],
+        "the slave form is natural on W and the master form routes through A's grab on W"
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    let mut ungrab_body = Vec::with_capacity(8);
+    ungrab_body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    ungrab_body.extend_from_slice(&XI_MASTER.to_le_bytes());
+    ungrab_body.extend_from_slice(&0u16.to_le_bytes());
+    dispatch(&mut f, CLIENT_A, XI2_OPCODE, 52, &ungrab_body); // XIUngrabDevice
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
+/// The queued master event is owned by the master captured in
+/// `PendingSyncEvent`, even if an explicit XI2 slave grab detaches its source
+/// before thaw (`../xserver/mi/mieq.c:484-508`).
+#[test]
+fn queued_master_press_uses_captured_master_after_source_detach() {
+    let mut f = p_fixture();
+    let source = crate::xinput::InputSourceId(0xABD3);
+    let device = super::pointer_source(&mut f.state, source.0, true);
+    let origin = InputOrigin::Physical(source);
+    grab_button_core(&mut f, CLIENT_B, D, 1, ANY_MODIFIER, 1, false);
+    grab_keyboard_sync_pointer(&mut f, CLIENT_A, W);
+    assert!(f.state.xi1_frozen[&XI_MASTER].frozen());
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+
+    send(&mut f, origin, PointerEventKind::ButtonPress, 1, 150, 150);
+    assert_eq!(f.state.buttons_down, 0, "the master transition is deferred");
+    assert_eq!(
+        f.state.xi_devices.device(device).unwrap().buttons_down,
+        BUTTON_1
+    );
+    assert_eq!(f.state.sync_pending.len(), 1);
+
+    let mut grab_body = Vec::with_capacity(20);
+    grab_body.extend_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+    grab_body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    grab_body.extend_from_slice(&0u32.to_le_bytes()); // no cursor
+    grab_body.extend_from_slice(&device.to_le_bytes());
+    grab_body.extend_from_slice(&[1, 1, 0, 0]); // async pointer and paired device
+    grab_body.extend_from_slice(&0u16.to_le_bytes()); // no XI2 event mask
+    dispatch(&mut f, CLIENT_A, XI2_OPCODE, 51, &grab_body); // XIGrabDevice
+    let _ = read_packets(&mut f.client_a); // successful XIGrabDevice reply
+    assert!(f.state.xi2_pointer_grabs.get(&device).is_some_and(|grab| {
+        grab.owner == ClientId(CLIENT_A)
+            && grab.grab_window == crate::resources::ROOT_WINDOW
+            && grab.via_xi2
+            && !grab.passive
+            && !grab.implicit
+    }));
+    assert_eq!(
+        f.state.xi_devices.device(device).unwrap().attached_master,
+        None,
+        "the explicit slave grab detaches the pending source"
+    );
+
+    ungrab_keyboard(&mut f, CLIENT_A);
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    let active = f
+        .state
+        .active_pointer_grab
+        .expect("the captured master pass activates B's passive core grab");
+    assert_eq!(active.owner, ClientId(CLIENT_B));
+    assert_eq!(active.grab_window, ResourceId(D));
+    assert!(active.passive && !active.implicit && !active.via_xi2);
+    assert_eq!(read_packets(&mut f.client_b), vec![core(4, D)]);
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(f.state.sync_pending.is_empty());
+
+    let mut ungrab_body = Vec::with_capacity(8);
+    ungrab_body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    ungrab_body.extend_from_slice(&device.to_le_bytes());
+    ungrab_body.extend_from_slice(&0u16.to_le_bytes());
+    dispatch(&mut f, CLIENT_A, XI2_OPCODE, 52, &ungrab_body); // XIUngrabDevice
+    assert_eq!(
+        f.state.xi_devices.device(device).unwrap().attached_master,
+        Some(XI_MASTER)
+    );
+    send(&mut f, origin, PointerEventKind::ButtonRelease, 1, 150, 150);
+    assert_eq!(read_packets(&mut f.client_b), vec![core(5, D)]);
+    assert!(f.state.active_pointer_grab.is_none());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD, device]);
+}
+
+/// A floating pointer updates its private position, not the master sprite
+/// used to resolve the next attached slave's pre-move window.
+#[test]
+fn floating_pointer_motion_does_not_advance_master_sprite_snapshot() {
+    let mut f = p_fixture();
+    let attached_source = crate::xinput::InputSourceId(0xABD4);
+    let floating_source = crate::xinput::InputSourceId(0xABD5);
+    let attached_device = super::pointer_source(&mut f.state, attached_source.0, true);
+    let floating_device = super::pointer_source(&mut f.state, floating_source.0, true);
+    let attached_origin = InputOrigin::Physical(attached_source);
+    let floating_origin = InputOrigin::Physical(floating_source);
+    select_xi2(&mut f, CLIENT_A, W, attached_device, XI_MOTION);
+    send(
+        &mut f,
+        attached_origin,
+        PointerEventKind::MotionNotify,
+        0,
+        150,
+        150,
+    );
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+
+    let mut grab_body = Vec::with_capacity(20);
+    grab_body.extend_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+    grab_body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    grab_body.extend_from_slice(&0u32.to_le_bytes()); // no cursor
+    grab_body.extend_from_slice(&floating_device.to_le_bytes());
+    grab_body.extend_from_slice(&[1, 1, 0, 0]); // async pointer and paired device
+    grab_body.extend_from_slice(&0u16.to_le_bytes()); // no XI2 event mask
+    dispatch(&mut f, CLIENT_A, XI2_OPCODE, 51, &grab_body); // XIGrabDevice
+    let _ = read_packets(&mut f.client_a);
+    assert_eq!(
+        f.state
+            .xi_devices
+            .device(floating_device)
+            .unwrap()
+            .attached_master,
+        None,
+        "the second source is floating while explicitly grabbed"
+    );
+
+    send(
+        &mut f,
+        floating_origin,
+        PointerEventKind::MotionNotify,
+        0,
+        650,
+        150,
+    );
+    let _ = read_packets(&mut f.client_a);
+    assert_eq!(f.state.pointer_root, (150, 150));
+    assert_eq!(
+        f.state.floating_pointer_positions.get(&floating_device),
+        Some(&(650.0, 150.0))
+    );
+
+    send(
+        &mut f,
+        attached_origin,
+        PointerEventKind::MotionNotify,
+        0,
+        650,
+        150,
+    );
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(6, attached_device, attached_device, W)],
+        "the attached slave routes from the master's still-current sprite in W"
+    );
+
+    let mut ungrab_body = Vec::with_capacity(8);
+    ungrab_body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    ungrab_body.extend_from_slice(&floating_device.to_le_bytes());
+    ungrab_body.extend_from_slice(&0u16.to_le_bytes());
+    dispatch(&mut f, CLIENT_A, XI2_OPCODE, 52, &ungrab_body); // XIUngrabDevice
+    assert_task1_end_state(&f, &[floating_device]);
+}
+
+/// Both slave passes see W while their master copies wait in a frozen queue:
+/// only processing those master copies moves the sprite window, matching
+/// Xorg `ProcessOtherEvent`/`CheckMotion` (`../xserver/Xi/exevents.c:1854-1855,1950`).
+#[test]
+fn successive_motions_behind_frozen_master_keep_the_pre_move_window() {
+    let mut f = p_fixture();
+    let source = crate::xinput::InputSourceId(0xABD6);
+    let device = super::pointer_source(&mut f.state, source.0, true);
+    let origin = InputOrigin::Physical(source);
+    select_xi2(&mut f, CLIENT_B, W, device, XI_MOTION);
+    select_xi2(&mut f, CLIENT_B, OUT, XI_MASTER, XI_MOTION);
+    send(&mut f, origin, PointerEventKind::MotionNotify, 0, 150, 150);
+    assert_eq!(f.state.master_sprite_root, (150, 150));
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+    grab_keyboard_sync_pointer(&mut f, CLIENT_A, W);
+    assert!(f.state.xi1_frozen[&XI_MASTER].frozen());
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+
+    for x in [650, 700] {
+        send(&mut f, origin, PointerEventKind::MotionNotify, 0, x, 150);
+        let packets = read_packets(&mut f.client_b);
+        assert_eq!(
+            packets,
+            vec![xi(6, device, device, W)],
+            "the slave pass at x={x} still uses W while the master is frozen"
+        );
+    }
+    assert_eq!(f.state.master_sprite_root, (150, 150));
+    assert_eq!(f.state.sync_pending.len(), 2);
+
+    ungrab_keyboard(&mut f, CLIENT_A);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(6, XI_MASTER, device, OUT), xi(6, XI_MASTER, device, OUT)],
+        "thaw processes both master forms without repeating either slave form"
+    );
+    assert_eq!(f.state.master_sprite_root, (700, 150));
+    assert!(f.state.sync_pending.is_empty());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
+/// Xvfb 21.1.24 measurement (cases A, B, C, E; spec invariant 8): one client
+/// selects XI2 Motion for slave 4 and master 2 on W. The slave's form routes
+/// from the window under the sprite BEFORE the move, the master's from AFTER.
+#[test]
+fn xi2_slave_motion_routes_from_pre_move_window_master_from_post_move() {
+    let mut f = p_fixture();
+    let origin = InputOrigin::XTest(XI_XTEST);
+    select_xi2(&mut f, CLIENT_A, W, XI_XTEST, XI_MOTION);
+    select_xi2(&mut f, CLIENT_A, W, XI_MASTER, XI_MOTION);
+    send(&mut f, origin, PointerEventKind::MotionNotify, 0, 145, 145);
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+
+    // C: inside -> inside, both forms (slave first).
+    send(&mut f, origin, PointerEventKind::MotionNotify, 0, 150, 150);
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(6, XI_XTEST, XI_XTEST, W), xi(6, XI_MASTER, XI_XTEST, W)]
+    );
+    // A: inside -> outside, slave form only.
+    send(&mut f, origin, PointerEventKind::MotionNotify, 0, 650, 150);
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(6, XI_XTEST, XI_XTEST, W)]
+    );
+    // E: outside -> outside, nothing.
+    send(&mut f, origin, PointerEventKind::MotionNotify, 0, 700, 150);
+    assert!(read_packets(&mut f.client_a).is_empty());
+    // B: outside -> inside, master form only.
+    send(&mut f, origin, PointerEventKind::MotionNotify, 0, 150, 150);
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(6, XI_MASTER, XI_XTEST, W)]
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+    assert_task1_end_state(&f, &[]);
 }

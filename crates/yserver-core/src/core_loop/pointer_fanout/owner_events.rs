@@ -30,29 +30,30 @@ pub(super) fn xi2_motion_targets_for_source(
     root_x: i16,
     root_y: i16,
     source_accepted: bool,
+    master_accepted: bool,
     replay: Option<PointerReplay>,
 ) -> Vec<Xi2MotionTarget> {
     const XI_MOTION: u16 = 6;
-    if !source_accepted {
+    if !source_accepted && !master_accepted {
         return Vec::new();
     }
 
     let mut forms = Vec::with_capacity(2);
     if let Some(replay) = replay {
         match state.xi_devices.role(replay.device) {
-            Some(crate::xinput::XiDeviceRole::SlavePointer) => {
+            Some(crate::xinput::XiDeviceRole::SlavePointer) if source_accepted => {
                 forms.push((Xi2PointerForm::Slave, replay.device));
             }
-            Some(crate::xinput::XiDeviceRole::MasterPointer) => {
+            Some(crate::xinput::XiDeviceRole::MasterPointer) if master_accepted => {
                 forms.push((Xi2PointerForm::Master, replay.device));
             }
             _ => {}
         }
     } else {
-        if let Some(deviceid) = source.slave_deviceid {
+        if source_accepted && let Some(deviceid) = source.slave_deviceid {
             forms.push((Xi2PointerForm::Slave, deviceid));
         }
-        if source.attached_master == Some(XI2_MASTER_POINTER_DEVICE_ID) {
+        if master_accepted && source.attached_master == Some(XI2_MASTER_POINTER_DEVICE_ID) {
             forms.push((Xi2PointerForm::Master, XI2_MASTER_POINTER_DEVICE_ID));
         }
     }

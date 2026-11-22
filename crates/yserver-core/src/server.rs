@@ -502,6 +502,7 @@ pub struct Xi1Freeze {
 #[derive(Debug, Clone)]
 pub enum QueuedInputEvent {
     HostPointer(crate::host_x11::HostPointerEvent),
+    HostPointerMaster(crate::host_x11::HostPointerEvent, Option<(u8, i32)>),
     HostKey(crate::host_x11::HostKeyEvent),
     /// A key already processed through the per-device/master guards. Keep the
     /// accepted master edge with frozen delivery so thaw cannot infer a new
@@ -1191,6 +1192,10 @@ pub struct ServerState {
     /// from request handlers that have no backend handle to query the
     /// pointer; without this cache they ship at (0,0).
     pub pointer_root: (i16, i16),
+    /// Authoritative position of the master pointer sprite. Slave and
+    /// floating-device input do not advance it; a queued master part advances
+    /// it only when that part is processed (`../xserver/Xi/exevents.c:1854-1855,1950`).
+    pub master_sprite_root: (i16, i16),
     /// Active pointer grab record (full state including event_mask/cursor/time).
     pub active_pointer_grab: Option<ActivePointerGrab>,
     /// XI2 pointer grabs on exact slave devices. Master and core pointer
@@ -2134,6 +2139,7 @@ impl ServerState {
             xkb_interests: HashMap::new(),
             selections: HashMap::new(),
             pointer_root: (0, 0),
+            master_sprite_root: (0, 0),
             active_pointer_grab: None,
             xi2_pointer_grabs: HashMap::new(),
             xi2_keyboard_grabs: HashMap::new(),

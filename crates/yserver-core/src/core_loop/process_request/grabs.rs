@@ -870,6 +870,11 @@ pub(super) fn handle_ungrab_pointer(
         return Ok(RequestOutcome::Handled);
     }
     deactivate_core_pointer_grab(state, backend, client_id);
+    // Xorg `DeactivatePointerGrab` ends in `ComputeFreezes`
+    // (`../xserver/dix/events.c:1721`): input queued behind the dying
+    // grab's freeze is processed now, not at the next unrelated thaw.
+    let xid_map = backend.xid_map().clone();
+    crate::core_loop::pointer_fanout::xi1_compute_freezes(state, backend, &xid_map);
     debug!("client {} #{} UngrabPointer", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
 }
@@ -1537,6 +1542,7 @@ pub(super) fn handle_grab_keyboard(
 
 pub(super) fn handle_ungrab_keyboard(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
@@ -1561,6 +1567,11 @@ pub(super) fn handle_ungrab_keyboard(
         return Ok(RequestOutcome::Handled);
     }
     deactivate_core_keyboard_grab(state, client_id);
+    // `DeactivateKeyboardGrab` ends in `ComputeFreezes` too
+    // (`../xserver/dix/events.c`): a pointer held on this grab's behalf
+    // thaws and its queued input is processed now.
+    let xid_map = backend.xid_map().clone();
+    crate::core_loop::pointer_fanout::xi1_compute_freezes(state, backend, &xid_map);
     debug!("client {} #{} UngrabKeyboard", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
 }

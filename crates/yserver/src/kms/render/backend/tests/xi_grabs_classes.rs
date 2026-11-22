@@ -1786,7 +1786,12 @@ fn record_keeps_pointer_events_enqueued_while_master_is_synchronously_frozen() {
         .map(|pending| {
             assert_eq!(pending.device, 2, "master 2 controls the queue");
             match &pending.event {
-                QueuedInputEvent::HostPointer(event) => (event.origin, event.kind, event.detail),
+                // Spec invariant 8: only master 2 is frozen, so each edge's
+                // slave part already ran and the queue holds the master
+                // part (../xserver mi/mieq.c:502-508).
+                QueuedInputEvent::HostPointerMaster(event, _) => {
+                    (event.origin, event.kind, event.detail)
+                }
                 other => panic!("unexpected queued input: {other:?}"),
             }
         })
@@ -1811,7 +1816,10 @@ fn record_keeps_pointer_events_enqueued_while_master_is_synchronously_frozen() {
             ),
         ]
     );
-    assert_eq!(state.buttons_down, 1, "physical Button1 stays held");
+    // Spec invariant 8: the master's held-button bitmap changes when the
+    // master's queued part is processed, so it is still empty while master 2
+    // is frozen; the physical slave's own state is already updated.
+    assert_eq!(state.buttons_down, 0, "master bitmap waits for its thaw");
     assert_eq!(state.xi_devices.device(pointer_id).unwrap().buttons_down, 1);
     assert_eq!(
         state

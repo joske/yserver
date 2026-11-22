@@ -10,6 +10,7 @@ const CLIENT_B: u32 = 0xA754;
 const WINDOW: u32 = 0x0010_A753;
 const CHILD: u32 = 0x0020_A753;
 const OUTSIDE: u32 = 0x0010_A754;
+const INITIAL_WINDOW: u32 = 0x0010_A755;
 const XTEST_OPCODE: u8 = 146;
 const XTEST_FAKE_INPUT: u8 = 2;
 const XI2_OPCODE: u8 = 137;
@@ -751,4 +752,399 @@ fn xtest_device_motion_preserves_partial_valuator_range() {
     assert!(xi1_device_event_ids(&owner).is_empty());
     assert!(kbd_map_drain(&mut f.client_b).is_empty());
     assert_explicit_slave_grab_end_state(&f, &[XI_XTEST_POINTER]);
+}
+
+// ---- XTS XAllowDeviceEvents (spec invariant 8, per-device freeze) ----
+//
+// XTS `XI/AllowDeviceEvents.m`: `grabstartup` selects DeviceMotionNotify,
+// DeviceButtonPress and DeviceButtonRelease for the button device on a
+// window and warps the pointer to (1,1) in it; `ispfrozen` simulates an
+// absolute one-axis DeviceMotion and reports "frozen" when the selecting
+// client does not receive DeviceMotionNotify. On Xorg a frozen master
+// pointer (core GrabPointer) does not freeze the slave (4): only the
+// master's event is enqueued (../xserver mi/mieq.c:502-508, dix/events.c
+// ComputeFreezes), so the slave's XI1 event arrives.
+
+const XI_ALLOW_DEVICE_EVENTS: u8 = 19;
+const ASYNC_THIS_DEVICE: u8 = 0;
+const SYNC_THIS_DEVICE: u8 = 1;
+const REPLAY_THIS_DEVICE: u8 = 2;
+
+fn ade_fixture() -> Fixture {
+    let mut state = ServerState::new();
+    let client_a = kbd_map_client_id(&mut state, CLIENT_A);
+    let client_b = kbd_map_client_id(&mut state, CLIENT_B);
+    let mut f = Fixture {
+        backend: KmsBackend::for_tests(),
+        state,
+        client_a,
+        client_b,
+    };
+    // The XTS grab window is away from the root's left edge; the one-axis
+    // X=0 probe moves the sprite out of it (Xorg still delivers the slave's
+    // motion, see `slave_pass_target`).
+    create_window(
+        &mut f,
+        CLIENT_A,
+        WINDOW,
+        yserver_core::resources::ROOT_WINDOW.0,
+        80,
+        285,
+        200,
+        200,
+    );
+    map_window(&mut f, CLIENT_A, WINDOW);
+    f
+}
+
+/// XTS `grabstartup`: XSelectExtensionEvent of the three device classes on
+/// the grab window, then the pointer warped to (1,1) in it.
+fn ade_grabstartup() -> Fixture {
+    let mut f = ade_fixture();
+    let offsets = [
+        yserver_core::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET,
+        yserver_core::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET,
+        yserver_core::xinput::XI_DEVICE_BUTTON_RELEASE_OFFSET,
+    ];
+    let mut body = Vec::new();
+    body.extend_from_slice(&WINDOW.to_le_bytes());
+    body.extend_from_slice(&u16::try_from(offsets.len()).unwrap().to_le_bytes());
+    body.extend_from_slice(&[0; 2]);
+    for offset in offsets {
+        let class = (u32::from(XI_XTEST_POINTER) << 8) | u32::from(XI_FIRST_EVENT + offset);
+        body.extend_from_slice(&class.to_le_bytes());
+    }
+    dispatch(
+        &mut f.state,
+        &mut f.backend,
+        CLIENT_A,
+        5,
+        XI2_OPCODE,
+        XI_SELECT_EXTENSION_EVENT,
+        &body,
+    );
+    assert_eq!(
+        f.state.clients[&CLIENT_A].xi1_window_event_classes[&ResourceId(WINDOW)].len(),
+        3,
+        "XSelectExtensionEvent must register the three XI1 classes"
+    );
+    fake_core_motion(&mut f, 0, 81, 286);
+    let _ = kbd_map_drain(&mut f.client_a);
+    f
+}
+
+/// XTS `ispfrozen`: the device counts as frozen when the simulated
+/// absolute DeviceMotion does not reach the selecting client.
+fn ade_ispfrozen(f: &mut Fixture) -> bool {
+    let _ = kbd_map_drain(&mut f.client_a);
+    fake_device_motion(f, XI_XTEST_POINTER, 0, 0, &[0]);
+    let received = kbd_map_drain(&mut f.client_a);
+    let motion = XI_FIRST_EVENT + yserver_core::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET;
+    !xi1_device_event_ids(&received)
+        .iter()
+        .any(|(kind, device)| *kind == motion && u16::from(*device) == XI_XTEST_POINTER)
+}
+
+fn allow_device_events(f: &mut Fixture, device: u16, mode: u8) {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    body.extend_from_slice(&[mode, u8::try_from(device).unwrap(), 0, 0]);
+    dispatch(
+        &mut f.state,
+        &mut f.backend,
+        CLIENT_A,
+        10,
+        XI2_OPCODE,
+        XI_ALLOW_DEVICE_EVENTS,
+        &body,
+    );
+}
+
+fn grab_core_pointer_sync_sync(f: &mut Fixture, client: u32) {
+    let mut body = Vec::with_capacity(20);
+    body.extend_from_slice(&WINDOW.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes()); // NoEventMask
+    body.extend_from_slice(&[0, 0]); // GrabModeSync, GrabModeSync
+    body.extend_from_slice(&0u32.to_le_bytes()); // no confinement
+    body.extend_from_slice(&0u32.to_le_bytes()); // no cursor
+    body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    dispatch(&mut f.state, &mut f.backend, client, 11, 26, 0, &body); // GrabPointer
+    assert!(
+        f.state
+            .active_pointer_grab
+            .is_some_and(|grab| grab.owner == yserver_protocol::x11::ClientId(client)),
+        "GrabPointer installs the core grab"
+    );
+}
+
+fn grab_core_keyboard_sync_sync(f: &mut Fixture) {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&WINDOW.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    body.extend_from_slice(&[0, 0, 0, 0]); // sync, sync, pad
+    dispatch(&mut f.state, &mut f.backend, CLIENT_A, 12, 31, 0, &body); // GrabKeyboard
+    assert!(
+        f.state.active_keyboard_grab.is_some(),
+        "GrabKeyboard installs the core grab"
+    );
+}
+
+fn ungrab_core(f: &mut Fixture) {
+    dispatch(
+        &mut f.state,
+        &mut f.backend,
+        CLIENT_A,
+        13,
+        27,
+        0,
+        &0u32.to_le_bytes(),
+    ); // UngrabPointer
+    dispatch(
+        &mut f.state,
+        &mut f.backend,
+        CLIENT_A,
+        14,
+        32,
+        0,
+        &0u32.to_le_bytes(),
+    ); // UngrabKeyboard
+}
+
+fn assert_ade_end_state(f: &mut Fixture, xi1_entries: &[u16]) {
+    assert!(
+        f.state.sync_pending.is_empty(),
+        "no input event stays queued"
+    );
+    assert!(
+        f.state.active_keyboard_grab.is_none(),
+        "keyboard grab ended"
+    );
+    let _ = kbd_map_drain(&mut f.client_a);
+    assert!(f.state.active_pointer_grab.is_none(), "master grab ended");
+    assert!(f.state.xi2_pointer_grabs.is_empty(), "slave grabs ended");
+    assert!(f.state.xi1_active_grabs.is_empty(), "XI1 grabs ended");
+    assert_xi1_end_state(f, xi1_entries);
+    assert!(
+        f.state.xi2_detached_masters.is_empty(),
+        "no slave is detached"
+    );
+    assert_button_state_empty(f);
+}
+
+#[test]
+fn xts_ade3_double_grab_async_this_device_thaws() {
+    let mut f = ade_grabstartup();
+    grab_core_pointer_sync_sync(&mut f, CLIENT_A);
+    grab_core_keyboard_sync_sync(&mut f);
+    let _ = kbd_map_drain(&mut f.client_a);
+
+    allow_device_events(&mut f, XI_XTEST_POINTER, ASYNC_THIS_DEVICE);
+    assert!(
+        !ade_ispfrozen(&mut f),
+        "DeviceMotionNotify of the unfrozen slave reaches the client"
+    );
+
+    ungrab_core(&mut f);
+    assert_ade_end_state(&mut f, &[XI_MASTER_POINTER, 3]);
+}
+
+#[test]
+fn xts_ade4_not_frozen_async_this_device() {
+    let mut f = ade_grabstartup();
+    allow_device_events(&mut f, XI_XTEST_POINTER, ASYNC_THIS_DEVICE);
+    assert!(!ade_ispfrozen(&mut f), "no device was frozen");
+    assert_ade_end_state(&mut f, &[]);
+}
+
+#[test]
+fn xts_ade6_sync_this_device_no_freeze() {
+    let mut f = ade_grabstartup();
+    allow_device_events(&mut f, XI_XTEST_POINTER, SYNC_THIS_DEVICE);
+    assert!(!ade_ispfrozen(&mut f), "SyncThisDevice froze nothing");
+    assert_ade_end_state(&mut f, &[]);
+}
+
+#[test]
+fn xts_ade9_replay_this_device_not_frozen() {
+    let mut f = ade_grabstartup();
+    fake_core_motion(&mut f, 0, 81, 286);
+    allow_device_events(&mut f, XI_XTEST_POINTER, REPLAY_THIS_DEVICE);
+    assert!(!ade_ispfrozen(&mut f), "ReplayThisDevice froze nothing");
+    assert_ade_end_state(&mut f, &[]);
+}
+
+/// XTS purposes 4, 6 and 9 say "the device is not frozen by the client, so
+/// the call has no effect". Here another client's synchronous core grab
+/// freezes the master pointer; the call must not thaw it, and the slave's
+/// DeviceMotionNotify must still reach the selecting client.
+fn ade_no_effect_while_other_client_freezes_master(mode: u8) {
+    let mut f = ade_grabstartup();
+    grab_core_pointer_sync_sync(&mut f, CLIENT_B);
+    let _ = kbd_map_drain(&mut f.client_b);
+
+    allow_device_events(&mut f, XI_XTEST_POINTER, mode);
+    assert!(
+        f.state
+            .xi1_frozen
+            .get(&XI_MASTER_POINTER)
+            .is_some_and(yserver_core::server::Xi1Freeze::frozen),
+        "A's AllowDeviceEvents does not thaw B's frozen master"
+    );
+    assert!(
+        !ade_ispfrozen(&mut f),
+        "the slave's DeviceMotionNotify reaches A while B freezes the master"
+    );
+
+    dispatch(
+        &mut f.state,
+        &mut f.backend,
+        CLIENT_B,
+        15,
+        27,
+        0,
+        &0u32.to_le_bytes(),
+    ); // UngrabPointer
+    let _ = kbd_map_drain(&mut f.client_b);
+    assert_ade_end_state(&mut f, &[XI_MASTER_POINTER, 3]);
+}
+
+#[test]
+fn xts_ade4_async_this_device_while_other_client_freezes_master() {
+    ade_no_effect_while_other_client_freezes_master(ASYNC_THIS_DEVICE);
+}
+
+#[test]
+fn xts_ade6_sync_this_device_while_other_client_freezes_master() {
+    ade_no_effect_while_other_client_freezes_master(SYNC_THIS_DEVICE);
+}
+
+#[test]
+fn xts_ade9_replay_this_device_while_other_client_freezes_master() {
+    ade_no_effect_while_other_client_freezes_master(REPLAY_THIS_DEVICE);
+}
+
+fn fake_device_button(f: &mut Fixture, device: u16, detail: u8, press: bool) {
+    let offset = if press {
+        yserver_core::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET
+    } else {
+        yserver_core::xinput::XI_DEVICE_BUTTON_RELEASE_OFFSET
+    };
+    let mut body = vec![0u8; 32];
+    body[0] = XI_FIRST_EVENT + offset;
+    body[1] = detail;
+    body[31] = u8::try_from(device).unwrap();
+    dispatch(
+        &mut f.state,
+        &mut f.backend,
+        CLIENT_A,
+        16,
+        XTEST_OPCODE,
+        XTEST_FAKE_INPUT,
+        &body,
+    );
+}
+
+/// XTS purpose 14: AllowDeviceEvents(SyncAll) with no grab has no effect;
+/// the following DeviceButtonPress selects an XI1 implicit grab on the grab
+/// window (Task 4) and the probe motion still reaches the client.
+#[test]
+fn xts_ade14_sync_all_without_grabs_then_button_press_not_frozen() {
+    let mut f = ade_grabstartup();
+    allow_device_events(&mut f, XI_XTEST_POINTER, 5); // SyncAll
+    fake_device_button(&mut f, XI_XTEST_POINTER, 1, true);
+    assert!(
+        !f.state.xi1_active_grabs.is_empty(),
+        "the delivered DeviceButtonPress creates the XI1 implicit grab"
+    );
+    assert!(
+        !ade_ispfrozen(&mut f),
+        "no grab froze the device after SyncAll"
+    );
+    fake_device_button(&mut f, XI_XTEST_POINTER, 1, false);
+    let _ = kbd_map_drain(&mut f.client_a);
+    assert_ade_end_state(&mut f, &[]);
+}
+
+/// Xorg runs the slave's pass before the master's and only the master's pass
+/// moves the sprite (`../xserver/mi/mieq.c:504-508`): a slave selector gets
+/// the motion leaving its window, a master selector the motion entering its
+/// own (measured on Xvfb 21.1.24; same shape as XTS AllowDeviceEvents'
+/// X=0 probe).
+#[test]
+fn xtest_slave_motion_uses_sprite_before_move_master_uses_after() {
+    let mut f = setup_x_case();
+    select_xi1_motion(&mut f, CLIENT_A, WINDOW, XI_XTEST_POINTER);
+    let _ = kbd_map_drain(&mut f.client_a);
+    let _ = kbd_map_drain(&mut f.client_b);
+
+    // Sprite in W -> OUTSIDE: A's XI1 slave selection on W fires, B's master
+    // selection on OUTSIDE fires.
+    fake_device_motion(&mut f, XI_XTEST_POINTER, 0, 0, &[650, 150]);
+    assert_eq!(
+        xi1_device_event_ids(&kbd_map_drain(&mut f.client_a)),
+        vec![(
+            XI_FIRST_EVENT + yserver_core::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET,
+            XI_XTEST_POINTER as u8,
+        )]
+    );
+    assert_eq!(
+        xi2_event_ids(&kbd_map_drain(&mut f.client_b)),
+        vec![(6, XI_MASTER_POINTER, XI_XTEST_POINTER)]
+    );
+
+    // Sprite OUTSIDE -> W: A's slave form follows the old window (OUTSIDE,
+    // not selected by A); A's master selection (from `setup_x_case`) and the
+    // new window W give the master form instead.
+    fake_device_motion(&mut f, XI_XTEST_POINTER, 0, 0, &[150, 150]);
+    let a = kbd_map_drain(&mut f.client_a);
+    assert!(
+        xi1_device_event_ids(&a).is_empty(),
+        "no slave form from OUTSIDE"
+    );
+    assert_eq!(
+        xi2_event_ids(&a),
+        vec![(6, XI_MASTER_POINTER, XI_XTEST_POINTER)]
+    );
+    assert!(kbd_map_drain(&mut f.client_b).is_empty());
+    assert_end_state(&f);
+}
+
+/// KMS starts its cursor at the primary-output centre. The first motion after
+/// startup, with no preparatory warp, routes the slave form from that actual
+/// sprite window (`../xserver/Xi/exevents.c:1854-1855,1950`).
+#[test]
+fn first_slave_motion_uses_kms_initial_sprite_position_without_warp() {
+    let mut f = fixture();
+    let (initial_x, initial_y) = f.backend.initial_pointer_position();
+    f.state.seed_master_sprite_position(initial_x, initial_y);
+    let left = i16::try_from(initial_x - 100).unwrap();
+    let top = i16::try_from(initial_y - 100).unwrap();
+    create_window(
+        &mut f,
+        CLIENT_A,
+        INITIAL_WINDOW,
+        yserver_core::resources::ROOT_WINDOW.0,
+        left,
+        top,
+        200,
+        200,
+    );
+    map_window(&mut f, CLIENT_A, INITIAL_WINDOW);
+    select_xi2(
+        &mut f,
+        CLIENT_A,
+        INITIAL_WINDOW,
+        XI_XTEST_POINTER,
+        XI_MOTION,
+    );
+
+    let outside_x = initial_x + 150;
+    fake_device_motion(&mut f, XI_XTEST_POINTER, 0, 0, &[outside_x, initial_y]);
+    let deliveries = decode_deliveries(&kbd_map_drain(&mut f.client_a));
+    assert_eq!(deliveries.len(), 1, "the first motion gets one slave form");
+    assert_eq!(deliveries[0].kind, 6);
+    assert!(deliveries[0].xi2);
+    assert_eq!(deliveries[0].window, INITIAL_WINDOW);
+    assert_eq!(f.state.pointer_root, (outside_x as i16, initial_y as i16));
+    assert_end_state(&f);
 }

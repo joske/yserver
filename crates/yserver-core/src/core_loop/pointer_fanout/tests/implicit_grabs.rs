@@ -739,6 +739,12 @@ fn check_slave_implicit_removal_subcase(ending: SlaveGrabEnd) -> Vec<&'static st
         SlaveGrabEnd::Ungrab => {
             ungrab_xi2_device(&mut f, CLIENT_A, device);
             move_to_out(&mut f, origin);
+            // Spec invariant 8 / Xvfb 21.1.24 measurement: leaving W, A's
+            // slave selection on W still gets the motion (pre-move window).
+            assert_eq!(
+                read_packets(&mut f.client_a),
+                vec![xi(6, device, device, W)]
+            );
             release(&mut f, origin, 1);
             assert!(read_packets(&mut f.client_a).is_empty());
             assert!(read_packets(&mut f.client_b).is_empty());
@@ -1438,8 +1444,12 @@ fn owner_disconnect_keeps_other_clients_hold() {
     assert!(!f.backend.grab_cursor_calls[cursor_call_start..].contains(&None));
     assert_eq!(f.state.xi2_detached_masters, detached_before);
 
+    // Spec invariant 8 / Xvfb 21.1.24 measurement: the slave's form routes from
+    // the window the sprite was in BEFORE the move, so entering OUT from a
+    // window B did not select gives B nothing; the master's form is not
+    // selected here.
     move_to_out(&mut f, origin);
-    assert_eq!(read_packets(&mut f.client_b), vec![xi(6, 4, 4, OUT)]);
+    assert!(read_packets(&mut f.client_b).is_empty());
     release(&mut f, origin, 1);
     assert_eq!(read_packets(&mut f.client_b), vec![xi(5, 4, 4, OUT)]);
     ungrab_core_pointer(&mut f, CLIENT_B);
@@ -1470,8 +1480,12 @@ fn destroy_grab_window_ends_slave_implicit_grab() {
     dispatch(&mut f, CLIENT_A, 4, 0, &W.to_le_bytes()); // DestroyWindow
     assert!(f.state.resources.window(ResourceId(W)).is_none());
     assert!(!f.state.xi2_pointer_grabs.contains_key(&XI_XTEST));
+    // Spec invariant 8 / Xvfb 21.1.24 measurement: the slave's form routes from
+    // the window the sprite was in BEFORE the move, so entering OUT from a
+    // window B did not select gives B nothing; the master's form is not
+    // selected here.
     move_to_out(&mut f, origin);
-    assert_eq!(read_packets(&mut f.client_b), vec![xi(6, 4, 4, OUT)]);
+    assert!(read_packets(&mut f.client_b).is_empty());
     release(&mut f, origin, 1);
     assert!(read_packets(&mut f.client_a).is_empty());
     assert_eq!(read_packets(&mut f.client_b), vec![xi(5, 4, 4, OUT)]);

@@ -588,6 +588,18 @@ fn owner_events_xi2_descendant_foreign_selector_gets_nothing() {
 fn owner_events_master_grab_leaves_slave_form_to_selectors() {
     // C5: the master grab redirects only the master form; B keeps its natural slave form.
     let mut f = fixture();
+    // The oracle prepositions the sprite at (145,145) inside W before the case
+    // (PREPOSITION XTestFakeMotionEvent); the slave form routes from that
+    // pre-move window (Xvfb 21.1.24 measurement, spec invariant 8).
+    inject(
+        &mut f,
+        PointerEventKind::MotionNotify,
+        145,
+        145,
+        HOST_WINDOW,
+    );
+    let _ = read_all_capture_available(&mut f.grabber);
+    let _ = read_all_capture_available(&mut f.other);
     select_xi2(&mut f, OTHER, WINDOW, XI_XTEST, XI_MOTION);
     grab_xi2(&mut f, WINDOW);
     inject(
@@ -1249,6 +1261,18 @@ fn core_owner_events_slave_only_xi2_does_not_block() {
     // C7s measured fixture: D is also owned by A; the master owner walk
     // ignores B's slave selection, and B still gets device 4/source 4.
     let mut f = fixture_with_child_owner(GRABBER);
+    // The oracle prepositions the sprite at (145,145) inside W before the case
+    // (PREPOSITION XTestFakeMotionEvent); the slave form routes from that
+    // pre-move window (Xvfb 21.1.24 measurement, spec invariant 8).
+    inject(
+        &mut f,
+        PointerEventKind::MotionNotify,
+        145,
+        145,
+        HOST_WINDOW,
+    );
+    let _ = read_all_capture_available(&mut f.grabber);
+    let _ = read_all_capture_available(&mut f.other);
     select_core(&mut f, GRABBER, WINDOW, CORE_MOTION);
     select_xi2(&mut f, OTHER, CHILD, XI_XTEST, XI_MOTION);
     grab_core(&mut f, OUTSIDE);
@@ -1287,6 +1311,18 @@ fn core_owner_events_slave_only_xi2_does_not_block_b_owned_variant() {
     // the measured W:A,D:A,OUT:A ownership; it preserves coverage of the
     // pre-existing ownership shortcut.
     let mut f = fixture();
+    // The oracle prepositions the sprite at (145,145) inside W before the case
+    // (PREPOSITION XTestFakeMotionEvent); the slave form routes from that
+    // pre-move window (Xvfb 21.1.24 measurement, spec invariant 8).
+    inject(
+        &mut f,
+        PointerEventKind::MotionNotify,
+        145,
+        145,
+        HOST_WINDOW,
+    );
+    let _ = read_all_capture_available(&mut f.grabber);
+    let _ = read_all_capture_available(&mut f.other);
     select_core(&mut f, GRABBER, WINDOW, CORE_MOTION);
     select_xi2(&mut f, OTHER, CHILD, XI_XTEST, XI_MOTION);
     grab_core(&mut f, OUTSIDE);

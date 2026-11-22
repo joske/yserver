@@ -1966,6 +1966,10 @@ pub(super) fn handle_xi1_allow_device_events(
                                     synthetic_repeat,
                                 );
                             }
+                            // The master part of a split pointer event
+                            // lives only in the pending queue; a grab
+                            // activation stores the full event.
+                            crate::server::QueuedInputEvent::HostPointerMaster(..) => {}
                             // Only a device event activates a grab, so
                             // the stored slot never holds a raw event;
                             // processing one is plain master delivery.
