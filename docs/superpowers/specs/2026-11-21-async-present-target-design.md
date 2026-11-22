@@ -1,6 +1,6 @@
 # Async Present with a future target flips in sync (#23)
 
-Status: revision 3, after sol review r2 (F1 the sync decision is taken at arrival and retained; F2 the completion bound covers ordinary one-frame-early executions only). Revision 2 followed sol review r1. Fixes: F1, Xorg makes a future-target flip synced even with Async; F2, no new parking; F3, the completion claim is narrowed; F4, proven defect vs open cause; F5, acceptance cases. Next: sol review, then the user's approval. Base: master `3ef6570b`.
+Status: revision 3, sol review r3 APPROVED; awaiting the user's approval (after sol review r2 (F1 the sync decision is taken at arrival and retained; F2 the completion bound covers ordinary one-frame-early executions only). Revision 2 followed sol review r1. Fixes: F1, Xorg makes a future-target flip synced even with Async; F2, no new parking; F3, the completion claim is narrowed; F4, proven defect vs open cause; F5, acceptance cases. Next: sol review, then the user's approval. Base: master `3ef6570b`.
 
 ## Intent
 
