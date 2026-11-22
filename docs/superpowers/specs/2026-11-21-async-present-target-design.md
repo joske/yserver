@@ -1,6 +1,6 @@
 # Async Present with a future target flips in sync (#23)
 
-Status: revision 2, after sol review r1. Fixes: F1, Xorg makes a future-target flip synced even with Async; F2, no new parking; F3, the completion claim is narrowed; F4, proven defect vs open cause; F5, acceptance cases. Next: sol review, then the user's approval. Base: master `3ef6570b`.
+Status: revision 3, after sol review r2 (F1 the sync decision is taken at arrival and retained; F2 the completion bound covers ordinary one-frame-early executions only). Revision 2 followed sol review r1. Fixes: F1, Xorg makes a future-target flip synced even with Async; F2, no new parking; F3, the completion claim is narrowed; F4, proven defect vs open cause; F5, acceptance cases. Next: sol review, then the user's approval. Base: master `3ef6570b`.
 
 ## Intent
 
@@ -39,14 +39,16 @@ Vulkan `FIFO_RELAXED` follows the same pattern (`src/vulkan/wsi/wsi_common_x11.c
 
 The smallest change matching Xorg: no new scheduling, no new parking.
 
-1. **A future target means a synced flip.** When a Present executes, `PresentOptionAsync` is removed from the options it hands to scanout if its effective target was after the general clock msc used for that execution decision (`msc_is_after(eff, clock_msc)`, the same clock the classifier used). The flip is then submitted like any synced flip and lands on the target vblank. Requests whose target is the current or a past msc keep Async and may tear, as in Xorg.
+1. **A future target at arrival means a synced flip, for good.** Like Xorg's `sync_flip` (`present_vblank.c:113`, decided once in `present_vblank_create` and kept through `present_execute`, `present_scmd.c:232`, `:579`), the decision is taken **at arrival**, with the general clock msc the arrival classifier uses: a request with `PresentOptionAsync` whose effective target is after that msc (`msc_is_after(eff, arrival_clock_msc)`) is a synced request. The decision is stored with the pending request and retained across every deferral (producer fence, acquire syncobj, flip in flight, msc parking), for both PresentPixmap and PresentPixmapSynced. When it executes, Async is removed from the options it hands to scanout, so the commit is synced, even if by then its target has become current or past. A request whose target was current or past **at arrival** keeps Async and may tear, as in Xorg.
 2. **Execution timing unchanged.** `classify_msc_due` stays as it is. Arrival, drain and supersession keep their decisions, wakeups and fallback ladder, so the failed-arm gap of r1 F2 does not arise.
 3. **Tearing state machine.** A synced future-target request does not qualify for tearing. The existing rule (`kms/present.rs`: a direct present without Async exits tearing and resets the probation streak) applies unchanged to the options the candidate now carries. Late frames still build a streak.
 4. **VRR.** Under VRR the direct submission stays ready-driven (`2026-10-23-vrr-design.md:27`); dropping Async there only removes the tearing request. The plan must check that the VRR path does not depend on Async for its timing and state the result.
 
 ## Completion bound
 
-For a request handled by rule 1, the flip retires on the target vblank, so the exact retirement sample, and therefore the completion msc, is `≥ target`.
+For a request handled by rule 1 and executed on the ordinary path, one frame before its target (`eff == clock_msc + 1`, no flip in flight, the commit accepted in time), the synced flip retires on the target vblank, so the exact retirement sample, and therefore the completion msc, equals the target; a missed submission retires later (`> target`).
+
+**Exempt, with today's results kept:** the preserved early fallbacks that execute a distant target immediately: the idle-display fallback (`present_ext.rs` ~867) and the failed shared-wake arm (`run.rs` ~3373). A synced atomic commit carries no target msc, so such a request retires on the next vblank and the unchanged sweep may stamp that msc, below the target, exactly as for a synced request today. Acceptance records this as the expected result for those two cases.
 
 The general rule that "no completion is below its target" is **not** claimed. The sweep's stamping policy, the blackout flush, epoch-change fail-open, and the existing test that stamps an older exact sample (`tests/present_pixmap.rs` ~1982) are unchanged. They are outside this change.
 
@@ -54,7 +56,7 @@ The general rule that "no completion is below its target" is **not** claimed. Th
 
 - **Async future-target presents:**
   - they are submitted as synced commits;
-  - their completion msc is `≥ target`, and equals it when on time;
+  - on the ordinary path their completion msc equals the target when on time and exceeds it when late (fallback exemptions above);
   - no two consecutive on-time presents of one client target the same msc.
 - **Async presents with a current or late target** still flip async when the ledger allows.
 - **Synced presents, supersession, VRR and the idle, blackout and failed-arm ladder** behave exactly as before.
@@ -63,6 +65,8 @@ The general rule that "no completion is below its target" is **not** claimed. Th
 
 - **Tests through production entries** (PresentPixmap dispatch with Async, the backend's flip and retirement path, the KMS test backend for commit kind). Each must fail on master where it covers the fix. Cases:
   - async next-target on direct scanout is synced, with completion = target;
+  - async future target at arrival whose producer becomes ready only after the target msc (fence-deferred PresentPixmap, acquire-deferred PresentPixmapSynced): still synced;
+  - async distant target executed by the idle fallback and by a failed wake arm: synced, completion as today (may be below target);
   - async current-target stays async;
   - async late request;
   - async on the composed path;
