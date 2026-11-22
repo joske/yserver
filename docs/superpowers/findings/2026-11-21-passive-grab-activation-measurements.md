@@ -244,3 +244,21 @@ for c in X1 X2 X3; do   # one fresh server per case
          fprintf(stderr, "unknown case id: %s\n", case_id);
          exit(2);
 ```
+
+## Branch results (2026-11-22, branch head 30b2db33)
+
+Headless yserver with lavapipe, the same clients and comparison rules as above; one fresh server per P, I5 and X case.
+
+- P1, P1m, P2, P2r, P2m, P3, P4, P4b, P4c and P5: all match Xvfb.
+- I1-I8 (implicit-oracle, shared server): all match Xvfb, including I5 (XI1 implicit grab), which differed on #374.
+- C1-C20: unchanged from #374 and equal to Xvfb, except C10, which differs only in raw timestamps, and C15, which cannot run headless (its Rust evidence is unchanged).
+- X1-X3: the sprite position and the delivered forms match Xvfb: (650,150) for X1 and X2, (150,0) for X3.
+- Slave motion forms route from the pre-move sprite window. Measured on Xvfb with core `XTestFakeMotionEvent` and XTest device motion alike: leaving W gives W the slave XI_Motion d4 only, entering W gives it the master d2 only (probes `passive-grabs/probe/m.c`, `q.c`).
+
+XTS (xts5 upstream `6cf9440`, scenarios XI, Xlib13, XIproto), master (`3ef6570b`) vs branch vs Xvfb 21.1.24:
+- No purpose regresses against master, and every changed purpose now matches Xvfb.
+- XSelectExtensionEvent 5: PASS on master, FAIL on the branch, FAIL on Xvfb (I5, pre-MPX assertion).
+- Now passing, as on Xvfb: XSelectExtensionEvent 7, XAllowEvents 8, XGrabKeyboard 12 and 15, XGrabPointer 10.
+- XAllowDeviceEvents is back to master/Xvfb after the per-device freeze. XIproto is identical.
+
+Gate: workspace 5150/0, lavapipe `--ignored` 774/0, `just man`, `pointer_fanout` 5× under 16 busy loops.
