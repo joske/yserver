@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
+mod amdgpu_import;
 mod crtc_config;
 mod export;
 mod platform_hooks;
