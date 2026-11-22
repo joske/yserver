@@ -951,6 +951,7 @@ pub(super) fn execute_present_pixmap_copy(
         request: req,
         wake,
         masked_options,
+        future_target_sync,
         src_host_xid,
         paint_dst_host_xid,
         completion_dst_host_xid,
@@ -1003,7 +1004,11 @@ pub(super) fn execute_present_pixmap_copy(
         update_region_xid: update,
         update_is_full: update_rects.is_none(),
         explicit_sync: matches!(req, PendingPresentRequest::PixmapSynced(_)),
-        options: masked_options,
+        options: if future_target_sync {
+            masked_options & !crate::present_scheduler::PRESENT_OPTION_ASYNC
+        } else {
+            masked_options
+        },
     };
     let completion = crate::backend::CompletedPresentEvent {
         client_id,
@@ -2156,6 +2161,12 @@ pub(super) fn handle_present_request(
                         idle_fence_xid: req.idle_fence,
                     },
                     masked_options,
+                    future_target_sync: masked_options
+                        & crate::present_scheduler::PRESENT_OPTION_ASYNC
+                        != 0
+                        && effective_target_msc.is_some_and(|effective| {
+                            crate::present_scheduler::msc_is_after(effective, domain.raw_msc)
+                        }),
                     src_host_xid: host_xid.as_raw(),
                     paint_dst_host_xid,
                     completion_dst_host_xid: completion_host.unwrap_or(paint_dst_host_xid),
@@ -2603,6 +2614,12 @@ pub(super) fn handle_present_request(
                             release_value: req.release_value,
                         },
                         masked_options,
+                        future_target_sync: masked_options
+                            & crate::present_scheduler::PRESENT_OPTION_ASYNC
+                            != 0
+                            && effective_target_msc.is_some_and(|effective| {
+                                crate::present_scheduler::msc_is_after(effective, domain.raw_msc)
+                            }),
                         src_host_xid: host_xid.as_raw(),
                         paint_dst_host_xid,
                         completion_dst_host_xid: completion_host.unwrap_or(paint_dst_host_xid),
