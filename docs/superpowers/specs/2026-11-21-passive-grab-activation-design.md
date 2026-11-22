@@ -80,6 +80,7 @@ Invariants:
    - slave not frozen, master frozen: the slave's forms (XI2 slave, XI1) and the slave's state are processed and delivered now; only the master's forms (XI2 master, core) and the master's state are queued for the master, and when the master thaws they are processed for the master only, without repeating the slave forms (the device restriction of invariant 4 is the reuse candidate);
    - neither frozen: unchanged.
    This applies to physical and XTest input alike. Clients that select slave events now receive them while the master is frozen, as on Xorg.
+   - **Slave forms of a motion go to the window under the sprite before the move.** Xorg processes the slave pass before the master pass moves the sprite window, so the slave's XI2 and XI1 motion forms are routed from the pre-move sprite window and the master's forms from the post-move one. Measured on Xvfb 21.1.24 (2026-11-22, core `XTestFakeMotionEvent` and XTest device motion alike): leaving W gives W the slave form only; entering W gives W the master form only. This corrects three #374 test expectations that assumed the post-move window for the slave form and were never measured.
 9. **Unchanged:** the crossing chain on activation (NotifyGrab), keyboard hold (`xi1_check_grab_for_syncs`), confine-to, detach and reattach of slave grabs, AllowEvents modes other than replay, and release-time deactivation.
 
 ## Goals
