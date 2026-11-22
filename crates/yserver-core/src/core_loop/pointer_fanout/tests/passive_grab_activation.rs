@@ -3,7 +3,8 @@
 use super::{
     implicit_grabs::{
         Fixture, assert_end_state, assert_end_state_with_xi1_entries, core, create_window,
-        dispatch, map_window, press_over_d, read_packets, release, select_xi2, send, xi,
+        dispatch, map_window, move_to_out, press_over_d, read_packets, release, select_core,
+        select_xi2, send, xi,
     },
     *,
 };
@@ -15,6 +16,7 @@ use yserver_protocol::x11::{ClientId, ResourceId};
 
 const CLIENT_A: u32 = 0xA753;
 const CLIENT_B: u32 = 0xA754;
+const CLIENT_C: u32 = 0xA756;
 const W: u32 = 0x0010_A753;
 const D: u32 = 0x0020_A753;
 const OUT: u32 = 0x0010_A754;
@@ -922,4 +924,465 @@ fn each_ungrab_removes_only_its_protocol() {
     assert!(f.state.button_grabs[0].via_xi2);
     assert_eq!(f.state.button_grabs[0].device_id, XI_MASTER);
     assert_task1_end_state(&f, &[]);
+}
+
+#[test]
+fn p2r_slave_replay_gives_only_slave_forms() {
+    let mut f = p_fixture();
+    select_xi2(&mut f, CLIENT_B, D, XI_XTEST, XI_BUTTONS);
+    select_xi2(&mut f, CLIENT_B, D, XI_MASTER, XI_BUTTONS);
+    xi_grab_button(
+        &mut f,
+        CLIENT_A,
+        XI_XTEST,
+        W,
+        1,
+        0,
+        false,
+        XI_BUTTON_RELEASE,
+    );
+
+    press_over_d(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    let grab = f
+        .state
+        .xi2_pointer_grabs
+        .get(&XI_XTEST)
+        .expect("the synchronous slave passive grab is active after press");
+    assert_eq!(grab.owner, ClientId(CLIENT_A));
+    assert_eq!(grab.grab_window, ResourceId(W));
+    assert!(grab.via_xi2 && grab.passive && !grab.implicit);
+    assert!(f.state.active_pointer_grab.is_none());
+    assert_eq!(f.state.buttons_down, 0);
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(4, XI_XTEST, XI_XTEST, W)]
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    xi_allow_events(&mut f, CLIENT_A, XI_XTEST, 2); // ReplayDevice
+    let implicit = f
+        .state
+        .xi2_pointer_grabs
+        .get(&XI_XTEST)
+        .expect("ReplayDevice creates the implicit grab on the replayed slave");
+    assert_eq!(implicit.owner, ClientId(CLIENT_B));
+    assert_eq!(implicit.grab_window, ResourceId(D));
+    assert!(implicit.via_xi2 && implicit.implicit && !implicit.passive);
+    assert!(f.state.active_pointer_grab.is_none());
+    assert_eq!(f.state.buttons_down, 0);
+    assert!(!f.state.xi2_detached_masters.contains_key(&XI_XTEST));
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(4, XI_XTEST, XI_XTEST, D)],
+        "P2r: replay delivers one slave press and no master-form press"
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+
+    release(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(5, XI_XTEST, XI_XTEST, D)]
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_task1_end_state(&f, &[XI_XTEST]);
+}
+
+#[test]
+fn p3_core_replay_does_not_repeat_slave_press() {
+    let mut f = p_fixture();
+    select_xi2(&mut f, CLIENT_B, D, XI_XTEST, XI_GRAB_MASK);
+    grab_button_core(&mut f, CLIENT_A, W, ANY_BUTTON, ANY_MODIFIER, 0, false);
+
+    press_over_d(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    let grab = f
+        .state
+        .active_pointer_grab
+        .expect("the core synchronous passive grab is active after press");
+    assert_eq!(grab.owner, ClientId(CLIENT_A));
+    assert_eq!(grab.grab_window, ResourceId(W));
+    assert!(!grab.via_xi2 && grab.passive && !grab.implicit);
+    let slave = f
+        .state
+        .xi2_pointer_grabs
+        .get(&XI_XTEST)
+        .expect("the first slave-form press already created B's implicit grab");
+    assert_eq!(slave.owner, ClientId(CLIENT_B));
+    assert_eq!(slave.grab_window, ResourceId(D));
+    assert!(slave.via_xi2 && slave.implicit && !slave.passive);
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(read_packets(&mut f.client_a), vec![core(4, W)]);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(4, XI_XTEST, XI_XTEST, D)]
+    );
+
+    allow_events_core(&mut f, CLIENT_A, 2); // ReplayPointer
+    assert!(f.state.active_pointer_grab.is_none());
+    assert!(
+        f.state
+            .xi2_pointer_grabs
+            .get(&XI_XTEST)
+            .is_some_and(|grab| {
+                grab.owner == ClientId(CLIENT_B)
+                    && grab.grab_window == ResourceId(D)
+                    && grab.via_xi2
+                    && grab.implicit
+                    && !grab.passive
+            }),
+        "the previously delivered slave form keeps its implicit grab"
+    );
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert!(
+        read_packets(&mut f.client_b).is_empty(),
+        "P3: ReplayPointer must not repeat B's already-delivered slave press"
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+
+    move_to_out(&mut f, InputOrigin::XTest(XI_XTEST));
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(6, XI_XTEST, XI_XTEST, D)]
+    );
+    release(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(5, XI_XTEST, XI_XTEST, D)]
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
+#[test]
+fn core_replay_activates_grab_below_grab_window() {
+    let mut f = p_fixture();
+    grab_button_core(&mut f, CLIENT_A, W, 1, ANY_MODIFIER, 0, false);
+    grab_button_core(&mut f, CLIENT_B, D, 1, ANY_MODIFIER, 1, false);
+
+    press_over_d(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    let grab = f
+        .state
+        .active_pointer_grab
+        .expect("the ancestor core synchronous passive grab wins initially");
+    assert_eq!(grab.owner, ClientId(CLIENT_A));
+    assert_eq!(grab.grab_window, ResourceId(W));
+    assert!(!grab.via_xi2 && grab.passive && !grab.implicit);
+    assert!(f.state.xi2_pointer_grabs.is_empty());
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(read_packets(&mut f.client_a), vec![core(4, W)]);
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    allow_events_core(&mut f, CLIENT_A, 2); // ReplayPointer
+    let replay_grab = f
+        .state
+        .active_pointer_grab
+        .expect("ReplayPointer rechecks passive grabs below W (Xorg events.c:1331-1363)");
+    assert_eq!(replay_grab.owner, ClientId(CLIENT_B));
+    assert_eq!(replay_grab.grab_window, ResourceId(D));
+    assert!(!replay_grab.via_xi2 && replay_grab.passive && !replay_grab.implicit);
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(read_packets(&mut f.client_b), vec![core(4, D)]);
+    assert!(read_packets(&mut f.client_a).is_empty());
+
+    release(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert_eq!(read_packets(&mut f.client_b), vec![core(5, D)]);
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
+#[test]
+fn replay_does_not_reactivate_grab_on_grab_window() {
+    let mut f = p_fixture();
+    select_xi2(&mut f, CLIENT_B, D, XI_MASTER, XI_BUTTONS);
+    grab_button_core(&mut f, CLIENT_A, D, ANY_BUTTON, ANY_MODIFIER, 0, false);
+    xi_grab_button(
+        &mut f, CLIENT_A, XI_MASTER, D, ANY_BUTTON, 0, false, XI_BUTTONS,
+    );
+
+    press_over_d(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    let grab = f
+        .state
+        .active_pointer_grab
+        .expect("P4's newer XI2 passive grab activates first");
+    assert_eq!(grab.owner, ClientId(CLIENT_A));
+    assert_eq!(grab.grab_window, ResourceId(D));
+    assert!(grab.via_xi2 && grab.passive && !grab.implicit);
+    assert!(f.state.xi2_pointer_grabs.is_empty());
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(4, XI_MASTER, XI_XTEST, D)]
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    allow_events_core(&mut f, CLIENT_A, 2); // ReplayPointer
+    let replay_grab = f
+        .state
+        .active_pointer_grab
+        .expect("natural replay delivery creates B's master implicit grab");
+    assert_eq!(replay_grab.owner, ClientId(CLIENT_B));
+    assert_eq!(replay_grab.grab_window, ResourceId(D));
+    assert!(replay_grab.via_xi2 && replay_grab.implicit && !replay_grab.passive);
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(4, XI_MASTER, XI_XTEST, D)]
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+
+    release(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(5, XI_MASTER, XI_XTEST, D)]
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
+#[test]
+fn core_replay_activates_grab_below_despite_slave_implicit_grab() {
+    let mut f = p_fixture();
+    // P3's slave selection already gave B the device-4 press and implicit grab
+    // before A's synchronous core grab replays on the master.
+    select_xi2(&mut f, CLIENT_B, D, XI_XTEST, XI_GRAB_MASK);
+    grab_button_core(&mut f, CLIENT_A, W, 1, ANY_MODIFIER, 0, false);
+    grab_button_core(&mut f, CLIENT_B, D, 1, ANY_MODIFIER, 1, false);
+
+    press_over_d(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    let grab = f
+        .state
+        .active_pointer_grab
+        .expect("A's synchronous core passive grab is active after press");
+    assert_eq!(grab.owner, ClientId(CLIENT_A));
+    assert_eq!(grab.grab_window, ResourceId(W));
+    assert!(!grab.via_xi2 && grab.passive && !grab.implicit);
+    let slave = f
+        .state
+        .xi2_pointer_grabs
+        .get(&XI_XTEST)
+        .expect("P3's earlier slave form created B's implicit grab");
+    assert_eq!(slave.owner, ClientId(CLIENT_B));
+    assert_eq!(slave.grab_window, ResourceId(D));
+    assert!(slave.via_xi2 && slave.implicit && !slave.passive);
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(read_packets(&mut f.client_a), vec![core(4, W)]);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(4, XI_XTEST, XI_XTEST, D)]
+    );
+
+    allow_events_core(&mut f, CLIENT_A, 2); // ReplayPointer
+    let replay_grab = f
+        .state
+        .active_pointer_grab
+        .expect("ReplayPointer checks B's core grab below W despite the slave grab");
+    assert_eq!(replay_grab.owner, ClientId(CLIENT_B));
+    assert_eq!(replay_grab.grab_window, ResourceId(D));
+    assert!(!replay_grab.via_xi2 && replay_grab.passive && !replay_grab.implicit);
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(read_packets(&mut f.client_b), vec![core(4, D)]);
+    assert!(read_packets(&mut f.client_a).is_empty());
+
+    release(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    let released = read_packets(&mut f.client_b);
+    assert_eq!(released.len(), 2);
+    assert!(released.contains(&core(5, D)));
+    assert!(released.contains(&xi(5, XI_XTEST, XI_XTEST, D)));
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
+#[test]
+fn master_replay_survives_source_slave_detach() {
+    const XI_GRAB_DEVICE: u8 = 51;
+    const XI_UNGRAB_DEVICE: u8 = 52;
+
+    let mut f = p_fixture();
+    let mut client_c = super::install_capture_client(&mut f.state, CLIENT_C);
+    select_core(&mut f, CLIENT_B, D, 0x000cu32);
+    select_xi2(&mut f, CLIENT_B, D, XI_MASTER, XI_BUTTONS);
+    grab_button_core(&mut f, CLIENT_A, W, 1, ANY_MODIFIER, 0, false);
+
+    press_over_d(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    let grab = f
+        .state
+        .active_pointer_grab
+        .expect("A's synchronous core passive grab is active after press");
+    assert_eq!(grab.owner, ClientId(CLIENT_A));
+    assert_eq!(grab.grab_window, ResourceId(W));
+    assert!(!grab.via_xi2 && grab.passive && !grab.implicit);
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(read_packets(&mut f.client_a), vec![core(4, W)]);
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    let mut grab_body = Vec::with_capacity(20);
+    grab_body.extend_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+    grab_body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    grab_body.extend_from_slice(&0u32.to_le_bytes()); // no cursor
+    grab_body.extend_from_slice(&XI_XTEST.to_le_bytes());
+    grab_body.extend_from_slice(&[1, 1, 0, 0]); // async pointer and paired device
+    grab_body.extend_from_slice(&0u16.to_le_bytes()); // no event mask
+    dispatch(&mut f, CLIENT_C, XI2_OPCODE, XI_GRAB_DEVICE, &grab_body);
+    let grab_reply = read_all_capture_available(&mut client_c);
+    assert_eq!(grab_reply.len(), 32, "XIGrabDevice returns its reply");
+    assert_eq!(grab_reply[0], 1, "XIGrabDevice returns an X reply");
+    assert_eq!(grab_reply[8], 0, "XIGrabDevice succeeds");
+    let slave_grab = f
+        .state
+        .xi2_pointer_grabs
+        .get(&XI_XTEST)
+        .expect("C's explicit device grab occupies slave 4");
+    assert_eq!(slave_grab.owner, ClientId(CLIENT_C));
+    assert_eq!(slave_grab.grab_window, crate::resources::ROOT_WINDOW);
+    assert!(slave_grab.via_xi2 && !slave_grab.passive && !slave_grab.implicit);
+    assert_eq!(
+        f.state.xi_devices.device(XI_XTEST).unwrap().attached_master,
+        None,
+        "XIGrabDevice detaches slave 4 while A's master grab remains active"
+    );
+    assert!(f.state.active_pointer_grab.is_some_and(|active| {
+        active.owner == ClientId(CLIENT_A)
+            && active.grab_window == ResourceId(W)
+            && active.passive
+            && !active.implicit
+    }));
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+
+    allow_events_core(&mut f, CLIENT_A, 2); // ReplayPointer
+    let replayed = read_packets(&mut f.client_b);
+    assert_eq!(replayed, vec![xi(4, XI_MASTER, XI_XTEST, D)]);
+    // B selected both core and XI2 master events. Xorg's same-client
+    // duplicate suppression leaves the master XI2 form in the packet stream.
+    assert!(read_packets(&mut f.client_a).is_empty());
+    let replay_grab = f
+        .state
+        .active_pointer_grab
+        .expect("the replayed master press creates B's master implicit grab");
+    assert_eq!(replay_grab.owner, ClientId(CLIENT_B));
+    assert_eq!(replay_grab.grab_window, ResourceId(D));
+    assert!(replay_grab.via_xi2 && replay_grab.implicit && !replay_grab.passive);
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(
+        f.state.xi_devices.device(XI_XTEST).unwrap().attached_master,
+        None,
+        "replay retains the captured master route while slave 4 remains detached"
+    );
+
+    let mut ungrab_body = Vec::with_capacity(8);
+    ungrab_body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    ungrab_body.extend_from_slice(&XI_XTEST.to_le_bytes());
+    ungrab_body.extend_from_slice(&0u16.to_le_bytes()); // padding
+    dispatch(&mut f, CLIENT_C, XI2_OPCODE, XI_UNGRAB_DEVICE, &ungrab_body);
+    assert!(!f.state.xi2_pointer_grabs.contains_key(&XI_XTEST));
+    assert_eq!(
+        f.state.xi_devices.device(XI_XTEST).unwrap().attached_master,
+        Some(XI_MASTER),
+        "XIUngrabDevice reattaches slave 4 before release"
+    );
+
+    move_to_out(&mut f, InputOrigin::XTest(XI_XTEST));
+    release(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(5, XI_MASTER, XI_XTEST, D)]
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(read_all_capture_available(&mut client_c).is_empty());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD, XI_XTEST]);
+}
+
+#[test]
+fn master_xi2_passive_grab_activates_on_replay_after_detach() {
+    const XI_GRAB_DEVICE: u8 = 51;
+    const XI_UNGRAB_DEVICE: u8 = 52;
+
+    let mut f = p_fixture();
+    let mut client_c = super::install_capture_client(&mut f.state, CLIENT_C);
+    // No XISelectEvents selection: activation must route through B's grab.
+    xi_grab_button(&mut f, CLIENT_B, XI_MASTER, D, 1, 1, false, XI_BUTTON_PRESS);
+    grab_button_core(&mut f, CLIENT_A, W, 1, ANY_MODIFIER, 0, false);
+
+    press_over_d(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    let grab = f
+        .state
+        .active_pointer_grab
+        .expect("A's synchronous core passive grab is active after press");
+    assert_eq!(grab.owner, ClientId(CLIENT_A));
+    assert_eq!(grab.grab_window, ResourceId(W));
+    assert!(!grab.via_xi2 && grab.passive && !grab.implicit);
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(read_packets(&mut f.client_a), vec![core(4, W)]);
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    let mut grab_body = Vec::with_capacity(20);
+    grab_body.extend_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+    grab_body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    grab_body.extend_from_slice(&0u32.to_le_bytes()); // no cursor
+    grab_body.extend_from_slice(&XI_XTEST.to_le_bytes());
+    grab_body.extend_from_slice(&[1, 1, 0, 0]); // async pointer and paired device
+    grab_body.extend_from_slice(&0u16.to_le_bytes()); // no event mask
+    dispatch(&mut f, CLIENT_C, XI2_OPCODE, XI_GRAB_DEVICE, &grab_body);
+    let grab_reply = read_all_capture_available(&mut client_c);
+    assert_eq!(grab_reply.len(), 32, "XIGrabDevice returns its reply");
+    assert_eq!(grab_reply[0], 1, "XIGrabDevice returns an X reply");
+    assert_eq!(grab_reply[8], 0, "XIGrabDevice succeeds");
+    assert!(
+        f.state
+            .xi2_pointer_grabs
+            .get(&XI_XTEST)
+            .is_some_and(|grab| {
+                grab.owner == ClientId(CLIENT_C)
+                    && grab.grab_window == crate::resources::ROOT_WINDOW
+                    && grab.via_xi2
+                    && !grab.passive
+                    && !grab.implicit
+            })
+    );
+    assert_eq!(
+        f.state.xi_devices.device(XI_XTEST).unwrap().attached_master,
+        None,
+        "XIGrabDevice detaches slave 4 while A's master grab remains active"
+    );
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+
+    allow_events_core(&mut f, CLIENT_A, 2); // ReplayPointer
+    let replay_grab = f
+        .state
+        .active_pointer_grab
+        .expect("replay activates B's master XI2 passive grab");
+    assert_eq!(replay_grab.owner, ClientId(CLIENT_B));
+    assert_eq!(replay_grab.grab_window, ResourceId(D));
+    assert!(replay_grab.via_xi2 && replay_grab.passive && !replay_grab.implicit);
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(4, XI_MASTER, XI_XTEST, D)],
+        "the master passive grab receives exactly one activating press"
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_eq!(
+        f.state.xi_devices.device(XI_XTEST).unwrap().attached_master,
+        None,
+        "replay uses the captured master while the source slave stays detached"
+    );
+
+    let mut ungrab_body = Vec::with_capacity(8);
+    ungrab_body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    ungrab_body.extend_from_slice(&XI_XTEST.to_le_bytes());
+    ungrab_body.extend_from_slice(&0u16.to_le_bytes()); // padding
+    dispatch(&mut f, CLIENT_C, XI2_OPCODE, XI_UNGRAB_DEVICE, &ungrab_body);
+    assert!(!f.state.xi2_pointer_grabs.contains_key(&XI_XTEST));
+    assert_eq!(
+        f.state.xi_devices.device(XI_XTEST).unwrap().attached_master,
+        Some(XI_MASTER),
+        "XIUngrabDevice reattaches slave 4 before release"
+    );
+    release(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(5, XI_MASTER, XI_XTEST, D)],
+        "the active master grab routes the release to the same window"
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(read_all_capture_available(&mut client_c).is_empty());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD, XI_XTEST]);
 }

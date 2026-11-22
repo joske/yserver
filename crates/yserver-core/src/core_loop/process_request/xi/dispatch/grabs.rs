@@ -4,7 +4,7 @@ use crate::{
     core_loop::{
         fanout::fanout_event_to_clients,
         key_fanout::replay_frozen_key_to_focus,
-        pointer_fanout::replay_frozen_pointer_event_to_state,
+        pointer_fanout::{PointerReplay, replay_frozen_pointer_event_to_state},
         process_request::{
             RequestOutcome, XI2_FIRST_ERROR, XI2_MAJOR_OPCODE, emit_x11_error_with_minor,
             grabs::{
@@ -1887,10 +1887,29 @@ pub(super) fn handle_xi1_allow_device_events(
                         f.other = None;
                     }
                     let stored = state.xi1_frozen.get_mut(&dev).and_then(|f| f.stored.take());
-                    // Reprocessing masks out passive grabs at or
-                    // above the released grab's window (Xorg
-                    // syncEvents.replayWin → CheckDeviceGrabs).
-                    let replay_floor = state.xi1_active_grabs.get(&dev).map(|g| g.grab_window);
+                    // Capture the device and grab window before deactivation;
+                    // Xorg's CheckDeviceGrabs replay starts strictly below
+                    // syncEvents.replayWin.
+                    let replay = state
+                        .xi1_active_grabs
+                        .get(&dev)
+                        .map(|grab| PointerReplay {
+                            device: dev,
+                            grab_window: grab.grab_window,
+                        })
+                        .or_else(|| {
+                            state.xi2_pointer_grabs.get(&dev).map(|grab| PointerReplay {
+                                device: dev,
+                                grab_window: grab.grab_window,
+                            })
+                        })
+                        .or_else(|| {
+                            state.active_pointer_grab.map(|grab| PointerReplay {
+                                device: dev,
+                                grab_window: grab.grab_window,
+                            })
+                        });
+                    let replay_floor = replay.map(|replay| replay.grab_window);
                     if state.xi1_active_grabs.contains_key(&dev) {
                         xi1_deactivate_device_grab(state, dev);
                     } else if state.active_pointer_grab.is_some_and(|grab| grab.passive) {
@@ -1923,8 +1942,10 @@ pub(super) fn handle_xi1_allow_device_events(
                             }
                             crate::server::QueuedInputEvent::HostPointer(event) => {
                                 let xid_map = backend.xid_map().clone();
+                                let replay = replay
+                                    .expect("a frozen pointer event retains its XI1 grab window");
                                 let _ = replay_frozen_pointer_event_to_state(
-                                    state, backend, &xid_map, event,
+                                    state, backend, &xid_map, event, replay,
                                 );
                             }
                             crate::server::QueuedInputEvent::HostKey(event) => {

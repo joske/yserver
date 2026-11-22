@@ -1766,8 +1766,16 @@ fn replayed_pointer_press_records_held_state_until_release() {
     let origin = crate::core_loop::InputOrigin::XTest(4);
     let press = source_button_event(PointerEventKind::ButtonPress, origin, 1, 1);
 
-    let _ =
-        replay_frozen_pointer_event_to_state(&mut state, &mut backend, &HostXidMap::new(), press);
+    let _ = replay_frozen_pointer_event_to_state(
+        &mut state,
+        &mut backend,
+        &HostXidMap::new(),
+        press,
+        crate::core_loop::pointer_fanout::PointerReplay {
+            device: crate::xinput::DEVICEID_MASTER_POINTER,
+            grab_window: crate::resources::ROOT_WINDOW,
+        },
+    );
     assert_eq!(
         state.buttons_down, 1,
         "replayed press marks the master button down"
@@ -2531,8 +2539,16 @@ fn replayed_pointer_press_does_not_repeat_raw_event() {
     press.kind = PointerEventKind::ButtonPress;
     press.detail = 1;
 
-    let dropped =
-        replay_frozen_pointer_event_to_state(&mut state, &mut backend, &HostXidMap::new(), press);
+    let dropped = replay_frozen_pointer_event_to_state(
+        &mut state,
+        &mut backend,
+        &HostXidMap::new(),
+        press,
+        crate::core_loop::pointer_fanout::PointerReplay {
+            device: crate::xinput::DEVICEID_MASTER_POINTER,
+            grab_window: crate::resources::ROOT_WINDOW,
+        },
+    );
     assert!(dropped.is_empty());
 
     let bytes = read_all_available(&mut peer);

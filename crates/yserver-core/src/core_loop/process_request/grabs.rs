@@ -4,7 +4,7 @@ use crate::{
     core_loop::{
         fanout::{emit_window_event_to_state, fanout_event_to_clients},
         key_fanout::replay_frozen_key_to_focus,
-        pointer_fanout::replay_frozen_pointer_event_to_state,
+        pointer_fanout::{PointerReplay, replay_frozen_pointer_event_to_state},
         process_request::{
             RequestOutcome, XI2_MAJOR_OPCODE, emit_x11_error,
             focus_pointer::emit_core_focus_transition, write_to_client,
@@ -160,20 +160,46 @@ pub(super) fn apply_xi2_allow_events_for_slave(
             .xi1_frozen
             .get_mut(&device_id)
             .and_then(|freeze| freeze.stored.take());
-        if let Some(crate::server::QueuedInputEvent::HostPointer(_)) = stored {
+        if let Some(crate::server::QueuedInputEvent::HostPointer(event)) = stored {
+            // Capture the frozen device and its grab window before removing
+            // the passive grab; replay uses both to select the Xorg pass and
+            // the strict-below replay floor.
+            let replay = state
+                .xi2_pointer_grabs
+                .get(&device_id)
+                .filter(|grab| grab.owner == client_id)
+                .map(|grab| PointerReplay {
+                    device: device_id,
+                    grab_window: grab.grab_window,
+                })
+                .or_else(|| {
+                    state
+                        .xi1_active_grabs
+                        .get(&device_id)
+                        .map(|grab| PointerReplay {
+                            device: device_id,
+                            grab_window: grab.grab_window,
+                        })
+                })
+                .or_else(|| {
+                    state
+                        .active_pointer_grab
+                        .filter(|grab| grab.owner == client_id)
+                        .map(|grab| PointerReplay {
+                            device: device_id,
+                            grab_window: grab.grab_window,
+                        })
+                })
+                .expect("a frozen pointer event retains its slave grab window");
             if let Some(grab) = state.xi2_pointer_grabs.get(&device_id)
                 && grab.owner == client_id
             {
                 state.xi2_pointer_grabs.remove(&device_id);
                 state.reattach_xi2_slave(device_id);
             }
-            if let Some(crate::server::QueuedInputEvent::HostPointer(event)) = stored {
-                let xid_map = backend.xid_map().clone();
-                let _dropped =
-                    crate::core_loop::pointer_fanout::replay_frozen_pointer_event_to_state(
-                        state, backend, &xid_map, event,
-                    );
-            }
+            let xid_map = backend.xid_map().clone();
+            let _dropped =
+                replay_frozen_pointer_event_to_state(state, backend, &xid_map, event, replay);
         } else if let Some(crate::server::QueuedInputEvent::HostKeyTransition(
             event,
             master_transition_accepted,
@@ -391,6 +417,26 @@ pub(super) fn apply_allow_events(
     // branch a GrabPointer(GrabModeSync) replays the frozen event but
     // stays active → user-visible stuck grab.
     let pointer_has_event = frozen_pointer.is_some();
+    let replay_context = (pointer_replay && pointer_has_event)
+        .then(|| {
+            state
+                .active_pointer_grab
+                .filter(|grab| grab.passive || grab.owner == client_id)
+                .map(|grab| PointerReplay {
+                    device: dev_ptr,
+                    grab_window: grab.grab_window,
+                })
+                .or_else(|| {
+                    state
+                        .xi1_active_grabs
+                        .get(&dev_ptr)
+                        .map(|grab| PointerReplay {
+                            device: dev_ptr,
+                            grab_window: grab.grab_window,
+                        })
+                })
+        })
+        .flatten();
     if pointer_replay && state.active_pointer_grab.is_some_and(|grab| grab.passive) {
         // Xorg `DeactivatePointerGrab` → `DoEnterLeaveEvents(grab
         // window → sprite, NotifyUngrab)` (dix/events.c:1711): mirror
@@ -492,7 +538,9 @@ pub(super) fn apply_allow_events(
         // passive grab on the panel, AllowEvents fires, mate-panel
         // (only XI2 mask, no core mask) saw the queued release
         // but no press → menu clicks dead.
-        let _dropped = replay_frozen_pointer_event_to_state(state, backend, &xid_map, event);
+        let replay = replay_context.expect("a core frozen pointer event retains its grab window");
+        let _dropped =
+            replay_frozen_pointer_event_to_state(state, backend, &xid_map, event, replay);
     }
     if keyboard_replay
         && let Some(crate::server::QueuedInputEvent::HostKeyTransition(

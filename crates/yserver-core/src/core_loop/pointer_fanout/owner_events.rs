@@ -2,10 +2,10 @@
 //! XI 1.x direct FakeInput delivery.
 
 use super::{
-    ClientId, PointerXiSource, ROOT_WINDOW, ResourceId, ServerState, XI2_MAJOR_OPCODE,
-    XI2_MASTER_POINTER_DEVICE_ID, Xi2PointerForm, clamp_grab_coord, fanout_event_to_clients, x11,
-    xi1_window_selectors, xi2_child_toward, xi2_form_targets_for_source,
-    xi2_route_window_for_source,
+    ClientId, PointerReplay, PointerXiSource, ROOT_WINDOW, ResourceId, ServerState,
+    XI2_MAJOR_OPCODE, XI2_MASTER_POINTER_DEVICE_ID, Xi2PointerForm, clamp_grab_coord,
+    fanout_event_to_clients, x11, xi1_window_selectors, xi2_child_toward,
+    xi2_form_targets_for_source, xi2_route_window_for_source,
 };
 
 /// One recipient/form decision for smooth-scroll update and stop motions.
@@ -32,6 +32,7 @@ pub(super) fn xi2_motion_targets_for_source(
     root_x: i16,
     root_y: i16,
     source_accepted: bool,
+    replay: Option<PointerReplay>,
 ) -> Vec<Xi2MotionTarget> {
     const XI_MOTION: u16 = 6;
     if !source_accepted {
@@ -39,16 +40,28 @@ pub(super) fn xi2_motion_targets_for_source(
     }
 
     let mut forms = Vec::with_capacity(2);
-    if let Some(deviceid) = source.slave_deviceid {
-        forms.push((Xi2PointerForm::Slave, deviceid));
-    }
-    if source.attached_master == Some(XI2_MASTER_POINTER_DEVICE_ID) {
-        forms.push((Xi2PointerForm::Master, XI2_MASTER_POINTER_DEVICE_ID));
+    if let Some(replay) = replay {
+        match state.xi_devices.role(replay.device) {
+            Some(crate::xinput::XiDeviceRole::SlavePointer) => {
+                forms.push((Xi2PointerForm::Slave, replay.device));
+            }
+            Some(crate::xinput::XiDeviceRole::MasterPointer) => {
+                forms.push((Xi2PointerForm::Master, replay.device));
+            }
+            _ => {}
+        }
+    } else {
+        if let Some(deviceid) = source.slave_deviceid {
+            forms.push((Xi2PointerForm::Slave, deviceid));
+        }
+        if source.attached_master == Some(XI2_MASTER_POINTER_DEVICE_ID) {
+            forms.push((Xi2PointerForm::Master, XI2_MASTER_POINTER_DEVICE_ID));
+        }
     }
 
     let mut targets = Vec::new();
     for (form, deviceid) in forms {
-        if let Some(grab) = grab_for_form(state, source, form) {
+        if let Some(grab) = grab_for_form(state, source, form, replay) {
             let natural = if grab.owner_events {
                 owner_events_route(
                     state,
@@ -281,7 +294,19 @@ pub(super) fn grab_for_form(
     state: &ServerState,
     source: PointerXiSource,
     form: Xi2PointerForm,
+    replay: Option<PointerReplay>,
 ) -> Option<crate::server::ActivePointerGrab> {
+    if let Some(replay) = replay {
+        return match (state.xi_devices.role(replay.device), form) {
+            (Some(crate::xinput::XiDeviceRole::MasterPointer), Xi2PointerForm::Master) => {
+                state.active_pointer_grab
+            }
+            (Some(crate::xinput::XiDeviceRole::SlavePointer), Xi2PointerForm::Slave) => {
+                state.xi2_pointer_grabs.get(&replay.device).copied()
+            }
+            _ => None,
+        };
+    }
     match form {
         Xi2PointerForm::Master => (source.sourceid == XI2_MASTER_POINTER_DEVICE_ID
             || source.attached_master == Some(XI2_MASTER_POINTER_DEVICE_ID))

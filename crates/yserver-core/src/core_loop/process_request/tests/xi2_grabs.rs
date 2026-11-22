@@ -931,48 +931,62 @@ fn xi_dynamic_grabs_slave_pointer_replay_reattaches_and_replays_to_natural_targe
     let mut backend = RecordingBackend::new();
     let (source_id, pointer_id) =
         xi_dynamic_grab_source(&mut state, 41, false, true, "replay-pointer");
+    let mut expected_xi1_freeze_devices: std::collections::BTreeSet<_> =
+        state.xi1_frozen.keys().copied().collect();
+    expected_xi1_freeze_devices.insert(pointer_id);
     assert!(pointer_id > 5, "test must use a dynamic physical slave ID");
     assert_eq!(
         state.xi_devices.role(pointer_id),
         Some(crate::xinput::XiDeviceRole::SlavePointer)
     );
-    state.resources.create_window(
+    let mut create_body = Vec::with_capacity(28);
+    create_body.extend_from_slice(&TARGET_WINDOW.to_le_bytes());
+    create_body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+    create_body.extend_from_slice(&0i16.to_le_bytes());
+    create_body.extend_from_slice(&0i16.to_le_bytes());
+    create_body.extend_from_slice(&100u16.to_le_bytes());
+    create_body.extend_from_slice(&100u16.to_le_bytes());
+    create_body.extend_from_slice(&0u16.to_le_bytes());
+    create_body.extend_from_slice(&1u16.to_le_bytes()); // InputOutput
+    create_body.extend_from_slice(&ROOT_VISUAL.0.to_le_bytes());
+    create_body.extend_from_slice(&0u32.to_le_bytes()); // no attributes
+    process_dynamic_request(
+        &mut state,
+        &mut backend,
         ClientId(TARGET_CLIENT),
-        yserver_protocol::x11::CreateWindowRequest {
-            depth: 24,
-            window: ResourceId(TARGET_WINDOW),
-            parent: ROOT_WINDOW,
-            x: 0,
-            y: 0,
-            width: 100,
-            height: 100,
-            border_width: 0,
-            class: 1,
-            visual: ROOT_VISUAL,
-            ..Default::default()
-        },
+        SequenceNumber(1),
+        1, // CreateWindow
+        24,
+        &create_body,
     );
-    let _ = state.resources.map_window(ResourceId(TARGET_WINDOW));
-    state
-        .clients
-        .get_mut(&TARGET_CLIENT)
-        .expect("target client")
-        .event_masks
-        .insert(ResourceId(TARGET_WINDOW), 0x0004); // ButtonPressMask
+    process_dynamic_request(
+        &mut state,
+        &mut backend,
+        ClientId(TARGET_CLIENT),
+        SequenceNumber(2),
+        8, // MapWindow
+        0,
+        &TARGET_WINDOW.to_le_bytes(),
+    );
+    // P2r and Xorg dix/events.c:1336 + Xi/exevents.c:964 replay the frozen
+    // slave device only, so select both edges on that slave.
+    process_xi_dynamic_request(
+        &mut state,
+        &mut backend,
+        ClientId(TARGET_CLIENT),
+        SequenceNumber(3),
+        46, // XISelectEvents
+        &xi_dynamic_select_events_body(TARGET_WINDOW, pointer_id, (1 << 4) | (1 << 5)), // P2r: XI_ButtonPress|Release
+    );
     Backend::register_top_level(&mut backend, None, ResourceId(TARGET_WINDOW), HOST_XID)
         .expect("register physical input target");
 
-    handle_xi2_request(
+    process_xi_dynamic_request(
         &mut state,
         &mut backend,
-        None,
         ClientId(GRAB_CLIENT),
         SequenceNumber(1),
-        yserver_protocol::x11::RequestHeader {
-            opcode: 131,
-            data: 54,
-            length_units: 9,
-        },
+        54, // XIPassiveGrabDevice
         &xi_dynamic_passive_grab_body(
             ROOT_WINDOW.0,
             1,
@@ -981,8 +995,7 @@ fn xi_dynamic_grabs_slave_pointer_replay_reattaches_and_replays_to_natural_targe
             0, // synchronous pointer mode
             1, // asynchronous paired-device mode
         ),
-    )
-    .expect("XIPassiveGrabDevice button");
+    );
     let _ = read_all_available(&mut grab_peer); // XIPassiveGrabDevice reply
 
     let xid_map = backend.xid_map().clone();
@@ -1005,7 +1018,22 @@ fn xi_dynamic_grabs_slave_pointer_replay_reattaches_and_replays_to_natural_targe
     };
     let _ = pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
 
-    assert!(state.xi2_pointer_grabs.contains_key(&pointer_id));
+    let passive = state
+        .xi2_pointer_grabs
+        .get(&pointer_id)
+        .expect("the slave passive grab is active after the press");
+    assert_eq!(passive.owner, ClientId(GRAB_CLIENT));
+    assert_eq!(passive.grab_window, ROOT_WINDOW);
+    assert!(passive.via_xi2 && passive.passive && !passive.implicit);
+    assert_eq!(
+        state.buttons_down, 0,
+        "slave activation has no master button"
+    );
+    assert_eq!(
+        state.xi_devices.device(pointer_id).unwrap().buttons_down,
+        1,
+        "the activating button is held on the slave"
+    );
     assert_eq!(
         state.xi_devices.device(pointer_id).unwrap().attached_master,
         None,
@@ -1027,27 +1055,29 @@ fn xi_dynamic_grabs_slave_pointer_replay_reattaches_and_replays_to_natural_targe
         "the natural target waits for XIReplayDevice"
     );
 
-    handle_xi2_request(
+    process_xi_dynamic_request(
         &mut state,
         &mut backend,
-        None,
         ClientId(GRAB_CLIENT),
         SequenceNumber(2),
-        yserver_protocol::x11::RequestHeader {
-            opcode: 131,
-            data: 53,
-            length_units: 3,
-        },
+        53, // XIAllowEvents ReplayDevice
         &xi_dynamic_allow_replay_body(pointer_id),
-    )
-    .expect("XIAllowEvents ReplayDevice");
+    );
 
-    assert!(!state.xi2_pointer_grabs.contains_key(&pointer_id));
-    assert!(state.active_pointer_grab.is_some_and(|grab| {
-        grab.implicit
-            && grab.owner == ClientId(TARGET_CLIENT)
-            && grab.grab_window == ResourceId(TARGET_WINDOW)
-    }));
+    assert!(state.active_pointer_grab.is_none());
+    assert!(
+        state
+            .xi2_pointer_grabs
+            .get(&pointer_id)
+            .is_some_and(|grab| {
+                grab.implicit
+                    && grab.via_xi2
+                    && !grab.passive
+                    && grab.owner == ClientId(TARGET_CLIENT)
+                    && grab.grab_window == ResourceId(TARGET_WINDOW)
+            }),
+        "P2r: ReplayDevice creates the slave implicit grab only on device {pointer_id}"
+    );
     assert_eq!(
         state.xi_devices.device(pointer_id).unwrap().attached_master,
         Some(crate::xinput::DEVICEID_MASTER_POINTER),
@@ -1058,20 +1088,16 @@ fn xi_dynamic_grabs_slave_pointer_replay_reattaches_and_replays_to_natural_targe
     assert!(state.xi1_frozen[&pointer_id].stored.is_none());
 
     let replay = read_all_or_buffered(&mut state, TARGET_CLIENT, &mut target_peer);
-    assert!(
-        replay.len() >= 32,
-        "expected replayed ButtonPress, got {} bytes",
-        replay.len()
-    );
     assert_eq!(
-        replay[0] & 0x7f,
-        4,
-        "replay reaches the target as ButtonPress"
+        xi_dynamic_event_ids(&replay),
+        [(4, pointer_id, pointer_id)],
+        "P2r/Xorg events.c:1336 and Xi/exevents.c:964: replay delivers only the slave XI2 press"
     );
+    assert!(replay.len() >= 32, "the XI2 replay packet is complete");
     assert_eq!(
-        &replay[12..16],
+        &replay[24..28],
         &TARGET_WINDOW.to_le_bytes(),
-        "XIReplayDevice delivers to the natural target after the passive grab"
+        "XIReplayDevice delivers the XI2 packet to the natural target window"
     );
 
     let _ = pointer_event_fanout_to_state(
@@ -1087,8 +1113,36 @@ fn xi_dynamic_grabs_slave_pointer_replay_reattaches_and_replays_to_natural_targe
         true,
         false,
     );
+    let released = read_all_or_buffered(&mut state, TARGET_CLIENT, &mut target_peer);
+    assert_eq!(
+        xi_dynamic_event_ids(&released),
+        [(5, pointer_id, pointer_id)],
+        "the slave implicit grab routes release on its original device"
+    );
     assert!(state.xi2_pointer_grabs.is_empty());
     assert!(state.active_pointer_grab.is_none());
+    assert!(state.xi1_active_grabs.is_empty());
+    assert!(state.xi2_detached_masters.is_empty());
+    let actual_xi1_freeze_devices: std::collections::BTreeSet<_> =
+        state.xi1_frozen.keys().copied().collect();
+    assert_eq!(actual_xi1_freeze_devices, expected_xi1_freeze_devices);
+    assert!(state.xi1_frozen.values().all(|freeze| {
+        freeze.state == crate::server::Xi1SyncState::Thawed
+            && freeze.other.is_none()
+            && freeze.stored.is_none()
+    }));
+    assert_eq!(state.buttons_down, 0);
+    for device in state.xi_devices.devices().iter().filter(|device| {
+        device.facet == Some(crate::xinput::XiFacetKind::PointerTouch)
+            || device.id == crate::xinput::DEVICEID_XTEST_POINTER
+    }) {
+        assert_eq!(
+            device.buttons_down, 0,
+            "pointer device {} is released",
+            device.id
+        );
+    }
+    assert!(state.unpublished_pointer_buttons_down.is_empty());
 }
 
 #[test]

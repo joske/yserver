@@ -4088,6 +4088,8 @@ impl ServerState {
         state_mask: u16,
         device_id: u16,
         master_device_id: Option<u16>,
+        replay_pass: Option<PassiveGrabPass>,
+        replay_floor: Option<ResourceId>,
     ) -> Option<(PassiveButtonGrab, PassiveGrabPass)> {
         // Xorg checks the slave device over the whole sprite trace before
         // checking the master (`../xserver/dix/grabs.c:439-458`). Within a
@@ -4114,15 +4116,29 @@ impl ServerState {
                 .then_some(device_id)
             });
         let mut passes = Vec::with_capacity(2);
-        if self.xi_devices.role(device_id) == Some(crate::xinput::XiDeviceRole::SlavePointer) {
-            passes.push(PassiveGrabPass::Slave(device_id));
-        }
-        if master_id.is_some() {
-            passes.push(PassiveGrabPass::Master);
+        if let Some(replay_pass) = replay_pass {
+            passes.push(replay_pass);
+        } else {
+            if self.xi_devices.role(device_id) == Some(crate::xinput::XiDeviceRole::SlavePointer) {
+                passes.push(PassiveGrabPass::Slave(device_id));
+            }
+            if master_id.is_some() {
+                passes.push(PassiveGrabPass::Master);
+            }
         }
 
+        // Replay starts CheckDeviceGrabs strictly below syncEvents.replayWin
+        // (Xorg dix/events.c:1331-1363). If the original grab window is no
+        // longer on the event's sprite trace, there are no candidates below it.
+        let first_window = replay_floor.map_or(0, |floor| {
+            chain
+                .iter()
+                .position(|candidate| *candidate == floor)
+                .map_or(chain.len(), |index| index + 1)
+        });
+
         for pass in passes {
-            for current in &chain {
+            for current in chain.iter().skip(first_window) {
                 let matching = self.button_grabs.iter().rev().find(|grab| {
                     if grab.grab_window != *current {
                         return false;
@@ -4551,6 +4567,8 @@ fn pointer_event_fanout_inner(
                 event.detail,
                 event.state,
                 xi_pointer_device_id,
+                None,
+                None,
                 None,
             )
             .map(|(grab, _pass)| (grab, hit_window))
