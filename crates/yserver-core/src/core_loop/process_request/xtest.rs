@@ -346,6 +346,107 @@ fn dispatch_fake_input_with_body(
             );
         }
 
+        // Xorg's ProcXTestFakeInput (../xserver/Xext/xtest.c:248-284) reads
+        // DeviceMotionNotify's firstValuator from its first DeviceValuator
+        // and checks it against the selected device record's ValuatorClass
+        // before validating any trailing chunk. Other XI event types start
+        // with firstValuator zero.
+        let first_valuator = if xi_offset == Some(crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET) {
+            body[32 + 7]
+        } else {
+            0
+        };
+        let num_axes = state
+            .xi_devices
+            .device(device_id)
+            .map_or(0, |device| device.class_shape.valuator_count());
+        if xi_offset == Some(crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET)
+            && first_valuator > num_axes
+        {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(fi.event_type),
+                u16::from(header.data),
+                header.opcode,
+            );
+        }
+
+        // Xorg rejects trailing events for devices with no ValuatorClass,
+        // reporting firstValuator (zero for every non-motion event;
+        // ../xserver/Xext/xtest.c:272-276).
+        if body.len() > 32 && num_axes == 0 {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(first_valuator),
+                u16::from(header.data),
+                header.opcode,
+            );
+        }
+
+        // ProcXTestFakeInput validates each continuation in wire order:
+        // event type, contiguous range, count, then the device axis bound
+        // (../xserver/Xext/xtest.c:278-315). This applies to button and key
+        // events with valuator chunks too.
+        let mut base = usize::from(first_valuator);
+        for dv in body[32..].chunks_exact(32) {
+            if dv[0] != crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_VALUATOR_OFFSET {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(dv[0]),
+                    u16::from(header.data),
+                    header.opcode,
+                );
+            }
+            let chunk_first = usize::from(dv[7]);
+            if chunk_first != base {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(dv[7]),
+                    u16::from(header.data),
+                    header.opcode,
+                );
+            }
+            let num_valuators = usize::from(dv[6]);
+            if !(1..=6).contains(&num_valuators) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(dv[6]),
+                    u16::from(header.data),
+                    header.opcode,
+                );
+            }
+            base += num_valuators;
+            if base > usize::from(num_axes) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(dv[6]),
+                    u16::from(header.data),
+                    header.opcode,
+                );
+            }
+        }
+
+        // Xorg's event-specific checks follow the chunk loop
+        // (../xserver/Xext/xtest.c:393-424). Keep that order so a malformed
+        // chunk supplies the reported error before an invalid detail.
         match xi_offset {
             Some(crate::xinput::XI_DEVICE_KEY_PRESS_OFFSET)
             | Some(crate::xinput::XI_DEVICE_KEY_RELEASE_OFFSET)
@@ -365,6 +466,17 @@ fn dispatch_fake_input_with_body(
             | Some(crate::xinput::XI_DEVICE_BUTTON_RELEASE_OFFSET)
                 if !fake_input_button_valid(&state.xi_devices, device_id, fi.detail) =>
             {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(fi.detail),
+                    u16::from(header.data),
+                    header.opcode,
+                );
+            }
+            Some(crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET) if fi.detail > 1 => {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -516,7 +628,7 @@ fn dispatch_fake_input_with_body(
                 let mut chunk = 32;
                 let mut got_first = false;
                 while let Some(dv) = body.get(chunk..chunk + 32) {
-                    let num = usize::from(dv[6].min(6));
+                    let num = usize::from(dv[6]);
                     if !got_first {
                         axes.first = dv[7];
                         got_first = true;
@@ -524,9 +636,6 @@ fn dispatch_fake_input_with_body(
                     for i in 0..num {
                         let off = 8 + i * 4;
                         let slot = usize::from(axes.count);
-                        if slot >= 6 {
-                            break;
-                        }
                         axes.values[slot] =
                             i32::from_le_bytes([dv[off], dv[off + 1], dv[off + 2], dv[off + 3]]);
                         #[allow(clippy::cast_possible_truncation)]
