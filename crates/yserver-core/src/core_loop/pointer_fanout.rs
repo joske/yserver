@@ -23,7 +23,8 @@ use buttons::{master_button_transition, pointer_button_transition};
 pub(in crate::core_loop) use owner_events::xtest_wire_valuators;
 use owner_events::{
     OwnerEventsRoute, OwnerProtocol, Xi1SelectionFilter, grab_for_form, owner_events_route,
-    xi1_selection_filter_for_slave_grab, xi2_motion_targets_for_source,
+    xi1_device_mask_on_window, xi1_event_mask_bit, xi1_selection_filter_for_slave_grab,
+    xi1_window_selectors, xi1_window_selectors_with_grab_class, xi2_motion_targets_for_source,
 };
 
 use yserver_protocol::x11::{self, ClientId, ResourceId, SequenceNumber};
@@ -3261,26 +3262,34 @@ pub(crate) fn xi1_route_device_event(
         xi1_fan_device_event(state, targets, *w, &q)
     });
     merge_dropped(&mut dropped, xi1_dropped);
-    if xi1_implicit_press
-        && let Some((targets, grab_window)) = hit.as_ref()
-        && let Some(owner) = targets.first().copied()
-    {
-        let device_mask = xi1_device_mask_on_window(state, *grab_window, q.deviceid);
-        state.xi1_active_grabs.insert(
-            q.deviceid,
-            crate::server::Xi1ActiveGrab {
-                owner,
-                deviceid: q.deviceid,
-                grab_window: *grab_window,
-                owner_events: false,
-                this_mode: 1,
-                other_mode: 1,
-                implicit: true,
-                device_mask,
-                passive_detail: None,
-            },
-        );
-        state.xi1_last_grab_time = q.time;
+    if xi1_implicit_press && let Some((targets, grab_window)) = hit.as_ref() {
+        // ../xserver/dix/events.c:2277-2310 walks every delivering node,
+        // including duplicate clients. The first node with ButtonGrab wins;
+        // otherwise the last delivering node owns the implicit grab.
+        let owner = xi1_window_selectors_with_grab_class(state, *grab_window, q.evcode, q.deviceid)
+            .iter()
+            .find_map(|(client, has_grab_class)| {
+                (*has_grab_class && targets.contains(client)).then_some(*client)
+            })
+            .or_else(|| targets.last().copied());
+        if let Some(owner) = owner {
+            let device_mask = xi1_device_mask_on_window(state, *grab_window, q.deviceid);
+            state.xi1_active_grabs.insert(
+                q.deviceid,
+                crate::server::Xi1ActiveGrab {
+                    owner,
+                    deviceid: q.deviceid,
+                    grab_window: *grab_window,
+                    owner_events: false,
+                    this_mode: 1,
+                    other_mode: 1,
+                    implicit: true,
+                    device_mask,
+                    passive_detail: None,
+                },
+            );
+            state.xi1_last_grab_time = q.time;
+        }
     }
     // A BRIDGED core grab (no XI1 grab, but the core pointer/keyboard
     // grab controls this device) must still trip an armed
@@ -3363,47 +3372,6 @@ fn resolve_slave_press_delivery(
     SlavePressDelivery::None
 }
 
-/// Clients that selected `(deviceid << 8) | evcode` on exactly `window`.
-fn xi1_window_selectors(
-    state: &ServerState,
-    window: ResourceId,
-    evcode: u8,
-    deviceid: u16,
-) -> Vec<ClientId> {
-    let class = (u32::from(deviceid) << 8) | u32::from(evcode);
-    state
-        .clients
-        .iter()
-        .filter(|(_, c)| {
-            c.xi1_window_event_classes
-                .get(&window)
-                .is_some_and(|set| set.contains(&class))
-        })
-        .map(|(id, _)| ClientId(*id))
-        .collect()
-}
-
-fn xi1_event_mask_bit(event_type: u8) -> u32 {
-    let Some(offset) = event_type.checked_sub(crate::server::XI_FIRST_EVENT) else {
-        return 0;
-    };
-    if offset < 32 { 1_u32 << offset } else { 0 }
-}
-
-fn xi1_device_mask_on_window(state: &ServerState, window: ResourceId, deviceid: u16) -> u32 {
-    state
-        .clients
-        .values()
-        .filter_map(|client| client.xi1_window_event_classes.get(&window))
-        .flatten()
-        .filter(|class| **class >> 8 == u32::from(deviceid))
-        .fold(0, |mask, class| {
-            mask | xi1_event_mask_bit(
-                u8::try_from(*class & 0xff).expect("XI1 event code fits one byte"),
-            )
-        })
-}
-
 /// True when `grab_window` is `target` or one of its ancestors.
 fn xi1_window_in_chain(state: &ServerState, target: ResourceId, grab_window: ResourceId) -> bool {
     let mut window = target;
@@ -3472,49 +3440,56 @@ fn xi1_fan_device_event(
     let (ox, oy) = state.resources.window_absolute_position(event_window);
     let event_x = clamp_grab_coord(q.root_x, ox);
     let event_y = clamp_grab_coord(q.root_y, oy);
-    fanout_event_to_clients(state, &targets, |buf, seq, order| {
-        crate::xinput::encode_xi1_device_input_event(
-            buf,
-            order,
-            q.evcode,
-            q.detail,
-            seq,
-            q.time,
-            ROOT_WINDOW.0,
-            event_window.0,
-            child.0,
-            q.root_x,
-            q.root_y,
-            event_x,
-            event_y,
-            q.state_mask,
-            if is_motion {
-                q.deviceid | u16::from(crate::xinput::XI1_MORE_EVENTS)
-            } else {
-                q.deviceid
-            },
-        );
-        if is_motion {
-            // Faked motion carries its explicit axis payload; real
-            // motion reports the X/Y axes (= sprite position).
-            let (num, first_v, values) = match q.axes {
-                Some(a) => (a.count.min(6), a.first, a.values),
-                None => (2, 0, [i32::from(q.root_x), i32::from(q.root_y), 0, 0, 0, 0]),
-            };
-            #[allow(clippy::cast_possible_truncation)]
-            crate::xinput::encode_xi1_device_valuator(
+    let mut dropped = Vec::new();
+    // The general fanout deduplicates client IDs. XI1 selection delivery
+    // instead sends once per InputClients node (../xserver/dix/events.c:2277).
+    for client in targets {
+        let failed = fanout_event_to_clients(state, &[client], |buf, seq, order| {
+            crate::xinput::encode_xi1_device_input_event(
                 buf,
                 order,
-                crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_VALUATOR_OFFSET,
-                q.deviceid as u8,
+                q.evcode,
+                q.detail,
                 seq,
+                q.time,
+                ROOT_WINDOW.0,
+                event_window.0,
+                child.0,
+                q.root_x,
+                q.root_y,
+                event_x,
+                event_y,
                 q.state_mask,
-                num,
-                first_v,
-                values,
+                if is_motion {
+                    q.deviceid | u16::from(crate::xinput::XI1_MORE_EVENTS)
+                } else {
+                    q.deviceid
+                },
             );
-        }
-    })
+            if is_motion {
+                // Faked motion carries its explicit axis payload; real
+                // motion reports the X/Y axes (= sprite position).
+                let (num, first_v, values) = match q.axes {
+                    Some(a) => (a.count.min(6), a.first, a.values),
+                    None => (2, 0, [i32::from(q.root_x), i32::from(q.root_y), 0, 0, 0, 0]),
+                };
+                #[allow(clippy::cast_possible_truncation)]
+                crate::xinput::encode_xi1_device_valuator(
+                    buf,
+                    order,
+                    crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_VALUATOR_OFFSET,
+                    q.deviceid as u8,
+                    seq,
+                    q.state_mask,
+                    num,
+                    first_v,
+                    values,
+                );
+            }
+        });
+        merge_dropped(&mut dropped, failed);
+    }
+    dropped
 }
 
 /// Resolve the Xorg paired master from the requested device's current
@@ -3864,19 +3839,9 @@ fn compute_xi1_targets_bounded(
     deviceid: u16,
     stop_at: Option<ResourceId>,
 ) -> Option<(Vec<ClientId>, ResourceId)> {
-    let class = (u32::from(deviceid) << 8) | u32::from(evcode);
     let mut window = target;
     loop {
-        let targets: Vec<ClientId> = state
-            .clients
-            .iter()
-            .filter(|(_, c)| {
-                c.xi1_window_event_classes
-                    .get(&window)
-                    .is_some_and(|set| set.contains(&class))
-            })
-            .map(|(id, _)| ClientId(*id))
-            .collect();
+        let targets = xi1_window_selectors(state, window, evcode, deviceid);
         if !targets.is_empty() {
             return Some((targets, window));
         }

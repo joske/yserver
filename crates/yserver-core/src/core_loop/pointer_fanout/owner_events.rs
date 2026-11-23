@@ -1,10 +1,75 @@
-//! Grab-owner selection and fallback routing shared by pointer fanout.
+//! Grab-owner selection, XI1 selection order, and fallback routing.
 
 use super::{
     ClientId, PointerReplay, PointerXiSource, ResourceId, ServerState,
-    XI2_MASTER_POINTER_DEVICE_ID, Xi2PointerForm, clamp_grab_coord, xi1_window_selectors,
-    xi2_child_toward, xi2_form_targets_for_source, xi2_route_window_for_source,
+    XI2_MASTER_POINTER_DEVICE_ID, Xi2PointerForm, clamp_grab_coord, xi2_child_toward,
+    xi2_form_targets_for_source, xi2_route_window_for_source,
 };
+
+/// Resolves XI1 event selectors in the shared per-window extension-entry
+/// order so routing and implicit-grab owner selection follow Xorg.
+pub(super) fn xi1_window_selectors(
+    state: &ServerState,
+    window: ResourceId,
+    evcode: u8,
+    deviceid: u16,
+) -> Vec<ClientId> {
+    xi1_window_selectors_with_grab_class(state, window, evcode, deviceid)
+        .into_iter()
+        .map(|(client, _)| client)
+        .collect()
+}
+
+/// Returns the canonical input-client entries that select an XI1 event and
+/// whether that same delivering entry selects DeviceButtonGrab.
+pub(super) fn xi1_window_selectors_with_grab_class(
+    state: &ServerState,
+    window: ResourceId,
+    evcode: u8,
+    deviceid: u16,
+) -> Vec<(ClientId, bool)> {
+    let class = (u32::from(deviceid) << 8) | u32::from(evcode);
+    let grab_class =
+        (u32::from(deviceid) << 8) | u32::from(crate::xinput::XI1_DEVICE_BUTTON_GRAB_CLASS);
+    state
+        .xi_input_clients
+        .get(&window)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            !entry.server_owned_placeholder && state.clients.contains_key(&entry.client.0)
+        })
+        .filter_map(|entry| {
+            let classes = entry.xi1_masks.get(&deviceid)?;
+            classes
+                .contains(&class)
+                .then_some((entry.client, classes.contains(&grab_class)))
+        })
+        .collect()
+}
+
+/// Converts an XI1 event type into the bit used by an implicit-grab mask.
+pub(super) fn xi1_event_mask_bit(event_type: u8) -> u32 {
+    let Some(offset) = event_type.checked_sub(crate::server::XI_FIRST_EVENT) else {
+        return 0;
+    };
+    if offset < 32 { 1_u32 << offset } else { 0 }
+}
+
+/// Returns Xorg's sticky `inputEvents` aggregate for the implicit-grab window.
+pub(super) fn xi1_device_mask_on_window(
+    state: &ServerState,
+    window: ResourceId,
+    deviceid: u16,
+) -> u32 {
+    state
+        .xi1_window_input_events
+        .get(&window)
+        .and_then(|per_device| per_device.get(&deviceid))
+        .copied()
+        .map(|mask| u32::try_from(mask).expect("XI1 event mask fits 32 bits"))
+        .unwrap_or_default()
+}
 
 /// One recipient/form decision for smooth-scroll update and stop motions.
 pub(super) struct Xi2MotionTarget {

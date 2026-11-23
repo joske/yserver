@@ -377,23 +377,28 @@ fn xi1_device_event_ids(bytes: &[u8]) -> Vec<(u8, u8)> {
 }
 
 fn select_xi2(state: &mut ServerState, client: u32, device: u16, mask: u64) {
-    state
-        .clients
-        .get_mut(&client)
-        .unwrap()
+    let (index, _) = state.ensure_xi_input_client(ROOT_WINDOW, ClientId(client));
+    state.xi_input_clients.get_mut(&ROOT_WINDOW).unwrap()[index]
         .xi2_masks
-        .insert((ROOT_WINDOW, device), mask);
+        .insert(device, mask);
+    state.refresh_xi_client_selection_projection(ClientId(client));
 }
 
 fn select_xi1_button(state: &mut ServerState, client: u32, device: u16, offset: u8) {
-    state
-        .clients
-        .get_mut(&client)
-        .unwrap()
-        .xi1_window_event_classes
+    let class = (u32::from(device) << 8) | u32::from(crate::server::XI_FIRST_EVENT + offset);
+    let (index, _) = state.ensure_xi_input_client(ROOT_WINDOW, ClientId(client));
+    state.xi_input_clients.get_mut(&ROOT_WINDOW).unwrap()[index]
+        .xi1_masks
+        .entry(device)
+        .or_default()
+        .insert(class);
+    *state
+        .xi1_window_input_events
         .entry(ROOT_WINDOW)
         .or_default()
-        .insert((u32::from(device) << 8) | u32::from(crate::server::XI_FIRST_EVENT + offset));
+        .entry(device)
+        .or_default() |= 1 << offset;
+    state.refresh_xi_client_selection_projection(ClientId(client));
 }
 
 #[test]

@@ -1194,7 +1194,15 @@ fn xi_config_completion_t6_dual_selection_delivers_each_event_path() {
     let mut lane = crate::core_loop::run::XiConfigLane::default();
     let physical_class = (u32::from(TEST_PHYSICAL_POINTER_ID) << 8) | 82;
     // XI2 selection.
-    select_xi2_property_event_on_root(&mut state, 1, TEST_PHYSICAL_POINTER_ID);
+    let xi2_client = ClientId(1);
+    let (entry_index, _) = state.ensure_xi_input_client(ROOT_WINDOW, xi2_client);
+    state
+        .xi_input_clients
+        .get_mut(&ROOT_WINDOW)
+        .expect("root input-client entry")[entry_index]
+        .xi2_masks
+        .insert(TEST_PHYSICAL_POINTER_ID, u64::from(XI2_PROPERTY_EVENT_MASK));
+    state.refresh_xi_client_selection_projection(xi2_client);
     // XI1 selection.
     let select_body = xi1_select_extension_event_body(ROOT_WINDOW.0, &[physical_class]);
     handle_xi2_request(

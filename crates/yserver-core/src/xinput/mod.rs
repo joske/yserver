@@ -74,6 +74,10 @@ pub const XI_DEVICE_PRESENCE_NOTIFY_OFFSET: u8 = 15;
 /// `_devicePresence` is class offset zero.
 pub const XI1_DEVICE_PRESENCE_CLASS: u32 = 256 << 8;
 
+/// XI1 `XEventClass` code for the exclusive DeviceButtonGrab selection.
+/// It chooses the implicit-grab owner but does not itself deliver an event.
+pub const XI1_DEVICE_BUTTON_GRAB_CLASS: u8 = 7;
+
 /// XI 1.x `DevicePropertyNotify` event code (XIproto.h:139, the 17th
 /// XInput event type). The wire type byte for a delivered event is
 /// `first_event + XI_DEVICE_PROPERTY_NOTIFY_OFFSET` (= 82 with

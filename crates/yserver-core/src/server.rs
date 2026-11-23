@@ -1136,6 +1136,20 @@ pub struct PresentWindowMsc {
     pub last_raw_msc: u64,
 }
 
+/// One Xorg `InputClients` node. DevicePresence may prepend duplicates, so
+/// each node owns its per-device XI1 and XI2 masks.
+#[derive(Debug, Clone)]
+pub struct XiInputClient {
+    pub client: ClientId,
+    /// True for Xorg's server-owned placeholder kept while DNP masks retain
+    /// the window's OtherInputMasks allocation after the last client leaves.
+    pub server_owned_placeholder: bool,
+    /// Per-device recognized XI1 classes; NoExtensionEvent leaves this empty.
+    pub xi1_masks: HashMap<u16, HashSet<u32>>,
+    /// Per-device XI2 masks; a positive wire length may leave this empty.
+    pub xi2_masks: HashMap<u16, u64>,
+}
+
 #[derive(Debug)]
 pub struct ServerState {
     pub atoms: AtomTable,
@@ -1211,6 +1225,13 @@ pub struct ServerState {
     pub floating_pointer_positions: HashMap<u16, (f32, f32)>,
     /// Registered passive button grabs.
     pub button_grabs: Vec<PassiveButtonGrab>,
+    /// Canonical Xorg `InputClients` entries, newest first. Duplicate clients
+    /// are retained because DevicePresence always prepends a new entry.
+    pub xi_input_clients: HashMap<ResourceId, Vec<XiInputClient>>,
+    /// Sticky Xorg `inputEvents` aggregate used by `ShouldFreeInputMasks` and
+    /// implicit-grab mask snapshots; event bits accumulate until the window's
+    /// OtherInputMasks storage is freed.
+    pub xi1_window_input_events: HashMap<ResourceId, HashMap<u16, u64>>,
     /// Global withheld-event queue, in arrival order across devices.
     pub sync_pending: std::collections::VecDeque<PendingSyncEvent>,
     /// Xorg `syncEvents.playingEvents`: prevents nested replay passes.
@@ -2146,6 +2167,8 @@ impl ServerState {
             xi2_detached_masters: HashMap::new(),
             floating_pointer_positions: HashMap::new(),
             button_grabs: Vec::new(),
+            xi_input_clients: HashMap::new(),
+            xi1_window_input_events: HashMap::new(),
             sync_pending: std::collections::VecDeque::new(),
             playing_sync_events: false,
             key_grabs: Vec::new(),
@@ -3475,23 +3498,18 @@ pub struct ClientState {
     /// (X11 ChangeSaveSet semantics).
     pub save_set: HashSet<ResourceId>,
     pub big_requests_enabled: bool,
-    /// XI2 event masks: (window_id, device_id) -> mask. Bit n selects
-    /// XI2 event type n; XI 2.4 defines types up to 32
-    /// (`XI_GestureSwipeEnd`), so the mask needs more than 32 bits.
+    /// Derived lookup cache for (window, device) -> XI2 mask. Canonical masks
+    /// live in `ServerState::xi_input_clients`; bit n selects XI2 event n.
     pub xi2_masks: HashMap<(ResourceId, u16), u64>,
     /// XI1 `XEventClass` values the client has selected via
     /// `SelectExtensionEvent` (XInput minor 6). Each class encodes
     /// `(deviceid << 8) | event_code` where `event_code` is one of the
     /// 17 XInput event types at `XI_FIRST_EVENT..=XI_FIRST_EVENT + 16`.
-    /// This is a delivery-oriented aggregate of the server-wide
-    /// notifications selected in `xi1_window_event_classes`. The canonical
-    /// per-window state lives there so GetSelectedExtensionEvents can report
-    /// the selection accurately.
+    /// Delivery aggregate of server-wide notifications selected per window.
+    /// Canonical per-window state lives in `ServerState::xi_input_clients`.
     pub xi1_event_classes: HashSet<u32>,
-    /// Canonical XI1 event classes per window. DeviceKeyPress through
-    /// DeviceMotionNotify are delivered by walking the event window's ancestor chain
-    /// (Xorg dix `DeliverDeviceEvents`). Key: window; value: the
-    /// selected `XEventClass` values for it.
+    /// Derived XI1 class cache by window. Canonical, duplicate-preserving
+    /// selections live in `ServerState::xi_input_clients`.
     pub xi1_window_event_classes: HashMap<ResourceId, HashSet<u32>>,
     /// Outbound bytes buffered when the client write fd would block.
     /// Populated in D2.
@@ -4072,23 +4090,6 @@ impl ServerState {
         let owner = self.selections.get(&selection)?;
         let target = self.client_target(owner.client?)?;
         Some((owner.window, target))
-    }
-
-    pub fn drop_window_subscriptions(&mut self, windows: &[ResourceId]) {
-        for client in self.clients.values_mut() {
-            for w in windows {
-                client.event_masks.remove(w);
-                client.xi1_window_event_classes.remove(w);
-            }
-            client
-                .xi2_masks
-                .retain(|(window, _), _| !windows.contains(window));
-            client.rebuild_xi1_global_event_classes();
-        }
-        // Xorg `CursorFreeWindow`: a destroyed window takes every
-        // client's XFIXES cursor selection on it along.
-        self.xfixes_cursor_masks
-            .retain(|(_, window), _| !windows.contains(window));
     }
 
     pub fn find_passive_grab(

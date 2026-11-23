@@ -1532,15 +1532,29 @@ fn key_source_selection_xi1_uses_the_physical_keyboard_facet() {
         (u32::from(device_id) << 8) | u32::from(XI_FIRST_EVENT + XI_DEVICE_KEY_PRESS_OFFSET);
     let release_class =
         (u32::from(device_id) << 8) | u32::from(XI_FIRST_EVENT + XI_DEVICE_KEY_RELEASE_OFFSET);
-    state
-        .clients
-        .get_mut(&CLIENT)
-        .unwrap()
-        .xi1_window_event_classes
-        .insert(
-            ROOT_WINDOW,
-            [press_class, release_class].into_iter().collect(),
-        );
+    use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+    // XSelectExtensionEvent through the production request path, so the
+    // window's input-client entry records the selection.
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+    body.extend_from_slice(&2u16.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&press_class.to_le_bytes());
+    body.extend_from_slice(&release_class.to_le_bytes());
+    yserver_core::core_loop::process_request::process_request(
+        &mut state,
+        &mut backend,
+        ClientId(CLIENT),
+        SequenceNumber(1),
+        RequestHeader {
+            opcode: 137,
+            data: 6,
+            length_units: 5,
+        },
+        &body,
+        None,
+    )
+    .expect("XSelectExtensionEvent for the physical keyboard facet");
     let key = |origin, pressed| {
         HostInputEvent::Key(HostKeyEvent {
             origin,
