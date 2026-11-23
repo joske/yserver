@@ -476,7 +476,8 @@ pub(super) fn apply_allow_events(
     }
 
     let keyboard_side = matches!(mode, 3..=7);
-    let frozen_keyboard = if keyboard_side {
+    let keyboard_grabbed = grab_owner_of(state, dev_kbd) == Some(client_id);
+    let frozen_keyboard = if keyboard_side && keyboard_grabbed {
         state
             .xi1_frozen
             .get_mut(&dev_kbd)
