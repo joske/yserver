@@ -2957,6 +2957,667 @@ fn dispatch_for_cow_test(
     .expect("process_request");
 }
 
+// ────────────────────────────────────────────────────────────────
+// Shaped higher siblings in a shared redirected backing (Task 1).
+// ────────────────────────────────────────────────────────────────
+
+/// Request-level geometry and colors for a child in the shared-backing
+/// fixture. `create_live_window` is not suitable here because it creates the
+/// backend mirror directly instead of exercising the core `CreateWindow`
+/// request path these regression tests cover.
+#[derive(Clone, Copy)]
+struct SharedSiblingSpec {
+    xid: yserver_protocol::x11::ResourceId,
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+    border_width: u16,
+    background: u32,
+    border: u32,
+}
+
+/// A live Vulkan setup with a manually redirected parent and two mapped
+/// siblings. Existing test fixtures either seed backend state directly or
+/// make windows outside `process_request`; this fixture must drive window
+/// creation, attributes, mapping and redirection through the real dispatcher.
+struct SharedSiblingFixture {
+    state: yserver_core::server::ServerState,
+    backend: KmsBackend,
+    parent: yserver_protocol::x11::ResourceId,
+    lower: SharedSiblingSpec,
+    upper: SharedSiblingSpec,
+}
+
+/// Dispatch `CreateWindow` for a fixture child. The existing
+/// `create_live_window` helper bypasses the request handler, so using it would
+/// leave protocol validation and the real window projection untested.
+#[allow(clippy::too_many_arguments)]
+fn create_shared_sibling_window(
+    state: &mut yserver_core::server::ServerState,
+    backend: &mut KmsBackend,
+    xid: yserver_protocol::x11::ResourceId,
+    parent: yserver_protocol::x11::ResourceId,
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+    border_width: u16,
+) {
+    let mut body = Vec::with_capacity(28);
+    body.extend_from_slice(&xid.0.to_le_bytes());
+    body.extend_from_slice(&parent.0.to_le_bytes());
+    body.extend_from_slice(&x.to_le_bytes());
+    body.extend_from_slice(&y.to_le_bytes());
+    body.extend_from_slice(&width.to_le_bytes());
+    body.extend_from_slice(&height.to_le_bytes());
+    body.extend_from_slice(&border_width.to_le_bytes());
+    body.extend_from_slice(&1u16.to_le_bytes()); // InputOutput
+    body.extend_from_slice(&yserver_core::resources::ROOT_VISUAL.0.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // no initial attributes
+    dispatch_for_cow_test(state, backend, 1, 24, &body); // CreateWindow
+    assert!(
+        state.resources.window(xid).is_some(),
+        "CreateWindow request must create {xid:?}"
+    );
+}
+
+/// Build the shared-redirection setup exclusively with core requests. The
+/// existing `seed_window` and `create_live_window` fixtures bypass request
+/// dispatch, while these tests need mapped geometry and backing ownership
+/// projected by `process_request`.
+fn shared_sibling_fixture(
+    lower: SharedSiblingSpec,
+    upper: SharedSiblingSpec,
+) -> Option<SharedSiblingFixture> {
+    use yserver_core::{backend::WindowHandle, resources::ROOT_WINDOW, server::ServerState};
+    use yserver_protocol::x11::ResourceId;
+
+    let mut backend = match KmsBackend::for_tests_with_vk() {
+        Ok(backend) => backend,
+        Err(error) if super::vulkan_absence_is_expected(&error) => {
+            eprintln!("skipping: no Vk: {error}");
+            return None;
+        }
+        Err(error) => panic!("unexpected Vulkan test fixture failure: {error}"),
+    };
+    let mut state = ServerState::new();
+    install_client_for_render(&mut state, 14);
+    state
+        .resources
+        .window_mut(ROOT_WINDOW)
+        .expect("root window")
+        .host_xid = WindowHandle::from_raw(backend.core.window_id);
+
+    let parent = ResourceId(0x0510_0001);
+    let parent_spec = SharedSiblingSpec {
+        xid: parent,
+        x: 0,
+        y: 0,
+        width: 64,
+        height: 64,
+        border_width: 0,
+        background: 0,
+        border: 0,
+    };
+    create_shared_sibling_window(
+        &mut state,
+        &mut backend,
+        parent_spec.xid,
+        ROOT_WINDOW,
+        parent_spec.x,
+        parent_spec.y,
+        parent_spec.width,
+        parent_spec.height,
+        parent_spec.border_width,
+    );
+    set_shared_sibling_pixels(&mut state, &mut backend, parent, 0, 0);
+    dispatch_for_cow_test(&mut state, &mut backend, 8, 0, &parent.0.to_le_bytes()); // MapWindow
+    let mut redirect = parent.0.to_le_bytes().to_vec();
+    redirect.extend_from_slice(&[1, 0, 0, 0]); // CompositeRedirectManual
+    dispatch_for_cow_test(&mut state, &mut backend, 144, 1, &redirect);
+    assert!(
+        state
+            .resources
+            .window(parent)
+            .and_then(|window| window.redirected_backing.as_ref())
+            .is_some(),
+        "manual RedirectWindow must create the parent's backing"
+    );
+
+    for spec in [lower, upper] {
+        create_shared_sibling_window(
+            &mut state,
+            &mut backend,
+            spec.xid,
+            parent,
+            spec.x,
+            spec.y,
+            spec.width,
+            spec.height,
+            spec.border_width,
+        );
+        set_shared_sibling_pixels(
+            &mut state,
+            &mut backend,
+            spec.xid,
+            spec.background,
+            spec.border,
+        );
+        dispatch_for_cow_test(&mut state, &mut backend, 8, 0, &spec.xid.0.to_le_bytes()); // MapWindow
+        let host_xid = state
+            .resources
+            .window(spec.xid)
+            .and_then(|window| window.host_xid)
+            .expect("mapped request window has host xid")
+            .as_raw();
+        assert!(
+            backend
+                .windows
+                .get(&host_xid)
+                .is_some_and(|geometry| geometry.viewable),
+            "MapWindow must make {:#x} viewable in the backend",
+            spec.xid.0
+        );
+    }
+
+    Some(SharedSiblingFixture {
+        state,
+        backend,
+        parent,
+        lower,
+        upper,
+    })
+}
+
+/// Set background and border pixels through `ChangeWindowAttributes`. The
+/// storage-only test fixtures cannot exercise the background and border paint
+/// triggered by this wire request.
+fn set_shared_sibling_pixels(
+    state: &mut yserver_core::server::ServerState,
+    backend: &mut KmsBackend,
+    window: yserver_protocol::x11::ResourceId,
+    background: u32,
+    border: u32,
+) {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&window.0.to_le_bytes());
+    body.extend_from_slice(&((1u32 << 1) | (1u32 << 3)).to_le_bytes()); // CWBackPixel | CWBorderPixel
+    body.extend_from_slice(&background.to_le_bytes());
+    body.extend_from_slice(&border.to_le_bytes());
+    dispatch_for_cow_test(state, backend, 2, 0, &body); // ChangeWindowAttributes
+}
+
+/// Set the bounding shape through the SHAPE `Rectangles` request. Directly
+/// editing `shape_bounding` would skip the core SHAPE handler and backend
+/// projection that these tests are intended to cover.
+fn set_shared_sibling_shape(
+    state: &mut yserver_core::server::ServerState,
+    backend: &mut KmsBackend,
+    window: yserver_protocol::x11::ResourceId,
+    rects: &[(i16, i16, u16, u16)],
+) {
+    use yserver_protocol::x11::shape;
+
+    let mut body = vec![
+        shape::OP_SET,
+        shape::KIND_BOUNDING,
+        shape::ORDERING_UNSORTED,
+        0,
+    ];
+    body.extend_from_slice(&window.0.to_le_bytes());
+    body.extend_from_slice(&0i16.to_le_bytes()); // x offset
+    body.extend_from_slice(&0i16.to_le_bytes()); // y offset
+    for &(x, y, width, height) in rects {
+        body.extend_from_slice(&x.to_le_bytes());
+        body.extend_from_slice(&y.to_le_bytes());
+        body.extend_from_slice(&width.to_le_bytes());
+        body.extend_from_slice(&height.to_le_bytes());
+    }
+    dispatch_for_cow_test(state, backend, 141, shape::RECTANGLES, &body);
+
+    let host_xid = state
+        .resources
+        .window(window)
+        .and_then(|record| record.host_xid)
+        .expect("SHAPE destination has host xid")
+        .as_raw();
+    assert_eq!(
+        backend.core.shape_bounding.get(&host_xid).map(Vec::len),
+        Some(rects.len()),
+        "SHAPE Rectangles request must reach the backend bounding shape"
+    );
+}
+
+/// Create and fill a pixmap using `CreatePixmap`, `CreateGC`, and
+/// `PolyFillRectangle` requests. `allocate_test_pixmap_bgra` allocates backend
+/// storage directly and therefore cannot prove the core resource and drawing
+/// paths used by `CopyArea`.
+fn create_filled_shared_pixmap(
+    state: &mut yserver_core::server::ServerState,
+    backend: &mut KmsBackend,
+    pixmap: yserver_protocol::x11::ResourceId,
+    gc: yserver_protocol::x11::ResourceId,
+    drawable: yserver_protocol::x11::ResourceId,
+    width: u16,
+    height: u16,
+    color: u32,
+) {
+    let mut create_pixmap = Vec::with_capacity(12);
+    create_pixmap.extend_from_slice(&pixmap.0.to_le_bytes());
+    create_pixmap.extend_from_slice(&drawable.0.to_le_bytes());
+    create_pixmap.extend_from_slice(&width.to_le_bytes());
+    create_pixmap.extend_from_slice(&height.to_le_bytes());
+    dispatch_for_cow_test(state, backend, 53, 24, &create_pixmap); // CreatePixmap
+    assert!(
+        state.resources.pixmap(pixmap).is_some(),
+        "CreatePixmap request"
+    );
+
+    let mut create_gc = Vec::with_capacity(16);
+    create_gc.extend_from_slice(&gc.0.to_le_bytes());
+    create_gc.extend_from_slice(&pixmap.0.to_le_bytes());
+    create_gc.extend_from_slice(&(1u32 << 2).to_le_bytes()); // GCForeground
+    create_gc.extend_from_slice(&color.to_le_bytes());
+    dispatch_for_cow_test(state, backend, 55, 0, &create_gc); // CreateGC
+
+    let mut fill = Vec::with_capacity(24);
+    fill.extend_from_slice(&pixmap.0.to_le_bytes());
+    fill.extend_from_slice(&gc.0.to_le_bytes());
+    fill.extend_from_slice(&0i16.to_le_bytes());
+    fill.extend_from_slice(&0i16.to_le_bytes());
+    fill.extend_from_slice(&width.to_le_bytes());
+    fill.extend_from_slice(&height.to_le_bytes());
+    dispatch_for_cow_test(state, backend, 70, 0, &fill); // PolyFillRectangle
+}
+
+/// Create the alternating one-pixel-column source used by T6 through X11
+/// pixmap and GC requests. The existing filled-pixmap helper handles only a
+/// single color, and direct backend fills would bypass the `CopyArea` source.
+fn create_alternating_shared_pixmap(
+    state: &mut yserver_core::server::ServerState,
+    backend: &mut KmsBackend,
+    pixmap: yserver_protocol::x11::ResourceId,
+    red_gc: yserver_protocol::x11::ResourceId,
+    cyan_gc: yserver_protocol::x11::ResourceId,
+    drawable: yserver_protocol::x11::ResourceId,
+    width: u16,
+    height: u16,
+) {
+    let mut create_pixmap = Vec::with_capacity(12);
+    create_pixmap.extend_from_slice(&pixmap.0.to_le_bytes());
+    create_pixmap.extend_from_slice(&drawable.0.to_le_bytes());
+    create_pixmap.extend_from_slice(&width.to_le_bytes());
+    create_pixmap.extend_from_slice(&height.to_le_bytes());
+    dispatch_for_cow_test(state, backend, 53, 24, &create_pixmap); // CreatePixmap
+    assert!(
+        state.resources.pixmap(pixmap).is_some(),
+        "CreatePixmap request"
+    );
+
+    for (gc, color) in [(red_gc, 0x00ff_0000u32), (cyan_gc, 0x0000_ffffu32)] {
+        let mut create_gc = Vec::with_capacity(16);
+        create_gc.extend_from_slice(&gc.0.to_le_bytes());
+        create_gc.extend_from_slice(&pixmap.0.to_le_bytes());
+        create_gc.extend_from_slice(&(1u32 << 2).to_le_bytes()); // GCForeground
+        create_gc.extend_from_slice(&color.to_le_bytes());
+        dispatch_for_cow_test(state, backend, 55, 0, &create_gc); // CreateGC
+
+        let mut fill = Vec::with_capacity(8 + usize::from(width / 2) * 8);
+        fill.extend_from_slice(&pixmap.0.to_le_bytes());
+        fill.extend_from_slice(&gc.0.to_le_bytes());
+        for x in 0..width {
+            if (x % 2 == 0) == (gc == red_gc) {
+                fill.extend_from_slice(&i16::try_from(x).expect("column x").to_le_bytes());
+                fill.extend_from_slice(&0i16.to_le_bytes());
+                fill.extend_from_slice(&1u16.to_le_bytes());
+                fill.extend_from_slice(&height.to_le_bytes());
+            }
+        }
+        dispatch_for_cow_test(state, backend, 70, 0, &fill); // PolyFillRectangle
+    }
+}
+
+/// Read one RGB pixel from a window via the `Backend::get_image` trait method,
+/// which is the same renderer entry the X11 GetImage handler calls. The test
+/// accessor would also return pixels, but using the trait here keeps the
+/// specified public backend entry explicit and checks the wire reply header.
+fn shared_parent_rgb(
+    state: &yserver_core::server::ServerState,
+    backend: &mut KmsBackend,
+    parent: yserver_protocol::x11::ResourceId,
+    x: u16,
+    y: u16,
+) -> u32 {
+    use yserver_core::backend::Backend;
+
+    let host_xid = state
+        .resources
+        .window(parent)
+        .and_then(|record| record.host_xid)
+        .expect("parent host xid")
+        .as_raw();
+    let reply = backend
+        .get_image(None, host_xid, 2, 0, 0, 64, 64, 0x00ff_ffff)
+        .expect("Backend::get_image")
+        .expect("GetImage reply");
+    assert!(
+        reply.len() >= 32 + 64 * 64 * 4,
+        "GetImage reply includes pixels"
+    );
+    let offset = 32 + (usize::from(y) * 64 + usize::from(x)) * 4;
+    (u32::from(reply[offset + 2]) << 16)
+        | (u32::from(reply[offset + 1]) << 8)
+        | u32::from(reply[offset])
+}
+
+/// Issue a CopyArea request from a pixmap into a child window. This helper
+/// avoids direct calls into backend drawing methods so destination clipping
+/// is exercised through the real core request path.
+fn copy_shared_pixmap_to_window(
+    state: &mut yserver_core::server::ServerState,
+    backend: &mut KmsBackend,
+    pixmap: yserver_protocol::x11::ResourceId,
+    window: yserver_protocol::x11::ResourceId,
+    gc: yserver_protocol::x11::ResourceId,
+    width: u16,
+    height: u16,
+) {
+    let mut body = Vec::with_capacity(24);
+    body.extend_from_slice(&pixmap.0.to_le_bytes());
+    body.extend_from_slice(&window.0.to_le_bytes());
+    body.extend_from_slice(&gc.0.to_le_bytes());
+    body.extend_from_slice(&0i16.to_le_bytes()); // source x
+    body.extend_from_slice(&0i16.to_le_bytes()); // source y
+    body.extend_from_slice(&0i16.to_le_bytes()); // destination x
+    body.extend_from_slice(&0i16.to_le_bytes()); // destination y
+    body.extend_from_slice(&width.to_le_bytes());
+    body.extend_from_slice(&height.to_le_bytes());
+    dispatch_for_cow_test(state, backend, 62, 0, &body); // CopyArea
+}
+
+/// T1: a shaped higher sibling occludes only its L-shaped bounding region in
+/// the shared backing. The empty-shape second draw also guards zero-rect
+/// shapes from becoming a full-rect occluder.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn shaped_higher_sibling_occludes_only_its_shape_in_shared_backing() {
+    use yserver_protocol::x11::ResourceId;
+
+    let upper = SharedSiblingSpec {
+        xid: ResourceId(0x0510_0003),
+        x: 0,
+        y: 0,
+        width: 16,
+        height: 16,
+        border_width: 0,
+        background: 0x0000_ff00,
+        border: 0,
+    };
+    let lower = SharedSiblingSpec {
+        xid: ResourceId(0x0510_0002),
+        x: 0,
+        y: 0,
+        width: 64,
+        height: 64,
+        border_width: 0,
+        background: 0,
+        border: 0,
+    };
+    let Some(mut fixture) = shared_sibling_fixture(lower, upper) else {
+        return;
+    };
+    set_shared_sibling_shape(
+        &mut fixture.state,
+        &mut fixture.backend,
+        fixture.upper.xid,
+        &[(0, 0, 5, 16), (0, 11, 16, 5)],
+    );
+    let pixmap = ResourceId(0x0510_0010);
+    let gc = ResourceId(0x0510_0011);
+    create_filled_shared_pixmap(
+        &mut fixture.state,
+        &mut fixture.backend,
+        pixmap,
+        gc,
+        fixture.parent,
+        64,
+        64,
+        0x00ff_0000,
+    );
+    copy_shared_pixmap_to_window(
+        &mut fixture.state,
+        &mut fixture.backend,
+        pixmap,
+        fixture.lower.xid,
+        gc,
+        64,
+        64,
+    );
+
+    assert_eq!(
+        shared_parent_rgb(&fixture.state, &mut fixture.backend, fixture.parent, 10, 5),
+        0x00ff_0000
+    );
+    assert_eq!(
+        shared_parent_rgb(&fixture.state, &mut fixture.backend, fixture.parent, 2, 2),
+        0x0000_ff00
+    );
+    assert_eq!(
+        shared_parent_rgb(&fixture.state, &mut fixture.backend, fixture.parent, 30, 30),
+        0x00ff_0000
+    );
+
+    set_shared_sibling_shape(
+        &mut fixture.state,
+        &mut fixture.backend,
+        fixture.upper.xid,
+        &[],
+    );
+    copy_shared_pixmap_to_window(
+        &mut fixture.state,
+        &mut fixture.backend,
+        pixmap,
+        fixture.lower.xid,
+        gc,
+        64,
+        64,
+    );
+    assert_eq!(
+        shared_parent_rgb(&fixture.state, &mut fixture.backend, fixture.parent, 2, 2),
+        0x00ff_0000
+    );
+}
+
+/// T2: an unshaped higher sibling continues to occlude its entire rectangle.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn unshaped_higher_sibling_still_occludes_its_rect() {
+    use yserver_protocol::x11::ResourceId;
+
+    let lower = SharedSiblingSpec {
+        xid: ResourceId(0x0511_0002),
+        x: 0,
+        y: 0,
+        width: 64,
+        height: 64,
+        border_width: 0,
+        background: 0,
+        border: 0,
+    };
+    let upper = SharedSiblingSpec {
+        xid: ResourceId(0x0511_0003),
+        x: 0,
+        y: 0,
+        width: 16,
+        height: 16,
+        border_width: 0,
+        background: 0x0000_ff00,
+        border: 0,
+    };
+    let Some(mut fixture) = shared_sibling_fixture(lower, upper) else {
+        return;
+    };
+    let pixmap = ResourceId(0x0511_0010);
+    let gc = ResourceId(0x0511_0011);
+    create_filled_shared_pixmap(
+        &mut fixture.state,
+        &mut fixture.backend,
+        pixmap,
+        gc,
+        fixture.parent,
+        64,
+        64,
+        0x00ff_0000,
+    );
+    copy_shared_pixmap_to_window(
+        &mut fixture.state,
+        &mut fixture.backend,
+        pixmap,
+        fixture.lower.xid,
+        gc,
+        64,
+        64,
+    );
+
+    assert_eq!(
+        shared_parent_rgb(&fixture.state, &mut fixture.backend, fixture.parent, 10, 5),
+        0x0000_ff00
+    );
+    assert_eq!(
+        shared_parent_rgb(&fixture.state, &mut fixture.backend, fixture.parent, 30, 30),
+        0x00ff_0000
+    );
+}
+
+/// T6: the sibling's bounding shape is clipped against its border-inclusive
+/// outer rect. Lower-window drawing, border repaint, and move carry all use
+/// the same shape-aware occluder contribution.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn bordered_shaped_sibling_occludes_shape_within_outer_rect() {
+    use yserver_protocol::x11::ResourceId;
+
+    let lower = SharedSiblingSpec {
+        xid: ResourceId(0x0512_0002),
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 40,
+        border_width: 4,
+        background: 0,
+        border: 0x0080_8080,
+    };
+    let upper = SharedSiblingSpec {
+        xid: ResourceId(0x0512_0003),
+        x: 0,
+        y: 0,
+        width: 16,
+        height: 16,
+        border_width: 2,
+        background: 0x0000_ff00,
+        border: 0x0000_00ff,
+    };
+    let Some(mut fixture) = shared_sibling_fixture(lower, upper) else {
+        return;
+    };
+    set_shared_sibling_shape(
+        &mut fixture.state,
+        &mut fixture.backend,
+        fixture.upper.xid,
+        &[(-2, -2, 6, 20), (-2, 12, 20, 6)],
+    );
+
+    let pixmap = ResourceId(0x0512_0010);
+    let red_gc = ResourceId(0x0512_0011);
+    let cyan_gc = ResourceId(0x0512_0012);
+    create_alternating_shared_pixmap(
+        &mut fixture.state,
+        &mut fixture.backend,
+        pixmap,
+        red_gc,
+        cyan_gc,
+        fixture.parent,
+        40,
+        40,
+    );
+    copy_shared_pixmap_to_window(
+        &mut fixture.state,
+        &mut fixture.backend,
+        pixmap,
+        fixture.lower.xid,
+        red_gc,
+        40,
+        40,
+    );
+    assert_eq!(
+        shared_parent_rgb(&fixture.state, &mut fixture.backend, fixture.parent, 10, 8),
+        0x00ff_0000
+    );
+    assert_eq!(
+        shared_parent_rgb(&fixture.state, &mut fixture.backend, fixture.parent, 1, 1),
+        0x0000_00ff
+    );
+    assert_eq!(
+        shared_parent_rgb(&fixture.state, &mut fixture.backend, fixture.parent, 3, 8),
+        0x0000_ff00
+    );
+
+    set_shared_sibling_pixels(
+        &mut fixture.state,
+        &mut fixture.backend,
+        fixture.lower.xid,
+        0,
+        0x00ff_ff00,
+    );
+    assert_eq!(
+        shared_parent_rgb(&fixture.state, &mut fixture.backend, fixture.parent, 10, 2),
+        0x00ff_ff00
+    );
+    assert_eq!(
+        shared_parent_rgb(&fixture.state, &mut fixture.backend, fixture.parent, 1, 1),
+        0x0000_00ff
+    );
+
+    dispatch_configure_window(
+        &mut fixture.state,
+        &mut fixture.backend,
+        fixture.lower.xid,
+        Some(1),
+        None,
+        None,
+    );
+    assert_eq!(
+        shared_parent_rgb(&fixture.state, &mut fixture.backend, fixture.parent, 10, 8),
+        0x0000_ffff
+    );
+    assert_eq!(
+        shared_parent_rgb(&fixture.state, &mut fixture.backend, fixture.parent, 3, 8),
+        0x0000_ff00
+    );
+    assert_ne!(
+        shared_parent_rgb(&fixture.state, &mut fixture.backend, fixture.parent, 6, 8),
+        0x0000_ff00
+    );
+
+    dispatch_configure_window(
+        &mut fixture.state,
+        &mut fixture.backend,
+        fixture.lower.xid,
+        Some(0),
+        None,
+        None,
+    );
+    assert_eq!(
+        shared_parent_rgb(&fixture.state, &mut fixture.backend, fixture.parent, 10, 8),
+        0x00ff_0000
+    );
+    assert_eq!(
+        shared_parent_rgb(&fixture.state, &mut fixture.backend, fixture.parent, 3, 8),
+        0x0000_ff00
+    );
+}
+
 /// A claimed COW with a mapped child under it, and a direct frame whose
 /// fallback is the COW on screen. Returns the child's host xid.
 fn cow_with_child_under_direct_scanout(

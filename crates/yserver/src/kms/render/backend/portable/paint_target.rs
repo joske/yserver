@@ -975,19 +975,58 @@ impl<P: Platform> XBackend<P> {
                             return None;
                         }
                         let sibling_target = self.resolve_paint_target(*sibling_host_xid)?;
-                        (sibling_target.backing_id() == dst_target.backing_id()).then_some((
-                            sibling_geom.stack_rank,
-                            ash::vk::Rect2D {
-                                offset: ash::vk::Offset2D {
-                                    x: sibling_target.offset().0 - dst_target.offset().0,
-                                    y: sibling_target.offset().1 - dst_target.offset().1,
-                                },
-                                extent: ash::vk::Extent2D {
-                                    width: u32::from(sibling_geom.width),
-                                    height: u32::from(sibling_geom.height),
-                                },
+                        if sibling_target.backing_id() != dst_target.backing_id() {
+                            return None;
+                        }
+
+                        // Keep the legacy rectangle byte-for-byte for an
+                        // unshaped sibling. A shaped sibling's contribution
+                        // comes from the border-inclusive child region; it is
+                        // in parent content space, so convert it through the
+                        // sibling and destination content offsets.
+                        let rank = sibling_geom.stack_rank;
+                        if self.bounding_shape_local(*sibling_host_xid).is_none() {
+                            return Some((
+                                rank,
+                                vec![ash::vk::Rect2D {
+                                    offset: ash::vk::Offset2D {
+                                        x: sibling_target.offset().0 - dst_target.offset().0,
+                                        y: sibling_target.offset().1 - dst_target.offset().1,
+                                    },
+                                    extent: ash::vk::Extent2D {
+                                        width: u32::from(sibling_geom.width),
+                                        height: u32::from(sibling_geom.height),
+                                    },
+                                }],
+                            ));
+                        }
+
+                        let bw = i32::from(sibling_geom.border_width);
+                        let bw_u32 = u32::from(sibling_geom.border_width);
+                        let outer = ash::vk::Rect2D {
+                            offset: ash::vk::Offset2D {
+                                x: i32::from(sibling_geom.x),
+                                y: i32::from(sibling_geom.y),
                             },
-                        ))
+                            extent: ash::vk::Extent2D {
+                                width: u32::from(sibling_geom.width) + 2 * bw_u32,
+                                height: u32::from(sibling_geom.height) + 2 * bw_u32,
+                            },
+                        };
+                        let dx = -i32::from(sibling_geom.x) - bw + sibling_target.offset().0
+                            - dst_target.offset().0;
+                        let dy = -i32::from(sibling_geom.y) - bw + sibling_target.offset().1
+                            - dst_target.offset().1;
+                        let shaped: Vec<_> = self
+                            .child_clip_region(*sibling_host_xid, sibling_geom, outer)
+                            .into_iter()
+                            .map(|mut rect| {
+                                rect.offset.x += dx;
+                                rect.offset.y += dy;
+                                rect
+                            })
+                            .collect();
+                        Some((rank, shaped))
                     }),
             );
             let Some(parent_xid) = branch_geom.parent else {
@@ -996,7 +1035,7 @@ impl<P: Platform> XBackend<P> {
             branch_xid = parent_xid;
         }
         occluders.sort_by_key(|(rank, _)| *rank);
-        occluders.into_iter().map(|(_, rect)| rect).collect()
+        occluders.into_iter().flat_map(|(_, rects)| rects).collect()
     }
 
     /// `host_xid`'s bounding shape in its own content space, or `None`
