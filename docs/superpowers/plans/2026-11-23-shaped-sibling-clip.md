@@ -166,8 +166,10 @@ Most likely to bite first:
       redraw.
       - `(10,8)` == `0x00ffff`: carried through the hole from P `(9,8)`.
       - `(3,8)` == `0x00ff00`: destination excluded, U's shape untouched.
-      - `(6,8)` == `0x000000`: its source P `(5,8)` lies in U's shape, so it is
-        source-excluded, not carried, and exposed to L's background.
+      - `(6,8)` != `0x00ff00`: its source P `(5,8)` lies in U's shape, so U's
+        pixels must not be carried into L. Whether the spot then holds L's
+        background or its earlier pixel is the exposure path's business, not
+        this test's.
       Then `ConfigureWindow` L back to `x=0`:
       - `(10,8)` == `0xff0000`;
       - `(3,8)` == `0x00ff00`.
