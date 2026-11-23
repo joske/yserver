@@ -3913,3 +3913,518 @@ fn pointer_crossing_between_cow_and_a_sibling_is_nonlinear() {
         ],
     );
 }
+
+// ────────────────────────────────────────────────────────────────
+// Shaped pixmap-background clears through ClipByChildren (Task 2).
+// ────────────────────────────────────────────────────────────────
+
+/// The Task 1 fixture only builds a depth-24 redirected parent with two
+/// siblings. G2 also needs nested windows and ARGB windows, so this creates
+/// just the real Vulkan/core root fixture without seeding window/store state.
+fn live_render_request_fixture() -> Option<(yserver_core::server::ServerState, KmsBackend)> {
+    use yserver_core::{backend::WindowHandle, resources::ROOT_WINDOW, server::ServerState};
+
+    let backend = match KmsBackend::for_tests_with_vk() {
+        Ok(backend) => backend,
+        Err(error) if super::vulkan_absence_is_expected(&error) => {
+            eprintln!("skipping: no Vk: {error}");
+            return None;
+        }
+        Err(error) => panic!("unexpected Vulkan test fixture failure: {error}"),
+    };
+    let mut state = ServerState::new();
+    install_client_for_render(&mut state, 14);
+    state
+        .resources
+        .window_mut(ROOT_WINDOW)
+        .expect("root window")
+        .host_xid = WindowHandle::from_raw(backend.core.window_id);
+    Some((state, backend))
+}
+
+/// Task 1's CreateWindow helper fixes depth 24, ROOT_VISUAL and an empty
+/// value mask. G2 needs depth-32 ARGB windows with CWColormap and
+/// CWBorderPixel sent through the protocol request.
+#[allow(clippy::too_many_arguments)]
+fn create_live_render_window(
+    state: &mut yserver_core::server::ServerState,
+    backend: &mut KmsBackend,
+    xid: yserver_protocol::x11::ResourceId,
+    parent: yserver_protocol::x11::ResourceId,
+    depth: u8,
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+    visual: yserver_protocol::x11::ResourceId,
+    value_mask: u32,
+    values: &[u32],
+) {
+    let mut body = Vec::with_capacity(28 + values.len() * 4);
+    body.extend_from_slice(&xid.0.to_le_bytes());
+    body.extend_from_slice(&parent.0.to_le_bytes());
+    body.extend_from_slice(&x.to_le_bytes());
+    body.extend_from_slice(&y.to_le_bytes());
+    body.extend_from_slice(&width.to_le_bytes());
+    body.extend_from_slice(&height.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes()); // border width
+    body.extend_from_slice(&1u16.to_le_bytes()); // InputOutput
+    body.extend_from_slice(&visual.0.to_le_bytes());
+    body.extend_from_slice(&value_mask.to_le_bytes());
+    for value in values {
+        body.extend_from_slice(&value.to_le_bytes());
+    }
+    dispatch_for_cow_test(state, backend, 1, depth, &body); // CreateWindow
+    assert!(
+        state.resources.window(xid).is_some(),
+        "CreateWindow request must create {xid:?}"
+    );
+}
+
+/// The shared-sibling fixture's redirect request is tied to its fixed parent;
+/// G2 uses the same Composite request on several custom nested trees.
+fn redirect_live_render_window(
+    state: &mut yserver_core::server::ServerState,
+    backend: &mut KmsBackend,
+    window: yserver_protocol::x11::ResourceId,
+) {
+    let mut body = window.0.to_le_bytes().to_vec();
+    body.extend_from_slice(&[1, 0, 0, 0]); // CompositeRedirectManual
+    dispatch_for_cow_test(state, backend, 144, 1, &body); // RedirectWindow
+    assert!(
+        state
+            .resources
+            .window(window)
+            .and_then(|record| record.redirected_backing.as_ref())
+            .is_some(),
+        "manual RedirectWindow must create the backing for {window:?}"
+    );
+}
+
+/// Task 1's attribute helper sets only background/border pixels. Pixmap
+/// backgrounds need CWBackPixmap dispatched to the core and backend too.
+fn set_live_render_background_pixmap(
+    state: &mut yserver_core::server::ServerState,
+    backend: &mut KmsBackend,
+    window: yserver_protocol::x11::ResourceId,
+    pixmap: yserver_protocol::x11::ResourceId,
+) {
+    let mut body = window.0.to_le_bytes().to_vec();
+    body.extend_from_slice(&1u32.to_le_bytes()); // CWBackPixmap
+    body.extend_from_slice(&pixmap.0.to_le_bytes());
+    dispatch_for_cow_test(state, backend, 2, 0, &body); // ChangeWindowAttributes
+}
+
+/// The shared `create_filled_shared_pixmap` helper is depth 24 and one color;
+/// T3 needs one depth-32 tile with four opaque bands to expose tile phase.
+fn create_argb_banded_render_pixmap(
+    state: &mut yserver_core::server::ServerState,
+    backend: &mut KmsBackend,
+    pixmap: yserver_protocol::x11::ResourceId,
+    first_gc: u32,
+    drawable: yserver_protocol::x11::ResourceId,
+) {
+    let mut create_pixmap = Vec::with_capacity(12);
+    create_pixmap.extend_from_slice(&pixmap.0.to_le_bytes());
+    create_pixmap.extend_from_slice(&drawable.0.to_le_bytes());
+    create_pixmap.extend_from_slice(&16u16.to_le_bytes());
+    create_pixmap.extend_from_slice(&16u16.to_le_bytes());
+    dispatch_for_cow_test(state, backend, 53, 32, &create_pixmap); // CreatePixmap
+    assert!(
+        state.resources.pixmap(pixmap).is_some(),
+        "CreatePixmap request"
+    );
+
+    for (band, color) in [0xffff_0000u32, 0xff00_ff00, 0xff00_00ff, 0xffff_ff00]
+        .into_iter()
+        .enumerate()
+    {
+        let gc =
+            yserver_protocol::x11::ResourceId(first_gc.checked_add(band as u32).expect("GC xid"));
+        let mut create_gc = Vec::with_capacity(16);
+        create_gc.extend_from_slice(&gc.0.to_le_bytes());
+        create_gc.extend_from_slice(&pixmap.0.to_le_bytes());
+        create_gc.extend_from_slice(&(1u32 << 2).to_le_bytes()); // GCForeground
+        create_gc.extend_from_slice(&color.to_le_bytes());
+        dispatch_for_cow_test(state, backend, 55, 0, &create_gc); // CreateGC
+
+        let mut fill = Vec::with_capacity(16);
+        fill.extend_from_slice(&pixmap.0.to_le_bytes());
+        fill.extend_from_slice(&gc.0.to_le_bytes());
+        fill.extend_from_slice(&u16::try_from(band * 4).expect("band x").to_le_bytes());
+        fill.extend_from_slice(&0i16.to_le_bytes());
+        fill.extend_from_slice(&4u16.to_le_bytes());
+        fill.extend_from_slice(&16u16.to_le_bytes());
+        dispatch_for_cow_test(state, backend, 70, 0, &fill); // PolyFillRectangle
+    }
+}
+
+/// The existing configure helper only encodes x/y/border width. The resize
+/// cases must exercise ConfigureWindow's width/height path through dispatch.
+fn configure_live_render_window_size(
+    state: &mut yserver_core::server::ServerState,
+    backend: &mut KmsBackend,
+    window: yserver_protocol::x11::ResourceId,
+    width: u16,
+    height: u16,
+) {
+    let mut body = Vec::with_capacity(12);
+    body.extend_from_slice(&window.0.to_le_bytes());
+    body.extend_from_slice(&((1u16 << 2) | (1u16 << 3)).to_le_bytes()); // CWWidth | CWHeight
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&u32::from(width).to_le_bytes());
+    body.extend_from_slice(&u32::from(height).to_le_bytes());
+    dispatch_for_cow_test(state, backend, 12, 0, &body); // ConfigureWindow
+    let geometry = state.resources.window(window).expect("resized window");
+    assert_eq!((geometry.width, geometry.height), (width, height));
+}
+
+/// `shared_parent_rgb` reads the fixed 64x64 parent from origin. T4 and T7
+/// need single pixels on variable-sized or non-parent drawables, but still
+/// use the same `Backend::get_image` trait entry as the wire GetImage path.
+fn live_render_rgb_at(
+    state: &yserver_core::server::ServerState,
+    backend: &mut KmsBackend,
+    drawable: yserver_protocol::x11::ResourceId,
+    x: u16,
+    y: u16,
+) -> u32 {
+    use yserver_core::backend::Backend;
+
+    let host_xid = state
+        .resources
+        .window(drawable)
+        .and_then(|record| record.host_xid)
+        .expect("GetImage drawable host xid")
+        .as_raw();
+    let reply = backend
+        .get_image(None, host_xid, 2, x as i16, y as i16, 1, 1, 0x00ff_ffff)
+        .expect("Backend::get_image")
+        .expect("GetImage reply");
+    assert!(reply.len() >= 36, "GetImage reply includes one pixel");
+    (u32::from(reply[34]) << 16) | (u32::from(reply[33]) << 8) | u32::from(reply[32])
+}
+
+/// T3: MapWindow's internal pixmap-background realize paint respects the
+/// window's disjoint bounding shape and keeps the tile's source phase.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn pixmap_background_realize_paints_only_inside_own_shape() {
+    use yserver_core::resources::{ARGB_COLORMAP, ARGB_VISUAL, ROOT_WINDOW};
+    use yserver_protocol::x11::ResourceId;
+
+    let Some((mut state, mut backend)) = live_render_request_fixture() else {
+        return;
+    };
+    let parent = ResourceId(0x0520_0001);
+    let child = ResourceId(0x0520_0002);
+    let pixmap = ResourceId(0x0520_0003);
+    let parent_attrs = (1 << 3) | (1 << 13); // CWBorderPixel | CWColormap
+    create_live_render_window(
+        &mut state,
+        &mut backend,
+        parent,
+        ROOT_WINDOW,
+        32,
+        0,
+        0,
+        64,
+        64,
+        ARGB_VISUAL,
+        parent_attrs,
+        &[0, ARGB_COLORMAP.0],
+    );
+    set_shared_sibling_pixels(&mut state, &mut backend, parent, 0xff00_0000, 0);
+    dispatch_for_cow_test(&mut state, &mut backend, 8, 0, &parent.0.to_le_bytes()); // MapWindow
+    redirect_live_render_window(&mut state, &mut backend, parent);
+
+    create_live_render_window(
+        &mut state,
+        &mut backend,
+        child,
+        parent,
+        32,
+        8,
+        8,
+        16,
+        16,
+        ARGB_VISUAL,
+        parent_attrs,
+        &[0, ARGB_COLORMAP.0],
+    );
+    create_argb_banded_render_pixmap(&mut state, &mut backend, pixmap, 0x0520_0010, child);
+    set_live_render_background_pixmap(&mut state, &mut backend, child, pixmap);
+    set_shared_sibling_shape(
+        &mut state,
+        &mut backend,
+        child,
+        &[(0, 0, 4, 16), (10, 0, 4, 16)],
+    );
+    dispatch_for_cow_test(&mut state, &mut backend, 8, 0, &child.0.to_le_bytes()); // MapWindow
+    assert_eq!(
+        state.resources.window(child).expect("child").map_state,
+        yserver_core::resources::MapState::Viewable,
+        "the SHAPEd child must reach the real realize paint on map"
+    );
+
+    assert_eq!(
+        shared_parent_rgb(&state, &mut backend, parent, 9, 10),
+        0x00ff_0000
+    );
+    assert_eq!(
+        shared_parent_rgb(&state, &mut backend, parent, 18, 10),
+        0x0000_00ff
+    );
+    assert_eq!(
+        shared_parent_rgb(&state, &mut backend, parent, 20, 10),
+        0x00ff_ff00
+    );
+    assert_eq!(
+        shared_parent_rgb(&state, &mut backend, parent, 14, 10),
+        0x0000_0000
+    );
+}
+
+/// T4: growing an unredirected pixmap-background parent in a redirected
+/// grandparent must preserve its mapped child's pixels, matching Xvfb 21.1.24.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn pixmap_background_grow_does_not_paint_over_mapped_child() {
+    use yserver_core::resources::{ROOT_VISUAL, ROOT_WINDOW};
+    use yserver_protocol::x11::ResourceId;
+
+    let Some((mut state, mut backend)) = live_render_request_fixture() else {
+        return;
+    };
+    let grandparent = ResourceId(0x0521_0001);
+    let parent = ResourceId(0x0521_0002);
+    let child = ResourceId(0x0521_0003);
+    let pixmap = ResourceId(0x0521_0004);
+    let gc = ResourceId(0x0521_0005);
+    create_live_render_window(
+        &mut state,
+        &mut backend,
+        grandparent,
+        ROOT_WINDOW,
+        24,
+        0,
+        0,
+        200,
+        200,
+        ROOT_VISUAL,
+        0,
+        &[],
+    );
+    set_shared_sibling_pixels(&mut state, &mut backend, grandparent, 0x0000_ff00, 0);
+    dispatch_for_cow_test(&mut state, &mut backend, 8, 0, &grandparent.0.to_le_bytes()); // MapWindow
+    redirect_live_render_window(&mut state, &mut backend, grandparent);
+
+    create_live_render_window(
+        &mut state,
+        &mut backend,
+        parent,
+        grandparent,
+        24,
+        0,
+        0,
+        60,
+        60,
+        ROOT_VISUAL,
+        0,
+        &[],
+    );
+    create_filled_shared_pixmap(
+        &mut state,
+        &mut backend,
+        pixmap,
+        gc,
+        grandparent,
+        8,
+        8,
+        0x00ff_0000,
+    );
+    set_live_render_background_pixmap(&mut state, &mut backend, parent, pixmap);
+    dispatch_for_cow_test(&mut state, &mut backend, 8, 0, &parent.0.to_le_bytes()); // MapWindow
+
+    create_live_render_window(
+        &mut state,
+        &mut backend,
+        child,
+        parent,
+        24,
+        10,
+        10,
+        30,
+        30,
+        ROOT_VISUAL,
+        0,
+        &[],
+    );
+    set_shared_sibling_pixels(&mut state, &mut backend, child, 0x0000_00ff, 0);
+    dispatch_for_cow_test(&mut state, &mut backend, 8, 0, &child.0.to_le_bytes()); // MapWindow
+    configure_live_render_window_size(&mut state, &mut backend, parent, 120, 120);
+
+    assert_eq!(
+        live_render_rgb_at(&state, &mut backend, child, 5, 5),
+        0x0000_00ff
+    );
+    assert_eq!(
+        live_render_rgb_at(&state, &mut backend, parent, 100, 100),
+        0x00ff_0000
+    );
+}
+
+/// T7: a pixmap clear on an own-leaf target has no subwindow clip and remains
+/// full-sized when ConfigureWindow grows the top-level window.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn pixmap_background_clear_on_own_leaf_is_unclipped() {
+    use yserver_core::resources::{ROOT_VISUAL, ROOT_WINDOW};
+    use yserver_protocol::x11::ResourceId;
+
+    let Some((mut state, mut backend)) = live_render_request_fixture() else {
+        return;
+    };
+    let window = ResourceId(0x0522_0001);
+    let pixmap = ResourceId(0x0522_0002);
+    let gc = ResourceId(0x0522_0003);
+    create_live_render_window(
+        &mut state,
+        &mut backend,
+        window,
+        ROOT_WINDOW,
+        24,
+        0,
+        0,
+        32,
+        32,
+        ROOT_VISUAL,
+        0,
+        &[],
+    );
+    create_filled_shared_pixmap(
+        &mut state,
+        &mut backend,
+        pixmap,
+        gc,
+        window,
+        8,
+        8,
+        0x00ff_0000,
+    );
+    set_live_render_background_pixmap(&mut state, &mut backend, window, pixmap);
+    dispatch_for_cow_test(&mut state, &mut backend, 8, 0, &window.0.to_le_bytes()); // MapWindow
+    configure_live_render_window_size(&mut state, &mut backend, window, 48, 48);
+
+    assert_eq!(
+        live_render_rgb_at(&state, &mut backend, window, 40, 40),
+        0x00ff_0000
+    );
+}
+
+/// T8: a visible piece whose local x begins beyond i16::MAX still tiles into
+/// the redirected parent's backing after a 32-bit Rect2D clip subtraction.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn pixmap_background_piece_beyond_i16_is_painted() {
+    use yserver_core::resources::{ROOT_VISUAL, ROOT_WINDOW};
+    use yserver_protocol::x11::ResourceId;
+
+    let Some((mut state, mut backend)) = live_render_request_fixture() else {
+        return;
+    };
+    let parent = ResourceId(0x0523_0001);
+    let child = ResourceId(0x0523_0002);
+    let grandchild = ResourceId(0x0523_0003);
+    let pixmap = ResourceId(0x0523_0004);
+    let gc = ResourceId(0x0523_0005);
+    create_live_render_window(
+        &mut state,
+        &mut backend,
+        parent,
+        ROOT_WINDOW,
+        24,
+        0,
+        0,
+        64,
+        64,
+        ROOT_VISUAL,
+        0,
+        &[],
+    );
+    set_shared_sibling_pixels(&mut state, &mut backend, parent, 0, 0);
+    dispatch_for_cow_test(&mut state, &mut backend, 8, 0, &parent.0.to_le_bytes()); // MapWindow
+    redirect_live_render_window(&mut state, &mut backend, parent);
+
+    create_filled_shared_pixmap(
+        &mut state,
+        &mut backend,
+        pixmap,
+        gc,
+        parent,
+        8,
+        8,
+        0x00ff_0000,
+    );
+    create_live_render_window(
+        &mut state,
+        &mut backend,
+        child,
+        parent,
+        24,
+        i16::MIN,
+        0,
+        40_000,
+        16,
+        ROOT_VISUAL,
+        0,
+        &[],
+    );
+    set_live_render_background_pixmap(&mut state, &mut backend, child, pixmap);
+    create_live_render_window(
+        &mut state,
+        &mut backend,
+        grandchild,
+        child,
+        24,
+        32_760,
+        0,
+        9,
+        16,
+        ROOT_VISUAL,
+        0,
+        &[],
+    );
+    set_shared_sibling_pixels(&mut state, &mut backend, grandchild, 0x0000_00ff, 0);
+    dispatch_for_cow_test(&mut state, &mut backend, 8, 0, &grandchild.0.to_le_bytes()); // MapWindow while parent is unmapped
+    assert_eq!(
+        state
+            .resources
+            .window(grandchild)
+            .expect("grandchild")
+            .map_state,
+        yserver_core::resources::MapState::Unviewable,
+        "mapped grandchild waits for its parent to become viewable"
+    );
+
+    let calls_before = backend.clear_window_area_calls;
+    dispatch_for_cow_test(&mut state, &mut backend, 8, 0, &child.0.to_le_bytes()); // MapWindow
+    assert!(
+        backend.clear_window_area_calls > calls_before,
+        "mapping the wide child must reach its internal background realize paint"
+    );
+    assert_eq!(
+        state.resources.window(child).expect("wide child").map_state,
+        yserver_core::resources::MapState::Viewable,
+        "the wide child must become viewable through the real MapWindow request"
+    );
+
+    assert_eq!(
+        shared_parent_rgb(&state, &mut backend, parent, 10, 8),
+        0x00ff_0000
+    );
+    assert_eq!(
+        shared_parent_rgb(&state, &mut backend, parent, 0, 8),
+        0x0000_00ff
+    );
+}
