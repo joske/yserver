@@ -199,7 +199,7 @@ In Xorg:
 - `AddExtensionClient` (`:2750-2751`) prepends the entry when a client first selects on the window through either protocol. Later selections update it in place.
 - The entry is freed when the client's resource goes (disconnect, window destroy). When a selection empties it, it is freed only if `ShouldFreeInputMasks` (`:3258-3272`) agrees.
 - The owner passed to `ActivateImplicitGrab` (`:2421`) is the last client delivered to, unless one with `DeviceButtonGrabMask` (`../xserver/Xi/extinit.c:144, 1105`) was delivered to; the first such client wins.
-- `DeviceButtonGrabMask` is exclusive (`../xserver/Xi/selectev.c:173-176`). A second client selecting it on the same window and device gets BadAccess (`../xserver/Xi/exevents.c:2672-2683`), and none of that request's selection is applied.
+- `DeviceButtonGrabMask` is exclusive (`../xserver/Xi/selectev.c:173-176`). A second client selecting it on the same window and device gets BadAccess (`../xserver/Xi/exevents.c:2672-2683`). `ProcXSelectExtensionEvent` applies devices in ascending device-ID order and stops at the first failure without undoing earlier devices (`../xserver/Xi/selectev.c:167-176`).
 
 **Measured (coordinator, Xvfb 21.1.24 vs #379 `6de66587`; client `~/Projects/claude-scratch/passive-grabs/xi1owner/xi1owner.c`, results `results-xvfb.txt`, `results-y379.txt` there):**
 
@@ -214,6 +214,7 @@ In Xorg:
 | xi2first | A XI2 (FocusIn, XIAllMasterDevices) on W, B XI1, A XI1 | A | B |
 | xi2clear | A XI1, B XI1, A XI2 on then XI2 empty | A | A |
 | grabconflict | A XI1+DeviceButtonGrab, B XI1+DeviceButtonGrab | B gets BadAccess (10) and no events; owner A | B accepted, both get the press |
+| twodev | A DeviceButtonGrab(+Press) on the mouse (id 6); B one request: Press/Release on the XTest pointer (id 4) + DeviceButtonGrab on the mouse (id 6) | B gets BadAccess (10), yet its id-4 selection stands: B gets press and release, owner B | (not run: device set differs) |
 
 **Invariant:**
 - Per window, the selection order is the order in which each client's shared extension-entry was created: newest first. The first XI1 or XI2 selection on the window creates it.
@@ -222,7 +223,7 @@ In Xorg:
 - `xi1_window_selectors` and delivery follow this order.
 - The implicit grab owner is the first delivered client whose classes on that window include the device's `DeviceButtonGrab` class. Otherwise it is the last delivered client.
 - `XSelectExtensionEvent` accepts the `DeviceButtonGrab` class for a button device. Its class encoding follows `libXi`'s `DeviceButtonPressGrab` (`_deviceButtonGrab` = 7 on the button class); the oracle's `abg`/`grabconflict` rows confirm it is accepted.
-  - When another client already holds that class on the same window and device, the whole request answers BadAccess before any of it is applied, including the order.
+  - When another client already holds that class on the same window and device, that device's selection is not changed and the request answers BadAccess. Devices with a lower ID in the same request keep their applied selection, including the entry they created. Devices with a higher ID are not applied (Xorg's ascending-ID loop).
   - The same client re-selecting it, and other windows or devices, are not conflicts.
 - The class delivers no event by itself.
 - The XI1 per-device mask snapshot and ownership requirements of spec invariant 6 (`spec:66-72`) are unchanged.
@@ -239,8 +240,9 @@ In Xorg:
   - Assert which client gets the release (the owner), that only the owner gets it, and, for `grabconflict`, BadAccess with B's classes not stored.
   - Each ends with the end-state check.
   - Add one row: a client that disconnects leaves the order (A, B select; B disconnects; C selects → owner A).
+  - `twodev` runs on the yserver fixture's own pair of pointer slaves (lower and higher device ID), with the same assertions: BadAccess, plus the lower device's selection and entry surviving.
   - Rows `abgb`, `resel`, `empty` and `xi2clear` are GUARDs (they pass on base).
-- [ ] **Step 2: Red run** on Task 4's head. `ab`, `ba`, `abg`, `xi2first` and `grabconflict` fail as in the #379 column.
+- [ ] **Step 2: Red run** on Task 4's head. `ab`, `ba`, `abg`, `xi2first`, `grabconflict` and `twodev` fail.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Gate.** Mutations:
   - M9: `.first()` → `.last()` without the order;
@@ -248,6 +250,7 @@ In Xorg:
   - M11: a re-selection moves the client to newest;
   - M12: an XI2 selection does not create the entry;
   - M13: drop the conflict check.
+  - M14: make the conflict reject the whole request (`twodev` turns red).
 - [ ] **Step 5: Commit** `fix(xi): the XI1 implicit grab goes to the client Xorg picks, DeviceButtonGrab first`.
 
 ### Task 6 (coordinator): finish
