@@ -979,46 +979,29 @@ impl<P: Platform> XBackend<P> {
                             return None;
                         }
 
-                        // Keep the legacy rectangle byte-for-byte for an
-                        // unshaped sibling. A shaped sibling's contribution
-                        // comes from the border-inclusive child region; it is
-                        // in parent content space, so convert it through the
-                        // sibling and destination content offsets.
+                        // `child_clip_region` returns the content box for an
+                        // unshaped sibling and the shape clipped to the outer
+                        // rect for a shaped one. Both are in parent content
+                        // space, so use the same conversion to destination
+                        // content coordinates.
                         let rank = sibling_geom.stack_rank;
-                        if self.bounding_shape_local(*sibling_host_xid).is_none() {
-                            return Some((
-                                rank,
-                                vec![ash::vk::Rect2D {
-                                    offset: ash::vk::Offset2D {
-                                        x: sibling_target.offset().0 - dst_target.offset().0,
-                                        y: sibling_target.offset().1 - dst_target.offset().1,
-                                    },
-                                    extent: ash::vk::Extent2D {
-                                        width: u32::from(sibling_geom.width),
-                                        height: u32::from(sibling_geom.height),
-                                    },
-                                }],
-                            ));
-                        }
-
                         let bw = i32::from(sibling_geom.border_width);
-                        let bw_u32 = u32::from(sibling_geom.border_width);
-                        let outer = ash::vk::Rect2D {
+                        let content_box = ash::vk::Rect2D {
                             offset: ash::vk::Offset2D {
-                                x: i32::from(sibling_geom.x),
-                                y: i32::from(sibling_geom.y),
+                                x: i32::from(sibling_geom.x) + bw,
+                                y: i32::from(sibling_geom.y) + bw,
                             },
                             extent: ash::vk::Extent2D {
-                                width: u32::from(sibling_geom.width) + 2 * bw_u32,
-                                height: u32::from(sibling_geom.height) + 2 * bw_u32,
+                                width: u32::from(sibling_geom.width),
+                                height: u32::from(sibling_geom.height),
                             },
                         };
-                        let dx = -i32::from(sibling_geom.x) - bw + sibling_target.offset().0
+                        let dx = -content_box.offset.x + sibling_target.offset().0
                             - dst_target.offset().0;
-                        let dy = -i32::from(sibling_geom.y) - bw + sibling_target.offset().1
+                        let dy = -content_box.offset.y + sibling_target.offset().1
                             - dst_target.offset().1;
-                        let shaped: Vec<_> = self
-                            .child_clip_region(*sibling_host_xid, sibling_geom, outer)
+                        let contribution: Vec<_> = self
+                            .child_clip_region(*sibling_host_xid, sibling_geom, content_box)
                             .into_iter()
                             .map(|mut rect| {
                                 rect.offset.x += dx;
@@ -1026,7 +1009,7 @@ impl<P: Platform> XBackend<P> {
                                 rect
                             })
                             .collect();
-                        Some((rank, shaped))
+                        Some((rank, contribution))
                     }),
             );
             let Some(parent_xid) = branch_geom.parent else {
