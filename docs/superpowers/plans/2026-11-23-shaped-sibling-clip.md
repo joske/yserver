@@ -205,13 +205,17 @@ Most likely to bite first:
 **Files:**
 - Modify: `crates/yserver/src/kms/render/backend/portable/windows.rs`
   (`clear_window_area_with_background`, pixmap branch ~847-900). Use
-  `subwindow_mode_clip` and `apply_subwindow_mode_clip` from `clip.rs`.
+  `subwindow_mode_clip` (`clip.rs`) and the `Rect2D` helpers
+  `compute_copy_area_dst_rects` / `intersect_rect_with_clip`.
 - Test: `crates/yserver/src/kms/render/backend/tests/paint_target.rs`.
 
 **Interfaces:**
-- Consumes: `subwindow_mode_clip(&self, host_xid: u32, mode: SubwindowMode) ->
-  Option<SubwindowModeClip>` and `apply_subwindow_mode_clip(&SubwindowModeClip,
-  &[Rectangle16]) -> Vec<Rectangle16>`, both existing.
+- Consumes, all existing:
+  - `subwindow_mode_clip(&self, host_xid: u32, mode: SubwindowMode) ->
+    Option<SubwindowModeClip>`, whose fields are `cut: Vec<Rect2D>` and
+    `keep: Option<Vec<Rect2D>>` (`backend.rs:664`);
+  - `compute_copy_area_dst_rects` (`draw.rs`);
+  - `intersect_rect_with_clip` (`clip.rs`).
 - Produces: none.
 
 - [ ] **Step 1: Write the failing tests** (lavapipe, `#[ignore]`).
@@ -259,13 +263,41 @@ Most likely to bite first:
     - Mutation: treat `None` from `subwindow_mode_clip` as "clip to nothing"
       → fails.
 
+  - **`pixmap_background_piece_beyond_i16_is_painted` (T8, review r2 B-1).**
+    - Setup:
+      - redirected parent P, 64×64, background pixel `0x000000`;
+      - child C of P at x = −32768, y = 0, 40000×16, with an 8×8 `0xff0000`
+        background pixmap, not yet mapped;
+      - child D of C at local x = 32760, 9×16, background pixel `0x0000ff`,
+        mapped;
+      - then map C.
+    - C's background clear minus D leaves `[0,32760)` and `[32769,40000)`
+      locally. The second piece covers P x = 1…63, and starts beyond
+      `i16::MAX` in C's local space. C's own leaf allocation may fail at this
+      width; realize still paints into P's backing.
+    - Assert on P:
+      - `(10,8)` == `0xff0000`;
+      - `(0,8)` == `0x0000ff` (D: local 32768 lies in `[32760,32769)`).
+    - Mutation: route the pixmap branch through `apply_subwindow_mode_clip` →
+      `(10,8)` fails.
+    - If setup cannot reach the realize paint, for example because core
+      rejects the geometry, stop and report; do not reshape the test.
+
 - [ ] **Step 2: Run on the base (with Task 1).** Expected: T3 and T4 FAIL as
-  stated; T7 PASS.
+  stated; T7 PASS; T8 follows the base's occluder-only branch, so record
+  its base result without requiring failure.
 - [ ] **Step 3: Implement.**
-  - In the pixmap branch, replace the occluder subtraction with
-    `subwindow_mode_clip(host_xid, SubwindowMode::ClipByChildren)` applied to
-    the clear rect through `apply_subwindow_mode_clip`. `None` means the
-    whole rect.
+  - In the pixmap branch, replace the occluder subtraction with the
+    `SubwindowModeClip` from `subwindow_mode_clip(host_xid,
+    SubwindowMode::ClipByChildren)`. `None` means the whole rect.
+  - Apply its `cut` and `keep` (both `Vec<ash::vk::Rect2D>`) to the
+    `Rect2D` clear rect with the existing 32-bit rect algebra:
+    - subtract `cut` with `compute_copy_area_dst_rects`;
+    - intersect with `keep` (when `Some`) with `intersect_rect_with_clip`.
+  - Do NOT go through `apply_subwindow_mode_clip`. That wrapper converts to
+    `Rectangle16` and drops pieces whose origin exceeds `i16`
+    (`clip.rs` ~675-686), while this branch tiles in `Rect2D`. The rule is the
+    same; only the 16-bit adapter is skipped. Say so in a one-line comment.
   - Keep the "nothing survives → return Ok" early return.
   - Keep each piece's `src_x/src_y = piece + tile_origin`.
   - Remove imports that become unused.
