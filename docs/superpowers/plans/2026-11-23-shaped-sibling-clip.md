@@ -90,7 +90,7 @@ Most likely to bite first:
    The pixmap branch must then clear the whole rect, as today. Pinned by T7.
 3. **Tile alignment.** After G2 cuts the rect into pieces, each piece must
    still sample at `piece + tile_origin`, not at the piece's own `0,0`.
-   Pinned by T3, whose pixmap is not uniform.
+   Pinned by T3's second island at a nonzero local origin.
 4. **A sibling shaped to empty** (an unmapped-like zero-rect shape). It must
    occlude nothing and must not panic on an empty `Vec`. Covered in T1 as a
    second assertion.
@@ -151,7 +151,9 @@ Most likely to bite first:
       - `(10,2)`: L's border ring, inside U's outer rect, outside the shape;
       - `(1,1)`: U's border, inside the shape;
       - `(3,8)`: U's content, inside the shape.
-    - **(a) draw:** after a `0xff0000` `CopyArea` over all of L:
+    - **(a) draw:** `CopyArea` a 40×40 depth-24 pixmap of one-pixel columns
+      over all of L. Even columns are `0xff0000`, odd columns `0x00ffff`, by P
+      x coordinate once drawn. Then:
       - `(10,8)` == `0xff0000`;
       - `(1,1)` == `0x0000ff`;
       - `(3,8)` == `0x00ff00`.
@@ -160,12 +162,21 @@ Most likely to bite first:
       `copy_area_shared_backing_occluders`.
       - `(10,2)` == `0xffff00`;
       - `(1,1)` == `0x0000ff`.
-    - **(c) move carry:** `ConfigureWindow` L to `x=1`, then back to `x=0`.
-      All four pixels keep their (a)/(b) values.
+    - **(c) move carry:** `ConfigureWindow` L to `x=1`, with no client
+      redraw.
+      - `(10,8)` == `0x00ffff`: carried through the hole from P `(9,8)`.
+      - `(3,8)` == `0x00ff00`: destination excluded, U's shape untouched.
+      - `(6,8)` == `0x000000`: its source P `(5,8)` lies in U's shape, so it is
+        source-excluded, not carried, and exposed to L's background.
+      Then `ConfigureWindow` L back to `x=0`:
+      - `(10,8)` == `0xff0000`;
+      - `(3,8)` == `0x00ff00`.
     - Mutations:
       - intersect U's shape with its content rect instead of its outer rect →
         (b) `(1,1)` fails;
-      - full-rect occluder → (a) `(10,8)` fails.
+      - full-rect occluder for every consumer → (a) `(10,8)` fails;
+      - full-rect occluder only for the two move-carry calls
+        (`paint_target.rs` ~807, ~892) → (c) `(10,8)` fails.
 
 - [ ] **Step 2: Run them on the base.** Expected: T1 and T6 FAIL on
   `(10,5)` / `(10,8)`; T2 PASS.
@@ -174,9 +185,13 @@ Most likely to bite first:
   geom, outer)` translated into `dst` content space. For an unshaped sibling,
   contribute the existing rect, unchanged.
   - Derive the translation from the same paint-target offsets the current
-    code uses. `child_clip_region` returns parent content space, so subtract
-    the sibling's `(x, y)` and add its paint-target offset minus the dst
-    offset.
+    code uses. `child_clip_region` places the shape at the sibling's CONTENT
+    origin `(x + bw, y + bw)` in parent content space, and `PaintTarget::offset`
+    is a content origin (`yserver-render/src/kms/render/target.rs:134-155`).
+    So subtract `(geom.x + bw, geom.y + bw)` and add `sibling_target.offset()
+    - dst_target.offset()`. This is the border design's
+    `W.border_width + C.x + C.border_width` rule
+    (`docs/superpowers/specs/2026-09-07-window-borders-design.md:444-451`).
   - Keep the outer rect border-inclusive (Review Focus 1).
 - [ ] **Step 4: Run** the three tests plus the existing `paint_target` tests
   (both commands of the per-task gate). Expected: all PASS.
@@ -200,21 +215,24 @@ Most likely to bite first:
 - [ ] **Step 1: Write the failing tests** (lavapipe, `#[ignore]`).
   - **`pixmap_background_realize_paints_only_inside_own_shape` (T3).**
     - Setup:
-      - redirected parent P, 64×64, background pixel `0x000000`;
-      - child C at 8,8, 16×16, with a depth-24 background pixmap 16×16. The
-        pixmap's left half is `0xff0000`, its right half `0x00ff00`, so tile
-        misalignment is visible;
-      - C is SHAPE-Rectangles bounded to `0,0 8x16` before `MapWindow`.
-    - Assert on P after `MapWindow` C:
-      - `(10,10)` == `0xff0000` (inside the shape, left half);
-      - `(20,10)` == `0x000000` (outside the shape, untouched).
-    - Then unmap and grow C to 24×16 with `ConfigureWindow`, reshape it to
-      `0,0 24x16`, and map it:
-      - `(26,10)` == `0xff0000`: column 18 of C samples the tile at 18 mod 16
-        = 2, the red half;
-      - `(20,10)` == `0x00ff00`.
-    - Mutation: restore the occluder-only clip in the pixmap branch →
-      `(20,10)` after the first map fails.
+      - redirected parent P, depth 32, 64×64, background pixel `0xff000000`
+        (opaque black). Depth-32 windows need a 32-bit visual, `CWColormap`
+        and `CWBorderPixel`, as xfwm4 frames do;
+      - child C of P, depth 32, at 8,8, 16×16, with a depth-32 16×16
+        background pixmap of four 4-pixel column bands, all alpha `0xff`:
+        cols 0-3 `0xffff0000`, 4-7 `0xff00ff00`, 8-11 `0xff0000ff`,
+        12-15 `0xffffff00`;
+      - before `MapWindow`, C is SHAPE-Rectangles bounded to two islands,
+        `0,0 4x16` and `10,0 4x16`.
+    - Assert RGB on P after `MapWindow` C:
+      - `(9,10)`, local col 1, == `0xff0000`;
+      - `(18,10)`, local col 10, == `0x0000ff` (second island, tile phase kept);
+      - `(20,10)`, local col 12, == `0xffff00`;
+      - `(14,10)`, local col 6, outside the shape, == `0x000000` (untouched).
+    - Mutations:
+      - restore the occluder-only clip in the pixmap branch → `(14,10)` fails;
+      - sample each surviving piece from tile `(0,0)` instead of
+        `piece + tile_origin` → `(18,10)` fails.
   - **`pixmap_background_grow_does_not_paint_over_mapped_child` (T4, oracle).**
     The case measured on 2026-11-23 against Xvfb 21.1.24
     (`~/Projects/claude-scratch/xfwm-corners/oracle/t4.c`).
