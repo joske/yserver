@@ -941,6 +941,84 @@ fn unpaced_output_client_enters_direct_on_first_retirement() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: a Root first entry behind a composed flip takes Copy. Each Copy
+// queues the next composed flip, so a steady stream never entered direct.
+fn root_first_entry_waits_for_pending_scene_flip() {
+    use yserver_core::backend::Backend;
+
+    let Some((fixture, direct)) = a3_root_fixture(985) else {
+        eprintln!("SKIP root_first_entry_waits_for_pending_scene_flip: Vulkan fixture unavailable");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let fd = fixture.kms_fd(0);
+    let scene_start = fixture.events.recorders[&fd].records().len();
+    a3_submit_composed_scene_commit(&mut fixture, 0);
+    assert!(fixture.events.backend.scene.has_pending_page_flip(0));
+    let before = fixture.events.recorders[&fd].records().len();
+
+    let probation = usize::from(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION);
+    for attempt in 0..probation {
+        assert_eq!(
+            Backend::try_present_direct(
+                &mut fixture.events.backend,
+                direct.candidate,
+                direct.event.clone(),
+            )
+            .expect("Root Present enters through Backend"),
+            attempt + 1 == probation,
+            "the post-probation Root Present is owned by direct, not Copy"
+        );
+    }
+    a3_tick(&mut fixture);
+    let owner = fixture.events.backend.pstate.direct.root();
+    assert_eq!(
+        owner
+            .queued_successor
+            .as_ref()
+            .map(|frame| frame.candidate.present_id),
+        Some(direct.candidate.present_id),
+        "the pending composed flip keeps the Root first entry queued"
+    );
+    assert!(owner.pending.is_none() && owner.current.is_none());
+    assert!(
+        a3_records_since(&fixture, fd, before)
+            .iter()
+            .all(|record| record.events.len() < fixture.events.backend.platform.outputs.len()),
+        "no grouped direct commit while Output(0)'s composed flip is pending"
+    );
+
+    // Retire every composed flip; the grouped entry waits for all outputs.
+    let scene_records = a3_records_since(&fixture, fd, scene_start);
+    a3_retire_records(&mut fixture, &scene_records);
+    assert!(
+        (0..fixture.events.backend.platform.outputs.len()).all(|output_idx| !fixture
+            .events
+            .backend
+            .scene
+            .has_pending_page_flip(output_idx))
+    );
+    let dispatch = a3_tick(&mut fixture);
+    let owner = fixture.events.backend.pstate.direct.root();
+    let pending = owner
+        .pending
+        .as_ref()
+        .expect("the composed flip's retirement dispatches the Root entry");
+    assert_eq!(pending.candidate.present_id, direct.candidate.present_id);
+    assert!(owner.queued_successor.is_none());
+    let pending_id = pending
+        .accepted_event_id
+        .expect("queued Root frame accepted after scene retirement");
+    assert!(dispatch.iter().any(|record| {
+        super::commit_identity::accepted_event_id(record) == Some(pending_id)
+            && record.events.len() == fixture.events.backend.platform.outputs.len()
+    }));
+    fixture.events.wait_for_submitted_gpu_work();
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: dispatch on the CRTC gate only.
 fn queued_entry_waits_for_scene_pending_on_its_output() {
     use yserver_core::backend::Backend;

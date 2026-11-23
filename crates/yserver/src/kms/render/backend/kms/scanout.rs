@@ -1835,37 +1835,43 @@ impl KmsBackend {
         if owner.pending.is_some() {
             return;
         }
-        let first_output_entry = matches!(scope, DirectScope::Output(_))
-            && owner.current.is_none()
-            && !owner.hold_direct
-            && owner.queued_successor.is_some();
-        if owner.unflip_requested && !first_output_entry {
+        let first_entry =
+            owner.current.is_none() && !owner.hold_direct && owner.queued_successor.is_some();
+        if owner.unflip_requested && !first_entry {
             return;
         }
         if let DirectScope::Output(output_idx) = scope
             && owner.queued_successor.is_some()
             && (self.scene.has_pending_page_flip(output_idx)
-                || (!first_output_entry && !self.direct_output_frames_scene_eligible(output_idx)))
+                || (!first_entry && !self.direct_output_frames_scene_eligible(output_idx)))
         {
-            if !first_output_entry {
+            if !first_entry {
                 self.request_direct_unflip_for(scope, "queued_direct_successor_scene_changed");
             }
             return;
         }
         let direct_outputs = self.direct_scope_outputs(scope);
+        // A Root first entry waits for every grouped output's composed flip.
+        if first_entry
+            && direct_outputs
+                .iter()
+                .any(|&output_idx| self.scene.has_pending_page_flip(output_idx))
+        {
+            return;
+        }
         if self
             .platform
             .scanout_commit_in_flight_for_outputs(&direct_outputs)
         {
             return;
         }
-        if first_output_entry
+        if first_entry
             && !self
                 .pstate
                 .direct
                 .get(scope)
                 .and_then(|owner| owner.queued_successor.as_ref())
-                .is_some_and(|frame| self.queued_output_candidate_eligible(frame, scope))
+                .is_some_and(|frame| self.queued_entry_candidate_eligible(frame, scope))
         {
             if let Some(frame) = self
                 .pstate
@@ -1903,7 +1909,7 @@ impl KmsBackend {
                 log::warn!(
                     "scanout_m2: queued direct successor submit failed after predecessor retirement: {error}"
                 );
-                if first_output_entry {
+                if first_entry {
                     self.fallback_queued_direct_entry_to_copy(scope, successor);
                 } else {
                     self.defer_direct_successor_skip(scope, successor);
@@ -1956,8 +1962,11 @@ impl KmsBackend {
             frame.event,
             candidate.completion_dst_host_xid,
         );
-        if let DirectScope::Output(output_idx) = scope {
-            self.scene.mark_scene_structure_dirty_for_output(output_idx);
+        match scope {
+            DirectScope::Root => self.scene.mark_scene_structure_dirty(),
+            DirectScope::Output(output_idx) => {
+                self.scene.mark_scene_structure_dirty_for_output(output_idx);
+            }
         }
         if let Some(owner) = self.pstate.direct.get_mut(scope) {
             owner.hold_direct = false;
@@ -1977,12 +1986,9 @@ impl KmsBackend {
     }
 
     fn cancel_queued_direct_entry_to_copy(&mut self, scope: DirectScope) -> Option<bool> {
-        let first_entry = matches!(scope, DirectScope::Output(_))
-            && self.pstate.direct.get(scope).is_some_and(|owner| {
-                owner.current.is_none()
-                    && owner.pending.is_none()
-                    && owner.queued_successor.is_some()
-            });
+        let first_entry = self.pstate.direct.get(scope).is_some_and(|owner| {
+            owner.current.is_none() && owner.pending.is_none() && owner.queued_successor.is_some()
+        });
         if !first_entry {
             return None;
         }
