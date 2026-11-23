@@ -328,15 +328,34 @@ pub(super) fn apply_allow_events(
 
     let pointer_replay = mode == 2;
     let keyboard_replay = mode == 5;
-
+    // Xorg AllowSome's NOT_GRABBED case replays only when this client owns
+    // this device's grab and it is frozen with the activating event
+    // (dix/events.c:1899-1906). A synced-only client passes the general gate
+    // above, but its replay must leave the freeze state, `other`, stored
+    // event and active grab untouched.
+    if (pointer_replay || keyboard_replay)
+        && !(this_grabbed && this_state == Xi1SyncState::FrozenWithEvent)
+    {
+        debug!(
+            "client {} #{} AllowEvents replay no-op (grabbed={this_grabbed} state={this_state:?})",
+            client_id.0, sequence.0
+        );
+        return Ok(RequestOutcome::Handled);
+    }
     // State transitions per mode (Xorg AllowSome switch). The queued
     // events play AFTER the transition so the freeze gate at fanout
     // entry sees the new state: Async → events flow; Sync →
     // FreezeNextEvent lets them flow until the next key/button trips
     // the re-freeze (FreezeThisEventIfNeededForSyncGrab).
     let set_state = |state: &mut ServerState, dev: u16, st: Xi1SyncState| {
+        let grabbed = grab_owner_of(state, dev) == Some(client_id);
         let f = state.xi1_frozen.entry(dev).or_default();
-        f.state = st;
+        // A client holding only `sync.other` can release that hold, but it
+        // cannot change the freeze state belonging to the device's grab
+        // owner (Xorg dix/events.c:1858-1863).
+        if grabbed {
+            f.state = st;
+        }
         if f.other == Some(client_id) {
             f.other = None;
         }
@@ -402,7 +421,8 @@ pub(super) fn apply_allow_events(
     // PlayReleasedEvents; with the grab still active they route to
     // the grab owner.
     let pointer_side = matches!(mode, 0 | 1 | 2 | 6 | 7);
-    let frozen_pointer = if pointer_side {
+    let pointer_grabbed = grab_owner_of(state, dev_ptr) == Some(client_id);
+    let frozen_pointer = if pointer_side && pointer_grabbed {
         state
             .xi1_frozen
             .get_mut(&dev_ptr)

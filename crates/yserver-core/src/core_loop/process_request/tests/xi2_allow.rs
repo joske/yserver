@@ -3351,13 +3351,12 @@ fn sync_passive_kbd_grab_synckeyboard_release_thaws() {
     );
 }
 
-/// Regression (codex review): ReplayKeyboard must release an
-/// EXPLICIT GrabKeyboard(GrabModeSync), not just a passive key
-/// grab — Xorg NOT_GRABBED calls DeactivateGrab regardless of
-/// grab kind (dix/events.c:1898). Pre-fix the grab stayed active
-/// after the replay → stuck keyboard.
+/// ReplayKeyboard from an explicit sync grab is a no-op while the
+/// unified state is FrozenNoEvent, even if a key is in the sync queue.
+/// Xorg AllowSome's NOT_GRABBED case deactivates only at
+/// FROZEN_WITH_EVENT (dix/events.c:1899-1906).
 #[test]
-fn core_replay_keyboard_releases_explicit_sync_grab() {
+fn core_replay_keyboard_requires_frozen_event_for_explicit_sync_grab() {
     use crate::{
         host_x11::HostKeyEvent,
         server::{ActiveKeyboardGrab, ActiveKeyboardGrabSource},
@@ -3371,9 +3370,8 @@ fn core_replay_keyboard_releases_explicit_sync_grab() {
     let _grab_peer = install_client(&mut state, GRAB_CLIENT_ID);
     state.core_focus.raw = FOCUS_WIN;
 
-    // Explicit GrabKeyboard(GrabModeSync): active grab + the
-    // device frozen-no-event, with a key withheld in the freeze
-    // queue (the "with event" condition for replay).
+    // Explicit GrabKeyboard(GrabModeSync): the device is frozen-no-event.
+    // A queued event does not make this state FrozenWithEvent.
     state.active_keyboard_grab = Some(ActiveKeyboardGrab {
         owner: ClientId(GRAB_CLIENT_ID),
         grab_window: ROOT_WINDOW,
@@ -3421,8 +3419,13 @@ fn core_replay_keyboard_releases_explicit_sync_grab() {
     )
     .expect("allow events replay keyboard");
 
-    assert!(
-        state.active_keyboard_grab.is_none(),
-        "ReplayKeyboard must deactivate the explicit sync keyboard grab",
+    assert!(state.active_keyboard_grab.is_some_and(|grab| {
+        grab.owner == ClientId(GRAB_CLIENT_ID)
+            && matches!(grab.source, ActiveKeyboardGrabSource::Explicit)
+    }));
+    assert_eq!(
+        state.xi1_frozen[&crate::xinput::DEVICEID_MASTER_KEYBOARD].state,
+        crate::server::Xi1SyncState::FrozenNoEvent
     );
+    assert_eq!(state.sync_pending.len(), 1);
 }

@@ -232,6 +232,497 @@ fn assert_task1_end_state(f: &Fixture, xi1_entries: &[u16]) {
     );
 }
 
+/// Reproduces PR1: a client's ReplayPointer must not consume another
+/// client's frozen pointer event merely because its keyboard grab synced it.
+#[test]
+fn replay_pointer_from_synced_only_client_is_a_noop() {
+    use crate::server::Xi1SyncState;
+
+    let mut f = p_fixture();
+    assert_eq!(f.state.buttons_down, 0);
+    select_xi2(&mut f, CLIENT_B, D, XI_MASTER, XI_GRAB_MASK);
+    grab_button_core(&mut f, CLIENT_A, W, 1, ANY_MODIFIER, 0, false);
+
+    press_over_d(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert_eq!(read_packets(&mut f.client_a), vec![core(4, W)]);
+    assert!(read_packets(&mut f.client_b).is_empty());
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER].state,
+        Xi1SyncState::FrozenWithEvent
+    );
+    assert!(f.state.xi1_frozen[&XI_MASTER].stored.is_some());
+
+    // A's explicit sync GrabPointer replaces the passive grab and leaves the
+    // event non-replayable, as CheckGrabForSyncs does for a new sync grab.
+    grab_core_pointer_sync(&mut f, CLIENT_A, W);
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER].state,
+        Xi1SyncState::FrozenNoEvent
+    );
+    assert!(f.state.xi1_frozen[&XI_MASTER].stored.is_some());
+    grab_keyboard_sync_pointer(&mut f, CLIENT_B, W);
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER].other,
+        Some(ClientId(CLIENT_B))
+    );
+
+    // Drain setup replies/crossings so the rejected request is checked as
+    // raw client output, including errors and crossing events.
+    let _ = read_all_capture_available(&mut f.client_a);
+    let _ = read_all_capture_available(&mut f.client_b);
+    allow_events_core(&mut f, CLIENT_B, 2); // ReplayPointer
+    assert!(
+        read_all_capture_available(&mut f.client_a).is_empty(),
+        "B's rejected replay produces no packet for A"
+    );
+    assert!(
+        read_all_capture_available(&mut f.client_b).is_empty(),
+        "B's rejected replay produces no packet for B"
+    );
+    let grab = f
+        .state
+        .active_pointer_grab
+        .expect("A's pointer grab remains active");
+    assert_eq!(grab.owner, ClientId(CLIENT_A));
+    assert!(!grab.passive && !grab.implicit);
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER].state,
+        Xi1SyncState::FrozenNoEvent
+    );
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER].other,
+        Some(ClientId(CLIENT_B))
+    );
+    assert!(f.state.xi1_frozen[&XI_MASTER].stored.is_some());
+
+    let _ = read_all_capture_available(&mut f.client_a);
+    let _ = read_all_capture_available(&mut f.client_b);
+    allow_events_core(&mut f, CLIENT_A, 2); // ReplayPointer while FrozenNoEvent
+    assert!(
+        read_all_capture_available(&mut f.client_a).is_empty(),
+        "A's rejected replay produces no packet for A"
+    );
+    assert!(
+        read_all_capture_available(&mut f.client_b).is_empty(),
+        "A's rejected replay produces no packet for B"
+    );
+    let still_grabbed = f
+        .state
+        .active_pointer_grab
+        .expect("A's pointer grab remains active");
+    assert_eq!(still_grabbed.owner, grab.owner);
+    assert_eq!(still_grabbed.grab_window, grab.grab_window);
+    assert_eq!(still_grabbed.passive, grab.passive);
+    assert_eq!(still_grabbed.implicit, grab.implicit);
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER].state,
+        Xi1SyncState::FrozenNoEvent
+    );
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER].other,
+        Some(ClientId(CLIENT_B))
+    );
+    assert!(f.state.xi1_frozen[&XI_MASTER].stored.is_some());
+
+    ungrab_core_pointer_request(&mut f, CLIENT_A);
+    ungrab_keyboard(&mut f, CLIENT_B);
+    release(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(5, XI_MASTER, XI_XTEST, D)],
+        "PR1: after both ungrabs, only the natural XI2 release is delivered"
+    );
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
+/// Reproduces PR2: a synced-only ReplayPointer is inert, then the grab owner
+/// can still replay the original FrozenWithEvent press below W.
+#[test]
+fn owner_replay_after_synced_client_noop_replays() {
+    use crate::server::Xi1SyncState;
+
+    let mut f = p_fixture();
+    assert_eq!(f.state.buttons_down, 0);
+    select_xi2(&mut f, CLIENT_B, D, XI_MASTER, XI_GRAB_MASK);
+    grab_button_core(&mut f, CLIENT_A, W, 1, ANY_MODIFIER, 0, false);
+
+    press_over_d(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert_eq!(read_packets(&mut f.client_a), vec![core(4, W)]);
+    assert!(read_packets(&mut f.client_b).is_empty());
+    let passive = f
+        .state
+        .active_pointer_grab
+        .expect("A's passive grab is active");
+    assert!(passive.passive && !passive.implicit);
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER].state,
+        Xi1SyncState::FrozenWithEvent
+    );
+
+    grab_keyboard_sync_pointer(&mut f, CLIENT_B, W);
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER].other,
+        Some(ClientId(CLIENT_B))
+    );
+    let _ = read_all_capture_available(&mut f.client_a);
+    let _ = read_all_capture_available(&mut f.client_b);
+    allow_events_core(&mut f, CLIENT_B, 2); // ReplayPointer from synced-only B
+    assert!(
+        read_all_capture_available(&mut f.client_a).is_empty(),
+        "B's rejected replay produces no packet for A"
+    );
+    assert!(
+        read_all_capture_available(&mut f.client_b).is_empty(),
+        "B's rejected replay produces no packet for B"
+    );
+    let still_passive = f
+        .state
+        .active_pointer_grab
+        .expect("A's passive pointer grab remains active");
+    assert_eq!(still_passive.owner, passive.owner);
+    assert_eq!(still_passive.grab_window, passive.grab_window);
+    assert_eq!(still_passive.passive, passive.passive);
+    assert_eq!(still_passive.implicit, passive.implicit);
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER].state,
+        Xi1SyncState::FrozenWithEvent
+    );
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER].other,
+        Some(ClientId(CLIENT_B))
+    );
+    assert!(f.state.xi1_frozen[&XI_MASTER].stored.is_some());
+
+    allow_events_core(&mut f, CLIENT_B, 0); // AsyncPointer clears only B's sync hold
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(read_packets(&mut f.client_b).is_empty());
+    assert_eq!(f.state.xi1_frozen[&XI_MASTER].other, None);
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER].state,
+        Xi1SyncState::FrozenWithEvent
+    );
+    assert!(f.state.xi1_frozen[&XI_MASTER].stored.is_some());
+
+    allow_events_core(&mut f, CLIENT_A, 2); // ReplayPointer
+    let implicit = f
+        .state
+        .active_pointer_grab
+        .expect("the replayed master press creates B's implicit grab on D");
+    assert_eq!(implicit.owner, ClientId(CLIENT_B));
+    assert_eq!(implicit.grab_window, ResourceId(D));
+    assert!(implicit.implicit && !implicit.passive && implicit.via_xi2);
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(4, XI_MASTER, XI_XTEST, D)],
+        "PR2: A's replay delivers the press as a master XI2 event below W"
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+
+    ungrab_keyboard(&mut f, CLIENT_B);
+    release(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(5, XI_MASTER, XI_XTEST, D)]
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
+/// Exercises the shared ReplayKeyboard admission path with a core key grab:
+/// a pointer grab's paired sync must not replay another client's key.
+#[test]
+fn replay_keyboard_from_synced_only_client_is_a_noop() {
+    use crate::{
+        host_x11::HostKeyEvent,
+        server::{ActiveKeyboardGrabSource, Xi1SyncState},
+    };
+
+    const KEYCODE: u8 = 38;
+    const KEY_PRESS_RELEASE_MASK: u32 = 0x0000_0003;
+    const ROOT: u32 = crate::resources::ROOT_WINDOW.0;
+    let mut f = p_fixture();
+    assert_eq!(f.state.buttons_down, 0);
+    select_core(&mut f, CLIENT_B, D, KEY_PRESS_RELEASE_MASK);
+    let mut set_focus = Vec::with_capacity(8);
+    set_focus.extend_from_slice(&D.to_le_bytes());
+    set_focus.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    dispatch(&mut f, CLIENT_B, 42, 0, &set_focus); // SetInputFocus
+
+    let mut grab_key = Vec::with_capacity(12);
+    grab_key.extend_from_slice(&ROOT.to_le_bytes());
+    grab_key.extend_from_slice(&0u16.to_le_bytes()); // modifiers
+    grab_key.extend_from_slice(&[KEYCODE, 1, 0, 0, 0, 0]); // async pointer, sync keyboard
+    dispatch(&mut f, CLIENT_A, 33, 0, &grab_key); // GrabKey
+    assert!(f.state.key_grabs.iter().any(|grab| {
+        grab.owner == ClientId(CLIENT_A)
+            && grab.grab_window.0 == ROOT
+            && grab.keycode == KEYCODE
+            && grab.keyboard_mode == 0
+    }));
+
+    crate::core_loop::key_fanout::key_event_fanout_to_state(
+        &mut f.state,
+        &mut f.backend,
+        HostKeyEvent {
+            origin: InputOrigin::NestedHost,
+            pressed: true,
+            keycode: KEYCODE,
+            time: f.time,
+            root_x: 145,
+            root_y: 145,
+            event_x: 145,
+            event_y: 145,
+            state: 0,
+        },
+    );
+    assert!(f.state.active_keyboard_grab.is_some_and(|grab| {
+        grab.owner == ClientId(CLIENT_A)
+            && matches!(
+                grab.source,
+                ActiveKeyboardGrabSource::PassiveKey { keycode: KEYCODE }
+            )
+    }));
+    // Xorg ActivatePassiveGrab promotes the activating sync key to
+    // FrozenWithEvent while preserving it for ReplayKeyboard.
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER_KEYBOARD].state,
+        Xi1SyncState::FrozenWithEvent
+    );
+    assert!(f.state.xi1_frozen[&XI_MASTER_KEYBOARD].stored.is_some());
+    let _ = read_all_capture_available(&mut f.client_a);
+    let _ = read_all_capture_available(&mut f.client_b);
+
+    // Re-grabbing the keyboard synchronously puts its unified state in
+    // FrozenNoEvent, matching the pointer sequence's explicit re-grab.
+    let mut grab_keyboard = Vec::with_capacity(12);
+    grab_keyboard.extend_from_slice(&W.to_le_bytes());
+    grab_keyboard.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    grab_keyboard.extend_from_slice(&[1, 0, 0, 0]); // async pointer, sync keyboard
+    dispatch(&mut f, CLIENT_A, 31, 0, &grab_keyboard); // GrabKeyboard
+    assert!(f.state.active_keyboard_grab.is_some_and(|grab| {
+        grab.owner == ClientId(CLIENT_A)
+            && matches!(grab.source, ActiveKeyboardGrabSource::Explicit)
+    }));
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER_KEYBOARD].state,
+        Xi1SyncState::FrozenNoEvent
+    );
+    assert!(f.state.xi1_frozen[&XI_MASTER_KEYBOARD].stored.is_some());
+    let _ = read_all_capture_available(&mut f.client_a);
+    let _ = read_all_capture_available(&mut f.client_b);
+
+    // B's GrabPointer syncs only the paired keyboard, so it is the
+    // synced-only requester for ReplayKeyboard.
+    let mut grab_pointer = Vec::with_capacity(20);
+    grab_pointer.extend_from_slice(&W.to_le_bytes());
+    grab_pointer.extend_from_slice(&0u16.to_le_bytes()); // no pointer events
+    grab_pointer.extend_from_slice(&[1, 0]); // async pointer, sync keyboard
+    grab_pointer.extend_from_slice(&0u32.to_le_bytes()); // no confinement
+    grab_pointer.extend_from_slice(&0u32.to_le_bytes()); // no cursor
+    grab_pointer.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    dispatch(&mut f, CLIENT_B, 26, 0, &grab_pointer); // GrabPointer
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER_KEYBOARD].other,
+        Some(ClientId(CLIENT_B))
+    );
+    let _ = read_all_capture_available(&mut f.client_a);
+    let _ = read_all_capture_available(&mut f.client_b);
+    allow_events_core(&mut f, CLIENT_B, 5); // ReplayKeyboard
+    assert!(
+        read_all_capture_available(&mut f.client_a).is_empty(),
+        "B's rejected replay produces no packet for A"
+    );
+    assert!(
+        read_all_capture_available(&mut f.client_b).is_empty(),
+        "B's rejected replay produces no packet for B"
+    );
+    assert!(f.state.active_keyboard_grab.is_some_and(|grab| {
+        grab.owner == ClientId(CLIENT_A)
+            && matches!(grab.source, ActiveKeyboardGrabSource::Explicit)
+    }));
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER_KEYBOARD].state,
+        Xi1SyncState::FrozenNoEvent
+    );
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER_KEYBOARD].other,
+        Some(ClientId(CLIENT_B))
+    );
+    assert!(f.state.xi1_frozen[&XI_MASTER_KEYBOARD].stored.is_some());
+
+    let _ = read_all_capture_available(&mut f.client_a);
+    let _ = read_all_capture_available(&mut f.client_b);
+    allow_events_core(&mut f, CLIENT_A, 5); // ReplayKeyboard
+    assert!(f.state.active_keyboard_grab.is_some_and(|grab| {
+        grab.owner == ClientId(CLIENT_A)
+            && matches!(grab.source, ActiveKeyboardGrabSource::Explicit)
+    }));
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER_KEYBOARD].state,
+        Xi1SyncState::FrozenNoEvent
+    );
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER_KEYBOARD].other,
+        Some(ClientId(CLIENT_B))
+    );
+    assert!(f.state.xi1_frozen[&XI_MASTER_KEYBOARD].stored.is_some());
+    assert!(
+        read_all_capture_available(&mut f.client_a).is_empty(),
+        "A's rejected replay produces no packet for A"
+    );
+    assert!(
+        read_all_capture_available(&mut f.client_b).is_empty(),
+        "A's rejected replay produces no packet for B"
+    );
+
+    ungrab_keyboard(&mut f, CLIENT_A);
+    dispatch(&mut f, CLIENT_B, 27, 0, &0u32.to_le_bytes()); // UngrabPointer
+    crate::core_loop::key_fanout::key_event_fanout_to_state(
+        &mut f.state,
+        &mut f.backend,
+        HostKeyEvent {
+            origin: InputOrigin::NestedHost,
+            pressed: false,
+            keycode: KEYCODE,
+            time: f.time + 1,
+            root_x: 145,
+            root_y: 145,
+            event_x: 145,
+            event_y: 145,
+            state: 0,
+        },
+    );
+    let release = read_all_capture_available(&mut f.client_b);
+    assert_eq!(release.len(), 32);
+    assert_eq!(release[0] & 0x7f, 3, "the terminating packet is KeyRelease");
+    assert!(f.state.active_keyboard_grab.is_none());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
+/// Exercises a request-created synchronous passive key grab through owner
+/// replay, using the existing fixture and production key fanout entry.
+#[test]
+fn owner_replay_keyboard_after_passive_key_grab_replays() {
+    use crate::{
+        host_x11::HostKeyEvent,
+        server::{ActiveKeyboardGrabSource, Xi1SyncState},
+    };
+
+    const KEYCODE: u8 = 38;
+    const KEY_PRESS_RELEASE_MASK: u32 = 0x0000_0003;
+    const ROOT: u32 = crate::resources::ROOT_WINDOW.0;
+
+    let mut f = p_fixture();
+    select_core(&mut f, CLIENT_B, D, KEY_PRESS_RELEASE_MASK);
+    let mut set_focus = Vec::with_capacity(8);
+    set_focus.extend_from_slice(&D.to_le_bytes());
+    set_focus.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    dispatch(&mut f, CLIENT_B, 42, 0, &set_focus); // SetInputFocus
+
+    let mut grab_key = Vec::with_capacity(12);
+    grab_key.extend_from_slice(&ROOT.to_le_bytes());
+    grab_key.extend_from_slice(&0u16.to_le_bytes()); // modifiers
+    grab_key.extend_from_slice(&[KEYCODE, 1, 0, 0, 0, 0]); // async pointer, sync keyboard
+    dispatch(&mut f, CLIENT_A, 33, 0, &grab_key); // GrabKey
+    assert!(f.state.key_grabs.iter().any(|grab| {
+        grab.owner == ClientId(CLIENT_A)
+            && grab.grab_window.0 == ROOT
+            && grab.keycode == KEYCODE
+            && grab.keyboard_mode == 0
+    }));
+
+    let _ = read_all_capture_available(&mut f.client_a);
+    let _ = read_all_capture_available(&mut f.client_b);
+    crate::core_loop::key_fanout::key_event_fanout_to_state(
+        &mut f.state,
+        &mut f.backend,
+        HostKeyEvent {
+            origin: InputOrigin::NestedHost,
+            pressed: true,
+            keycode: KEYCODE,
+            time: f.time,
+            root_x: 145,
+            root_y: 145,
+            event_x: 145,
+            event_y: 145,
+            state: 0,
+        },
+    );
+
+    let grab = f
+        .state
+        .active_keyboard_grab
+        .expect("the request-created passive key grab activates");
+    assert_eq!(grab.owner, ClientId(CLIENT_A));
+    assert_eq!(grab.grab_window, ResourceId(ROOT));
+    assert!(matches!(
+        grab.source,
+        ActiveKeyboardGrabSource::PassiveKey { keycode: KEYCODE }
+    ));
+    let freeze = &f.state.xi1_frozen[&XI_MASTER_KEYBOARD];
+    assert_eq!(freeze.state, Xi1SyncState::FrozenWithEvent);
+    assert!(matches!(
+        freeze.stored.as_ref(),
+        Some(crate::server::QueuedInputEvent::HostKeyTransition(event, _, _))
+            if event.pressed && event.keycode == KEYCODE
+    ));
+    let activating = read_all_capture_available(&mut f.client_a);
+    assert_eq!(activating.len(), 32);
+    assert_eq!(activating[0] & 0x7f, 2, "activation sends KeyPress to A");
+    assert_eq!(activating[1], KEYCODE);
+    assert_eq!(
+        u32::from_le_bytes(activating[12..16].try_into().unwrap()),
+        ROOT
+    );
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+
+    allow_events_core(&mut f, CLIENT_A, 5); // ReplayKeyboard
+    assert!(f.state.active_keyboard_grab.is_none());
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER_KEYBOARD].state,
+        Xi1SyncState::Thawed
+    );
+    let replayed = read_all_capture_available(&mut f.client_b);
+    assert_eq!(replayed.len(), 32);
+    assert_eq!(replayed[0] & 0x7f, 2, "ReplayKeyboard delivers KeyPress");
+    assert_eq!(replayed[1], KEYCODE);
+    assert_eq!(
+        u32::from_le_bytes(replayed[12..16].try_into().unwrap()),
+        D,
+        "the replay reaches B's natural focus window"
+    );
+    assert!(read_all_capture_available(&mut f.client_a).is_empty());
+
+    crate::core_loop::key_fanout::key_event_fanout_to_state(
+        &mut f.state,
+        &mut f.backend,
+        HostKeyEvent {
+            origin: InputOrigin::NestedHost,
+            pressed: false,
+            keycode: KEYCODE,
+            time: f.time + 1,
+            root_x: 145,
+            root_y: 145,
+            event_x: 145,
+            event_y: 145,
+            state: 0,
+        },
+    );
+    let released = read_all_capture_available(&mut f.client_b);
+    assert_eq!(released.len(), 32);
+    assert_eq!(
+        released[0] & 0x7f,
+        3,
+        "KeyRelease follows the replayed press"
+    );
+    assert_eq!(released[1], KEYCODE);
+    assert_eq!(u32::from_le_bytes(released[12..16].try_into().unwrap()), D);
+    assert!(read_all_capture_available(&mut f.client_a).is_empty());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
 /// GH #277 (probe V9, measured on Xorg in
 /// `tools/vng-scenarios/key-grab-activation`): Xorg `ActivatePassiveGrab`
 /// (dix/events.c) delivers the activating press with

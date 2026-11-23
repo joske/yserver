@@ -587,12 +587,18 @@ fn deliver_routed_key_with_master_status(
             // focus window if the grab owner declines it. Mirrors the
             // sync passive-button-grab freeze in `pointer_fanout`.
             if freeze && event.pressed {
-                state.xi1_frozen.entry(device_id).or_default().stored =
-                    Some(crate::server::QueuedInputEvent::HostKeyTransition(
-                        event,
-                        master_transition_accepted,
-                        synthetic_repeat,
-                    ));
+                let sync = state.xi1_frozen.entry(grab_device_id).or_default();
+                sync.stored = Some(crate::server::QueuedInputEvent::HostKeyTransition(
+                    event,
+                    master_transition_accepted,
+                    synthetic_repeat,
+                ));
+                // Xorg ActivatePassiveGrab promotes the synchronous
+                // activating key to FROZEN_WITH_EVENT (dix/events.c:
+                // 3861-3863), matching the pointer activation path.
+                if sync.state == crate::server::Xi1SyncState::FrozenNoEvent {
+                    sync.state = crate::server::Xi1SyncState::FrozenWithEvent;
+                }
             }
             // Xorg DeliverGrabbedEvent: with owner_events, key events
             // that would naturally land on one of the grab client's
