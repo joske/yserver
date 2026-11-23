@@ -5,6 +5,8 @@ use crate::kms::{
     },
     scanout_route::RenderDeviceId,
 };
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
+use std::os::fd::AsFd;
 use std::{collections::HashMap, io};
 use yserver_core::backend::{
     Backend as _, Dri3Caps, Dri3ImportModifier, Dri3PixmapExport, PixmapHandle,
@@ -442,39 +444,81 @@ impl KmsBackend {
         };
         // Vulkan's modifier import is explicit-only, so an implicit
         // layout has to be resolved to a concrete modifier first. gbm
-        // does that the way glamor does it for the same request
-        // (`gbm_bo_import(GBM_BO_IMPORT_FD)` then `gbm_bo_get_modifier`,
-        // ../xserver/glamor/glamor_egl.c:572 and :450).
+        // reports DRM_FORMAT_MOD_INVALID for an implicitly imported
+        // amdgpu buffer, but the kernel GEM metadata still carries the
+        // real tiling flags: amdgpu_import queries them on the render
+        // node. Other drivers (or a failed query) keep the old
+        // "layout unknown" path.
         //
-        // On failure this returns Err rather than falling back to
-        // LINEAR. Guessing is what #138 was: a wrong *successful*
-        // import corrupts the client's own output and reports success,
-        // where a refused one is visible and debuggable.
-        // What we tell clients later, which is the half that matters:
-        // `DRM_FORMAT_MOD_INVALID` means "layout not named", and a client
-        // re-importing on that answer resolves it itself (EGL and GL have
-        // an implicit dma-buf import path; Vulkan does not). Claiming
-        // LINEAR instead is #138 -- the client believes us and samples a
-        // tiled buffer as linear.
-        //
-        // We cannot do better than "unknown" here: gbm reports
-        // DRM_FORMAT_MOD_INVALID for an implicitly imported buffer on
-        // amdgpu -- measured, and it does so even for gbm's own fresh
-        // allocation -- so there is nothing to resolve against. i915 does
-        // report a concrete modifier, but a fix that only works on Intel
-        // is not a fix.
+        // We still report DRM_FORMAT_MOD_INVALID to clients for an
+        // implicit import: they did not name the layout, and a client
+        // re-importing on that answer resolves it itself.
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
+        let resolved_implicit = match modifier {
+            Dri3ImportModifier::Implicit { .. } => self
+                .platform
+                .selected_render_device()
+                .and_then(|device| device.render_node.as_ref())
+                .and_then(|node| node.open_fresh().ok())
+                .and_then(|render_fd| {
+                    super::amdgpu_import::resolve_modifier(
+                        render_fd.as_fd(),
+                        fd.as_fd(),
+                        u32::from(width),
+                        u32::from(height),
+                        stride,
+                    )
+                }),
+            Dri3ImportModifier::Explicit(_) => None,
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd")))]
+        let resolved_implicit: Option<u64> = None;
+
+        // A modifier the driver does not advertise is invalid usage in
+        // vkCreateImage. Keep the unknown-layout fallback rather than
+        // turning a guessed-but-working layout into a failed import.
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
+        let resolved_implicit = resolved_implicit.filter(|resolved| {
+            let supported = crate::kms::vk::dri3::supported_modifiers(
+                &vk,
+                format,
+                crate::kms::vk::dri3::CLIENT_IMPORT_USAGE,
+            );
+            if supported.contains(resolved) {
+                true
+            } else {
+                log::debug!(
+                    "DRI3 import: resolved implicit modifier 0x{resolved:x} is not \
+                     advertised by the driver; keeping the unknown-layout path"
+                );
+                false
+            }
+        });
+
         let (vk_modifier, reported_modifier, client_size, implicit_layout) = match modifier {
             Dri3ImportModifier::Explicit(m) => (m, Some(m), None, false),
-            // LINEAR is a best-effort for OUR OWN Vulkan view of the
-            // buffer, which is only ever sampled if the server itself
-            // composites this pixmap. It is deliberately NOT what we
-            // report back.
-            Dri3ImportModifier::Implicit { size } => (
-                crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR,
-                Some(crate::kms::vk::dri3::DRM_FORMAT_MOD_INVALID),
-                Some(size),
-                true,
-            ),
+            Dri3ImportModifier::Implicit { size } => match resolved_implicit {
+                Some(m) => (
+                    m,
+                    Some(crate::kms::vk::dri3::DRM_FORMAT_MOD_INVALID),
+                    Some(size),
+                    // The modifier is resolved, but direct scanout stays
+                    // disabled until the legacy layout has been validated
+                    // on Polaris hardware. Composition uses the real
+                    // modifier; scanout.rs refuses implicit imports.
+                    true,
+                ),
+                // LINEAR is a best-effort for OUR OWN Vulkan view of the
+                // buffer, which is only ever sampled if the server itself
+                // composites this pixmap. It is deliberately NOT what we
+                // report back.
+                None => (
+                    crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR,
+                    Some(crate::kms::vk::dri3::DRM_FORMAT_MOD_INVALID),
+                    Some(size),
+                    true,
+                ),
+            },
         };
         let modifier = vk_modifier;
         let drawable = crate::kms::vk::dri3::import_dmabuf_reporting(
