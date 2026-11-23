@@ -403,6 +403,37 @@ pub(super) fn send(
     f.pointer = (x, y);
 }
 
+/// Sends a pointer event from root coordinates when the point is outside the
+/// fixture's top-level windows; `send` stamps either W or OUT as its producer.
+pub(super) fn send_to_root(
+    f: &mut Fixture,
+    origin: InputOrigin,
+    kind: PointerEventKind,
+    detail: u8,
+    x: i16,
+    y: i16,
+) {
+    let time = f.time;
+    f.time += 1;
+    let event = HostPointerEvent {
+        origin,
+        kind,
+        host_xid: 0,
+        detail,
+        time,
+        root_x: x,
+        root_y: y,
+        event_x: x,
+        event_y: y,
+        state: 0,
+        ..motion_event()
+    };
+    let dropped =
+        pointer_event_fanout_to_state(&mut f.state, &mut f.backend, &f.xid_map, event, true, false);
+    assert!(dropped.is_empty(), "test input must not disconnect clients");
+    f.pointer = (x, y);
+}
+
 pub(super) fn press_over_d(f: &mut Fixture, origin: InputOrigin, button: u8) {
     send(f, origin, PointerEventKind::MotionNotify, 0, 150, 150);
     let _ = read_all_capture_available(&mut f.client_a);

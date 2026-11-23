@@ -1031,7 +1031,14 @@ fn pointer_event_fanout_to_state_inner(
         && passive_transition_accepted
         && !passive_grab_blocked
     {
-        try_match_passive_grab(state, xid_map, event, replay, deferred_master)
+        try_match_passive_grab(
+            state,
+            xid_map,
+            event,
+            replay,
+            deferred_master,
+            button_transition.master_accepted,
+        )
     } else {
         None
     };
@@ -4322,6 +4329,7 @@ fn try_match_passive_grab(
     event: HostPointerEvent,
     replay: Option<PointerReplay>,
     deferred_master: bool,
+    master_transition_accepted: bool,
 ) -> Option<(
     crate::server::PassiveButtonGrab,
     yserver_protocol::x11::ResourceId,
@@ -4346,17 +4354,38 @@ fn try_match_passive_grab(
         }
         _ => None,
     });
-    let (grab, pass) = state.find_passive_grab(
-        hit_window,
-        event.detail,
-        event.state,
-        device_id,
-        source.attached_master,
-        replay_pass,
-        replay
-            .filter(|_| !deferred_master)
-            .map(|replay| replay.grab_window),
-    )?;
+    let replay_floor = replay
+        .filter(|_| !deferred_master)
+        .map(|replay| replay.grab_window);
+    let find_pass = |pass| {
+        state.find_passive_grab(
+            hit_window,
+            event.detail,
+            event.state,
+            device_id,
+            source.attached_master,
+            Some(pass),
+            replay_floor,
+        )
+    };
+    let candidate = if let Some(replay_pass) = replay_pass {
+        find_pass(replay_pass)
+    } else {
+        // Xorg processes a slave before its master (`mi/mieq.c:502-508`),
+        // and `UpdateDeviceState` can independently return DONT_PROCESS for
+        // the already-held master button (`Xi/exevents.c:938-955`). Keep the
+        // slave lookup tied to its accepted transition, but skip the master
+        // pass when that master's transition was rejected.
+        let slave_candidate = source
+            .slave_deviceid
+            .and_then(|slave| find_pass(crate::server::PassiveGrabPass::Slave(slave)));
+        slave_candidate.or_else(|| {
+            master_transition_accepted
+                .then(|| find_pass(crate::server::PassiveGrabPass::Master))
+                .flatten()
+        })
+    }?;
+    let (grab, pass) = candidate;
     Some((grab, hit_window, pass))
 }
 

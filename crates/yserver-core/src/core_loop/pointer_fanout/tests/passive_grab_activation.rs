@@ -4,7 +4,7 @@ use super::{
     implicit_grabs::{
         Fixture, assert_end_state, assert_end_state_with_xi1_entries, core, create_window,
         dispatch, map_window, move_to_out, press_over_d, read_packets, release, select_core,
-        select_xi2, send, xi,
+        select_xi2, send, send_to_root, xi,
     },
     *,
 };
@@ -1157,6 +1157,147 @@ fn held_button_blocks_core_grab_on_master_pass() {
     assert_eq!(f.state.buttons_down, BUTTON_3);
     release(&mut f, InputOrigin::Physical(source), 3);
     assert_task1_end_state(&f, &[]);
+}
+
+/// Covers the master `DONT_PROCESS` case when a physical source already holds
+/// the same logical button; the neighboring test uses a different button.
+#[test]
+fn master_held_button_blocks_core_grab_on_master_pass() {
+    let mut f = p_fixture();
+    select_xi2(&mut f, CLIENT_B, D, XI_MASTER, XI_BUTTON_PRESS);
+    select_xi2(&mut f, CLIENT_B, D, XI_XTEST, XI_BUTTONS);
+    grab_button_core(&mut f, CLIENT_A, W, 1, ANY_MODIFIER, 1, false);
+    let source = crate::xinput::InputSourceId(0xABCE);
+    let physical_device = super::pointer_source(&mut f.state, source.0, true);
+
+    send_to_root(
+        &mut f,
+        InputOrigin::Physical(source),
+        PointerEventKind::ButtonPress,
+        1,
+        500,
+        500,
+    );
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(
+        f.state
+            .xi_devices
+            .device(physical_device)
+            .expect("registered physical pointer")
+            .buttons_down,
+        BUTTON_1
+    );
+
+    press_over_d(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert!(
+        f.state.active_pointer_grab.is_none(),
+        "the master must not activate a core passive grab for a duplicate held button; active={:?}",
+        f.state.active_pointer_grab
+    );
+    let slave_grab = f.state.xi2_pointer_grabs.get(&XI_XTEST).copied();
+    assert!(slave_grab.is_some_and(|grab| {
+        grab.owner == ClientId(CLIENT_B)
+            && grab.grab_window == ResourceId(D)
+            && grab.via_xi2
+            && grab.implicit
+            && !grab.passive
+    }));
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(
+        f.state
+            .xi_devices
+            .device(XI_XTEST)
+            .expect("XTest pointer exists")
+            .buttons_down,
+        BUTTON_1
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(4, XI_XTEST, XI_XTEST, D)],
+        "the slave press is delivered without a master-form press"
+    );
+
+    release(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(
+        read_packets(&mut f.client_b),
+        vec![xi(5, XI_XTEST, XI_XTEST, D)]
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    release(&mut f, InputOrigin::Physical(source), 1);
+    assert_end_state(&f);
+    assert_eq!(f.state.buttons_down, 0);
+    assert!(
+        f.state
+            .xi_devices
+            .devices()
+            .iter()
+            .all(|device| device.buttons_down == 0)
+    );
+}
+
+/// Keeps slave-pass activation covered while the master already holds that
+/// button from a different registered source.
+#[test]
+fn master_held_button_still_activates_slave_pass_grab() {
+    let mut f = p_fixture();
+    let source = crate::xinput::InputSourceId(0xABCF);
+    let physical_device = super::pointer_source(&mut f.state, source.0, true);
+    xi_grab_button(&mut f, CLIENT_A, XI_XTEST, W, 1, 1, false, XI_BUTTONS);
+
+    send_to_root(
+        &mut f,
+        InputOrigin::Physical(source),
+        PointerEventKind::ButtonPress,
+        1,
+        500,
+        500,
+    );
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(
+        f.state
+            .xi_devices
+            .device(physical_device)
+            .expect("registered physical pointer")
+            .buttons_down,
+        BUTTON_1
+    );
+
+    press_over_d(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    let grab = f.state.xi2_pointer_grabs.get(&XI_XTEST).copied();
+    assert!(grab.is_some_and(|grab| {
+        grab.owner == ClientId(CLIENT_A)
+            && grab.grab_window == ResourceId(W)
+            && grab.via_xi2
+            && grab.passive
+            && !grab.implicit
+    }));
+    assert!(f.state.active_pointer_grab.is_none());
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(4, XI_XTEST, XI_XTEST, W)]
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    release(&mut f, InputOrigin::XTest(XI_XTEST), 1);
+    assert!(f.state.xi2_pointer_grabs.is_empty());
+    assert_eq!(f.state.buttons_down, BUTTON_1);
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(5, XI_XTEST, XI_XTEST, W)]
+    );
+    release(&mut f, InputOrigin::Physical(source), 1);
+    assert_end_state_with_xi1_entries(&f, &[XI_XTEST]);
+    assert_eq!(f.state.buttons_down, 0);
+    assert!(
+        f.state
+            .xi_devices
+            .devices()
+            .iter()
+            .all(|device| device.buttons_down == 0)
+    );
 }
 
 #[test]
