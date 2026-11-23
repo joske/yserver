@@ -934,6 +934,7 @@ mod tests {
                 idle_fence_xid: 0x0000_0999,
             },
             masked_options: 0,
+            future_target_sync: false,
             src_host_xid: 0x0040_0102,
             paint_dst_host_xid: 0x0040_0101,
             completion_dst_host_xid: 0x0040_0101,

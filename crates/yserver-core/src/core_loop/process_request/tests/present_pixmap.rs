@@ -2641,6 +2641,7 @@ fn deferred_present_pixmap_copies_only_after_source_readiness() {
         }),
         wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
         masked_options: 0,
+        future_target_sync: false,
         src_host_xid: 0x400102,
         paint_dst_host_xid: 0x400101,
         completion_dst_host_xid: 0x400101,
@@ -2772,6 +2773,7 @@ fn destroyed_window_purges_parked_present_wait_before_producer_ready() {
             idle_fence_xid: IDLE_FENCE,
         },
         masked_options: 0,
+        future_target_sync: false,
         src_host_xid: 0x400102,
         paint_dst_host_xid: 0x400101,
         completion_dst_host_xid: 0x400101,
@@ -5993,3 +5995,6 @@ fn present_async_may_tear_bit_is_0x10() {
     let opts = 0x1 | 0x8 | 0x10;
     assert_eq!(opts & !0x10u32, 0x1 | 0x8);
 }
+
+#[path = "present_async_target.rs"]
+mod async_target;

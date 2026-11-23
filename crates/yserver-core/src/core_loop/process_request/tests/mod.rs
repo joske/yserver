@@ -922,6 +922,7 @@ fn stub_pending_present_entry(window: u32, present_id: u64) -> crate::server::Pe
             }),
             wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
             masked_options: 0,
+            future_target_sync: false,
             src_host_xid: 0x2,
             // Deliberately DISTINCT from `window` (the client-visible
             // XID the blocked-check keys on via `request.window()`):
@@ -984,6 +985,7 @@ fn present_pending_entry_with(
             }),
             wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
             masked_options: 0,
+            future_target_sync: false,
             src_host_xid: pixmap_host_xid,
             paint_dst_host_xid: window_host_xid,
             completion_dst_host_xid: window_host_xid,
@@ -1141,6 +1143,7 @@ impl SupersessionFixture {
                 idle_fence_xid: self.idle_fence,
             },
             masked_options: 0,
+            future_target_sync: false,
             src_host_xid: 0x2,
             paint_dst_host_xid: self.window | 0x0040_0000,
             completion_dst_host_xid: self.window | 0x0040_0000,
