@@ -212,12 +212,15 @@ In Xorg:
 | resel | A XI1, B XI1, A XI1 again | A | A |
 | empty | A XI1, B XI1, A `XSelectExtensionEvent` with 0 classes, A XI1 | A (an empty list changes nothing) | A |
 | xi2first | A XI2 (FocusIn, XIAllMasterDevices) on W, B XI1, A XI1 | A | B |
+| xi2len0 | A XISelectEvents with `mask_len` 0, B XI1, A XI1 | B (no entry created) | — |
+| xi2zerobits | A XISelectEvents with `mask_len` 4, all bits zero, B XI1, A XI1 | A (entry created) | — |
 | xi2clear | A XI1, B XI1, A XI2 on then XI2 empty | A | A |
 | grabconflict | A XI1+DeviceButtonGrab, B XI1+DeviceButtonGrab | B gets BadAccess (10) and no events; owner A | B accepted, both get the press |
 | twodev | A DeviceButtonGrab(+Press) on the mouse (id 6); B one request: Press/Release on the XTest pointer (id 4) + DeviceButtonGrab on the mouse (id 6) | B gets BadAccess (10), yet its id-4 selection stands: B gets press and release, owner B | (not run: device set differs) |
 
 **Invariant:**
 - Per window, the selection order is the order in which each client's shared extension-entry was created: newest first. The first XI1 or XI2 selection on the window creates it.
+- An XI2 mask creates the entry only when its wire `mask_len` is nonzero (`../xserver/Xi/exevents.c:3333-3362`, `xiselectev.c:314-315`). A positive length with all bits zero creates it; a zero length does not. The XI2 parser keeps that length until the entry is recorded (today `events.rs:102-133` folds both into a numeric zero).
 - Later XI1/XI2 selections never move it. An empty XI1 list is a no-op.
 - It leaves the order when the client disconnects or the window is destroyed, or when a selection empties all its masks and Xorg's `ShouldFreeInputMasks` would free it.
 - `xi1_window_selectors` and delivery follow this order.
@@ -241,7 +244,7 @@ In Xorg:
   - Each ends with the end-state check.
   - Add one row: a client that disconnects leaves the order (A, B select; B disconnects; C selects → owner A).
   - `twodev` runs on the yserver fixture's own pair of pointer slaves (lower and higher device ID), with the same assertions: BadAccess, plus the lower device's selection and entry surviving.
-  - Rows `abgb`, `resel`, `empty` and `xi2clear` are GUARDs (they pass on base).
+  - Rows `abgb`, `resel`, `empty` and `xi2clear` are GUARDs (they pass on base). `xi2len0` and `xi2zerobits` are the review round-3 pair; they differ only in `mask_len`.
 - [ ] **Step 2: Red run** on Task 4's head. `ab`, `ba`, `abg`, `xi2first`, `grabconflict` and `twodev` fail.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Gate.** Mutations:
@@ -251,6 +254,7 @@ In Xorg:
   - M12: an XI2 selection does not create the entry;
   - M13: drop the conflict check.
   - M14: make the conflict reject the whole request (`twodev` turns red).
+  - M15: a zero-length XI2 mask creates the entry (`xi2len0` turns red).
 - [ ] **Step 5: Commit** `fix(xi): the XI1 implicit grab goes to the client Xorg picks, DeviceButtonGrab first`.
 
 ### Task 6 (coordinator): finish
