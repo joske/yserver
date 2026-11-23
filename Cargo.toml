@@ -28,7 +28,7 @@ input = "0.10"
 libc = "0.2.191"
 log = "0.4"
 mio = { version = "1", features = ["net", "os-ext", "os-poll"] }
-nix = { version = "0.31", features = [
+nix = { version = "0.32", features = [
   "event",
   "fs",
   "ioctl",
