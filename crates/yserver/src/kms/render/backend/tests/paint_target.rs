@@ -4428,3 +4428,139 @@ fn pixmap_background_piece_beyond_i16_is_painted() {
         0x0000_00ff
     );
 }
+
+// ────────────────────────────────────────────────────────────────
+// End-to-end shaped sibling clipping (Task 3).
+// ────────────────────────────────────────────────────────────────
+
+/// T5: a corner piece's hole shows the client both after its draw and after
+/// the piece is remapped and its pixmap background is realized again.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn xfwm_corner_piece_shows_client_through_its_hole() {
+    use yserver_protocol::x11::ResourceId;
+
+    let Some((mut state, mut backend)) = live_render_request_fixture() else {
+        return;
+    };
+    let frame = ResourceId(0x0530_0001);
+    let client = ResourceId(0x0530_0002);
+    let piece = ResourceId(0x0530_0003);
+    let piece_pixmap = ResourceId(0x0530_0004);
+    let piece_gc = ResourceId(0x0530_0005);
+    let client_pixmap = ResourceId(0x0530_0006);
+    let client_gc = ResourceId(0x0530_0007);
+    use yserver_core::resources::{ROOT_VISUAL, ROOT_WINDOW};
+
+    create_live_render_window(
+        &mut state,
+        &mut backend,
+        frame,
+        ROOT_WINDOW,
+        24,
+        0,
+        0,
+        64,
+        64,
+        ROOT_VISUAL,
+        0,
+        &[],
+    );
+    dispatch_for_cow_test(&mut state, &mut backend, 8, 0, &frame.0.to_le_bytes()); // MapWindow
+    redirect_live_render_window(&mut state, &mut backend, frame);
+
+    create_live_render_window(
+        &mut state,
+        &mut backend,
+        client,
+        frame,
+        24,
+        0,
+        0,
+        64,
+        64,
+        ROOT_VISUAL,
+        0,
+        &[],
+    );
+    set_shared_sibling_pixels(&mut state, &mut backend, client, 0x0000_0000, 0);
+    dispatch_for_cow_test(&mut state, &mut backend, 8, 0, &client.0.to_le_bytes()); // MapWindow
+
+    create_live_render_window(
+        &mut state,
+        &mut backend,
+        piece,
+        frame,
+        24,
+        0,
+        48,
+        16,
+        16,
+        ROOT_VISUAL,
+        0,
+        &[],
+    );
+    create_filled_shared_pixmap(
+        &mut state,
+        &mut backend,
+        piece_pixmap,
+        piece_gc,
+        frame,
+        16,
+        16,
+        0x0010_1010,
+    );
+    set_live_render_background_pixmap(&mut state, &mut backend, piece, piece_pixmap);
+    dispatch_for_cow_test(&mut state, &mut backend, 8, 0, &piece.0.to_le_bytes()); // MapWindow
+    set_shared_sibling_shape(
+        &mut state,
+        &mut backend,
+        piece,
+        &[(0, 0, 5, 11), (0, 11, 16, 5)],
+    );
+
+    create_filled_shared_pixmap(
+        &mut state,
+        &mut backend,
+        client_pixmap,
+        client_gc,
+        frame,
+        64,
+        64,
+        0x00ff_0000,
+    );
+    copy_shared_pixmap_to_window(
+        &mut state,
+        &mut backend,
+        client_pixmap,
+        client,
+        client_gc,
+        64,
+        64,
+    );
+
+    assert_eq!(
+        shared_parent_rgb(&state, &mut backend, frame, 10, 52),
+        0x00ff_0000,
+        "client draw reaches the corner piece's hole"
+    );
+    assert_eq!(
+        shared_parent_rgb(&state, &mut backend, frame, 2, 60),
+        0x0010_1010,
+        "client draw leaves the corner piece's L-shaped region"
+    );
+
+    dispatch_for_cow_test(&mut state, &mut backend, 10, 0, &piece.0.to_le_bytes()); // UnmapWindow
+    dispatch_for_cow_test(&mut state, &mut backend, 8, 0, &piece.0.to_le_bytes()); // MapWindow
+
+    assert_eq!(
+        shared_parent_rgb(&state, &mut backend, frame, 10, 52),
+        0x00ff_0000,
+        "remapped piece's background paint preserves the hole"
+    );
+    assert_eq!(
+        shared_parent_rgb(&state, &mut backend, frame, 2, 60),
+        0x0010_1010,
+        "remapped piece repaints its L-shaped region"
+    );
+}
