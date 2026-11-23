@@ -2939,6 +2939,29 @@ fn successive_motions_behind_frozen_master_keep_the_pre_move_window() {
     assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
 }
 
+/// Pins the slave Motion child to the window under the sprite before it moves.
+#[test]
+fn slave_motion_child_comes_from_pre_move_target() {
+    let mut f = p_fixture();
+    let origin = InputOrigin::XTest(XI_XTEST);
+    select_xi2(&mut f, CLIENT_B, W, XI_XTEST, XI_MOTION);
+    send(&mut f, origin, PointerEventKind::MotionNotify, 0, 145, 145);
+    let _ = read_packets(&mut f.client_a);
+    let _ = read_packets(&mut f.client_b);
+
+    send(&mut f, origin, PointerEventKind::MotionNotify, 0, 650, 150);
+
+    let packets = read_packets(&mut f.client_b);
+    assert_eq!(packets, vec![xi(6, XI_XTEST, XI_XTEST, W)]);
+    assert_eq!(packets[0].window, W);
+    assert_eq!(
+        packets[0].child, D,
+        "the slave form reports pre-move child D"
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_task1_end_state(&f, &[]);
+}
+
 /// Xvfb 21.1.24 measurement (cases A, B, C, E; spec invariant 8): one client
 /// selects XI2 Motion for slave 4 and master 2 on W. The slave's form routes
 /// from the window under the sprite BEFORE the move, the master's from AFTER.
@@ -2969,9 +2992,11 @@ fn xi2_slave_motion_routes_from_pre_move_window_master_from_post_move() {
     assert!(read_packets(&mut f.client_a).is_empty());
     // B: outside -> inside, master form only.
     send(&mut f, origin, PointerEventKind::MotionNotify, 0, 150, 150);
+    let master_packets = read_packets(&mut f.client_a);
+    assert_eq!(master_packets, vec![xi(6, XI_MASTER, XI_XTEST, W)]);
     assert_eq!(
-        read_packets(&mut f.client_a),
-        vec![xi(6, XI_MASTER, XI_XTEST, W)]
+        master_packets[0].child, D,
+        "GUARD: the master form keeps its post-move child"
     );
     assert!(read_packets(&mut f.client_b).is_empty());
     assert_task1_end_state(&f, &[]);

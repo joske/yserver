@@ -2676,7 +2676,12 @@ fn pointer_event_fanout_to_state_inner(
                 if win == nested_id {
                     (nested_id, ResourceId(0), event_x, event_y)
                 } else {
-                    let child = xi2_child_toward(state, win, target);
+                    let child_target = if form == Xi2PointerForm::Slave {
+                        slave_pass_target
+                    } else {
+                        target
+                    };
+                    let child = xi2_child_toward(state, win, child_target);
                     let (ax, ay) = state.resources.window_absolute_position(win);
                     (
                         win,

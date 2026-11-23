@@ -2615,8 +2615,8 @@ fn xi_owner_events_fallback_preserves_other_recipients_root_geometry() {
     );
     assert_eq!(
         u32::from_le_bytes(selector_bytes[28..32].try_into().unwrap()),
-        CHILD,
-        "the selected root event retains its child path"
+        0,
+        "Xorg's slave pass retains the pre-move root child path (../xserver/mi/mieq.c:504-508)"
     );
     assert_eq!(
         i16::from_le_bytes(selector_bytes[42..44].try_into().unwrap()),
