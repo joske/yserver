@@ -45,17 +45,17 @@ No new grab table, no new path.
 
 1. **Task 1 — another client's grab on the other device.**
    - Setup: a ReplayPointer from a client that holds only the keyboard grab, while the pointer is frozen by A's grab.
-   - Expected: a no-op for the pointer. A's frozen press is still replayable by A afterwards.
+   - Expected: a no-op for the pointer. A's press stays replayable by A only while the state is `FrozenWithEvent`.
 2. **Task 3 — valid requests are not rejected.**
    - `first=0, num=2` on the 2-axis XTest pointer moves the sprite exactly as before.
    - `DeviceButtonPress` with no trailing valuators is accepted.
 3. **Task 4 — the slave form still flows.**
    - When the master refuses an already-held button, the XTest slave's XI2/XI1 slave-form press is still delivered.
    - A slave passive grab on that slave still activates.
-4. **Task 5 — selection order survives re-selection and removal.**
-   - A client re-selecting on the same window keeps its place.
-   - A client whose selection on the window goes empty and comes back moves to the newest place.
-   - A destroyed client leaves the order.
+4. **Task 5 — selection order follows Xorg's shared entry.**
+   - A re-selection, an empty XI1 list or an XI2 change keeps the client's place.
+   - An XI2 selection made first creates the place.
+   - A disconnected client leaves the order.
 5. **Task 2 — the `win == nested_id` shortcut.** It keeps returning `(nested_id, None, event_x, event_y)` unchanged.
 
 ---
@@ -76,20 +76,32 @@ No new grab table, no new path.
 
 - [ ] **Step 1: Write the failing tests**
   - `replay_pointer_from_synced_only_client_is_a_noop`, the review's sequence:
-    1. A's sync passive pointer grab activates on a press over W, and the press is stored.
-    2. A sends `GrabPointer(pointer_mode=Sync)`; the stored press stays.
+    1. A's sync passive pointer grab activates on a press over W, and the press is stored (`FrozenWithEvent`).
+    2. A sends `GrabPointer(pointer_mode=Sync)`. As in Xorg's `CheckGrabForSyncs` (`../xserver/dix/events.c:1429-1430`; yserver `xi1_check_grab_for_syncs`), the state becomes `FrozenNoEvent`. The unified freeze state is the sole authority (plan `2026-07-15-freeze-state-unification.md`), so the stored bytes are not replayable.
     3. B sends `GrabKeyboard(pointer_mode=Sync)`, so `xi1_frozen[DEVICEID_MASTER_POINTER].other == Some(B)`.
     4. B sends `AllowEvents(ReplayPointer)`.
     - Assert: no panic, and no packet to any client from step 4.
-    - Assert: A's grab is still active and explicit; the pointer state is still `FrozenWithEvent` with the stored press; `other` is still B.
-    - Then A sends `AllowEvents(ReplayPointer)`: the press replays below A's grab window exactly as `p_fixture` P2r expects.
-    - Then B ungrabs the keyboard, the release flows, and the end state holds.
-  - `replay_keyboard_from_synced_only_client_is_a_noop`: the same shape on the keyboard, with B frozen by A's sync keyboard grab, if the code path is shared. Otherwise a GUARD row stating that.
+    - Assert: A's grab is still active and explicit, the pointer state is still `FrozenNoEvent`, and `other` is still B.
+    5. A sends `AllowEvents(ReplayPointer)`.
+    - Assert: a no-op (state not `FrozenWithEvent`). No packet; A's grab is still active; state and `other` are unchanged.
+    6. A ungrabs the pointer and B ungrabs the keyboard; the button is released.
+    - The packets from step 6 on match Xvfb for the same sequence (coordinator Step 0). Then the end state holds.
+  - `owner_replay_after_synced_client_noop_replays`: the genuine `FrozenWithEvent` case.
+    1. A's sync passive pointer grab activates on a press over W (`FrozenWithEvent`).
+    2. B sends `GrabKeyboard(pointer_mode=Sync)`, then `AllowEvents(ReplayPointer)`.
+    - Assert: a no-op as above; state still `FrozenWithEvent`.
+    3. B sends `AllowEvents(AsyncPointer)`. Xorg's THAWED case for a synced-only client clears `other` (`:1858-1863`).
+    - Assert: `other == None`; the state is unchanged.
+    4. A sends `AllowEvents(ReplayPointer)`.
+    - Assert: the press replays below A's grab window as `p_fixture` P2r expects. Then B ungrabs, the release flows, and the end state holds.
+  - `replay_keyboard_from_synced_only_client_is_a_noop`: the same shape as the first test on the keyboard, if the code path is shared. Otherwise a GUARD row stating that.
+- [ ] **Step 0 (coordinator, before dispatch):** add both pointer sequences as cases to `passive-oracle`, run them on Xvfb, and put the packet rows in the brief.
 - [ ] **Step 2: Red run** on `6de66587`. The first test panics at the `expect`; record the panic line.
 - [ ] **Step 3: Implement** the invariant in the AllowEvents handler.
-- [ ] **Step 4: Gate.**
-  - Mutation M1: drop the `this_state == FrozenWithEvent` term. The tests must stay red or panic.
-  - Mutation M2: move the precondition after `set_state`. The tests must be red (`other` cleared).
+- [ ] **Step 4: Gate.** Mutations:
+  - M1: drop the `this_state == FrozenWithEvent` term. The first test must turn red at step 5: A's replay deactivates the grab.
+  - M2: move the precondition after `set_state`. A test must turn red: `other` is cleared by B's request.
+  - M2b: drop the `this_grabbed` term. `owner_replay_after_synced_client_noop_replays` must panic or turn red at step 2.
 - [ ] **Step 5: Commit** `fix(grabs): AllowEvents replays only for the client whose grab froze the event, as Xorg's AllowSome`.
 
 ### Task 2: slave Motion `child` from the pre-move target
@@ -181,35 +193,61 @@ Scenario: physical button 1 held over root, the pointer over W with a core `Grab
 
 **Review item 5.** `pointer_fanout.rs:3254` takes `targets.first()`, and `xi1_window_selectors` iterates the clients `HashMap`, so the owner is arbitrary.
 
-In Xorg, `DeliverEventToWindowMask` (`../xserver/dix/events.c:2276-2310`) walks the window's `inputClients` list. `AddExtensionClient` (`../xserver/Xi/exevents.c:2750-2751`) prepends a new selector, and a re-selection modifies the entry in place. The owner passed to `ActivateImplicitGrab` (`:2421`) is the last client delivered to, unless one with `DeviceButtonGrabMask` (`../xserver/Xi/extinit.c:144, 1105`) was delivered to; the first such client wins.
+In Xorg:
+- `DeliverEventToWindowMask` (`../xserver/dix/events.c:2276-2310`) walks the window's `inputClients` list.
+- One `InputClients` entry exists per client per window. It is shared by XI1 (`SelectForWindow`, `../xserver/Xi/exevents.c:2660-2700`) and XI2 (`XISetEventMask`, `:3333-3348`) selections.
+- `AddExtensionClient` (`:2750-2751`) prepends the entry when a client first selects on the window through either protocol. Later selections update it in place.
+- The entry is freed when the client's resource goes (disconnect, window destroy). When a selection empties it, it is freed only if `ShouldFreeInputMasks` (`:3258-3272`) agrees.
+- The owner passed to `ActivateImplicitGrab` (`:2421`) is the last client delivered to, unless one with `DeviceButtonGrabMask` (`../xserver/Xi/extinit.c:144, 1105`) was delivered to; the first such client wins.
+- `DeviceButtonGrabMask` is exclusive (`../xserver/Xi/selectev.c:173-176`). A second client selecting it on the same window and device gets BadAccess (`../xserver/Xi/exevents.c:2672-2683`), and none of that request's selection is applied.
+
+**Measured (coordinator, Xvfb 21.1.24 vs #379 `6de66587`; client `~/Projects/claude-scratch/passive-grabs/xi1owner/xi1owner.c`, results `results-xvfb.txt`, `results-y379.txt` there):**
+
+| Row | Sequence (XI1 = DeviceButtonPress+Release on W, XTest pointer) | Xvfb owner | #379 |
+|---|---|---|---|
+| ab | A XI1, B XI1 | A | B |
+| ba | B XI1, A XI1 | B | A |
+| abg | A XI1+DeviceButtonGrab, B XI1 | A | B |
+| abgb | A XI1, B XI1+DeviceButtonGrab | B | B |
+| resel | A XI1, B XI1, A XI1 again | A | A |
+| empty | A XI1, B XI1, A `XSelectExtensionEvent` with 0 classes, A XI1 | A (an empty list changes nothing) | A |
+| xi2first | A XI2 (FocusIn, XIAllMasterDevices) on W, B XI1, A XI1 | A | B |
+| xi2clear | A XI1, B XI1, A XI2 on then XI2 empty | A | A |
+| grabconflict | A XI1+DeviceButtonGrab, B XI1+DeviceButtonGrab | B gets BadAccess (10) and no events; owner A | B accepted, both get the press |
 
 **Invariant:**
-- `xi1_window_selectors` returns clients in Xorg's list order: newest selector first. A re-selection keeps its place. A client whose classes on that window become empty, or which disconnects, or whose window is destroyed, leaves the order.
-- Delivery order follows it.
+- Per window, the selection order is the order in which each client's shared extension-entry was created: newest first. The first XI1 or XI2 selection on the window creates it.
+- Later XI1/XI2 selections never move it. An empty XI1 list is a no-op.
+- It leaves the order when the client disconnects or the window is destroyed, or when a selection empties all its masks and Xorg's `ShouldFreeInputMasks` would free it.
+- `xi1_window_selectors` and delivery follow this order.
 - The implicit grab owner is the first delivered client whose classes on that window include the device's `DeviceButtonGrab` class. Otherwise it is the last delivered client.
-- `XSelectExtensionEvent` accepts and stores the `DeviceButtonGrab` class for a button device. Its class encoding follows `libXi`'s `DeviceButtonPressGrab` (`_deviceButtonGrab` = 7 on the button class); confirm it against the oracle.
+- `XSelectExtensionEvent` accepts the `DeviceButtonGrab` class for a button device. Its class encoding follows `libXi`'s `DeviceButtonPressGrab` (`_deviceButtonGrab` = 7 on the button class); the oracle's `abg`/`grabconflict` rows confirm it is accepted.
+  - When another client already holds that class on the same window and device, the whole request answers BadAccess before any of it is applied, including the order.
+  - The same client re-selecting it, and other windows or devices, are not conflicts.
 - The class delivers no event by itself.
+- The XI1 per-device mask snapshot and ownership requirements of spec invariant 6 (`spec:66-72`) are unchanged.
 
 **Files:**
 - Modify: `crates/yserver-core/src/core_loop/pointer_fanout.rs` (`xi1_window_selectors`, ~3355; owner pick, ~3251).
-- Modify: the XI1 selection storage. Reuse `xi1_window_event_classes`; add order only where it cannot be derived, and justify it.
+- Modify: `crates/yserver-core/src/core_loop/process_request/xi/dispatch/events.rs` (~361-437, XSelectExtensionEvent: conflict check) and the XI2 selection path, only to record the entry's creation.
+- Modify: the selection storage. Reuse `xi1_window_event_classes`. Add one per-window creation order only where it cannot be derived, and justify it.
+  - Its teardown must ride the existing per-window and per-client teardown.
+  - DevicePresence and global-notification selections keep their current behaviour.
 - Test: `crates/yserver-core/src/core_loop/process_request/tests/xi1.rs` or `implicit_grabs.rs`.
 
-- [ ] **Step 0 (coordinator, before dispatch):** measure on Xvfb with `implicit-oracle`. Clients A then B select `DeviceButtonPress | DeviceButtonRelease` on W; press over W.
-  - Record which client gets the release (the implicit grab owner).
-  - Repeat with B then A.
-  - Repeat with A also selecting `DeviceButtonPressGrab`.
-  - Record the rows in the ledger. If they contradict the invariant, the measurement wins and the invariant is amended before dispatch.
-- [ ] **Step 1: Write the failing tests**
-  - `xi1_implicit_grab_owner_is_last_delivered`, run with both selection orders. Assert the release goes only to the measured owner, then check the end state.
-  - `xi1_device_button_grab_selector_owns_implicit_grab`.
-  - Review Focus 4 rows: re-selection keeps the order; empty-and-back moves to newest; a disconnect leaves the order.
-- [ ] **Step 2: Red run** on Task 4's head. At least one order gives the wrong owner, and the DeviceButtonGrab row fails.
+- [ ] **Step 1: Write the failing tests:** one test per table row, with the same sequence through `process_request`.
+  - Assert which client gets the release (the owner), that only the owner gets it, and, for `grabconflict`, BadAccess with B's classes not stored.
+  - Each ends with the end-state check.
+  - Add one row: a client that disconnects leaves the order (A, B select; B disconnects; C selects → owner A).
+  - Rows `abgb`, `resel`, `empty` and `xi2clear` are GUARDs (they pass on base).
+- [ ] **Step 2: Red run** on Task 4's head. `ab`, `ba`, `abg`, `xi2first` and `grabconflict` fail as in the #379 column.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Gate.** Mutations:
-  - M9: `.first()` → `.last()` without the grab-class rule;
+  - M9: `.first()` → `.last()` without the order;
   - M10: ignore the DeviceButtonGrab class;
-  - M11: a re-selection moves the client to newest.
+  - M11: a re-selection moves the client to newest;
+  - M12: an XI2 selection does not create the entry;
+  - M13: drop the conflict check.
 - [ ] **Step 5: Commit** `fix(xi): the XI1 implicit grab goes to the client Xorg picks, DeviceButtonGrab first`.
 
 ### Task 6 (coordinator): finish
