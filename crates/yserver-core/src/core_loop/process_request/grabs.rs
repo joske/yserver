@@ -49,10 +49,254 @@ pub(super) fn handle_allow_events(
     apply_allow_events(state, backend, client_id, sequence, mode, time)
 }
 
-/// Map an XI2 `XIAllowEvents` mode + registry-classified target onto the
-/// equivalent core `AllowSome` mode consumed by [`apply_allow_events`]. The
-/// paired modes act on the OTHER device. Touch modes (`XIAcceptTouch`=6 /
-/// `XIRejectTouch`=7) and anything unknown are unsupported → `None` (no-op).
+/// One `AllowSome` state transition shared by core and XI2 AllowEvents.
+#[derive(Debug, Clone, Copy)]
+enum AllowSomeState {
+    Thawed,
+    FreezeNextEvent,
+    ThawedBoth,
+    FreezeBothNextEvent,
+    ThawOthers,
+    NotGrabbed,
+}
+
+/// Returns the timestamp represented by a device's existing active-grab
+/// record, so AllowSome can build its bound without borrowing another
+/// client's grab time from a different device.
+fn allow_some_device_grab_time(
+    state: &ServerState,
+    client_id: ClientId,
+    device_id: u16,
+    target_device: bool,
+) -> Option<u32> {
+    use crate::xinput::XiDeviceRole;
+
+    match state.xi_devices.role(device_id) {
+        Some(XiDeviceRole::MasterPointer) => state
+            .active_pointer_grab
+            .filter(|grab| target_device || grab.owner == client_id)
+            .map(|grab| grab.time),
+        Some(XiDeviceRole::MasterKeyboard) => state
+            .active_keyboard_grab
+            .filter(|grab| target_device || grab.owner == client_id)
+            .map(|_| state.last_keyboard_grab_time),
+        Some(XiDeviceRole::SlavePointer) => state
+            .xi2_pointer_grabs
+            .get(&device_id)
+            .filter(|grab| target_device || grab.owner == client_id)
+            .map(|grab| grab.time),
+        // Active keyboard and XI1 grab records do not retain grabTime. Do
+        // not substitute their process-global last-grab timestamp: another
+        // client's grab on a different device may have updated it.
+        Some(XiDeviceRole::SlaveKeyboard) | None => None,
+    }
+}
+
+/// Apply Xorg `AllowSome` admission and state transitions for one requested
+/// device (`dix/events.c:1825-1926`). Returns the grabbed devices whose
+/// transition permits stored-event cleanup and queued playback by the adapter.
+fn apply_allow_some(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    device_id: u16,
+    new_state: AllowSomeState,
+    time: u32,
+) -> Option<Vec<u16>> {
+    use crate::{
+        server::Xi1SyncState,
+        xinput::{DEVICEID_MASTER_KEYBOARD, DEVICEID_MASTER_POINTER},
+    };
+
+    let has_client_grab = |device: u16| {
+        state
+            .xi1_active_grabs
+            .get(&device)
+            .is_some_and(|grab| grab.owner == client_id)
+            || state
+                .xi2_pointer_grabs
+                .get(&device)
+                .is_some_and(|grab| grab.owner == client_id)
+            || state
+                .xi2_keyboard_grabs
+                .get(&device)
+                .is_some_and(|grab| grab.owner == client_id)
+            || (device == DEVICEID_MASTER_POINTER
+                && state
+                    .active_pointer_grab
+                    .is_some_and(|grab| grab.owner == client_id))
+            || (device == DEVICEID_MASTER_KEYBOARD
+                && state
+                    .active_keyboard_grab
+                    .is_some_and(|grab| grab.owner == client_id))
+    };
+    let grabbed_devices: Vec<u16> = state
+        .xi_devices
+        .devices()
+        .iter()
+        .map(|device| device.id)
+        .filter(|device| has_client_grab(*device))
+        .collect();
+    let mut grab_time = allow_some_device_grab_time(state, client_id, device_id, true);
+    for other_id in grabbed_devices
+        .iter()
+        .copied()
+        .filter(|id| *id != device_id)
+    {
+        if let Some(other_grab_time) =
+            allow_some_device_grab_time(state, client_id, other_id, false)
+        {
+            grab_time = match grab_time {
+                None => Some(other_grab_time),
+                Some(current)
+                    if crate::core_loop::xi1_focus::time_after(other_grab_time, current) =>
+                {
+                    Some(other_grab_time)
+                }
+                bound => bound,
+            };
+        }
+    }
+    let mut now = state.timestamp_now().max(state.xi1_last_input_time);
+    if let Some(bound) = grab_time
+        && crate::core_loop::xi1_focus::time_after(bound, now)
+    {
+        now = bound;
+    }
+    if time != 0
+        && (crate::core_loop::xi1_focus::time_after(time, now)
+            || grab_time.is_some_and(|bound| crate::core_loop::xi1_focus::time_after(bound, time)))
+    {
+        debug!(
+            "client {} #{} AllowSome ignored (time {time} outside [{grab_time:?}, {now}])",
+            client_id.0, sequence.0
+        );
+        return None;
+    }
+
+    let this_grabbed = crate::core_loop::pointer_fanout::xi1_device_grab_owner(state, device_id)
+        == Some(client_id);
+    let this_sync = state
+        .xi1_frozen
+        .get(&device_id)
+        .map_or(Xi1SyncState::Thawed, |freeze| freeze.state);
+    let this_synced = state
+        .xi1_frozen
+        .get(&device_id)
+        .and_then(|freeze| freeze.other)
+        == Some(client_id);
+    if !((this_grabbed && this_sync >= Xi1SyncState::FrozenNoEvent) || this_synced) {
+        debug!(
+            "client {} #{} AllowSome no-op (device={device_id} grabbed={this_grabbed} state={this_sync:?} synced={this_synced})",
+            client_id.0, sequence.0
+        );
+        return None;
+    }
+
+    let others_frozen = grabbed_devices.iter().any(|other_id| {
+        *other_id != device_id
+            && state
+                .xi1_frozen
+                .get(other_id)
+                .is_some_and(|freeze| freeze.state >= Xi1SyncState::FrozenNoEvent)
+    });
+
+    let mut affected = Vec::new();
+    let mut all_devices: Vec<u16> = state
+        .xi_devices
+        .devices()
+        .iter()
+        .map(|device| device.id)
+        .collect();
+    for frozen_id in state.xi1_frozen.keys().copied() {
+        if !all_devices.contains(&frozen_id) {
+            all_devices.push(frozen_id);
+        }
+    }
+
+    match new_state {
+        AllowSomeState::Thawed => {
+            if this_grabbed {
+                state.xi1_frozen.entry(device_id).or_default().state = Xi1SyncState::Thawed;
+                affected.push(device_id);
+            }
+            if this_synced {
+                state.xi1_frozen.entry(device_id).or_default().other = None;
+            }
+        }
+        AllowSomeState::FreezeNextEvent => {
+            if !this_grabbed {
+                return None;
+            }
+            let freeze = state.xi1_frozen.entry(device_id).or_default();
+            freeze.state = Xi1SyncState::FreezeNextEvent;
+            if this_synced {
+                freeze.other = None;
+            }
+            affected.push(device_id);
+        }
+        AllowSomeState::ThawedBoth | AllowSomeState::FreezeBothNextEvent => {
+            if !others_frozen {
+                return None;
+            }
+            let next_state = if matches!(new_state, AllowSomeState::ThawedBoth) {
+                Xi1SyncState::Thawed
+            } else {
+                Xi1SyncState::FreezeBothNextEvent
+            };
+            for affected_id in &grabbed_devices {
+                state.xi1_frozen.entry(*affected_id).or_default().state = next_state;
+                affected.push(*affected_id);
+            }
+            for other_id in &all_devices {
+                if let Some(freeze) = state.xi1_frozen.get_mut(other_id)
+                    && freeze.other == Some(client_id)
+                {
+                    freeze.other = None;
+                }
+            }
+        }
+        AllowSomeState::ThawOthers => {
+            if !others_frozen {
+                return None;
+            }
+            for affected_id in &grabbed_devices {
+                if *affected_id == device_id {
+                    continue;
+                }
+                state.xi1_frozen.entry(*affected_id).or_default().state = Xi1SyncState::Thawed;
+                affected.push(*affected_id);
+            }
+            for other_id in &all_devices {
+                if *other_id == device_id {
+                    continue;
+                }
+                if let Some(freeze) = state.xi1_frozen.get_mut(other_id)
+                    && freeze.other == Some(client_id)
+                {
+                    freeze.other = None;
+                }
+            }
+        }
+        AllowSomeState::NotGrabbed => {
+            if !this_grabbed || this_sync != Xi1SyncState::FrozenWithEvent {
+                return None;
+            }
+            state.xi1_frozen.entry(device_id).or_default().state = Xi1SyncState::Thawed;
+            if this_synced {
+                state.xi1_frozen.entry(device_id).or_default().other = None;
+            }
+            affected.push(device_id);
+        }
+    }
+
+    Some(affected)
+}
+
+/// Map an XI2 per-device mode to the equivalent core wrapper mode. Paired
+/// modes retain the requested master as `thisDev` and are handled directly
+/// as `AllowSomeState` by the XI2 adapter. Touch modes and unknown modes are
+/// unsupported → `None` (no-op).
 /// XI2 mode constants per `X11/extensions/XI2.h`: AsyncDevice=0,
 /// SyncDevice=1, ReplayDevice=2, AsyncPairedDevice=3, AsyncPair=4,
 /// SyncPair=5.
@@ -64,102 +308,41 @@ pub(super) fn xi2_allow_mode_to_core(xi2_mode: u8, kbd: bool) -> Option<u8> {
         0 => u8::from(kbd) * 3,     // XIAsyncDevice  → Async{Pointer,Keyboard}
         1 => 1 + u8::from(kbd) * 3, // XISyncDevice   → Sync{Pointer,Keyboard}
         2 => 2 + u8::from(kbd) * 3, // XIReplayDevice → Replay{Pointer,Keyboard}
-        3 => u8::from(!kbd) * 3,    // XIAsyncPairedDevice → async the PAIRED device
-        4 => 6,                     // XIAsyncPair → AsyncBoth
-        5 => 7,                     // XISyncPair  → SyncBoth
+        3..=5 => return None,       // paired modes retain the requested device
         _ => return None,           // XIAcceptTouch / XIRejectTouch / unknown
     })
 }
 
-/// XI2 AllowEvents for a slave device uses the exact device's freeze state;
-/// paired modes use the opposite master returned by the registry attachment.
+/// XI2 AllowEvents on a slave uses that exact device's `AllowSome` state.
 pub(super) fn apply_xi2_allow_events_for_slave(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     device_id: u16,
-    is_keyboard: bool,
     xi_mode: u8,
     time: u32,
 ) -> io::Result<RequestOutcome> {
     use crate::server::Xi1SyncState;
 
-    if xi_mode > 5 {
-        return Ok(RequestOutcome::Handled);
-    }
-    let paired_id = crate::core_loop::pointer_fanout::xi1_other_input_device(state, device_id);
-    let target_id = if xi_mode == 3 {
-        let Some(paired_id) = paired_id else {
-            return Ok(RequestOutcome::Handled);
-        };
-        paired_id
-    } else {
-        device_id
-    };
-    let target_owner = crate::core_loop::pointer_fanout::xi1_device_grab_owner(state, target_id);
-    let target_state = state
-        .xi1_frozen
-        .get(&target_id)
-        .map_or(Xi1SyncState::Thawed, |freeze| freeze.state);
-    let target_other = state
-        .xi1_frozen
-        .get(&target_id)
-        .and_then(|freeze| freeze.other);
-    let is_frozen_by_client = target_owner == Some(client_id)
-        && target_state >= Xi1SyncState::FrozenNoEvent
-        || target_other == Some(client_id);
-    if !is_frozen_by_client {
-        return Ok(RequestOutcome::Handled);
-    }
-    let now = state
-        .timestamp_now()
-        .max(state.xi1_last_input_time)
-        .max(if is_keyboard {
-            state.last_keyboard_grab_time
-        } else {
-            state.last_pointer_grab_time
-        });
-    if time != 0 && crate::core_loop::xi1_focus::time_after(time, now) {
-        return Ok(RequestOutcome::Handled);
-    }
-
-    let mut devices = Vec::with_capacity(2);
-    match xi_mode {
-        0..=2 => devices.push(device_id),
-        3 => devices.push(target_id),
-        4 | 5 => {
-            devices.push(device_id);
-            if let Some(paired_id) = paired_id {
-                devices.push(paired_id);
-            }
-        }
-        _ => return Ok(RequestOutcome::Handled),
-    }
     let new_state = match xi_mode {
-        0 | 3 | 4 => Some(Xi1SyncState::Thawed),
-        1 | 5 => Some(Xi1SyncState::FreezeNextEvent),
-        2 => Some(Xi1SyncState::Thawed),
-        _ => None,
+        0 => AllowSomeState::Thawed,
+        1 => AllowSomeState::FreezeNextEvent,
+        2 => AllowSomeState::NotGrabbed,
+        _ => return Ok(RequestOutcome::Handled),
     };
-    for id in &devices {
-        if let Some(new_state) = new_state {
-            let freeze = state.xi1_frozen.entry(*id).or_default();
-            freeze.state = new_state;
-            if freeze.other == Some(client_id) {
-                freeze.other = None;
-            }
-            if matches!(xi_mode, 0 | 3 | 4) {
-                freeze.stored = None;
-            }
-        }
-    }
+    let Some(affected_devices) =
+        apply_allow_some(state, client_id, sequence, device_id, new_state, time)
+    else {
+        return Ok(RequestOutcome::Handled);
+    };
 
     if xi_mode == 2 {
         let stored = state
             .xi1_frozen
             .get_mut(&device_id)
             .and_then(|freeze| freeze.stored.take());
+        state.xi1_frozen.entry(device_id).or_default().state = Xi1SyncState::Thawed;
         if let Some(crate::server::QueuedInputEvent::HostPointer(event)) = stored {
             // Capture the frozen device and its grab window before removing
             // the passive grab; replay uses both to select the Xorg pass and
@@ -232,6 +415,14 @@ pub(super) fn apply_xi2_allow_events_for_slave(
             }
             let _dropped = crate::core_loop::key_fanout::replay_frozen_key_to_focus(state, event);
         }
+    } else {
+        for id in affected_devices {
+            if crate::core_loop::pointer_fanout::xi1_device_grab_owner(state, id) == Some(client_id)
+                && let Some(freeze) = state.xi1_frozen.get_mut(&id)
+            {
+                freeze.stored = None;
+            }
+        }
     }
     let xid_map = backend.xid_map().clone();
     crate::core_loop::pointer_fanout::xi1_compute_freezes(state, backend, &xid_map);
@@ -242,16 +433,47 @@ pub(super) fn apply_xi2_allow_events_for_slave(
     Ok(RequestOutcome::Handled)
 }
 
-/// Shared `AllowSome` implementation (Xorg `dix/events.c:1823`), driven by
-/// BOTH core `AllowEvents` (mode straight from the request) AND XI2
-/// `XIAllowEvents` (mode mapped from the XI2 mode + deviceid; see
-/// [`xi2_allow_mode_to_core`]). Routing the XI2 path through here — rather
-/// than the old partial reimplementation in the XI2 handler — kills a
-/// recurring class of divergence bugs where the XI2 copy mishandled modes
-/// the core path got right (the desktop rubber-band = Async/Replay thaw
-/// gap; the Cinnamon input freeze = `XISyncDevice`/mode-1 treated as a
-/// no-op). `mode` is a CORE AllowEvents mode (0..=7); `time` is the
-/// request timestamp.
+/// Apply XI2 paired modes to the requested master, preserving `AllowSome`'s
+/// master-device admission and draining playback only after a real transition.
+pub(super) fn apply_xi2_allow_events_for_master_paired(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    device_id: u16,
+    xi_mode: u8,
+    time: u32,
+) -> io::Result<RequestOutcome> {
+    let new_state = match xi_mode {
+        3 => AllowSomeState::ThawOthers,
+        4 => AllowSomeState::ThawedBoth,
+        5 => AllowSomeState::FreezeBothNextEvent,
+        _ => return Ok(RequestOutcome::Handled),
+    };
+    let Some(affected_devices) =
+        apply_allow_some(state, client_id, sequence, device_id, new_state, time)
+    else {
+        return Ok(RequestOutcome::Handled);
+    };
+    for id in affected_devices {
+        if crate::core_loop::pointer_fanout::xi1_device_grab_owner(state, id) == Some(client_id)
+            && let Some(freeze) = state.xi1_frozen.get_mut(&id)
+        {
+            freeze.stored = None;
+        }
+    }
+    let xid_map = backend.xid_map().clone();
+    crate::core_loop::pointer_fanout::xi1_compute_freezes(state, backend, &xid_map);
+    debug!(
+        "client {} #{} XIAllowEvents paired master device={} mode={}",
+        client_id.0, sequence.0, device_id, xi_mode
+    );
+    Ok(RequestOutcome::Handled)
+}
+
+/// Run core AllowEvents through the shared Xorg `AllowSome` transition
+/// (`dix/events.c:1825`), then apply the existing master-device replay and
+/// queued-playback handling for transitions that the routine admitted.
 pub(super) fn apply_allow_events(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -260,29 +482,6 @@ pub(super) fn apply_allow_events(
     mode: u8,
     time: u32,
 ) -> io::Result<RequestOutcome> {
-    // Xorg AllowSome: the request is a no-op when its time is LATER
-    // than the current time or EARLIER than the client's grab time
-    // (XAllowEvents-12/13). Pointer modes gate on the pointer's grab
-    // time, keyboard and *Both modes on the keyboard's.
-    let grab_time = if matches!(mode, 0..=2) {
-        state.last_pointer_grab_time
-    } else {
-        state.last_keyboard_grab_time
-    };
-    let now = state
-        .timestamp_now()
-        .max(state.xi1_last_input_time)
-        .max(grab_time);
-    if time != 0
-        && (crate::core_loop::xi1_focus::time_after(time, now)
-            || crate::core_loop::xi1_focus::time_after(grab_time, time))
-    {
-        debug!(
-            "client {} #{} AllowEvents ignored (time {time} outside [{grab_time}, {now}])",
-            client_id.0, sequence.0
-        );
-        return Ok(RequestOutcome::Handled);
-    }
     debug!(
         "client {} #{} AllowEvents mode={} frozen_pointer={} frozen_keyboard={}",
         client_id.0,
@@ -298,118 +497,42 @@ pub(super) fn apply_allow_events(
             .is_some_and(|f| f.stored.is_some()),
     );
 
-    // Port of Xorg AllowSome (dix/events.c:1823). `thisDev` is the
-    // pointer for the pointer modes and the keyboard for the keyboard
-    // and *Both modes; the request is a no-op unless this client's
-    // grab holds the device frozen, or the device is synced on this
-    // client's behalf.
-    use crate::server::Xi1SyncState;
+    let dev_ptr = crate::xinput::DEVICEID_MASTER_POINTER;
+    let dev_kbd = crate::xinput::DEVICEID_MASTER_KEYBOARD;
     let dev_this = if matches!(mode, 0..=2) {
-        crate::xinput::DEVICEID_MASTER_POINTER
+        dev_ptr
     } else {
-        crate::xinput::DEVICEID_MASTER_KEYBOARD
+        dev_kbd
     };
     let grab_owner_of = |state: &ServerState, dev: u16| -> Option<ClientId> {
         crate::core_loop::pointer_fanout::xi1_device_grab_owner(state, dev)
     };
-    let this_grabbed = grab_owner_of(state, dev_this) == Some(client_id);
-    let this_state = state
-        .xi1_frozen
-        .get(&dev_this)
-        .map_or(Xi1SyncState::Thawed, |f| f.state);
-    let this_synced = state.xi1_frozen.get(&dev_this).and_then(|f| f.other) == Some(client_id);
-    if !((this_grabbed && this_state >= Xi1SyncState::FrozenNoEvent) || this_synced) {
-        debug!(
-            "client {} #{} AllowEvents no-op (not frozen by this client: grabbed={this_grabbed} state={this_state:?} synced={this_synced})",
-            client_id.0, sequence.0
-        );
+    let new_state = match mode {
+        0 | 3 => AllowSomeState::Thawed,
+        1 | 4 => AllowSomeState::FreezeNextEvent,
+        2 | 5 => AllowSomeState::NotGrabbed,
+        6 => AllowSomeState::ThawedBoth,
+        7 => AllowSomeState::FreezeBothNextEvent,
+        _ => return Ok(RequestOutcome::Handled),
+    };
+    let Some(affected_devices) =
+        apply_allow_some(state, client_id, sequence, dev_this, new_state, time)
+    else {
         return Ok(RequestOutcome::Handled);
-    }
-
+    };
     let pointer_replay = mode == 2;
     let keyboard_replay = mode == 5;
-    // Xorg AllowSome's NOT_GRABBED case replays only when this client owns
-    // this device's grab and it is frozen with the activating event
-    // (dix/events.c:1899-1906). A synced-only client passes the general gate
-    // above, but its replay must leave the freeze state, `other`, stored
-    // event and active grab untouched.
-    if (pointer_replay || keyboard_replay)
-        && !(this_grabbed && this_state == Xi1SyncState::FrozenWithEvent)
-    {
-        debug!(
-            "client {} #{} AllowEvents replay no-op (grabbed={this_grabbed} state={this_state:?})",
-            client_id.0, sequence.0
-        );
-        return Ok(RequestOutcome::Handled);
-    }
-    // State transitions per mode (Xorg AllowSome switch). The queued
-    // events play AFTER the transition so the freeze gate at fanout
-    // entry sees the new state: Async → events flow; Sync →
-    // FreezeNextEvent lets them flow until the next key/button trips
-    // the re-freeze (FreezeThisEventIfNeededForSyncGrab).
-    let set_state = |state: &mut ServerState, dev: u16, st: Xi1SyncState| {
-        let grabbed = grab_owner_of(state, dev) == Some(client_id);
-        let f = state.xi1_frozen.entry(dev).or_default();
-        // A client holding only `sync.other` can release that hold, but it
-        // cannot change the freeze state belonging to the device's grab
-        // owner (Xorg dix/events.c:1858-1863).
-        if grabbed {
-            f.state = st;
+    // Both transitions also affect XI1/XI2 slave grabs. Drop their stored
+    // event slots only when this client's grab was among the admitted changes;
+    // the master pointer/keyboard slots are handled below for Replay support.
+    for affected_id in affected_devices {
+        if affected_id != dev_ptr
+            && affected_id != dev_kbd
+            && grab_owner_of(state, affected_id) == Some(client_id)
+            && let Some(freeze) = state.xi1_frozen.get_mut(&affected_id)
+        {
+            freeze.stored = None;
         }
-        if f.other == Some(client_id) {
-            f.other = None;
-        }
-    };
-    let dev_ptr = crate::xinput::DEVICEID_MASTER_POINTER;
-    let dev_kbd = crate::xinput::DEVICEID_MASTER_KEYBOARD;
-    // Xorg AllowSome `othersFrozen`: the *Both modes (AsyncBoth /
-    // SyncBoth) only act when ANOTHER device this client grabbed is
-    // itself frozen (dix/events.c:1872, 1886 — `if (othersFrozen)`).
-    // Without this gate a client could thaw/re-freeze its own device
-    // via *Both even when no paired device is frozen, leaving later
-    // grabs in the wrong sync state. In the two-device model "others"
-    // relative to dev_this (keyboard, for *Both) is the pointer.
-    let others_frozen = {
-        let other = if dev_this == dev_kbd {
-            dev_ptr
-        } else {
-            dev_kbd
-        };
-        grab_owner_of(state, other) == Some(client_id)
-            && state
-                .xi1_frozen
-                .get(&other)
-                .is_some_and(|f| f.state >= Xi1SyncState::FrozenNoEvent)
-    };
-    match mode {
-        0 | 2 => set_state(state, dev_ptr, Xi1SyncState::Thawed),
-        1 => set_state(state, dev_ptr, Xi1SyncState::FreezeNextEvent),
-        3 | 5 => set_state(state, dev_kbd, Xi1SyncState::Thawed),
-        4 => set_state(state, dev_kbd, Xi1SyncState::FreezeNextEvent),
-        6 if others_frozen => {
-            // AsyncBoth thaws every device this client's grabs froze.
-            for dev in [dev_ptr, dev_kbd] {
-                if grab_owner_of(state, dev) == Some(client_id)
-                    || state.xi1_frozen.get(&dev).and_then(|f| f.other) == Some(client_id)
-                {
-                    set_state(state, dev, Xi1SyncState::Thawed);
-                }
-            }
-        }
-        7 if others_frozen => {
-            // SyncBoth arms FreezeBothNextEvent on the client's
-            // grabbed devices.
-            for dev in [dev_ptr, dev_kbd] {
-                if grab_owner_of(state, dev) == Some(client_id)
-                    || state.xi1_frozen.get(&dev).and_then(|f| f.other) == Some(client_id)
-                {
-                    set_state(state, dev, Xi1SyncState::FreezeBothNextEvent);
-                }
-            }
-        }
-        // *Both with no paired device frozen → no-op (Xorg).
-        6 | 7 => {}
-        _ => {}
     }
 
     // Withheld pointer events. The activating press of a sync passive
@@ -795,7 +918,7 @@ pub(super) fn handle_grab_pointer(
                 grab_window,
                 event_mask,
                 cursor,
-                time,
+                time: if time == 0 { now } else { time },
                 owner_events,
                 via_xi2: false,
                 implicit: false,

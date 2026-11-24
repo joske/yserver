@@ -35,11 +35,16 @@ const RECORD_CONTEXT: u32 = 0x0300_0001;
 const XI_MASTER: u16 = 2;
 const XI_MASTER_KEYBOARD: u16 = 3;
 const XI_XTEST: u16 = 4;
+const XI_ALL_MASTER_DEVICES: u16 = 1;
+const XI_XTEST_KEYBOARD: u16 = 5;
 const XI_ALL_DEVICES: u16 = 0;
 const XI_MOTION: u32 = 1 << 6;
 const XI_BUTTON_PRESS: u32 = 1 << 4;
 const XI_BUTTON_RELEASE: u32 = 1 << 5;
 const XI_BUTTONS: u32 = XI_BUTTON_PRESS | XI_BUTTON_RELEASE;
+const XI_KEY_PRESS: u32 = 1 << 2;
+const XI_KEY_RELEASE: u32 = 1 << 3;
+const XI_KEYS: u32 = XI_KEY_PRESS | XI_KEY_RELEASE;
 const XI_GRAB_MASK: u32 = XI_MOTION | XI_BUTTONS;
 const ANY_BUTTON: u8 = 0;
 const ANY_MODIFIER: u16 = 0x8000;
@@ -165,11 +170,79 @@ fn allow_events_core(f: &mut Fixture, client: u32, mode: u8) {
 }
 
 fn xi_allow_events(f: &mut Fixture, client: u32, device: u16, mode: u8) {
+    xi_allow_events_at(f, client, device, mode, 0);
+}
+
+/// Sends XIAllowEvents with an explicit server timestamp for the admission
+/// regression, which must exercise the interval between two request grabs.
+fn xi_allow_events_at(f: &mut Fixture, client: u32, device: u16, mode: u8, time: u32) {
     let mut body = Vec::with_capacity(8);
-    body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    body.extend_from_slice(&time.to_le_bytes());
     body.extend_from_slice(&device.to_le_bytes());
     body.extend_from_slice(&[mode, 0]);
     dispatch(f, client, XI2_OPCODE, XI_XI_ALLOW_EVENTS, &body);
+}
+
+/// Moves only the fixture clock origin so request-driven grab times cross the
+/// signed half of the X11 timestamp range without fabricating grab state.
+fn set_test_clock_epoch(f: &mut Fixture, timestamp: u32) {
+    f.state.start_instant =
+        std::time::Instant::now() - std::time::Duration::from_millis(u64::from(timestamp));
+}
+
+/// Consumes exactly the successful XIGrabDevice reply and rejects stray setup
+/// events at a boundary where the oracle records no event packets.
+fn assert_xi_grab_success_reply(peer: &mut crate::transport::CapturedPeer) {
+    let reply = read_all_capture_available(peer);
+    assert_eq!(
+        reply.len(),
+        32,
+        "only the XIGrabDevice reply is present: {reply:?}"
+    );
+    assert_eq!(reply[0], 1, "XIGrabDevice returns an X reply");
+    assert_eq!(reply[8], 0, "XIGrabDevice returned GrabSuccess");
+}
+
+/// Checks the XI_FocusIn NotifyGrab packet emitted with an XI2 keyboard grab,
+/// followed by its success reply, so the setup boundary cannot hide traffic.
+fn assert_xi_keyboard_grab_success(
+    peer: &mut crate::transport::CapturedPeer,
+    device: u16,
+    window: u32,
+) {
+    let setup = read_all_capture_available(peer);
+    assert_eq!(setup.len(), 108, "one XI_FocusIn and one grab reply");
+    assert_eq!(setup[0], 35, "keyboard grab emits a GenericEvent");
+    assert_eq!(setup[1], XI2_OPCODE, "FocusIn uses the XI extension");
+    assert_eq!(
+        u32::from_le_bytes(setup[4..8].try_into().unwrap()),
+        11,
+        "XI_FocusIn is 76 bytes"
+    );
+    assert_eq!(
+        u16::from_le_bytes(setup[8..10].try_into().unwrap()),
+        9,
+        "the generated event is XI_FocusIn"
+    );
+    assert_eq!(
+        u16::from_le_bytes(setup[10..12].try_into().unwrap()),
+        device,
+        "XI_FocusIn names the grabbed keyboard"
+    );
+    assert_eq!(setup[18], 1, "XI_FocusIn mode is NotifyGrab");
+    assert_eq!(setup[19], 3, "XI_FocusIn detail is NotifyNonlinear");
+    assert_eq!(
+        u32::from_le_bytes(setup[20..24].try_into().unwrap()),
+        ROOT_WINDOW.0,
+        "XI_FocusIn root is the root window"
+    );
+    assert_eq!(
+        u32::from_le_bytes(setup[24..28].try_into().unwrap()),
+        window,
+        "XI_FocusIn event is the grab window"
+    );
+    assert_eq!(setup[76], 1, "XIGrabDevice returns an X reply");
+    assert_eq!(setup[84], 0, "XIGrabDevice returned GrabSuccess");
 }
 
 fn enable_record_button_events(f: &mut Fixture, peer: &mut crate::transport::CapturedPeer) {
@@ -3281,4 +3354,885 @@ fn xi2_slave_motion_routes_from_pre_move_window_master_from_post_move() {
     );
     assert!(read_packets(&mut f.client_b).is_empty());
     assert_task1_end_state(&f, &[]);
+}
+
+/// Creates an XI2 active grab through the wire request path so AllowEvents
+/// tests can select the grab device, both modes, and its delivered mask. The
+/// XI wire values are Sync=0 and Async=1.
+fn grab_xi2_device_with_modes(
+    f: &mut Fixture,
+    client: u32,
+    device: u16,
+    this_mode: u8,
+    paired_mode: u8,
+    mask: u32,
+) {
+    grab_xi2_device_with_modes_at_window(f, client, W, device, this_mode, paired_mode, mask);
+}
+
+/// Sends XIGrabDevice to a chosen window; the Xvfb sync rows grab the root,
+/// while the existing passive-grab cases use the fixture's W window.
+fn grab_xi2_device_with_modes_at_window(
+    f: &mut Fixture,
+    client: u32,
+    window: u32,
+    device: u16,
+    this_mode: u8,
+    paired_mode: u8,
+    mask: u32,
+) {
+    use crate::xinput::XiDeviceRole;
+
+    let mut body = Vec::with_capacity(if mask == 0 { 20 } else { 24 });
+    body.extend_from_slice(&window.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    body.extend_from_slice(&0u32.to_le_bytes()); // no cursor
+    body.extend_from_slice(&device.to_le_bytes());
+    body.extend_from_slice(&[this_mode, paired_mode, 0, 0]); // modes, owner_events, pad
+    body.extend_from_slice(&u16::from(mask != 0).to_le_bytes()); // mask_len in 4-byte units
+    if mask != 0 {
+        body.extend_from_slice(&mask.to_le_bytes());
+    }
+    dispatch(f, client, XI2_OPCODE, 51, &body); // XIGrabDevice
+
+    let installed = match f.state.xi_devices.role(device) {
+        Some(XiDeviceRole::MasterPointer) => f
+            .state
+            .active_pointer_grab
+            .is_some_and(|grab| grab.owner == ClientId(client)),
+        Some(XiDeviceRole::SlavePointer) => f
+            .state
+            .xi2_pointer_grabs
+            .get(&device)
+            .is_some_and(|grab| grab.owner == ClientId(client)),
+        Some(XiDeviceRole::MasterKeyboard) => f
+            .state
+            .active_keyboard_grab
+            .is_some_and(|grab| grab.owner == ClientId(client)),
+        Some(XiDeviceRole::SlaveKeyboard) => f
+            .state
+            .xi2_keyboard_grabs
+            .get(&device)
+            .is_some_and(|grab| grab.owner == ClientId(client)),
+        None => false,
+    };
+    assert!(
+        installed,
+        "XIGrabDevice installs client {client} on {device}"
+    );
+}
+
+/// Removes an XI2 active grab using XIUngrabDevice after an AllowEvents
+/// scenario, allowing the shared end-state invariant to inspect the result.
+fn ungrab_xi2_device(f: &mut Fixture, client: u32, device: u16) {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    body.extend_from_slice(&device.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes());
+    dispatch(f, client, XI2_OPCODE, 52, &body); // XIUngrabDevice
+}
+
+/// Asserts encoded XI2 device packets, including key events that the shared
+/// pointer-focused `read_packets` decoder intentionally does not expose. A
+/// zero expected window skips that field when the oracle row leaves it open.
+fn assert_xi2_packets(
+    peer: &mut crate::transport::CapturedPeer,
+    expected: &[(u16, u16, u16, u32)],
+) {
+    let bytes = read_all_capture_available(peer);
+    let mut offset = 0;
+    for &(evtype, device, source, window) in expected {
+        assert!(offset + 32 <= bytes.len(), "missing XI2 packet {evtype}");
+        assert_eq!(bytes[offset], 35, "GenericEvent packet header");
+        assert_eq!(
+            u16::from_le_bytes([bytes[offset + 8], bytes[offset + 9]]),
+            evtype,
+            "XI2 event type"
+        );
+        assert_eq!(
+            u16::from_le_bytes([bytes[offset + 10], bytes[offset + 11]]) & 0x7fff,
+            device,
+            "XI2 device id"
+        );
+        if window != 0 {
+            assert_eq!(
+                u32::from_le_bytes(bytes[offset + 24..offset + 28].try_into().unwrap()),
+                window,
+                "XI2 event window"
+            );
+        }
+        let source_offset = if matches!(evtype, 7 | 8) { 16 } else { 52 };
+        assert_eq!(
+            u16::from_le_bytes([
+                bytes[offset + source_offset],
+                bytes[offset + source_offset + 1]
+            ]),
+            source,
+            "XI2 source id"
+        );
+        let extra = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+        offset += 32 + usize::try_from(extra).unwrap() * 4;
+    }
+    assert_eq!(offset, bytes.len(), "no unexpected encoded XI2 packets");
+}
+
+/// Sync from a client holding only `sync.other` must not release that hold.
+/// A second fixture also checks that the owner's Async does not bypass the
+/// independent synced client's hold.
+#[test]
+fn sync_pointer_from_synced_only_client_is_a_noop() {
+    use crate::server::Xi1SyncState;
+
+    let origin = InputOrigin::XTest(XI_XTEST);
+    let mut f = p_fixture();
+    select_xi2(
+        &mut f,
+        CLIENT_A,
+        ROOT_WINDOW.0,
+        XI_ALL_MASTER_DEVICES,
+        XI_BUTTONS,
+    );
+    select_xi2(
+        &mut f,
+        CLIENT_B,
+        ROOT_WINDOW.0,
+        XI_ALL_MASTER_DEVICES,
+        XI_BUTTONS,
+    );
+    grab_xi2_device_with_modes_at_window(
+        &mut f,
+        CLIENT_B,
+        ROOT_WINDOW.0,
+        XI_MASTER_KEYBOARD,
+        1,
+        0,
+        XI_KEYS,
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(read_packets(&mut f.client_b).is_empty());
+    send_to_root(&mut f, origin, PointerEventKind::ButtonPress, 1, 500, 700);
+    send_to_root(&mut f, origin, PointerEventKind::ButtonRelease, 1, 500, 700);
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    allow_events_core(&mut f, CLIENT_B, 1); // SyncPointer
+    assert!(
+        read_packets(&mut f.client_a).is_empty(),
+        "B's SyncPointer must not release its on-behalf pointer hold"
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER].other,
+        Some(ClientId(CLIENT_B))
+    );
+
+    allow_events_core(&mut f, CLIENT_B, 0); // AsyncPointer
+    let packets_a = read_packets(&mut f.client_a);
+    let packets_b = read_packets(&mut f.client_b);
+    // Implicit-owner choice among equal selections follows hash order in yserver; Xorg picks by selection order (PR #379 follow-up).
+    let press = xi(4, XI_MASTER, XI_XTEST, ROOT_WINDOW.0);
+    let release = xi(5, XI_MASTER, XI_XTEST, ROOT_WINDOW.0);
+    assert!(
+        (packets_a == vec![press, release] && packets_b == vec![press])
+            || (packets_a == vec![press] && packets_b == vec![press, release]),
+        "the release must reach exactly one selecting client exactly once"
+    );
+    assert_eq!(f.state.xi1_frozen[&XI_MASTER].other, None);
+    ungrab_xi2_device(&mut f, CLIENT_B, XI_MASTER_KEYBOARD);
+    assert!(f.state.active_keyboard_grab.is_none());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+
+    let mut f = p_fixture();
+    select_xi2(
+        &mut f,
+        CLIENT_A,
+        ROOT_WINDOW.0,
+        XI_ALL_MASTER_DEVICES,
+        XI_BUTTONS,
+    );
+    select_xi2(
+        &mut f,
+        CLIENT_B,
+        ROOT_WINDOW.0,
+        XI_ALL_MASTER_DEVICES,
+        XI_BUTTONS,
+    );
+    grab_xi2_device_with_modes_at_window(
+        &mut f,
+        CLIENT_A,
+        ROOT_WINDOW.0,
+        XI_MASTER,
+        0,
+        1,
+        XI_BUTTONS,
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(read_packets(&mut f.client_b).is_empty());
+    // Row 2 injects before B's paired grab; the already frozen input is
+    // withheld when B adds its independent `other` hold.
+    send_to_root(&mut f, origin, PointerEventKind::ButtonPress, 1, 500, 700);
+    send_to_root(&mut f, origin, PointerEventKind::ButtonRelease, 1, 500, 700);
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(read_packets(&mut f.client_b).is_empty());
+    grab_xi2_device_with_modes_at_window(
+        &mut f,
+        CLIENT_B,
+        ROOT_WINDOW.0,
+        XI_MASTER_KEYBOARD,
+        1,
+        0,
+        XI_KEYS,
+    );
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    allow_events_core(&mut f, CLIENT_B, 1); // B SyncPointer
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(read_packets(&mut f.client_b).is_empty());
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER].state,
+        Xi1SyncState::FrozenNoEvent
+    );
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER].other,
+        Some(ClientId(CLIENT_B))
+    );
+    allow_events_core(&mut f, CLIENT_A, 0); // A AsyncPointer
+    assert!(
+        read_packets(&mut f.client_a).is_empty(),
+        "A's AsyncPointer must leave B's independent hold in place"
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+    assert_eq!(f.state.xi1_frozen[&XI_MASTER].state, Xi1SyncState::Thawed);
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER].other,
+        Some(ClientId(CLIENT_B))
+    );
+    allow_events_core(&mut f, CLIENT_B, 0); // B AsyncPointer
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![
+            xi(4, XI_MASTER, XI_XTEST, ROOT_WINDOW.0),
+            xi(5, XI_MASTER, XI_XTEST, ROOT_WINDOW.0),
+        ]
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+    ungrab_xi2_device(&mut f, CLIENT_B, XI_MASTER_KEYBOARD);
+    ungrab_xi2_device(&mut f, CLIENT_A, XI_MASTER);
+    assert!(f.state.active_pointer_grab.is_none());
+    assert!(f.state.active_keyboard_grab.is_none());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
+/// SyncKeyboard from a client holding only `sync.other` must leave queued
+/// keys frozen; the two-owner case checks both Async packet boundaries.
+#[test]
+fn sync_keyboard_from_synced_only_client_is_a_noop() {
+    use crate::{host_x11::HostKeyEvent, server::Xi1SyncState};
+
+    const KEYCODE: u8 = 38;
+    let key = |pressed, time| HostKeyEvent {
+        origin: InputOrigin::XTest(XI_XTEST_KEYBOARD),
+        pressed,
+        keycode: KEYCODE,
+        time,
+        root_x: 145,
+        root_y: 145,
+        event_x: 145,
+        event_y: 145,
+        state: 0,
+    };
+    let mut f = p_fixture();
+    select_xi2(
+        &mut f,
+        CLIENT_A,
+        ROOT_WINDOW.0,
+        XI_ALL_MASTER_DEVICES,
+        XI_KEYS,
+    );
+    select_xi2(
+        &mut f,
+        CLIENT_B,
+        ROOT_WINDOW.0,
+        XI_ALL_MASTER_DEVICES,
+        XI_KEYS,
+    );
+    let mut focus = Vec::with_capacity(8);
+    focus.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+    focus.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    dispatch(&mut f, CLIENT_A, 42, 0, &focus); // SetInputFocus to Xvfb's root focus
+    grab_xi2_device_with_modes_at_window(
+        &mut f,
+        CLIENT_B,
+        ROOT_WINDOW.0,
+        XI_MASTER,
+        1,
+        0,
+        XI_BUTTONS,
+    );
+    let _ = read_all_capture_available(&mut f.client_a);
+    let _ = read_all_capture_available(&mut f.client_b);
+    let _ = crate::core_loop::key_fanout::key_event_fanout_to_state(
+        &mut f.state,
+        &mut f.backend,
+        key(true, f.time),
+    );
+    f.time += 1;
+    let _ = crate::core_loop::key_fanout::key_event_fanout_to_state(
+        &mut f.state,
+        &mut f.backend,
+        key(false, f.time),
+    );
+    f.time += 1;
+    assert!(read_all_capture_available(&mut f.client_a).is_empty());
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER_KEYBOARD].other,
+        Some(ClientId(CLIENT_B))
+    );
+    assert!(
+        f.state
+            .sync_pending
+            .iter()
+            .any(|pending| pending.device == XI_MASTER_KEYBOARD),
+        "the keyboard fanout must queue input behind the paired freeze"
+    );
+
+    allow_events_core(&mut f, CLIENT_B, 4); // SyncKeyboard
+    assert!(
+        read_all_capture_available(&mut f.client_a).is_empty(),
+        "B's SyncKeyboard must not release its on-behalf keyboard hold"
+    );
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER_KEYBOARD].other,
+        Some(ClientId(CLIENT_B))
+    );
+    allow_events_core(&mut f, CLIENT_B, 3); // AsyncKeyboard
+    assert_xi2_packets(
+        &mut f.client_a,
+        &[
+            (2, XI_MASTER_KEYBOARD, XI_XTEST_KEYBOARD, ROOT_WINDOW.0),
+            (3, XI_MASTER_KEYBOARD, XI_XTEST_KEYBOARD, ROOT_WINDOW.0),
+        ],
+    );
+    assert_xi2_packets(
+        &mut f.client_b,
+        &[
+            (2, XI_MASTER_KEYBOARD, XI_XTEST_KEYBOARD, ROOT_WINDOW.0),
+            (3, XI_MASTER_KEYBOARD, XI_XTEST_KEYBOARD, ROOT_WINDOW.0),
+        ],
+    );
+    assert_eq!(f.state.xi1_frozen[&XI_MASTER_KEYBOARD].other, None);
+    ungrab_xi2_device(&mut f, CLIENT_B, XI_MASTER);
+    assert!(f.state.active_pointer_grab.is_none());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+
+    let mut f = p_fixture();
+    select_xi2(
+        &mut f,
+        CLIENT_A,
+        ROOT_WINDOW.0,
+        XI_ALL_MASTER_DEVICES,
+        XI_KEYS,
+    );
+    select_xi2(
+        &mut f,
+        CLIENT_B,
+        ROOT_WINDOW.0,
+        XI_ALL_MASTER_DEVICES,
+        XI_KEYS,
+    );
+    let mut focus = Vec::with_capacity(8);
+    focus.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+    focus.extend_from_slice(&0u32.to_le_bytes());
+    dispatch(&mut f, CLIENT_A, 42, 0, &focus); // SetInputFocus to Xvfb's root focus
+    grab_xi2_device_with_modes_at_window(
+        &mut f,
+        CLIENT_A,
+        ROOT_WINDOW.0,
+        XI_MASTER_KEYBOARD,
+        0,
+        1,
+        XI_KEYS,
+    );
+    let _ = read_all_capture_available(&mut f.client_a);
+    let _ = read_all_capture_available(&mut f.client_b);
+    let _ = crate::core_loop::key_fanout::key_event_fanout_to_state(
+        &mut f.state,
+        &mut f.backend,
+        key(true, f.time),
+    );
+    f.time += 1;
+    let _ = crate::core_loop::key_fanout::key_event_fanout_to_state(
+        &mut f.state,
+        &mut f.backend,
+        key(false, f.time),
+    );
+    f.time += 1;
+    assert!(read_all_capture_available(&mut f.client_a).is_empty());
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+    assert!(
+        f.state
+            .sync_pending
+            .iter()
+            .any(|pending| pending.device == XI_MASTER_KEYBOARD),
+        "the keyboard fanout must queue input behind the paired freeze"
+    );
+
+    grab_xi2_device_with_modes_at_window(
+        &mut f,
+        CLIENT_B,
+        ROOT_WINDOW.0,
+        XI_MASTER,
+        1,
+        0,
+        XI_BUTTONS,
+    );
+    assert!(
+        read_all_capture_available(&mut f.client_a).is_empty(),
+        "B's grab must not send packets to A"
+    );
+    assert_xi_grab_success_reply(&mut f.client_b);
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER_KEYBOARD].other,
+        Some(ClientId(CLIENT_B))
+    );
+
+    allow_events_core(&mut f, CLIENT_B, 4); // B SyncKeyboard
+    assert!(read_all_capture_available(&mut f.client_a).is_empty());
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER_KEYBOARD].state,
+        Xi1SyncState::FrozenNoEvent
+    );
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER_KEYBOARD].other,
+        Some(ClientId(CLIENT_B))
+    );
+    allow_events_core(&mut f, CLIENT_A, 3); // A AsyncKeyboard
+    assert!(
+        read_all_capture_available(&mut f.client_a).is_empty(),
+        "A's AsyncKeyboard must leave B's independent hold in place"
+    );
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER_KEYBOARD].state,
+        Xi1SyncState::Thawed
+    );
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER_KEYBOARD].other,
+        Some(ClientId(CLIENT_B))
+    );
+    allow_events_core(&mut f, CLIENT_B, 3); // B AsyncKeyboard
+    assert_xi2_packets(
+        &mut f.client_a,
+        &[
+            (2, XI_MASTER_KEYBOARD, XI_XTEST_KEYBOARD, ROOT_WINDOW.0),
+            (3, XI_MASTER_KEYBOARD, XI_XTEST_KEYBOARD, ROOT_WINDOW.0),
+        ],
+    );
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+    ungrab_xi2_device(&mut f, CLIENT_B, XI_MASTER);
+    ungrab_xi2_device(&mut f, CLIENT_A, XI_MASTER_KEYBOARD);
+    assert!(f.state.active_pointer_grab.is_none());
+    assert!(f.state.active_keyboard_grab.is_none());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
+/// An XI2 slave-keyboard grab has no stored timestamp; its valid high-bit
+/// XIAsyncDevice time must still release queued input.
+#[test]
+fn xi_async_slave_keyboard_without_stored_time_accepts_high_bit_time() {
+    use crate::{host_x11::HostKeyEvent, server::Xi1SyncState};
+
+    const SERVER_TIME: u32 = 0x9000_0200;
+    const ALLOW_TIME: u32 = 0x9000_0100;
+    const KEYCODE: u8 = 38;
+
+    let mut f = p_fixture();
+    set_test_clock_epoch(&mut f, SERVER_TIME);
+    select_xi2(&mut f, CLIENT_A, ROOT_WINDOW.0, XI_XTEST_KEYBOARD, XI_KEYS);
+    select_xi2(
+        &mut f,
+        CLIENT_B,
+        ROOT_WINDOW.0,
+        XI_ALL_MASTER_DEVICES,
+        XI_KEYS,
+    );
+    grab_xi2_device_with_modes_at_window(
+        &mut f,
+        CLIENT_A,
+        ROOT_WINDOW.0,
+        XI_XTEST_KEYBOARD,
+        0,
+        1,
+        XI_KEYS,
+    );
+    assert_xi_keyboard_grab_success(&mut f.client_a, XI_XTEST_KEYBOARD, ROOT_WINDOW.0);
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+    assert!(f.state.timestamp_now() >= SERVER_TIME);
+    assert_eq!(
+        f.state.xi1_frozen[&XI_XTEST_KEYBOARD].state,
+        Xi1SyncState::FrozenNoEvent
+    );
+
+    let key = |pressed, time| HostKeyEvent {
+        origin: InputOrigin::XTest(XI_XTEST_KEYBOARD),
+        pressed,
+        keycode: KEYCODE,
+        time,
+        root_x: 145,
+        root_y: 145,
+        event_x: 145,
+        event_y: 145,
+        state: 0,
+    };
+    let _ = crate::core_loop::key_fanout::key_event_fanout_to_state(
+        &mut f.state,
+        &mut f.backend,
+        key(true, f.time),
+    );
+    f.time += 1;
+    let _ = crate::core_loop::key_fanout::key_event_fanout_to_state(
+        &mut f.state,
+        &mut f.backend,
+        key(false, f.time),
+    );
+    f.time += 1;
+    assert!(read_all_capture_available(&mut f.client_a).is_empty());
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+
+    xi_allow_events_at(&mut f, CLIENT_A, XI_XTEST_KEYBOARD, 0, ALLOW_TIME); // XIAsyncDevice
+    assert_eq!(
+        f.state.xi1_frozen[&XI_XTEST_KEYBOARD].state,
+        Xi1SyncState::Thawed,
+        "a valid high-bit AllowEvents time admits the unknown-time grab"
+    );
+    assert_xi2_packets(
+        &mut f.client_a,
+        &[
+            (2, XI_XTEST_KEYBOARD, XI_XTEST_KEYBOARD, ROOT_WINDOW.0),
+            (3, XI_XTEST_KEYBOARD, XI_XTEST_KEYBOARD, ROOT_WINDOW.0),
+        ],
+    );
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+    ungrab_xi2_device(&mut f, CLIENT_A, XI_XTEST_KEYBOARD);
+    assert!(f.state.xi2_keyboard_grabs.is_empty());
+    assert_task1_end_state(&f, &[XI_XTEST_KEYBOARD]);
+}
+
+/// An unknown same-client slave-keyboard time must not replace a known
+/// high-bit master-pointer bound during XIAsyncDevice admission.
+#[test]
+fn xi_async_unknown_keyboard_grab_preserves_known_pointer_bound() {
+    use crate::server::Xi1SyncState;
+
+    const SERVER_TIME: u32 = 0x9000_0200;
+    let mut f = p_fixture();
+    set_test_clock_epoch(&mut f, SERVER_TIME);
+    select_xi2(
+        &mut f,
+        CLIENT_A,
+        ROOT_WINDOW.0,
+        XI_ALL_MASTER_DEVICES,
+        XI_BUTTONS,
+    );
+    select_xi2(
+        &mut f,
+        CLIENT_B,
+        ROOT_WINDOW.0,
+        XI_ALL_MASTER_DEVICES,
+        XI_BUTTONS,
+    );
+    grab_xi2_device_with_modes_at_window(
+        &mut f,
+        CLIENT_A,
+        ROOT_WINDOW.0,
+        XI_MASTER,
+        0,
+        1,
+        XI_BUTTONS,
+    );
+    let known_pointer_bound = f.state.active_pointer_grab.unwrap().time;
+    assert!(known_pointer_bound >= SERVER_TIME);
+    assert_xi_grab_success_reply(&mut f.client_a);
+
+    grab_xi2_device_with_modes_at_window(
+        &mut f,
+        CLIENT_A,
+        ROOT_WINDOW.0,
+        XI_XTEST_KEYBOARD,
+        1,
+        1,
+        XI_KEYS,
+    );
+    assert_xi_keyboard_grab_success(&mut f.client_a, XI_XTEST_KEYBOARD, ROOT_WINDOW.0);
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+    assert!(f.state.timestamp_now() >= SERVER_TIME);
+
+    let origin = InputOrigin::XTest(XI_XTEST);
+    send_to_root(&mut f, origin, PointerEventKind::ButtonPress, 1, 500, 700);
+    assert!(read_all_capture_available(&mut f.client_a).is_empty());
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+    send_to_root(&mut f, origin, PointerEventKind::ButtonRelease, 1, 500, 700);
+    assert!(read_all_capture_available(&mut f.client_a).is_empty());
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER].state,
+        Xi1SyncState::FrozenNoEvent
+    );
+
+    xi_allow_events_at(&mut f, CLIENT_A, XI_MASTER, 0, known_pointer_bound); // XIAsyncDevice
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER].state,
+        Xi1SyncState::Thawed,
+        "an unknown same-client grab cannot replace the known pointer bound"
+    );
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![
+            xi(4, XI_MASTER, XI_XTEST, ROOT_WINDOW.0),
+            xi(5, XI_MASTER, XI_XTEST, ROOT_WINDOW.0),
+        ]
+    );
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+    ungrab_xi2_device(&mut f, CLIENT_A, XI_MASTER);
+    ungrab_xi2_device(&mut f, CLIENT_A, XI_XTEST_KEYBOARD);
+    assert!(f.state.xi2_keyboard_grabs.is_empty());
+    assert!(f.state.active_pointer_grab.is_none());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD, XI_XTEST_KEYBOARD]);
+}
+
+/// Paired XI2 modes are no-ops without another frozen grab; this also pins
+/// the paired-device `other` hold when only the requested pointer is grabbed.
+#[test]
+fn xi_async_paired_device_without_frozen_others_is_a_noop() {
+    use crate::server::Xi1SyncState;
+
+    let mut f = p_fixture();
+    grab_xi2_device_with_modes(&mut f, CLIENT_A, XI_MASTER, 0, 0, XI_BUTTONS);
+    let _ = read_all_capture_available(&mut f.client_a);
+    let _ = read_all_capture_available(&mut f.client_b);
+    let expected_state = Xi1SyncState::FrozenNoEvent;
+    for mode in [3, 4, 5] {
+        xi_allow_events(&mut f, CLIENT_A, XI_MASTER, mode);
+        assert!(read_all_capture_available(&mut f.client_a).is_empty());
+        assert!(read_all_capture_available(&mut f.client_b).is_empty());
+        assert_eq!(f.state.xi1_frozen[&XI_MASTER].state, expected_state);
+        assert_eq!(
+            f.state.xi1_frozen[&XI_MASTER_KEYBOARD].other,
+            Some(ClientId(CLIENT_A)),
+            "paired mode {mode} must preserve the on-behalf keyboard hold"
+        );
+    }
+
+    let origin = InputOrigin::XTest(XI_XTEST);
+    send(&mut f, origin, PointerEventKind::ButtonPress, 1, 150, 150);
+    send(&mut f, origin, PointerEventKind::ButtonRelease, 1, 150, 150);
+    assert!(read_all_capture_available(&mut f.client_a).is_empty());
+    xi_allow_events(&mut f, CLIENT_A, XI_MASTER, 0); // XIAsyncDevice
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![xi(4, XI_MASTER, XI_XTEST, W), xi(5, XI_MASTER, XI_XTEST, W),]
+    );
+    ungrab_xi2_device(&mut f, CLIENT_A, XI_MASTER);
+    assert!(f.state.active_pointer_grab.is_none());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+}
+
+/// ReplayDevice on an explicit frozen-no-event slave must leave its grab and
+/// freeze untouched because there is no FrozenWithEvent to replay.
+#[test]
+fn xi_replay_device_on_frozen_no_event_slave_is_a_noop() {
+    use crate::server::Xi1SyncState;
+
+    let mut f = p_fixture();
+    select_xi2(&mut f, CLIENT_A, ROOT_WINDOW.0, XI_XTEST, XI_BUTTONS);
+    grab_xi2_slave_sync(&mut f, CLIENT_A, ROOT_WINDOW.0, XI_XTEST, XI_BUTTONS);
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    xi_allow_events(&mut f, CLIENT_A, XI_XTEST, 2); // XIReplayDevice
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(read_packets(&mut f.client_b).is_empty());
+    assert_eq!(
+        f.state.xi1_frozen[&XI_XTEST].state,
+        Xi1SyncState::FrozenNoEvent
+    );
+    assert!(f.state.xi2_pointer_grabs.contains_key(&XI_XTEST));
+
+    let origin = InputOrigin::XTest(XI_XTEST);
+    send_to_root(&mut f, origin, PointerEventKind::ButtonPress, 1, 500, 700);
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(read_packets(&mut f.client_b).is_empty());
+    send_to_root(&mut f, origin, PointerEventKind::ButtonRelease, 1, 500, 700);
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    xi_allow_events(&mut f, CLIENT_A, XI_XTEST, 0); // XIAsyncDevice
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![
+            xi(4, XI_XTEST, XI_XTEST, ROOT_WINDOW.0),
+            xi(5, XI_XTEST, XI_XTEST, ROOT_WINDOW.0),
+        ]
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+    ungrab_xi2_device(&mut f, CLIENT_A, XI_XTEST);
+    assert!(f.state.xi2_pointer_grabs.is_empty());
+    assert_task1_end_state(&f, &[XI_XTEST]);
+}
+
+/// Allows a slave at a timestamp between its owner's grab and a later
+/// different-client master grab, matching Xorg's per-client AllowSome bound.
+#[test]
+fn xi_async_slave_uses_requesting_clients_grab_time() {
+    use crate::server::Xi1SyncState;
+
+    let mut f = p_fixture();
+    while f.state.timestamp_now() == 0 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    grab_xi2_slave_sync(&mut f, CLIENT_A, ROOT_WINDOW.0, XI_XTEST, XI_BUTTONS);
+    let t1_after_grab = f.state.timestamp_now();
+    assert_eq!(
+        f.state.xi1_frozen[&XI_XTEST].state,
+        Xi1SyncState::FrozenNoEvent
+    );
+
+    let between = t1_after_grab.saturating_add(1);
+    while f.state.timestamp_now() <= between {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    let mut grab = Vec::with_capacity(20);
+    grab.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+    grab.extend_from_slice(&0x000cu16.to_le_bytes()); // ButtonPress|ButtonRelease
+    grab.extend_from_slice(&[1, 1]); // asynchronous pointer and keyboard
+    grab.extend_from_slice(&0u32.to_le_bytes()); // no confinement
+    grab.extend_from_slice(&0u32.to_le_bytes()); // no cursor
+    grab.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    dispatch(&mut f, CLIENT_B, 26, 0, &grab); // GrabPointer
+    let t2 = f.state.last_pointer_grab_time;
+    assert!(t1_after_grab < between && between < t2);
+    assert!(f.state.active_pointer_grab.is_some_and(|grab| {
+        grab.owner == ClientId(CLIENT_B) && grab.grab_window.0 == ROOT_WINDOW.0
+    }));
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    let origin = InputOrigin::XTest(XI_XTEST);
+    send(&mut f, origin, PointerEventKind::ButtonPress, 1, 150, 150);
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(read_packets(&mut f.client_b).is_empty());
+    send(&mut f, origin, PointerEventKind::ButtonRelease, 1, 150, 150);
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert!(read_packets(&mut f.client_b).is_empty());
+
+    xi_allow_events_at(&mut f, CLIENT_A, XI_XTEST, 0, between); // XIAsyncDevice
+    assert_eq!(
+        read_packets(&mut f.client_a),
+        vec![
+            xi(4, XI_XTEST, XI_XTEST, ROOT_WINDOW.0),
+            xi(5, XI_XTEST, XI_XTEST, ROOT_WINDOW.0),
+        ]
+    );
+    assert!(read_packets(&mut f.client_b).is_empty());
+    assert_eq!(f.state.xi1_frozen[&XI_XTEST].state, Xi1SyncState::Thawed);
+
+    ungrab_xi2_device(&mut f, CLIENT_A, XI_XTEST);
+    dispatch(&mut f, CLIENT_B, 27, 0, &0u32.to_le_bytes()); // UngrabPointer
+    assert!(f.state.xi2_pointer_grabs.is_empty());
+    assert!(f.state.active_pointer_grab.is_none());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD, XI_XTEST]);
+}
+
+/// XI2 paired modes on a slave are no-ops even when this client has frozen
+/// grabs on both the slave and its former paired master keyboard.
+#[test]
+fn xi_paired_modes_on_slave_are_noops() {
+    use crate::server::Xi1SyncState;
+
+    for mode in [3, 4, 5] {
+        let mut f = p_fixture();
+        select_xi2(&mut f, CLIENT_A, ROOT_WINDOW.0, XI_XTEST, XI_BUTTONS);
+        select_xi2(&mut f, CLIENT_A, ROOT_WINDOW.0, XI_MASTER_KEYBOARD, XI_KEYS);
+        grab_xi2_slave_sync(&mut f, CLIENT_A, ROOT_WINDOW.0, XI_XTEST, XI_BUTTONS);
+        grab_xi2_device_with_modes(&mut f, CLIENT_A, XI_MASTER_KEYBOARD, 0, 1, XI_KEYS);
+        let before_slave = f.state.xi1_frozen[&XI_XTEST].state;
+        let before_keyboard = f.state.xi1_frozen[&XI_MASTER_KEYBOARD].state;
+        let before_pointer_other = f.state.xi1_frozen[&XI_MASTER].other;
+        assert_eq!(before_slave, Xi1SyncState::FrozenNoEvent);
+        assert_eq!(before_keyboard, Xi1SyncState::FrozenNoEvent);
+        assert_eq!(before_pointer_other, None);
+        let _ = read_all_capture_available(&mut f.client_a);
+        let _ = read_all_capture_available(&mut f.client_b);
+
+        xi_allow_events(&mut f, CLIENT_A, XI_XTEST, mode);
+        assert!(read_all_capture_available(&mut f.client_a).is_empty());
+        assert!(read_all_capture_available(&mut f.client_b).is_empty());
+        assert_eq!(f.state.xi1_frozen[&XI_XTEST].state, before_slave);
+        assert_eq!(
+            f.state.xi1_frozen[&XI_MASTER_KEYBOARD].state,
+            before_keyboard
+        );
+        assert_eq!(f.state.xi1_frozen[&XI_MASTER].other, before_pointer_other);
+        assert!(f.state.xi2_pointer_grabs.contains_key(&XI_XTEST));
+        assert!(f.state.active_keyboard_grab.is_some());
+
+        let origin = InputOrigin::XTest(XI_XTEST);
+        send_to_root(&mut f, origin, PointerEventKind::ButtonPress, 1, 500, 700);
+        assert!(read_all_capture_available(&mut f.client_a).is_empty());
+        assert!(read_all_capture_available(&mut f.client_b).is_empty());
+        send_to_root(&mut f, origin, PointerEventKind::ButtonRelease, 1, 500, 700);
+        assert!(read_all_capture_available(&mut f.client_a).is_empty());
+        assert!(read_all_capture_available(&mut f.client_b).is_empty());
+
+        let key = |pressed, time| crate::host_x11::HostKeyEvent {
+            origin: InputOrigin::XTest(XI_XTEST_KEYBOARD),
+            pressed,
+            keycode: 38,
+            time,
+            root_x: 145,
+            root_y: 145,
+            event_x: 145,
+            event_y: 145,
+            state: 0,
+        };
+        let _ = crate::core_loop::key_fanout::key_event_fanout_to_state(
+            &mut f.state,
+            &mut f.backend,
+            key(true, f.time),
+        );
+        f.time += 1;
+        assert!(read_all_capture_available(&mut f.client_a).is_empty());
+        assert!(read_all_capture_available(&mut f.client_b).is_empty());
+        let _ = crate::core_loop::key_fanout::key_event_fanout_to_state(
+            &mut f.state,
+            &mut f.backend,
+            key(false, f.time),
+        );
+        f.time += 1;
+        assert!(read_all_capture_available(&mut f.client_a).is_empty());
+        assert!(read_all_capture_available(&mut f.client_b).is_empty());
+
+        xi_allow_events(&mut f, CLIENT_A, XI_XTEST, 0); // XIAsyncDevice
+        xi_allow_events(&mut f, CLIENT_A, XI_MASTER_KEYBOARD, 0); // XIAsyncDevice
+        assert_xi2_packets(
+            &mut f.client_a,
+            &[
+                (4, XI_XTEST, XI_XTEST, 0),
+                (5, XI_XTEST, XI_XTEST, 0),
+                (2, XI_MASTER_KEYBOARD, XI_XTEST_KEYBOARD, 0),
+                (3, XI_MASTER_KEYBOARD, XI_XTEST_KEYBOARD, 0),
+            ],
+        );
+        assert!(read_all_capture_available(&mut f.client_b).is_empty());
+        ungrab_xi2_device(&mut f, CLIENT_A, XI_XTEST);
+        ungrab_xi2_device(&mut f, CLIENT_A, XI_MASTER_KEYBOARD);
+        assert!(f.state.xi2_pointer_grabs.is_empty());
+        assert!(f.state.active_keyboard_grab.is_none());
+        assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD, XI_XTEST]);
+    }
 }

@@ -8,7 +8,8 @@ use crate::{
         process_request::{
             RequestOutcome, XI2_FIRST_ERROR, XI2_MAJOR_OPCODE, emit_x11_error_with_minor,
             grabs::{
-                apply_allow_events, apply_xi2_allow_events_for_slave, deactivate_core_pointer_grab,
+                apply_allow_events, apply_xi2_allow_events_for_master_paired,
+                apply_xi2_allow_events_for_slave, deactivate_core_pointer_grab,
                 deactivate_passive_pointer_grab_crossings, xi2_allow_mode_to_core,
             },
             xi::{
@@ -102,6 +103,11 @@ pub(super) fn handle_xi_grab_device(
                 mask[..mask_bytes.len()].copy_from_slice(mask_bytes);
                 u64::from_le_bytes(mask)
             });
+        let grab_time = if time == 0 {
+            state.timestamp_now().max(state.xi1_last_input_time)
+        } else {
+            time
+        };
         let role = match state.xi_devices.role(deviceid) {
             Some(role) => role,
             None => {
@@ -233,6 +239,7 @@ pub(super) fn handle_xi_grab_device(
                 };
                 if is_master {
                     state.active_keyboard_grab = Some(grab);
+                    state.last_keyboard_grab_time = grab_time;
                 } else {
                     state.xi2_keyboard_grabs.insert(deviceid, grab);
                     let _ = state.detach_xi2_slave(deviceid);
@@ -243,7 +250,7 @@ pub(super) fn handle_xi_grab_device(
                     grab_window: ResourceId(grab_window),
                     event_mask: 0xFFFF, // core mask is unused for XI2 grabs
                     cursor: ResourceId(cursor),
-                    time,
+                    time: grab_time,
                     owner_events,
                     via_xi2: true,
                     implicit: false,
@@ -252,6 +259,7 @@ pub(super) fn handle_xi_grab_device(
                 };
                 if is_master {
                     state.set_pointer_grab(grab);
+                    state.last_pointer_grab_time = grab_time;
                 } else {
                     state.xi2_pointer_grabs.insert(deviceid, grab);
                     let _ = state.detach_xi2_slave(deviceid);
@@ -646,27 +654,22 @@ pub(super) fn handle_xi_allow_events(
     } else {
         0
     };
-    // Map the XI2 mode + target deviceid onto the equivalent core
-    // AllowSome mode and run the SHARED `apply_allow_events`. This
-    // used to be a partial reimplementation that diverged from the
-    // core path and caused recurring freezes (desktop rubber-band =
-    // Async/Replay thaw gap; Cinnamon input freeze = XISyncDevice
-    // treated as a no-op). Touch modes (XIAcceptTouch/XIRejectTouch)
-    // are unsupported → no-op.
     if is_master {
-        if let Some(core_mode) = xi2_allow_mode_to_core(mode, is_keyboard) {
-            return apply_allow_events(state, backend, client_id, sequence, core_mode, time);
+        if mode <= 2 {
+            if let Some(core_mode) = xi2_allow_mode_to_core(mode, is_keyboard) {
+                return apply_allow_events(state, backend, client_id, sequence, core_mode, time);
+            }
+        } else if (3..=5).contains(&mode) {
+            return apply_xi2_allow_events_for_master_paired(
+                state, backend, client_id, sequence, deviceid, mode, time,
+            );
         }
+    } else if (3..=5).contains(&mode) {
+        // Xorg accepts XI2 paired modes only for a master device.
+        return Ok(RequestOutcome::Handled);
     } else {
         return apply_xi2_allow_events_for_slave(
-            state,
-            backend,
-            client_id,
-            sequence,
-            deviceid,
-            is_keyboard,
-            mode,
-            time,
+            state, backend, client_id, sequence, deviceid, mode, time,
         );
     }
     return Ok(RequestOutcome::Handled);

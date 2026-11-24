@@ -1543,7 +1543,7 @@ fn frozen_pointer_replay_maps_button_exactly_once() {
     );
 }
 
-/// XI2 mode → core AllowSome mode mapping ([`xi2_allow_mode_to_core`]).
+/// XI2 per-device mode → core wrapper mode mapping ([`xi2_allow_mode_to_core`]).
 #[test]
 fn xi2_allow_mode_to_core_maps_all_modes() {
     // Pointer: Async/Sync/Replay → Pointer variants.
@@ -1554,11 +1554,10 @@ fn xi2_allow_mode_to_core_maps_all_modes() {
     assert_eq!(xi2_allow_mode_to_core(0, true), Some(3)); // → AsyncKeyboard
     assert_eq!(xi2_allow_mode_to_core(1, true), Some(4)); // → SyncKeyboard
     assert_eq!(xi2_allow_mode_to_core(2, true), Some(5)); // → ReplayKeyboard
-    // paired: AsyncPairedDevice acts on the OTHER device.
-    assert_eq!(xi2_allow_mode_to_core(3, false), Some(3)); // ptr grab → async keyboard
-    assert_eq!(xi2_allow_mode_to_core(3, true), Some(0)); // kbd grab → async pointer
-    assert_eq!(xi2_allow_mode_to_core(4, false), Some(6)); // AsyncPair → AsyncBoth
-    assert_eq!(xi2_allow_mode_to_core(5, false), Some(7)); // SyncPair  → SyncBoth
+    // Paired modes keep the requested device as AllowSome's `thisDev`.
+    assert_eq!(xi2_allow_mode_to_core(3, false), None); // AsyncPairedDevice
+    assert_eq!(xi2_allow_mode_to_core(4, false), None); // AsyncPair
+    assert_eq!(xi2_allow_mode_to_core(5, false), None); // SyncPair
     // touch / unknown → unsupported.
     assert_eq!(xi2_allow_mode_to_core(6, false), None); // XIAcceptTouch
     assert_eq!(xi2_allow_mode_to_core(7, false), None); // XIRejectTouch
