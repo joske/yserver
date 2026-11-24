@@ -560,6 +560,25 @@ impl<P: Platform> XBackend<P> {
         raw_dy: i32,
         origin: yserver_core::core_loop::InputOrigin,
     ) {
+        // Xorg applies `dev->transform` to absolute valuators as the first
+        // step of `transformAbsolute` (dix/getevents.c) — before clamping,
+        // confinement, or crossings. Covering it here means warps
+        // (`NestedHost` → the master's CTM) get the same treatment as
+        // device-originated absolute motion, like `GetPointerEvents`.
+        if !relative {
+            let transform =
+                yserver_core::core_loop::pointer_fanout::transform_for_origin(server_state, origin);
+            if !transform.is_identity() {
+                let (tx, ty) = yserver_core::core_loop::pointer_fanout::transform_pointer_position(
+                    transform,
+                    f64::from(x),
+                    f64::from(y),
+                    self.platform.fb_size(),
+                );
+                x = tx;
+                y = ty;
+            }
+        }
         // Apply active-grab confinement before hit-testing and crossing
         // generation.  The core fanout also clamps as a backend-independent
         // safety net, but that is too late for KMS: dispatch_motion_event()

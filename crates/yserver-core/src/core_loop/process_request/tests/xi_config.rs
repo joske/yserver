@@ -238,16 +238,16 @@ fn xi1_list_device_properties_wire() {
     let wire = read_all_available(&mut peer);
     assert_eq!(
         wire.len(),
-        32 + 16,
-        "32 header + XTEST marker + Device Enabled + 2 client atoms"
+        32 + 20,
+        "32 header + XTEST marker + Device Enabled + CTM + 2 client atoms"
     );
     assert_eq!(wire[0], 1, "X_Reply");
     assert_eq!(
         u32::from_le_bytes(wire[4..8].try_into().unwrap()),
-        4,
-        "length = nAtoms including the XTEST marker and Device Enabled"
+        5,
+        "length = nAtoms including the XTEST marker, Device Enabled and CTM"
     );
-    assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 4, "nAtoms");
+    assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 5, "nAtoms");
     assert!(wire[10..32].iter().all(|&b| b == 0), "pad zero");
     let mut atoms = wire[32..]
         .chunks_exact(4)
@@ -256,6 +256,7 @@ fn xi1_list_device_properties_wire() {
     let mut expected = vec![
         state.xtest_device_atom.0,
         state.xi_device_enabled_atom.0,
+        state.xi_ctm_atom.0,
         100,
         200,
     ];
@@ -3535,4 +3536,247 @@ fn xi_config_completion_invalid_value_yields_bad_value_without_mutation() {
     assert!(backend.started_device_configs.is_empty());
     assert!(lane.is_empty());
     assert!(pending.is_empty());
+}
+
+// -----------------------------------------------------------------
+// libinput Calibration Matrix (FloatVec{9} + Calibration binding)
+// -----------------------------------------------------------------
+
+/// Touchpad fixture with calibration support: `has_matrix` reports the
+/// capability, current/default carry distinct matrices so the Default
+/// companion is exercised too.
+fn seed_pointer_with_calibration(state: &mut ServerState) -> u16 {
+    let info = crate::core_loop::DeviceInfo {
+        source_id: crate::xinput::InputSourceId(u64::from(line!())),
+        enabled: true,
+        resume_key: None,
+        capabilities: crate::xinput::InputCapabilities {
+            keyboard: false,
+            pointer: true,
+            touch: false,
+        },
+        name: "calibrated pointer".into(),
+        device_node: "/dev/input/event9".into(),
+        sysname: "event9".into(),
+        vendor_id: 1,
+        product_id: 2,
+        is_touchpad: false,
+        config: crate::core_loop::message::LibinputConfigSnapshot {
+            calibration: crate::core_loop::message::MatrixSetting {
+                available: true,
+                current: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                default: [0.5, 0.0, 0.25, 0.0, 0.5, 0.0, 0.0, 0.0, 1.0],
+            },
+            ..Default::default()
+        },
+    };
+    seed_physical_pointer_fixture(state, &info)
+}
+
+fn calibration_fixture_ids(state: &ServerState) -> (crate::xinput::InputSourceId, AtomId, AtomId) {
+    let source = state
+        .xi_devices
+        .device(TEST_PHYSICAL_POINTER_ID)
+        .and_then(|device| device.source_id)
+        .expect("calibration source");
+    let writable = state
+        .atoms
+        .id_for("libinput Calibration Matrix")
+        .expect("calibration atom seeded");
+    let default = state
+        .atoms
+        .id_for("libinput Calibration Matrix Default")
+        .expect("calibration default atom seeded");
+    (source, writable, default)
+}
+
+#[test]
+fn calibration_matrix_seeded_and_read_back() {
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let mut backend = RecordingBackend::new();
+    seed_pointer_with_calibration(&mut state);
+    let (_, writable, default) = calibration_fixture_ids(&state);
+
+    let device = state.xi_devices.device(TEST_PHYSICAL_POINTER_ID).unwrap();
+    let prop = &device.properties[&writable];
+    assert_eq!(prop.format, 32);
+    assert_eq!(prop.type_atom, state.float_atom);
+    assert_eq!(prop.data.len(), 36);
+    assert!(!prop.read_only);
+    let default_prop = &device.properties[&default];
+    assert!(default_prop.read_only);
+    // The default companion carries the fixture's 0.5-scale matrix.
+    assert_eq!(
+        f32::from_le_bytes(default_prop.data[0..4].try_into().unwrap()),
+        0.5
+    );
+
+    // XIGetProperty on the writable row returns the identity current.
+    let mut body = Vec::new();
+    body.extend_from_slice(&TEST_PHYSICAL_POINTER_ID.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&writable.0.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&100u32.to_le_bytes());
+    handle_xi2_request(
+        &mut state,
+        &mut backend,
+        None,
+        ClientId(1),
+        SequenceNumber(1),
+        xi2_header(59),
+        &body,
+    )
+    .unwrap();
+    let wire = read_all_available(&mut peer);
+    assert_eq!(u32::from_le_bytes(wire[16..20].try_into().unwrap()), 9);
+    assert_eq!(f32::from_le_bytes(wire[32..36].try_into().unwrap()), 1.0);
+}
+
+#[test]
+fn calibration_matrix_write_reaches_backend_and_commits() {
+    let mut state = ServerState::new();
+    let mut peer = install_capture_client(&mut state, 1);
+    let mut backend = RecordingBackend::new();
+    seed_pointer_with_calibration(&mut state);
+    let (mut inventory, source) = inventory_for_t3_source(&state);
+    let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+    let mut lane = crate::core_loop::run::XiConfigLane::default();
+    let (_, writable, _) = calibration_fixture_ids(&state);
+    let float = state.float_atom.0;
+
+    // A 90°-rotation-ish matrix with the mandatory 0 0 1 tail.
+    let m = [0.0f32, -1.0, 0.25, 1.0, 0.0, -0.5, 0.0, 0.0, 1.0];
+    let mut data = Vec::new();
+    for v in m {
+        data.extend_from_slice(&v.to_le_bytes());
+    }
+    let body = xi2_change_property_body(
+        TEST_PHYSICAL_POINTER_ID,
+        crate::xinput::XI_PROP_MODE_REPLACE,
+        32,
+        writable.0,
+        float,
+        &data,
+    );
+    drive_t3_config_wire_request(
+        &mut state,
+        &mut peer,
+        &mut backend,
+        &mut inventory,
+        &mut pending,
+        &mut lane,
+        1,
+        1,
+        xi2_header(57),
+        &body,
+    );
+    assert!(
+        read_all_available(&mut peer).is_empty(),
+        "successful write has no reply"
+    );
+    assert_eq!(
+        backend.started_device_configs,
+        vec![(
+            source,
+            crate::xinput::libinput_props::DeviceConfigChange::CalibrationMatrix(m)
+        )],
+        "the decoded nine-element change reaches the libinput lane"
+    );
+    let dev = state.xi_devices.device(TEST_PHYSICAL_POINTER_ID).unwrap();
+    assert_eq!(dev.properties[&writable].data, data);
+    assert_eq!(inventory.get(source).unwrap().config.calibration.current, m);
+}
+
+#[test]
+fn calibration_matrix_rejects_bad_tail_and_short_write() {
+    let mut state = ServerState::new();
+    let mut peer = install_capture_client(&mut state, 1);
+    let mut backend = RecordingBackend::new();
+    seed_pointer_with_calibration(&mut state);
+    let (mut inventory, _) = inventory_for_t3_source(&state);
+    let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+    let mut lane = crate::core_loop::run::XiConfigLane::default();
+    let (_, writable, _) = calibration_fixture_ids(&state);
+    let float = state.float_atom.0;
+
+    // Last row 0 0 2 → LibinputSetPropertyCalibration's checkonly
+    // BadValue. An 8-element write → `size != 9` → BadValue.
+    let mut bad_tail = [1.0f32; 9];
+    bad_tail[8] = 2.0;
+    let mut tail_data = Vec::new();
+    for v in bad_tail {
+        tail_data.extend_from_slice(&v.to_le_bytes());
+    }
+    let short_data = tail_data[..32].to_vec();
+    for (i, data) in [tail_data, short_data].iter().enumerate() {
+        let body = xi2_change_property_body(
+            TEST_PHYSICAL_POINTER_ID,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            32,
+            writable.0,
+            float,
+            data,
+        );
+        let seq = u16::try_from(i + 1).unwrap();
+        drive_t3_config_wire_request(
+            &mut state,
+            &mut peer,
+            &mut backend,
+            &mut inventory,
+            &mut pending,
+            &mut lane,
+            1,
+            seq,
+            xi2_header(57),
+            &body,
+        );
+        let wire = read_all_available(&mut peer);
+        assert_xi_config_error(&wire, 2, seq, 57);
+    }
+    assert!(backend.started_device_configs.is_empty());
+    assert!(lane.is_empty());
+}
+
+#[test]
+fn calibration_matrix_default_is_read_only() {
+    let mut state = ServerState::new();
+    let mut peer = install_capture_client(&mut state, 1);
+    let mut backend = RecordingBackend::new();
+    seed_pointer_with_calibration(&mut state);
+    let (mut inventory, _) = inventory_for_t3_source(&state);
+    let mut pending = crate::core_loop::run::PendingBackendRequests::default();
+    let mut lane = crate::core_loop::run::XiConfigLane::default();
+    let (_, _, default) = calibration_fixture_ids(&state);
+    let float = state.float_atom.0;
+    let mut data = Vec::new();
+    for v in [1.0f32; 9] {
+        data.extend_from_slice(&v.to_le_bytes());
+    }
+    let body = xi2_change_property_body(
+        TEST_PHYSICAL_POINTER_ID,
+        crate::xinput::XI_PROP_MODE_REPLACE,
+        32,
+        default.0,
+        float,
+        &data,
+    );
+    drive_t3_config_wire_request(
+        &mut state,
+        &mut peer,
+        &mut backend,
+        &mut inventory,
+        &mut pending,
+        &mut lane,
+        1,
+        1,
+        xi2_header(57),
+        &body,
+    );
+    let wire = read_all_available(&mut peer);
+    assert_xi_config_error(&wire, 10, 1, 57);
+    assert!(backend.started_device_configs.is_empty());
+    assert!(lane.is_empty());
 }

@@ -37,7 +37,8 @@ use input::{
 };
 use yserver_core::{
     core_loop::message::{
-        BitFlags2, BoolSetting, FloatSetting, LibinputConfigSnapshot, OneHot2, OneHot3, U32Setting,
+        BitFlags2, BoolSetting, FloatSetting, LibinputConfigSnapshot, MatrixSetting, OneHot2,
+        OneHot3, U32Setting,
     },
     xinput::libinput_props::{DeviceConfigChange, DeviceConfigError},
 };
@@ -303,6 +304,15 @@ pub(crate) fn gather(dev: &Device) -> LibinputConfigSnapshot {
         default_mask: 0,
     };
 
+    // Calibration: libinput reports a six-element matrix; the XI
+    // property exposes the X-style 3x3 form with a forced `0 0 1`
+    // tail (xf86libinput.c:LibinputInitCalibrationProperty).
+    let calibration = MatrixSetting {
+        available: dev.config_calibration_has_matrix(),
+        current: expand_calibration(dev.config_calibration_matrix()),
+        default: expand_calibration(dev.config_calibration_default_matrix()),
+    };
+
     LibinputConfigSnapshot {
         tap,
         tap_drag,
@@ -320,6 +330,19 @@ pub(crate) fn gather(dev: &Device) -> LibinputConfigSnapshot {
         accel_profile,
         accel_profile_available_mask,
         send_events,
+        calibration,
+    }
+}
+
+/// Widen libinput's six-element calibration matrix to the X-style 3x3
+/// wire form (`matrix[6] = matrix[7] = 0`, `matrix[8] = 1`, matching
+/// `LibinputInitCalibrationProperty`). `None` — libinput reports no
+/// matrix on a non-calibration device — yields the identity, which is
+/// also what the property would read there.
+fn expand_calibration(m6: Option<[f32; 6]>) -> [f32; 9] {
+    match m6 {
+        Some(m) => [m[0], m[1], m[2], m[3], m[4], m[5], 0.0, 0.0, 1.0],
+        None => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
     }
 }
 
@@ -408,6 +431,11 @@ pub(crate) fn apply(dev: &mut Device, change: DeviceConfigChange) -> Result<(), 
         } else {
             ScrollButtonLockState::Disabled
         }),
+        // Only the first two rows reach libinput; the `0 0 1` tail was
+        // enforced at decode so dropping it is lossless.
+        C::CalibrationMatrix(m) => {
+            dev.config_calibration_set_matrix([m[0], m[1], m[2], m[3], m[4], m[5]])
+        }
     };
     match status {
         Ok(()) => Ok(()),

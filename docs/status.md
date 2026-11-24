@@ -33,6 +33,14 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-11-23 CTM homogeneous division (branch `input-transform-matrix`):** the
+  `Coordinate Transformation Matrix` now performs the same homogeneous
+  divide as Pixman/XLibre's `pixman_f_transform_point` in
+  `dix/getevents.c` — the full bottom row forms `w` and divides `x`/`y`,
+  so `130/130/100` is equivalent to `1.3/1.3/1`; a zero `w` preserves the
+  input, matching the failed pixman call. Relative motion zeroes only the
+  translation column; absolute uses the full matrix. Host feel
+  comparison still unmeasured.
 - **2026-11-22 Async Present with a future target flips in sync (`fix/async-present-target`, #23):** Xorg's `present_vblank_create` makes a flip-capable request whose target is in the future a synced flip whatever its options, keeps that decision through re-execution and executes it one frame early (`present_vblank.c:110-122`, `present_scmd.c:232,579,770-771`). yserver executed on the same schedule but kept `PresentOptionAsync` on the scanout candidate, so Mesa adaptive vsync (swap interval −1) and Vulkan `FIFO_RELAXED` frames flipped up to a refresh early, tore, and completed one msc below their target; Mesa then aimed the next swap at the same vblank (craftfever's SuperTuxKart log, presents 2001-2008; reproduced on AMD at ~83 async flips/s on a 60 Hz output). `PendingPresentPixmap::future_target_sync` is now decided at arrival with the msc that computes the effective target and survives every deferral; `execute_present_pixmap_copy` clears Async on the scanout candidate only. Requests that arrive late or for the current msc still flip async. Scheduling, supersession, completion stamping, VRR and the KMS backend are unchanged (KMS recording-scene tests pin the synced commit, the tearing exit and VRR). Gate: workspace 5099/0, lavapipe `--ignored` 777/0, `just man`, rule F 5/5. Hardware check with SuperTuxKart on AMD and craftfever's HD 4000 pending.
 - **2026-11-22 Legacy DRI3 AMD tiling (branch `fix/dri3-amdgpu-tiling`):** a
   DRI3 1.0 `PixmapFromBuffer` carries no modifier, and `gbm_bo_get_modifier`

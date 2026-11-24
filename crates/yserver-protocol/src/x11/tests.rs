@@ -1372,6 +1372,8 @@ fn xi2_raw_button_event_matches_xorg_empty_valuator_payload() {
         4,
         1483,
         449,
+        1483,
+        449,
     );
 
     let event = &out[start..];
@@ -1397,6 +1399,8 @@ fn xi2_raw_motion_event_carries_xy_valuators() {
         0x5436,
         0,
         4,
+        1483,
+        449,
         1483,
         449,
     );

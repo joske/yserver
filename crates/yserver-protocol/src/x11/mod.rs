@@ -2318,10 +2318,12 @@ pub fn encode_xi2_motion_with_scroll(
 
 /// Encode an XInput2 raw device event (XI_RawKeyPress / XI_RawKeyRelease /
 /// XI_RawButtonPress / XI_RawButtonRelease / XI_RawMotion / XI_RawTouch*).
-/// Motion and touch events include X and Y valuators with the supplied
-/// relative values stored as FP3232 (signed 32-bit integer + unsigned 32-bit
-/// fraction). Xorg emits key and button events with a padded, all-zero
-/// valuator mask and no values.
+/// Motion and touch events include X and Y valuators stored as FP3232
+/// (signed 32-bit integer + unsigned 32-bit fraction): `val_x`/`val_y`
+/// fill `axisvalues` (Xorg's post-transform mask — `set_raw_valuators`
+/// copies `raw->valuators.data`) and `raw_x`/`raw_y` fill
+/// `axisvalues_raw` (the untouched device values). Xorg emits key and
+/// button events with a padded, all-zero valuator mask and no values.
 /// xeyes selects XI_RawMotion as a "cursor moved" notification and then
 /// calls XIQueryPointer for the actual position; we only need to supply
 /// enough payload to wake the client.
@@ -2336,6 +2338,8 @@ pub fn encode_xi2_raw_event(
     time: u32,
     detail: u32,
     sourceid: u16,
+    val_x: i32,
+    val_y: i32,
     raw_x: i32,
     raw_y: i32,
 ) {
@@ -2365,13 +2369,15 @@ pub fn encode_xi2_raw_event(
     write_u32(byte_order, out, 0); // Xorg-width second mask word
 
     if carries_valuators {
-        // FP3232 values: integer part (i32) + fractional part (u32 = 0).
-        write_u32(byte_order, out, raw_x as u32);
+        // axisvalues — FP3232, integer part (i32) + fractional part
+        // (u32 = 0). Post-transform values like Xorg's
+        // `raw->valuators.data`.
+        write_u32(byte_order, out, val_x as u32);
         write_u32(byte_order, out, 0); // X fractional
-        write_u32(byte_order, out, raw_y as u32);
+        write_u32(byte_order, out, val_y as u32);
         write_u32(byte_order, out, 0); // Y fractional
 
-        // axisvalues_raw — same as axisvalues for our purposes.
+        // axisvalues_raw — the untouched device values.
         write_u32(byte_order, out, raw_x as u32);
         write_u32(byte_order, out, 0);
         write_u32(byte_order, out, raw_y as u32);

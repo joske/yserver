@@ -466,6 +466,15 @@ impl<P: Platform> XBackend<P> {
                 motion_delta,
                 ..
             } => {
+                // The generating device's `Coordinate Transformation
+                // Matrix` (Xorg `dev->transform`): relative events take
+                // the matrix with only the translation column zeroed
+                // (Xorg's `relative_transform`); absolute positions take
+                // the full homogeneous matrix in normalized coordinates,
+                // applied inside `process_pointer_absolute` and below.
+                // Both divide by the bottom-row `w`.
+                let transform =
+                    yserver_core::core_loop::pointer_fanout::transform_for_origin(state, origin);
                 if let Some(device_id) =
                     yserver_core::core_loop::pointer_fanout::floating_pointer_device_id(
                         state, origin,
@@ -490,14 +499,20 @@ impl<P: Platform> XBackend<P> {
                                 )
                             });
                         let delta = motion_delta.unwrap_or([f64::from(dx), f64::from(dy)]);
+                        let (tdx, tdy) = transform.relative(delta[0], delta[1]);
                         (
-                            (current.0 + delta[0] as f32)
+                            (current.0 + tdx as f32)
                                 .clamp(0.0, self.platform.fb_size().0.saturating_sub(1) as f32),
-                            (current.1 + delta[1] as f32)
+                            (current.1 + tdy as f32)
                                 .clamp(0.0, self.platform.fb_size().1.saturating_sub(1) as f32),
                         )
                     } else {
-                        (x as f32, y as f32)
+                        yserver_core::core_loop::pointer_fanout::transform_pointer_position(
+                            transform,
+                            f64::from(x),
+                            f64::from(y),
+                            self.platform.fb_size(),
+                        )
                     };
                     if relative {
                         floating_position_update = Some((device_id, position));
@@ -521,12 +536,25 @@ impl<P: Platform> XBackend<P> {
                     );
                 } else {
                     self.core.button_mask = (state.buttons_down & 0x001f) << 8;
-                    if relative && matches!(origin, InputOrigin::Physical(_)) {
-                        let delta = motion_delta.unwrap_or([f64::from(dx), f64::from(dy)]);
+                    if relative {
+                        // For physical relative input `x`/`y` are the
+                        // already-integrated target, so recover the delta
+                        // from the pre-acceleration fields instead and
+                        // transform it (Xorg transforms the delta, not
+                        // the accumulated position).
+                        let delta = if matches!(origin, InputOrigin::Physical(_)) {
+                            motion_delta.unwrap_or([f64::from(dx), f64::from(dy)])
+                        } else {
+                            [
+                                f64::from(x) - f64::from(self.core.cursor_x),
+                                f64::from(y) - f64::from(self.core.cursor_y),
+                            ]
+                        };
+                        let (tdx, tdy) = transform.relative(delta[0], delta[1]);
                         self.process_pointer_absolute(
                             state,
-                            self.core.cursor_x + delta[0] as f32,
-                            self.core.cursor_y + delta[1] as f32,
+                            self.core.cursor_x + tdx as f32,
+                            self.core.cursor_y + tdy as f32,
                             true,
                             dx,
                             dy,
