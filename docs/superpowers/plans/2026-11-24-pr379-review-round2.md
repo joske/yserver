@@ -61,12 +61,13 @@ Xorg has one function for this: `AllowSome(client, time, thisDev, newState)` (21
   - FREEZE_NEXT_EVENT: only if `thisGrabbed` (then clear own `other` if synced);
   - THAWED_BOTH / FREEZE_BOTH_NEXT_EVENT / THAW_OTHERS: only if `othersFrozen`; THAW_OTHERS skips `thisDev`;
   - NOT_GRABBED: only if `thisGrabbed && FrozenWithEvent`.
-  Core AllowEvents, XIAllowEvents on a master and XIAllowEvents on a slave all go through it. The existing stored-event, replay and queued-playback code stays and runs only for the transitions the routine performed (stored event taken only by the device's grab owner).
+  Core AllowEvents, XI1 AllowDeviceEvents (`process_request/xi/dispatch/grabs.rs` `handle_xi1_allow_device_events`; Xorg `Xi/allowev.c`, where modes 3–5 stay valid on slaves), XIAllowEvents on a master and XIAllowEvents on a slave all go through it. The master-only restriction for paired modes lives in the XI2 adapter only. `othersFrozen` and the *Both/THAW_OTHERS transitions scan every device the client has grabbed (slaves included), not only the paired master. Start from the existing XI1 transition logic. The existing stored-event, replay and queued-playback code stays and runs only for the transitions the routine performed (stored event taken only by the device's grab owner).
 - Tests (each a measured Xvfb row, packets plus `other`/freeze end state):
   - `sync_pointer_from_synced_only_client_is_a_noop` / `sync_keyboard_…`: a case where only B's `other` hold freezes the device (premature thaw visible in packets on the current head), and a case where A's grab also freezes it, asserting B's hold survives B's Sync and the device stays frozen until both A's Async and B's Async are sent (assert the packet boundary after each).
-  - `xi_async_paired_device_without_frozen_others_is_a_noop`: A grabs the pointer with both modes sync, keyboard not grabbed; `XIAsyncPairedDevice(pointer)` and `XIAsyncPair(pointer)` change nothing.
+  - `xi_async_paired_device_without_frozen_others_is_a_noop`: A grabs the pointer with both modes sync, keyboard not grabbed; `XIAsyncPairedDevice(pointer)`, `XIAsyncPair(pointer)` and `XISyncPair(pointer)` change nothing.
+  - `xi1_async_all_thaws_every_grabbed_slave`: A sync-grabs two slaves (XI1 GrabDevice), then XI1 AllowDeviceEvents `AsyncAll` on one; both thaw.
   - `xi_replay_device_on_frozen_no_event_slave_is_a_noop`: explicit sync slave grab (FrozenNoEvent), `XIReplayDevice(slave)` keeps it frozen and grabbed.
-  - `xi_paired_modes_on_slave_are_noops`: modes 3–5 on a slave change nothing.
+  - `xi_paired_modes_on_slave_are_noops`: fresh fixture per mode with a sync slave grab AND another frozen grab of the same client (the master keyboard, the slave's former paired device); modes 3, 4 and 5 each sent on the slave leave both devices' grab, freeze state and `other` unchanged.
 - Mutations: removing the `thisGrabbed` gate for FREEZE_NEXT_EVENT, the `othersFrozen` gate for THAW_OTHERS, the master-only check for paired modes, or the FrozenWithEvent check on the slave replay each fail a test.
 
 ### Task 4: small follow-ups and citations
