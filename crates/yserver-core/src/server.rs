@@ -1136,19 +1136,7 @@ pub struct PresentWindowMsc {
     pub last_raw_msc: u64,
 }
 
-/// One Xorg `InputClients` node. DevicePresence may prepend duplicates, so
-/// each node owns its per-device XI1 and XI2 masks.
-#[derive(Debug, Clone)]
-pub struct XiInputClient {
-    pub client: ClientId,
-    /// True for Xorg's server-owned placeholder kept while DNP masks retain
-    /// the window's OtherInputMasks allocation after the last client leaves.
-    pub server_owned_placeholder: bool,
-    /// Per-device recognized XI1 classes; NoExtensionEvent leaves this empty.
-    pub xi1_masks: HashMap<u16, HashSet<u32>>,
-    /// Per-device XI2 masks; a positive wire length may leave this empty.
-    pub xi2_masks: HashMap<u16, u64>,
-}
+pub use crate::xinput::XiInputClient;
 
 #[derive(Debug)]
 pub struct ServerState {
