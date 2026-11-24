@@ -21,7 +21,7 @@ pub(super) fn xi1_window_selectors(
 }
 
 /// Returns the canonical input-client entries that select an XI1 event and
-/// whether that same delivering entry selects DeviceButtonGrab.
+/// whether that same delivering entry selects either XI1 button-grab class.
 pub(super) fn xi1_window_selectors_with_grab_class(
     state: &ServerState,
     window: ResourceId,
@@ -29,8 +29,6 @@ pub(super) fn xi1_window_selectors_with_grab_class(
     deviceid: u16,
 ) -> Vec<(ClientId, bool)> {
     let class = (u32::from(deviceid) << 8) | u32::from(evcode);
-    let grab_class =
-        (u32::from(deviceid) << 8) | u32::from(crate::xinput::XI1_DEVICE_BUTTON_GRAB_CLASS);
     state
         .xi_input_clients
         .get(&window)
@@ -41,9 +39,12 @@ pub(super) fn xi1_window_selectors_with_grab_class(
         })
         .filter_map(|entry| {
             let classes = entry.xi1_masks.get(&deviceid)?;
+            let selects_grab_class = classes.iter().any(|class| {
+                u8::try_from(*class & 0xff).is_ok_and(crate::xinput::xi1_class_is_button_grab)
+            });
             classes
                 .contains(&class)
-                .then_some((entry.client, classes.contains(&grab_class)))
+                .then_some((entry.client, selects_grab_class))
         })
         .collect()
 }

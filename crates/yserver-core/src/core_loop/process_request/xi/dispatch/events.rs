@@ -8,10 +8,9 @@ use crate::{
             emit_x11_error_with_minor,
             xi::{
                 XI1_ERROR_BAD_CLASS, XI1_ERROR_BAD_DEVICE, XI1_ERROR_BAD_MODE,
-                dispatch::xi_write_reply, emit_xi2_device_changed_bootstrap,
-                xi1_device_has_buttons, xi1_device_valid, xi1_error, xi1_event_class_device,
-                xi1_send_extension_event_resolve_targets, xi1_window_exists,
-                xi2_first_invalid_mask_bit,
+                dispatch::xi_write_reply, emit_xi2_device_changed_bootstrap, xi1_device_valid,
+                xi1_error, xi1_event_class_device, xi1_send_extension_event_resolve_targets,
+                xi1_window_exists, xi2_first_invalid_mask_bit,
             },
         },
     },
@@ -436,14 +435,11 @@ pub(super) fn handle_xi_get_selected_events(
 //   body[6..8] pad00  (CARD16),
 //   body[8..]  count × XEventClass (CARD32).
 //
-// An XEventClass packs `(deviceid << 8) | event_code`. We only
-// implement XI1 `DevicePropertyNotify` (event code 16 within
-// the XInput block, i.e. low byte = `XI_FIRST_EVENT + 16` = 82
-// — yserver assigns XInput the contiguous block 66..=82), so
-// classes for other XI1 events (motion / button / key / etc.)
-// are accepted but ignored. We do NOT error on unknown classes:
-// a single SelectExtensionEvent often selects multiple classes
-// and Xorg silently drops the ones it can't service.
+// An XEventClass packs `(deviceid << 8) | event_code`. Xorg 21.1.24
+// registers the non-delivering classes 0..=8, NoExtensionEvent (9),
+// and the event classes in `Xi/extinit.c:1071-1110`; `Xi/selectev.c:163-177`
+// applies each decoded device mask. Unknown classes are ignored, as in
+// CreateMaskFromList, while recognized classes replace that device's mask.
 //
 // Selection state is canonical per window, as in Xorg. Events such
 // as DevicePropertyNotify carry no event-window field, so a separate
@@ -453,12 +449,11 @@ pub(super) fn handle_xi_get_selected_events(
 // supplied class list, this client's prior selections for that
 // deviceid on this window are dropped before the new set is
 // installed. A client
-// unsubscribes a given deviceid by passing at least one class
-// for it whose low byte is not `DevicePropertyNotify` — the
-// deviceid lands in `touched_devices` and its prior entries
-// are cleared; the unsupported class itself is silently
-// dropped. `count == 0` is a no-op (the existing selection
-// survives unchanged), matching Xorg's behaviour.
+// unsubscribes a given deviceid by passing a recognized class for it
+// whose EventInfo mask is zero, such as NoExtensionEvent; that deviceid
+// lands in `touched_devices` and its prior entries are cleared. An
+// unknown class does not touch the device. `count == 0` is a no-op
+// (the existing selection survives unchanged), matching Xorg.
 #[allow(clippy::needless_return)]
 pub(super) fn handle_xi1_select_extension_event(
     state: &mut ServerState,
@@ -590,18 +585,10 @@ pub(super) fn handle_xi1_select_extension_event(
             // global client list, NOT a per-window event-mask.
             accepted_classes.push(class);
             true
-        } else if class_low == crate::xinput::XI1_DEVICE_BUTTON_GRAB_CLASS {
-            if !xi1_device_has_buttons(&state.xi_devices, u16::from(dev_byte)) {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    XI1_ERROR_BAD_CLASS,
-                    class,
-                    u16::from(minor),
-                    XI2_MAJOR_OPCODE,
-                );
-            }
+        } else if class_low <= crate::xinput::XI1_DEVICE_OWNER_GRAB_BUTTON_CLASS {
+            // CreateMaskFromList validates the device, not its button
+            // capability (Xorg 21.1.24 `Xi/grabdev.c:171-199`). Classes
+            // 7 and 8 both select DeviceButtonGrabMask.
             accepted_classes.push(class);
             true
         } else if class_low == 9 {
@@ -642,9 +629,14 @@ pub(super) fn handle_xi1_select_extension_event(
     let mut ordered_devices: Vec<u8> = touched_devices.into_iter().collect();
     ordered_devices.sort_unstable();
     for device in ordered_devices {
-        let grab_class =
-            (u32::from(device) << 8) | u32::from(crate::xinput::XI1_DEVICE_BUTTON_GRAB_CLASS);
-        let selects_grab_class = accepted_classes.contains(&grab_class);
+        let device_classes: Vec<u32> = accepted_classes
+            .iter()
+            .copied()
+            .filter(|class| class >> 8 == u32::from(device))
+            .collect();
+        let selects_grab_class = device_classes.iter().any(|class| {
+            u8::try_from(*class & 0xff).is_ok_and(crate::xinput::xi1_class_is_button_grab)
+        });
         if selects_grab_class
             && state.xi_input_clients.get(&window).is_some_and(|entries| {
                 entries.iter().any(|entry| {
@@ -652,7 +644,12 @@ pub(super) fn handle_xi1_select_extension_event(
                         && entry
                             .xi1_masks
                             .get(&u16::from(device))
-                            .is_some_and(|classes| classes.contains(&grab_class))
+                            .is_some_and(|classes| {
+                                classes.iter().any(|class| {
+                                    u8::try_from(*class & 0xff)
+                                        .is_ok_and(crate::xinput::xi1_class_is_button_grab)
+                                })
+                            })
                 })
             })
         {
@@ -670,11 +667,6 @@ pub(super) fn handle_xi1_select_extension_event(
             );
         }
 
-        let device_classes: Vec<u32> = accepted_classes
-            .iter()
-            .copied()
-            .filter(|class| class >> 8 == u32::from(device))
-            .collect();
         let (entry_index, created) = state.ensure_xi_input_client(window, client_id);
         if let Some(entry) = state
             .xi_input_clients
@@ -693,8 +685,18 @@ pub(super) fn handle_xi1_select_extension_event(
             let mut aggregate = 0u64;
             for class in &device_classes {
                 let event_code = class & 0xff;
-                if event_code == u32::from(crate::xinput::XI1_DEVICE_BUTTON_GRAB_CLASS) {
-                    aggregate |= 1 << 17; // DeviceButtonGrabMask, ../xserver/Xi/extinit.c:144
+                if event_code <= 6 {
+                    // Xorg registers these non-delivering classes with the
+                    // motion-hint/button-motion masks (Xi/extinit.c:1091-1097).
+                    // Keep yserver's snapshot qualifier bits outside XI1 event
+                    // offsets 0..=16 and the reserved bits 17/18.
+                    aggregate |= 1u64 << (19 + event_code);
+                } else if u8::try_from(event_code)
+                    .is_ok_and(crate::xinput::xi1_class_is_button_grab)
+                {
+                    // DeviceButtonGrabMask is shared by classes 7 and 8
+                    // (Xorg 21.1.24 Xi/extinit.c:144-145,1105-1106).
+                    aggregate |= 1 << 17;
                 } else if let Some(offset) = event_code.checked_sub(u32::from(XI_FIRST_EVENT)) {
                     aggregate |= 1u64 << offset;
                 }

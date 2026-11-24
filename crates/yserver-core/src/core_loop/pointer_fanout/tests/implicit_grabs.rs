@@ -2263,6 +2263,9 @@ fn xi1_implicit_grab_owner_disconnect_frees_device() {
 }
 
 const XI1_DEVICE_BUTTON_GRAB_CLASS: u8 = 7;
+const XI1_DEVICE_OWNER_GRAB_BUTTON_CLASS: u8 = 8;
+const XI1_DEVICE_POINTER_MOTION_HINT_CLASS: u8 = 0;
+const XI1_DEVICE_BUTTON_MOTION_CLASS: u8 = 6;
 const XI1_DEVICE_BUTTON_PRESS_CODE: u8 =
     crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET;
 const XI1_DEVICE_BUTTON_RELEASE_CODE: u8 =
@@ -3709,6 +3712,239 @@ fn xi1_implicit_owner_s4grabagg_retains_grab_bit() {
     assert!(read_packets(&mut f.client_b).is_empty());
     assert_end_state(&f);
     assert_buttons_released(&f);
+}
+
+/// Registering a non-delivering motion class replaces ButtonPress for that
+/// device, so the former ButtonPress selector receives no event packet.
+#[test]
+fn xi1_button_motion_class_replaces_device_selection() {
+    for special_class in [
+        XI1_DEVICE_BUTTON_MOTION_CLASS,
+        XI1_DEVICE_POINTER_MOTION_HINT_CLASS,
+    ] {
+        let mut f = fixture();
+        select_xi1_event_classes(
+            &mut f,
+            CLIENT_A,
+            W,
+            XI_XTEST as u8,
+            &[XI1_DEVICE_BUTTON_PRESS_CODE],
+        );
+        select_xi1_event_classes(&mut f, CLIENT_A, W, XI_XTEST as u8, &[special_class]);
+
+        let origin = InputOrigin::XTest(XI_XTEST);
+        press_over_d(&mut f, origin, 1);
+        assert!(
+            read_packets(&mut f.client_a).is_empty(),
+            "selecting XI1 class {special_class} replaces ButtonPress delivery"
+        );
+        assert!(read_packets(&mut f.client_b).is_empty());
+        let selected_class = (u32::from(XI_XTEST) << 8) | u32::from(special_class);
+        let entry = f.state.xi_input_clients[&ResourceId(W)]
+            .iter()
+            .find(|entry| entry.client == ClientId(CLIENT_A))
+            .expect("the XI1 selection keeps A's input-client entry");
+        let classes = &entry.xi1_masks[&XI_XTEST];
+        assert_eq!(classes.len(), 1);
+        assert!(classes.contains(&selected_class));
+
+        release(&mut f, origin, 1);
+        assert!(read_packets(&mut f.client_a).is_empty());
+        assert!(read_packets(&mut f.client_b).is_empty());
+        assert_end_state(&f);
+        assert_buttons_released(&f);
+    }
+}
+
+/// Class 8 and class 7 share DeviceButtonGrabMask, so either class blocks a
+/// second client's selection in both request orders.
+#[test]
+fn xi1_owner_grab_button_is_exclusive_with_button_grab() {
+    for (first_client, first_class, second_client, second_class) in [
+        (
+            CLIENT_A,
+            XI1_DEVICE_OWNER_GRAB_BUTTON_CLASS,
+            CLIENT_B,
+            XI1_DEVICE_BUTTON_GRAB_CLASS,
+        ),
+        (
+            CLIENT_B,
+            XI1_DEVICE_BUTTON_GRAB_CLASS,
+            CLIENT_A,
+            XI1_DEVICE_OWNER_GRAB_BUTTON_CLASS,
+        ),
+    ] {
+        let mut f = fixture();
+        select_xi1_event_classes(&mut f, first_client, W, XI_XTEST as u8, &[first_class]);
+
+        let class = (u32::from(XI_XTEST as u8) << 8) | u32::from(second_class);
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&W.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&[0; 2]);
+        body.extend_from_slice(&class.to_le_bytes());
+        dispatch(&mut f, second_client, XI2_OPCODE, 6, &body);
+        let error = if second_client == CLIENT_A {
+            read_all_capture_available(&mut f.client_a)
+        } else {
+            read_all_capture_available(&mut f.client_b)
+        };
+        assert_eq!(
+            error.len(),
+            32,
+            "the conflicting request returns one X error"
+        );
+        assert_eq!(error[0], 0, "BadAccess is an X error packet");
+        assert_eq!(error[1], yserver_protocol::x11::error::BAD_ACCESS);
+        assert_eq!(error[8], 6, "XSelectExtensionEvent minor opcode");
+        assert_eq!(error[10], XI2_OPCODE, "XInput major opcode");
+        assert_end_state(&f);
+        assert_buttons_released(&f);
+    }
+}
+
+/// A newer B selection with DeviceOwnerGrabButton owns the implicit XI1
+/// button grab, matching the DeviceButtonGrab selection path.
+#[test]
+fn xi1_owner_grab_button_picks_implicit_owner() {
+    let mut f = fixture();
+    select_xi1_event_classes(
+        &mut f,
+        CLIENT_A,
+        W,
+        XI_XTEST as u8,
+        &[XI1_DEVICE_BUTTON_PRESS_CODE, XI1_DEVICE_BUTTON_RELEASE_CODE],
+    );
+    select_xi1_event_classes(
+        &mut f,
+        CLIENT_B,
+        W,
+        XI_XTEST as u8,
+        &[
+            XI1_DEVICE_BUTTON_PRESS_CODE,
+            XI1_DEVICE_BUTTON_RELEASE_CODE,
+            XI1_DEVICE_OWNER_GRAB_BUTTON_CLASS,
+        ],
+    );
+
+    let origin = InputOrigin::XTest(XI_XTEST);
+    press_over_d(&mut f, origin, 1);
+    assert_eq!(
+        f.state.xi1_active_grabs[&XI_XTEST].owner,
+        ClientId(CLIENT_B)
+    );
+    assert_eq!(read_packets(&mut f.client_a), vec![xi1(4, XI_XTEST, W)]);
+    assert_eq!(read_packets(&mut f.client_b), vec![xi1(4, XI_XTEST, W)]);
+    release(&mut f, origin, 1);
+    assert!(read_packets(&mut f.client_a).is_empty());
+    assert_eq!(read_packets(&mut f.client_b), vec![xi1(5, XI_XTEST, W)]);
+    assert_end_state(&f);
+    assert_buttons_released(&f);
+}
+
+/// Motion and owner-grab classes keep their original entry alive when A
+/// narrows to NoExtensionEvent, preserving Xorg's implicit-owner ordering.
+#[test]
+fn xi1_non_delivering_classes_retain_sticky_aggregate() {
+    // The XI1 event block spans offsets 0 through 16; bits 17 and 18 are
+    // reserved in yserver's u32 implicit-grab snapshot.
+    const XI1_EVENT_OFFSET_DOMAIN: u64 = (1 << 17) - 1;
+    const XI1_RESERVED_SNAPSHOT_BITS: u64 = (1 << 17) | (1 << 18);
+
+    for special_class in [
+        XI1_DEVICE_POINTER_MOTION_HINT_CLASS,
+        XI1_DEVICE_BUTTON_MOTION_CLASS,
+        XI1_DEVICE_OWNER_GRAB_BUTTON_CLASS,
+    ] {
+        let mut f = fixture();
+        select_xi1_event_classes(&mut f, CLIENT_A, W, XI_XTEST as u8, &[special_class]);
+        let (special_bit, expected_aggregate) = match special_class {
+            XI1_DEVICE_POINTER_MOTION_HINT_CLASS => (1u64 << 19, 1u64 << 19),
+            XI1_DEVICE_BUTTON_MOTION_CLASS => (1u64 << 25, 1u64 << 25),
+            XI1_DEVICE_OWNER_GRAB_BUTTON_CLASS => (1u64 << 17, 1u64 << 17),
+            _ => unreachable!("test only covers XI1 classes 0, 6, and 8"),
+        };
+        let initial_aggregate = f.state.xi1_window_input_events[&ResourceId(W)][&XI_XTEST];
+        assert_eq!(
+            initial_aggregate, expected_aggregate,
+            "class {special_class} stores its aggregate qualifier bit"
+        );
+        if special_class <= 6 {
+            assert_eq!(
+                initial_aggregate & XI1_EVENT_OFFSET_DOMAIN,
+                0,
+                "class {special_class} qualifier is disjoint from every XI1 event offset"
+            );
+            assert_eq!(
+                initial_aggregate & XI1_RESERVED_SNAPSHOT_BITS,
+                0,
+                "class {special_class} qualifier avoids reserved snapshot bits"
+            );
+        }
+        select_xi2_wire_mask(&mut f, CLIENT_B, W, 1, &[0]);
+        select_xi1_event_classes(
+            &mut f,
+            CLIENT_A,
+            W,
+            XI_XTEST,
+            &[XI1_NO_EXTENSION_EVENT_CLASS],
+        );
+        let button_classes = [XI1_DEVICE_BUTTON_PRESS_CODE, XI1_DEVICE_BUTTON_RELEASE_CODE];
+        select_xi1_event_classes(&mut f, CLIENT_A, W, XI_XTEST, &button_classes);
+        select_xi1_event_classes(&mut f, CLIENT_B, W, XI_XTEST, &button_classes);
+
+        let origin = InputOrigin::XTest(XI_XTEST);
+        press_over_d(&mut f, origin, 1);
+        assert_eq!(
+            f.state.xi1_active_grabs[&XI_XTEST].owner,
+            ClientId(CLIENT_A),
+            "class {special_class} retains A's earlier input-client position"
+        );
+        assert_eq!(read_packets(&mut f.client_a), vec![xi1(4, XI_XTEST, W)]);
+        assert_eq!(read_packets(&mut f.client_b), vec![xi1(4, XI_XTEST, W)]);
+        release(&mut f, origin, 1);
+        assert_eq!(read_packets(&mut f.client_a), vec![xi1(5, XI_XTEST, W)]);
+        assert!(read_packets(&mut f.client_b).is_empty());
+
+        assert_eq!(special_bit & u64::from(XI1_PRESS | XI1_RELEASE), 0);
+        let aggregate = f.state.xi1_window_input_events[&ResourceId(W)][&XI_XTEST];
+        assert_ne!(aggregate & special_bit, 0);
+        assert_ne!(aggregate & u64::from(XI1_PRESS | XI1_RELEASE), 0);
+        assert_end_state(&f);
+        assert_buttons_released(&f);
+    }
+}
+
+/// DeviceButtonGrab and DeviceOwnerGrabButton selections are valid for a
+/// keyboard device with no buttons, and the following core request succeeds.
+#[test]
+fn xi1_button_grab_on_buttonless_device_is_accepted() {
+    for class_code in [
+        XI1_DEVICE_BUTTON_GRAB_CLASS,
+        XI1_DEVICE_OWNER_GRAB_BUTTON_CLASS,
+    ] {
+        let mut f = fixture();
+        select_xi1_event_classes(&mut f, CLIENT_A, W, 5u16, &[class_code]);
+        assert!(
+            read_all_capture_available(&mut f.client_a).is_empty(),
+            "class {class_code} on the XTEST keyboard must not return BadClass"
+        );
+
+        dispatch(&mut f, CLIENT_A, 43, 0, &[]); // GetInputFocus round trip
+        let reply = read_all_capture_available(&mut f.client_a);
+        assert_eq!(reply.len(), 32);
+        assert_eq!(reply[0], 1, "GetInputFocus reply follows the selection");
+        assert_eq!(reply[1], 0);
+
+        let selected_class = (5u32 << 8) | u32::from(class_code);
+        let entry = f.state.xi_input_clients[&ResourceId(W)]
+            .iter()
+            .find(|entry| entry.client == ClientId(CLIENT_A))
+            .expect("accepted buttonless class keeps A's input-client entry");
+        assert!(entry.xi1_masks[&5].contains(&selected_class));
+        assert_end_state(&f);
+        assert_buttons_released(&f);
+    }
 }
 
 /// s5dnp2dev catches one retirement per request instead of per decoded device;

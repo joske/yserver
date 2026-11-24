@@ -78,6 +78,19 @@ pub const XI1_DEVICE_PRESENCE_CLASS: u32 = 256 << 8;
 /// It chooses the implicit-grab owner but does not itself deliver an event.
 pub const XI1_DEVICE_BUTTON_GRAB_CLASS: u8 = 7;
 
+/// XI1 `XEventClass` code for DeviceOwnerGrabButton.
+pub const XI1_DEVICE_OWNER_GRAB_BUTTON_CLASS: u8 = 8;
+
+/// Returns whether an XI1 event class selects the shared button-grab mask.
+/// Xorg 21.1.24 assigns both classes to `DeviceButtonGrabMask` in
+/// `Xi/extinit.c:144-145,1105-1106`.
+pub(crate) const fn xi1_class_is_button_grab(class: u8) -> bool {
+    matches!(
+        class,
+        XI1_DEVICE_BUTTON_GRAB_CLASS | XI1_DEVICE_OWNER_GRAB_BUTTON_CLASS
+    )
+}
+
 /// XI 1.x `DevicePropertyNotify` event code (XIproto.h:139, the 17th
 /// XInput event type). The wire type byte for a delivered event is
 /// `first_event + XI_DEVICE_PROPERTY_NOTIFY_OFFSET` (= 82 with
