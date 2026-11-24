@@ -593,9 +593,9 @@ fn deliver_routed_key_with_master_status(
                     master_transition_accepted,
                     synthetic_repeat,
                 ));
-                // Xorg ActivatePassiveGrab promotes the synchronous
-                // activating key to FROZEN_WITH_EVENT (dix/events.c:
-                // 3861-3863), matching the pointer activation path.
+                // Xorg `ActivateGrabNoDelivery` promotes the synchronous
+                // activating key to FROZEN_WITH_EVENT (dix/events.c:3917-3919),
+                // matching the pointer activation path.
                 if sync.state == crate::server::Xi1SyncState::FrozenNoEvent {
                     sync.state = crate::server::Xi1SyncState::FrozenWithEvent;
                 }

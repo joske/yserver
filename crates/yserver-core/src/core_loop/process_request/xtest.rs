@@ -636,6 +636,9 @@ fn dispatch_fake_input_with_body(
                     for i in 0..num {
                         let off = 8 + i * 4;
                         let slot = usize::from(axes.count);
+                        if slot >= 6 {
+                            break;
+                        }
                         axes.values[slot] =
                             i32::from_le_bytes([dv[off], dv[off + 1], dv[off + 2], dv[off + 3]]);
                         #[allow(clippy::cast_possible_truncation)]

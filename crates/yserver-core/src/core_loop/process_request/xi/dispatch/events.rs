@@ -235,7 +235,7 @@ pub(super) fn handle_xi_select_events(
                     state,
                     client_id,
                     sequence,
-                    XI1_ERROR_BAD_DEVICE, // Xorg's XISelectEvents rejects an unknown device before recording any input-client entry (xiselectev.c:177)
+                    XI1_ERROR_BAD_DEVICE, // Xorg validates the device before applying any XISelectEvents masks (Xi/xiselectev.c:178-185,304-324)
                     u32::from(deviceid),
                     46,
                     header.opcode,
@@ -792,7 +792,7 @@ pub(super) fn handle_xi1_get_selected_extension_events(
             .into_iter()
             .flatten()
             // Server ownership suppresses delivery, not query visibility
-            // (../xserver/Xi/getselev.c:114-117, 148-151).
+            // (../xserver/Xi/getselev.c:118-151).
             .flat_map(|entry| entry.xi1_masks.values())
             .flatten()
             .copied()

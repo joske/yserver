@@ -576,7 +576,7 @@ fn pointer_event_fanout_to_state_inner(
 
     // Resolve the same unified freeze predicate here that the enqueue path
     // below uses. Xorg calls DeviceEventCallback while enqueueing a frozen
-    // input event (dix/events.c:1166), before later duplicate suppression;
+    // input event (dix/events.c:1164-1181), before later duplicate suppression;
     // this lets RECORD observe XTEST edges that do not change the master
     // button bitmap while a physical button is already held.
     let source_device_id = xi_source.slave_deviceid.unwrap_or(xi_source.sourceid);
@@ -3452,7 +3452,7 @@ fn xi1_fan_device_event(
     let event_y = clamp_grab_coord(q.root_y, oy);
     let mut dropped = Vec::new();
     // The general fanout deduplicates client IDs. XI1 selection delivery
-    // instead sends once per InputClients node (../xserver/dix/events.c:2277).
+    // instead sends once per InputClients node (../xserver/dix/events.c:2279-2316).
     for client in targets {
         let failed = fanout_event_to_clients(state, &[client], |buf, seq, order| {
             crate::xinput::encode_xi1_device_input_event(
