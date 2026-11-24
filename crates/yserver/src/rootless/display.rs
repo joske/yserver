@@ -24,6 +24,10 @@ use super::host::{CpuFrame, DmabufFrame, FrameEvent, HandoffKind, RootlessHost};
 use crate::kms::vk::device::VkContext;
 
 /// One thing the window system said, for the core or the presenter.
+/// `Input` carries `HostInputEvent` inline: the enum's largest payload
+/// (`DeviceAdded`'s `DeviceInfo`) is a cold per-lifecycle variant, and
+/// boxing `Input` would instead put an allocation on every motion event.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum HostItem {
     Request(HostRequest),

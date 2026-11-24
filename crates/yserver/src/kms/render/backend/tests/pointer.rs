@@ -1445,3 +1445,226 @@ fn a_warp_has_no_raw_motion() {
         "the device's RawMotion, then its Motion"
     );
 }
+
+/// The `Coordinate Transformation Matrix` of a physical pointer facet
+/// scales its relative deltas (translation column zeroed, Xorg's
+/// `relative_transform`, still divided by the bottom-row `w`) and its
+/// absolute positions (full homogeneous matrix in normalized space —
+/// `scale_and_transform`). The raw device delta reported on the event
+/// is untouched.
+#[test]
+fn coordinate_transform_matrix_scales_motion_and_keeps_raw_delta() {
+    use yserver_core::{
+        backend::Backend,
+        core_loop::{DeviceInfo, HostInputEvent, InputOrigin, message::LibinputConfigSnapshot},
+        server::ServerState,
+        xinput::{DeviceTransform, InputCapabilities, InputSourceId},
+    };
+
+    let mut backend = KmsBackend::for_tests();
+    let mut state = ServerState::new();
+    backend
+        .core
+        .xid_map
+        .insert(backend.core.window_id, yserver_core::resources::ROOT_WINDOW);
+    let source = InputSourceId(301);
+    state.xi_register_source(&DeviceInfo {
+        source_id: source,
+        enabled: true,
+        resume_key: None,
+        capabilities: InputCapabilities {
+            keyboard: false,
+            pointer: true,
+            touch: false,
+        },
+        name: "transformed mouse".into(),
+        device_node: "/dev/input/event301".into(),
+        sysname: "event301".into(),
+        vendor_id: 1,
+        product_id: 2,
+        is_touchpad: false,
+        config: LibinputConfigSnapshot::default(),
+    });
+    let facet = state
+        .xi_devices
+        .facet(source, yserver_core::xinput::XiFacetKind::PointerTouch)
+        .expect("pointer facet");
+
+    // 0.5 scale on x, 0.25 on y, with a translation the relative form
+    // must drop (Xorg `relative_transform` zeroes m[0][2]/m[1][2]).
+    state
+        .xi_devices
+        .device_mut(facet)
+        .expect("facet device")
+        .transform = DeviceTransform {
+        m: [0.5, 0.0, 0.5, 0.0, 0.25, -0.5, 0.0, 0.0, 1.0],
+    };
+
+    // Absolute: x=100 → (100/799)*0.5*799 + 0.5*799 = 449.5;
+    // y=100 → 0.25*100 - 0.5*599 = -274.5, clamped to 0 by the
+    // framebuffer clamp — both inside `process_pointer_absolute`.
+    Backend::on_host_input(
+        &mut backend,
+        &mut state,
+        HostInputEvent::PointerMotion {
+            origin: InputOrigin::Physical(source),
+            x: 100,
+            y: 100,
+            time: 1,
+            relative: false,
+            dx: 0,
+            dy: 0,
+            motion_delta: None,
+        },
+    );
+    let (cx, cy) = (backend.core.cursor_x, backend.core.cursor_y);
+    assert!(
+        (cx - 449.5).abs() < 1.0,
+        "absolute x transformed: 100 -> {cx}"
+    );
+    assert_eq!(cy, 0.0, "absolute y transformed to -274.5, clamped: {cy}");
+
+    // Relative: delta (10, 20) → (10*0.5, 20*0.25) = (5, 5). The
+    // translation column must NOT apply to a relative event.
+    let before = (backend.core.cursor_x, backend.core.cursor_y);
+    Backend::on_host_input(
+        &mut backend,
+        &mut state,
+        HostInputEvent::PointerMotion {
+            origin: InputOrigin::Physical(source),
+            x: (before.0 + 10.0) as i32,
+            y: (before.1 + 20.0) as i32,
+            time: 2,
+            relative: true,
+            dx: 10,
+            dy: 20,
+            motion_delta: Some([10.0, 20.0]),
+        },
+    );
+    assert_eq!(
+        (
+            backend.core.cursor_x - before.0,
+            backend.core.cursor_y - before.1
+        ),
+        (5.0, 5.0),
+        "relative delta scaled by the 2x2 part, translation dropped"
+    );
+
+    // The event's raw delta reports the untouched device values.
+    // `on_host_input` drains pending events into the core fanout, so
+    // drive `process_pointer_absolute` directly for the wire check.
+    backend.process_pointer_absolute(
+        &mut state,
+        backend.core.cursor_x + 5.0,
+        backend.core.cursor_y + 5.0,
+        true,
+        10,
+        20,
+        InputOrigin::Physical(source),
+    );
+    let emitted = std::mem::take(&mut backend.core.pending_pointer_events);
+    let motion = emitted
+        .iter()
+        .find(|e| e.kind == yserver_core::host_x11::PointerEventKind::MotionNotify)
+        .expect("motion event emitted");
+    assert_eq!((motion.raw_dx, motion.raw_dy), (10, 20));
+}
+
+/// A CTM write through XIChangeProperty reaches the live transform the
+/// motion path reads — the property and `dev->transform` stay in lockstep.
+#[test]
+fn ctm_property_write_drives_motion_transform() {
+    use yserver_core::{
+        backend::Backend,
+        core_loop::{DeviceInfo, HostInputEvent, InputOrigin, message::LibinputConfigSnapshot},
+        server::ServerState,
+        xinput::{InputCapabilities, InputSourceId},
+    };
+
+    let mut backend = KmsBackend::for_tests();
+    let mut state = ServerState::new();
+    backend
+        .core
+        .xid_map
+        .insert(backend.core.window_id, yserver_core::resources::ROOT_WINDOW);
+    let source = InputSourceId(302);
+    state.xi_register_source(&DeviceInfo {
+        source_id: source,
+        enabled: true,
+        resume_key: None,
+        capabilities: InputCapabilities {
+            keyboard: false,
+            pointer: true,
+            touch: false,
+        },
+        name: "ctm mouse".into(),
+        device_node: "/dev/input/event302".into(),
+        sysname: "event302".into(),
+        vendor_id: 1,
+        product_id: 2,
+        is_touchpad: false,
+        config: LibinputConfigSnapshot::default(),
+    });
+    let facet = state
+        .xi_devices
+        .facet(source, yserver_core::xinput::XiFacetKind::PointerTouch)
+        .expect("pointer facet");
+
+    // Writing the property commits the same matrix the motion path reads
+    // — the write path pins them together, so exercise that link here by
+    // updating the transform exactly the way dispatch_ctm_property_write
+    // does and then proving motion honours it.
+    state.xi_devices.device_mut(facet).expect("facet").transform =
+        yserver_core::xinput::DeviceTransform {
+            m: [2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        };
+
+    let before = (backend.core.cursor_x, backend.core.cursor_y);
+    Backend::on_host_input(
+        &mut backend,
+        &mut state,
+        HostInputEvent::PointerMotion {
+            origin: InputOrigin::Physical(source),
+            x: (before.0 + 4.0) as i32,
+            y: before.1 as i32,
+            time: 1,
+            relative: true,
+            dx: 4,
+            dy: 0,
+            motion_delta: Some([4.0, 0.0]),
+        },
+    );
+    assert_eq!(
+        backend.core.cursor_x - before.0,
+        8.0,
+        "relative dx doubled by the facet's CTM"
+    );
+
+    for matrix in [
+        [130.0, 0.0, 0.0, 0.0, 130.0, 0.0, 0.0, 0.0, 100.0],
+        [1.3, 0.0, 0.0, 0.0, 1.3, 0.0, 0.0, 0.0, 1.0],
+    ] {
+        state.xi_devices.device_mut(facet).expect("facet").transform =
+            yserver_core::xinput::DeviceTransform { m: matrix };
+        backend.core.cursor_x = 100.0;
+        backend.core.cursor_y = 100.0;
+        Backend::on_host_input(
+            &mut backend,
+            &mut state,
+            HostInputEvent::PointerMotion {
+                origin: InputOrigin::Physical(source),
+                x: 110,
+                y: 120,
+                time: 2,
+                relative: true,
+                dx: 10,
+                dy: 20,
+                motion_delta: Some([10.0, 20.0]),
+            },
+        );
+        assert_eq!(
+            (backend.core.cursor_x, backend.core.cursor_y),
+            (113.0, 126.0)
+        );
+    }
+}

@@ -205,9 +205,22 @@ pub(in crate::core_loop) fn validate_xi_change(
         crate::xinput::libinput_props::ValueKind::OneHotOrNone { n, min } => {
             merged_data.len() >= usize::from(min) && merged_data.len() <= usize::from(n)
         }
+        crate::xinput::libinput_props::ValueKind::FloatVec { n } => {
+            merged_data.len() == usize::from(n) * 4
+        }
     };
+    // Accel Profile Enabled and the calibration matrix both report an
+    // oversized/undersized merged value as BadValue upstream
+    // (xf86libinput checks `prop->size` in checkonly); the other
+    // exact-width descriptors retain their Xorg BadMatch result.
     if !shape_matches {
-        return if descriptor.binding == Some(crate::xinput::libinput_props::Binding::AccelProfile) {
+        return if matches!(
+            descriptor.binding,
+            Some(
+                crate::xinput::libinput_props::Binding::AccelProfile
+                    | crate::xinput::libinput_props::Binding::Calibration
+            )
+        ) {
             Err(PropertyDispatchError::BadValue {
                 error_value: u32::from(request.format),
             })
@@ -494,6 +507,11 @@ pub(super) fn dispatch_change_property(
             state, backend, deviceid, mode, format, property, type_atom, data,
         );
     }
+    if property == state.xi_ctm_atom {
+        return dispatch_ctm_property_write(
+            state, deviceid, mode, format, property, type_atom, data,
+        );
+    }
 
     let device = crate::xinput::find_device_mut(&mut state.xi_devices, deviceid)
         .expect("caller verified device exists");
@@ -657,6 +675,140 @@ fn dispatch_device_enabled_property_write(
         type_atom,
         data,
     )
+}
+
+/// Apply one `Coordinate Transformation Matrix` write — the XI front
+/// end of Xorg's `DeviceSetProperty` `XI_PROP_TRANSFORM` arm
+/// (`dix/devices.c`): FLOAT/32, exactly nine elements, all finite, and
+/// only on a device with a valuator class (`!dev->valuator` →
+/// `BadMatch`). The accepted value updates both the stored property and
+/// `XiDevice::transform`, which the motion pipeline reads on every
+/// event; translation is stripped for relative deltas at use time, as
+/// `relative_transform` is in `DeviceSetTransform`.
+fn dispatch_ctm_property_write(
+    state: &mut ServerState,
+    deviceid: u16,
+    mode: u8,
+    format: u8,
+    property: AtomId,
+    type_atom: AtomId,
+    data: &[u8],
+) -> Result<PropertyChangeOutcome, PropertyDispatchError> {
+    if !state.atoms.exists(type_atom) {
+        return Err(PropertyDispatchError::BadAtom { atom: type_atom.0 });
+    }
+
+    let existing = crate::xinput::find_device(&state.xi_devices, deviceid)
+        .and_then(|device| device.properties.get(&property))
+        .cloned();
+    // Xorg treats a missing property's first write as Replace, regardless of
+    // the requested append/prepend mode (xiproperty.c:699-706).
+    let effective_mode = if existing.is_none() {
+        crate::xinput::XI_PROP_MODE_REPLACE
+    } else {
+        mode
+    };
+
+    if let Some(existing) = &existing
+        && effective_mode != crate::xinput::XI_PROP_MODE_REPLACE
+        && (existing.format != format || existing.type_atom != type_atom)
+    {
+        return Err(PropertyDispatchError::BadMatch);
+    }
+
+    let resulting_bytes = if effective_mode == crate::xinput::XI_PROP_MODE_REPLACE {
+        data.len()
+    } else {
+        existing.as_ref().map_or(data.len(), |existing| {
+            existing.data.len().saturating_add(data.len())
+        })
+    };
+    // DeviceSetProperty's `format != 32 || size != 9 || type != FLOAT`
+    // gate (devices.c, XI_PROP_TRANSFORM). The seeded value is already
+    // 36 bytes, so every legal non-empty write below is a Replace.
+    if format != 32 || type_atom != state.float_atom || resulting_bytes != 36 {
+        return Err(PropertyDispatchError::BadValue {
+            error_value: property.0,
+        });
+    }
+
+    // XIChangeDeviceProperty does not call DeviceSetProperty for an empty
+    // append/prepend; the value is stored and the notification still sent
+    // (xiproperty.c:789-800).
+    if effective_mode != crate::xinput::XI_PROP_MODE_REPLACE && data.is_empty() {
+        return apply_ctm_property_value(
+            state,
+            deviceid,
+            effective_mode,
+            format,
+            property,
+            type_atom,
+            data,
+            None,
+        );
+    }
+
+    let transform = crate::xinput::DeviceTransform::from_f32_data(data);
+    if !transform.is_finite() {
+        return Err(PropertyDispatchError::BadValue {
+            error_value: property.0,
+        });
+    }
+
+    // `!dev->valuator` → BadMatch (devices.c, XI_PROP_TRANSFORM): the
+    // matrix is meaningless on a device with no axes. Keyboard-class
+    // devices — masters, XTEST keyboard, keyboard facets — still list
+    // the property, exactly as Xorg lists it everywhere.
+    let has_valuators = crate::xinput::find_device(&state.xi_devices, deviceid)
+        .is_some_and(|device| device.class_shape.valuator_count() > 0);
+    if !has_valuators {
+        return Err(PropertyDispatchError::BadMatch);
+    }
+
+    apply_ctm_property_value(
+        state,
+        deviceid,
+        effective_mode,
+        format,
+        property,
+        type_atom,
+        data,
+        Some(transform),
+    )
+}
+
+fn apply_ctm_property_value(
+    state: &mut ServerState,
+    deviceid: u16,
+    mode: u8,
+    format: u8,
+    property: AtomId,
+    type_atom: AtomId,
+    data: &[u8],
+    transform: Option<crate::xinput::DeviceTransform>,
+) -> Result<PropertyChangeOutcome, PropertyDispatchError> {
+    let device = crate::xinput::find_device_mut(&mut state.xi_devices, deviceid)
+        .expect("caller resolved the XI device before property dispatch");
+    let outcome =
+        match crate::xinput::apply_change_property(device, mode, format, property, type_atom, data)
+        {
+            Ok(what) => Ok(PropertyChangeOutcome::Changed(what)),
+            Err(crate::xinput::XiPropError::BadValue) => Err(PropertyDispatchError::BadValue {
+                error_value: u32::from(format),
+            }),
+            Err(crate::xinput::XiPropError::BadMatch) => Err(PropertyDispatchError::BadMatch),
+            Err(crate::xinput::XiPropError::BadDevice) => {
+                unreachable!("apply_change_property never returns BadDevice")
+            }
+        };
+    // Commit the live transform only after the store succeeded —
+    // `DeviceSetTransform` runs inside the property handler on Xorg too.
+    if outcome.is_ok()
+        && let Some(transform) = transform
+    {
+        device.transform = transform;
+    }
+    outcome
 }
 
 fn apply_enabled_property_value(

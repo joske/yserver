@@ -1589,6 +1589,9 @@ pub struct ServerState {
     /// `FLOAT/32` — needs us to intern the name at startup so the
     /// type-atom on the wire never resolves to id 0.
     pub float_atom: AtomId,
+    /// Atom identity for each device's `Coordinate Transformation
+    /// Matrix` property (`XI_PROP_TRANSFORM` in Xorg).
+    pub xi_ctm_atom: AtomId,
 }
 
 /// Server-side key auto-repeat for one input origin. Carries the original
@@ -2063,6 +2066,7 @@ impl ServerState {
         // type=float_atom on its wire replies without a per-request
         // intern dance.
         let float_atom = atoms.intern("FLOAT", false);
+        let xi_ctm_atom = atoms.intern(crate::xinput::PROP_COORDINATE_TRANSFORM_MATRIX, false);
         let mut xi_devices = crate::xinput::XiRegistry::new();
         for device_id in [
             crate::xinput::DEVICEID_MASTER_POINTER,
@@ -2084,6 +2088,14 @@ impl ServerState {
                         deletable: false,
                     },
                 );
+            // Xorg installs the CTM on every input device at
+            // AddInputDevice (devices.c); writes still require a
+            // valuator class, so the keyboard devices keep a read-only
+            // de facto matrix like Xorg's.
+            let device = xi_devices
+                .device_mut(device_id)
+                .expect("XiRegistry creates all four base devices");
+            crate::xinput::seed_transform_matrix_property(device, xi_ctm_atom, float_atom);
         }
         for device_id in [
             crate::xinput::DEVICEID_XTEST_POINTER,
@@ -2226,6 +2238,7 @@ impl ServerState {
             xtest_device_atom,
             xi_device_enabled_atom,
             float_atom,
+            xi_ctm_atom,
         }
     }
 
@@ -2331,6 +2344,11 @@ impl ServerState {
                             read_only: false,
                             deletable: false,
                         },
+                    );
+                    crate::xinput::seed_transform_matrix_property(
+                        device,
+                        self.xi_ctm_atom,
+                        self.float_atom,
                     );
                 }
             }
@@ -4827,6 +4845,16 @@ fn pointer_event_fanout_inner(
         };
         let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
         let mut buf = Vec::with_capacity(68);
+        let (val_x, val_y) = state
+            .lock()
+            .ok()
+            .map_or((event.raw_dx, event.raw_dy), |state| {
+                let transform =
+                    crate::core_loop::pointer_fanout::transform_for_origin(&state, event.origin);
+                let (tx, ty) = transform.relative(f64::from(event.raw_dx), f64::from(event.raw_dy));
+                #[allow(clippy::cast_possible_truncation)]
+                (tx as i32, ty as i32)
+            });
         x11::encode_xi2_raw_event(
             &mut buf,
             target.byte_order,
@@ -4837,7 +4865,10 @@ fn pointer_event_fanout_inner(
             event.time,
             u32::from(event.detail),
             xi_pointer_device_id, // sourceid follows the input origin
-            // Relative device delta, not absolute position (see pointer_fanout).
+            // Post-transform delta in axisvalues; raw device delta in
+            // axisvalues_raw (see pointer_fanout).
+            val_x,
+            val_y,
             event.raw_dx,
             event.raw_dy,
         );

@@ -3155,16 +3155,16 @@ fn xi_list_properties_wire() {
     let wire = read_all_available(&mut peer);
     assert_eq!(
         wire.len(),
-        32 + 16,
-        "32 header + XTEST marker + Device Enabled + 2 client atoms"
+        32 + 20,
+        "32 header + XTEST marker + Device Enabled + CTM + 2 client atoms"
     );
     assert_eq!(wire[0], 1, "X_Reply");
     assert_eq!(
         u32::from_le_bytes(wire[4..8].try_into().unwrap()),
-        4,
+        5,
         "length"
     );
-    assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 4, "num_properties");
+    assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 5, "num_properties");
     let mut atoms = wire[32..]
         .chunks_exact(4)
         .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
@@ -3172,6 +3172,7 @@ fn xi_list_properties_wire() {
     let mut expected = vec![
         state.xtest_device_atom.0,
         state.xi_device_enabled_atom.0,
+        state.xi_ctm_atom.0,
         100,
         200,
     ];
@@ -3576,5 +3577,230 @@ fn xi_change_cursor_propagates_define_cursor_to_backend() {
         "XIChangeCursor with cursor=None (xid 0) must invoke \
              `backend.define_cursor(window, 0)` — same X11 None \
              semantics as the CWA cursor path.",
+    );
+}
+
+// -----------------------------------------------------------------
+// Coordinate Transformation Matrix (XI_PROP_TRANSFORM)
+// -----------------------------------------------------------------
+
+fn ctm_matrix_bytes(m: [f32; 9]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(36);
+    for v in m {
+        data.extend_from_slice(&v.to_le_bytes());
+    }
+    data
+}
+
+#[test]
+fn ctm_seeded_identity_on_base_and_physical_devices() {
+    let mut state = ServerState::new();
+    let identity = ctm_matrix_bytes([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    // Xorg installs the CTM on every input device at AddInputDevice —
+    // masters, XTEST slaves, and both physical facet kinds.
+    for id in [
+        crate::xinput::DEVICEID_MASTER_POINTER,
+        crate::xinput::DEVICEID_MASTER_KEYBOARD,
+        crate::xinput::DEVICEID_XTEST_POINTER,
+        crate::xinput::DEVICEID_XTEST_KEYBOARD,
+    ] {
+        let device = state.xi_devices.device(id).expect("base device");
+        let prop = device
+            .properties
+            .get(&state.xi_ctm_atom)
+            .unwrap_or_else(|| panic!("device {id} has no CTM"));
+        assert_eq!(prop.format, 32, "device {id} CTM format");
+        assert_eq!(prop.type_atom, state.float_atom, "device {id} CTM type");
+        assert_eq!(prop.data, identity, "device {id} CTM identity seed");
+        assert!(!prop.read_only, "device {id} CTM is writable");
+        assert!(!prop.deletable, "device {id} CTM is non-deletable");
+        assert!(device.transform.is_identity());
+    }
+    seed_pointer_for_t3(&mut state);
+    let device = state
+        .xi_devices
+        .device(TEST_PHYSICAL_POINTER_ID)
+        .expect("physical pointer facet");
+    let prop = device
+        .properties
+        .get(&state.xi_ctm_atom)
+        .expect("physical pointer CTM");
+    assert_eq!(prop.data, identity);
+    assert!(!prop.deletable);
+}
+
+#[test]
+fn xi_ctm_write_updates_live_transform() {
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let mut backend = RecordingBackend::new();
+    let ctm = state.xi_ctm_atom.0;
+    let float = state.float_atom.0;
+
+    // Scale x by 2, translate by +0.5 on the XTEST pointer.
+    let m = [2.0f32, 0.0, 0.5, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    let data = ctm_matrix_bytes(m);
+    let body = xi2_change_property_body(
+        crate::xinput::DEVICEID_XTEST_POINTER,
+        crate::xinput::XI_PROP_MODE_REPLACE,
+        32,
+        ctm,
+        float,
+        &data,
+    );
+    handle_xi2_request(
+        &mut state,
+        &mut backend,
+        None,
+        ClientId(1),
+        SequenceNumber(1),
+        xi2_header_for_body(57, &body),
+        &body,
+    )
+    .unwrap();
+    assert!(
+        read_all_available(&mut peer).is_empty(),
+        "accepted CTM write produces no reply"
+    );
+    let device = state
+        .xi_devices
+        .device(crate::xinput::DEVICEID_XTEST_POINTER)
+        .unwrap();
+    assert_eq!(
+        device.transform.m,
+        [2.0, 0.0, 0.5, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        "the accepted matrix updates dev->transform"
+    );
+    assert_eq!(
+        device.properties[&AtomId(ctm)].data,
+        data,
+        "stored property holds the nine written floats"
+    );
+}
+
+#[test]
+fn xi_ctm_write_on_keyboard_is_badmatch() {
+    // `!dev->valuator` → BadMatch (devices.c, XI_PROP_TRANSFORM).
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let mut backend = RecordingBackend::new();
+    let ctm = state.xi_ctm_atom.0;
+    let float = state.float_atom.0;
+    let data = ctm_matrix_bytes([1.0; 9]);
+    for deviceid in [
+        crate::xinput::DEVICEID_MASTER_KEYBOARD,
+        crate::xinput::DEVICEID_XTEST_KEYBOARD,
+    ] {
+        let body = xi2_change_property_body(
+            deviceid,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            32,
+            ctm,
+            float,
+            &data,
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header_for_body(57, &body),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32);
+        assert_eq!(wire[0], 0, "error packet for device {deviceid}");
+        assert_eq!(wire[1], 8, "BadMatch for device {deviceid}");
+    }
+}
+
+#[test]
+fn xi_ctm_write_rejects_nonfinite_wrong_size_and_wrong_type() {
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let mut backend = RecordingBackend::new();
+    let ctm = state.xi_ctm_atom.0;
+    let float = state.float_atom.0;
+
+    // NaN in element 4 → DeviceSetProperty's isfinite gate → BadValue.
+    let mut nan = [1.0f32; 9];
+    nan[4] = f32::NAN;
+    let cases: Vec<(u8, u32, Vec<u8>)> = vec![
+        (32, float, ctm_matrix_bytes(nan)),
+        // Only eight elements → `size != 9` → BadValue.
+        (32, float, ctm_matrix_bytes([1.0; 9])[..32].to_vec()),
+        // INTEGER type on a 9-item write → `type != FLOAT` → BadValue.
+        (32, crate::xinput::XA_INTEGER.0, ctm_matrix_bytes([1.0; 9])),
+        // format 8 → `format != 32` → BadValue.
+        (8, float, vec![1; 9]),
+    ];
+    for (i, (format, type_atom, data)) in cases.iter().enumerate() {
+        let body = xi2_change_property_body(
+            crate::xinput::DEVICEID_XTEST_POINTER,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            *format,
+            ctm,
+            *type_atom,
+            data,
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header_for_body(57, &body),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "case {i}: one error packet");
+        assert_eq!(wire[1], 2, "case {i}: BadValue");
+    }
+    assert!(
+        state
+            .xi_devices
+            .device(crate::xinput::DEVICEID_XTEST_POINTER)
+            .unwrap()
+            .transform
+            .is_identity(),
+        "rejected writes leave dev->transform untouched"
+    );
+}
+
+#[test]
+fn xi_ctm_delete_is_badaccess() {
+    // Xorg marks the CTM non-deletable (XISetDevicePropertyDeletable).
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let mut backend = RecordingBackend::new();
+    let ctm = state.xi_ctm_atom.0;
+    let mut body = Vec::new();
+    body.extend_from_slice(&crate::xinput::DEVICEID_XTEST_POINTER.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&ctm.to_le_bytes());
+    handle_xi2_request(
+        &mut state,
+        &mut backend,
+        None,
+        ClientId(1),
+        SequenceNumber(1),
+        xi2_header(58),
+        &body,
+    )
+    .unwrap();
+    let wire = read_all_available(&mut peer);
+    assert_eq!(wire.len(), 32);
+    assert_eq!(wire[1], 10, "BadAccess deleting the non-deletable CTM");
+    assert!(
+        state
+            .xi_devices
+            .device(crate::xinput::DEVICEID_XTEST_POINTER)
+            .unwrap()
+            .properties
+            .contains_key(&AtomId(ctm)),
+        "CTM survives the rejected delete"
     );
 }

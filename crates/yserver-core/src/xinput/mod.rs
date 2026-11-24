@@ -15,12 +15,14 @@ pub mod hotplug;
 pub mod libinput_props;
 pub mod query;
 pub mod registry;
+pub mod transform;
 
 pub use query::XiQueryError;
 pub use registry::{
     InputCapabilities, InputSourceId, NAME_XTEST_KEYBOARD, NAME_XTEST_POINTER, XiDeviceRole,
     XiFacetKind, XiRegistry,
 };
+pub use transform::DeviceTransform;
 
 // ---------------------------------------------------------------------------
 // X11 predefined atom ids for property type annotation
@@ -182,6 +184,10 @@ pub struct XiDevice {
     /// Cumulative vertical and horizontal smooth-scroll valuators for this
     /// pointer source, independent of other attached mice.
     pub scroll_axis_values: [i32; 2],
+    /// The live `Coordinate Transformation Matrix` (`dev->transform` in
+    /// Xorg). Seeded identity with the property; updated by every
+    /// accepted write to the CTM property atom.
+    pub transform: DeviceTransform,
 }
 
 /// The XI class layouts represented by this registry stage.
@@ -246,6 +252,7 @@ impl XiDevice {
             properties: BTreeMap::new(),
             buttons_down: 0,
             scroll_axis_values: [0; 2],
+            transform: DeviceTransform::IDENTITY,
         }
     }
 
@@ -273,6 +280,7 @@ impl XiDevice {
             properties: BTreeMap::new(),
             buttons_down: 0,
             scroll_axis_values: [0; 2],
+            transform: DeviceTransform::IDENTITY,
         }
     }
 }
@@ -304,6 +312,11 @@ pub fn initial_xi_devices() -> Vec<XiDevice> {
 pub const PROP_TAPPING_ENABLED: &str = "libinput Tapping Enabled";
 /// XI's per-device enabled-state property (`XI_PROP_ENABLED`).
 pub const PROP_DEVICE_ENABLED: &str = "Device Enabled";
+/// XI's per-device coordinate transform property (`XI_PROP_TRANSFORM`).
+/// Xorg installs it on every input device at `AddInputDevice` as a
+/// non-deletable FLOAT/32 nine-element identity matrix
+/// (`dix/devices.c:DeviceSetTransform`/`deviceProperty`).
+pub const PROP_COORDINATE_TRANSFORM_MATRIX: &str = "Coordinate Transformation Matrix";
 /// XTEST's predefined virtual-device marker property.
 pub const PROP_XTEST_DEVICE: &str = "XTEST Device";
 const PROP_DEVICE_NODE: &str = "Device Node";
@@ -396,6 +409,7 @@ pub(crate) fn binding_available(
         Binding::AccelProfile => config.accel_profile_available_mask != 0,
         Binding::ScrollButton => config.scroll_button.available,
         Binding::ScrollButtonLock => config.scroll_button_lock.available,
+        Binding::Calibration => config.calibration.available,
     }
 }
 
@@ -408,7 +422,8 @@ fn descriptor_current_data(
     config: &crate::core_loop::message::LibinputConfigSnapshot,
 ) -> Vec<u8> {
     use libinput_props::{
-        Binding, encode_bitflags, encode_bool, encode_card32, encode_float, encode_onehot,
+        Binding, encode_bitflags, encode_bool, encode_card32, encode_float, encode_floats,
+        encode_onehot,
     };
     match desc.binding {
         Some(Binding::Tap) => encode_bool(config.tap.current),
@@ -428,6 +443,7 @@ fn descriptor_current_data(
         Some(Binding::AccelProfile) => encode_onehot(config.accel_profile.current, 3),
         Some(Binding::ScrollButton) => encode_card32(config.scroll_button.current),
         Some(Binding::ScrollButtonLock) => encode_bool(config.scroll_button_lock.current),
+        Some(Binding::Calibration) => encode_floats(&config.calibration.current),
         None => Vec::new(),
     }
 }
@@ -438,7 +454,7 @@ fn descriptor_default_data(
     config: &crate::core_loop::message::LibinputConfigSnapshot,
 ) -> Option<Vec<u8>> {
     use libinput_props::{
-        encode_bitflags, encode_bool, encode_card32, encode_float, encode_onehot,
+        encode_bitflags, encode_bool, encode_card32, encode_float, encode_floats, encode_onehot,
     };
     let sibling = writable_sibling_for_default(desc.name)?;
     let binding = sibling.binding?;
@@ -459,6 +475,7 @@ fn descriptor_default_data(
         Binding::AccelProfile => encode_onehot(config.accel_profile.default, 3),
         Binding::ScrollButton => encode_card32(config.scroll_button.default),
         Binding::ScrollButtonLock => encode_bool(config.scroll_button_lock.default),
+        Binding::Calibration => encode_floats(&config.calibration.default),
     })
 }
 
@@ -512,6 +529,27 @@ pub fn type_atom_for(val: libinput_props::XiValType, float_atom: AtomId) -> Atom
         libinput_props::XiValType::Card32 => XA_CARDINAL,
         libinput_props::XiValType::Float => float_atom,
     }
+}
+
+/// Seed the `Coordinate Transformation Matrix` property on `device`:
+/// a writable, non-deletable FLOAT/32 nine-element identity matrix —
+/// the property Xorg installs at `AddInputDevice` for every input
+/// device, masters and XTEST slaves included (`dix/devices.c`).
+///
+/// Inserted directly rather than through [`seed_pointer_properties`]
+/// because Xorg puts the property on *every* device, keyboard facets
+/// included; writes still fail `BadMatch` where the device has no
+/// valuator class (`DeviceSetProperty`'s `!dev->valuator` gate).
+pub fn seed_transform_matrix_property(device: &mut XiDevice, atom: AtomId, float_atom: AtomId) {
+    set_seeded_property(
+        device,
+        atom,
+        float_atom,
+        32,
+        DeviceTransform::IDENTITY.to_f32_data(),
+        false,
+        false,
+    );
 }
 
 /// A source's device node; `None` for a source without one (a window
@@ -1841,15 +1879,15 @@ mod tests {
             if id == DEVICEID_XTEST_POINTER || id == DEVICEID_XTEST_KEYBOARD {
                 assert_eq!(
                     dev.properties.len(),
-                    2,
-                    "XTEST marker and Device Enabled remain on {id}"
+                    3,
+                    "XTEST marker, Device Enabled and CTM remain on {id}"
                 );
                 assert!(dev.properties.contains_key(&state.xtest_device_atom));
             } else {
                 assert_eq!(
                     dev.properties.len(),
-                    1,
-                    "only Device Enabled is seeded on {id}"
+                    2,
+                    "only Device Enabled and CTM are seeded on {id}"
                 );
             }
             let enabled = dev
@@ -2123,9 +2161,10 @@ mod tests {
         assert_ne!(id, DEVICEID_XTEST_POINTER);
         let slave = state.xi_devices.device(DEVICEID_XTEST_POINTER).unwrap();
         assert_eq!(slave.name, registry::NAME_XTEST_POINTER);
-        assert_eq!(slave.properties.len(), 2);
+        assert_eq!(slave.properties.len(), 3);
         assert!(slave.properties.contains_key(&state.xtest_device_atom));
         assert!(slave.properties.contains_key(&state.xi_device_enabled_atom));
+        assert!(slave.properties.contains_key(&state.xi_ctm_atom));
     }
 
     /// T2: seeding is driven entirely by the descriptor table. Available

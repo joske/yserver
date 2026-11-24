@@ -152,6 +152,57 @@ fn resolve_pointer_xi_source(
     })
 }
 
+/// The `Coordinate Transformation Matrix` of the device that generated
+/// `origin`'s events — `dev->transform` on the generating `DeviceIntRec`
+/// in Xorg terms: the pointer facet for physical input, the named device
+/// for XTEST input, the master pointer for nested/warp traffic. A
+/// physical source without a published facet is not an XI device and has
+/// no transform (identity), matching Xorg where `dev->transform` exists
+/// only on registered devices.
+#[must_use]
+pub fn transform_for_origin(
+    state: &ServerState,
+    origin: crate::core_loop::InputOrigin,
+) -> crate::xinput::DeviceTransform {
+    use crate::core_loop::InputOrigin;
+    let device_id = match origin {
+        InputOrigin::Physical(source_id) => state
+            .xi_devices
+            .facet(source_id, crate::xinput::XiFacetKind::PointerTouch),
+        InputOrigin::XTest(device_id) => Some(device_id),
+        InputOrigin::NestedHost => Some(crate::xinput::DEVICEID_MASTER_POINTER),
+    };
+    device_id
+        .and_then(|id| state.xi_devices.device(id))
+        .map_or(crate::xinput::DeviceTransform::IDENTITY, |device| {
+            device.transform
+        })
+}
+
+/// Map a framebuffer-space absolute position through `origin`'s CTM in
+/// normalized coordinates — Xorg's `transform()` on the
+/// `scale_from_screen`-normalized point (`dix/getevents.c`). The caller
+/// passes the same framebuffer extent the input thread used to map
+/// `0..1` device coordinates onto `fb-1`, so normalization inverts that
+/// mapping exactly.
+#[must_use]
+pub fn transform_pointer_position(
+    transform: crate::xinput::DeviceTransform,
+    x: f64,
+    y: f64,
+    fb_size: (u16, u16),
+) -> (f32, f32) {
+    if transform.is_identity() {
+        #[allow(clippy::cast_possible_truncation)]
+        return (x as f32, y as f32);
+    }
+    let w = f64::from(fb_size.0.saturating_sub(1).max(1));
+    let h = f64::from(fb_size.1.saturating_sub(1).max(1));
+    let (nx, ny) = transform.absolute(x / w, y / h);
+    #[allow(clippy::cast_possible_truncation)]
+    ((nx * w) as f32, (ny * h) as f32)
+}
+
 /// Apply Xorg's `UpdateFromMaster` bookkeeping for an accepted pointer
 /// event: a source change announces `SlaveSwitch`, and the master inherits
 /// the current source valuators. Scroll Motion and scroll-stop call this same
@@ -2091,6 +2142,16 @@ fn pointer_event_fanout_to_state_inner(
         && !warp
         && let Some(raw_evtype) = xi2_raw_evtype
     {
+        // `axisvalues` carry the post-transform delta (Xorg
+        // `set_raw_valuators` copies the transformed mask into
+        // `raw->valuators.data`); `axisvalues_raw` keeps the untouched
+        // device values. The transform is the generating device's — the
+        // same resolution the cursor-integration path used.
+        let transform = transform_for_origin(state, event.origin);
+        let (val_x, val_y) = {
+            let (tx, ty) = transform.relative(f64::from(event.raw_dx), f64::from(event.raw_dy));
+            (tx as i32, ty as i32)
+        };
         // mieq processes the attached slave first, then copies ET_Raw* to its
         // master by rewriting deviceid and retaining sourceid. Keep that
         // order for clients selecting both forms. Master-only origins have
@@ -2108,6 +2169,8 @@ fn pointer_event_fanout_to_state_inner(
                         event.time,
                         u32::from(event.detail),
                         xi_source.sourceid,
+                        val_x,
+                        val_y,
                         event.raw_dx,
                         event.raw_dy,
                     );
@@ -2125,6 +2188,8 @@ fn pointer_event_fanout_to_state_inner(
                 event.time,
                 u32::from(event.detail),
                 xi_source.sourceid,
+                val_x,
+                val_y,
                 event.raw_dx,
                 event.raw_dy,
             );

@@ -71,6 +71,13 @@ pub enum DeviceConfigChange {
     ScrollButton(u32),
     /// `libinput Button Scrolling Button Lock Enabled` (Scalar Bool).
     ScrollButtonLock(bool),
+    /// `libinput Calibration Matrix` (FloatVec, 9 f32s).
+    /// The wire form is the X-style 3×3 matrix; libinput consumes only
+    /// the first two rows (`libinput_device_config_calibration_set_matrix`
+    /// takes six values), so the last row must remain `0 0 1` — enforced
+    /// at [`decode_change`] exactly as `xf86libinput.c:
+    /// LibinputSetPropertyCalibration` rejects it.
+    CalibrationMatrix([f32; 9]),
 }
 
 /// Why a config apply failed → mapped to an X error by the dispatch layer.
@@ -173,6 +180,11 @@ pub enum ValueKind {
     OneHotOrNone { n: u8, min: u8 },
     /// Any subset of `n` Bool slots set (each byte non-zero ⇔ bit set).
     BitFlags { n: u8 },
+    /// Exactly `n` consecutive f32 elements at format 32
+    /// (`n * 4` bytes). Used by `libinput Calibration Matrix`
+    /// (`n = 9`, the X-style 3×3 form of libinput's six-element
+    /// calibration matrix).
+    FloatVec { n: u8 },
 }
 
 /// Whether clients may modify a property.
@@ -205,6 +217,7 @@ pub enum Binding {
     AccelProfile,
     ScrollButton,
     ScrollButtonLock,
+    Calibration,
 }
 
 /// One row of the libinput property descriptor table.
@@ -507,6 +520,22 @@ pub static DESCRIPTORS: &[PropDescriptor] = &[
         access: Access::ReadOnly,
         binding: None,
     },
+    PropDescriptor {
+        name: "libinput Calibration Matrix",
+        val: XiValType::Float,
+        format: 32,
+        kind: ValueKind::FloatVec { n: 9 },
+        access: Access::ReadWrite,
+        binding: Some(Binding::Calibration),
+    },
+    PropDescriptor {
+        name: "libinput Calibration Matrix Default",
+        val: XiValType::Float,
+        format: 32,
+        kind: ValueKind::FloatVec { n: 9 },
+        access: Access::ReadOnly,
+        binding: None,
+    },
 ];
 
 /// Look up a descriptor by exact property name.
@@ -534,6 +563,7 @@ pub fn descriptor_by_name(name: &str) -> Option<&'static PropDescriptor> {
 ///     for why that one accepts a range and the others must not.
 ///   * `BitFlags { n }` — `format` MUST be 8; `data.len() == n` (any
 ///     pattern of zero/non-zero bytes is legal).
+///   * `FloatVec { n }` — `format` MUST be 32; `data.len() == n * 4`.
 ///
 /// Exact-width kinds reject an **empty** value implicitly (`0 != n`, and
 /// `n >= 1` for every row in [`DESCRIPTORS`]). `OneHotOrNone` rejects it
@@ -582,6 +612,12 @@ pub fn validate_value(kind: ValueKind, format: u8, data: &[u8]) -> Result<(), De
             }
             Ok(())
         }
+        ValueKind::FloatVec { n } => {
+            if format != 32 || data.len() != usize::from(n) * 4 {
+                return Err(DeviceConfigError::Invalid);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -595,7 +631,9 @@ pub fn validate_value(kind: ValueKind, format: u8, data: &[u8]) -> Result<(), De
 #[must_use]
 pub fn normalize_value(kind: ValueKind, data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     let n = match kind {
-        ValueKind::Scalar => return std::borrow::Cow::Borrowed(data),
+        ValueKind::Scalar | ValueKind::FloatVec { .. } => {
+            return std::borrow::Cow::Borrowed(data);
+        }
         ValueKind::OneHot { n } | ValueKind::OneHotOrNone { n, .. } | ValueKind::BitFlags { n } => {
             n
         }
@@ -681,6 +719,19 @@ pub fn decode_change(
         }
         Binding::ScrollButton => DeviceConfigChange::ScrollButton(card32(data)),
         Binding::ScrollButtonLock => DeviceConfigChange::ScrollButtonLock(bool_scalar(data)),
+        Binding::Calibration => {
+            // The X-style 3×3 matrix ends in `0 0 1`; libinput consumes
+            // only the first two rows. xf86libinput rejects any other
+            // last row in checkonly (LibinputSetPropertyCalibration).
+            let mut m = [0.0f32; 9];
+            for (i, chunk) in data.chunks_exact(4).enumerate() {
+                m[i] = float32(chunk);
+            }
+            if m[6] != 0.0 || m[7] != 0.0 || m[8] != 1.0 {
+                return Err(DeviceConfigError::Invalid);
+            }
+            DeviceConfigChange::CalibrationMatrix(m)
+        }
     })
 }
 
@@ -732,6 +783,16 @@ pub fn encode_float(value: f32) -> Vec<u8> {
     value.to_le_bytes().to_vec()
 }
 
+/// Encode consecutive FLOAT/32 elements as little-endian IEEE-754 bytes.
+#[must_use]
+pub fn encode_floats(values: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
+}
+
 /// Resolve the writable property descriptor affected by a confirmed
 /// libinput change. This is used after a server reset, when the submitted
 /// protocol request and its old atom ID have intentionally been discarded.
@@ -753,6 +814,7 @@ pub fn descriptor_for_change(change: DeviceConfigChange) -> &'static PropDescrip
         DeviceConfigChange::AccelProfile(_) => Binding::AccelProfile,
         DeviceConfigChange::ScrollButton(_) => Binding::ScrollButton,
         DeviceConfigChange::ScrollButtonLock(_) => Binding::ScrollButtonLock,
+        DeviceConfigChange::CalibrationMatrix(_) => Binding::Calibration,
     };
     DESCRIPTORS
         .iter()
@@ -781,6 +843,7 @@ pub fn encode_change_value(change: DeviceConfigChange) -> Vec<u8> {
         DeviceConfigChange::AccelSpeed(value) => encode_float(value),
         DeviceConfigChange::AccelProfile(value) => encode_onehot(value, 3),
         DeviceConfigChange::ScrollButton(value) => encode_card32(value),
+        DeviceConfigChange::CalibrationMatrix(values) => encode_floats(&values),
     }
 }
 

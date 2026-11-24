@@ -109,6 +109,28 @@ pub struct BitFlags2 {
     pub default_mask: u8,
 }
 
+/// libinput calibration matrix (`libinput_device_config_calibration_*`).
+/// `current`/`default` hold the X-style 3×3 wire form: libinput's two
+/// rows plus a fixed `0 0 1` tail (`xf86libinput.c:
+/// LibinputInitCalibrationProperty` forces `matrix[6] = matrix[7] = 0`,
+/// `matrix[8] = 1` on both the live and default exposures).
+#[derive(Debug, Clone, Copy)]
+pub struct MatrixSetting {
+    pub available: bool,
+    pub current: [f32; 9],
+    pub default: [f32; 9],
+}
+
+impl Default for MatrixSetting {
+    fn default() -> Self {
+        Self {
+            available: false,
+            current: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            default: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        }
+    }
+}
+
 /// Full touchpad/pointer libinput config snapshot, gathered at DeviceAdded.
 ///
 /// One `BoolSetting`/`FloatSetting`/... per libinput property group. All
@@ -142,6 +164,9 @@ pub struct LibinputConfigSnapshot {
     pub accel_profile_available_mask: u8,
     /// Send-events: bitflags bit0=disabled, bit1=disabled-on-external-mouse.
     pub send_events: BitFlags2,
+    /// Calibration matrix (`libinput Calibration Matrix`). `available`
+    /// follows `libinput_device_config_calibration_has_matrix`.
+    pub calibration: MatrixSetting,
 }
 
 impl LibinputConfigSnapshot {
@@ -167,6 +192,7 @@ impl LibinputConfigSnapshot {
             C::AccelProfile(value) => self.accel_profile.current = value.filter(|slot| *slot < 2),
             C::ScrollButton(value) => self.scroll_button.current = value,
             C::ScrollButtonLock(value) => self.scroll_button_lock.current = value,
+            C::CalibrationMatrix(value) => self.calibration.current = value,
         }
     }
 }
