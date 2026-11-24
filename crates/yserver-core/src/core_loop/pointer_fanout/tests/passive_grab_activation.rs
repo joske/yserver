@@ -4426,3 +4426,181 @@ fn xi_paired_modes_on_slave_are_noops() {
         assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD, XI_XTEST]);
     }
 }
+
+/// Sends an XTestFakeInput request, checks its production translation at the
+/// RecordingBackend boundary, then routes that input through pointer fanout.
+/// RecordingBackend records the FakeInput request but does not run the input
+/// loop, so this keeps the request and fanout sides explicit in the fixture.
+fn xtest_fake_pointer(f: &mut Fixture, event_type: u8, x: i16, y: i16) {
+    use yserver_protocol::x11::xtest;
+
+    assert!(matches!(
+        event_type,
+        xtest::FAKE_BUTTON_PRESS | xtest::FAKE_BUTTON_RELEASE | xtest::FAKE_MOTION_NOTIFY
+    ));
+    let detail = if event_type == xtest::FAKE_MOTION_NOTIFY {
+        0
+    } else {
+        1
+    };
+    let before = f.backend.calls().len();
+    let mut body = [0; 28];
+    body[0] = event_type;
+    body[1] = detail;
+    body[4..8].copy_from_slice(&f.time.to_le_bytes());
+    body[8..12].copy_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+    body[20..22].copy_from_slice(&x.to_le_bytes());
+    body[22..24].copy_from_slice(&y.to_le_bytes());
+    dispatch(f, CLIENT_B, 146, xtest::FAKE_INPUT, &body);
+
+    let recorded = f.backend.calls();
+    let translated: Vec<_> = recorded[before..]
+        .iter()
+        .filter_map(|call| match call {
+            crate::backend::recording::RecordedCall::HostPointer {
+                x,
+                y,
+                button,
+                pressed,
+            } => Some((*x, *y, *button, *pressed)),
+            _ => None,
+        })
+        .collect();
+    let expected_button = if event_type == xtest::FAKE_MOTION_NOTIFY {
+        (x.into(), y.into(), 0, false)
+    } else {
+        (0, 0, 0x110, event_type == xtest::FAKE_BUTTON_PRESS)
+    };
+    assert_eq!(translated, vec![expected_button]);
+
+    let (kind, root_x, root_y) = match event_type {
+        xtest::FAKE_MOTION_NOTIFY => (PointerEventKind::MotionNotify, x, y),
+        xtest::FAKE_BUTTON_PRESS => (PointerEventKind::ButtonPress, f.pointer.0, f.pointer.1),
+        xtest::FAKE_BUTTON_RELEASE => (PointerEventKind::ButtonRelease, f.pointer.0, f.pointer.1),
+        _ => unreachable!(),
+    };
+    let host_xid = if root_x >= 550 { HOST_OUT } else { HOST_W };
+    let event = crate::host_x11::HostPointerEvent {
+        origin: InputOrigin::XTest(XI_XTEST),
+        kind,
+        host_xid,
+        detail: if kind == PointerEventKind::MotionNotify {
+            0
+        } else {
+            1
+        },
+        time: f.time,
+        root_x,
+        root_y,
+        event_x: if root_x >= 550 {
+            root_x - 550
+        } else {
+            root_x - 100
+        },
+        event_y: root_y - 100,
+        state: (f.state.buttons_down & 0x001f) << 8,
+        ..motion_event()
+    };
+    f.time += 1;
+    let dropped = crate::core_loop::pointer_fanout::pointer_event_fanout_to_state(
+        &mut f.state,
+        &mut f.backend,
+        &f.xid_map,
+        event,
+        true,
+        false,
+    );
+    assert!(
+        dropped.is_empty(),
+        "XTest input must not disconnect clients"
+    );
+    f.pointer = (root_x, root_y);
+}
+
+/// Decodes the wire fields that distinguish the Xvfb measured button packets:
+/// event kind/detail, event window, and the pre-transition button state.
+fn read_core_button_packets(peer: &mut crate::transport::CapturedPeer) -> Vec<(u8, u8, u32, u16)> {
+    let bytes = read_all_capture_available(peer);
+    assert_eq!(bytes.len() % 32, 0, "core packets are 32 bytes: {bytes:?}");
+    bytes
+        .chunks_exact(32)
+        .map(|packet| {
+            let kind = packet[0] & 0x7f;
+            assert!(matches!(kind, 4 | 5), "unexpected packet: {packet:?}");
+            (
+                kind,
+                packet[1],
+                u32::from_le_bytes(packet[12..16].try_into().unwrap()),
+                u16::from_le_bytes(packet[28..30].try_into().unwrap()),
+            )
+        })
+        .collect()
+}
+
+/// A replayed core press must not restore a source button already released
+/// while only the master pass was frozen; the queued master release then
+/// clears the button before the next frame's passive grab check.
+#[test]
+fn sync_passive_replay_clears_master_button_before_following_passive_grab() {
+    use yserver_protocol::x11::xtest;
+
+    let mut f = p_fixture();
+    select_core(&mut f, CLIENT_A, W, 0x000c); // ButtonPress|ButtonRelease
+    grab_button_core(&mut f, CLIENT_A, W, 1, ANY_MODIFIER, 0, false);
+    grab_button_core(&mut f, CLIENT_A, OUT, 1, ANY_MODIFIER, 0, false);
+
+    xtest_fake_pointer(&mut f, xtest::FAKE_MOTION_NOTIFY, 250, 250);
+    assert!(read_all_capture_available(&mut f.client_a).is_empty());
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+    xtest_fake_pointer(&mut f, xtest::FAKE_BUTTON_PRESS, 250, 250);
+    let activating_press = read_core_button_packets(&mut f.client_a);
+    assert_eq!(activating_press, vec![(4, 1, W, 0)]);
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+
+    xtest_fake_pointer(&mut f, xtest::FAKE_BUTTON_RELEASE, 250, 250);
+    assert!(read_all_capture_available(&mut f.client_a).is_empty());
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+    allow_events_core(&mut f, CLIENT_A, 2); // ReplayPointer
+    let replayed_a = read_core_button_packets(&mut f.client_a);
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+    let master_buttons_after_replay = f.state.buttons_down;
+    let source_buttons_after_replay = f
+        .state
+        .xi_devices
+        .device(XI_XTEST)
+        .expect("XTest pointer source device")
+        .buttons_down;
+
+    xtest_fake_pointer(&mut f, xtest::FAKE_MOTION_NOTIFY, 650, 150);
+    assert!(read_all_capture_available(&mut f.client_a).is_empty());
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+    xtest_fake_pointer(&mut f, xtest::FAKE_BUTTON_PRESS, 650, 150);
+    let activating_press_b = read_core_button_packets(&mut f.client_a);
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+
+    allow_events_core(&mut f, CLIENT_A, 0); // AsyncPointer for B's grab, if it activated
+    xtest_fake_pointer(&mut f, xtest::FAKE_BUTTON_RELEASE, 650, 150);
+    let release_b = read_core_button_packets(&mut f.client_a);
+    assert!(read_all_capture_available(&mut f.client_b).is_empty());
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+
+    assert_eq!(
+        master_buttons_after_replay, 0,
+        "the queued master release leaves no master button held; source=0x{source_buttons_after_replay:04x}, replay packets={replayed_a:?}"
+    );
+    assert_eq!(
+        replayed_a,
+        vec![(4, 1, W, 0), (5, 1, W, 0x0100)],
+        "ReplayPointer re-delivers A's press and queued release with measured state fields"
+    );
+    assert_eq!(
+        activating_press_b,
+        vec![(4, 1, OUT, 0)],
+        "M's passive grab on B activates with the measured state field"
+    );
+    assert_eq!(
+        release_b,
+        vec![(5, 1, OUT, 0x0100)],
+        "the final release reaches M before its passive grab ends"
+    );
+}

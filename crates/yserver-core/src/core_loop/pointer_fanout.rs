@@ -618,6 +618,25 @@ fn pointer_event_fanout_to_state_inner(
                 master_accepted: false,
                 master_changed: false,
             }
+        } else if replay_is_master
+            && (1..=16).contains(&event.detail)
+            && state.buttons_down & (1u16 << (event.detail - 1)) != 0
+        {
+            // If the master already has this button, ReplayPointer is
+            // reprocessing an edge whose slave half ran on arrival. Later
+            // slave input may already have released it while only the master
+            // was frozen, so do not restore the source bit from the replay.
+            master_button_transition(
+                state,
+                xi_source,
+                1u16 << (event.detail - 1),
+                event.kind == PointerEventKind::ButtonPress,
+                Some(
+                    replay
+                        .expect("master replay retains its pending device")
+                        .device,
+                ),
+            )
         } else {
             pointer_button_transition(
                 state,
