@@ -2681,15 +2681,25 @@ fn pointer_event_fanout_to_state_inner(
                     )
                     .unwrap_or(target)
                 };
-                if win == nested_id {
-                    (nested_id, ResourceId(0), event_x, event_y)
+                let child_target = if form == Xi2PointerForm::Slave {
+                    slave_pass_target
                 } else {
-                    let child_target = if form == Xi2PointerForm::Slave {
-                        slave_pass_target
+                    target
+                };
+                // Xorg's FindChildForEvent reports the sprite path's child
+                // for XI2 fixup (21.1.24 dix/events.c:2598-2619, 2623-2642).
+                // The slave pass uses the prior sprite target even when the
+                // event window is also the post-move target.
+                let child = xi2_child_toward(state, win, child_target);
+                if win == nested_id {
+                    let child = if form == Xi2PointerForm::Slave {
+                        child
                     } else {
-                        target
+                        // The master form's shortcut has nested_id == target.
+                        ResourceId(0)
                     };
-                    let child = xi2_child_toward(state, win, child_target);
+                    (nested_id, child, event_x, event_y)
+                } else {
                     let (ax, ay) = state.resources.window_absolute_position(win);
                     (
                         win,

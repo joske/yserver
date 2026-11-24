@@ -1,4 +1,4 @@
-use super::*;
+use super::{implicit_grabs::assert_end_state, *};
 
 use crate::{
     backend::recording::RecordingBackend,
@@ -1451,6 +1451,133 @@ fn owner_events_scroll_motion_routed_independently_of_wheel_press() {
         read_all_capture_available(&mut f.other).is_empty(),
         "B's Motion selection on D is rejected by the owner-events grab"
     );
+}
+
+/// Pins the slave Motion child from Xorg's prior sprite path when the event
+/// window is also the post-move target. Windows and selections go through
+/// production requests; input uses the registered-source fanout entry.
+#[test]
+fn slave_motion_child_into_parent_reports_child() {
+    const SOURCE: u64 = 0xA7536;
+    let mut state = ServerState::new();
+    let grabber = install_capture_client(&mut state, GRABBER);
+    let other = install_capture_client(&mut state, OTHER);
+    let mut xid_map = HostXidMap::new();
+    xid_map.insert(HOST_WINDOW, ResourceId(WINDOW));
+    let mut f = Fixture {
+        state,
+        backend: RecordingBackend::new(),
+        xid_map,
+        grabber,
+        other,
+    };
+
+    // Create W and D through the real core request path. D is offset 20,20
+    // in W, so (150,150) hits D and (240,150) stays in W outside D.
+    let mut create = Vec::with_capacity(28);
+    create.extend_from_slice(&WINDOW.to_le_bytes());
+    create.extend_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+    create.extend_from_slice(&100i16.to_le_bytes());
+    create.extend_from_slice(&100i16.to_le_bytes());
+    create.extend_from_slice(&200u16.to_le_bytes());
+    create.extend_from_slice(&200u16.to_le_bytes());
+    create.extend_from_slice(&0u16.to_le_bytes());
+    create.extend_from_slice(&1u16.to_le_bytes());
+    create.extend_from_slice(&ROOT_VISUAL.0.to_le_bytes());
+    create.extend_from_slice(&0u32.to_le_bytes());
+    dispatch(&mut f, GRABBER, 1, 1, 24, &create);
+    dispatch(&mut f, GRABBER, 2, 8, 0, &WINDOW.to_le_bytes());
+
+    let mut create = Vec::with_capacity(28);
+    create.extend_from_slice(&CHILD.to_le_bytes());
+    create.extend_from_slice(&WINDOW.to_le_bytes());
+    create.extend_from_slice(&20i16.to_le_bytes());
+    create.extend_from_slice(&20i16.to_le_bytes());
+    create.extend_from_slice(&100u16.to_le_bytes());
+    create.extend_from_slice(&100u16.to_le_bytes());
+    create.extend_from_slice(&0u16.to_le_bytes());
+    create.extend_from_slice(&1u16.to_le_bytes());
+    create.extend_from_slice(&ROOT_VISUAL.0.to_le_bytes());
+    create.extend_from_slice(&0u32.to_le_bytes());
+    dispatch(&mut f, OTHER, 1, 1, 24, &create);
+    dispatch(&mut f, OTHER, 2, 8, 0, &CHILD.to_le_bytes());
+
+    let pointer = pointer_source(&mut f.state, SOURCE, true);
+    let _ = read_all_capture_available(&mut f.grabber);
+    let _ = read_all_capture_available(&mut f.other);
+
+    inject_from_origin(
+        &mut f,
+        crate::core_loop::InputOrigin::Physical(crate::xinput::InputSourceId(SOURCE)),
+        PointerEventKind::MotionNotify,
+        150,
+        150,
+        HOST_WINDOW,
+    );
+    select_xi2(&mut f, GRABBER, WINDOW, pointer, XI_MOTION);
+    select_xi2(&mut f, GRABBER, WINDOW, XI_MASTER, XI_MOTION);
+
+    inject_from_origin(
+        &mut f,
+        crate::core_loop::InputOrigin::Physical(crate::xinput::InputSourceId(SOURCE)),
+        PointerEventKind::MotionNotify,
+        240,
+        150,
+        HOST_WINDOW,
+    );
+
+    let packets = read_all_capture_available(&mut f.grabber);
+    assert_eq!(
+        decode_deliveries(&packets),
+        vec![
+            Delivery {
+                xi2: true,
+                kind: 6,
+                window: WINDOW,
+                child: CHILD,
+            },
+            Delivery {
+                xi2: true,
+                kind: 6,
+                window: WINDOW,
+                child: 0,
+            },
+        ],
+        "the slave event keeps D from its prior sprite path; the master form follows the new W target"
+    );
+    assert_eq!(
+        xi2_event_ids(&packets),
+        vec![(6, pointer, pointer), (6, XI_MASTER, pointer)],
+        "the encoded packets contain slave then master Motion forms"
+    );
+    // Coordinates are not asserted: Xvfb reports the slave form's pre-move
+    // root (150,150) and yserver the post-move one, a known divergence listed
+    // as a PR #379 follow-up (XI2 slave motion coordinates).
+    assert!(read_all_capture_available(&mut f.other).is_empty());
+    assert_eq!(f.state.pointer_root, (240, 150));
+    assert_eq!(f.state.master_sprite_root, (240, 150));
+    assert_eq!(
+        crate::core_loop::key_fanout::deepest_window_at_pointer(&f.state),
+        ResourceId(WINDOW),
+        "the sprite ends in W outside D"
+    );
+    let Fixture {
+        state,
+        backend,
+        xid_map,
+        grabber,
+        other,
+    } = f;
+    let end_state = super::implicit_grabs::Fixture {
+        state,
+        backend,
+        xid_map,
+        client_a: grabber,
+        client_b: other,
+        pointer: (240, 150),
+        time: 52,
+    };
+    assert_end_state(&end_state);
 }
 
 #[test]
