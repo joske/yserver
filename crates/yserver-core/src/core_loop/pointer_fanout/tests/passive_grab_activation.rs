@@ -3381,11 +3381,35 @@ fn grab_xi2_device_with_modes_at_window(
     paired_mode: u8,
     mask: u32,
 ) {
+    grab_xi2_device_with_modes_at_window_and_time(
+        f,
+        client,
+        window,
+        device,
+        this_mode,
+        paired_mode,
+        mask,
+        0,
+    );
+}
+
+/// Sends XIGrabDevice at an explicit timestamp so the foreign-target-bound
+/// regression can request grabs in one order with timestamps in another.
+fn grab_xi2_device_with_modes_at_window_and_time(
+    f: &mut Fixture,
+    client: u32,
+    window: u32,
+    device: u16,
+    this_mode: u8,
+    paired_mode: u8,
+    mask: u32,
+    time: u32,
+) {
     use crate::xinput::XiDeviceRole;
 
     let mut body = Vec::with_capacity(if mask == 0 { 20 } else { 24 });
     body.extend_from_slice(&window.to_le_bytes());
-    body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    body.extend_from_slice(&time.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes()); // no cursor
     body.extend_from_slice(&device.to_le_bytes());
     body.extend_from_slice(&[this_mode, paired_mode, 0, 0]); // modes, owner_events, pad
@@ -3440,6 +3464,12 @@ fn assert_xi2_packets(
     expected: &[(u16, u16, u16, u32)],
 ) {
     let bytes = read_all_capture_available(peer);
+    assert_xi2_packet_bytes(&bytes, expected);
+}
+
+/// Checks captured XI2 bytes after the test has already cleaned up its grabs,
+/// so a deliberately red timestamp assertion still runs the shared end-state check.
+fn assert_xi2_packet_bytes(bytes: &[u8], expected: &[(u16, u16, u16, u32)]) {
     let mut offset = 0;
     for &(evtype, device, source, window) in expected {
         assert!(offset + 32 <= bytes.len(), "missing XI2 packet {evtype}");
@@ -4146,6 +4176,166 @@ fn xi_async_slave_uses_requesting_clients_grab_time() {
     assert!(f.state.xi2_pointer_grabs.is_empty());
     assert!(f.state.active_pointer_grab.is_none());
     assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD, XI_XTEST]);
+}
+
+/// A foreign target grab's later time must not reject the requester's valid
+/// paired-device thaw; the paired pointer hold remains until cleanup.
+#[test]
+fn xi_async_paired_device_ignores_foreign_target_grab_time() {
+    use crate::{host_x11::HostKeyEvent, server::Xi1SyncState};
+
+    const SERVER_TIME: u32 = 0x9000_0200;
+    const POINTER_GRAB_TIME: u32 = SERVER_TIME + 200;
+    const KEYBOARD_GRAB_TIME: u32 = SERVER_TIME + 100;
+    const ALLOW_TIME: u32 = SERVER_TIME + 150;
+    const KEYCODE: u8 = 38;
+
+    let mut f = p_fixture();
+    set_test_clock_epoch(&mut f, SERVER_TIME);
+    select_xi2(
+        &mut f,
+        CLIENT_A,
+        ROOT_WINDOW.0,
+        XI_ALL_MASTER_DEVICES,
+        XI_KEYS,
+    );
+    select_xi2(
+        &mut f,
+        CLIENT_B,
+        ROOT_WINDOW.0,
+        XI_ALL_MASTER_DEVICES,
+        XI_KEYS,
+    );
+    let mut focus = Vec::with_capacity(8);
+    focus.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+    focus.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    dispatch(&mut f, CLIENT_A, 42, 0, &focus); // SetInputFocus to the root
+
+    while f.state.timestamp_now() <= POINTER_GRAB_TIME {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    grab_xi2_device_with_modes_at_window_and_time(
+        &mut f,
+        CLIENT_A,
+        ROOT_WINDOW.0,
+        XI_MASTER,
+        1,
+        1,
+        XI_MOTION,
+        POINTER_GRAB_TIME,
+    );
+    assert_xi_grab_success_reply(&mut f.client_a);
+    let pointer_grab = f
+        .state
+        .active_pointer_grab
+        .expect("A owns the later master-pointer grab");
+    assert_eq!(pointer_grab.owner, ClientId(CLIENT_A));
+    assert_eq!(pointer_grab.time, POINTER_GRAB_TIME);
+
+    grab_xi2_device_with_modes_at_window_and_time(
+        &mut f,
+        CLIENT_B,
+        ROOT_WINDOW.0,
+        XI_MASTER_KEYBOARD,
+        0,
+        0,
+        XI_KEYS,
+        KEYBOARD_GRAB_TIME,
+    );
+    assert_xi_keyboard_grab_success(&mut f.client_b, XI_MASTER_KEYBOARD, ROOT_WINDOW.0);
+    assert!(read_all_capture_available(&mut f.client_a).is_empty());
+    assert_eq!(f.state.last_keyboard_grab_time, KEYBOARD_GRAB_TIME);
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER_KEYBOARD].state,
+        Xi1SyncState::FrozenNoEvent
+    );
+    assert_eq!(
+        f.state.xi1_frozen[&XI_MASTER].other,
+        Some(ClientId(CLIENT_B)),
+        "B's synchronous paired-pointer mode owns the pointer's other hold"
+    );
+
+    f.time = f.state.timestamp_now();
+    for pressed in [true, false] {
+        let _ = crate::core_loop::key_fanout::key_event_fanout_to_state(
+            &mut f.state,
+            &mut f.backend,
+            HostKeyEvent {
+                origin: InputOrigin::XTest(XI_XTEST_KEYBOARD),
+                pressed,
+                keycode: KEYCODE,
+                time: f.time,
+                root_x: 145,
+                root_y: 145,
+                event_x: 145,
+                event_y: 145,
+                state: 0,
+            },
+        );
+        f.time += 1;
+    }
+    let keyboard_input_queued = f
+        .state
+        .sync_pending
+        .iter()
+        .any(|pending| pending.device == XI_MASTER_KEYBOARD);
+    let before_allow_a = read_all_capture_available(&mut f.client_a);
+    let before_allow_b = read_all_capture_available(&mut f.client_b);
+
+    xi_allow_events_at(&mut f, CLIENT_B, XI_MASTER, 3, ALLOW_TIME); // XIAsyncPairedDevice
+    let keyboard_state_after_allow = f.state.xi1_frozen[&XI_MASTER_KEYBOARD].state;
+    let pointer_other_after_allow = f.state.xi1_frozen[&XI_MASTER].other;
+    let after_allow_a = read_all_capture_available(&mut f.client_a);
+    let after_allow_b = read_all_capture_available(&mut f.client_b);
+
+    send_to_root(
+        &mut f,
+        InputOrigin::XTest(XI_XTEST),
+        PointerEventKind::MotionNotify,
+        0,
+        500,
+        700,
+    );
+    let pointer_held_a = read_all_capture_available(&mut f.client_a);
+    let pointer_held_b = read_all_capture_available(&mut f.client_b);
+    // Release the preserved paired hold through AllowSome so the queued
+    // pointer motion is played before the common end-state check.
+    xi_allow_events_at(&mut f, CLIENT_B, XI_MASTER, 0, 0); // XIAsyncDevice
+    let pointer_released_a = read_all_capture_available(&mut f.client_a);
+    let pointer_released_b = read_all_capture_available(&mut f.client_b);
+    ungrab_xi2_device(&mut f, CLIENT_B, XI_MASTER_KEYBOARD);
+    let _ = read_all_capture_available(&mut f.client_a);
+    let _ = read_all_capture_available(&mut f.client_b);
+    ungrab_xi2_device(&mut f, CLIENT_A, XI_MASTER);
+    assert_task1_end_state(&f, &[XI_MASTER, XI_MASTER_KEYBOARD]);
+
+    assert!(
+        keyboard_input_queued,
+        "the synchronous keyboard grab queues key input before AllowEvents"
+    );
+    assert_eq!(keyboard_state_after_allow, Xi1SyncState::Thawed);
+    assert_eq!(
+        pointer_other_after_allow,
+        Some(ClientId(CLIENT_B)),
+        "XIAsyncPairedDevice thaws B's keyboard but preserves B's pointer hold"
+    );
+    assert_xi2_packet_bytes(&before_allow_a, &[]);
+    assert_xi2_packet_bytes(&before_allow_b, &[]);
+    assert_xi2_packet_bytes(&after_allow_a, &[]);
+    assert_xi2_packet_bytes(
+        &after_allow_b,
+        &[
+            (2, XI_MASTER_KEYBOARD, XI_XTEST_KEYBOARD, ROOT_WINDOW.0),
+            (3, XI_MASTER_KEYBOARD, XI_XTEST_KEYBOARD, ROOT_WINDOW.0),
+        ],
+    );
+    assert_xi2_packet_bytes(&pointer_held_a, &[]);
+    assert_xi2_packet_bytes(&pointer_held_b, &[]);
+    assert_xi2_packet_bytes(
+        &pointer_released_a,
+        &[(6, XI_MASTER, XI_XTEST, ROOT_WINDOW.0)],
+    );
+    assert_xi2_packet_bytes(&pointer_released_b, &[]);
 }
 
 /// XI2 paired modes on a slave are no-ops even when this client has frozen

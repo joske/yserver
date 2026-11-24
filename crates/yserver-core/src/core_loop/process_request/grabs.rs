@@ -60,30 +60,28 @@ enum AllowSomeState {
     NotGrabbed,
 }
 
-/// Returns the timestamp represented by a device's existing active-grab
-/// record, so AllowSome can build its bound without borrowing another
-/// client's grab time from a different device.
+/// Returns the timestamp represented by an active grab owned by the
+/// requester, so AllowSome's bound never includes a foreign grab.
 fn allow_some_device_grab_time(
     state: &ServerState,
     client_id: ClientId,
     device_id: u16,
-    target_device: bool,
 ) -> Option<u32> {
     use crate::xinput::XiDeviceRole;
 
     match state.xi_devices.role(device_id) {
         Some(XiDeviceRole::MasterPointer) => state
             .active_pointer_grab
-            .filter(|grab| target_device || grab.owner == client_id)
+            .filter(|grab| grab.owner == client_id)
             .map(|grab| grab.time),
         Some(XiDeviceRole::MasterKeyboard) => state
             .active_keyboard_grab
-            .filter(|grab| target_device || grab.owner == client_id)
+            .filter(|grab| grab.owner == client_id)
             .map(|_| state.last_keyboard_grab_time),
         Some(XiDeviceRole::SlavePointer) => state
             .xi2_pointer_grabs
             .get(&device_id)
-            .filter(|grab| target_device || grab.owner == client_id)
+            .filter(|grab| grab.owner == client_id)
             .map(|grab| grab.time),
         // Active keyboard and XI1 grab records do not retain grabTime. Do
         // not substitute their process-global last-grab timestamp: another
@@ -137,15 +135,13 @@ fn apply_allow_some(
         .map(|device| device.id)
         .filter(|device| has_client_grab(*device))
         .collect();
-    let mut grab_time = allow_some_device_grab_time(state, client_id, device_id, true);
+    let mut grab_time = allow_some_device_grab_time(state, client_id, device_id);
     for other_id in grabbed_devices
         .iter()
         .copied()
         .filter(|id| *id != device_id)
     {
-        if let Some(other_grab_time) =
-            allow_some_device_grab_time(state, client_id, other_id, false)
-        {
+        if let Some(other_grab_time) = allow_some_device_grab_time(state, client_id, other_id) {
             grab_time = match grab_time {
                 None => Some(other_grab_time),
                 Some(current)
