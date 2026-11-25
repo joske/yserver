@@ -52,8 +52,9 @@ focus, and device notifications", taken at `8247002b`. Line numbers below are na
   (`fixture.state.start_instant = Instant::now() + Duration::from_secs(30)`, as in `access_notify_support.rs`), so
   the timestamp is zero in both runs.
 - Byte parity is pinned against base behavior, not against another run of the new code: for every event a task
-  touches, one no-policy test asserts the complete literal frames (all 32 bytes, sequence and byte order included,
-  timestamp pinned to zero). The Allow and denial comparisons use those literal frames. Such baseline tests pass
+  touches, one no-policy test asserts the complete literal output for each recipient stream: the whole event, its
+  variable payload included (HierarchyChanged device records, DeviceChanged class data), sequence and byte order,
+  timestamp pinned to zero, and the frames around it in order. The Allow and denial comparisons use those literal frames. Such baseline tests pass
   before and after the implementation; their failure is shown by their named mutation.
 - Expected event descriptions in tests are written out with `EventDescription::extension(..)` from the XI constants,
   not through the production helpers, so a wrong helper fails a test and every red step compiles.
@@ -91,10 +92,10 @@ denied recipient.
 | X3 / 2 | XI2 DeviceChanged | `X/hotplug.rs:emit_xi2_device_changed` (263) | each (client, window) pair | W(selected window) | Drop; continue pairs | `Xi/exevents.c:747-760` |
 | X4 / 2 | XI2 DeviceChanged bootstrap | `P/xi/mod.rs:emit_xi2_device_changed_bootstrap` (629 → 650) | the issuing client, one event per selected master | W(ROOT_WINDOW) | Drop that master's event before appending | none: yserver producer, spec subject ruling |
 | X5 / 3 | XI1 DeviceMappingNotify | `C/xi1_focus.rs:emit_device_mapping_notify` (626) | aggregate class selectors, minus originator | D(deviceid) | Drop | `dix/inpututils.c:103` (per-window broadcast; device subject is a yserver rule) |
-| X5b / 3 | XI1 DeviceMappingNotify after an XKB Set request | `C/xkb_select.rs:send_legacy_map_notify` (430) → X5 with `originator: None` | every matching selector, the XKB requester included | D(deviceid) | Drop; XKB and core notifications keep their existing delivery | `xkb/xkbEvents.c:117-133` (Xorg writes the core notification before its per-window XI1 broadcast) |
+| X5b / 3 | XI1 DeviceMappingNotify after an XKB change | `C/xkb_select.rs:send_legacy_map_notify` (430) → X5 with `originator: None` | every matching selector, the XKB requester included | D(deviceid) | Drop; the core notification keeps its existing delivery | key map: core write `xkb/xkbEvents.c:117`, XI1 broadcast `:142`; modifier map: core `:126`, XI1 `:154` |
 | X6 / 3 | XI1 ChangeDeviceNotify | `C/xi1_focus.rs:emit_change_device_notify` (696) | aggregate class selectors, minus originator | D(deviceid) | Drop | none: Xorg returns `BadDevice` (`Xi/chgkbd.c:92`) |
 | X7a / 3 | Originator DeviceMappingNotify, inline | `P/xi/dispatch/control.rs` key map (483), button map (841) | the originator, if selected | D(deviceid) | Drop the inline copy; keep reply and order | key map: `xkb/xkbEvents.c:133`; button map: `dix/inpututils.c:103`. The separate originator copy, its order and the device subject are yserver behavior |
-| X7b / 3 | Originator DeviceMappingNotify, singleton fanout | `P/xi/dispatch/control.rs` modifier map, `notify_device` closure (640) | the originator, if selected | D(deviceid) | Drop; the closure keeps running before the core `MappingNotify` | `xkb/xkbEvents.c:133`; same yserver note |
+| X7b / 3 | Originator DeviceMappingNotify, singleton fanout | `P/xi/dispatch/control.rs` modifier map, `notify_device` closure (640) | the originator, if selected | D(deviceid) | Drop; the closure keeps running before the core `MappingNotify` | modifier map: core `xkb/xkbEvents.c:126`, XI1 broadcast `:154`; same yserver note |
 | X8 / 3 | Originator ChangeDeviceNotify | `P/xi/dispatch/devices.rs` ChangeKeyboardDevice (663) | the originator, if selected | D(deviceid) | Drop the inline copy; keep core MappingNotify and reply | none (as X6) |
 | X9 / 4 | XI2 PropertyEvent | `P/props.rs:emit_property_change` (778) | aggregate exact/`XIAllDevices` selectors | D(deviceid) | Drop | `Xi/xiproperty.c:185-208` (per-window broadcast; device subject is a yserver rule) |
 | X10 / 4 | XI1 DevicePropertyNotify | `P/props.rs:emit_property_change` (821) | aggregate exact-class selectors | D(deviceid) | Drop; independent of X9 | same |
@@ -135,7 +136,12 @@ Task paths: production paths relative to `crates/yserver-core/src/`; `tests/` = 
     outside `process_request`; assert the recorded check has `request: None`; when driven by the enable request,
     `request` equals `Some` of that request's opcodes.
     `// mutation: hard-code Some(RequestOpcodes) in the check`
-- [ ] **Step 2: Run** `cargo test -p yserver-core access_xi_notify` — Expected: the tests compile and FAIL on their assertions (no Receive calls recorded).
+  - `receive_xi_hotplug_baseline_frames`: no policy installed; a device is disabled with both selections on ROOT
+    and a child. Pin each client's complete literal output: DevicePresenceNotify and HierarchyChanged with its
+    device records, one copy per selected window, in order. Passes before and after.
+    `// mutation: drop the last hierarchy device record`
+- [ ] **Step 2: Run** `cargo test -p yserver-core access_xi_notify` — Expected: the denial tests compile and FAIL on
+  their assertions (no Receive calls recorded); the baseline test passes.
 - [ ] **Step 3: Implement** the two helpers and switch X1, X2 to the checked fanout with `W(selected_window)`
   (rename `_selected_window`). Build the `EventBatch` once outside the loop. The helpers are added in this step and
   used only by production code.
@@ -164,7 +170,12 @@ with both masters denied nothing is written and the request still succeeds.
     master's event arrives, byte-identical to its all-Allow bytes; the selection is stored. Variant denying every
     DeviceChanged Receive call (admission allowed): no event bytes, no error, selection stored.
     `// mutation: check once for the whole buffer instead of per master`
-- [ ] **Step 2: Run** `cargo test -p yserver-core access_xi_notify` — Expected: the two new tests FAIL.
+  - `receive_xi_device_changed_baseline_frames`: no policy installed. Pin the complete literal output, class data
+    included, of the slave-switch DeviceChanged (one copy per selected window) and of the bootstrap (pointer
+    master's event, then keyboard master's, then nothing else). Passes before and after.
+    `// mutation: swap the bootstrap master order`
+- [ ] **Step 2: Run** `cargo test -p yserver-core access_xi_notify` — Expected: the two denial tests FAIL; the
+  baseline test passes.
 - [ ] **Step 3: Implement** X3 as in Task 1 and X4 as stated in Interfaces.
 - [ ] **Step 4: Run** the tests, `cargo test -p yserver-core xi` and the crate suite under load — Expected: PASS.
 - [ ] **Step 5: Commit** `feat(access): Receive on XI DeviceChanged and its bootstrap`.
@@ -204,13 +215,17 @@ state.receive_request)`; only `Allow` appends the copy. Core `MappingNotify` wri
   - `receive_xi_mapping_change_baseline_order`: no policy installed. Pin complete literal frames:
     SetDeviceButtonMapping → reply then DeviceMappingNotify; ChangeKeyboardDevice → ChangeDeviceNotify, core
     `MappingNotify`, reply; SetDeviceModifierMapping on the master keyboard → DeviceMappingNotify, core
-    `MappingNotify`, reply. Passes before and after the implementation.
+    `MappingNotify`, reply. Also pin each non-originator stream: for ChangeKeyboardDevice, a selecting other client
+    gets ChangeDeviceNotify with its own sequence, then core `MappingNotify`. Passes before and after the
+    implementation. Second mutation: give X6 the request's sequence instead of the recipient's.
     `// mutation: append X7a's button-map copy before the reply`
-  - `receive_xi_mapping_after_xkb_set_request`: the XKB requester and another client select the master keyboard's
-    DeviceMappingNotify; an XKB SetMap request changes the key map; deny the requester's XI1 copy. The requester
-    gets no XI1 copy but keeps its XKB and core notifications and the reply, literal and in order; the other
-    client's XI1 frame equals its literal baseline; the recorded check uses `D(DEVICEID_MASTER_KEYBOARD)`; no Receive
-    call is recorded for the XKB or core notifications. `// mutation: leave X5 on the unchecked fanout`
+  - `receive_xi_mapping_after_xkb_change`: two clients select the master keyboard's DeviceMappingNotify; call the
+    production `xkb_select::send_legacy_map_notify` directly (server work, `receive_request` = `None`) with a key-map
+    change; deny client A's XI1 copy. A gets its core `MappingNotify` and no XI1 copy; B gets core `MappingNotify`
+    then XI1, equal to the literal baseline; the recorded check uses `D(DEVICEID_MASTER_KEYBOARD)`; no Receive call
+    is recorded for the core notification. No backend change is needed: `RecordingBackend` produces no XKB SetMap
+    output, and this emitter is the shared tail of every XKB-caused path.
+    `// mutation: leave X5 on the unchecked fanout`
 - [ ] **Step 2: Run** `cargo test -p yserver-core access_xi_notify`, then
   `cargo test -p yserver-core access_notify_exemptions` — Expected: the new denial tests and the updated exemption
   test FAIL; the baseline-order test passes.
