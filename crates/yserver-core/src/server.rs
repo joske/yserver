@@ -3022,6 +3022,9 @@ pub struct PendingPresentPixmap {
     /// pins the exact DRM syncobj independently of subsequent XID reuse.
     pub wake: crate::backend::PresentWake,
     pub masked_options: u32,
+    /// Arrival-time decision to submit a future-target Async request as a
+    /// synced flip. Retained through source, acquire, and MSC deferrals.
+    pub future_target_sync: bool,
     pub src_host_xid: u32,
     pub paint_dst_host_xid: u32,
     pub completion_dst_host_xid: u32,

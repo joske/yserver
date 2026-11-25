@@ -601,6 +601,194 @@ fn a3_offer_output_candidate_after_probation(
     accepted
 }
 
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+fn async_candidates_admit_tearing_then_synced_candidate_commits_vsync() {
+    use std::os::fd::{AsFd, AsRawFd};
+    use yserver_core::backend::Backend;
+
+    let Some((fixture, _)) = a3_output_fixture(1, 1180) else {
+        eprintln!(
+            "SKIP async_candidates_admit_tearing_then_synced_candidate_commits_vsync: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    for device in &mut fixture.events.backend.platform.devices {
+        device.async_page_flip = true;
+    }
+
+    let tearing = fixture.install_direct_output_present(
+        1,
+        1181,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    );
+    fixture
+        .events
+        .backend
+        .for_tests_set_scanout_m1_prober(super::present_scanout::record_scanout_m1_probe);
+
+    let fd = fixture.events.backend.platform.devices[0]
+        .device
+        .as_fd()
+        .as_raw_fd();
+    let tearing_start = fixture.events.recorders[&fd].records().len();
+    assert!(
+        a3_offer_output_candidate_after_probation(&mut fixture, &tearing),
+        "Async Output Present enters after direct probation"
+    );
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("scheduler submits the initial direct candidate");
+    fixture.events.wait_for_submitted_gpu_work();
+    let initial_records = a3_records_since(&fixture, fd, tearing_start);
+    let _initial_commit = initial_records
+        .iter()
+        .find(|record| {
+            super::commit_identity::accepted_event_id(record).is_some()
+                && record.events.len() == 1
+                && record.events[0].crtc == fixture.events.backend.platform.outputs[1].output.crtc
+        })
+        .expect("probationary candidate has an accepted direct commit");
+    assert_eq!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .pending
+            .as_ref()
+            .map(|frame| frame.candidate.present_id),
+        Some(tearing.candidate.present_id),
+        "the probationary commit belongs to the direct owner"
+    );
+    a3_retire_records(&mut fixture, &initial_records);
+    let initial_completion = Backend::drain_completed_present_events(&mut fixture.events.backend);
+    assert_eq!(initial_completion.len(), 1);
+    assert_eq!(
+        initial_completion[0].present_id,
+        tearing.candidate.present_id
+    );
+    assert!(Backend::drain_retired_present_idle_events(&mut fixture.events.backend).is_empty());
+    assert_eq!(
+        fixture.events.backend.tearing_scope(),
+        Some(crate::kms::render::backend::DirectScope::Output(1)),
+        "Async candidates complete tearing admission probation"
+    );
+
+    let mut async_tearing = tearing.candidate;
+    async_tearing.present_id += 2;
+    let mut async_tearing_event = tearing.event.clone();
+    async_tearing_event.present_id = async_tearing.present_id;
+    async_tearing_event.serial = async_tearing_event.serial.wrapping_add(2);
+    let async_start = fixture.events.recorders[&fd].records().len();
+    Backend::note_present_scanout_candidate(&mut fixture.events.backend, async_tearing);
+    assert!(
+        Backend::try_present_direct(
+            &mut fixture.events.backend,
+            async_tearing,
+            async_tearing_event.clone(),
+        )
+        .expect("tearing owner accepts its Async follow-up through Backend")
+    );
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("scheduler submits the accepted Async follow-up");
+    fixture.events.wait_for_submitted_gpu_work();
+    let async_records = a3_records_since(&fixture, fd, async_start);
+    let async_commit = async_records
+        .iter()
+        .find(|record| {
+            super::commit_identity::accepted_event_id(record).is_some()
+                && record.events.len() == 1
+                && record.events[0].crtc == fixture.events.backend.platform.outputs[1].output.crtc
+        })
+        .expect("tearing owner follow-up has an accepted direct commit");
+    assert_eq!(
+        async_commit.kind,
+        crate::drm::atomic::AtomicCommitKind::Async,
+        "recorded direct commit carries the Async flag"
+    );
+    a3_retire_records(&mut fixture, &async_records);
+    let async_completion = Backend::drain_completed_present_events(&mut fixture.events.backend);
+    assert_eq!(async_completion.len(), 1, "Async Present retires once");
+    assert_eq!(async_completion[0].present_id, async_tearing.present_id);
+    let idled = Backend::drain_retired_present_idle_events(&mut fixture.events.backend);
+    assert_eq!(idled.len(), 1);
+    assert_eq!(idled[0].present_id, tearing.candidate.present_id);
+    assert_eq!(
+        fixture.events.backend.tearing_scope(),
+        Some(crate::kms::render::backend::DirectScope::Output(1)),
+        "the Async probation admits this window as the tearing owner"
+    );
+
+    let mut synced = async_tearing;
+    synced.present_id += 1;
+    synced.options &= !yserver_core::present_scheduler::PRESENT_OPTION_ASYNC;
+    let mut synced_event = async_tearing_event;
+    synced_event.present_id = synced.present_id;
+    synced_event.serial = synced_event.serial.wrapping_add(1);
+    synced_event.options = synced.options;
+    let synced_start = fixture.events.recorders[&fd].records().len();
+    Backend::note_present_scanout_candidate(&mut fixture.events.backend, synced);
+    assert!(
+        Backend::try_present_direct(&mut fixture.events.backend, synced, synced_event)
+            .expect("candidate without Async goes through Backend"),
+        "same-window synced successor remains direct eligible"
+    );
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("scheduler submits the synced successor");
+    fixture.events.wait_for_submitted_gpu_work();
+    let synced_records = a3_records_since(&fixture, fd, synced_start);
+    let synced_commit = synced_records
+        .iter()
+        .find(|record| {
+            super::commit_identity::accepted_event_id(record).is_some()
+                && record.events.len() == 1
+                && record.events[0].crtc == fixture.events.backend.platform.outputs[1].output.crtc
+        })
+        .expect("synced candidate has an accepted direct commit");
+    assert_ne!(
+        synced_commit.kind,
+        crate::drm::atomic::AtomicCommitKind::Async,
+        "candidate without Async commits in sync"
+    );
+    assert_eq!(
+        fixture.events.backend.tearing_scope(),
+        None,
+        "candidate without Async exits tearing"
+    );
+    a3_retire_records(&mut fixture, &synced_records);
+    let synced_completion = Backend::drain_completed_present_events(&mut fixture.events.backend);
+    assert_eq!(synced_completion.len(), 1, "synced Present retires once");
+    assert_eq!(synced_completion[0].present_id, synced.present_id);
+    let idled = Backend::drain_retired_present_idle_events(&mut fixture.events.backend);
+    assert_eq!(idled.len(), 1);
+    assert_eq!(idled[0].present_id, async_tearing.present_id);
+    assert_eq!(
+        synced_completion[0]
+            .completion_clock
+            .expect("retirement carries its CRTC clock")
+            .msc,
+        60,
+        "synced completion is stamped with the retirement MSC"
+    );
+
+    Backend::unmap_subwindow(&mut fixture.events.backend, None, tearing.target_xid)
+        .expect("remove direct target through Backend");
+    let cleanup_start = fixture.events.recorders[&fd].records().len();
+    Backend::maybe_composite(&mut fixture.events.backend).expect("submit owner replacement");
+    fixture.events.wait_for_submitted_gpu_work();
+    let cleanup = a3_records_since(&fixture, fd, cleanup_start);
+    assert!(
+        a3_has_scene_commit_for(
+            &cleanup,
+            fixture.events.backend.platform.outputs[1].output.crtc
+        ),
+        "the unmap replaces the retained direct frame with a composed frame"
+    );
+    a3_retire_records(&mut fixture, &cleanup);
+    let _ = Backend::drain_completed_present_events(&mut fixture.events.backend);
+    let idled = Backend::drain_retired_present_idle_events(&mut fixture.events.backend);
+    assert_eq!(idled.len(), 1);
+    assert_eq!(idled[0].present_id, synced.present_id);
+    fixture.finish_after_normal_drain();
+}
+
 fn a3_submit_gamma_commit(
     fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixtureGuard,
     output_idx: usize,
@@ -935,6 +1123,84 @@ fn unpaced_output_client_enters_direct_on_first_retirement() {
         crate::drm::atomic::AtomicCommitKind::Async,
         "the async requester enters synchronously while Output(0) owns tearing"
     );
+    fixture.events.wait_for_submitted_gpu_work();
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: a Root first entry behind a composed flip takes Copy. Each Copy
+// queues the next composed flip, so a steady stream never entered direct.
+fn root_first_entry_waits_for_pending_scene_flip() {
+    use yserver_core::backend::Backend;
+
+    let Some((fixture, direct)) = a3_root_fixture(985) else {
+        eprintln!("SKIP root_first_entry_waits_for_pending_scene_flip: Vulkan fixture unavailable");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let fd = fixture.kms_fd(0);
+    let scene_start = fixture.events.recorders[&fd].records().len();
+    a3_submit_composed_scene_commit(&mut fixture, 0);
+    assert!(fixture.events.backend.scene.has_pending_page_flip(0));
+    let before = fixture.events.recorders[&fd].records().len();
+
+    let probation = usize::from(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION);
+    for attempt in 0..probation {
+        assert_eq!(
+            Backend::try_present_direct(
+                &mut fixture.events.backend,
+                direct.candidate,
+                direct.event.clone(),
+            )
+            .expect("Root Present enters through Backend"),
+            attempt + 1 == probation,
+            "the post-probation Root Present is owned by direct, not Copy"
+        );
+    }
+    a3_tick(&mut fixture);
+    let owner = fixture.events.backend.pstate.direct.root();
+    assert_eq!(
+        owner
+            .queued_successor
+            .as_ref()
+            .map(|frame| frame.candidate.present_id),
+        Some(direct.candidate.present_id),
+        "the pending composed flip keeps the Root first entry queued"
+    );
+    assert!(owner.pending.is_none() && owner.current.is_none());
+    assert!(
+        a3_records_since(&fixture, fd, before)
+            .iter()
+            .all(|record| record.events.len() < fixture.events.backend.platform.outputs.len()),
+        "no grouped direct commit while Output(0)'s composed flip is pending"
+    );
+
+    // Retire every composed flip; the grouped entry waits for all outputs.
+    let scene_records = a3_records_since(&fixture, fd, scene_start);
+    a3_retire_records(&mut fixture, &scene_records);
+    assert!(
+        (0..fixture.events.backend.platform.outputs.len()).all(|output_idx| !fixture
+            .events
+            .backend
+            .scene
+            .has_pending_page_flip(output_idx))
+    );
+    let dispatch = a3_tick(&mut fixture);
+    let owner = fixture.events.backend.pstate.direct.root();
+    let pending = owner
+        .pending
+        .as_ref()
+        .expect("the composed flip's retirement dispatches the Root entry");
+    assert_eq!(pending.candidate.present_id, direct.candidate.present_id);
+    assert!(owner.queued_successor.is_none());
+    let pending_id = pending
+        .accepted_event_id
+        .expect("queued Root frame accepted after scene retirement");
+    assert!(dispatch.iter().any(|record| {
+        super::commit_identity::accepted_event_id(record) == Some(pending_id)
+            && record.events.len() == fixture.events.backend.platform.outputs.len()
+    }));
     fixture.events.wait_for_submitted_gpu_work();
     fixture.finish();
 }

@@ -104,12 +104,10 @@ pub struct ImportedDmabufMetadata {
     pub fourcc: u32,
     pub vk_format: vk::Format,
     pub modifier: u64,
-    /// True when the client never named the layout (legacy
-    /// `PixmapFromBuffer`), so `modifier` above is **our guess**, not a
-    /// fact. Any consumer that acts on the layout -- notably the M1
-    /// direct-scanout probe, which would hand the buffer to KMS
-    /// described as linear -- must refuse such a pixmap rather than
-    /// trust the field.
+    /// True when the import came from the legacy no-modifier
+    /// `PixmapFromBuffer` request. `modifier` may have been resolved from
+    /// the kernel GEM metadata for composition, but direct scanout still
+    /// treats the layout as unvalidated and must refuse it.
     pub implicit_layout: bool,
     pub planes: Vec<ImportedDmabufPlane>,
     pub width: u16,
@@ -257,9 +255,12 @@ impl Storage {
     /// as a v2 `Storage`. The handles in `image`/`memory`/`image_view`
     /// alias the inner `DrawableImage`; the inner `Drop` owns the
     /// release of those handles + the imported dma-buf fd.
-    /// `current_layout` starts at `UNDEFINED` (`DrawableImage`'s
-    /// `from_dmabuf` likewise leaves the image undefined until the
-    /// first paint barrier). Used by `dri3_import_pixmap`.
+    /// `current_layout` starts at `GENERAL`, not `UNDEFINED`: the
+    /// client has already written the dma-buf, so the first server-side
+    /// copy/sample must preserve its contents. A first transition from
+    /// `UNDEFINED` lets the driver discard or re-tile them, which shows
+    /// up as banding in GPU-composited clients. Used by
+    /// `dri3_import_pixmap`.
     pub fn from_imported_drawable_image(
         drawable: crate::kms::vk::target::DrawableImage,
         sample_view: vk::ImageView,
@@ -279,7 +280,7 @@ impl Storage {
             extent,
             format,
             depth,
-            current_layout: vk::ImageLayout::UNDEFINED,
+            current_layout: vk::ImageLayout::GENERAL,
             is_test_stub: false,
             imported_drawable: Some(drawable),
             imported_dmabuf: Some(imported_dmabuf),

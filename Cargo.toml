@@ -28,16 +28,19 @@ input = "0.10"
 libc = "0.2.191"
 log = "0.4"
 mio = { version = "1", features = ["net", "os-ext", "os-poll"] }
-nix = { version = "0.31", features = [
-  "event",
-  "fs",
-  "ioctl",
-  "mman",
-  "poll",
-  "signal",
-  "socket",
-  "term",
-] }
+nix = {
+  version = "0.32",
+  features = [
+    "event",
+    "fs",
+    "ioctl",
+    "mman",
+    "poll",
+    "signal",
+    "socket",
+    "term",
+  ]
+}
 roxmltree = "0.21"
 serde_json = "1"
 thiserror = "2"

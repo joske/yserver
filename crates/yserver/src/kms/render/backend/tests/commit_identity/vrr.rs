@@ -36,6 +36,8 @@ use yserver_core::backend::{Backend, ModeSpec};
 
 const VRR_PROP_ID: u32 = 90;
 
+#[path = "vrr_async_present.rs"]
+mod async_present_tests;
 #[path = "vrr_cursor_idle.rs"]
 mod cursor_idle;
 #[path = "vrr_per_output.rs"]
@@ -1131,12 +1133,27 @@ fn request_present(
     serial: u32,
     sequence: u16,
 ) {
+    request_present_with_options(state, backend, window, pixmap, serial, 0, 0, sequence);
+}
+
+fn request_present_with_options(
+    state: &mut yserver_core::server::ServerState,
+    backend: &mut KmsBackend,
+    window: u32,
+    pixmap: u32,
+    serial: u32,
+    options: u32,
+    target_msc: u64,
+    sequence: u16,
+) {
     use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber, present as x11present};
 
     let mut body = vec![0_u8; 68];
     body[0..4].copy_from_slice(&window.to_le_bytes());
     body[4..8].copy_from_slice(&pixmap.to_le_bytes());
     body[8..12].copy_from_slice(&serial.to_le_bytes());
+    body[36..40].copy_from_slice(&options.to_le_bytes());
+    body[44..52].copy_from_slice(&target_msc.to_le_bytes());
     yserver_core::core_loop::process_request::process_request(
         state,
         backend,
