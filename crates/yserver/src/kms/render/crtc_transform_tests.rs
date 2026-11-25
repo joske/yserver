@@ -555,6 +555,7 @@ fn motion(b: &mut KmsBackend, state: &mut ServerState, to: (i32, i32), delta: (i
             dx: delta.0,
             dy: delta.1,
             motion_delta: None,
+            device_axes: None,
         },
     );
 }

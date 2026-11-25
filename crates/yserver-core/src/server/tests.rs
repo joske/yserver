@@ -626,6 +626,7 @@ fn xi_dynamic_reset_nested_host_pointer_uses_master_xi_ids() {
             raw_dx: 1,
             raw_dy: 2,
             tree_change: false,
+            device_axes: None,
         },
     );
 
@@ -1045,6 +1046,7 @@ fn replay_pointer_delivers_to_button_press_window_not_grab_owner() {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         },
     );
 
@@ -1223,6 +1225,7 @@ fn passive_grab_owner_events_keeps_child_delivery_on_owned_windows() {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         },
     );
 
@@ -1402,6 +1405,7 @@ fn passive_grab_owner_events_keeps_descendant_delivery_even_when_child_owned_els
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         },
     );
 
@@ -1543,6 +1547,7 @@ fn pointer_event_fanout_filters_by_mask() {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         },
     );
 
@@ -1681,6 +1686,7 @@ fn pointer_event_fanout_delivers_motion_under_button_motion_mask() {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         },
     );
 
@@ -1718,6 +1724,7 @@ fn pointer_event_fanout_delivers_motion_under_button_motion_mask() {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         },
     );
     let a_read2 = a_reader_remote.read(&mut buf);
@@ -1789,6 +1796,7 @@ fn pointer_event_fanout_drops_unknown_host_xid() {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         },
     );
 

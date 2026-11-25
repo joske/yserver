@@ -330,6 +330,12 @@ pub struct PassiveButtonGrab {
     pub via_xi2: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassiveGrabPass {
+    Slave(u16),
+    Master,
+}
+
 #[derive(Debug, Clone)]
 pub struct KeyGrab {
     pub owner: ClientId,
@@ -414,6 +420,10 @@ pub struct Xi1ActiveGrab {
     pub owner_events: bool,
     pub this_mode: u8,
     pub other_mode: u8,
+    /// True when a DeviceButtonPress selection created the grab implicitly.
+    pub implicit: bool,
+    /// Union of the grab window's XI1 event classes at implicit activation.
+    pub device_mask: u32,
     /// Some(detail) when activated from a passive key/button grab —
     /// auto-released when that detail is released.
     pub passive_detail: Option<u8>,
@@ -492,6 +502,7 @@ pub struct Xi1Freeze {
 #[derive(Debug, Clone)]
 pub enum QueuedInputEvent {
     HostPointer(crate::host_x11::HostPointerEvent),
+    HostPointerMaster(crate::host_x11::HostPointerEvent, Option<(u8, i32)>),
     HostKey(crate::host_x11::HostKeyEvent),
     /// A key already processed through the per-device/master guards. Keep the
     /// accepted master edge with frozen delivery so thaw cannot infer a new
@@ -1125,6 +1136,8 @@ pub struct PresentWindowMsc {
     pub last_raw_msc: u64,
 }
 
+pub use crate::xinput::XiInputClient;
+
 #[derive(Debug)]
 pub struct ServerState {
     pub atoms: AtomTable,
@@ -1181,6 +1194,10 @@ pub struct ServerState {
     /// from request handlers that have no backend handle to query the
     /// pointer; without this cache they ship at (0,0).
     pub pointer_root: (i16, i16),
+    /// Authoritative position of the master pointer sprite. Slave and
+    /// floating-device input do not advance it; a queued master part advances
+    /// it only when that part is processed (`../xserver/Xi/exevents.c:1854-1855,1950`).
+    pub master_sprite_root: (i16, i16),
     /// Active pointer grab record (full state including event_mask/cursor/time).
     pub active_pointer_grab: Option<ActivePointerGrab>,
     /// XI2 pointer grabs on exact slave devices. Master and core pointer
@@ -1196,6 +1213,13 @@ pub struct ServerState {
     pub floating_pointer_positions: HashMap<u16, (f32, f32)>,
     /// Registered passive button grabs.
     pub button_grabs: Vec<PassiveButtonGrab>,
+    /// Canonical Xorg `InputClients` entries, newest first. Duplicate clients
+    /// are retained because DevicePresence always prepends a new entry.
+    pub xi_input_clients: HashMap<ResourceId, Vec<XiInputClient>>,
+    /// Sticky Xorg `inputEvents` aggregate used by `ShouldFreeInputMasks` and
+    /// implicit-grab mask snapshots; event bits accumulate until the window's
+    /// OtherInputMasks storage is freed.
+    pub xi1_window_input_events: HashMap<ResourceId, HashMap<u16, u64>>,
     /// Global withheld-event queue, in arrival order across devices.
     pub sync_pending: std::collections::VecDeque<PendingSyncEvent>,
     /// Xorg `syncEvents.playingEvents`: prevents nested replay passes.
@@ -2124,12 +2148,15 @@ impl ServerState {
             xkb_interests: HashMap::new(),
             selections: HashMap::new(),
             pointer_root: (0, 0),
+            master_sprite_root: (0, 0),
             active_pointer_grab: None,
             xi2_pointer_grabs: HashMap::new(),
             xi2_keyboard_grabs: HashMap::new(),
             xi2_detached_masters: HashMap::new(),
             floating_pointer_positions: HashMap::new(),
             button_grabs: Vec::new(),
+            xi_input_clients: HashMap::new(),
+            xi1_window_input_events: HashMap::new(),
             sync_pending: std::collections::VecDeque::new(),
             playing_sync_events: false,
             key_grabs: Vec::new(),
@@ -3459,23 +3486,18 @@ pub struct ClientState {
     /// (X11 ChangeSaveSet semantics).
     pub save_set: HashSet<ResourceId>,
     pub big_requests_enabled: bool,
-    /// XI2 event masks: (window_id, device_id) -> mask. Bit n selects
-    /// XI2 event type n; XI 2.4 defines types up to 32
-    /// (`XI_GestureSwipeEnd`), so the mask needs more than 32 bits.
+    /// Derived lookup cache for (window, device) -> XI2 mask. Canonical masks
+    /// live in `ServerState::xi_input_clients`; bit n selects XI2 event n.
     pub xi2_masks: HashMap<(ResourceId, u16), u64>,
     /// XI1 `XEventClass` values the client has selected via
     /// `SelectExtensionEvent` (XInput minor 6). Each class encodes
     /// `(deviceid << 8) | event_code` where `event_code` is one of the
     /// 17 XInput event types at `XI_FIRST_EVENT..=XI_FIRST_EVENT + 16`.
-    /// This is a delivery-oriented aggregate of the server-wide
-    /// notifications selected in `xi1_window_event_classes`. The canonical
-    /// per-window state lives there so GetSelectedExtensionEvents can report
-    /// the selection accurately.
+    /// Delivery aggregate of server-wide notifications selected per window.
+    /// Canonical per-window state lives in `ServerState::xi_input_clients`.
     pub xi1_event_classes: HashSet<u32>,
-    /// Canonical XI1 event classes per window. DeviceKeyPress through
-    /// DeviceMotionNotify are delivered by walking the event window's ancestor chain
-    /// (Xorg dix `DeliverDeviceEvents`). Key: window; value: the
-    /// selected `XEventClass` values for it.
+    /// Derived XI1 class cache by window. Canonical, duplicate-preserving
+    /// selections live in `ServerState::xi_input_clients`.
     pub xi1_window_event_classes: HashMap<ResourceId, HashSet<u32>>,
     /// Outbound bytes buffered when the client write fd would block.
     /// Populated in D2.
@@ -4058,23 +4080,6 @@ impl ServerState {
         Some((owner.window, target))
     }
 
-    pub fn drop_window_subscriptions(&mut self, windows: &[ResourceId]) {
-        for client in self.clients.values_mut() {
-            for w in windows {
-                client.event_masks.remove(w);
-                client.xi1_window_event_classes.remove(w);
-            }
-            client
-                .xi2_masks
-                .retain(|(window, _), _| !windows.contains(window));
-            client.rebuild_xi1_global_event_classes();
-        }
-        // Xorg `CursorFreeWindow`: a destroyed window takes every
-        // client's XFIXES cursor selection on it along.
-        self.xfixes_cursor_masks
-            .retain(|(_, window), _| !windows.contains(window));
-    }
-
     pub fn find_passive_grab(
         &self,
         window: ResourceId,
@@ -4082,16 +4087,12 @@ impl ServerState {
         state_mask: u16,
         device_id: u16,
         master_device_id: Option<u16>,
-    ) -> Option<PassiveButtonGrab> {
-        // X11 GrabButton: the grab activates only when "no other
-        // buttons ... are logically down" (XGrabButton-1).
-        if button >= 1 && self.buttons_down & !(1u16 << (button - 1)) != 0 {
-            return None;
-        }
-        // Xorg CheckDeviceGrabs walks the sprite trace TOP-DOWN (root
-        // first): a grab on an ancestor takes precedence over the same
-        // grab deeper in the tree (XTS XGrabButton-4), and root-window
-        // WM grabs match clicks anywhere.
+        replay_pass: Option<PassiveGrabPass>,
+        replay_floor: Option<ResourceId>,
+    ) -> Option<(PassiveButtonGrab, PassiveGrabPass)> {
+        // Xorg checks the slave device over the whole sprite trace before
+        // checking the master (`../xserver/dix/grabs.c:439-458`). Within a
+        // pass, CheckDeviceGrabs walks root-first (`XGrabButton-4`).
         let mut chain = vec![window];
         let mut current = window;
         for _ in 0..256 {
@@ -4104,39 +4105,93 @@ impl ServerState {
             chain.push(w.parent);
             current = w.parent;
         }
-        for current in chain.into_iter().rev() {
-            let attached_master =
-                master_device_id.or_else(|| self.xi_devices.attachment(device_id));
-            let matching = self.button_grabs.iter().filter_map(|grab| {
-                if grab.grab_window != current {
-                    return None;
-                }
-                let button_match = grab.button == 0 || grab.button == button;
-                let mod_match = grab.modifiers == 0x8000 || grab.modifiers == (state_mask & 0x00ff);
-                let device_match = (grab.device_id == 0 && attached_master.is_some())
-                    || grab.device_id == device_id
-                    || Some(grab.device_id) == attached_master;
-                // Xorg ActivatePointerGrab fails when confine_to is
-                // not viewable — the grab does not activate
-                // (XGrabButton-3).
-                let confine_ok = grab.confine_to.0 == 0
-                    || self
-                        .resources
-                        .window(grab.confine_to)
-                        .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
-                (button_match && mod_match && device_match && confine_ok).then(|| {
-                    let specificity = if grab.device_id == device_id && grab.device_id != 0 {
-                        3
-                    } else if grab.device_id != 0 {
-                        2
-                    } else {
-                        1
-                    };
-                    (specificity, grab)
-                })
+        chain.reverse();
+
+        let master_id = master_device_id
+            .or_else(|| self.xi_devices.attachment(device_id))
+            .or_else(|| {
+                (self.xi_devices.role(device_id)
+                    == Some(crate::xinput::XiDeviceRole::MasterPointer))
+                .then_some(device_id)
             });
-            if let Some((_, grab)) = matching.max_by_key(|(specificity, _)| *specificity) {
-                return Some(grab.clone());
+        let mut passes = Vec::with_capacity(2);
+        if let Some(replay_pass) = replay_pass {
+            passes.push(replay_pass);
+        } else {
+            if self.xi_devices.role(device_id) == Some(crate::xinput::XiDeviceRole::SlavePointer) {
+                passes.push(PassiveGrabPass::Slave(device_id));
+            }
+            if master_id.is_some() {
+                passes.push(PassiveGrabPass::Master);
+            }
+        }
+
+        // Replay starts CheckDeviceGrabs strictly below syncEvents.replayWin
+        // (Xorg dix/events.c:1331-1363). If the original grab window is no
+        // longer on the event's sprite trace, there are no candidates below it.
+        let first_window = replay_floor.map_or(0, |floor| {
+            chain
+                .iter()
+                .position(|candidate| *candidate == floor)
+                .map_or(chain.len(), |index| index + 1)
+        });
+
+        for pass in passes {
+            for current in chain.iter().skip(first_window) {
+                let matching = self.button_grabs.iter().rev().find(|grab| {
+                    if grab.grab_window != *current {
+                        return false;
+                    }
+                    let device_match = match pass {
+                        PassiveGrabPass::Slave(slave_id) => {
+                            grab.via_xi2 && (grab.device_id == slave_id || grab.device_id == 0)
+                        }
+                        PassiveGrabPass::Master => {
+                            if grab.via_xi2 {
+                                master_id.is_some_and(|master_id| {
+                                    grab.device_id == master_id
+                                        || grab.device_id == 1
+                                        || grab.device_id == 0
+                                })
+                            } else {
+                                true
+                            }
+                        }
+                    };
+                    let button_match = grab.button == 0 || grab.button == button;
+                    let mod_match =
+                        grab.modifiers == 0x8000 || grab.modifiers == (state_mask & 0x00ff);
+                    // Xorg checks the first-button rule on the device pass that
+                    // owns this candidate (`events.c:4200`). A slave XI2 grab,
+                    // including XIAllDevices on its slave pass, sees only that
+                    // source's held buttons. Core and master candidates see the
+                    // master's aggregate state.
+                    let slave_candidate = matches!(pass, PassiveGrabPass::Slave(_));
+                    let held_buttons = if slave_candidate {
+                        self.xi_devices
+                            .device(device_id)
+                            .map_or(0, |device| device.buttons_down)
+                    } else {
+                        self.buttons_down
+                    };
+                    let no_other_buttons = match button {
+                        0 => true,
+                        1..=16 => held_buttons & !(1u16 << (button - 1)) == 0,
+                        _ => held_buttons == 0,
+                    };
+                    // Xorg ActivatePointerGrab fails when confine_to is
+                    // not viewable — the grab does not activate
+                    // (XGrabButton-3).
+                    let confine_ok = grab.confine_to.0 == 0
+                        || self
+                            .resources
+                            .window(grab.confine_to)
+                            .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
+                    button_match && mod_match && device_match && no_other_buttons && confine_ok
+                });
+                if let Some(grab) = matching {
+                    return Some((grab.clone(), pass));
+                }
             }
         }
         None
@@ -4512,8 +4567,10 @@ fn pointer_event_fanout_inner(
                 event.state,
                 xi_pointer_device_id,
                 None,
+                None,
+                None,
             )
-            .map(|grab| (grab, hit_window))
+            .map(|(grab, _pass)| (grab, hit_window))
         });
         if let Some(grab) = matched {
             let (grab, hit_window) = grab;

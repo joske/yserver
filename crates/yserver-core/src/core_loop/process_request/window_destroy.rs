@@ -86,6 +86,20 @@ pub(crate) fn execute_destroy(
     // XFIXES selection inputs go before `DeleteWindow` runs.
     drop_xfixes_selection_inputs_on(state, top);
 
+    // UnrealizeTree makes every window in the subtree unreachable for input
+    // before DeleteWindowFromAnyEvents deactivates grabs. Deactivation can
+    // replay queued input synchronously, so remove the subtree's passive
+    // grabs before that replay can match a window that is being destroyed.
+    state
+        .button_grabs
+        .retain(|grab| !windows.contains(&grab.grab_window));
+    state
+        .key_grabs
+        .retain(|grab| !windows.contains(&grab.grab_window));
+    state
+        .xi1_passive_grabs
+        .retain(|grab| !windows.contains(&grab.grab_window));
+
     // 2-4. `UnmapWindow(T, FALSE)` (`dix/window.c:2844-2875`).
     let mut unrealized: HashSet<ResourceId> = HashSet::new();
     if top_map_state != MapState::Unmapped {
@@ -172,9 +186,6 @@ pub(crate) fn execute_destroy(
         if !unrealized.contains(&window) {
             delete_window_from_any_events(state, backend, origin, window, &windows, top);
         }
-        state.button_grabs.retain(|g| g.grab_window != window);
-        state.key_grabs.retain(|g| g.grab_window != window);
-        state.xi1_passive_grabs.retain(|g| g.grab_window != window);
         state.drop_window_subscriptions(&[window]);
         // `(*pScreen->DestroyWindow)` (`dix/window.c:1018`): `present_destroy_window`
         // (`present/present_screen.c:89-120`) sends PresentWindowDestroyed,

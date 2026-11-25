@@ -19,11 +19,178 @@ use crate::{
     xinput::{XI_DEVICE_KEY_PRESS_OFFSET, XI2_DEVICE_CHANGED_MASK},
 };
 use log::debug;
-use std::{collections::HashSet, io};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+};
 use yserver_protocol::{
     x11,
     x11::{ClientByteOrder, ClientId, RequestHeader, ResourceId, SequenceNumber},
 };
+
+impl ServerState {
+    pub fn drop_window_subscriptions(&mut self, windows: &[ResourceId]) {
+        for client in self.clients.values_mut() {
+            for window in windows {
+                client.event_masks.remove(window);
+                client.xi1_window_event_classes.remove(window);
+            }
+            client
+                .xi2_masks
+                .retain(|(window, _), _| !windows.contains(window));
+            client.rebuild_xi1_global_event_classes();
+        }
+        self.xi_input_clients
+            .retain(|window, _| !windows.contains(window));
+        self.xi1_window_input_events
+            .retain(|window, _| !windows.contains(window));
+        self.xi1_window_dont_propagate
+            .retain(|window, _| !windows.contains(window));
+        // Xorg `CursorFreeWindow`: a destroyed window takes every
+        // client's XFIXES cursor selection on it along.
+        self.xfixes_cursor_masks
+            .retain(|(_, window), _| !windows.contains(window));
+    }
+
+    /// Returns the position of the first matching Xorg input-client entry;
+    /// duplicate entries are retained and request paths update this first one.
+    pub(crate) fn xi_input_client_index(
+        &self,
+        window: ResourceId,
+        client: ClientId,
+    ) -> Option<usize> {
+        self.xi_input_clients
+            .get(&window)?
+            .iter()
+            .position(|entry| !entry.server_owned_placeholder && entry.client == client)
+    }
+
+    /// Prepends a new Xorg input-client entry, including duplicate clients
+    /// created by `HandleDevicePresenceMask`.
+    pub(crate) fn prepend_xi_input_client(&mut self, window: ResourceId, client: ClientId) {
+        self.xi_input_clients.entry(window).or_default().insert(
+            0,
+            crate::server::XiInputClient {
+                client,
+                server_owned_placeholder: false,
+                xi1_masks: HashMap::new(),
+                xi2_masks: HashMap::new(),
+            },
+        );
+    }
+
+    /// Returns the existing first entry or prepends one when this protocol
+    /// path creates a shared XI selection entry.
+    pub(crate) fn ensure_xi_input_client(
+        &mut self,
+        window: ResourceId,
+        client: ClientId,
+    ) -> (usize, bool) {
+        if let Some(index) = self.xi_input_client_index(window, client) {
+            (index, false)
+        } else {
+            self.prepend_xi_input_client(window, client);
+            (0, true)
+        }
+    }
+
+    /// Rebuilds legacy client-local lookup maps from the canonical per-window
+    /// input-client entries, so existing delivery helpers remain projections.
+    pub(crate) fn refresh_xi_client_selection_projection(&mut self, client: ClientId) {
+        let mut xi1 = HashMap::<ResourceId, HashSet<u32>>::new();
+        let mut xi2 = HashMap::<(ResourceId, u16), u64>::new();
+        for (window, entries) in &self.xi_input_clients {
+            for entry in entries.iter().filter(|entry| entry.client == client) {
+                for classes in entry.xi1_masks.values() {
+                    xi1.entry(*window)
+                        .or_default()
+                        .extend(classes.iter().copied());
+                }
+                for (&device, &mask) in &entry.xi2_masks {
+                    if mask != 0 {
+                        *xi2.entry((*window, device)).or_default() |= mask;
+                    }
+                }
+            }
+        }
+        if let Some(client_state) = self.clients.get_mut(&client.0) {
+            client_state.xi1_window_event_classes = xi1;
+            client_state.xi2_masks = xi2;
+            client_state.rebuild_xi1_global_event_classes();
+        }
+    }
+
+    /// Implements Xorg's `ShouldFreeInputMasks`: the retained XI1 aggregate
+    /// and the current do-not-propagate masks both keep the window storage live.
+    pub(crate) fn should_free_xi_input_masks(&self, window: ResourceId) -> bool {
+        let has_input_events = self
+            .xi1_window_input_events
+            .get(&window)
+            .is_some_and(|per_device| per_device.values().any(|mask| *mask != 0));
+        let has_dont_propagate = self
+            .xi1_window_dont_propagate
+            .get(&window)
+            .is_some_and(|classes| !classes.is_empty());
+        !has_input_events && !has_dont_propagate
+    }
+
+    /// Removes one `FreeResource` target entry and refreshes that client's
+    /// projected maps so freeing also drops this entry's XI1 and XI2 masks.
+    pub(crate) fn remove_xi_input_client(
+        &mut self,
+        window: ResourceId,
+        index: usize,
+    ) -> Option<ClientId> {
+        let entries = self.xi_input_clients.get_mut(&window)?;
+        if index >= entries.len() {
+            return None;
+        }
+        let client = entries[index].client;
+        let has_dont_propagate = self
+            .xi1_window_dont_propagate
+            .get(&window)
+            .is_some_and(|classes| !classes.is_empty());
+        // ../xserver/Xi/exevents.c:2833-2868: only the sole remaining
+        // node can retain storage. Transfer its resource ownership intact;
+        // its XI1/XI2 masks still participate in exclusivity and aggregation.
+        if entries.len() == 1 && has_dont_propagate {
+            entries[index].client = ClientId(0);
+            entries[index].server_owned_placeholder = true;
+        } else {
+            entries.remove(index);
+            if entries.is_empty() {
+                self.xi_input_clients.remove(&window);
+                self.xi1_window_input_events.remove(&window);
+                self.xi1_window_dont_propagate.remove(&window);
+            }
+        }
+        self.refresh_xi_client_selection_projection(client);
+        Some(client)
+    }
+
+    /// Drops every shared XI input-client entry owned by a disconnected
+    /// client. If the last client leaves, Xorg frees all window input-mask
+    /// storage unless DNP masks keep it alive as a server-owned placeholder.
+    pub(crate) fn forget_xi_extension_client(&mut self, client: ClientId) {
+        let windows: Vec<_> = self
+            .xi_input_clients
+            .iter()
+            .filter(|(_, entries)| {
+                entries
+                    .iter()
+                    .any(|entry| !entry.server_owned_placeholder && entry.client == client)
+            })
+            .map(|(window, _)| *window)
+            .collect();
+        for window in windows {
+            // Disconnect frees resources individually. An older server-owned
+            // node counts as a remaining node, even after DNP was cleared.
+            while let Some(index) = self.xi_input_client_index(window, client) {
+                self.remove_xi_input_client(window, index);
+            }
+        }
+    }
+}
 
 #[allow(clippy::needless_return)]
 pub(super) fn handle_xi_select_events(
@@ -40,10 +207,21 @@ pub(super) fn handle_xi_select_events(
     let mut send_device_changed_bootstrap = false;
     if body.len() >= 8 {
         let window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+        if state.resources.window(window).is_none() {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_WINDOW,
+                window.0,
+                46,
+                header.opcode,
+            );
+        }
         let num_masks = u16::from_le_bytes([body[4], body[5]]) as usize;
         // Xorg ProcXISelectEvents checks every mask before
         // setting any, so a rejected request changes nothing.
-        let mut masks: Vec<(u16, u64)> = Vec::with_capacity(num_masks);
+        let mut masks: Vec<(u16, u64, usize)> = Vec::with_capacity(num_masks);
         let mut pos = 8;
         for _ in 0..num_masks {
             if pos + 4 > body.len() {
@@ -52,6 +230,17 @@ pub(super) fn handle_xi_select_events(
             let deviceid = u16::from_le_bytes([body[pos], body[pos + 1]]);
             let mask_len = u16::from_le_bytes([body[pos + 2], body[pos + 3]]) as usize;
             pos += 4;
+            if !matches!(deviceid, 0 | 1) && state.xi_devices.device(deviceid).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    XI1_ERROR_BAD_DEVICE, // Xorg validates the device before applying any XISelectEvents masks (Xi/xiselectev.c:178-185,304-324)
+                    u32::from(deviceid),
+                    46,
+                    header.opcode,
+                );
+            }
             let byte_len = mask_len.saturating_mul(4);
             if pos + byte_len > body.len() {
                 break;
@@ -104,7 +293,7 @@ pub(super) fn handle_xi_select_events(
             let mut word = [0u8; 8];
             let keep = byte_len.min(8);
             word[..keep].copy_from_slice(&mask_bytes[..keep]);
-            masks.push((deviceid, u64::from_le_bytes(word)));
+            masks.push((deviceid, u64::from_le_bytes(word), mask_len));
             pos += byte_len;
         }
         crate::core_loop::process_request::return_on_access_denial!(
@@ -121,23 +310,36 @@ pub(super) fn handle_xi_select_events(
             sequence,
             access_request,
         );
-        if let Some(client) = state.clients.get_mut(&client_id.0) {
-            for (deviceid, mask) in masks {
-                debug!(
-                    "client {} XISelectEvents window=0x{:x} deviceid={} mask=0x{:x}",
-                    client_id.0, window.0, deviceid, mask
-                );
-                if mask == 0 {
-                    client.xi2_masks.remove(&(window, deviceid));
-                } else {
-                    client.xi2_masks.insert((window, deviceid), mask);
-                    if window == ROOT_WINDOW
-                        && matches!(deviceid, 0..=3)
-                        && (mask & u64::from(XI2_DEVICE_CHANGED_MASK)) != 0
-                    {
-                        send_device_changed_bootstrap = true;
+        for (deviceid, mask, mask_len) in masks {
+            debug!(
+                "client {} XISelectEvents window=0x{:x} deviceid={} mask=0x{:x}",
+                client_id.0, window.0, deviceid, mask
+            );
+            let entry_index = if mask_len != 0 {
+                Some(state.ensure_xi_input_client(window, client_id).0)
+            } else {
+                state.xi_input_client_index(window, client_id)
+            };
+            if let Some(entry_index) = entry_index {
+                if let Some(entry) = state
+                    .xi_input_clients
+                    .get_mut(&window)
+                    .and_then(|entries| entries.get_mut(entry_index))
+                {
+                    if mask_len == 0 || mask == 0 {
+                        entry.xi2_masks.remove(&deviceid);
+                    } else {
+                        entry.xi2_masks.insert(deviceid, mask);
                     }
                 }
+                state.refresh_xi_client_selection_projection(client_id);
+            }
+            if mask_len != 0
+                && window == ROOT_WINDOW
+                && matches!(deviceid, 0..=3)
+                && (mask & u64::from(XI2_DEVICE_CHANGED_MASK)) != 0
+            {
+                send_device_changed_bootstrap = true;
             }
         }
     }
@@ -189,14 +391,17 @@ pub(super) fn handle_xi_get_selected_events(
         // mask itself is a bit array (bit n in byte n/8), written as
         // little-endian bytes for every client.
         let mut selected: Vec<(u16, u64)> = state
-            .clients
-            .get(&client_id.0)
-            .map(|client| {
-                client
+            .xi_input_clients
+            .get(&window)
+            .into_iter()
+            .flatten()
+            .find(|entry| entry.client == client_id && !entry.server_owned_placeholder)
+            .map(|entry| {
+                entry
                     .xi2_masks
                     .iter()
-                    .filter(|&(&(win, _), &mask)| win == window && mask != 0)
-                    .map(|(&(_, dev), &mask)| (dev, mask))
+                    .filter(|(_, mask)| **mask != 0)
+                    .map(|(&device, &mask)| (device, mask))
                     .collect()
             })
             .unwrap_or_default();
@@ -230,14 +435,11 @@ pub(super) fn handle_xi_get_selected_events(
 //   body[6..8] pad00  (CARD16),
 //   body[8..]  count × XEventClass (CARD32).
 //
-// An XEventClass packs `(deviceid << 8) | event_code`. We only
-// implement XI1 `DevicePropertyNotify` (event code 16 within
-// the XInput block, i.e. low byte = `XI_FIRST_EVENT + 16` = 82
-// — yserver assigns XInput the contiguous block 66..=82), so
-// classes for other XI1 events (motion / button / key / etc.)
-// are accepted but ignored. We do NOT error on unknown classes:
-// a single SelectExtensionEvent often selects multiple classes
-// and Xorg silently drops the ones it can't service.
+// An XEventClass packs `(deviceid << 8) | event_code`. Xorg 21.1.24
+// registers the non-delivering classes 0..=8, NoExtensionEvent (9),
+// and the event classes in `Xi/extinit.c:1071-1110`; `Xi/selectev.c:163-177`
+// applies each decoded device mask. Unknown classes are ignored, as in
+// CreateMaskFromList, while recognized classes replace that device's mask.
 //
 // Selection state is canonical per window, as in Xorg. Events such
 // as DevicePropertyNotify carry no event-window field, so a separate
@@ -247,12 +449,11 @@ pub(super) fn handle_xi_get_selected_events(
 // supplied class list, this client's prior selections for that
 // deviceid on this window are dropped before the new set is
 // installed. A client
-// unsubscribes a given deviceid by passing at least one class
-// for it whose low byte is not `DevicePropertyNotify` — the
-// deviceid lands in `touched_devices` and its prior entries
-// are cleared; the unsupported class itself is silently
-// dropped. `count == 0` is a no-op (the existing selection
-// survives unchanged), matching Xorg's behaviour.
+// unsubscribes a given deviceid by passing a recognized class for it
+// whose EventInfo mask is zero, such as NoExtensionEvent; that deviceid
+// lands in `touched_devices` and its prior entries are cleared. An
+// unknown class does not touch the device. `count == 0` is a no-op
+// (the existing selection survives unchanged), matching Xorg.
 #[allow(clippy::needless_return)]
 pub(super) fn handle_xi1_select_extension_event(
     state: &mut ServerState,
@@ -333,17 +534,25 @@ pub(super) fn handle_xi1_select_extension_event(
         }
         ordinary_classes.push(class);
     }
-    if presence_selected && let Some(client) = state.clients.get_mut(&client_id.0) {
-        // Xorg installs DevicePresenceNotifyMask in
-        // HandleDevicePresenceMask before ordinary classes are
-        // validated. Preserve that ordering if a later class in
-        // this request reports BadClass.
-        client
-            .xi1_window_event_classes
-            .entry(ResourceId(sel_window))
+    if presence_selected && state.clients.contains_key(&client_id.0) {
+        // HandleDevicePresenceMask always prepends, even if this client
+        // already has an entry. Preserve its early application if a later
+        // ordinary class in the same request reports BadClass.
+        let window = ResourceId(sel_window);
+        state.prepend_xi_input_client(window, client_id);
+        let entry = &mut state.xi_input_clients.get_mut(&window).unwrap()[0];
+        entry
+            .xi1_masks
+            .entry(256)
             .or_default()
             .insert(crate::xinput::XI1_DEVICE_PRESENCE_CLASS);
-        client.rebuild_xi1_global_event_classes();
+        *state
+            .xi1_window_input_events
+            .entry(window)
+            .or_default()
+            .entry(0)
+            .or_default() |= 1 << 18;
+        state.refresh_xi_client_selection_projection(client_id);
     }
     for class in &ordinary_classes {
         if !xi1_device_valid(&state.xi_devices, xi1_event_class_device(*class)) {
@@ -358,10 +567,9 @@ pub(super) fn handle_xi1_select_extension_event(
             );
         }
     }
-    // Decode the requested class list and collect the set of
-    // deviceids that appear (so we can drop the client's stale
-    // entries for *those* devices — Xorg's "replace per device"
-    // semantics, see Xi/selectev.c::ProcXSelectExtensionEvent).
+    // Decode only classes CreateMaskFromList recognizes. In particular,
+    // NoExtensionEvent touches its device with a zero mask, while an
+    // unknown event class never reaches SelectForWindow.
     let mut accepted_classes: Vec<u32> = Vec::with_capacity(ordinary_classes.len());
     let mut touched_devices: HashSet<u8> = HashSet::new();
     for class in ordinary_classes {
@@ -369,29 +577,37 @@ pub(super) fn handle_xi1_select_extension_event(
         let class_low = class as u8; // event code in the XInput block
         #[allow(clippy::cast_possible_truncation)]
         let dev_byte = (class >> 8) as u8;
-        touched_devices.insert(dev_byte);
-        // DevicePropertyNotify classes are device-scoped; the
-        // input-event classes (DeviceKeyPress..DeviceMotionNotify),
-        // the focus classes (DeviceFocusIn/Out, consumed by
-        // `xi1_focus::emit_device_focus`) and DeviceStateNotify
-        // (consumed by `xi1_state_notify::deliver_state_notify`)
-        // select per window like core input events and are
-        // recorded in `xi1_window_event_classes` below. Other
-        // classes are silently discarded, matching Xorg: it walks
-        // `xi_all_events` and skips entries it cannot service.
-        if crate::server::xi1_class_is_global_notification(class) {
+        let recognized = if crate::server::xi1_class_is_global_notification(class) {
             // DevicePropertyNotify / DeviceMappingNotify /
             // ChangeDeviceNotify are server-wide per-device
             // events: Xorg `Xi/exevents.c::SendMappingNotify` /
             // `SendDeviceNotify` fan them out by walking the
             // global client list, NOT a per-window event-mask.
             accepted_classes.push(class);
+            true
+        } else if class_low <= crate::xinput::XI1_DEVICE_OWNER_GRAB_BUTTON_CLASS {
+            // CreateMaskFromList validates the device, not its button
+            // capability (Xorg 21.1.24 `Xi/grabdev.c:171-199`). Classes
+            // 7 and 8 both select DeviceButtonGrabMask.
+            accepted_classes.push(class);
+            true
+        } else if class_low == 9 {
+            // `_noExtensionEvent` has a known EventInfo entry with mask 0.
+            true
         } else if (XI_FIRST_EVENT + XI_DEVICE_KEY_PRESS_OFFSET
             ..=XI_FIRST_EVENT + crate::xinput::XI_DEVICE_FOCUS_OUT_OFFSET)
             .contains(&class_low)
             || class_low == XI_FIRST_EVENT + crate::xinput::XI_DEVICE_STATE_NOTIFY_OFFSET
         {
             accepted_classes.push(class);
+            true
+        } else {
+            // CreateMaskFromList ignores unknown classes, leaving this
+            // device's temporary mask untouched and never selecting it.
+            false
+        };
+        if recognized {
+            touched_devices.insert(dev_byte);
         }
     }
     debug!(
@@ -409,38 +625,108 @@ pub(super) fn handle_xi1_select_extension_event(
             .filter(|class| !crate::server::xi1_class_is_global_notification(**class))
             .count(),
     );
-    if let Some(client) = state.clients.get_mut(&client_id.0) {
-        // Selection state belongs to the request window. Drop stale
-        // entries for the named devices on that window only (Xorg
-        // replacement semantics), then install the accepted list.
-        if !touched_devices.is_empty()
-            && let Some(set) = client
-                .xi1_window_event_classes
-                .get_mut(&ResourceId(sel_window))
+    let window = ResourceId(sel_window);
+    let mut ordered_devices: Vec<u8> = touched_devices.into_iter().collect();
+    ordered_devices.sort_unstable();
+    for device in ordered_devices {
+        let device_classes: Vec<u32> = accepted_classes
+            .iter()
+            .copied()
+            .filter(|class| class >> 8 == u32::from(device))
+            .collect();
+        let selects_grab_class = device_classes.iter().any(|class| {
+            u8::try_from(*class & 0xff).is_ok_and(crate::xinput::xi1_class_is_button_grab)
+        });
+        if selects_grab_class
+            && state.xi_input_clients.get(&window).is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry.client != client_id
+                        && entry
+                            .xi1_masks
+                            .get(&u16::from(device))
+                            .is_some_and(|classes| {
+                                classes.iter().any(|class| {
+                                    u8::try_from(*class & 0xff)
+                                        .is_ok_and(crate::xinput::xi1_class_is_button_grab)
+                                })
+                            })
+                })
+            })
         {
-            set.retain(|c| {
-                if *c == crate::xinput::XI1_DEVICE_PRESENCE_CLASS {
-                    return true;
-                }
-                #[allow(clippy::cast_possible_truncation)]
-                let dev_byte = (c >> 8) as u8;
-                !touched_devices.contains(&dev_byte)
-            });
-        }
-        if !accepted_classes.is_empty() {
-            let set = client
-                .xi1_window_event_classes
-                .entry(ResourceId(sel_window))
-                .or_default();
-            for class in accepted_classes {
-                set.insert(class);
-            }
+            // Xorg applies SelectForWindow in ascending device-id order.
+            // Earlier devices already applied; this device and all later
+            // ones remain unchanged after its exclusive-mask conflict.
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_ACCESS,
+                0,
+                u16::from(minor),
+                XI2_MAJOR_OPCODE,
+            );
         }
 
-        // Keep the delivery-oriented aggregate in sync. Global XI1
-        // notifications have no event-window field, but selecting
-        // them is still per-window protocol state.
-        client.rebuild_xi1_global_event_classes();
+        let (entry_index, created) = state.ensure_xi_input_client(window, client_id);
+        if let Some(entry) = state
+            .xi_input_clients
+            .get_mut(&window)
+            .and_then(|entries| entries.get_mut(entry_index))
+        {
+            if device_classes.is_empty() {
+                entry.xi1_masks.remove(&u16::from(device));
+            } else {
+                entry
+                    .xi1_masks
+                    .insert(u16::from(device), device_classes.iter().copied().collect());
+            }
+        }
+        if !device_classes.is_empty() {
+            let mut aggregate = 0u64;
+            for class in &device_classes {
+                let event_code = class & 0xff;
+                if event_code <= 6 {
+                    // Xorg registers these non-delivering classes with the
+                    // motion-hint/button-motion masks (Xi/extinit.c:1091-1097).
+                    // Keep yserver's snapshot qualifier bits outside XI1 event
+                    // offsets 0..=16 and the reserved bits 17/18.
+                    aggregate |= 1u64 << (19 + event_code);
+                } else if u8::try_from(event_code)
+                    .is_ok_and(crate::xinput::xi1_class_is_button_grab)
+                {
+                    // DeviceButtonGrabMask is shared by classes 7 and 8
+                    // (Xorg 21.1.24 Xi/extinit.c:144-145,1105-1106).
+                    aggregate |= 1 << 17;
+                } else if let Some(offset) = event_code.checked_sub(u32::from(XI_FIRST_EVENT)) {
+                    aggregate |= 1u64 << offset;
+                }
+            }
+            if aggregate != 0 {
+                *state
+                    .xi1_window_input_events
+                    .entry(window)
+                    .or_default()
+                    .entry(u16::from(device))
+                    .or_default() |= aggregate;
+            }
+        }
+        state.refresh_xi_client_selection_projection(client_id);
+
+        // SelectForWindow frees an existing input-client resource only when
+        // its XI1 masks are empty and ShouldFreeInputMasks agrees. A newly
+        // added zero-mask NoExtensionEvent entry is retained.
+        let entry_has_xi1_masks = state
+            .xi_input_clients
+            .get(&window)
+            .and_then(|entries| entries.get(entry_index))
+            .is_some_and(|entry| entry.xi1_masks.values().any(|classes| !classes.is_empty()));
+        if !created
+            && device_classes.is_empty()
+            && !entry_has_xi1_masks
+            && state.should_free_xi_input_masks(window)
+        {
+            state.remove_xi_input_client(window, entry_index);
+        }
     }
     return Ok(RequestOutcome::Handled);
 }
@@ -491,18 +777,25 @@ pub(super) fn handle_xi1_get_selected_extension_events(
         );
         let window = ResourceId(win);
         let mut this_client: Vec<u32> = state
-            .clients
-            .get(&client_id.0)
-            .and_then(|client| client.xi1_window_event_classes.get(&window))
-            .map(|classes| classes.iter().copied().collect())
+            .xi_input_clients
+            .get(&window)
+            .into_iter()
+            .flatten()
+            .find(|entry| entry.client == client_id && !entry.server_owned_placeholder)
+            .map(|entry| entry.xi1_masks.values().flatten().copied().collect())
             .unwrap_or_default();
         this_client.sort_unstable();
 
         let mut all_clients: Vec<u32> = state
-            .clients
-            .values()
-            .filter_map(|client| client.xi1_window_event_classes.get(&window))
-            .flat_map(|classes| classes.iter().copied())
+            .xi_input_clients
+            .get(&window)
+            .into_iter()
+            .flatten()
+            // Server ownership suppresses delivery, not query visibility
+            // (../xserver/Xi/getselev.c:118-151).
+            .flat_map(|entry| entry.xi1_masks.values())
+            .flatten()
+            .copied()
             .collect();
         all_clients.sort_unstable();
 
@@ -559,15 +852,18 @@ pub(super) fn handle_xi1_change_device_dont_propagate_list(
             );
         }
         let count = usize::from(u16::from_le_bytes([body[4], body[5]]));
-        let mut classes: Vec<u32> = Vec::with_capacity(count);
+        // CreateMaskFromList first decodes every recognized class. Keep
+        // unsuppressible bits until per-device validation; silently dropping
+        // them would allocate storage for a request Xorg rejects.
+        let mut devices = std::collections::BTreeMap::<u16, (u32, HashSet<u32>)>::new();
         for i in 0..count {
             let off = 8 + i * 4;
-            if off + 4 > body.len() {
+            let Some(bytes) = body.get(off..off + 4) else {
                 break;
-            }
-            let class =
-                u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
-            if !xi1_device_valid(&state.xi_devices, xi1_event_class_device(class)) {
+            };
+            let class = u32::from_le_bytes(bytes.try_into().unwrap());
+            let device = xi1_event_class_device(class);
+            if !xi1_device_valid(&state.xi_devices, device) {
                 return xi1_error(
                     state,
                     client_id,
@@ -577,7 +873,33 @@ pub(super) fn handle_xi1_change_device_dont_propagate_list(
                     minor,
                 );
             }
-            classes.push(class);
+            let code = u8::try_from(class & 0xff).unwrap();
+            // Xorg EventInfo masks (../xserver/Xi/extinit.c:132-147,
+            // 1071-1111). Only the five input masks propagate.
+            let mask = match code.checked_sub(XI_FIRST_EVENT) {
+                Some(1) => 1,
+                Some(2) => 1 << 1,
+                Some(3) => 1 << 2,
+                Some(4) => 1 << 3,
+                Some(5) => 1 << 6,
+                Some(6 | 7) => 1 << 14,
+                Some(8 | 9) => 1 << 4,
+                Some(10) => 1 << 5,
+                Some(11) => 1 << 15,
+                Some(12) => 1 << 16,
+                Some(16) => 1 << 19,
+                _ => match code {
+                    0 => 1 << 7,
+                    1..=6 => 1 << (7 + code),
+                    7 | 8 => 1 << 17,
+                    _ => 0, // unknown classes and NoExtensionEvent
+                },
+            };
+            if mask != 0 {
+                let entry = devices.entry(device).or_default();
+                entry.0 |= mask;
+                entry.1.insert(class);
+            }
         }
         crate::core_loop::process_request::return_on_access_denial!(
             crate::core_loop::process_request::validate_resource_if_present(
@@ -593,25 +915,62 @@ pub(super) fn handle_xi1_change_device_dont_propagate_list(
             sequence,
             access_request,
         );
-        // mode 0 = AddToList, 1 = DeleteFromList. Xorg
-        // `Xi/chgdprop.c::ChangeDeviceDontPropagateList` applies the
-        // change to `OtherInputMasks.dontPropagateMask[deviceid]`;
-        // the deviceid is encoded in the high byte of each class so
-        // the per-device split is implicit in the class set.
-        let entry = state
-            .xi1_window_dont_propagate
-            .entry(ResourceId(win))
-            .or_default();
-        if mode == 0 {
-            for c in &classes {
-                entry.insert(*c);
+        let window = ResourceId(win);
+        if mode == 1 && !state.xi_input_clients.contains_key(&window) {
+            return xi_write_reply(state, client_id, Vec::new());
+        }
+        // ../xserver/Xi/chgprop.c:126-140 invokes suppression once for
+        // each nonzero temporary mask, in ascending device order. Each call
+        // may free the head resource, including an XI2-only entry.
+        for (device, (mask, classes)) in devices {
+            if mode == 0 && mask & !0x4f != 0 {
+                let previous = state
+                    .xi1_window_dont_propagate
+                    .get(&window)
+                    .map_or(0, |existing| {
+                        existing
+                            .iter()
+                            .filter(|class| xi1_event_class_device(**class) == device)
+                            .fold(0, |bits, class| {
+                                bits | match (*class & 0xff).checked_sub(u32::from(XI_FIRST_EVENT))
+                                {
+                                    Some(1) => 1,
+                                    Some(2) => 2,
+                                    Some(3) => 4,
+                                    Some(4) => 8,
+                                    Some(5) => 64,
+                                    _ => 0,
+                                }
+                            })
+                    });
+                return xi1_error(
+                    state,
+                    client_id,
+                    sequence,
+                    XI1_ERROR_BAD_CLASS,
+                    mask | previous,
+                    minor,
+                );
             }
-        } else {
-            for c in &classes {
-                entry.remove(c);
+            if mode == 0 {
+                if !state.xi_input_clients.contains_key(&window) {
+                    state.prepend_xi_input_client(window, client_id);
+                }
+                state
+                    .xi1_window_dont_propagate
+                    .entry(window)
+                    .or_default()
+                    .extend(classes);
+            } else if let Some(existing) = state.xi1_window_dont_propagate.get_mut(&window) {
+                for class in classes {
+                    existing.remove(&class);
+                }
+                if existing.is_empty() {
+                    state.xi1_window_dont_propagate.remove(&window);
+                }
             }
-            if entry.is_empty() {
-                state.xi1_window_dont_propagate.remove(&ResourceId(win));
+            if state.should_free_xi_input_masks(window) {
+                state.remove_xi_input_client(window, 0);
             }
         }
         debug!(

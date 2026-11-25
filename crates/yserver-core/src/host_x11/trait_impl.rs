@@ -104,7 +104,12 @@ impl Backend for HostX11Backend {
                 }));
             }
             HostInputEvent::PointerMotion {
-                origin, x, y, time, ..
+                origin,
+                x,
+                y,
+                time,
+                device_axes,
+                ..
             } => {
                 self.push_pending_host_event(HostEvent::Pointer(HostPointerEvent {
                     // XTEST selects its virtual device with GetXTestDevice
@@ -130,6 +135,7 @@ impl Backend for HostX11Backend {
                     raw_dx: 0,
                     raw_dy: 0,
                     tree_change: false,
+                    device_axes,
                 }));
             }
             // ynest is a nested backend fed by the parent X server's input,
@@ -185,6 +191,7 @@ impl Backend for HostX11Backend {
                     raw_dx: 0,
                     raw_dy: 0,
                     tree_change: false,
+                    device_axes: None,
                 }));
             }
             // Device add/remove are plumbing-only in the host-X11 backend;

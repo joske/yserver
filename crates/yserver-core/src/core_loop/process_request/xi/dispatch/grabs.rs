@@ -4,11 +4,12 @@ use crate::{
     core_loop::{
         fanout::fanout_event_to_clients,
         key_fanout::replay_frozen_key_to_focus,
-        pointer_fanout::replay_frozen_pointer_event_to_state,
+        pointer_fanout::{PointerReplay, replay_frozen_pointer_event_to_state},
         process_request::{
             RequestOutcome, XI2_FIRST_ERROR, XI2_MAJOR_OPCODE, emit_x11_error_with_minor,
             grabs::{
-                apply_allow_events, apply_xi2_allow_events_for_slave, deactivate_core_pointer_grab,
+                apply_allow_events, apply_xi2_allow_events_for_master_paired,
+                apply_xi2_allow_events_for_slave, deactivate_core_pointer_grab,
                 deactivate_passive_pointer_grab_crossings, xi2_allow_mode_to_core,
             },
             xi::{
@@ -102,6 +103,11 @@ pub(super) fn handle_xi_grab_device(
                 mask[..mask_bytes.len()].copy_from_slice(mask_bytes);
                 u64::from_le_bytes(mask)
             });
+        let grab_time = if time == 0 {
+            state.timestamp_now().max(state.xi1_last_input_time)
+        } else {
+            time
+        };
         let role = match state.xi_devices.role(deviceid) {
             Some(role) => role,
             None => {
@@ -180,10 +186,11 @@ pub(super) fn handle_xi_grab_device(
             )
         } else {
             u8::from(
-                state
-                    .xi2_pointer_grabs
-                    .get(&deviceid)
-                    .is_some_and(|grab| grab.owner != client_id),
+                state.xi1_active_grabs.contains_key(&deviceid)
+                    || state
+                        .xi2_pointer_grabs
+                        .get(&deviceid)
+                        .is_some_and(|grab| grab.owner != client_id),
             )
         };
         if grab_status == 0 {
@@ -232,6 +239,7 @@ pub(super) fn handle_xi_grab_device(
                 };
                 if is_master {
                     state.active_keyboard_grab = Some(grab);
+                    state.last_keyboard_grab_time = grab_time;
                 } else {
                     state.xi2_keyboard_grabs.insert(deviceid, grab);
                     let _ = state.detach_xi2_slave(deviceid);
@@ -242,7 +250,7 @@ pub(super) fn handle_xi_grab_device(
                     grab_window: ResourceId(grab_window),
                     event_mask: 0xFFFF, // core mask is unused for XI2 grabs
                     cursor: ResourceId(cursor),
-                    time,
+                    time: grab_time,
                     owner_events,
                     via_xi2: true,
                     implicit: false,
@@ -251,6 +259,7 @@ pub(super) fn handle_xi_grab_device(
                 };
                 if is_master {
                     state.set_pointer_grab(grab);
+                    state.last_pointer_grab_time = grab_time;
                 } else {
                     state.xi2_pointer_grabs.insert(deviceid, grab);
                     let _ = state.detach_xi2_slave(deviceid);
@@ -645,27 +654,22 @@ pub(super) fn handle_xi_allow_events(
     } else {
         0
     };
-    // Map the XI2 mode + target deviceid onto the equivalent core
-    // AllowSome mode and run the SHARED `apply_allow_events`. This
-    // used to be a partial reimplementation that diverged from the
-    // core path and caused recurring freezes (desktop rubber-band =
-    // Async/Replay thaw gap; Cinnamon input freeze = XISyncDevice
-    // treated as a no-op). Touch modes (XIAcceptTouch/XIRejectTouch)
-    // are unsupported → no-op.
     if is_master {
-        if let Some(core_mode) = xi2_allow_mode_to_core(mode, is_keyboard) {
-            return apply_allow_events(state, backend, client_id, sequence, core_mode, time);
+        if mode <= 2 {
+            if let Some(core_mode) = xi2_allow_mode_to_core(mode, is_keyboard) {
+                return apply_allow_events(state, backend, client_id, sequence, core_mode, time);
+            }
+        } else if (3..=5).contains(&mode) {
+            return apply_xi2_allow_events_for_master_paired(
+                state, backend, client_id, sequence, deviceid, mode, time,
+            );
         }
+    } else if (3..=5).contains(&mode) {
+        // Xorg accepts XI2 paired modes only for a master device.
+        return Ok(RequestOutcome::Handled);
     } else {
         return apply_xi2_allow_events_for_slave(
-            state,
-            backend,
-            client_id,
-            sequence,
-            deviceid,
-            is_keyboard,
-            mode,
-            time,
+            state, backend, client_id, sequence, deviceid, mode, time,
         );
     }
     return Ok(RequestOutcome::Handled);
@@ -1170,6 +1174,8 @@ pub(super) fn handle_xi1_grab_device(
                     owner_events: owner_events != 0,
                     this_mode,
                     other_mode,
+                    implicit: false,
+                    device_mask: 0,
                     passive_detail: None,
                 },
             );
@@ -1887,10 +1893,29 @@ pub(super) fn handle_xi1_allow_device_events(
                         f.other = None;
                     }
                     let stored = state.xi1_frozen.get_mut(&dev).and_then(|f| f.stored.take());
-                    // Reprocessing masks out passive grabs at or
-                    // above the released grab's window (Xorg
-                    // syncEvents.replayWin → CheckDeviceGrabs).
-                    let replay_floor = state.xi1_active_grabs.get(&dev).map(|g| g.grab_window);
+                    // Capture the device and grab window before deactivation;
+                    // Xorg's CheckDeviceGrabs replay starts strictly below
+                    // syncEvents.replayWin.
+                    let replay = state
+                        .xi1_active_grabs
+                        .get(&dev)
+                        .map(|grab| PointerReplay {
+                            device: dev,
+                            grab_window: grab.grab_window,
+                        })
+                        .or_else(|| {
+                            state.xi2_pointer_grabs.get(&dev).map(|grab| PointerReplay {
+                                device: dev,
+                                grab_window: grab.grab_window,
+                            })
+                        })
+                        .or_else(|| {
+                            state.active_pointer_grab.map(|grab| PointerReplay {
+                                device: dev,
+                                grab_window: grab.grab_window,
+                            })
+                        });
+                    let replay_floor = replay.map(|replay| replay.grab_window);
                     if state.xi1_active_grabs.contains_key(&dev) {
                         xi1_deactivate_device_grab(state, dev);
                     } else if state.active_pointer_grab.is_some_and(|grab| grab.passive) {
@@ -1919,12 +1944,14 @@ pub(super) fn handle_xi1_allow_device_events(
                         match stored {
                             crate::server::QueuedInputEvent::Xi1Routed(mut q) => {
                                 q.replay_floor = replay_floor;
-                                let _ = xi1_route_device_event(state, q, true);
+                                let _ = xi1_route_device_event(state, q, true, None);
                             }
                             crate::server::QueuedInputEvent::HostPointer(event) => {
                                 let xid_map = backend.xid_map().clone();
+                                let replay = replay
+                                    .expect("a frozen pointer event retains its XI1 grab window");
                                 let _ = replay_frozen_pointer_event_to_state(
-                                    state, backend, &xid_map, event,
+                                    state, backend, &xid_map, event, replay,
                                 );
                             }
                             crate::server::QueuedInputEvent::HostKey(event) => {
@@ -1942,6 +1969,10 @@ pub(super) fn handle_xi1_allow_device_events(
                                     synthetic_repeat,
                                 );
                             }
+                            // The master part of a split pointer event
+                            // lives only in the pending queue; a grab
+                            // activation stores the full event.
+                            crate::server::QueuedInputEvent::HostPointerMaster(..) => {}
                             // Only a device event activates a grab, so
                             // the stored slot never holds a raw event;
                             // processing one is plain master delivery.

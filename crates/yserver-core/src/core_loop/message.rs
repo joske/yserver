@@ -352,6 +352,8 @@ pub enum HostInputEvent {
         /// Accelerated fractional libinput delta for physical relative
         /// input. Absolute, nested, and XTEST motion leave this absent.
         motion_delta: Option<[f64; 2]>,
+        /// Explicit XI1 DeviceValuator payload carried by XTest device motion.
+        device_axes: Option<crate::server::Xi1MotionAxes>,
     },
     PointerButton {
         origin: InputOrigin,

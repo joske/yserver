@@ -2334,6 +2334,7 @@ mod tests {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         };
         let xid_map = HostXidMap::default();
         let mut backend = RecordingBackend::new();

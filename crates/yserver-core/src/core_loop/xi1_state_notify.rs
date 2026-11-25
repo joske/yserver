@@ -287,14 +287,13 @@ mod tests {
             | u32::from(
                 crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_STATE_NOTIFY_OFFSET,
             );
-        state
-            .clients
-            .get_mut(&1)
-            .unwrap()
-            .xi1_window_event_classes
-            .entry(window)
+        let (index, _) = state.ensure_xi_input_client(window, ClientId(1));
+        state.xi_input_clients.get_mut(&window).unwrap()[index]
+            .xi1_masks
+            .entry(dev)
             .or_default()
             .insert(class);
+        state.refresh_xi_client_selection_projection(ClientId(1));
     }
 
     #[test]

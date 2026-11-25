@@ -292,6 +292,7 @@ fn xi_owner_events_scroll_fixture() -> (
             dx: 0,
             dy: 0,
             motion_delta: None,
+            device_axes: None,
         },
     );
 
@@ -724,6 +725,7 @@ fn xi_dynamic_owner_events_grab_fallback_preserves_slave_button_and_motion_ident
             dx: 0,
             dy: 0,
             motion_delta: None,
+            device_axes: None,
         },
     );
     let motion = xi2_events(&kbd_map_drain(&mut peer));
@@ -1784,7 +1786,12 @@ fn record_keeps_pointer_events_enqueued_while_master_is_synchronously_frozen() {
         .map(|pending| {
             assert_eq!(pending.device, 2, "master 2 controls the queue");
             match &pending.event {
-                QueuedInputEvent::HostPointer(event) => (event.origin, event.kind, event.detail),
+                // Spec invariant 8: only master 2 is frozen, so each edge's
+                // slave part already ran and the queue holds the master
+                // part (../xserver mi/mieq.c:502-508).
+                QueuedInputEvent::HostPointerMaster(event, _) => {
+                    (event.origin, event.kind, event.detail)
+                }
                 other => panic!("unexpected queued input: {other:?}"),
             }
         })
@@ -1809,7 +1816,10 @@ fn record_keeps_pointer_events_enqueued_while_master_is_synchronously_frozen() {
             ),
         ]
     );
-    assert_eq!(state.buttons_down, 1, "physical Button1 stays held");
+    // Spec invariant 8: the master's held-button bitmap changes when the
+    // master's queued part is processed, so it is still empty while master 2
+    // is frozen; the physical slave's own state is already updated.
+    assert_eq!(state.buttons_down, 0, "master bitmap waits for its thaw");
     assert_eq!(state.xi_devices.device(pointer_id).unwrap().buttons_down, 1);
     assert_eq!(
         state
@@ -1951,6 +1961,7 @@ fn xi_slave_switch_scroll_stop_next_motion_and_query_share_current_source_value(
         dx: 0,
         dy: 0,
         motion_delta: None,
+        device_axes: None,
     };
     let mut backend = KmsBackend::for_tests();
     let mut state = ServerState::new();
@@ -2158,6 +2169,7 @@ fn xi_slave_switch_kms_suspend_and_removal_clear_last_source() {
         dx: 0,
         dy: 0,
         motion_delta: None,
+        device_axes: None,
     };
     let events = |bytes: &[u8]| {
         let mut result = Vec::new();
@@ -2718,6 +2730,7 @@ fn xi_master_classes_store_last_slave_shape_after_removal_then_xtest_switch() {
             dx: 0,
             dy: 0,
             motion_delta: None,
+            device_axes: None,
         },
     );
     let physical_changed = xi_master_changed_summaries(&kbd_map_drain(&mut peer));
@@ -2796,6 +2809,7 @@ fn xi_master_classes_store_last_slave_shape_after_removal_then_xtest_switch() {
             dx: 0,
             dy: 0,
             motion_delta: None,
+            device_axes: None,
         },
     );
     let xtest_changed = xi_master_changed_summaries(&kbd_map_drain(&mut peer));

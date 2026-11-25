@@ -1,12 +1,76 @@
-//! Grab-owner selection and fallback routing shared by pointer fanout and
-//! XI 1.x direct FakeInput delivery.
+//! Grab-owner selection, XI1 selection order, and fallback routing.
 
 use super::{
-    ClientId, PointerXiSource, ROOT_WINDOW, ResourceId, ServerState, XI2_MAJOR_OPCODE,
-    XI2_MASTER_POINTER_DEVICE_ID, Xi2PointerForm, clamp_grab_coord, fanout_event_to_clients, x11,
-    xi1_window_selectors, xi2_child_toward, xi2_form_targets_for_source,
-    xi2_route_window_for_source,
+    ClientId, PointerReplay, PointerXiSource, ResourceId, ServerState,
+    XI2_MASTER_POINTER_DEVICE_ID, Xi2PointerForm, clamp_grab_coord, xi2_child_toward,
+    xi2_form_targets_for_source, xi2_route_window_for_source,
 };
+
+/// Resolves XI1 event selectors in the shared per-window extension-entry
+/// order so routing and implicit-grab owner selection follow Xorg.
+pub(super) fn xi1_window_selectors(
+    state: &ServerState,
+    window: ResourceId,
+    evcode: u8,
+    deviceid: u16,
+) -> Vec<ClientId> {
+    xi1_window_selectors_with_grab_class(state, window, evcode, deviceid)
+        .into_iter()
+        .map(|(client, _)| client)
+        .collect()
+}
+
+/// Returns the canonical input-client entries that select an XI1 event and
+/// whether that same delivering entry selects either XI1 button-grab class.
+pub(super) fn xi1_window_selectors_with_grab_class(
+    state: &ServerState,
+    window: ResourceId,
+    evcode: u8,
+    deviceid: u16,
+) -> Vec<(ClientId, bool)> {
+    let class = (u32::from(deviceid) << 8) | u32::from(evcode);
+    state
+        .xi_input_clients
+        .get(&window)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            !entry.server_owned_placeholder && state.clients.contains_key(&entry.client.0)
+        })
+        .filter_map(|entry| {
+            let classes = entry.xi1_masks.get(&deviceid)?;
+            let selects_grab_class = classes.iter().any(|class| {
+                u8::try_from(*class & 0xff).is_ok_and(crate::xinput::xi1_class_is_button_grab)
+            });
+            classes
+                .contains(&class)
+                .then_some((entry.client, selects_grab_class))
+        })
+        .collect()
+}
+
+/// Converts an XI1 event type into the bit used by an implicit-grab mask.
+pub(super) fn xi1_event_mask_bit(event_type: u8) -> u32 {
+    let Some(offset) = event_type.checked_sub(crate::server::XI_FIRST_EVENT) else {
+        return 0;
+    };
+    if offset < 32 { 1_u32 << offset } else { 0 }
+}
+
+/// Returns Xorg's sticky `inputEvents` aggregate for the implicit-grab window.
+pub(super) fn xi1_device_mask_on_window(
+    state: &ServerState,
+    window: ResourceId,
+    deviceid: u16,
+) -> u32 {
+    state
+        .xi1_window_input_events
+        .get(&window)
+        .and_then(|per_device| per_device.get(&deviceid))
+        .copied()
+        .map(|mask| u32::try_from(mask).expect("XI1 event mask fits 32 bits"))
+        .unwrap_or_default()
+}
 
 /// One recipient/form decision for smooth-scroll update and stop motions.
 pub(super) struct Xi2MotionTarget {
@@ -32,23 +96,37 @@ pub(super) fn xi2_motion_targets_for_source(
     root_x: i16,
     root_y: i16,
     source_accepted: bool,
+    master_accepted: bool,
+    replay: Option<PointerReplay>,
 ) -> Vec<Xi2MotionTarget> {
     const XI_MOTION: u16 = 6;
-    if !source_accepted {
+    if !source_accepted && !master_accepted {
         return Vec::new();
     }
 
     let mut forms = Vec::with_capacity(2);
-    if let Some(deviceid) = source.slave_deviceid {
-        forms.push((Xi2PointerForm::Slave, deviceid));
-    }
-    if source.attached_master == Some(XI2_MASTER_POINTER_DEVICE_ID) {
-        forms.push((Xi2PointerForm::Master, XI2_MASTER_POINTER_DEVICE_ID));
+    if let Some(replay) = replay {
+        match state.xi_devices.role(replay.device) {
+            Some(crate::xinput::XiDeviceRole::SlavePointer) if source_accepted => {
+                forms.push((Xi2PointerForm::Slave, replay.device));
+            }
+            Some(crate::xinput::XiDeviceRole::MasterPointer) if master_accepted => {
+                forms.push((Xi2PointerForm::Master, replay.device));
+            }
+            _ => {}
+        }
+    } else {
+        if source_accepted && let Some(deviceid) = source.slave_deviceid {
+            forms.push((Xi2PointerForm::Slave, deviceid));
+        }
+        if master_accepted && source.attached_master == Some(XI2_MASTER_POINTER_DEVICE_ID) {
+            forms.push((Xi2PointerForm::Master, XI2_MASTER_POINTER_DEVICE_ID));
+        }
     }
 
     let mut targets = Vec::new();
     for (form, deviceid) in forms {
-        if let Some(grab) = grab_for_form(state, source, form) {
+        if let Some(grab) = grab_for_form(state, source, form, replay) {
             let natural = if grab.owner_events {
                 owner_events_route(
                     state,
@@ -199,80 +277,33 @@ pub(super) fn xi1_selection_filter_for_slave_grab(
     (filter, Some((grab, route)))
 }
 
-pub(super) fn xi2_direct_xtest_motion(
-    state: &mut ServerState,
-    q: &crate::server::Xi1QueuedEvent,
-    grab: crate::server::ActivePointerGrab,
-    route: OwnerEventsRoute,
-) -> Vec<ClientId> {
-    const XI_MOTION: u16 = 6;
+pub(in crate::core_loop) fn xtest_wire_valuators(
+    axes: crate::server::Xi1MotionAxes,
+    completed_position: Option<(i16, i16)>,
+) -> (u8, Vec<i32>) {
     // Xorg's FakeInput path writes explicit values at their global axis
     // index, then copies the range from a zero-based slice (C18;
     // `../xserver/Xext/xtest.c:248-284`,
     // `../xserver/dix/inpututils.c:452-462`). Match the resulting wire
-    // valuators, including its nonzero-first-axis behavior.
-    let motion_valuators = q.axes.map(|axes| {
-        let count = usize::from(axes.count.min(6));
-        let first = usize::from(axes.first);
-        let values = (0..count)
-            .map(|output_offset| {
-                output_offset
+    // valuators, including its nonzero-first-axis behavior. Xorg then writes
+    // the completed pointer position back to present X/Y axes after motion
+    // accumulation and confinement (`../xserver/dix/getevents.c:786,976`,
+    // `../xserver/dix/eventconvert.c:738`).
+    let count = usize::from(axes.count.min(6));
+    let first = usize::from(axes.first);
+    let values = (0..count)
+        .map(
+            |output_offset| match (first + output_offset, completed_position) {
+                (0, Some((x, _))) => i32::from(x),
+                (1, Some((_, y))) => i32::from(y),
+                _ => output_offset
                     .checked_sub(first)
                     .filter(|request_offset| *request_offset < count)
-                    .map_or(0, |request_offset| axes.values[request_offset])
-            })
-            .collect::<Vec<_>>();
-        (axes.first, values)
-    });
-    let (window, child, event_x, event_y) = match route {
-        OwnerEventsRoute::Natural {
-            window,
-            x,
-            y,
-            child,
-            protocol: OwnerProtocol::Xi2,
-        } => (window, child, x, y),
-        OwnerEventsRoute::Fallback if grab.xi2_mask & (1_u64 << XI_MOTION) != 0 => {
-            let (window_x, window_y) = state.resources.window_absolute_position(grab.grab_window);
-            let child = xi2_child_toward(state, grab.grab_window, q.natural_target);
-            (
-                grab.grab_window,
-                child,
-                clamp_grab_coord(q.root_x, window_x),
-                clamp_grab_coord(q.root_y, window_y),
-            )
-        }
-        OwnerEventsRoute::Natural { .. } | OwnerEventsRoute::Fallback => return Vec::new(),
-    };
-    fanout_event_to_clients(
-        state,
-        std::slice::from_ref(&grab.owner),
-        |buf, seq, order| {
-            x11::encode_xi2_device_event(
-                buf,
-                order,
-                seq,
-                XI2_MAJOR_OPCODE,
-                XI_MOTION,
-                q.deviceid,
-                q.time,
-                ROOT_WINDOW,
-                window,
-                child,
-                q.root_x,
-                q.root_y,
-                event_x,
-                event_y,
-                q.state_mask,
-                0,
-                q.deviceid,
-                0,
-                motion_valuators
-                    .as_ref()
-                    .map(|(first, values)| (*first, values.as_slice())),
-            );
-        },
-    )
+                    .map_or(0, |request_offset| axes.values[request_offset]),
+            },
+        )
+        .collect();
+    (axes.first, values)
 }
 
 /// Return the grab attached to this device form. A master grab controls the
@@ -281,15 +312,49 @@ pub(super) fn grab_for_form(
     state: &ServerState,
     source: PointerXiSource,
     form: Xi2PointerForm,
+    replay: Option<PointerReplay>,
 ) -> Option<crate::server::ActivePointerGrab> {
+    let slave_grab = |device_id| {
+        state
+            .xi2_pointer_grabs
+            .get(&device_id)
+            .copied()
+            .or_else(|| {
+                state
+                    .xi1_active_grabs
+                    .get(&device_id)
+                    .filter(|grab| grab.implicit)
+                    .map(|grab| crate::server::ActivePointerGrab {
+                        owner: grab.owner,
+                        grab_window: grab.grab_window,
+                        event_mask: 0,
+                        cursor: ResourceId(0),
+                        time: state.xi1_last_grab_time,
+                        owner_events: grab.owner_events,
+                        via_xi2: false,
+                        implicit: true,
+                        passive: false,
+                        xi2_mask: 0,
+                    })
+            })
+    };
+    if let Some(replay) = replay {
+        return match (state.xi_devices.role(replay.device), form) {
+            (Some(crate::xinput::XiDeviceRole::MasterPointer), Xi2PointerForm::Master) => {
+                state.active_pointer_grab
+            }
+            (Some(crate::xinput::XiDeviceRole::SlavePointer), Xi2PointerForm::Slave) => {
+                slave_grab(replay.device)
+            }
+            _ => None,
+        };
+    }
     match form {
         Xi2PointerForm::Master => (source.sourceid == XI2_MASTER_POINTER_DEVICE_ID
             || source.attached_master == Some(XI2_MASTER_POINTER_DEVICE_ID))
         .then_some(state.active_pointer_grab)
         .flatten(),
-        Xi2PointerForm::Slave => source
-            .slave_deviceid
-            .and_then(|device_id| state.xi2_pointer_grabs.get(&device_id).copied()),
+        Xi2PointerForm::Slave => source.slave_deviceid.and_then(slave_grab),
     }
 }
 
