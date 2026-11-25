@@ -217,7 +217,9 @@ state.receive_request)`; only `Allow` appends the copy. Core `MappingNotify` wri
     `MappingNotify`, reply; SetDeviceModifierMapping on the master keyboard → DeviceMappingNotify, core
     `MappingNotify`, reply. Also pin each non-originator stream: for ChangeKeyboardDevice, a selecting other client
     gets ChangeDeviceNotify with its own sequence, then core `MappingNotify`. Passes before and after the
-    implementation. Second mutation: give X6 the request's sequence instead of the recipient's.
+    implementation. Second mutation: give X6 the request's sequence instead of the recipient's. Likewise for
+    ChangeDeviceKeyMapping: a selecting non-originator gets core `MappingNotify` then DeviceMappingNotify with its own
+    sequence. Third mutation: move X5's write ahead of the core `MappingNotify`.
     `// mutation: append X7a's button-map copy before the reply`
   - `receive_xi_mapping_after_xkb_change`: two clients select the master keyboard's DeviceMappingNotify; call the
     production `xkb_select::send_legacy_map_notify` directly (server work, `receive_request` = `None`) with a key-map
@@ -245,8 +247,9 @@ both with `D(deviceid)` through the checked fanout. The returned vector keeps ca
 - [ ] **Step 1: Write the failing tests:**
   - `receive_xi_property_forms_checked_independently`: one client selects XI2 PropertyEvent (`XIAllDevices`) and
     XI1 DevicePropertyNotify for the device; XIChangeProperty on the device. Run 1 denies only the XI2 description,
-    run 2 only the XI1 description. In each run the client receives exactly the other form's copy, equal to its
-    all-Allow bytes, and exactly one Receive call per form is recorded with `D(deviceid)` and the exact description;
+    run 2 only the XI1 description, both for that client only. A second client selects both forms and is always
+    allowed; in both runs its complete stream equals the literal baseline. In each run the first client receives
+    exactly the other form's copy, equal to its literal baseline, and exactly one Receive call per form is recorded with `D(deviceid)` and the exact description;
     the property value is stored; replies and errors are unchanged.
     `// mutation: skip the check on the XI1 path (X10)`
   - `receive_xi_property_baseline_order`: no policy installed, the dual-selecting client receives XI2
@@ -258,7 +261,11 @@ both with `D(deviceid)` through the checked fanout. The returned vector keeps ca
   baseline test passes.
 - [ ] **Step 3: Implement** X9 and X10. Correct the `emit_property_change` doc comment: Xorg broadcasts per selecting
   window (`Xi/xiproperty.c:206-208`, `Xi/exevents.c:3300-3312`); yserver sends one aggregate copy per client and
-  form, and its device subject is a yserver rule.
+  form, and its device subject is a yserver rule. Also correct the class-selection comment in
+  `core_loop/process_request/xi/dispatch/events.rs` (~580): the per-client aggregation of mapping, change-device and
+  property notifications is yserver behavior; Xorg broadcasts mapping and property per window
+  (`xkb/xkbEvents.c:142`, `Xi/xiproperty.c:206`) and returns `BadDevice` from ChangeKeyboardDevice
+  (`Xi/chgkbd.c:97`).
 - [ ] **Step 4: Run** the tests, the full crate suite under load, every `tests/*.rs` integration target, and
   `cargo clippy --all-targets -- -D warnings` — Expected: PASS.
 - [ ] **Step 5: Commit** `feat(access): Receive on XI device property notifications`.
