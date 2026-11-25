@@ -621,8 +621,8 @@ fn literal_physical_pointer_classes(source_id: u16, order: ClientByteOrder) -> V
     super::access_notify_support::append_event_u16(&mut classes, order, 10); // 10 four-byte units
     super::access_notify_support::append_event_u16(&mut classes, order, source_id);
     super::access_notify_support::append_event_u16(&mut classes, order, 7); // seven buttons
-    super::access_notify_support::append_event_u16(&mut classes, order, 0); // zero state length
-    super::access_notify_support::append_event_u16(&mut classes, order, 0); // zero state
+    super::access_notify_support::append_event_u16(&mut classes, order, 0); // state bitmap (4 bytes), first half
+    super::access_notify_support::append_event_u16(&mut classes, order, 0); // state bitmap, second half: all zero
     for atom in 0x5d_u32..=0x63 {
         super::access_notify_support::append_event_u32(&mut classes, order, atom);
     }
