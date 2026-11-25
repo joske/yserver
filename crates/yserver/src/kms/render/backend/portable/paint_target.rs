@@ -975,19 +975,41 @@ impl<P: Platform> XBackend<P> {
                             return None;
                         }
                         let sibling_target = self.resolve_paint_target(*sibling_host_xid)?;
-                        (sibling_target.backing_id() == dst_target.backing_id()).then_some((
-                            sibling_geom.stack_rank,
-                            ash::vk::Rect2D {
-                                offset: ash::vk::Offset2D {
-                                    x: sibling_target.offset().0 - dst_target.offset().0,
-                                    y: sibling_target.offset().1 - dst_target.offset().1,
-                                },
-                                extent: ash::vk::Extent2D {
-                                    width: u32::from(sibling_geom.width),
-                                    height: u32::from(sibling_geom.height),
-                                },
+                        if sibling_target.backing_id() != dst_target.backing_id() {
+                            return None;
+                        }
+
+                        // `child_clip_region` returns the content box for an
+                        // unshaped sibling and the shape clipped to the outer
+                        // rect for a shaped one. Both are in parent content
+                        // space, so use the same conversion to destination
+                        // content coordinates.
+                        let rank = sibling_geom.stack_rank;
+                        let bw = i32::from(sibling_geom.border_width);
+                        let content_box = ash::vk::Rect2D {
+                            offset: ash::vk::Offset2D {
+                                x: i32::from(sibling_geom.x) + bw,
+                                y: i32::from(sibling_geom.y) + bw,
                             },
-                        ))
+                            extent: ash::vk::Extent2D {
+                                width: u32::from(sibling_geom.width),
+                                height: u32::from(sibling_geom.height),
+                            },
+                        };
+                        let dx = -content_box.offset.x + sibling_target.offset().0
+                            - dst_target.offset().0;
+                        let dy = -content_box.offset.y + sibling_target.offset().1
+                            - dst_target.offset().1;
+                        let contribution: Vec<_> = self
+                            .child_clip_region(*sibling_host_xid, sibling_geom, content_box)
+                            .into_iter()
+                            .map(|mut rect| {
+                                rect.offset.x += dx;
+                                rect.offset.y += dy;
+                                rect
+                            })
+                            .collect();
+                        Some((rank, contribution))
                     }),
             );
             let Some(parent_xid) = branch_geom.parent else {
@@ -996,7 +1018,7 @@ impl<P: Platform> XBackend<P> {
             branch_xid = parent_xid;
         }
         occluders.sort_by_key(|(rank, _)| *rank);
-        occluders.into_iter().map(|(_, rect)| rect).collect()
+        occluders.into_iter().flat_map(|(_, rects)| rects).collect()
     }
 
     /// `host_xid`'s bounding shape in its own content space, or `None`

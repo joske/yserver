@@ -19,7 +19,7 @@ use crate::kms::{
 use ash::vk;
 use std::io;
 use yserver_core::{
-    backend::{OriginContext, PixmapHandle, WindowHandle},
+    backend::{OriginContext, PixmapHandle, SubwindowMode, WindowHandle},
     host_x11::{HostSubwindowConfig, HostSubwindowVisual},
     server::ServerState,
 };
@@ -853,21 +853,10 @@ impl<P: Platform> XBackend<P> {
             if self.store.get(src).map(|d| d.storage.format)
                 == Some(ash::vk::Format::B8G8R8A8_UNORM)
             {
-                // Higher-stacked sibling windows that share this backing
-                // must not be overwritten by this clear. xfwm4 frames a
-                // top-level with a titlebar window (e.g. 1136x28) and the
-                // decoration buttons as SIBLINGS that all flatten into the
-                // one redirect backing, with the buttons stacked ABOVE the
-                // titlebar. Painted in client-request order, the titlebar's
-                // background-pixmap clear lands AFTER the buttons and — with
-                // no sibling clip — stomps them flat (decoration buttons
-                // "briefly show then vanish; reappear on hover"). copy_area
-                // already guards this exact shared-backing case via
-                // `copy_area_shared_backing_occluders`; mirror it here so
-                // ClearArea / background tiling honours the same clip.
-                // Coords are dst-window-local (the occluder rects' space);
-                // `dst_target.offset()` shifts each surviving piece into the
-                // backing.
+                // Like solid backgrounds, pixmap backgrounds use ClipByChildren
+                // here, including mapped children and the shared-backing clip.
+                // Coords are dst-window-local; `dst_target.offset()` shifts
+                // each surviving piece into the backing.
                 let clear_rect = ash::vk::Rect2D {
                     offset: ash::vk::Offset2D {
                         x: i32::from(x),
@@ -878,18 +867,21 @@ impl<P: Platform> XBackend<P> {
                         height: u32::from(height),
                     },
                 };
-                let surviving: Vec<ash::vk::Rect2D> = if self.windows.contains_key(&host_xid) {
-                    let occ = self.copy_area_shared_backing_occluders(host_xid, &dst_target);
-                    if occ.is_empty() {
-                        vec![clear_rect]
-                    } else {
-                        compute_copy_area_dst_rects(clear_rect, &occ)
+                let mut surviving = vec![clear_rect];
+                if let Some(clip) =
+                    self.subwindow_mode_clip(host_xid, SubwindowMode::ClipByChildren)
+                {
+                    // Keep Rect2D pieces: the Rectangle16 adapter drops origins beyond i16.
+                    surviving = compute_copy_area_dst_rects(clear_rect, &clip.cut);
+                    if let Some(keep) = clip.keep.as_deref() {
+                        surviving = surviving
+                            .into_iter()
+                            .flat_map(|rect| intersect_rect_with_clip(rect, keep))
+                            .collect();
                     }
-                } else {
-                    vec![clear_rect]
-                };
+                }
                 if surviving.is_empty() {
-                    // Fully occluded by higher siblings — nothing to clear.
+                    // Fully clipped — nothing to clear.
                     return Ok(());
                 }
                 let rects: Vec<CompositeRect> = surviving
