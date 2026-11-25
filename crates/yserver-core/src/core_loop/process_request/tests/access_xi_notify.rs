@@ -13,7 +13,13 @@ use crate::{
     access::{Decision, DenyError, EventDescription, EventSubject, RequestOpcodes},
     resources::ROOT_WINDOW,
 };
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use yserver_protocol::x11::{ClientId, ResourceId};
 
 const CHILD_WINDOW: ResourceId = ResourceId(0x0071_0001);
@@ -522,4 +528,635 @@ fn receive_xi_hotplug_baseline_frames() {
         literal_disabled_stream_with_order(10, device_id, ClientByteOrder::BigEndian),
         "complete big-endian hotplug frames with sequence 10"
     );
+}
+
+fn xi2_device_changed_selection_body(window: ResourceId, device_id: u16) -> Vec<u8> {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&window.0.to_le_bytes());
+    body.extend_from_slice(&1u16.to_le_bytes()); // num_masks
+    body.extend_from_slice(&0u16.to_le_bytes()); // pad
+    body.extend_from_slice(&device_id.to_le_bytes());
+    body.extend_from_slice(&1u16.to_le_bytes()); // mask_len
+    body.extend_from_slice(&crate::xinput::XI2_DEVICE_CHANGED_MASK.to_le_bytes());
+    body
+}
+
+fn select_device_changed(
+    fixture: &mut NotifyFixture,
+    client: ClientId,
+    sequence: u16,
+    window: ResourceId,
+    device_id: u16,
+) {
+    let body = xi2_device_changed_selection_body(window, device_id);
+    fixture
+        .request(
+            client,
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: 137,
+                data: 46,
+                length_units: 5,
+            },
+            &body,
+        )
+        .expect("XISelectEvents DeviceChanged selection");
+}
+
+fn xi2_device_changed_frames(wire: &[u8]) -> Vec<&[u8]> {
+    let mut frames = Vec::new();
+    let mut offset = 0;
+    while offset < wire.len() {
+        assert!(wire.len() - offset >= 32, "complete GenericEvent header");
+        assert_eq!(wire[offset], 35, "GenericEvent");
+        let units = usize::try_from(u32::from_le_bytes(
+            wire[offset + 4..offset + 8].try_into().unwrap(),
+        ))
+        .unwrap();
+        let length = 32 + units * 4;
+        assert!(
+            length <= wire.len() - offset,
+            "complete DeviceChanged frame"
+        );
+        frames.push(&wire[offset..offset + length]);
+        offset += length;
+    }
+    frames
+}
+
+fn literal_device_changed_event(
+    sequence: u16,
+    device_id: u16,
+    source_id: u16,
+    num_classes: u16,
+    classes: &[u8],
+) -> Vec<u8> {
+    let mut bytes = vec![35, 137]; // GenericEvent, XInput major opcode
+    super::access_notify_support::append_event_u16(
+        &mut bytes,
+        ClientByteOrder::LittleEndian,
+        sequence,
+    );
+    super::access_notify_support::append_event_u32(
+        &mut bytes,
+        ClientByteOrder::LittleEndian,
+        u32::try_from(classes.len() / 4).unwrap(),
+    );
+    super::access_notify_support::append_event_u16(&mut bytes, ClientByteOrder::LittleEndian, 1); // XI_DeviceChanged
+    super::access_notify_support::append_event_u16(
+        &mut bytes,
+        ClientByteOrder::LittleEndian,
+        device_id,
+    );
+    super::access_notify_support::append_event_u32(&mut bytes, ClientByteOrder::LittleEndian, 0);
+    super::access_notify_support::append_event_u16(
+        &mut bytes,
+        ClientByteOrder::LittleEndian,
+        num_classes,
+    );
+    super::access_notify_support::append_event_u16(
+        &mut bytes,
+        ClientByteOrder::LittleEndian,
+        source_id,
+    );
+    bytes.extend_from_slice(&[1, 0]); // SlaveSwitch, pad0
+    super::access_notify_support::append_event_u16(&mut bytes, ClientByteOrder::LittleEndian, 0);
+    super::access_notify_support::append_event_u32(&mut bytes, ClientByteOrder::LittleEndian, 0);
+    super::access_notify_support::append_event_u32(&mut bytes, ClientByteOrder::LittleEndian, 0);
+    bytes.extend_from_slice(classes);
+    bytes
+}
+
+fn literal_physical_pointer_classes(source_id: u16) -> Vec<u8> {
+    let mut classes = vec![1, 0, 10, 0]; // ButtonClass, 10 four-byte units
+    super::access_notify_support::append_event_u16(
+        &mut classes,
+        ClientByteOrder::LittleEndian,
+        source_id,
+    );
+    classes.extend_from_slice(&[7, 0, 0, 0, 0, 0]); // seven buttons, zero state
+    for atom in 0x5d_u32..=0x63 {
+        super::access_notify_support::append_event_u32(
+            &mut classes,
+            ClientByteOrder::LittleEndian,
+            atom,
+        );
+    }
+    for (axis, atom, max, value) in [
+        (0u16, 0x64_u32, -1_i32, 400_i32),
+        (1, 0x65, -1, 300),
+        (2, 0x66, 0, 0),
+        (3, 0x67, 0, 0),
+    ] {
+        classes.extend_from_slice(&[2, 0, 11, 0]); // ValuatorClass, 11 units
+        super::access_notify_support::append_event_u16(
+            &mut classes,
+            ClientByteOrder::LittleEndian,
+            source_id,
+        );
+        super::access_notify_support::append_event_u16(
+            &mut classes,
+            ClientByteOrder::LittleEndian,
+            axis,
+        );
+        super::access_notify_support::append_event_u32(
+            &mut classes,
+            ClientByteOrder::LittleEndian,
+            atom,
+        );
+        super::access_notify_support::append_event_u32(
+            &mut classes,
+            ClientByteOrder::LittleEndian,
+            u32::MAX,
+        ); // minimum = -1
+        super::access_notify_support::append_event_u32(
+            &mut classes,
+            ClientByteOrder::LittleEndian,
+            0,
+        );
+        super::access_notify_support::append_event_u32(
+            &mut classes,
+            ClientByteOrder::LittleEndian,
+            max as u32,
+        );
+        super::access_notify_support::append_event_u32(
+            &mut classes,
+            ClientByteOrder::LittleEndian,
+            0,
+        );
+        super::access_notify_support::append_event_u32(
+            &mut classes,
+            ClientByteOrder::LittleEndian,
+            value as u32,
+        );
+        super::access_notify_support::append_event_u32(
+            &mut classes,
+            ClientByteOrder::LittleEndian,
+            0,
+        );
+        super::access_notify_support::append_event_u32(
+            &mut classes,
+            ClientByteOrder::LittleEndian,
+            0,
+        );
+        classes.extend_from_slice(&[0; 4]); // relative mode and padding
+    }
+    for (number, scroll_type) in [(2u16, 1u16), (3, 2)] {
+        classes.extend_from_slice(&[3, 0, 6, 0]); // ScrollClass, 6 units
+        super::access_notify_support::append_event_u16(
+            &mut classes,
+            ClientByteOrder::LittleEndian,
+            source_id,
+        );
+        super::access_notify_support::append_event_u16(
+            &mut classes,
+            ClientByteOrder::LittleEndian,
+            number,
+        );
+        super::access_notify_support::append_event_u16(
+            &mut classes,
+            ClientByteOrder::LittleEndian,
+            scroll_type,
+        );
+        super::access_notify_support::append_event_u16(
+            &mut classes,
+            ClientByteOrder::LittleEndian,
+            0,
+        );
+        super::access_notify_support::append_event_u32(
+            &mut classes,
+            ClientByteOrder::LittleEndian,
+            0,
+        );
+        super::access_notify_support::append_event_u32(
+            &mut classes,
+            ClientByteOrder::LittleEndian,
+            1,
+        );
+        super::access_notify_support::append_event_u32(
+            &mut classes,
+            ClientByteOrder::LittleEndian,
+            0,
+        );
+    }
+    assert_eq!(classes.len(), 264, "complete seven-class pointer payload");
+    classes
+}
+
+fn literal_keyboard_classes(source_id: u16) -> Vec<u8> {
+    let mut classes = vec![0, 0, 250, 0]; // KeyClass, 250 four-byte units
+    super::access_notify_support::append_event_u16(
+        &mut classes,
+        ClientByteOrder::LittleEndian,
+        source_id,
+    );
+    classes.extend_from_slice(&[248, 0]); // keycodes 8 through 255
+    for keycode in 8_u32..=255 {
+        super::access_notify_support::append_event_u32(
+            &mut classes,
+            ClientByteOrder::LittleEndian,
+            keycode,
+        );
+    }
+    assert_eq!(classes.len(), 1000, "complete 248-key KeyClass payload");
+    classes
+}
+
+fn bootstrap_device_changed_fixture() -> (NotifyFixture, u16, u16) {
+    let mut fixture = NotifyFixture::new();
+    let pointer_id = seed_pointer_for_t3(&mut fixture.state);
+    let keyboard_ids = fixture
+        .state
+        .xi_register_source(&crate::core_loop::DeviceInfo {
+            source_id: crate::xinput::InputSourceId(0x4b45_5942),
+            enabled: true,
+            resume_key: None,
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: true,
+                pointer: false,
+                touch: false,
+            },
+            name: "Access test keyboard".into(),
+            device_node: "/dev/input/access-test-keyboard".into(),
+            sysname: "access-test-keyboard".into(),
+            vendor_id: 1,
+            product_id: 2,
+            is_touchpad: false,
+            config: Default::default(),
+        });
+    let keyboard_id = *keyboard_ids
+        .first()
+        .expect("keyboard source creates one XI keyboard facet");
+    assert!(
+        fixture
+            .state
+            .xi_record_last_slave(crate::xinput::DEVICEID_MASTER_POINTER, pointer_id)
+    );
+    assert!(
+        fixture
+            .state
+            .xi_record_last_slave(crate::xinput::DEVICEID_MASTER_KEYBOARD, keyboard_id)
+    );
+    fixture.state.start_instant = std::time::Instant::now() + Duration::from_secs(30);
+    for client in [
+        NOTIFY_SENDER,
+        NOTIFY_RECEIVER_DENIED,
+        NOTIFY_RECEIVER_ALLOWED,
+    ] {
+        fixture.drain(client);
+    }
+    (fixture, pointer_id, keyboard_id)
+}
+
+fn device_changed_description() -> EventDescription {
+    EventDescription::extension(35, 137, 1)
+}
+
+fn is_device_changed_receive(call: &RecordedExtensionCheck) -> bool {
+    call.hook == ExtensionHook::Receive
+        && call
+            .events
+            .as_ref()
+            .is_some_and(|events| events.as_slice() == [EventDescription::extension(35, 137, 1)])
+}
+
+#[test]
+fn receive_xi_device_changed_denial_per_window() {
+    // mutation: drop the subject loop variable and check W(ROOT_WINDOW)
+    let (mut allowed, device_id) = hotplug_fixture();
+    select_device_changed(
+        &mut allowed,
+        NOTIFY_RECEIVER_DENIED,
+        3,
+        ROOT_WINDOW,
+        crate::xinput::DEVICEID_MASTER_POINTER,
+    );
+    select_device_changed(
+        &mut allowed,
+        NOTIFY_RECEIVER_DENIED,
+        4,
+        CHILD_WINDOW,
+        crate::xinput::DEVICEID_MASTER_POINTER,
+    );
+    let allowed_calls = allowed.install_policy(|_, _| Decision::Allow);
+    assert!(
+        crate::xinput::hotplug::announce_xi2_slave_switch(
+            &mut allowed.state,
+            crate::xinput::DEVICEID_MASTER_POINTER,
+            device_id,
+        )
+        .is_empty()
+    );
+    assert!(allowed.drain(NOTIFY_SENDER).is_empty());
+    let all_allow_wire = allowed.drain(NOTIFY_RECEIVER_DENIED);
+    let all_allow = xi2_device_changed_frames(&all_allow_wire);
+    assert_eq!(all_allow.len(), 2, "root and child each have a copy");
+    assert_eq!(all_allow[0], all_allow[1], "window is not on the wire");
+    assert_eq!(
+        allowed
+            .state
+            .xi_last_slave(crate::xinput::DEVICEID_MASTER_POINTER),
+        Some(device_id)
+    );
+    let allowed_receives = receive_checks(&allowed_calls);
+    assert_eq!(allowed_receives.len(), 2);
+    assert!(allowed_receives.iter().any(|call| {
+        call.receive == Some(EventSubject::Window(ROOT_WINDOW))
+            && call.request.is_none()
+            && call.events == Some(vec![device_changed_description()])
+    }));
+    assert!(allowed_receives.iter().any(|call| {
+        call.receive == Some(EventSubject::Window(CHILD_WINDOW))
+            && call.request.is_none()
+            && call.events == Some(vec![device_changed_description()])
+    }));
+
+    let (mut denied, device_id) = hotplug_fixture();
+    select_device_changed(
+        &mut denied,
+        NOTIFY_RECEIVER_DENIED,
+        3,
+        ROOT_WINDOW,
+        crate::xinput::DEVICEID_MASTER_POINTER,
+    );
+    select_device_changed(
+        &mut denied,
+        NOTIFY_RECEIVER_DENIED,
+        4,
+        CHILD_WINDOW,
+        crate::xinput::DEVICEID_MASTER_POINTER,
+    );
+    let calls = denied.install_policy(|_, call| {
+        if call.hook == ExtensionHook::Receive
+            && call.client == NOTIFY_RECEIVER_DENIED
+            && call.receive == Some(EventSubject::Window(CHILD_WINDOW))
+            && call.events.as_ref().is_some_and(|events| {
+                events.as_slice() == [EventDescription::extension(35, 137, 1)]
+            })
+        {
+            Decision::Deny(DENY)
+        } else {
+            Decision::Allow
+        }
+    });
+    assert!(
+        crate::xinput::hotplug::announce_xi2_slave_switch(
+            &mut denied.state,
+            crate::xinput::DEVICEID_MASTER_POINTER,
+            device_id,
+        )
+        .is_empty()
+    );
+    assert!(
+        crate::core_loop::client_io::failed_writers(&denied.state.clients).is_empty(),
+        "denying one copy does not queue a writer for disconnect"
+    );
+    assert!(denied.drain(NOTIFY_SENDER).is_empty());
+    let received_wire = denied.drain(NOTIFY_RECEIVER_DENIED);
+    let received = xi2_device_changed_frames(&received_wire);
+    assert_eq!(
+        received,
+        [all_allow[0]],
+        "only the root-selected copy remains"
+    );
+    assert_eq!(
+        denied
+            .state
+            .xi_last_slave(crate::xinput::DEVICEID_MASTER_POINTER),
+        Some(device_id),
+        "denying a copy leaves the master switch applied"
+    );
+    assert!(denied.state.clients.contains_key(&NOTIFY_RECEIVER_DENIED.0));
+    let denied_receives = receive_checks(&calls)
+        .into_iter()
+        .filter(is_device_changed_receive)
+        .collect::<Vec<_>>();
+    assert_eq!(denied_receives.len(), 2);
+    assert!(denied_receives.iter().any(|call| {
+        call.receive == Some(EventSubject::Window(ROOT_WINDOW))
+            && call.events == Some(vec![EventDescription::extension(35, 137, 1)])
+            && call.request.is_none()
+    }));
+    assert!(denied_receives.iter().any(|call| {
+        call.receive == Some(EventSubject::Window(CHILD_WINDOW))
+            && call.events == Some(vec![EventDescription::extension(35, 137, 1)])
+            && call.request.is_none()
+    }));
+}
+
+#[test]
+fn receive_xi_bootstrap_denies_one_master_only() {
+    // mutation: check once for the whole buffer instead of per master
+    let (mut allowed, _, _) = bootstrap_device_changed_fixture();
+    select_device_changed(
+        &mut allowed,
+        NOTIFY_RECEIVER_DENIED,
+        20,
+        ROOT_WINDOW,
+        0, // XIAllDevices
+    );
+    let all_allow_wire = allowed.drain(NOTIFY_RECEIVER_DENIED);
+    let all_allow = xi2_device_changed_frames(&all_allow_wire);
+    assert_eq!(all_allow.len(), 2);
+    assert_eq!(
+        u16::from_le_bytes([all_allow[0][10], all_allow[0][11]]),
+        crate::xinput::DEVICEID_MASTER_POINTER
+    );
+    assert_eq!(
+        u16::from_le_bytes([all_allow[1][10], all_allow[1][11]]),
+        crate::xinput::DEVICEID_MASTER_KEYBOARD
+    );
+
+    let (mut denied, _, _) = bootstrap_device_changed_fixture();
+    let matched = Arc::new(AtomicUsize::new(0));
+    let matched_for_policy = Arc::clone(&matched);
+    let calls = denied.install_policy(move |_, call| {
+        if call.hook == ExtensionHook::Receive
+            && call.client == NOTIFY_RECEIVER_DENIED
+            && call.events.as_ref().is_some_and(|events| {
+                events.as_slice() == [EventDescription::extension(35, 137, 1)]
+            })
+            && matched_for_policy.fetch_add(1, Ordering::Relaxed) == 0
+        {
+            Decision::Deny(DENY)
+        } else {
+            Decision::Allow
+        }
+    });
+    select_device_changed(
+        &mut denied,
+        NOTIFY_RECEIVER_DENIED,
+        20,
+        ROOT_WINDOW,
+        0, // XIAllDevices
+    );
+    let received_wire = denied.drain(NOTIFY_RECEIVER_DENIED);
+    let received = xi2_device_changed_frames(&received_wire);
+    assert_eq!(
+        received,
+        [all_allow[1]],
+        "keyboard event survives pointer denial"
+    );
+    assert!(denied.state.clients.contains_key(&NOTIFY_RECEIVER_DENIED.0));
+    assert!(crate::core_loop::client_io::failed_writers(&denied.state.clients).is_empty());
+    assert_eq!(
+        denied.state.clients[&NOTIFY_RECEIVER_DENIED.0]
+            .xi2_masks
+            .get(&(ROOT_WINDOW, 0)),
+        Some(&u64::from(crate::xinput::XI2_DEVICE_CHANGED_MASK)),
+        "denial does not undo XISelectEvents"
+    );
+    let receives = receive_checks(&calls)
+        .into_iter()
+        .filter(is_device_changed_receive)
+        .collect::<Vec<_>>();
+    assert_eq!(receives.len(), 2);
+    assert!(receives.iter().all(|call| {
+        call.client == NOTIFY_RECEIVER_DENIED
+            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
+            && call.events == Some(vec![EventDescription::extension(35, 137, 1)])
+            && call.request
+                == Some(RequestOpcodes {
+                    major: 137,
+                    minor: 46,
+                })
+    }));
+
+    let (mut deny_all_events, _, _) = bootstrap_device_changed_fixture();
+    let calls = deny_all_events.install_policy(|_, call| {
+        if call.hook == ExtensionHook::Receive
+            && call.client == NOTIFY_RECEIVER_DENIED
+            && call.events.as_ref().is_some_and(|events| {
+                events.as_slice() == [EventDescription::extension(35, 137, 1)]
+            })
+        {
+            Decision::Deny(DENY)
+        } else {
+            Decision::Allow
+        }
+    });
+    select_device_changed(
+        &mut deny_all_events,
+        NOTIFY_RECEIVER_DENIED,
+        20,
+        ROOT_WINDOW,
+        0, // XIAllDevices
+    );
+    assert!(deny_all_events.drain(NOTIFY_RECEIVER_DENIED).is_empty());
+    assert!(
+        deny_all_events
+            .state
+            .clients
+            .contains_key(&NOTIFY_RECEIVER_DENIED.0)
+    );
+    assert!(crate::core_loop::client_io::failed_writers(&deny_all_events.state.clients).is_empty());
+    assert_eq!(
+        deny_all_events.state.clients[&NOTIFY_RECEIVER_DENIED.0]
+            .xi2_masks
+            .get(&(ROOT_WINDOW, 0)),
+        Some(&u64::from(crate::xinput::XI2_DEVICE_CHANGED_MASK))
+    );
+    let receives = receive_checks(&calls)
+        .into_iter()
+        .filter(is_device_changed_receive)
+        .collect::<Vec<_>>();
+    assert_eq!(receives.len(), 2);
+    assert!(receives.iter().all(|call| {
+        call.client == NOTIFY_RECEIVER_DENIED
+            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
+            && call.events == Some(vec![EventDescription::extension(35, 137, 1)])
+            && call.request
+                == Some(RequestOpcodes {
+                    major: 137,
+                    minor: 46,
+                })
+    }));
+}
+
+#[test]
+fn receive_xi_device_changed_baseline_frames() {
+    // mutation: swap the bootstrap master order
+    let (mut changed, device_id) = hotplug_fixture();
+    select_device_changed(
+        &mut changed,
+        NOTIFY_RECEIVER_DENIED,
+        3,
+        ROOT_WINDOW,
+        crate::xinput::DEVICEID_MASTER_POINTER,
+    );
+    select_device_changed(
+        &mut changed,
+        NOTIFY_RECEIVER_DENIED,
+        4,
+        CHILD_WINDOW,
+        crate::xinput::DEVICEID_MASTER_POINTER,
+    );
+    assert!(
+        crate::xinput::hotplug::announce_xi2_slave_switch(
+            &mut changed.state,
+            crate::xinput::DEVICEID_MASTER_POINTER,
+            device_id,
+        )
+        .is_empty()
+    );
+    let changed_wire = changed.drain(NOTIFY_RECEIVER_DENIED);
+    let changed_frames = xi2_device_changed_frames(&changed_wire);
+    assert_eq!(changed_frames.len(), 2);
+    let pointer_classes = literal_physical_pointer_classes(device_id);
+    let changed_event = literal_device_changed_event(
+        4,
+        crate::xinput::DEVICEID_MASTER_POINTER,
+        device_id,
+        7,
+        &pointer_classes,
+    );
+    assert_eq!(
+        changed_wire,
+        [changed_event.clone(), changed_event].concat()
+    );
+
+    let (mut bootstrap, pointer_id, keyboard_id) = bootstrap_device_changed_fixture();
+    select_device_changed(
+        &mut bootstrap,
+        NOTIFY_RECEIVER_DENIED,
+        20,
+        ROOT_WINDOW,
+        0, // XIAllDevices
+    );
+    let bootstrap_wire = bootstrap.drain(NOTIFY_RECEIVER_DENIED);
+    let bootstrap_frames = xi2_device_changed_frames(&bootstrap_wire);
+    assert_eq!(bootstrap_frames.len(), 2);
+    assert_eq!(
+        u16::from_le_bytes([bootstrap_frames[0][10], bootstrap_frames[0][11]]),
+        crate::xinput::DEVICEID_MASTER_POINTER
+    );
+    assert_eq!(
+        u16::from_le_bytes([bootstrap_frames[0][18], bootstrap_frames[0][19]]),
+        pointer_id
+    );
+    assert_eq!(
+        u16::from_le_bytes([bootstrap_frames[1][10], bootstrap_frames[1][11]]),
+        crate::xinput::DEVICEID_MASTER_KEYBOARD
+    );
+    assert_eq!(
+        u16::from_le_bytes([bootstrap_frames[1][18], bootstrap_frames[1][19]]),
+        keyboard_id
+    );
+    let pointer_classes = literal_physical_pointer_classes(pointer_id);
+    let keyboard_classes = literal_keyboard_classes(keyboard_id);
+    let pointer_event = literal_device_changed_event(
+        20,
+        crate::xinput::DEVICEID_MASTER_POINTER,
+        pointer_id,
+        7,
+        &pointer_classes,
+    );
+    let keyboard_event = literal_device_changed_event(
+        20,
+        crate::xinput::DEVICEID_MASTER_KEYBOARD,
+        keyboard_id,
+        1,
+        &keyboard_classes,
+    );
+    assert_eq!(bootstrap_wire, [pointer_event, keyboard_event].concat());
 }

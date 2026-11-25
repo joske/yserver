@@ -266,14 +266,18 @@ pub fn emit_xi2_device_changed(
 
     let time = state.timestamp_now();
     let mut disconnected = HashSet::new();
-    for (client_id, _selected_window) in targets {
+    let events = [super::xi2_event_description(1)];
+    let batch = EventBatch::new(&events);
+    for (client_id, selected_window) in targets {
         if disconnected.contains(&client_id.0) {
             continue;
         }
         disconnected.extend(
-            crate::core_loop::fanout::fanout_event_to_clients(
+            fanout_event_to_clients_with_receive(
                 state,
                 std::slice::from_ref(&client_id),
+                EventSubject::Window(selected_window),
+                &batch,
                 |buf, sequence, order| {
                     let (classes, num_classes) = encode_device_classes(source_classes, order);
                     x11::encode_xi2_device_changed_event(
