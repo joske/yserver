@@ -269,6 +269,7 @@ pub fn process_disconnect_reporting(
     // Snapshot the resource-id base before the client entry is removed.
     // Recycled below only for `!retain` clients — see IdAllocator::release.
     let released_base = state.clients.get(&client_id.0).map(|c| c.resource_id_base);
+    state.forget_xi_extension_client(client_id);
     state.clients.remove(&client_id.0);
     if !retain && let Some(base) = released_base {
         state.id_allocator.release(base);

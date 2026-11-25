@@ -464,6 +464,7 @@ impl<P: Platform> XBackend<P> {
                 dx,
                 dy,
                 motion_delta,
+                device_axes,
                 ..
             } => {
                 if let Some(device_id) =
@@ -518,6 +519,7 @@ impl<P: Platform> XBackend<P> {
                         self.serialize_modifiers() | buttons,
                         dx,
                         dy,
+                        device_axes,
                     );
                 } else {
                     self.core.button_mask = (state.buttons_down & 0x001f) << 8;
@@ -531,10 +533,18 @@ impl<P: Platform> XBackend<P> {
                             dx,
                             dy,
                             origin,
+                            device_axes,
                         );
                     } else {
                         self.process_pointer_absolute(
-                            state, x as f32, y as f32, relative, dx, dy, origin,
+                            state,
+                            x as f32,
+                            y as f32,
+                            relative,
+                            dx,
+                            dy,
+                            origin,
+                            device_axes,
                         );
                     }
                 }
@@ -600,6 +610,7 @@ impl<P: Platform> XBackend<P> {
                         state_mask,
                         0,
                         0,
+                        None,
                     );
                 } else {
                     self.core.button_mask = (state.buttons_down & 0x001f) << 8;

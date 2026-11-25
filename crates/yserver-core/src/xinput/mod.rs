@@ -74,6 +74,23 @@ pub const XI_DEVICE_PRESENCE_NOTIFY_OFFSET: u8 = 15;
 /// `_devicePresence` is class offset zero.
 pub const XI1_DEVICE_PRESENCE_CLASS: u32 = 256 << 8;
 
+/// XI1 `XEventClass` code for the exclusive DeviceButtonGrab selection.
+/// It chooses the implicit-grab owner but does not itself deliver an event.
+pub const XI1_DEVICE_BUTTON_GRAB_CLASS: u8 = 7;
+
+/// XI1 `XEventClass` code for DeviceOwnerGrabButton.
+pub const XI1_DEVICE_OWNER_GRAB_BUTTON_CLASS: u8 = 8;
+
+/// Returns whether an XI1 event class selects the shared button-grab mask.
+/// Xorg 21.1.24 assigns both classes to `DeviceButtonGrabMask` in
+/// `Xi/extinit.c:144-145,1105-1106`.
+pub(crate) const fn xi1_class_is_button_grab(class: u8) -> bool {
+    matches!(
+        class,
+        XI1_DEVICE_BUTTON_GRAB_CLASS | XI1_DEVICE_OWNER_GRAB_BUTTON_CLASS
+    )
+}
+
 /// XI 1.x `DevicePropertyNotify` event code (XIproto.h:139, the 17th
 /// XInput event type). The wire type byte for a delivered event is
 /// `first_event + XI_DEVICE_PROPERTY_NOTIFY_OFFSET` (= 82 with
@@ -3035,4 +3052,18 @@ mod tests {
             "slave keyboard is never touchpad"
         );
     }
+}
+
+/// One Xorg `InputClients` node. DevicePresence may prepend duplicates, so
+/// each node owns its per-device XI1 and XI2 masks.
+#[derive(Debug, Clone)]
+pub struct XiInputClient {
+    pub client: yserver_protocol::x11::ClientId,
+    /// True for Xorg's server-owned placeholder kept while DNP masks retain
+    /// the window's OtherInputMasks allocation after the last client leaves.
+    pub server_owned_placeholder: bool,
+    /// Per-device recognized XI1 classes; NoExtensionEvent leaves this empty.
+    pub xi1_masks: std::collections::HashMap<u16, std::collections::HashSet<u32>>,
+    /// Per-device XI2 masks; a positive wire length may leave this empty.
+    pub xi2_masks: std::collections::HashMap<u16, u64>,
 }

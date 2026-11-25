@@ -587,12 +587,18 @@ fn deliver_routed_key_with_master_status(
             // focus window if the grab owner declines it. Mirrors the
             // sync passive-button-grab freeze in `pointer_fanout`.
             if freeze && event.pressed {
-                state.xi1_frozen.entry(device_id).or_default().stored =
-                    Some(crate::server::QueuedInputEvent::HostKeyTransition(
-                        event,
-                        master_transition_accepted,
-                        synthetic_repeat,
-                    ));
+                let sync = state.xi1_frozen.entry(grab_device_id).or_default();
+                sync.stored = Some(crate::server::QueuedInputEvent::HostKeyTransition(
+                    event,
+                    master_transition_accepted,
+                    synthetic_repeat,
+                ));
+                // Xorg `ActivateGrabNoDelivery` promotes the synchronous
+                // activating key to FROZEN_WITH_EVENT (dix/events.c:3917-3919),
+                // matching the pointer activation path.
+                if sync.state == crate::server::Xi1SyncState::FrozenNoEvent {
+                    sync.state = crate::server::Xi1SyncState::FrozenWithEvent;
+                }
             }
             // Xorg DeliverGrabbedEvent: with owner_events, key events
             // that would naturally land on one of the grab client's
@@ -1482,6 +1488,7 @@ fn deliver_xi1_focused_key(
             replay_floor: None,
         },
         true,
+        None,
     )
 }
 
@@ -1786,10 +1793,11 @@ mod tests {
             device: u16,
         ) -> crate::transport::CapturedPeer {
             let peer = capture_client(state, id);
-            let client = state.clients.get_mut(&id).unwrap();
-            client
+            let (index, _) = state.ensure_xi_input_client(ROOT_WINDOW, ClientId(id));
+            state.xi_input_clients.get_mut(&ROOT_WINDOW).unwrap()[index]
                 .xi2_masks
-                .insert((ROOT_WINDOW, device), u64::from(ROUTED_MASK));
+                .insert(device, u64::from(ROUTED_MASK));
+            state.refresh_xi_client_selection_projection(ClientId(id));
             state.xi2_client_versions.insert(ClientId(id), (2, 2));
             peer
         }
@@ -2065,12 +2073,13 @@ mod tests {
             assert_eq!((razer_id, hyperx_id), (6, 7));
 
             let mut peer = root_selector(&mut state, 61, 3);
-            state
-                .clients
-                .get_mut(&61)
-                .unwrap()
+            let index = state
+                .xi_input_client_index(ROOT_WINDOW, ClientId(61))
+                .unwrap();
+            state.xi_input_clients.get_mut(&ROOT_WINDOW).unwrap()[index]
                 .xi2_masks
-                .insert((ROOT_WINDOW, 3), u64::from(ROUTED_MASK) | DEVICE_CHANGED);
+                .insert(3, u64::from(ROUTED_MASK) | DEVICE_CHANGED);
+            state.refresh_xi_client_selection_projection(ClientId(61));
             let mut backend = crate::backend::recording::RecordingBackend::new();
 
             let parse = |bytes: &[u8]| {
@@ -2191,7 +2200,7 @@ mod tests {
             event_masks: HashMap::from([(window, core_mask)]),
             save_set: HashSet::new(),
             big_requests_enabled: false,
-            xi2_masks: HashMap::from([((window, 3u16), xi2_mask)]),
+            xi2_masks: HashMap::new(),
             xi1_event_classes: HashSet::new(),
             xi1_window_event_classes: HashMap::new(),
             outbound: VecDeque::new(),
@@ -2207,6 +2216,11 @@ mod tests {
             peer: crate::peer::PeerIdentity::unknown_unix(),
         };
         state.clients.insert(id, client);
+        let (index, _) = state.ensure_xi_input_client(window, ClientId(id));
+        state.xi_input_clients.get_mut(&window).unwrap()[index]
+            .xi2_masks
+            .insert(3, xi2_mask);
+        state.refresh_xi_client_selection_projection(ClientId(id));
         peer
     }
 
@@ -2789,11 +2803,15 @@ mod tests {
             xi_version: Option<(u16, u16)>,
         ) -> UnixStream {
             let peer = install_kf(state, id, ROOT_WINDOW, 0, 0);
-            let client = state.clients.get_mut(&id).unwrap();
-            client.xi2_masks.clear();
+            let index = state
+                .xi_input_client_index(ROOT_WINDOW, ClientId(id))
+                .unwrap();
+            let entry = &mut state.xi_input_clients.get_mut(&ROOT_WINDOW).unwrap()[index];
+            entry.xi2_masks.clear();
             for d in devices {
-                client.xi2_masks.insert((ROOT_WINDOW, *d), u64::from(mask));
+                entry.xi2_masks.insert(*d, u64::from(mask));
             }
+            state.refresh_xi_client_selection_projection(ClientId(id));
             if let Some(v) = xi_version {
                 state.xi2_client_versions.insert(ClientId(id), v);
             }
@@ -3437,15 +3455,19 @@ mod tests {
                 state.xi_register_source(&super::key_source_routing::keyboard_info(source))[0];
             let evcode = crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_KEY_PRESS_OFFSET;
             let mut xev = install_kf(&mut state, 9, XEV, 0, 0);
-            state
-                .clients
-                .get_mut(&9)
-                .unwrap()
-                .xi1_window_event_classes
-                .insert(
-                    XEV,
-                    HashSet::from([(u32::from(device) << 8) | u32::from(evcode)]),
-                );
+            let (entry_index, _) = state.ensure_xi_input_client(XEV, ClientId(9));
+            state.xi_input_clients.get_mut(&XEV).unwrap()[entry_index]
+                .xi1_masks
+                .entry(device)
+                .or_default()
+                .insert((u32::from(device) << 8) | u32::from(evcode));
+            *state
+                .xi1_window_input_events
+                .entry(XEV)
+                .or_default()
+                .entry(device)
+                .or_default() |= 1 << crate::xinput::XI_DEVICE_KEY_PRESS_OFFSET;
+            state.refresh_xi_client_selection_projection(ClientId(9));
             state.core_focus.raw = 1;
             let mut backend = crate::backend::recording::RecordingBackend::default();
             let event = HostKeyEvent {
@@ -3624,11 +3646,13 @@ mod tests {
             state.pointer_root = OVER_B;
             let xi2_keys = (1u64 << XI2_KEYPRESS_EVTYPE) | (1u64 << XI2_KEYRELEASE_EVTYPE);
             let owner = install_kf(&mut state, OWNER, ROOT_WINDOW, 0, 0);
-            let masks = &mut state.clients.get_mut(&OWNER).unwrap().xi2_masks;
-            masks.clear();
             for w in [ROOT_WINDOW, T, B, W2] {
-                masks.insert((w, XI2_ALL_MASTER_DEVICES), xi2_keys);
+                let (index, _) = state.ensure_xi_input_client(w, ClientId(OWNER));
+                let masks = &mut state.xi_input_clients.get_mut(&w).unwrap()[index].xi2_masks;
+                masks.clear();
+                masks.insert(XI2_ALL_MASTER_DEVICES, xi2_keys);
             }
+            state.refresh_xi_client_selection_projection(ClientId(OWNER));
             state.core_focus.raw = 1;
             state.key_grabs.push(KeyGrab {
                 device_id: XI2_MASTER_KEYBOARD_DEVICE_ID,

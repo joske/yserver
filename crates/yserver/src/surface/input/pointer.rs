@@ -59,6 +59,7 @@ pub(crate) fn motion(raw: &RawPointer, fb: (u16, u16), time: u32) -> HostInputEv
         dx: delta(raw.dx_pt),
         dy: delta(raw.dy_pt),
         motion_delta: None,
+        device_axes: None,
     }
 }
 

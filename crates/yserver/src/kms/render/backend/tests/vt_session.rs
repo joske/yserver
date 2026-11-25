@@ -524,6 +524,7 @@ fn xi_dynamic_reset_retires_kms_input_and_replays_inventory_on_the_runner_bounda
             dx: 0,
             dy: 0,
             motion_delta: None,
+            device_axes: None,
         },
     );
     for (origin, button) in [
@@ -671,6 +672,7 @@ fn xi_dynamic_reset_retires_kms_input_and_replays_inventory_on_the_runner_bounda
                 dx: 5,
                 dy: 0,
                 motion_delta: Some([5.0, 0.0]),
+                device_axes: None,
             },
         );
         input_sender
@@ -1530,6 +1532,7 @@ fn xi_source_removal_vt_suspend_releases_physical_state_once_and_resumes_same_fa
             dx: 0,
             dy: 0,
             motion_delta: None,
+            device_axes: None,
         },
     );
     assert_eq!(

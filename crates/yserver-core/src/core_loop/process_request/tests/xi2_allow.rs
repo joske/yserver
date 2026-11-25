@@ -421,6 +421,7 @@ fn xi_allow_events_replay_device_replays_frozen_button_press_to_target() {
                 raw_dx: 0,
                 raw_dy: 0,
                 tree_change: false,
+                device_axes: None,
             },
         ));
     }
@@ -601,6 +602,7 @@ fn active_grab_owner_events_natural_delivery_to_sibling_window_owned_by_grab_cli
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let xid_map = backend.xid_map().clone();
     let _ = pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, motion, true, false);
@@ -739,6 +741,7 @@ fn xi_allow_events_replay_device_drains_queued_release_after_press() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     {
         let f = state
@@ -978,6 +981,7 @@ fn xi_allow_events_async_device_thaws_freeze_and_replays_queue() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     {
         let f = state
@@ -1262,6 +1266,7 @@ fn out_of_band_pointer_thaw_replays_withheld_release() {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         }),
     });
 
@@ -1383,6 +1388,7 @@ fn compute_freezes_replays_global_queue_in_arrival_order() {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         }),
     });
 
@@ -1506,6 +1512,7 @@ fn frozen_pointer_replay_maps_button_exactly_once() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let _ = crate::core_loop::pointer_fanout::pointer_event_fanout_to_state(
         &mut state,
@@ -1536,7 +1543,7 @@ fn frozen_pointer_replay_maps_button_exactly_once() {
     );
 }
 
-/// XI2 mode → core AllowSome mode mapping ([`xi2_allow_mode_to_core`]).
+/// XI2 per-device mode → core wrapper mode mapping ([`xi2_allow_mode_to_core`]).
 #[test]
 fn xi2_allow_mode_to_core_maps_all_modes() {
     // Pointer: Async/Sync/Replay → Pointer variants.
@@ -1547,11 +1554,10 @@ fn xi2_allow_mode_to_core_maps_all_modes() {
     assert_eq!(xi2_allow_mode_to_core(0, true), Some(3)); // → AsyncKeyboard
     assert_eq!(xi2_allow_mode_to_core(1, true), Some(4)); // → SyncKeyboard
     assert_eq!(xi2_allow_mode_to_core(2, true), Some(5)); // → ReplayKeyboard
-    // paired: AsyncPairedDevice acts on the OTHER device.
-    assert_eq!(xi2_allow_mode_to_core(3, false), Some(3)); // ptr grab → async keyboard
-    assert_eq!(xi2_allow_mode_to_core(3, true), Some(0)); // kbd grab → async pointer
-    assert_eq!(xi2_allow_mode_to_core(4, false), Some(6)); // AsyncPair → AsyncBoth
-    assert_eq!(xi2_allow_mode_to_core(5, false), Some(7)); // SyncPair  → SyncBoth
+    // Paired modes keep the requested device as AllowSome's `thisDev`.
+    assert_eq!(xi2_allow_mode_to_core(3, false), None); // AsyncPairedDevice
+    assert_eq!(xi2_allow_mode_to_core(4, false), None); // AsyncPair
+    assert_eq!(xi2_allow_mode_to_core(5, false), None); // SyncPair
     // touch / unknown → unsupported.
     assert_eq!(xi2_allow_mode_to_core(6, false), None); // XIAcceptTouch
     assert_eq!(xi2_allow_mode_to_core(7, false), None); // XIRejectTouch
@@ -1651,6 +1657,7 @@ fn xi_allow_events_sync_device_thaws_and_drains_queue() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     {
         let f = state
@@ -1807,6 +1814,7 @@ fn xi_allow_events_replay_device_releases_active_pointer_grab() {
                 raw_dx: 0,
                 raw_dy: 0,
                 tree_change: false,
+                device_axes: None,
             },
         ));
     }
@@ -1886,13 +1894,13 @@ fn xi_sync_passive_grab_replays_xi2_press_to_target_only_after_allow_events() {
         .get_mut(&GRAB_CLIENT_ID)
         .expect("grab client")
         .xi2_masks
-        .insert((ResourceId(TARGET_WIN), 1), u64::from(XI2_BUTTON_PRESS_BIT));
+        .insert((ResourceId(TARGET_WIN), 4), u64::from(XI2_BUTTON_PRESS_BIT));
     state
         .clients
         .get_mut(&TARGET_CLIENT_ID)
         .expect("target client")
         .xi2_masks
-        .insert((ResourceId(TARGET_WIN), 1), u64::from(XI2_BUTTON_PRESS_BIT));
+        .insert((ResourceId(TARGET_WIN), 4), u64::from(XI2_BUTTON_PRESS_BIT));
     state.button_grabs.push(PassiveButtonGrab {
         device_id: 0,
         owner: ClientId(GRAB_CLIENT_ID),
@@ -1925,16 +1933,26 @@ fn xi_sync_passive_grab_replays_xi2_press_to_target_only_after_allow_events() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let xid_map = backend.xid_map().clone();
     let _dropped =
         pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, event, true, false);
 
-    assert!(state.active_pointer_grab.is_some_and(|grab| grab.passive));
+    // Task 2 Review Focus 1: XIAllDevices (0) matches the XTest slave pass,
+    // so Xorg stores the passive grab and freeze on device 4
+    // (`../xserver/dix/grabs.c:439-458`).
+    assert!(
+        state
+            .xi2_pointer_grabs
+            .get(&crate::xinput::DEVICEID_XTEST_POINTER)
+            .is_some_and(|grab| grab.passive)
+    );
+    assert!(state.active_pointer_grab.is_none());
     assert!(
         state
             .xi1_frozen
-            .get(&crate::xinput::DEVICEID_MASTER_POINTER)
+            .get(&crate::xinput::DEVICEID_XTEST_POINTER)
             .and_then(|f| f.stored.as_ref())
             .is_some()
     );
@@ -1953,7 +1971,7 @@ fn xi_sync_passive_grab_replays_xi2_press_to_target_only_after_allow_events() {
 
     let mut body = Vec::with_capacity(8);
     body.extend_from_slice(&0x1234u32.to_le_bytes()); // time
-    body.extend_from_slice(&2u16.to_le_bytes()); // deviceid
+    body.extend_from_slice(&crate::xinput::DEVICEID_XTEST_POINTER.to_le_bytes()); // deviceid
     body.push(2); // mode = ReplayDevice
     body.push(0); // pad
 
@@ -2055,15 +2073,25 @@ fn xi_sync_passive_grab_release_during_freeze_queues_for_replay() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let xid_map = backend.xid_map().clone();
     let _dropped =
         pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
-    assert!(state.active_pointer_grab.is_some_and(|grab| grab.passive));
+    // Task 2 Review Focus 1: XIAllDevices (0) matches the XTest slave pass,
+    // so Xorg stores the passive grab and freeze on device 4
+    // (`../xserver/dix/grabs.c:439-458`).
+    assert!(
+        state
+            .xi2_pointer_grabs
+            .get(&crate::xinput::DEVICEID_XTEST_POINTER)
+            .is_some_and(|grab| grab.passive)
+    );
+    assert!(state.active_pointer_grab.is_none());
     assert!(
         state
             .xi1_frozen
-            .get(&crate::xinput::DEVICEID_MASTER_POINTER)
+            .get(&crate::xinput::DEVICEID_XTEST_POINTER)
             .and_then(|f| f.stored.as_ref())
             .is_some()
     );
@@ -2075,7 +2103,7 @@ fn xi_sync_passive_grab_release_during_freeze_queues_for_replay() {
         !state
             .sync_pending
             .iter()
-            .any(|p| p.device == crate::xinput::DEVICEID_MASTER_POINTER
+            .any(|p| p.device == crate::xinput::DEVICEID_XTEST_POINTER
                 && matches!(
                     &p.event,
                     crate::server::QueuedInputEvent::HostPointer(e)
@@ -2098,14 +2126,21 @@ fn xi_sync_passive_grab_release_during_freeze_queues_for_replay() {
     // Grab MUST still be active (waiting for AllowEvents). Press
     // is still frozen. Release is in the queue.
     assert!(
-        state.active_pointer_grab.is_some(),
+        state
+            .xi2_pointer_grabs
+            .contains_key(&crate::xinput::DEVICEID_XTEST_POINTER),
         "grab must remain active while frozen — release waits for AllowEvents",
     );
-    assert!(state.active_pointer_grab.is_some_and(|grab| grab.passive));
+    assert!(
+        state
+            .xi2_pointer_grabs
+            .get(&crate::xinput::DEVICEID_XTEST_POINTER)
+            .is_some_and(|grab| grab.passive)
+    );
     assert!(
         state
             .xi1_frozen
-            .get(&crate::xinput::DEVICEID_MASTER_POINTER)
+            .get(&crate::xinput::DEVICEID_XTEST_POINTER)
             .and_then(|f| f.stored.as_ref())
             .is_some()
     );
@@ -2116,7 +2151,7 @@ fn xi_sync_passive_grab_release_during_freeze_queues_for_replay() {
         state
             .sync_pending
             .iter()
-            .any(|p| p.device == crate::xinput::DEVICEID_MASTER_POINTER
+            .any(|p| p.device == crate::xinput::DEVICEID_XTEST_POINTER
                 && matches!(
                     &p.event,
                     crate::server::QueuedInputEvent::HostPointer(e)
@@ -2204,7 +2239,7 @@ fn xi_passive_grab_owner_events_redirects_foreign_descendant_press_to_grab_clien
         .event_masks
         .insert(ResourceId(CHILD_WIN), 0x0000_0004);
     state.button_grabs.push(PassiveButtonGrab {
-        device_id: 0,
+        device_id: crate::xinput::DEVICEID_MASTER_POINTER,
         owner: ClientId(GRAB_CLIENT_ID),
         grab_window: ResourceId(GRAB_WIN),
         button: 1,
@@ -2235,6 +2270,7 @@ fn xi_passive_grab_owner_events_redirects_foreign_descendant_press_to_grab_clien
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let xid_map = backend.xid_map().clone();
     let _dropped =
@@ -2248,9 +2284,21 @@ fn xi_passive_grab_owner_events_redirects_foreign_descendant_press_to_grab_clien
              delivery to the GRAB client (Xorg dix/events.c:2069 aborts the \
              natural walk on a foreign subscriber); got {grab_read:?}",
     );
-    assert_eq!(buf[0], 4, "core ButtonPress to the grab client");
+    // P1m: Xorg ActivatePassiveGrab delivers an XI2 grab's activation in
+    // XI2 form (`../xserver/dix/events.c:3833`); inspect the first packet.
+    assert_eq!(buf[0], 35, "XI2 event to the grab client");
     assert_eq!(
-        &buf[12..16],
+        u16::from_le_bytes([buf[8], buf[9]]),
+        4,
+        "XI_ButtonPress to the grab client"
+    );
+    assert_eq!(
+        u16::from_le_bytes([buf[10], buf[11]]) & 0x7fff,
+        crate::xinput::DEVICEID_MASTER_POINTER,
+        "the exact master grab remains on the master form"
+    );
+    assert_eq!(
+        &buf[24..28],
         &GRAB_WIN.to_le_bytes(),
         "press reported on the grab window",
     );
@@ -2389,6 +2437,7 @@ fn xi_active_device_grab_funnels_button_release_to_grab_owner_not_window_under_c
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let xid_map = backend.xid_map().clone();
     let press = HostPointerEvent {
@@ -2525,6 +2574,7 @@ fn core_pointer_grab_does_not_send_xi2_to_grab_owner() {
         raw_dx: 0,
         raw_dy: 0,
         tree_change: false,
+        device_axes: None,
     };
     let xid_map = backend.xid_map().clone();
     let _dropped =
@@ -3300,13 +3350,12 @@ fn sync_passive_kbd_grab_synckeyboard_release_thaws() {
     );
 }
 
-/// Regression (codex review): ReplayKeyboard must release an
-/// EXPLICIT GrabKeyboard(GrabModeSync), not just a passive key
-/// grab — Xorg NOT_GRABBED calls DeactivateGrab regardless of
-/// grab kind (dix/events.c:1898). Pre-fix the grab stayed active
-/// after the replay → stuck keyboard.
+/// ReplayKeyboard from an explicit sync grab is a no-op while the
+/// unified state is FrozenNoEvent, even if a key is in the sync queue.
+/// Xorg AllowSome's NOT_GRABBED case deactivates only at
+/// FROZEN_WITH_EVENT (dix/events.c:1899-1906).
 #[test]
-fn core_replay_keyboard_releases_explicit_sync_grab() {
+fn core_replay_keyboard_requires_frozen_event_for_explicit_sync_grab() {
     use crate::{
         host_x11::HostKeyEvent,
         server::{ActiveKeyboardGrab, ActiveKeyboardGrabSource},
@@ -3320,9 +3369,8 @@ fn core_replay_keyboard_releases_explicit_sync_grab() {
     let _grab_peer = install_client(&mut state, GRAB_CLIENT_ID);
     state.core_focus.raw = FOCUS_WIN;
 
-    // Explicit GrabKeyboard(GrabModeSync): active grab + the
-    // device frozen-no-event, with a key withheld in the freeze
-    // queue (the "with event" condition for replay).
+    // Explicit GrabKeyboard(GrabModeSync): the device is frozen-no-event.
+    // A queued event does not make this state FrozenWithEvent.
     state.active_keyboard_grab = Some(ActiveKeyboardGrab {
         owner: ClientId(GRAB_CLIENT_ID),
         grab_window: ROOT_WINDOW,
@@ -3370,8 +3418,13 @@ fn core_replay_keyboard_releases_explicit_sync_grab() {
     )
     .expect("allow events replay keyboard");
 
-    assert!(
-        state.active_keyboard_grab.is_none(),
-        "ReplayKeyboard must deactivate the explicit sync keyboard grab",
+    assert!(state.active_keyboard_grab.is_some_and(|grab| {
+        grab.owner == ClientId(GRAB_CLIENT_ID)
+            && matches!(grab.source, ActiveKeyboardGrabSource::Explicit)
+    }));
+    assert_eq!(
+        state.xi1_frozen[&crate::xinput::DEVICEID_MASTER_KEYBOARD].state,
+        crate::server::Xi1SyncState::FrozenNoEvent
     );
+    assert_eq!(state.sync_pending.len(), 1);
 }

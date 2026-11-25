@@ -98,6 +98,394 @@ fn xi_xtest_fake_key(event_type: u8, keycode: u8, device_id: u8) -> Vec<u8> {
     body
 }
 
+/// Checks the complete empty end state for the local `ServerState` rows in
+/// this module. Existing KMS end-state helpers take fixture wrappers, while
+/// these XTest validation rows own state directly, so this helper verifies
+/// their grabs, freezes, detaches, and every held-button store in one place.
+fn assert_xtest_valuator_end_state(state: &ServerState) {
+    assert!(state.active_pointer_grab.is_none(), "master grab ended");
+    assert!(state.xi2_pointer_grabs.is_empty(), "slave grabs ended");
+    assert!(state.xi1_active_grabs.is_empty(), "XI1 grabs ended");
+    assert!(state.xi1_frozen.is_empty(), "XI1 freeze entries ended");
+    assert!(
+        state.xi2_detached_masters.is_empty(),
+        "no slave remains detached"
+    );
+    assert_eq!(state.buttons_down, 0, "all master buttons are released");
+    assert!(
+        state
+            .xi_devices
+            .devices()
+            .iter()
+            .all(|device| device.buttons_down == 0),
+        "every source's held-button set is empty"
+    );
+    assert!(
+        state
+            .xi1_device_input_state
+            .values()
+            .all(|device| device.buttons_down.iter().all(|byte| *byte == 0)),
+        "every XI1 device button set is empty"
+    );
+    assert!(
+        state
+            .unpublished_pointer_buttons_down
+            .values()
+            .all(|buttons| *buttons == 0),
+        "unpublished source held-button sets are empty"
+    );
+}
+
+/// Exercises each Xorg DeviceValuator validation row through the existing
+/// `process_request` harness. One table-driven test keeps the XTEST event,
+/// XI2 selection and device records real while allowing the red run to reach
+/// every malformed row and both passing guards on the unmodified handler.
+#[test]
+fn xtest_device_valuator_validation_matches_xorg() {
+    use std::os::unix::net::UnixStream;
+
+    const CLIENT: u32 = 5;
+    const XTEST: u8 = 146;
+    const FAKE_INPUT: u8 = 2;
+    const XINPUT: u8 = 137;
+    const XI_SELECT_EVENTS: u8 = 46;
+    const XI_KEY_PRESS: u8 = 2;
+    const XI_BUTTON_PRESS: u8 = 4;
+    const XI_BUTTON_RELEASE: u8 = 5;
+    const XI_MOTION: u8 = 6;
+
+    // DeviceValuator is XInput event 66, followed by key, button and motion
+    // events 67 through 71. The XTEST pointer's CorePointer record has two
+    // ValuatorClass axes; the XTEST keyboard record has none.
+    let make_fake =
+        |event_type: u8, detail: u8, device_id: u8, trailing: &[(u8, u8, u8, [i32; 6])]| {
+            let mut body = vec![0u8; 32];
+            body[0] = event_type;
+            body[1] = detail;
+            body[31] = device_id;
+            for &(trailing_type, num_valuators, first_valuator, values) in trailing {
+                let mut valuator = vec![0u8; 32];
+                valuator[0] = trailing_type;
+                valuator[1] = device_id;
+                valuator[6] = num_valuators;
+                valuator[7] = first_valuator;
+                for (index, value) in values.into_iter().enumerate() {
+                    let offset = 8 + index * 4;
+                    valuator[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+                }
+                body.extend_from_slice(&valuator);
+            }
+            body
+        };
+    let select = |state: &mut ServerState,
+                  backend: &mut KmsBackend,
+                  peer: &mut UnixStream,
+                  sequence: u16,
+                  device_id: u16,
+                  mask: u32| {
+        let mut body = Vec::with_capacity(16);
+        body.extend_from_slice(&yserver_core::resources::ROOT_WINDOW.0.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes()); // one event mask
+        body.extend_from_slice(&[0; 2]);
+        body.extend_from_slice(&device_id.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes()); // one 32-bit mask unit
+        body.extend_from_slice(&mask.to_le_bytes());
+        xi_xtest_grab_request(
+            state,
+            backend,
+            peer,
+            sequence,
+            XINPUT,
+            XI_SELECT_EVENTS,
+            &body,
+        )
+    };
+
+    let malformed_rows = [
+        (
+            "first_valuator_past_num_axes",
+            4u8,
+            71u8,
+            0u8,
+            vec![(66u8, 1u8, 3u8, [300, 200, 0, 0, 0, 0])],
+            71u32,
+            1u32 << XI_MOTION,
+            None,
+        ),
+        (
+            "trailing_event_on_device_without_valuators",
+            5,
+            67,
+            38,
+            vec![(66, 1, 0, [0; 6])],
+            0,
+            1u32 << XI_KEY_PRESS,
+            Some(68u8),
+        ),
+        (
+            "trailing_event_type_is_not_device_valuator",
+            4,
+            69,
+            1,
+            vec![(67, 1, 0, [0; 6])],
+            67,
+            1u32 << XI_BUTTON_PRESS,
+            Some(70u8),
+        ),
+        (
+            "first_valuator_is_not_contiguous",
+            4,
+            71,
+            0,
+            vec![
+                (66, 1, 0, [300, 200, 0, 0, 0, 0]),
+                (66, 1, 2, [100, 0, 0, 0, 0, 0]),
+            ],
+            2,
+            1u32 << XI_MOTION,
+            None,
+        ),
+        (
+            "num_valuators_is_outside_one_through_six",
+            4,
+            71,
+            0,
+            vec![(66, 0, 0, [300, 200, 0, 0, 0, 0])],
+            0,
+            1u32 << XI_MOTION,
+            None,
+        ),
+        (
+            "valuator_sum_exceeds_num_axes",
+            4,
+            71,
+            0,
+            vec![(66, 3, 0, [300, 200, 100, 0, 0, 0])],
+            3,
+            1u32 << XI_MOTION,
+            None,
+        ),
+        (
+            "device_motion_detail_is_outside_zero_or_one",
+            4,
+            71,
+            2,
+            vec![(66, 2, 0, [300, 200, 0, 0, 0, 0])],
+            2,
+            1u32 << XI_MOTION,
+            None,
+        ),
+        (
+            "review_first_zero_num_six_on_two_axis_pointer",
+            4,
+            71,
+            0,
+            vec![(66, 6, 0, [300, 200, 100, 50, 25, 10])],
+            6,
+            1u32 << XI_MOTION,
+            None,
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (name, device_id, event_type, detail, trailing, error_value, mask, cleanup) in
+        malformed_rows
+    {
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let mut peer = kbd_map_client_id(&mut state, CLIENT);
+        let start_position = state.pointer_root;
+        let start_held = xi_xtest_held_snapshot(&state, &backend);
+        let selected = select(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            u16::from(device_id),
+            mask,
+        );
+        if !selected.is_empty() {
+            failures.push(format!(
+                "{name}: XISelectEvents setup returned {selected:02x?}"
+            ));
+        }
+
+        let request = make_fake(event_type, detail, device_id, &trailing);
+        let wire = xi_xtest_grab_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            2,
+            XTEST,
+            FAKE_INPUT,
+            &request,
+        );
+        if wire.len() != 32 || wire.first() != Some(&0) {
+            failures.push(format!(
+                "{name}: expected only one BadValue packet; got {wire:02x?}"
+            ));
+        } else {
+            let got_error_value = u32::from_le_bytes(wire[4..8].try_into().unwrap());
+            let got_minor = u16::from_le_bytes(wire[8..10].try_into().unwrap());
+            if (
+                wire[1],
+                got_error_value,
+                got_minor,
+                wire[10],
+                u16::from_le_bytes([wire[2], wire[3]]),
+            ) != (2, error_value, 2, XTEST, 2)
+            {
+                failures.push(format!(
+                    "{name}: error tuple was (code={}, value={got_error_value}, minor={got_minor}, major={}, sequence={}), expected (2, {error_value}, 2, {XTEST}, 2)",
+                    wire[1], wire[10], u16::from_le_bytes([wire[2], wire[3]])
+                ));
+            }
+        }
+        if state.pointer_root != start_position {
+            failures.push(format!(
+                "{name}: rejected request moved sprite from {start_position:?} to {:?}",
+                state.pointer_root
+            ));
+        }
+
+        // If the untouched handler accepted an invalid press, release it
+        // through the same request path so the row still finishes cleanly.
+        if let Some(release_type) = cleanup {
+            let release = make_fake(release_type, detail, device_id, &[]);
+            let _ = xi_xtest_grab_request(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                3,
+                XTEST,
+                FAKE_INPUT,
+                &release,
+            );
+        }
+
+        if xi_xtest_held_snapshot(&state, &backend) != start_held
+            || !state.xi2_pointer_grabs.is_empty()
+            || !state.xi2_keyboard_grabs.is_empty()
+            || !state.xi1_active_grabs.is_empty()
+            || state.active_pointer_grab.is_some()
+        {
+            failures.push(format!(
+                "{name}: input/grab state did not return to its start state"
+            ));
+        }
+        assert_xtest_valuator_end_state(&state);
+    }
+
+    // GUARD: valid absolute and relative DeviceMotionNotify chunks retain the
+    // base behavior on the two-axis XTEST pointer and produce encoded events.
+    {
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let mut peer = kbd_map_client_id(&mut state, CLIENT);
+        let start_held = xi_xtest_held_snapshot(&state, &backend);
+        assert!(select(&mut state, &mut backend, &mut peer, 1, 4, 1 << XI_MOTION).is_empty());
+
+        let absolute = make_fake(71, 0, 4, &[(66, 2, 0, [220, 240, 0, 0, 0, 0])]);
+        let absolute_wire = xi_xtest_grab_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            2,
+            XTEST,
+            FAKE_INPUT,
+            &absolute,
+        );
+        assert!(
+            xi_xtest_generic_event_types(&absolute_wire).contains(&u16::from(XI_MOTION)),
+            "valid absolute DeviceMotionNotify must be delivered: {absolute_wire:02x?}"
+        );
+        assert_eq!(state.pointer_root, (220, 240));
+
+        let relative = make_fake(71, 1, 4, &[(66, 2, 0, [12, -7, 0, 0, 0, 0])]);
+        let relative_wire = xi_xtest_grab_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            3,
+            XTEST,
+            FAKE_INPUT,
+            &relative,
+        );
+        assert!(
+            xi_xtest_generic_event_types(&relative_wire).contains(&u16::from(XI_MOTION)),
+            "valid relative DeviceMotionNotify must be delivered: {relative_wire:02x?}"
+        );
+        assert_eq!(state.pointer_root, (232, 233));
+        assert_eq!(xi_xtest_held_snapshot(&state, &backend), start_held);
+        assert!(state.xi2_pointer_grabs.is_empty());
+        assert!(state.xi2_keyboard_grabs.is_empty());
+        assert!(state.xi1_active_grabs.is_empty());
+        assert!(state.active_pointer_grab.is_none());
+        assert_xtest_valuator_end_state(&state);
+    }
+
+    // GUARD: DeviceButtonPress without a trailing DeviceValuator is legal.
+    {
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let mut peer = kbd_map_client_id(&mut state, CLIENT);
+        let start_held = xi_xtest_held_snapshot(&state, &backend);
+        assert!(
+            select(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                1,
+                4,
+                (1 << XI_BUTTON_PRESS) | (1 << XI_BUTTON_RELEASE),
+            )
+            .is_empty()
+        );
+
+        let press = make_fake(69, 1, 4, &[]);
+        let press_wire = xi_xtest_grab_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            2,
+            XTEST,
+            FAKE_INPUT,
+            &press,
+        );
+        assert!(
+            xi_xtest_generic_event_types(&press_wire).contains(&u16::from(XI_BUTTON_PRESS)),
+            "DeviceButtonPress without valuators is accepted: {press_wire:02x?}"
+        );
+
+        let release = make_fake(70, 1, 4, &[]);
+        let release_wire = xi_xtest_grab_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            3,
+            XTEST,
+            FAKE_INPUT,
+            &release,
+        );
+        assert!(
+            xi_xtest_generic_event_types(&release_wire).contains(&u16::from(XI_BUTTON_RELEASE)),
+            "DeviceButtonRelease without valuators is accepted: {release_wire:02x?}"
+        );
+        assert_eq!(xi_xtest_held_snapshot(&state, &backend), start_held);
+        assert!(state.xi2_pointer_grabs.is_empty());
+        assert!(state.xi2_keyboard_grabs.is_empty());
+        assert!(state.xi1_active_grabs.is_empty());
+        assert!(state.active_pointer_grab.is_none());
+        assert_xtest_valuator_end_state(&state);
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Xorg DeviceValuator validation mismatches (the guard scenarios above must pass):\n{}",
+        failures.join("\n")
+    );
+}
+
 /// XTEST FakeInput MotionNotify with detail = 1 is a relative move: Xorg
 /// (Xext/xtest.c ProcXTestFakeInput) passes rootX/rootY as the valuators
 /// without POINTER_ABSOLUTE, so GetPointerEvents adds them to the current

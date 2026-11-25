@@ -136,6 +136,7 @@ fn pointer_enters_input_only_window_and_shows_its_cursor() {
     let motion = |x: i32, y: i32| HostInputEvent::PointerMotion {
         origin: yserver_core::core_loop::InputOrigin::NestedHost,
         motion_delta: None,
+        device_axes: None,
         x,
         y,
         time: 0,
@@ -246,6 +247,7 @@ fn input_only_window_keeps_its_freed_cursor_until_it_drops_it() {
     let motion = |x: i32, y: i32| HostInputEvent::PointerMotion {
         origin: yserver_core::core_loop::InputOrigin::NestedHost,
         motion_delta: None,
+        device_axes: None,
         x,
         y,
         time: 0,

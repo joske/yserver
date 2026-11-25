@@ -135,6 +135,7 @@ impl LibinputThreadState {
                     dx: dx.round() as i32,
                     dy: dy.round() as i32,
                     motion_delta: Some([dx, dy]),
+                    device_axes: None,
                 }
             }
             InputEvent::PointerMotionAbsolute {
@@ -157,6 +158,7 @@ impl LibinputThreadState {
                     dx: (self.cursor_x - old_cx).round() as i32,
                     dy: (self.cursor_y - old_cy).round() as i32,
                     motion_delta: None,
+                    device_axes: None,
                 }
             }
             InputEvent::Button {
@@ -519,6 +521,7 @@ pub fn process_batch(
                 dy,
                 origin,
                 motion_delta,
+                device_axes,
             } => {
                 // Coalesce only within one producer and motion mode. Keep
                 // the latest absolute position while preserving both raw
@@ -529,10 +532,12 @@ pub fn process_batch(
                             origin: pending_origin,
                             relative: pending_relative,
                             motion_delta: pending_delta,
+                            device_axes: pending_axes,
                             ..
                         } if *pending_origin == origin
                             && *pending_relative == relative
-                            && pending_delta.is_some() == motion_delta.is_some())
+                            && pending_delta.is_some() == motion_delta.is_some()
+                            && pending_axes.is_none() && device_axes.is_none())
                 });
                 let (sum_dx, sum_dy, sum_motion_delta) = if compatible {
                     let Some(HostInputEvent::PointerMotion {
@@ -570,6 +575,7 @@ pub fn process_batch(
                     dx: sum_dx,
                     dy: sum_dy,
                     motion_delta: sum_motion_delta,
+                    device_axes,
                 });
             }
             non_motion => {

@@ -345,6 +345,7 @@ impl<P: Platform> XBackend<P> {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         };
         self.emit_pointer(ev);
     }
@@ -356,6 +357,7 @@ impl<P: Platform> XBackend<P> {
         mask: u16,
         raw_dx: i32,
         raw_dy: i32,
+        device_axes: Option<yserver_core::server::Xi1MotionAxes>,
     ) {
         let (event_x, event_y) = self.event_relative_coords(host_xid);
         let ev = HostPointerEvent {
@@ -374,6 +376,7 @@ impl<P: Platform> XBackend<P> {
             raw_dx,
             raw_dy,
             tree_change: false,
+            device_axes,
         };
         self.emit_pointer(ev);
     }
@@ -389,6 +392,7 @@ impl<P: Platform> XBackend<P> {
         state_mask: u16,
         raw_dx: i32,
         raw_dy: i32,
+        device_axes: Option<yserver_core::server::Xi1MotionAxes>,
     ) {
         let previous = (self.core.cursor_x, self.core.cursor_y);
         self.core.cursor_x = f32::from(root_x);
@@ -411,6 +415,7 @@ impl<P: Platform> XBackend<P> {
             raw_dx,
             raw_dy,
             tree_change: false,
+            device_axes,
         });
         self.core.cursor_x = previous.0;
         self.core.cursor_y = previous.1;
@@ -506,6 +511,7 @@ impl<P: Platform> XBackend<P> {
         raw_dx: i32,
         raw_dy: i32,
         origin: yserver_core::core_loop::InputOrigin,
+        device_axes: Option<yserver_core::server::Xi1MotionAxes>,
     ) {
         // Fall back to the root container so root-window subscribers
         // (e16's right-click-desktop menu, fvwm3's root bindings) can
@@ -518,7 +524,7 @@ impl<P: Platform> XBackend<P> {
             self.core.cursor_x, self.core.cursor_y
         );
         self.update_pointer_window(server_state, host_xid, mask, origin);
-        self.emit_motion_only(origin, host_xid, mask, raw_dx, raw_dy);
+        self.emit_motion_only(origin, host_xid, mask, raw_dx, raw_dy, device_axes);
     }
 
     /// Every live CRTC's root rectangle (its footprint at its origin).
@@ -559,6 +565,7 @@ impl<P: Platform> XBackend<P> {
         raw_dx: i32,
         raw_dy: i32,
         origin: yserver_core::core_loop::InputOrigin,
+        device_axes: Option<yserver_core::server::Xi1MotionAxes>,
     ) {
         // Apply active-grab confinement before hit-testing and crossing
         // generation.  The core fanout also clamps as a backend-independent
@@ -681,7 +688,7 @@ impl<P: Platform> XBackend<P> {
         let prev = server_state.barrier_bypass;
         server_state.barrier_bypass = prev || !relative;
         self.core.pending_motion_barrier_bypass = !relative;
-        self.dispatch_motion_event(server_state, raw_dx, raw_dy, origin);
+        self.dispatch_motion_event(server_state, raw_dx, raw_dy, origin, device_axes);
         server_state.barrier_bypass = prev;
     }
 
@@ -829,6 +836,7 @@ impl<P: Platform> XBackend<P> {
             raw_dx: 0,
             raw_dy: 0,
             tree_change: false,
+            device_axes: None,
         };
         self.emit_pointer(ptr_event);
         // Implicit-grab crossings (G3). Direct v1 port.
@@ -892,6 +900,7 @@ impl<P: Platform> XBackend<P> {
             0,
             0,
             yserver_core::core_loop::InputOrigin::NestedHost,
+            None,
         );
         // As `on_host_input`'s drain: the absolute motion's barrier
         // bypass holds until its queued events reach the fanout.

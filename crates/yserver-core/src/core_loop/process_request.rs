@@ -543,7 +543,7 @@ fn process_request_inner(
         29 => handle_ungrab_button(state, client_id, sequence, header, body),
         30 => handle_change_active_pointer_grab(state, client_id, sequence, access_request, body),
         31 => handle_grab_keyboard(state, client_id, sequence, header, body),
-        32 => handle_ungrab_keyboard(state, client_id, sequence, body),
+        32 => handle_ungrab_keyboard(state, backend, client_id, sequence, body),
         33 => handle_grab_key(state, client_id, sequence, header, body),
         34 => handle_ungrab_key(state, client_id, sequence, header, body),
         // ── font / size queries (pure state-read replies) ──

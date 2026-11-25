@@ -124,6 +124,7 @@ fn pointer_source_routing_kms_preserves_origin_and_drops_unknown_before_cursor_m
             dx: 0,
             dy: 0,
             motion_delta: None,
+            device_axes: None,
         },
     );
     assert_eq!(
@@ -164,6 +165,7 @@ fn pointer_source_routing_kms_preserves_origin_and_drops_unknown_before_cursor_m
             dx: 0,
             dy: 0,
             motion_delta: None,
+            device_axes: None,
         },
     );
     assert_eq!((backend.core.cursor_x, backend.core.cursor_y), (20.0, 30.0));
@@ -189,6 +191,7 @@ fn pointer_source_routing_kms_preserves_origin_and_drops_unknown_before_cursor_m
         0,
         0,
         InputOrigin::Physical(source),
+        None,
     );
     assert_eq!((backend.core.cursor_x, backend.core.cursor_y), (21.0, 31.0));
     let emitted = std::mem::take(&mut backend.core.pending_pointer_events);
@@ -218,6 +221,7 @@ fn pointer_source_routing_kms_preserves_origin_and_drops_unknown_before_cursor_m
             dx: 0,
             dy: 0,
             motion_delta: None,
+            device_axes: None,
         },
     );
     assert_eq!((backend.core.cursor_x, backend.core.cursor_y), (21.0, 31.0));
@@ -416,6 +420,7 @@ fn process_pointer_absolute_clamps_to_output() {
         0,
         0,
         yserver_core::core_loop::InputOrigin::XTest(4),
+        None,
     );
     assert_eq!(b.core.cursor_x, 100.0);
     assert_eq!(b.core.cursor_y, 200.0);
@@ -428,6 +433,7 @@ fn process_pointer_absolute_clamps_to_output() {
         0,
         0,
         yserver_core::core_loop::InputOrigin::XTest(4),
+        None,
     );
     assert_eq!(b.core.cursor_x, 799.0);
     assert_eq!(b.core.cursor_y, 599.0);
@@ -514,6 +520,7 @@ fn confined_motion_does_not_cross_into_window_below() {
         21,
         0,
         yserver_core::core_loop::InputOrigin::XTest(4),
+        None,
     );
 
     assert_eq!((b.core.cursor_x, b.core.cursor_y), (199.0, 150.0));
@@ -557,6 +564,7 @@ fn process_pointer_absolute_uses_union_fb_extent_for_multi_output() {
         0,
         0,
         yserver_core::core_loop::InputOrigin::XTest(4),
+        None,
     );
     assert_eq!(
         b.core.cursor_x, 4000.0,
@@ -574,6 +582,7 @@ fn process_pointer_absolute_uses_union_fb_extent_for_multi_output() {
         0,
         0,
         yserver_core::core_loop::InputOrigin::XTest(4),
+        None,
     );
     assert_eq!(b.core.cursor_x, 5119.0);
     assert_eq!(b.core.cursor_y, 1439.0);
@@ -624,6 +633,7 @@ fn process_pointer_absolute_skips_pointer_barriers_when_absolute() {
             dx: 0,
             dy: 0,
             motion_delta: None,
+            device_axes: None,
         },
     );
 
@@ -698,6 +708,7 @@ fn kms_pointer_authority_integrates_relative_motion_against_pointer_barriers() {
         dx,
         dy: 0,
         motion_delta,
+        device_axes: None,
     };
 
     // Physical absolute input represents touch/tablet motion and bypasses
@@ -965,6 +976,7 @@ fn on_host_input_does_not_log_gap() {
             dx: 0,
             dy: 0,
             motion_delta: None,
+            device_axes: None,
         },
     );
     assert!(
@@ -1082,6 +1094,7 @@ fn kms_pointer_authority_integrates_physical_relative_motion_in_kms() {
             dx,
             dy,
             motion_delta,
+            device_axes: None,
         };
 
     // The input thread's x=650 is stale for the master and differs from
@@ -1432,6 +1445,7 @@ fn a_warp_has_no_raw_motion() {
             dx: 9,
             dy: 0,
             motion_delta: None,
+            device_axes: None,
             origin: yserver_core::core_loop::InputOrigin::NestedHost,
         },
     );

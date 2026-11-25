@@ -73,6 +73,7 @@ fn a_grabbed_press_names_the_grab_windows_child_under_the_pointer() {
         raw_dy: 0,
         origin: crate::core_loop::message::InputOrigin::XTest(4),
         tree_change: false,
+        device_axes: None,
     };
     let _ = pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
     let bytes = read_all_available(&mut picker);

@@ -72,6 +72,7 @@ fn motion(
             dx: x - px,
             dy: y - py,
             motion_delta: None,
+            device_axes: None,
         },
     );
 }
@@ -168,6 +169,7 @@ pub(crate) fn map_input(state: &mut ServerState, backend: &mut dyn Backend, inpu
                     dx: raw_dx,
                     dy: raw_dy,
                     motion_delta: Some([delta.0, delta.1]),
+                    device_axes: None,
                 },
             );
         }

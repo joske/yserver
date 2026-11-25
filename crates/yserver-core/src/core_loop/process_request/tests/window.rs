@@ -3874,7 +3874,7 @@ fn destroy_window_drops_passive_grabs_and_a_recycled_id_does_not_match_them() {
     let pointer = crate::xinput::DEVICEID_MASTER_POINTER;
     assert!(
         state
-            .find_passive_grab(ResourceId(WIN), 1, 0, pointer, master)
+            .find_passive_grab(ResourceId(WIN), 1, 0, pointer, master, None, None)
             .is_some(),
         "the grab matches before the destroy"
     );
@@ -3901,7 +3901,7 @@ fn destroy_window_drops_passive_grabs_and_a_recycled_id_does_not_match_them() {
     create(&mut state);
     assert!(
         state
-            .find_passive_grab(ResourceId(WIN), 1, 0, pointer, master)
+            .find_passive_grab(ResourceId(WIN), 1, 0, pointer, master, None, None)
             .is_none(),
         "the recycled id does not match the destroyed window's grab"
     );

@@ -842,6 +842,11 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     let (fb_w, fb_h) = (topology.width, topology.height);
     log::info!("yserver: scanout {fb_w}x{fb_h}");
     let mut state = topology.into_server_state();
+    // Seed the core's master sprite snapshot from the same real KMS cursor
+    // position used by libinput. Slave routing on the first motion must see
+    // the startup sprite window, before the master processes that motion.
+    let (init_cx, init_cy) = backend.initial_pointer_position();
+    state.seed_master_sprite_position(init_cx, init_cy);
     // Tie the libinput thread's `clock::server_time_ms()` baseline
     // to ServerState's `start_instant` so the input-event timestamps
     // and the `state.timestamp_now()` clock used by the
@@ -975,7 +980,6 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
             log::info!("yserver: Direct mode — spawning libinput sender thread");
             // Seed the input thread's cursor at the primary-output centre so it
             // agrees with the core's startup position (Xorg-style warp to display 0).
-            let (init_cx, init_cy) = backend.initial_pointer_position();
             thread::Builder::new()
                 .name("yserver-libinput".into())
                 .spawn(move || {

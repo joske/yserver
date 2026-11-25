@@ -802,12 +802,17 @@ fn find_xi2_property_event(wire: &[u8]) -> Option<&[u8]> {
 /// Subscribe `client_id` to `XI_PropertyEventMask` for one device at
 /// the root window — the selection MATE / GDK make after learning its id.
 fn select_xi2_property_event_on_root(state: &mut ServerState, client_id: u32, deviceid: u16) {
+    let client = ClientId(client_id);
+    let entry_index = state.ensure_xi_input_client(ROOT_WINDOW, client).0;
     state
-        .clients
-        .get_mut(&client_id)
-        .expect("client installed")
+        .xi_input_clients
+        .get_mut(&ROOT_WINDOW)
+        .expect("canonical root input-client list exists")
+        .get_mut(entry_index)
+        .expect("canonical root input-client entry exists")
         .xi2_masks
-        .insert((ROOT_WINDOW, deviceid), u64::from(XI2_PROPERTY_EVENT_MASK));
+        .insert(deviceid, u64::from(XI2_PROPERTY_EVENT_MASK));
+    state.refresh_xi_client_selection_projection(client);
 }
 
 fn xi_hotplug_dispatch(
