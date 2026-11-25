@@ -67,43 +67,76 @@ fn literal_presence_disabled(sequence: u16, device_id: u16) -> Vec<u8> {
 }
 
 fn literal_presence(sequence: u16, device_id: u16, change: u8) -> Vec<u8> {
+    literal_presence_with_order(sequence, device_id, change, ClientByteOrder::LittleEndian)
+}
+
+fn literal_presence_with_order(
+    sequence: u16,
+    device_id: u16,
+    change: u8,
+    order: ClientByteOrder,
+) -> Vec<u8> {
     let mut bytes = vec![81, 0]; // XI_FIRST_EVENT + XI_DevicePresenceNotify
-    bytes.extend_from_slice(&sequence.to_le_bytes());
-    bytes.extend_from_slice(&[0, 0, 0, 0]); // zero timestamp
+    super::access_notify_support::append_event_u16(&mut bytes, order, sequence);
+    super::access_notify_support::append_event_u32(&mut bytes, order, 0); // zero timestamp
     bytes.extend_from_slice(&[change, u8::try_from(device_id).unwrap(), 0, 0]);
     bytes.extend_from_slice(&[0; 20]);
     bytes
 }
 
 fn literal_hierarchy_disabled(sequence: u16) -> Vec<u8> {
+    literal_hierarchy_disabled_with_order(sequence, ClientByteOrder::LittleEndian)
+}
+
+fn literal_hierarchy_disabled_with_order(sequence: u16, order: ClientByteOrder) -> Vec<u8> {
     let mut bytes = vec![35, 137]; // GenericEvent, XInput major opcode
-    bytes.extend_from_slice(&sequence.to_le_bytes());
-    bytes.extend_from_slice(&15_u32.to_le_bytes()); // five 12-byte device records
-    bytes.extend_from_slice(&11_u16.to_le_bytes()); // XI_HierarchyChanged
-    bytes.extend_from_slice(&0_u16.to_le_bytes()); // XIAllDevices
-    bytes.extend_from_slice(&[0; 4]); // zero timestamp
-    bytes.extend_from_slice(&128_u32.to_le_bytes()); // XI_DeviceDisabled
-    bytes.extend_from_slice(&5_u16.to_le_bytes());
+    super::access_notify_support::append_event_u16(&mut bytes, order, sequence);
+    super::access_notify_support::append_event_u32(&mut bytes, order, 15); // five 12-byte device records
+    super::access_notify_support::append_event_u16(&mut bytes, order, 11); // XI_HierarchyChanged
+    super::access_notify_support::append_event_u16(&mut bytes, order, 0); // XIAllDevices
+    super::access_notify_support::append_event_u32(&mut bytes, order, 0); // zero timestamp
+    super::access_notify_support::append_event_u32(&mut bytes, order, 128); // XI_DeviceDisabled
+    super::access_notify_support::append_event_u16(&mut bytes, order, 5);
     bytes.extend_from_slice(&[0; 10]); // header padding
     // Master pointer: attached to its paired master keyboard.
-    bytes.extend_from_slice(&[2, 0, 3, 0, 1, 1, 0, 0, 0, 0, 0, 0]);
+    append_hierarchy_record(&mut bytes, order, 2, 3, 1, true, 0);
     // Master keyboard: attached to its paired master pointer.
-    bytes.extend_from_slice(&[3, 0, 2, 0, 2, 1, 0, 0, 0, 0, 0, 0]);
+    append_hierarchy_record(&mut bytes, order, 3, 2, 2, true, 0);
     // Virtual XTEST pointer.
-    bytes.extend_from_slice(&[4, 0, 2, 0, 3, 1, 0, 0, 0, 0, 0, 0]);
+    append_hierarchy_record(&mut bytes, order, 4, 2, 3, true, 0);
     // Virtual XTEST keyboard.
-    bytes.extend_from_slice(&[5, 0, 3, 0, 4, 1, 0, 0, 0, 0, 0, 0]);
+    append_hierarchy_record(&mut bytes, order, 5, 3, 4, true, 0);
     // Disabled physical pointer facet (the changed device).
-    bytes.extend_from_slice(&[6, 0, 2, 0, 3, 0, 0, 0, 128, 0, 0, 0]);
+    append_hierarchy_record(&mut bytes, order, 6, 2, 3, false, 128);
     bytes
 }
 
-fn literal_disabled_stream(sequence: u16, device_id: u16) -> Vec<u8> {
+fn append_hierarchy_record(
+    bytes: &mut Vec<u8>,
+    order: ClientByteOrder,
+    device_id: u16,
+    attachment: u16,
+    use_: u8,
+    enabled: bool,
+    flags: u32,
+) {
+    super::access_notify_support::append_event_u16(bytes, order, device_id);
+    super::access_notify_support::append_event_u16(bytes, order, attachment);
+    bytes.extend_from_slice(&[use_, u8::from(enabled)]);
+    bytes.extend_from_slice(&[0; 2]);
+    super::access_notify_support::append_event_u32(bytes, order, flags);
+}
+
+fn literal_disabled_stream_with_order(
+    sequence: u16,
+    device_id: u16,
+    order: ClientByteOrder,
+) -> Vec<u8> {
     [
-        literal_presence_disabled(sequence, device_id),
-        literal_presence_disabled(sequence, device_id),
-        literal_hierarchy_disabled(sequence),
-        literal_hierarchy_disabled(sequence),
+        literal_presence_with_order(sequence, device_id, 3, order),
+        literal_presence_with_order(sequence, device_id, 3, order),
+        literal_hierarchy_disabled_with_order(sequence, order),
+        literal_hierarchy_disabled_with_order(sequence, order),
     ]
     .concat()
 }
@@ -181,6 +214,10 @@ fn receive_xi_hierarchy_subject_is_selected_window() {
         }
     });
     disable_device(&mut denied, denied_device);
+    assert!(
+        crate::core_loop::client_io::failed_writers(&denied.state.clients).is_empty(),
+        "denying the hierarchy copy does not queue a writer for disconnect"
+    );
     assert!(denied.drain(NOTIFY_SENDER).is_empty());
     let received = denied.drain(NOTIFY_RECEIVER_DENIED);
     assert_eq!(
@@ -207,6 +244,11 @@ fn receive_xi_hierarchy_subject_is_selected_window() {
             .data,
         [0],
         "denying the notification leaves Device Enabled at zero"
+    );
+    assert_eq!(
+        denied.state.xi_devices.attachment(denied_device),
+        None,
+        "the disabled live facet is floated after its hierarchy snapshot is published"
     );
     assert!(denied.state.clients.contains_key(&NOTIFY_RECEIVER_DENIED.0));
 
@@ -305,6 +347,10 @@ fn receive_xi_presence_denial_keeps_other_client() {
         }
     });
     disable_device(&mut denied, denied_device);
+    assert!(
+        crate::core_loop::client_io::failed_writers(&denied.state.clients).is_empty(),
+        "denying the presence copy does not queue a writer for disconnect"
+    );
     assert!(denied.drain(NOTIFY_SENDER).is_empty());
     let denied_bytes = denied.drain(NOTIFY_RECEIVER_DENIED);
     let allowed_bytes = denied.drain(NOTIFY_RECEIVER_ALLOWED);
@@ -331,6 +377,11 @@ fn receive_xi_presence_denial_keeps_other_client() {
             .properties[&denied.state.xi_device_enabled_atom]
             .data,
         [0]
+    );
+    assert_eq!(
+        denied.state.xi_devices.attachment(denied_device),
+        None,
+        "the disabled live facet is floated after its presence publication"
     );
     assert!(denied.state.clients.contains_key(&NOTIFY_RECEIVER_DENIED.0));
     assert!(
@@ -417,11 +468,23 @@ fn receive_xi_hotplug_baseline_frames() {
     // mutation: drop the last hierarchy device record
     let (mut fixture, device_id) = hotplug_fixture();
     for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+        let (
+            hierarchy_root_sequence,
+            hierarchy_child_sequence,
+            presence_root_sequence,
+            presence_child_sequence,
+            order,
+        ) = if client == NOTIFY_RECEIVER_DENIED {
+            (3, 4, 5, 6, ClientByteOrder::LittleEndian)
+        } else {
+            (7, 8, 9, 10, ClientByteOrder::BigEndian)
+        };
+        fixture.state.clients.get_mut(&client.0).unwrap().byte_order = order;
         xi_hotplug_select_hierarchy(
             &mut fixture.state,
             &mut fixture.backend,
             client.0,
-            3,
+            hierarchy_root_sequence,
             ROOT_WINDOW,
             true,
         );
@@ -429,7 +492,7 @@ fn receive_xi_hotplug_baseline_frames() {
             &mut fixture.state,
             &mut fixture.backend,
             client.0,
-            4,
+            hierarchy_child_sequence,
             CHILD_WINDOW,
             true,
         );
@@ -437,21 +500,26 @@ fn receive_xi_hotplug_baseline_frames() {
             &mut fixture.state,
             &mut fixture.backend,
             client.0,
-            5,
+            presence_root_sequence,
             ROOT_WINDOW,
         );
         xi_hotplug_select_presence(
             &mut fixture.state,
             &mut fixture.backend,
             client.0,
-            6,
+            presence_child_sequence,
             CHILD_WINDOW,
         );
     }
     disable_device(&mut fixture, device_id);
-    let expected = literal_disabled_stream(6, device_id);
-    for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
-        let actual = fixture.drain(client);
-        assert_eq!(actual, expected, "complete hotplug frames for {client:?}");
-    }
+    assert_eq!(
+        fixture.drain(NOTIFY_RECEIVER_DENIED),
+        literal_disabled_stream_with_order(6, device_id, ClientByteOrder::LittleEndian),
+        "complete little-endian hotplug frames with sequence 6"
+    );
+    assert_eq!(
+        fixture.drain(NOTIFY_RECEIVER_ALLOWED),
+        literal_disabled_stream_with_order(10, device_id, ClientByteOrder::BigEndian),
+        "complete big-endian hotplug frames with sequence 10"
+    );
 }
