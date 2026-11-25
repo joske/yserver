@@ -11,6 +11,7 @@ use super::{
 };
 use crate::{
     access::{Decision, DenyError, EventDescription, EventSubject, RequestOpcodes},
+    core_loop::process_request::RequestOutcome,
     resources::ROOT_WINDOW,
 };
 use std::{
@@ -530,17 +531,6 @@ fn receive_xi_hotplug_baseline_frames() {
     );
 }
 
-fn xi2_device_changed_selection_body(window: ResourceId, device_id: u16) -> Vec<u8> {
-    let mut body = Vec::with_capacity(16);
-    body.extend_from_slice(&window.0.to_le_bytes());
-    body.extend_from_slice(&1u16.to_le_bytes()); // num_masks
-    body.extend_from_slice(&0u16.to_le_bytes()); // pad
-    body.extend_from_slice(&device_id.to_le_bytes());
-    body.extend_from_slice(&1u16.to_le_bytes()); // mask_len
-    body.extend_from_slice(&crate::xinput::XI2_DEVICE_CHANGED_MASK.to_le_bytes());
-    body
-}
-
 fn select_device_changed(
     fixture: &mut NotifyFixture,
     client: ClientId,
@@ -548,8 +538,38 @@ fn select_device_changed(
     window: ResourceId,
     device_id: u16,
 ) {
-    let body = xi2_device_changed_selection_body(window, device_id);
+    select_device_changed_with_order(
+        fixture,
+        client,
+        sequence,
+        window,
+        device_id,
+        ClientByteOrder::LittleEndian,
+    );
+}
+
+fn select_device_changed_with_order(
+    fixture: &mut NotifyFixture,
+    client: ClientId,
+    sequence: u16,
+    window: ResourceId,
+    device_id: u16,
+    order: ClientByteOrder,
+) {
+    // NotifyFixture calls process_request after the reader's body swap, so
+    // the reused XI test builder supplies its normalized little-endian body.
     fixture
+        .state
+        .clients
+        .get_mut(&client.0)
+        .expect("fixture client")
+        .byte_order = order;
+    let body = super::xi2_grabs::xi_dynamic_select_events_body(
+        window.0,
+        device_id,
+        crate::xinput::XI2_DEVICE_CHANGED_MASK,
+    );
+    let outcome = fixture
         .request(
             client,
             SequenceNumber(sequence),
@@ -561,27 +581,10 @@ fn select_device_changed(
             &body,
         )
         .expect("XISelectEvents DeviceChanged selection");
-}
-
-fn xi2_device_changed_frames(wire: &[u8]) -> Vec<&[u8]> {
-    let mut frames = Vec::new();
-    let mut offset = 0;
-    while offset < wire.len() {
-        assert!(wire.len() - offset >= 32, "complete GenericEvent header");
-        assert_eq!(wire[offset], 35, "GenericEvent");
-        let units = usize::try_from(u32::from_le_bytes(
-            wire[offset + 4..offset + 8].try_into().unwrap(),
-        ))
-        .unwrap();
-        let length = 32 + units * 4;
-        assert!(
-            length <= wire.len() - offset,
-            "complete DeviceChanged frame"
-        );
-        frames.push(&wire[offset..offset + length]);
-        offset += length;
-    }
-    frames
+    assert!(
+        matches!(outcome, RequestOutcome::Handled),
+        "XISelectEvents must complete without disconnecting its issuer"
+    );
 }
 
 fn literal_device_changed_event(
@@ -590,57 +593,38 @@ fn literal_device_changed_event(
     source_id: u16,
     num_classes: u16,
     classes: &[u8],
+    order: ClientByteOrder,
 ) -> Vec<u8> {
     let mut bytes = vec![35, 137]; // GenericEvent, XInput major opcode
-    super::access_notify_support::append_event_u16(
-        &mut bytes,
-        ClientByteOrder::LittleEndian,
-        sequence,
-    );
+    super::access_notify_support::append_event_u16(&mut bytes, order, sequence);
     super::access_notify_support::append_event_u32(
         &mut bytes,
-        ClientByteOrder::LittleEndian,
+        order,
         u32::try_from(classes.len() / 4).unwrap(),
     );
-    super::access_notify_support::append_event_u16(&mut bytes, ClientByteOrder::LittleEndian, 1); // XI_DeviceChanged
-    super::access_notify_support::append_event_u16(
-        &mut bytes,
-        ClientByteOrder::LittleEndian,
-        device_id,
-    );
-    super::access_notify_support::append_event_u32(&mut bytes, ClientByteOrder::LittleEndian, 0);
-    super::access_notify_support::append_event_u16(
-        &mut bytes,
-        ClientByteOrder::LittleEndian,
-        num_classes,
-    );
-    super::access_notify_support::append_event_u16(
-        &mut bytes,
-        ClientByteOrder::LittleEndian,
-        source_id,
-    );
+    super::access_notify_support::append_event_u16(&mut bytes, order, 1); // XI_DeviceChanged
+    super::access_notify_support::append_event_u16(&mut bytes, order, device_id);
+    super::access_notify_support::append_event_u32(&mut bytes, order, 0);
+    super::access_notify_support::append_event_u16(&mut bytes, order, num_classes);
+    super::access_notify_support::append_event_u16(&mut bytes, order, source_id);
     bytes.extend_from_slice(&[1, 0]); // SlaveSwitch, pad0
-    super::access_notify_support::append_event_u16(&mut bytes, ClientByteOrder::LittleEndian, 0);
-    super::access_notify_support::append_event_u32(&mut bytes, ClientByteOrder::LittleEndian, 0);
-    super::access_notify_support::append_event_u32(&mut bytes, ClientByteOrder::LittleEndian, 0);
+    super::access_notify_support::append_event_u16(&mut bytes, order, 0);
+    super::access_notify_support::append_event_u32(&mut bytes, order, 0);
+    super::access_notify_support::append_event_u32(&mut bytes, order, 0);
     bytes.extend_from_slice(classes);
     bytes
 }
 
-fn literal_physical_pointer_classes(source_id: u16) -> Vec<u8> {
-    let mut classes = vec![1, 0, 10, 0]; // ButtonClass, 10 four-byte units
-    super::access_notify_support::append_event_u16(
-        &mut classes,
-        ClientByteOrder::LittleEndian,
-        source_id,
-    );
-    classes.extend_from_slice(&[7, 0, 0, 0, 0, 0]); // seven buttons, zero state
+fn literal_physical_pointer_classes(source_id: u16, order: ClientByteOrder) -> Vec<u8> {
+    let mut classes = Vec::new();
+    super::access_notify_support::append_event_u16(&mut classes, order, 1); // ButtonClass
+    super::access_notify_support::append_event_u16(&mut classes, order, 10); // 10 four-byte units
+    super::access_notify_support::append_event_u16(&mut classes, order, source_id);
+    super::access_notify_support::append_event_u16(&mut classes, order, 7); // seven buttons
+    super::access_notify_support::append_event_u16(&mut classes, order, 0); // zero state length
+    super::access_notify_support::append_event_u16(&mut classes, order, 0); // zero state
     for atom in 0x5d_u32..=0x63 {
-        super::access_notify_support::append_event_u32(
-            &mut classes,
-            ClientByteOrder::LittleEndian,
-            atom,
-        );
+        super::access_notify_support::append_event_u32(&mut classes, order, atom);
     }
     for (axis, atom, max, value) in [
         (0u16, 0x64_u32, -1_i32, 400_i32),
@@ -648,118 +632,71 @@ fn literal_physical_pointer_classes(source_id: u16) -> Vec<u8> {
         (2, 0x66, 0, 0),
         (3, 0x67, 0, 0),
     ] {
-        classes.extend_from_slice(&[2, 0, 11, 0]); // ValuatorClass, 11 units
-        super::access_notify_support::append_event_u16(
-            &mut classes,
-            ClientByteOrder::LittleEndian,
-            source_id,
-        );
-        super::access_notify_support::append_event_u16(
-            &mut classes,
-            ClientByteOrder::LittleEndian,
-            axis,
-        );
-        super::access_notify_support::append_event_u32(
-            &mut classes,
-            ClientByteOrder::LittleEndian,
-            atom,
-        );
-        super::access_notify_support::append_event_u32(
-            &mut classes,
-            ClientByteOrder::LittleEndian,
-            u32::MAX,
-        ); // minimum = -1
-        super::access_notify_support::append_event_u32(
-            &mut classes,
-            ClientByteOrder::LittleEndian,
-            0,
-        );
-        super::access_notify_support::append_event_u32(
-            &mut classes,
-            ClientByteOrder::LittleEndian,
-            max as u32,
-        );
-        super::access_notify_support::append_event_u32(
-            &mut classes,
-            ClientByteOrder::LittleEndian,
-            0,
-        );
-        super::access_notify_support::append_event_u32(
-            &mut classes,
-            ClientByteOrder::LittleEndian,
-            value as u32,
-        );
-        super::access_notify_support::append_event_u32(
-            &mut classes,
-            ClientByteOrder::LittleEndian,
-            0,
-        );
-        super::access_notify_support::append_event_u32(
-            &mut classes,
-            ClientByteOrder::LittleEndian,
-            0,
-        );
+        super::access_notify_support::append_event_u16(&mut classes, order, 2); // ValuatorClass
+        super::access_notify_support::append_event_u16(&mut classes, order, 11); // 11 units
+        super::access_notify_support::append_event_u16(&mut classes, order, source_id);
+        super::access_notify_support::append_event_u16(&mut classes, order, axis);
+        super::access_notify_support::append_event_u32(&mut classes, order, atom);
+        super::access_notify_support::append_event_u32(&mut classes, order, u32::MAX); // minimum = -1
+        super::access_notify_support::append_event_u32(&mut classes, order, 0);
+        super::access_notify_support::append_event_u32(&mut classes, order, max as u32);
+        super::access_notify_support::append_event_u32(&mut classes, order, 0);
+        super::access_notify_support::append_event_u32(&mut classes, order, value as u32);
+        super::access_notify_support::append_event_u32(&mut classes, order, 0);
+        super::access_notify_support::append_event_u32(&mut classes, order, 0);
         classes.extend_from_slice(&[0; 4]); // relative mode and padding
     }
     for (number, scroll_type) in [(2u16, 1u16), (3, 2)] {
-        classes.extend_from_slice(&[3, 0, 6, 0]); // ScrollClass, 6 units
-        super::access_notify_support::append_event_u16(
-            &mut classes,
-            ClientByteOrder::LittleEndian,
-            source_id,
-        );
-        super::access_notify_support::append_event_u16(
-            &mut classes,
-            ClientByteOrder::LittleEndian,
-            number,
-        );
-        super::access_notify_support::append_event_u16(
-            &mut classes,
-            ClientByteOrder::LittleEndian,
-            scroll_type,
-        );
-        super::access_notify_support::append_event_u16(
-            &mut classes,
-            ClientByteOrder::LittleEndian,
-            0,
-        );
-        super::access_notify_support::append_event_u32(
-            &mut classes,
-            ClientByteOrder::LittleEndian,
-            0,
-        );
-        super::access_notify_support::append_event_u32(
-            &mut classes,
-            ClientByteOrder::LittleEndian,
-            1,
-        );
-        super::access_notify_support::append_event_u32(
-            &mut classes,
-            ClientByteOrder::LittleEndian,
-            0,
-        );
+        super::access_notify_support::append_event_u16(&mut classes, order, 3); // ScrollClass
+        super::access_notify_support::append_event_u16(&mut classes, order, 6); // 6 units
+        super::access_notify_support::append_event_u16(&mut classes, order, source_id);
+        super::access_notify_support::append_event_u16(&mut classes, order, number);
+        super::access_notify_support::append_event_u16(&mut classes, order, scroll_type);
+        super::access_notify_support::append_event_u16(&mut classes, order, 0);
+        super::access_notify_support::append_event_u32(&mut classes, order, 0);
+        super::access_notify_support::append_event_u32(&mut classes, order, 1);
+        super::access_notify_support::append_event_u32(&mut classes, order, 0);
     }
     assert_eq!(classes.len(), 264, "complete seven-class pointer payload");
     classes
 }
 
-fn literal_keyboard_classes(source_id: u16) -> Vec<u8> {
-    let mut classes = vec![0, 0, 250, 0]; // KeyClass, 250 four-byte units
-    super::access_notify_support::append_event_u16(
-        &mut classes,
-        ClientByteOrder::LittleEndian,
-        source_id,
-    );
-    classes.extend_from_slice(&[248, 0]); // keycodes 8 through 255
+fn literal_keyboard_classes(source_id: u16, order: ClientByteOrder) -> Vec<u8> {
+    let mut classes = Vec::new();
+    super::access_notify_support::append_event_u16(&mut classes, order, 0); // KeyClass
+    super::access_notify_support::append_event_u16(&mut classes, order, 250); // 250 units
+    super::access_notify_support::append_event_u16(&mut classes, order, source_id);
+    super::access_notify_support::append_event_u16(&mut classes, order, 248); // keycodes 8 through 255
     for keycode in 8_u32..=255 {
-        super::access_notify_support::append_event_u32(
-            &mut classes,
-            ClientByteOrder::LittleEndian,
-            keycode,
-        );
+        super::access_notify_support::append_event_u32(&mut classes, order, keycode);
     }
     assert_eq!(classes.len(), 1000, "complete 248-key KeyClass payload");
     classes
+}
+
+fn literal_bootstrap_device_changed_stream(
+    sequence: u16,
+    pointer_id: u16,
+    keyboard_id: u16,
+    order: ClientByteOrder,
+) -> Vec<u8> {
+    let pointer_event = literal_device_changed_event(
+        sequence,
+        crate::xinput::DEVICEID_MASTER_POINTER,
+        pointer_id,
+        7,
+        &literal_physical_pointer_classes(pointer_id, order),
+        order,
+    );
+    let keyboard_event = literal_device_changed_event(
+        sequence,
+        crate::xinput::DEVICEID_MASTER_KEYBOARD,
+        keyboard_id,
+        1,
+        &literal_keyboard_classes(keyboard_id, order),
+        order,
+    );
+    [pointer_event, keyboard_event].concat()
 }
 
 fn bootstrap_device_changed_fixture() -> (NotifyFixture, u16, u16) {
@@ -849,9 +786,19 @@ fn receive_xi_device_changed_denial_per_window() {
     );
     assert!(allowed.drain(NOTIFY_SENDER).is_empty());
     let all_allow_wire = allowed.drain(NOTIFY_RECEIVER_DENIED);
-    let all_allow = xi2_device_changed_frames(&all_allow_wire);
-    assert_eq!(all_allow.len(), 2, "root and child each have a copy");
-    assert_eq!(all_allow[0], all_allow[1], "window is not on the wire");
+    let event = literal_device_changed_event(
+        4,
+        crate::xinput::DEVICEID_MASTER_POINTER,
+        device_id,
+        7,
+        &literal_physical_pointer_classes(device_id, ClientByteOrder::LittleEndian),
+        ClientByteOrder::LittleEndian,
+    );
+    assert_eq!(
+        all_allow_wire,
+        [event.clone(), event.clone()].concat(),
+        "explicit-Allow control emits two complete literal frames"
+    );
     assert_eq!(
         allowed
             .state
@@ -907,17 +854,23 @@ fn receive_xi_device_changed_denial_per_window() {
         )
         .is_empty()
     );
+    let expected_event = literal_device_changed_event(
+        4,
+        crate::xinput::DEVICEID_MASTER_POINTER,
+        device_id,
+        7,
+        &literal_physical_pointer_classes(device_id, ClientByteOrder::LittleEndian),
+        ClientByteOrder::LittleEndian,
+    );
     assert!(
         crate::core_loop::client_io::failed_writers(&denied.state.clients).is_empty(),
         "denying one copy does not queue a writer for disconnect"
     );
     assert!(denied.drain(NOTIFY_SENDER).is_empty());
     let received_wire = denied.drain(NOTIFY_RECEIVER_DENIED);
-    let received = xi2_device_changed_frames(&received_wire);
     assert_eq!(
-        received,
-        [all_allow[0]],
-        "only the root-selected copy remains"
+        received_wire, expected_event,
+        "only the root-selected literal frame remains"
     );
     assert_eq!(
         denied
@@ -947,7 +900,11 @@ fn receive_xi_device_changed_denial_per_window() {
 #[test]
 fn receive_xi_bootstrap_denies_one_master_only() {
     // mutation: check once for the whole buffer instead of per master
-    let (mut allowed, _, _) = bootstrap_device_changed_fixture();
+    // mutation: pass EventSubject::Global to the bootstrap Receive check
+    // mutation: skip the bootstrap Receive check (the explicit-Allow count must fail)
+    // mutation: return RequestOutcome::Disconnect from XISelectEvents
+    let (mut allowed, pointer_id, keyboard_id) = bootstrap_device_changed_fixture();
+    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
     select_device_changed(
         &mut allowed,
         NOTIFY_RECEIVER_DENIED,
@@ -956,26 +913,40 @@ fn receive_xi_bootstrap_denies_one_master_only() {
         0, // XIAllDevices
     );
     let all_allow_wire = allowed.drain(NOTIFY_RECEIVER_DENIED);
-    let all_allow = xi2_device_changed_frames(&all_allow_wire);
-    assert_eq!(all_allow.len(), 2);
-    assert_eq!(
-        u16::from_le_bytes([all_allow[0][10], all_allow[0][11]]),
-        crate::xinput::DEVICEID_MASTER_POINTER
+    let all_allow_literal = literal_bootstrap_device_changed_stream(
+        20,
+        pointer_id,
+        keyboard_id,
+        ClientByteOrder::LittleEndian,
     );
     assert_eq!(
-        u16::from_le_bytes([all_allow[1][10], all_allow[1][11]]),
-        crate::xinput::DEVICEID_MASTER_KEYBOARD
+        all_allow_wire, all_allow_literal,
+        "explicit-Allow bootstrap control emits both complete literal frames in order"
     );
+    let allow_receives = receive_checks(&allow_calls)
+        .into_iter()
+        .filter(is_device_changed_receive)
+        .collect::<Vec<_>>();
+    assert_eq!(allow_receives.len(), 2);
+    assert!(allow_receives.iter().all(|call| {
+        call.client == NOTIFY_RECEIVER_DENIED
+            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
+            && call.events == Some(vec![EventDescription::extension(35, 137, 1)])
+            && call.request
+                == Some(RequestOpcodes {
+                    major: 137,
+                    minor: 46,
+                })
+    }));
 
-    let (mut denied, _, _) = bootstrap_device_changed_fixture();
+    let (mut denied, _, denied_keyboard_id) = bootstrap_device_changed_fixture();
     let matched = Arc::new(AtomicUsize::new(0));
     let matched_for_policy = Arc::clone(&matched);
     let calls = denied.install_policy(move |_, call| {
         if call.hook == ExtensionHook::Receive
             && call.client == NOTIFY_RECEIVER_DENIED
-            && call.events.as_ref().is_some_and(|events| {
-                events.as_slice() == [EventDescription::extension(35, 137, 1)]
-            })
+            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
+            && is_device_changed_receive(call)
             && matched_for_policy.fetch_add(1, Ordering::Relaxed) == 0
         {
             Decision::Deny(DENY)
@@ -991,11 +962,17 @@ fn receive_xi_bootstrap_denies_one_master_only() {
         0, // XIAllDevices
     );
     let received_wire = denied.drain(NOTIFY_RECEIVER_DENIED);
-    let received = xi2_device_changed_frames(&received_wire);
+    let expected_keyboard = literal_device_changed_event(
+        20,
+        crate::xinput::DEVICEID_MASTER_KEYBOARD,
+        denied_keyboard_id,
+        1,
+        &literal_keyboard_classes(denied_keyboard_id, ClientByteOrder::LittleEndian),
+        ClientByteOrder::LittleEndian,
+    );
     assert_eq!(
-        received,
-        [all_allow[1]],
-        "keyboard event survives pointer denial"
+        received_wire, expected_keyboard,
+        "keyboard literal frame survives pointer denial"
     );
     assert!(denied.state.clients.contains_key(&NOTIFY_RECEIVER_DENIED.0));
     assert!(crate::core_loop::client_io::failed_writers(&denied.state.clients).is_empty());
@@ -1026,9 +1003,8 @@ fn receive_xi_bootstrap_denies_one_master_only() {
     let calls = deny_all_events.install_policy(|_, call| {
         if call.hook == ExtensionHook::Receive
             && call.client == NOTIFY_RECEIVER_DENIED
-            && call.events.as_ref().is_some_and(|events| {
-                events.as_slice() == [EventDescription::extension(35, 137, 1)]
-            })
+            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
+            && is_device_changed_receive(call)
         {
             Decision::Deny(DENY)
         } else {
@@ -1076,6 +1052,7 @@ fn receive_xi_bootstrap_denies_one_master_only() {
 #[test]
 fn receive_xi_device_changed_baseline_frames() {
     // mutation: swap the bootstrap master order
+    // mutation: hard-code little-endian class encoding at X3 or X4
     let (mut changed, device_id) = hotplug_fixture();
     select_device_changed(
         &mut changed,
@@ -1091,6 +1068,19 @@ fn receive_xi_device_changed_baseline_frames() {
         CHILD_WINDOW,
         crate::xinput::DEVICEID_MASTER_POINTER,
     );
+    select_device_changed(
+        &mut changed,
+        NOTIFY_RECEIVER_ALLOWED,
+        10,
+        ROOT_WINDOW,
+        crate::xinput::DEVICEID_MASTER_POINTER,
+    );
+    changed
+        .state
+        .clients
+        .get_mut(&NOTIFY_RECEIVER_ALLOWED.0)
+        .expect("fixture client")
+        .byte_order = ClientByteOrder::BigEndian;
     assert!(
         crate::xinput::hotplug::announce_xi2_slave_switch(
             &mut changed.state,
@@ -1100,19 +1090,32 @@ fn receive_xi_device_changed_baseline_frames() {
         .is_empty()
     );
     let changed_wire = changed.drain(NOTIFY_RECEIVER_DENIED);
-    let changed_frames = xi2_device_changed_frames(&changed_wire);
-    assert_eq!(changed_frames.len(), 2);
-    let pointer_classes = literal_physical_pointer_classes(device_id);
+    let pointer_classes =
+        literal_physical_pointer_classes(device_id, ClientByteOrder::LittleEndian);
     let changed_event = literal_device_changed_event(
         4,
         crate::xinput::DEVICEID_MASTER_POINTER,
         device_id,
         7,
         &pointer_classes,
+        ClientByteOrder::LittleEndian,
     );
     assert_eq!(
         changed_wire,
         [changed_event.clone(), changed_event].concat()
+    );
+    let changed_big_endian_wire = changed.drain(NOTIFY_RECEIVER_ALLOWED);
+    let changed_big_endian_event = literal_device_changed_event(
+        10,
+        crate::xinput::DEVICEID_MASTER_POINTER,
+        device_id,
+        7,
+        &literal_physical_pointer_classes(device_id, ClientByteOrder::BigEndian),
+        ClientByteOrder::BigEndian,
+    );
+    assert_eq!(
+        changed_big_endian_wire, changed_big_endian_event,
+        "fanout serializes the full frame and class payload in the recipient byte order"
     );
 
     let (mut bootstrap, pointer_id, keyboard_id) = bootstrap_device_changed_fixture();
@@ -1123,40 +1126,34 @@ fn receive_xi_device_changed_baseline_frames() {
         ROOT_WINDOW,
         0, // XIAllDevices
     );
+    select_device_changed_with_order(
+        &mut bootstrap,
+        NOTIFY_RECEIVER_ALLOWED,
+        30,
+        ROOT_WINDOW,
+        0, // XIAllDevices
+        ClientByteOrder::BigEndian,
+    );
     let bootstrap_wire = bootstrap.drain(NOTIFY_RECEIVER_DENIED);
-    let bootstrap_frames = xi2_device_changed_frames(&bootstrap_wire);
-    assert_eq!(bootstrap_frames.len(), 2);
     assert_eq!(
-        u16::from_le_bytes([bootstrap_frames[0][10], bootstrap_frames[0][11]]),
-        crate::xinput::DEVICEID_MASTER_POINTER
+        bootstrap_wire,
+        literal_bootstrap_device_changed_stream(
+            20,
+            pointer_id,
+            keyboard_id,
+            ClientByteOrder::LittleEndian,
+        ),
+        "bootstrap complete literal frames retain pointer then keyboard order"
     );
+    let bootstrap_big_endian_wire = bootstrap.drain(NOTIFY_RECEIVER_ALLOWED);
     assert_eq!(
-        u16::from_le_bytes([bootstrap_frames[0][18], bootstrap_frames[0][19]]),
-        pointer_id
+        bootstrap_big_endian_wire,
+        literal_bootstrap_device_changed_stream(
+            30,
+            pointer_id,
+            keyboard_id,
+            ClientByteOrder::BigEndian,
+        ),
+        "bootstrap encodes both complete frames and class payloads in recipient byte order"
     );
-    assert_eq!(
-        u16::from_le_bytes([bootstrap_frames[1][10], bootstrap_frames[1][11]]),
-        crate::xinput::DEVICEID_MASTER_KEYBOARD
-    );
-    assert_eq!(
-        u16::from_le_bytes([bootstrap_frames[1][18], bootstrap_frames[1][19]]),
-        keyboard_id
-    );
-    let pointer_classes = literal_physical_pointer_classes(pointer_id);
-    let keyboard_classes = literal_keyboard_classes(keyboard_id);
-    let pointer_event = literal_device_changed_event(
-        20,
-        crate::xinput::DEVICEID_MASTER_POINTER,
-        pointer_id,
-        7,
-        &pointer_classes,
-    );
-    let keyboard_event = literal_device_changed_event(
-        20,
-        crate::xinput::DEVICEID_MASTER_KEYBOARD,
-        keyboard_id,
-        1,
-        &keyboard_classes,
-    );
-    assert_eq!(bootstrap_wire, [pointer_event, keyboard_event].concat());
 }
