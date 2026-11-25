@@ -108,28 +108,6 @@ fn literal_disabled_stream(sequence: u16, device_id: u16) -> Vec<u8> {
     .concat()
 }
 
-fn event_frames(bytes: &[u8]) -> Vec<&[u8]> {
-    let mut frames = Vec::new();
-    let mut offset = 0;
-    while offset < bytes.len() {
-        assert!(bytes.len() - offset >= 32, "truncated XI event frame");
-        let frame_len = if bytes[offset] == 35 {
-            let extra_words =
-                u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
-            32 + extra_words * 4
-        } else {
-            32
-        };
-        assert!(
-            frame_len <= bytes.len() - offset,
-            "truncated XI event payload"
-        );
-        frames.push(&bytes[offset..offset + frame_len]);
-        offset += frame_len;
-    }
-    frames
-}
-
 fn receive_checks(
     calls: &Arc<std::sync::Mutex<Vec<RecordedExtensionCheck>>>,
 ) -> Vec<RecordedExtensionCheck> {
@@ -166,15 +144,26 @@ fn receive_xi_hierarchy_subject_is_selected_window() {
     // mutation: pass W(ROOT_WINDOW) instead of the selected window in X2
     let (mut allowed, allowed_device) = hotplug_fixture();
     select_hierarchy_on_root_and_child(&mut allowed, NOTIFY_RECEIVER_DENIED);
+    let allowed_calls = allowed.install_policy(|_, _| Decision::Allow);
     disable_device(&mut allowed, allowed_device);
+    assert!(allowed.drain(NOTIFY_SENDER).is_empty());
     let all_allow = allowed.drain(NOTIFY_RECEIVER_DENIED);
     assert_eq!(
         all_allow,
         [literal_hierarchy_disabled(4), literal_hierarchy_disabled(4)].concat()
     );
-    let all_allow_frames = event_frames(&all_allow);
-    assert_eq!(all_allow_frames.len(), 2);
-    assert_eq!(all_allow_frames[0], all_allow_frames[1]);
+    let allowed_receives = receive_checks(&allowed_calls);
+    assert_eq!(allowed_receives.len(), 2);
+    assert!(
+        allowed_receives
+            .iter()
+            .any(|call| { call.receive == Some(EventSubject::Window(ROOT_WINDOW)) })
+    );
+    assert!(
+        allowed_receives
+            .iter()
+            .any(|call| { call.receive == Some(EventSubject::Window(CHILD_WINDOW)) })
+    );
 
     let (mut denied, denied_device) = hotplug_fixture();
     select_hierarchy_on_root_and_child(&mut denied, NOTIFY_RECEIVER_DENIED);
@@ -192,14 +181,13 @@ fn receive_xi_hierarchy_subject_is_selected_window() {
         }
     });
     disable_device(&mut denied, denied_device);
+    assert!(denied.drain(NOTIFY_SENDER).is_empty());
     let received = denied.drain(NOTIFY_RECEIVER_DENIED);
-    let received_frames = event_frames(&received);
     assert_eq!(
-        received_frames.len(),
-        1,
+        received,
+        literal_hierarchy_disabled(4),
         "only the root-selected copy remains"
     );
-    assert_eq!(received_frames[0], all_allow_frames[0]);
     assert!(
         !denied
             .state
@@ -259,7 +247,9 @@ fn receive_xi_presence_denial_keeps_other_client() {
         3,
         CHILD_WINDOW,
     );
+    let allowed_calls = allowed.install_policy(|_, _| Decision::Allow);
     disable_device(&mut allowed, allowed_device);
+    assert!(allowed.drain(NOTIFY_SENDER).is_empty());
     let all_allow_denied = allowed.drain(NOTIFY_RECEIVER_DENIED);
     let all_allow_other = allowed.drain(NOTIFY_RECEIVER_ALLOWED);
     assert_eq!(
@@ -270,6 +260,16 @@ fn receive_xi_presence_denial_keeps_other_client() {
         all_allow_other,
         literal_presence_disabled(3, allowed_device)
     );
+    let allowed_receives = receive_checks(&allowed_calls);
+    assert_eq!(allowed_receives.len(), 2);
+    assert!(allowed_receives.iter().any(|call| {
+        call.client == NOTIFY_RECEIVER_DENIED
+            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
+    }));
+    assert!(allowed_receives.iter().any(|call| {
+        call.client == NOTIFY_RECEIVER_ALLOWED
+            && call.receive == Some(EventSubject::Window(CHILD_WINDOW))
+    }));
 
     let (mut denied, denied_device) = hotplug_fixture();
     xi_hotplug_select_presence(
@@ -305,6 +305,7 @@ fn receive_xi_presence_denial_keeps_other_client() {
         }
     });
     disable_device(&mut denied, denied_device);
+    assert!(denied.drain(NOTIFY_SENDER).is_empty());
     let denied_bytes = denied.drain(NOTIFY_RECEIVER_DENIED);
     let allowed_bytes = denied.drain(NOTIFY_RECEIVER_ALLOWED);
     assert!(
@@ -312,8 +313,6 @@ fn receive_xi_presence_denial_keeps_other_client() {
         "denied client gets no event or error"
     );
     assert_eq!(allowed_bytes, all_allow_other);
-    assert_eq!(all_allow_denied.len(), 32);
-    assert_eq!(event_frames(&allowed_bytes).len(), 1);
     assert!(
         !denied
             .state
@@ -454,11 +453,5 @@ fn receive_xi_hotplug_baseline_frames() {
     for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
         let actual = fixture.drain(client);
         assert_eq!(actual, expected, "complete hotplug frames for {client:?}");
-        let frames = event_frames(&actual);
-        assert_eq!(frames.len(), 4);
-        assert_eq!(frames[0], literal_presence_disabled(6, device_id));
-        assert_eq!(frames[1], literal_presence_disabled(6, device_id));
-        assert_eq!(frames[2], literal_hierarchy_disabled(6));
-        assert_eq!(frames[3], literal_hierarchy_disabled(6));
     }
 }
