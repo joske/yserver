@@ -67,7 +67,7 @@
     - **referenced** = recount keys ∪ {`effective_cursor_xid`, `default_cursor_xid`, `core.active_cursor`, `grab_cursor_override`}. For each referenced XID in `m` (no early free):
       - its `cursor_records` entry exists;
       - a static cursor: `b.cursor_pixmaps[xid] == m.sprites[xid]` and that `DrawableId` is still in `b.store`;
-      - an animation: `anim_cursor_records[xid]` exists with exactly `m.frames[xid]` as frame sources, and `b.cursor_pixmaps[xid]` is the modeled sprite of one of those frames and is still in `b.store` (the canonical alias).
+      - an animation: `anim_cursor_records[xid]` exists with exactly `m.frames[xid]` as frame sources, each frame's saved `pixmap` equals `m.sprites[frame.source]` and is still in `b.store`, and `b.cursor_pixmaps[xid]` is one of those sprites (the canonical alias).
     - if `reached_reclamation_point` (no leak), for each XID in `m.freed` that is not referenced: no `cursor_records` / `cursor_pixmaps` / `anim_cursor_records` entry, not in `released_cursors`, and for a static cursor `m.sprites[xid]` is no longer in `b.store`. This tracks frees on the model's side, so a collector that drops an XID from `released_cursors` without its records or sprite is caught. (Null-storage drawables leave the store at their last decref, as `present_scanout.rs:1116` shows for the COW.)
   - A seeded generator (`xorshift64`, seeds `1..=64`, 300 steps each). Every seed starts with a fixed prefix: create a window, `define_cursor` a fresh cursor on it, `free_cursor` that cursor, `destroy_subwindow` the window, so the window-removal mutation always has a witness. Then ops, drawn uniformly, each skipped when its preconditions fail:
     - create a static cursor (`sprite_cursor`); create an animated cursor of 1–4 frames from live, unfreed static cursors, where a frame source may repeat;
@@ -76,7 +76,7 @@
     - `free_cursor` on a live, not yet freed cursor (each XID at most once; freed XIDs are never used again, as the core guarantees);
     - `replace_cursor(old, new)` with both unfreed;
     - `set_grab_cursor(Some(live))` / `set_grab_cursor(None)`;
-    - pointer move to a random live window through the public path, `Backend::on_host_input(&mut state, HostInputEvent::PointerMotion { .. })` to a point inside it, as `tests/crossings.rs:104-147` does. The generator therefore owns a core `ServerState` and creates every window in both trees the way that fixture does (core resource, then the backend window through `window_geom_insert`, then `windows_restructured`), and destroys it in both.
+    - pointer move to a random live window through the public path, `Backend::on_host_input(&mut state, HostInputEvent::PointerMotion { .. })` to a point inside it, as `tests/crossings.rs:104-147` does. The generator therefore owns a core `ServerState` and creates every window in both trees the way that fixture does (core resource, mapped in the core with `map_window` as `crossings.rs:123` does, then the backend window through `window_geom_insert`, then `windows_restructured`), and destroys it in both. Before relying on moves, the test asserts once that a motion into a window with its own cursor makes `effective_cursor_xid` that cursor.
     - overlay: `get_overlay_window`; `define_cursor` on the COW xid; immediate release (`prepare_overlay_release` + `retire_overlay_window`); deferred release followed later by either reacquisition (`get_overlay_window`) or teardown (`stop_direct_after_scanout_replaced(DirectScope::Root, …)`).
       - Deferred-release fixture, as `present_scanout.rs:1079-1090` does: a fresh, disjoint target/source XID pair per cycle (targets step by 2 in a range no other op uses, since `install_direct_frame_for_target_test` allocates its source at `target + 1` and that store entry outlives the frame); the target goes in through the store allocation `seed_window` does plus `window_geom_insert`, not `seed_window` itself, which writes the window map directly; `install_direct_frame_for_target_test(b, target, cow_id, true)`, then `b.pstate.direct.root_mut().unflip_shadow_ready = true` before `prepare_overlay_release`.
       - After a reacquisition, call `stop_direct_after_scanout_replaced` once to retire that cycle's frame before any later cycle installs another.
@@ -139,7 +139,7 @@
   - `shared_cursor_goes_with_the_last_window` — c defined on three windows, freed; `define_cursor(w, 0)` on two of them leaves c alive; the third leaves it gone.
   - `reclaim_checks_stay_bounded_with_a_large_released_backlog`:
     - 100 animated cursors of 20 frames each, every frame a `test_cursor`; all 2,000 frame XIDs freed; the animations stay live. Assert `released_cursors.len() == 2000`.
-    - 20 windows created through `window_geom_insert`, two live static cursors a, b.
+    - 20 windows created through `window_geom_insert`, two live static cursors a, b. Put the pointer on window 0 (`core.prev_pointer_window`, as `tests/cursor.rs:450` does; no core state is needed here) and assert the first `define_cursor(w0, a)` makes `effective_cursor_xid == Some(a)`, so every later define really changes the effective cursor.
     - `let before = b.cursor_reclaim_checks;` then 1,000 `define_cursor` calls alternating a/b on the window under the pointer, and 1,000 `set_grab_cursor` calls alternating `Some(a)`/`None`.
     - Assert `b.cursor_reclaim_checks - before <= 4 * 2000` and `released_cursors.len() == 2000`.
 
@@ -162,7 +162,7 @@
 
 - [ ] **Step 5: Mutations** (each run and reverted)
   - Restore a scan of a `released_cursors` snapshot through `cursor_reclaimable` inside `collect_released_cursors` → `reclaim_checks_stay_bounded_with_a_large_released_backlog` fails.
-  - Reclaim inside `cursor_ref_drop` instead of pushing → `overlay_orphaned_cursor_survives_teardown_until_next_reclamation_point` fails.
+  - In `cursor_ref_drop`'s zero-count branch, push and then call `collect_released_cursors` immediately (early reclamation) → the assertion right after teardown in `overlay_orphaned_cursor_survives_teardown_until_next_reclamation_point` fails (record or sprite already gone).
   - Skip the frame `cursor_ref_drop` cascade → the existing `animated_cursor_keeps_its_freed_frames_alive` fails, and so does the random test's recount equality.
   - Skip `window_geom_remove` in `finish_cow_release` (direct `windows.remove`) → the overlay test or the random test's leak assertion fails.
 
@@ -177,6 +177,6 @@
 
 ### After the tasks (controller, not codex)
 
-- Gate: `/data/Projects/claude-scratch/access-control/pr4c-v2/gate/gate.sh` adapted to this worktree (fmt, clippy ×3, Windows check of `yserver-core`, FreeBSD clippy, workspace tests, lavapipe `--ignored`, `tools/check-layout.sh`, `just man`). Before the lavapipe step, run the CI lavapipe job's capability checks (`.github/workflows/ci.yml:131`: `SYNC_FD` export and DRM format modifiers) and fail the gate if either is missing, so GPU test bodies cannot silently skip.
-- Hardware acceptance (user's permission per session): a local client in `/data/Projects/claude-scratch/issue-387/` creates 100 animated cursors and frees their frame XIDs, then changes a window cursor and re-grabs the pointer 60 times a second; compare `ChangeWindowAttributes` and `GrabPointer` times in `YSERVER_LOOP_TELEMETRY=1` output, master `8247002b` against the branch. Then CS2 in a session aged by browser use, master against the branch, with MangoHud.
+- Gate: `/data/Projects/claude-scratch/access-control/pr4c-v2/gate/gate.sh` adapted to this worktree (fmt, clippy ×3, Windows check of `yserver-core`, FreeBSD clippy, workspace tests, lavapipe `--ignored`, `tools/check-layout.sh`, `just man`). The lavapipe step sources `lvp-env.sh` and, in that same shell, first runs the CI lavapipe job's capability checks (`.github/workflows/ci.yml:131-160`: `vulkaninfo` must show `SYNC_FD` export and DRM format modifiers) and fails if either is missing, then runs the `--ignored` suite, so GPU test bodies cannot silently skip.
+- Hardware acceptance (user's permission per session): a local client in `/data/Projects/claude-scratch/issue-387/` creates 100 animated cursors of 20 distinct frame cursors each and frees all 2,000 frame XIDs (the scaling test's backlog), then changes a window cursor and re-grabs the pointer 60 times a second; compare `ChangeWindowAttributes` and `GrabPointer` times in `YSERVER_LOOP_TELEMETRY=1` output, master `8247002b` against the branch. Then CS2 in a session aged by browser use, master against the branch, with MangoHud.
 - A branch build for the reporter, with a reply (drafted by me, posted by the user) asking for the same match with MangoHud as before. Compare his before/after fps and GPU load against his earlier logs in `/data/Projects/claude-scratch/issue-387/dl3/` and report the numbers on the issue.
