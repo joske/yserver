@@ -1872,12 +1872,14 @@ fn receive_core_grab_chain_denial() {
     assert_no_writer_failures(&denied);
 }
 
-fn literal_xi2_button_press(
+fn literal_xi2_device_press(
     order: ClientByteOrder,
     sequence: u16,
+    evtype: u16,
     deviceid: u16,
     sourceid: u16,
     time: u32,
+    detail: u8,
     window: ResourceId,
     root_x: i16,
     root_y: i16,
@@ -1887,58 +1889,13 @@ fn literal_xi2_button_press(
     let mut event = vec![35, 137]; // GenericEvent, XI2 major opcode
     append_event_u16(&mut event, order, sequence);
     append_event_u32(&mut event, order, 22); // 88 bytes after 32-byte header
-    append_event_u16(&mut event, order, 4); // XI_ButtonPress
+    append_event_u16(&mut event, order, evtype);
     append_event_u16(&mut event, order, deviceid);
     append_event_u32(&mut event, order, time);
-    append_event_u32(&mut event, order, 1); // button detail
+    append_event_u32(&mut event, order, u32::from(detail));
     append_event_u32(&mut event, order, ROOT_WINDOW.0);
     append_event_u32(&mut event, order, window.0);
     append_event_u32(&mut event, order, 0); // child
-    for coordinate in [root_x, root_y, event_x, event_y] {
-        append_event_u32(&mut event, order, (i32::from(coordinate) << 16) as u32);
-    }
-    append_event_u16(&mut event, order, 8); // buttons length
-    append_event_u16(&mut event, order, 2); // valuators length
-    append_event_u16(&mut event, order, sourceid);
-    append_event_u16(&mut event, order, 0); // pad
-    append_event_u32(&mut event, order, 0); // flags
-    append_event_u32(&mut event, order, 0); // mods.base
-    append_event_u32(&mut event, order, 0); // mods.latched
-    append_event_u32(&mut event, order, 0); // mods.locked
-    append_event_u32(&mut event, order, 0); // mods.effective
-    event.extend_from_slice(&[0; 4]); // group
-    for _ in 0..8 {
-        append_event_u32(&mut event, order, 0); // buttons mask
-    }
-    append_event_u32(&mut event, order, 0); // valuator mask word 0
-    append_event_u32(&mut event, order, 0); // valuator mask word 1
-    assert_eq!(event.len(), 120);
-    event
-}
-
-fn literal_xi2_key_press(
-    order: ClientByteOrder,
-    sequence: u16,
-    deviceid: u16,
-    sourceid: u16,
-    time: u32,
-    keycode: u8,
-    window: ResourceId,
-    root_x: i16,
-    root_y: i16,
-    event_x: i16,
-    event_y: i16,
-) -> Vec<u8> {
-    let mut event = vec![35, 137]; // GenericEvent, XI2 major opcode
-    append_event_u16(&mut event, order, sequence);
-    append_event_u32(&mut event, order, 22); // 88 bytes after 32-byte header
-    append_event_u16(&mut event, order, 2); // XI_KeyPress
-    append_event_u16(&mut event, order, deviceid);
-    append_event_u32(&mut event, order, time);
-    append_event_u32(&mut event, order, u32::from(keycode));
-    append_event_u32(&mut event, order, ROOT_WINDOW.0);
-    append_event_u32(&mut event, order, window.0);
-    append_event_u32(&mut event, order, 0); // no child
     for coordinate in [root_x, root_y, event_x, event_y] {
         append_event_u32(&mut event, order, (i32::from(coordinate) << 16) as u32);
     }
@@ -2408,13 +2365,14 @@ fn literal_xi2_keyboard_key_press(
     deviceid: u16,
     sourceid: u16,
 ) -> Vec<u8> {
-    literal_xi2_key_press(
+    literal_xi2_device_press(
         order,
         sequence,
+        2, // XI_KeyPress
         deviceid,
         sourceid,
         0x3579,
-        38,
+        38, // key detail
         CROSS_PARENT,
         CROSS_START_X,
         CROSS_START_Y,
@@ -2474,12 +2432,14 @@ fn literal_unaffected_xi_grab_event(
     deviceid: u16,
 ) -> Vec<u8> {
     if deviceid == crate::xinput::DEVICEID_MASTER_POINTER {
-        literal_xi2_button_press(
+        literal_xi2_device_press(
             order,
             sequence,
+            4, // XI_ButtonPress
             crate::xinput::DEVICEID_MASTER_POINTER,
             4, // XTEST pointer source
             0x3579,
+            1, // button detail
             CROSS_CHILD,
             CROSS_X,
             CROSS_Y,
@@ -3228,6 +3188,23 @@ fn receive_xi_grab_device_synthetic_denial() {
             .concat(),
             "allow-control successful grab keeps its synthetic activation"
         );
+        assert!(allowed.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
+        let allowed_initial_grab_state = if is_pointer {
+            allowed
+                .state
+                .active_pointer_grab
+                .map(|grab| (grab.owner, grab.grab_window))
+        } else {
+            allowed
+                .state
+                .active_keyboard_grab
+                .map(|grab| (grab.owner, grab.grab_window))
+        };
+        assert_eq!(
+            allowed_initial_grab_state,
+            Some((NOTIFY_RECEIVER_DENIED, CROSS_CHILD)),
+            "allow-control initial XIGrabDevice state"
+        );
 
         if !is_pointer {
             assert!(matches!(
@@ -3275,8 +3252,9 @@ fn receive_xi_grab_device_synthetic_denial() {
                 .concat(),
                 "allow-control re-grab pins old FocusOut before new FocusIn"
             );
+            assert!(allowed.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
         }
-        let allowed_grab_state = if is_pointer {
+        let allowed_regrab_state = if is_pointer {
             allowed
                 .state
                 .active_pointer_grab
@@ -3287,6 +3265,18 @@ fn receive_xi_grab_device_synthetic_denial() {
                 .active_keyboard_grab
                 .map(|grab| (grab.owner, grab.grab_window))
         };
+        assert_eq!(
+            allowed_regrab_state,
+            Some((
+                NOTIFY_RECEIVER_DENIED,
+                if is_pointer {
+                    CROSS_CHILD
+                } else {
+                    CROSS_PARENT
+                },
+            )),
+            "allow-control active XIGrabDevice state after the re-grab step"
+        );
         let event_sequence = if is_pointer {
             XI_GRAB_SEQUENCE
         } else {
@@ -3298,6 +3288,7 @@ fn receive_xi_grab_device_synthetic_denial() {
             literal_unaffected_xi_grab_event(ClientByteOrder::BigEndian, event_sequence, deviceid,),
             "selected XI2 input event stays unchanged during the active grab"
         );
+        assert!(allowed.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
 
         assert!(matches!(
             xi_ungrab_device(&mut allowed, deviceid, XI_UNGRAB_SEQUENCE),
@@ -3322,6 +3313,7 @@ fn receive_xi_grab_device_synthetic_denial() {
                 && allowed.state.active_keyboard_grab.is_none(),
             "allow-control ungrab releases the master grab"
         );
+        assert!(allowed.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
 
         let mut denied = xi2_grab_fixture();
         let denied_pairs = if is_pointer {
@@ -3376,23 +3368,26 @@ fn receive_xi_grab_device_synthetic_denial() {
             denied.state.active_keyboard_grab.is_some()
         };
         assert!(active, "denial leaves the XIGrabDevice active");
-        if is_pointer {
-            let denied_grab = denied
+        let denied_initial_grab_state = if is_pointer {
+            denied
                 .state
                 .active_pointer_grab
-                .map(|grab| (grab.owner, grab.grab_window));
-            assert_eq!(denied_grab, Some((NOTIFY_RECEIVER_DENIED, CROSS_CHILD)));
-            assert_eq!(
-                allowed_grab_state, denied_grab,
-                "denial keeps the same pointer grab as the Allow run"
-            );
+                .map(|grab| (grab.owner, grab.grab_window))
         } else {
-            let denied_grab = denied
+            denied
                 .state
                 .active_keyboard_grab
-                .map(|grab| (grab.owner, grab.grab_window));
-            assert_eq!(denied_grab, Some((NOTIFY_RECEIVER_DENIED, CROSS_CHILD)));
-        }
+                .map(|grab| (grab.owner, grab.grab_window))
+        };
+        assert_eq!(
+            allowed_initial_grab_state, denied_initial_grab_state,
+            "Receive denial leaves the same initial XIGrabDevice state as Allow"
+        );
+        assert_eq!(
+            denied_initial_grab_state,
+            Some((NOTIFY_RECEIVER_DENIED, CROSS_CHILD)),
+            "denied synthetic activation leaves the requested grab active"
+        );
         assert_eq!(
             denied.drain(NOTIFY_RECEIVER_DENIED),
             literal_xi_grab_reply(ClientByteOrder::BigEndian, XI_GRAB_SEQUENCE, 0),
@@ -3424,12 +3419,13 @@ fn receive_xi_grab_device_synthetic_denial() {
                 literal_xi_grab_reply(ClientByteOrder::BigEndian, XI_REGRAB_SEQUENCE, 0,),
                 "denied keyboard re-grab keeps its Success reply"
             );
+            assert!(denied.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
             let denied_grab = denied
                 .state
                 .active_keyboard_grab
                 .map(|grab| (grab.owner, grab.grab_window));
             assert_eq!(
-                allowed_grab_state, denied_grab,
+                allowed_regrab_state, denied_grab,
                 "denial keeps the same re-grab as the Allow run"
             );
         }
@@ -3440,6 +3436,7 @@ fn receive_xi_grab_device_synthetic_denial() {
             literal_unaffected_xi_grab_event(ClientByteOrder::BigEndian, event_sequence, deviceid,),
             "denying synthetic events leaves selected XI2 input unchanged"
         );
+        assert!(denied.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
         assert!(matches!(
             xi_ungrab_device(&mut denied, deviceid, XI_UNGRAB_SEQUENCE),
             RequestOutcome::Handled
@@ -3524,12 +3521,14 @@ fn receive_core_cooked_pointer_unchecked() {
     );
     assert_eq!(
         fixture.drain(NOTIFY_RECEIVER_DENIED),
-        literal_xi2_button_press(
+        literal_xi2_device_press(
             ClientByteOrder::BigEndian,
             DUAL_SEQUENCE,
+            4, // XI_ButtonPress
             4,
             4,
             0x3579,
+            1, // button detail
             CROSS_CHILD,
             CROSS_X,
             CROSS_Y,
