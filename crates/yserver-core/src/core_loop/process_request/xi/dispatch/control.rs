@@ -1,20 +1,18 @@
 use crate::{
+    access::{Decision, EventBatch, EventSubject},
     backend::{Backend, OriginContext},
-    core_loop::{
-        fanout::fanout_event_to_clients,
-        process_request::{
-            RequestOutcome,
-            input_ctl::{
-                ModmapChangeOutcome, apply_keymap_change, change_modifier_mapping,
-                fetch_merged_keymap, legacy_keyboard_mapping_notify,
-            },
-            motion_history_range,
-            xi::{
-                XI1_ERROR_BAD_DEVICE, XI1_KEY_MAX, XI1_KEY_MIN, dispatch::xi_write_reply,
-                xi1_device_button_count, xi1_device_has_buttons, xi1_device_has_keys,
-                xi1_device_has_valuators, xi1_device_valid, xi1_device_valuator_count, xi1_error,
-                xi1_zero_reply,
-            },
+    core_loop::process_request::{
+        RequestOutcome,
+        input_ctl::{
+            ModmapChangeOutcome, apply_keymap_change, change_modifier_mapping, fetch_merged_keymap,
+            legacy_keyboard_mapping_notify,
+        },
+        motion_history_range,
+        xi::{
+            XI1_ERROR_BAD_DEVICE, XI1_KEY_MAX, XI1_KEY_MIN, dispatch::xi_write_reply,
+            xi1_device_button_count, xi1_device_has_buttons, xi1_device_has_keys,
+            xi1_device_has_valuators, xi1_device_valid, xi1_device_valuator_count, xi1_error,
+            xi1_zero_reply,
         },
     },
     server::ServerState,
@@ -477,20 +475,31 @@ pub(super) fn handle_xi1_change_device_key_mapping(
         if crate::core_loop::xi1_focus::xi1_client_wants_device_mapping_notify(
             state, client_id, dev,
         ) {
-            let time = state.timestamp_now();
-            #[allow(clippy::cast_possible_truncation)]
-            let device_byte = dev as u8;
-            crate::xinput::encode_xi1_device_mapping_notify(
-                &mut buf,
-                byte_order,
-                crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
-                device_byte,
-                sequence,
-                time,
-                1,
-                first,
-                count,
+            let event_description = crate::xinput::xi1_event_description(
+                crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
             );
+            let events = EventBatch::new(std::slice::from_ref(&event_description));
+            if let Decision::Allow = state.check_receive(
+                client_id,
+                EventSubject::Device(dev),
+                &events,
+                state.receive_request,
+            ) {
+                let time = state.timestamp_now();
+                #[allow(clippy::cast_possible_truncation)]
+                let device_byte = dev as u8;
+                crate::xinput::encode_xi1_device_mapping_notify(
+                    &mut buf,
+                    byte_order,
+                    crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
+                    device_byte,
+                    sequence,
+                    time,
+                    1,
+                    first,
+                    count,
+                );
+            }
         }
         crate::core_loop::xi1_focus::emit_device_mapping_notify(
             state,
@@ -634,23 +643,33 @@ pub(super) fn handle_xi1_set_device_modifier_mapping(
             if crate::core_loop::xi1_focus::xi1_client_wants_device_mapping_notify(
                 state, client_id, dev,
             ) {
+                let event_description = crate::xinput::xi1_event_description(
+                    crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
+                );
+                let events = EventBatch::new(std::slice::from_ref(&event_description));
                 let time = state.timestamp_now();
                 #[allow(clippy::cast_possible_truncation)]
                 let device_byte = dev as u8;
-                let _dropped = fanout_event_to_clients(state, &[client_id], |buf, seq, order| {
-                    crate::xinput::encode_xi1_device_mapping_notify(
-                        buf,
-                        order,
-                        crate::server::XI_FIRST_EVENT
-                            + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
-                        device_byte,
-                        seq,
-                        time,
-                        0,
-                        0,
-                        0,
-                    );
-                });
+                let _dropped = crate::core_loop::fanout::fanout_event_to_clients_with_receive(
+                    state,
+                    &[client_id],
+                    EventSubject::Device(dev),
+                    &events,
+                    |buf, seq, order| {
+                        crate::xinput::encode_xi1_device_mapping_notify(
+                            buf,
+                            order,
+                            crate::server::XI_FIRST_EVENT
+                                + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
+                            device_byte,
+                            seq,
+                            time,
+                            0,
+                            0,
+                            0,
+                        );
+                    },
+                );
             }
             crate::core_loop::xi1_focus::emit_device_mapping_notify(
                 state,
@@ -835,20 +854,32 @@ pub(super) fn handle_xi1_set_device_button_mapping(
             if crate::core_loop::xi1_focus::xi1_client_wants_device_mapping_notify(
                 state, client_id, dev,
             ) {
-                let time = state.timestamp_now();
-                #[allow(clippy::cast_possible_truncation)]
-                let device_byte = dev as u8;
-                crate::xinput::encode_xi1_device_mapping_notify(
-                    &mut buf,
-                    byte_order,
-                    crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
-                    device_byte,
-                    sequence,
-                    time,
-                    2,
-                    0,
-                    0,
+                let event_description = crate::xinput::xi1_event_description(
+                    crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
                 );
+                let events = EventBatch::new(std::slice::from_ref(&event_description));
+                if let Decision::Allow = state.check_receive(
+                    client_id,
+                    EventSubject::Device(dev),
+                    &events,
+                    state.receive_request,
+                ) {
+                    let time = state.timestamp_now();
+                    #[allow(clippy::cast_possible_truncation)]
+                    let device_byte = dev as u8;
+                    crate::xinput::encode_xi1_device_mapping_notify(
+                        &mut buf,
+                        byte_order,
+                        crate::server::XI_FIRST_EVENT
+                            + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
+                        device_byte,
+                        sequence,
+                        time,
+                        2,
+                        0,
+                        0,
+                    );
+                }
             }
             crate::core_loop::xi1_focus::emit_device_mapping_notify(
                 state,

@@ -568,7 +568,8 @@ pub(super) enum ModmapChangeOutcome {
 ///
 /// `on_applied` runs once the change took effect and before any notification
 /// goes out: the XI request sends its DeviceMappingNotify there, so its
-/// clients see it ahead of the XKB and core notifications, as on Xorg.
+/// clients see it ahead of the XKB and core notifications in yserver. Xorg
+/// writes the core MappingNotify first (`xkb/xkbEvents.c:117-133`).
 pub(super) fn change_modifier_mapping(
     state: &mut ServerState,
     backend: &mut dyn Backend,

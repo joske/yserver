@@ -1,6 +1,7 @@
 use super::{
     access_notify_support::{
         NOTIFY_RECEIVER_ALLOWED, NOTIFY_RECEIVER_DENIED, NOTIFY_SENDER, NotifyFixture,
+        finish_literal_event, literal_event_header,
     },
     extensions::{ExtensionHook, RecordedExtensionCheck},
     xi_hotplug::{
@@ -1156,4 +1157,906 @@ fn receive_xi_device_changed_baseline_frames() {
         ),
         "bootstrap encodes both complete frames and class payloads in recipient byte order"
     );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum XiMappingRequest {
+    ChangeDeviceKeyMapping,
+    SetDeviceModifierMapping,
+    SetDeviceButtonMapping,
+    ChangeKeyboardDevice,
+}
+
+#[derive(Clone, Debug)]
+enum XiMappingPolicy {
+    None,
+    AllowAll,
+    Deny(Vec<ClientId>),
+}
+
+const MAPPING_ORIGINATOR_SEQUENCE: u16 = 0x31;
+const MAPPING_DENIED_SEQUENCE: u16 = 0x42;
+const MAPPING_ALLOWED_SEQUENCE: u16 = 0x53;
+const MAPPING_CLIENTS: [ClientId; 3] = [
+    NOTIFY_SENDER,
+    NOTIFY_RECEIVER_DENIED,
+    NOTIFY_RECEIVER_ALLOWED,
+];
+
+fn xi1_class(device_id: u16, event_offset: u8) -> u32 {
+    (u32::from(device_id) << 8) | u32::from(crate::server::XI_FIRST_EVENT + event_offset)
+}
+
+fn mapping_device(request: XiMappingRequest) -> u16 {
+    match request {
+        XiMappingRequest::SetDeviceButtonMapping => crate::xinput::DEVICEID_MASTER_POINTER,
+        XiMappingRequest::ChangeDeviceKeyMapping
+        | XiMappingRequest::SetDeviceModifierMapping
+        | XiMappingRequest::ChangeKeyboardDevice => crate::xinput::DEVICEID_MASTER_KEYBOARD,
+    }
+}
+
+fn mapping_event_offset(request: XiMappingRequest) -> u8 {
+    match request {
+        XiMappingRequest::ChangeKeyboardDevice => crate::xinput::XI_CHANGE_DEVICE_NOTIFY_OFFSET,
+        XiMappingRequest::ChangeDeviceKeyMapping
+        | XiMappingRequest::SetDeviceModifierMapping
+        | XiMappingRequest::SetDeviceButtonMapping => {
+            crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET
+        }
+    }
+}
+
+fn mapping_event_description(request: XiMappingRequest) -> EventDescription {
+    let offset = mapping_event_offset(request);
+    EventDescription::extension(
+        crate::server::XI_FIRST_EVENT + offset,
+        137,
+        u16::from(offset),
+    )
+}
+
+fn mapping_request_body(request: XiMappingRequest) -> (u8, Vec<u8>) {
+    match request {
+        XiMappingRequest::ChangeDeviceKeyMapping => {
+            let mut body = vec![crate::xinput::DEVICEID_MASTER_KEYBOARD as u8, 8, 1, 1];
+            body.extend_from_slice(&0x0061_u32.to_le_bytes());
+            (25, body)
+        }
+        XiMappingRequest::SetDeviceModifierMapping => {
+            let mut body = vec![crate::xinput::DEVICEID_MASTER_KEYBOARD as u8, 1, 0, 0];
+            body.extend_from_slice(&[50, 0, 37, 0, 0, 0, 0, 0]);
+            (27, body)
+        }
+        XiMappingRequest::SetDeviceButtonMapping => (29, vec![2, 1, 0, 0, 2, 0, 0, 0]),
+        XiMappingRequest::ChangeKeyboardDevice => (
+            11,
+            vec![crate::xinput::DEVICEID_MASTER_KEYBOARD as u8, 0, 0, 0],
+        ),
+    }
+}
+
+fn mapping_device_state(state: &ServerState) -> Vec<(u16, Option<u16>, bool)> {
+    state
+        .xi_devices
+        .devices()
+        .iter()
+        .map(|device| {
+            (
+                device.id,
+                state.xi_devices.attachment(device.id),
+                device.enabled,
+            )
+        })
+        .collect()
+}
+
+struct XiMappingRun {
+    outputs: Vec<Vec<u8>>,
+    calls: Vec<RecordedExtensionCheck>,
+    keymap: Option<Vec<u32>>,
+    modifier_mapping: Option<(u8, Vec<u8>)>,
+    button_mapping: Option<Vec<u8>>,
+    device_state: Vec<(u16, Option<u16>, bool)>,
+}
+
+fn select_xi1_class(
+    fixture: &mut NotifyFixture,
+    client: ClientId,
+    sequence: u16,
+    device_id: u16,
+    event_offset: u8,
+) {
+    let body =
+        xi1_select_extension_event_body(ROOT_WINDOW.0, &[xi1_class(device_id, event_offset)]);
+    let outcome = fixture
+        .request(
+            client,
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: 137,
+                data: 6,
+                length_units: 4,
+            },
+            &body,
+        )
+        .expect("XI SelectExtensionEvent through production dispatcher");
+    assert!(matches!(outcome, RequestOutcome::Handled));
+    assert!(
+        fixture.state.clients[&client.0]
+            .xi1_event_classes
+            .contains(&xi1_class(device_id, event_offset)),
+        "SelectExtensionEvent stores the selected XI1 class"
+    );
+    fixture.state.clients[&client.0]
+        .last_sequence
+        .store(sequence, Ordering::Relaxed);
+    let selection_output = fixture.drain(client);
+    assert!(
+        selection_output.is_empty(),
+        "selection has no reply or error: {selection_output:?}"
+    );
+    assert!(
+        crate::core_loop::client_io::failed_writers(&fixture.state.clients).is_empty(),
+        "selection does not fail a writer"
+    );
+}
+
+fn xi_mapping_fixture(request: XiMappingRequest, select_originator: bool) -> NotifyFixture {
+    let mut fixture = NotifyFixture::new();
+    fixture.state.start_instant = std::time::Instant::now() + Duration::from_secs(30);
+    let device_id = mapping_device(request);
+    let offset = mapping_event_offset(request);
+    if select_originator {
+        select_xi1_class(&mut fixture, NOTIFY_SENDER, 0x11, device_id, offset);
+    }
+    select_xi1_class(
+        &mut fixture,
+        NOTIFY_RECEIVER_DENIED,
+        MAPPING_DENIED_SEQUENCE,
+        device_id,
+        offset,
+    );
+    select_xi1_class(
+        &mut fixture,
+        NOTIFY_RECEIVER_ALLOWED,
+        MAPPING_ALLOWED_SEQUENCE,
+        device_id,
+        offset,
+    );
+    fixture
+        .state
+        .clients
+        .get_mut(&NOTIFY_RECEIVER_DENIED.0)
+        .expect("denied mapping receiver")
+        .byte_order = ClientByteOrder::BigEndian;
+    fixture
+}
+
+fn run_xi_mapping_request(
+    request: XiMappingRequest,
+    select_originator: bool,
+    policy: XiMappingPolicy,
+) -> XiMappingRun {
+    let mut fixture = xi_mapping_fixture(request, select_originator);
+    let calls = match policy {
+        XiMappingPolicy::None => None,
+        XiMappingPolicy::AllowAll => Some(fixture.install_policy(|_, _| Decision::Allow)),
+        XiMappingPolicy::Deny(clients) => {
+            let subject = EventSubject::Device(mapping_device(request));
+            let events = vec![mapping_event_description(request)];
+            Some(fixture.install_policy(move |_, call| {
+                if call.hook == ExtensionHook::Receive
+                    && clients.contains(&call.client)
+                    && call.receive == Some(subject)
+                    && call.events.as_ref() == Some(&events)
+                {
+                    Decision::Deny(DENY)
+                } else {
+                    Decision::Allow
+                }
+            }))
+        }
+    };
+
+    let device_state_before = mapping_device_state(&fixture.state);
+    fixture.state.clients[&NOTIFY_SENDER.0]
+        .last_sequence
+        .store(MAPPING_ORIGINATOR_SEQUENCE, Ordering::Relaxed);
+    let (minor, body) = mapping_request_body(request);
+    let outcome = fixture
+        .request(
+            NOTIFY_SENDER,
+            SequenceNumber(MAPPING_ORIGINATOR_SEQUENCE),
+            RequestHeader {
+                opcode: 137,
+                data: minor,
+                length_units: u32::try_from((4 + body.len()).div_ceil(4)).unwrap(),
+            },
+            &body,
+        )
+        .expect("XI mapping request through production dispatcher");
+    assert!(matches!(outcome, RequestOutcome::Handled));
+    assert!(
+        crate::core_loop::client_io::failed_writers(&fixture.state.clients).is_empty(),
+        "mapping request and Receive denial do not fail a writer"
+    );
+    let device_state = mapping_device_state(&fixture.state);
+    if matches!(request, XiMappingRequest::ChangeKeyboardDevice) {
+        assert_eq!(
+            device_state, device_state_before,
+            "ChangeKeyboardDevice preserves the XI device attachments and enabled state"
+        );
+    }
+    let outputs = MAPPING_CLIENTS
+        .into_iter()
+        .map(|client| fixture.drain(client))
+        .collect();
+    let calls = calls.map_or_else(Vec::new, |calls| calls.lock().unwrap().clone());
+    XiMappingRun {
+        outputs,
+        calls,
+        keymap: fixture.state.keymap_overrides.get(&8).cloned(),
+        modifier_mapping: fixture
+            .state
+            .xi1_modifier_map
+            .get(&mapping_device(request))
+            .cloned(),
+        button_mapping: fixture
+            .state
+            .xi1_button_map
+            .get(&mapping_device(request))
+            .cloned(),
+        device_state,
+    }
+}
+
+fn literal_mapping_notify(
+    sequence: u16,
+    request: u8,
+    first_keycode: u8,
+    count: u8,
+    order: ClientByteOrder,
+) -> Vec<u8> {
+    let mut event = literal_event_header(34, 0, sequence, order);
+    event.extend_from_slice(&[request, first_keycode, count]);
+    finish_literal_event(event)
+}
+
+fn literal_xi1_mapping_notify(
+    sequence: u16,
+    device_id: u16,
+    request: u8,
+    first_keycode: u8,
+    count: u8,
+    order: ClientByteOrder,
+) -> Vec<u8> {
+    let mut event = literal_event_header(
+        crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
+        u8::try_from(device_id).unwrap(),
+        sequence,
+        order,
+    );
+    event.extend_from_slice(&[request, first_keycode, count, 0]);
+    super::access_notify_support::append_event_u32(&mut event, order, 0);
+    event.extend_from_slice(&[0; 20]);
+    finish_literal_event(event)
+}
+
+fn literal_xi1_change_device_notify(
+    sequence: u16,
+    device_id: u16,
+    request: u8,
+    order: ClientByteOrder,
+) -> Vec<u8> {
+    let mut event = literal_event_header(
+        crate::server::XI_FIRST_EVENT + crate::xinput::XI_CHANGE_DEVICE_NOTIFY_OFFSET,
+        u8::try_from(device_id).unwrap(),
+        sequence,
+        order,
+    );
+    super::access_notify_support::append_event_u32(&mut event, order, 0);
+    event.push(request);
+    event.extend_from_slice(&[0; 23]);
+    finish_literal_event(event)
+}
+
+fn literal_xi1_reply(sequence: u16, minor: u8, status: u8, order: ClientByteOrder) -> Vec<u8> {
+    let mut reply = vec![0; 32];
+    reply[0] = 1;
+    reply[1] = minor;
+    match order {
+        ClientByteOrder::LittleEndian => {
+            reply[2..4].copy_from_slice(&sequence.to_le_bytes());
+        }
+        ClientByteOrder::BigEndian => {
+            reply[2..4].copy_from_slice(&sequence.to_be_bytes());
+        }
+    }
+    reply[8] = status;
+    reply
+}
+
+fn literal_mapping_stream(
+    request: XiMappingRequest,
+    client: ClientId,
+    sequence: u16,
+    order: ClientByteOrder,
+    originator_selected: bool,
+) -> Vec<u8> {
+    let is_originator = client == NOTIFY_SENDER;
+    match request {
+        XiMappingRequest::ChangeDeviceKeyMapping => {
+            let mut frames = literal_mapping_notify(sequence, 1, 8, 1, order);
+            if !is_originator || originator_selected {
+                frames.extend_from_slice(&literal_xi1_mapping_notify(
+                    sequence,
+                    mapping_device(request),
+                    1,
+                    8,
+                    1,
+                    order,
+                ));
+            }
+            frames
+        }
+        XiMappingRequest::SetDeviceModifierMapping => {
+            let mut frames = Vec::new();
+            if !is_originator || originator_selected {
+                frames.extend_from_slice(&literal_xi1_mapping_notify(
+                    sequence,
+                    mapping_device(request),
+                    0,
+                    0,
+                    0,
+                    order,
+                ));
+            }
+            frames.extend_from_slice(&literal_mapping_notify(sequence, 0, 0, 0, order));
+            if is_originator {
+                frames.extend_from_slice(&literal_xi1_reply(sequence, 27, 0, order));
+            }
+            frames
+        }
+        XiMappingRequest::SetDeviceButtonMapping => {
+            let mut frames = Vec::new();
+            if is_originator {
+                frames.extend_from_slice(&literal_xi1_reply(sequence, 0, 0, order));
+                if originator_selected {
+                    frames.extend_from_slice(&literal_xi1_mapping_notify(
+                        sequence,
+                        mapping_device(request),
+                        2,
+                        0,
+                        0,
+                        order,
+                    ));
+                }
+            } else {
+                frames.extend_from_slice(&literal_xi1_mapping_notify(
+                    sequence,
+                    mapping_device(request),
+                    2,
+                    0,
+                    0,
+                    order,
+                ));
+            }
+            frames
+        }
+        XiMappingRequest::ChangeKeyboardDevice => {
+            let mut frames = Vec::new();
+            if originator_selected || !is_originator {
+                frames.extend_from_slice(&literal_xi1_change_device_notify(
+                    sequence,
+                    mapping_device(request),
+                    1,
+                    order,
+                ));
+            }
+            frames.extend_from_slice(&literal_mapping_notify(sequence, 1, 0, 0, order));
+            if is_originator {
+                frames.extend_from_slice(&literal_xi1_reply(sequence, 0, 0, order));
+            }
+            frames
+        }
+    }
+}
+
+fn mapping_run_output(run: &XiMappingRun, client: ClientId) -> &[u8] {
+    let index = MAPPING_CLIENTS
+        .iter()
+        .position(|candidate| *candidate == client)
+        .expect("mapping fixture client");
+    &run.outputs[index]
+}
+
+fn assert_mapping_receive_calls(
+    run: &XiMappingRun,
+    request: XiMappingRequest,
+    clients: &[ClientId],
+    request_opcodes: Option<RequestOpcodes>,
+) {
+    let receives: Vec<_> = run
+        .calls
+        .iter()
+        .filter(|call| call.hook == ExtensionHook::Receive)
+        .collect();
+    assert_eq!(receives.len(), clients.len());
+    for client in clients {
+        assert!(receives.iter().any(|call| {
+            call.client == *client
+                && call.receive == Some(EventSubject::Device(mapping_device(request)))
+                && call.events == Some(vec![mapping_event_description(request)])
+                && call.request == request_opcodes
+        }));
+    }
+}
+
+#[test]
+fn receive_xi_mapping_fanout_device_subject() {
+    // mutation: use EventSubject::Global in X5
+    let baseline = run_xi_mapping_request(
+        XiMappingRequest::ChangeDeviceKeyMapping,
+        false,
+        XiMappingPolicy::AllowAll,
+    );
+    for (client, sequence, order) in [
+        (
+            NOTIFY_SENDER,
+            MAPPING_ORIGINATOR_SEQUENCE,
+            ClientByteOrder::LittleEndian,
+        ),
+        (
+            NOTIFY_RECEIVER_DENIED,
+            MAPPING_DENIED_SEQUENCE,
+            ClientByteOrder::BigEndian,
+        ),
+        (
+            NOTIFY_RECEIVER_ALLOWED,
+            MAPPING_ALLOWED_SEQUENCE,
+            ClientByteOrder::LittleEndian,
+        ),
+    ] {
+        assert_eq!(
+            mapping_run_output(&baseline, client),
+            literal_mapping_stream(
+                XiMappingRequest::ChangeDeviceKeyMapping,
+                client,
+                sequence,
+                order,
+                false,
+            ),
+            "allow control matches literal key-map output for client {}",
+            client.0
+        );
+    }
+    assert_eq!(baseline.keymap.as_deref(), Some([0x61].as_slice()));
+    assert_mapping_receive_calls(
+        &baseline,
+        XiMappingRequest::ChangeDeviceKeyMapping,
+        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
+        Some(RequestOpcodes {
+            major: 137,
+            minor: 25,
+        }),
+    );
+
+    let denied = run_xi_mapping_request(
+        XiMappingRequest::ChangeDeviceKeyMapping,
+        false,
+        XiMappingPolicy::Deny(vec![NOTIFY_RECEIVER_DENIED]),
+    );
+    assert_eq!(
+        mapping_run_output(&denied, NOTIFY_RECEIVER_DENIED),
+        literal_mapping_notify(MAPPING_DENIED_SEQUENCE, 1, 8, 1, ClientByteOrder::BigEndian,),
+        "denial drops only the selected DeviceMappingNotify copy"
+    );
+    assert_eq!(
+        mapping_run_output(&denied, NOTIFY_RECEIVER_ALLOWED),
+        mapping_run_output(&baseline, NOTIFY_RECEIVER_ALLOWED),
+        "allowed recipient stays byte-identical to literal baseline"
+    );
+    assert_eq!(denied.keymap.as_deref(), Some([0x61].as_slice()));
+    assert_eq!(denied.keymap, baseline.keymap);
+    assert_mapping_receive_calls(
+        &denied,
+        XiMappingRequest::ChangeDeviceKeyMapping,
+        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
+        Some(RequestOpcodes {
+            major: 137,
+            minor: 25,
+        }),
+    );
+}
+
+#[test]
+fn receive_xi_mapping_originator_denial_keeps_reply_order() {
+    // mutation: skip the check at the button-mapping site only
+    // mutation: move X7b's write into the reply buffer
+    for request in [
+        XiMappingRequest::ChangeDeviceKeyMapping,
+        XiMappingRequest::SetDeviceModifierMapping,
+        XiMappingRequest::SetDeviceButtonMapping,
+    ] {
+        let all_allow = run_xi_mapping_request(request, true, XiMappingPolicy::AllowAll);
+        let denied =
+            run_xi_mapping_request(request, true, XiMappingPolicy::Deny(vec![NOTIFY_SENDER]));
+        let minor = mapping_request_body(request).0;
+        assert_mapping_receive_calls(
+            &all_allow,
+            request,
+            &MAPPING_CLIENTS,
+            Some(RequestOpcodes { major: 137, minor }),
+        );
+        for (client, sequence, order) in [
+            (
+                NOTIFY_SENDER,
+                MAPPING_ORIGINATOR_SEQUENCE,
+                ClientByteOrder::LittleEndian,
+            ),
+            (
+                NOTIFY_RECEIVER_DENIED,
+                MAPPING_DENIED_SEQUENCE,
+                ClientByteOrder::BigEndian,
+            ),
+            (
+                NOTIFY_RECEIVER_ALLOWED,
+                MAPPING_ALLOWED_SEQUENCE,
+                ClientByteOrder::LittleEndian,
+            ),
+        ] {
+            assert_eq!(
+                mapping_run_output(&all_allow, client),
+                literal_mapping_stream(request, client, sequence, order, true),
+                "all-Allow literal frames for {request:?}, client {}",
+                client.0
+            );
+            let expected_denied = if client == NOTIFY_SENDER {
+                match request {
+                    XiMappingRequest::ChangeDeviceKeyMapping => {
+                        literal_mapping_notify(sequence, 1, 8, 1, order)
+                    }
+                    XiMappingRequest::SetDeviceModifierMapping => [
+                        literal_mapping_notify(sequence, 0, 0, 0, order),
+                        literal_xi1_reply(sequence, 27, 0, order),
+                    ]
+                    .concat(),
+                    XiMappingRequest::SetDeviceButtonMapping => {
+                        literal_xi1_reply(sequence, 0, 0, order)
+                    }
+                    XiMappingRequest::ChangeKeyboardDevice => unreachable!(),
+                }
+            } else {
+                literal_mapping_stream(request, client, sequence, order, true)
+            };
+            assert_eq!(
+                mapping_run_output(&denied, client),
+                expected_denied,
+                "denial removes only the XI copy for {request:?}, client {}",
+                client.0
+            );
+        }
+        match request {
+            XiMappingRequest::ChangeDeviceKeyMapping => {
+                assert_eq!(denied.keymap.as_deref(), Some([0x61].as_slice()));
+                assert_eq!(denied.keymap, all_allow.keymap);
+            }
+            XiMappingRequest::SetDeviceModifierMapping => {
+                assert_eq!(denied.modifier_mapping, all_allow.modifier_mapping);
+                assert_eq!(
+                    denied.modifier_mapping.as_ref().map(|mapping| mapping.0),
+                    Some(1)
+                );
+            }
+            XiMappingRequest::SetDeviceButtonMapping => {
+                assert_eq!(denied.button_mapping, all_allow.button_mapping);
+                assert_eq!(denied.button_mapping.as_ref().unwrap()[0], 2);
+            }
+            XiMappingRequest::ChangeKeyboardDevice => unreachable!(),
+        }
+        assert_mapping_receive_calls(
+            &denied,
+            request,
+            &MAPPING_CLIENTS,
+            Some(RequestOpcodes { major: 137, minor }),
+        );
+    }
+}
+
+#[test]
+fn receive_change_device_notify_originator_denial_keeps_core_mapping() {
+    // mutation: leave X6 on the unchecked fanout
+    // mutation: route the core MappingNotify through the checked fanout
+    let request = XiMappingRequest::ChangeKeyboardDevice;
+    let all_allow = run_xi_mapping_request(request, true, XiMappingPolicy::AllowAll);
+    let denied = run_xi_mapping_request(
+        request,
+        true,
+        XiMappingPolicy::Deny(vec![NOTIFY_SENDER, NOTIFY_RECEIVER_DENIED]),
+    );
+    assert_mapping_receive_calls(
+        &all_allow,
+        request,
+        &MAPPING_CLIENTS,
+        Some(RequestOpcodes {
+            major: 137,
+            minor: 11,
+        }),
+    );
+    for (client, sequence, order) in [
+        (
+            NOTIFY_SENDER,
+            MAPPING_ORIGINATOR_SEQUENCE,
+            ClientByteOrder::LittleEndian,
+        ),
+        (
+            NOTIFY_RECEIVER_DENIED,
+            MAPPING_DENIED_SEQUENCE,
+            ClientByteOrder::BigEndian,
+        ),
+        (
+            NOTIFY_RECEIVER_ALLOWED,
+            MAPPING_ALLOWED_SEQUENCE,
+            ClientByteOrder::LittleEndian,
+        ),
+    ] {
+        assert_eq!(
+            mapping_run_output(&all_allow, client),
+            literal_mapping_stream(request, client, sequence, order, true),
+            "all-Allow literal ChangeDeviceNotify and core MappingNotify frames"
+        );
+        let expected_denied = if client == NOTIFY_SENDER {
+            [
+                literal_mapping_notify(sequence, 1, 0, 0, order),
+                literal_xi1_reply(sequence, 0, 0, order),
+            ]
+            .concat()
+        } else if client == NOTIFY_RECEIVER_DENIED {
+            literal_mapping_notify(sequence, 1, 0, 0, order)
+        } else {
+            literal_mapping_stream(request, client, sequence, order, true)
+        };
+        assert_eq!(
+            mapping_run_output(&denied, client),
+            expected_denied,
+            "denied ChangeDeviceNotify leaves core MappingNotify and reply"
+        );
+    }
+    assert_eq!(denied.device_state, all_allow.device_state);
+    assert_mapping_receive_calls(
+        &denied,
+        request,
+        &MAPPING_CLIENTS,
+        Some(RequestOpcodes {
+            major: 137,
+            minor: 11,
+        }),
+    );
+    assert!(
+        denied
+            .calls
+            .iter()
+            .filter(|call| call.hook == ExtensionHook::Receive)
+            .all(|call| call.events
+                == Some(vec![EventDescription::extension(
+                    crate::server::XI_FIRST_EVENT + crate::xinput::XI_CHANGE_DEVICE_NOTIFY_OFFSET,
+                    137,
+                    u16::from(crate::xinput::XI_CHANGE_DEVICE_NOTIFY_OFFSET),
+                )]))
+    );
+}
+
+#[test]
+fn receive_xi_mapping_change_baseline_order() {
+    // mutation: append X7a's button-map copy before the reply
+    // mutation: give X6 the request's sequence instead of the recipient's
+    // mutation: move X5's write ahead of the core MappingNotify
+    for request in [
+        XiMappingRequest::SetDeviceButtonMapping,
+        XiMappingRequest::ChangeKeyboardDevice,
+        XiMappingRequest::SetDeviceModifierMapping,
+        XiMappingRequest::ChangeDeviceKeyMapping,
+    ] {
+        let run = run_xi_mapping_request(request, true, XiMappingPolicy::None);
+        for (client, sequence, order) in [
+            (
+                NOTIFY_SENDER,
+                MAPPING_ORIGINATOR_SEQUENCE,
+                ClientByteOrder::LittleEndian,
+            ),
+            (
+                NOTIFY_RECEIVER_DENIED,
+                MAPPING_DENIED_SEQUENCE,
+                ClientByteOrder::BigEndian,
+            ),
+            (
+                NOTIFY_RECEIVER_ALLOWED,
+                MAPPING_ALLOWED_SEQUENCE,
+                ClientByteOrder::LittleEndian,
+            ),
+        ] {
+            assert_eq!(
+                mapping_run_output(&run, client),
+                literal_mapping_stream(request, client, sequence, order, true),
+                "no-policy complete literal stream for {request:?}, client {}",
+                client.0
+            );
+        }
+        assert!(run.calls.is_empty(), "no policy means no Receive calls");
+        match request {
+            XiMappingRequest::ChangeDeviceKeyMapping => {
+                assert_eq!(run.keymap.as_deref(), Some([0x61].as_slice()));
+            }
+            XiMappingRequest::SetDeviceModifierMapping => {
+                assert_eq!(
+                    run.modifier_mapping.as_ref().map(|mapping| mapping.0),
+                    Some(1)
+                );
+            }
+            XiMappingRequest::SetDeviceButtonMapping => {
+                assert_eq!(run.button_mapping.as_ref().unwrap()[0], 2);
+            }
+            XiMappingRequest::ChangeKeyboardDevice => {}
+        }
+    }
+}
+
+#[test]
+fn receive_xi_mapping_after_xkb_change() {
+    // mutation: leave X5 on the unchecked fanout
+    let mut baseline = NotifyFixture::new();
+    baseline.state.start_instant = std::time::Instant::now() + Duration::from_secs(30);
+    for (client, sequence) in [
+        (NOTIFY_RECEIVER_DENIED, MAPPING_DENIED_SEQUENCE),
+        (NOTIFY_RECEIVER_ALLOWED, MAPPING_ALLOWED_SEQUENCE),
+    ] {
+        select_xi1_class(
+            &mut baseline,
+            client,
+            sequence,
+            crate::xinput::DEVICEID_MASTER_KEYBOARD,
+            crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
+        );
+    }
+    baseline
+        .state
+        .clients
+        .get_mut(&NOTIFY_RECEIVER_DENIED.0)
+        .expect("denied XKB receiver")
+        .byte_order = ClientByteOrder::BigEndian;
+    let keymap_before = baseline.state.keymap_overrides.clone();
+    crate::core_loop::xkb_select::send_legacy_map_notify(
+        &mut baseline.state,
+        crate::core_loop::xkb_select::LegacyCause::MapNotify,
+        0x0002,
+        8,
+        1,
+    );
+    assert!(
+        crate::core_loop::client_io::failed_writers(&baseline.state.clients).is_empty(),
+        "server XKB notification does not fail a writer"
+    );
+    let baseline_denied = baseline.drain(NOTIFY_RECEIVER_DENIED);
+    let baseline_allowed = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
+    assert_eq!(
+        baseline_denied,
+        [
+            literal_mapping_notify(MAPPING_DENIED_SEQUENCE, 1, 8, 1, ClientByteOrder::BigEndian),
+            literal_xi1_mapping_notify(
+                MAPPING_DENIED_SEQUENCE,
+                crate::xinput::DEVICEID_MASTER_KEYBOARD,
+                1,
+                8,
+                1,
+                ClientByteOrder::BigEndian,
+            ),
+        ]
+        .concat(),
+        "all-Allow literal core-then-XI stream for the big-endian client"
+    );
+    assert_eq!(
+        baseline_allowed,
+        [
+            literal_mapping_notify(
+                MAPPING_ALLOWED_SEQUENCE,
+                1,
+                8,
+                1,
+                ClientByteOrder::LittleEndian
+            ),
+            literal_xi1_mapping_notify(
+                MAPPING_ALLOWED_SEQUENCE,
+                crate::xinput::DEVICEID_MASTER_KEYBOARD,
+                1,
+                8,
+                1,
+                ClientByteOrder::LittleEndian,
+            ),
+        ]
+        .concat(),
+        "all-Allow literal core-then-XI stream for the second client"
+    );
+    assert_eq!(baseline.state.keymap_overrides, keymap_before);
+
+    let mut denied = NotifyFixture::new();
+    denied.state.start_instant = std::time::Instant::now() + Duration::from_secs(30);
+    for (client, sequence) in [
+        (NOTIFY_RECEIVER_DENIED, MAPPING_DENIED_SEQUENCE),
+        (NOTIFY_RECEIVER_ALLOWED, MAPPING_ALLOWED_SEQUENCE),
+    ] {
+        select_xi1_class(
+            &mut denied,
+            client,
+            sequence,
+            crate::xinput::DEVICEID_MASTER_KEYBOARD,
+            crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
+        );
+    }
+    denied
+        .state
+        .clients
+        .get_mut(&NOTIFY_RECEIVER_DENIED.0)
+        .expect("denied XKB receiver")
+        .byte_order = ClientByteOrder::BigEndian;
+    let calls = denied.install_policy(|_, call| {
+        if call.hook == ExtensionHook::Receive
+            && call.client == NOTIFY_RECEIVER_DENIED
+            && call.receive
+                == Some(EventSubject::Device(
+                    crate::xinput::DEVICEID_MASTER_KEYBOARD,
+                ))
+            && call.events.as_ref().is_some_and(|events| {
+                events.as_slice()
+                    == [EventDescription::extension(
+                        crate::server::XI_FIRST_EVENT
+                            + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
+                        137,
+                        u16::from(crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET),
+                    )]
+            })
+        {
+            Decision::Deny(DENY)
+        } else {
+            Decision::Allow
+        }
+    });
+    let keymap_before = denied.state.keymap_overrides.clone();
+    crate::core_loop::xkb_select::send_legacy_map_notify(
+        &mut denied.state,
+        crate::core_loop::xkb_select::LegacyCause::MapNotify,
+        0x0002,
+        8,
+        1,
+    );
+    assert!(
+        crate::core_loop::client_io::failed_writers(&denied.state.clients).is_empty(),
+        "Receive denial does not fail an XKB recipient writer"
+    );
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_DENIED),
+        literal_mapping_notify(MAPPING_DENIED_SEQUENCE, 1, 8, 1, ClientByteOrder::BigEndian),
+        "denied XI copy leaves the core MappingNotify"
+    );
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_ALLOWED),
+        baseline_allowed,
+        "allowed stream equals the literal all-Allow stream"
+    );
+    let receives = receive_checks(&calls);
+    assert_eq!(receives.len(), 2);
+    assert!(receives.iter().all(|call| {
+        call.receive
+            == Some(EventSubject::Device(
+                crate::xinput::DEVICEID_MASTER_KEYBOARD,
+            ))
+            && call.events
+                == Some(vec![EventDescription::extension(
+                    crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
+                    137,
+                    u16::from(crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET),
+                )])
+            && call.request.is_none()
+    }));
+    assert_eq!(denied.state.keymap_overrides, keymap_before);
 }

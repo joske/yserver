@@ -359,7 +359,23 @@ fn assert_mapping_wire(run: &MappingRun, case: MappingCase) {
 }
 
 fn literal_mapping_notify(sequence: u16, request: u8, first_keycode: u8, count: u8) -> Vec<u8> {
-    let mut event = literal_event_header(34, 0, sequence, ClientByteOrder::LittleEndian);
+    literal_mapping_notify_with_order(
+        sequence,
+        request,
+        first_keycode,
+        count,
+        ClientByteOrder::LittleEndian,
+    )
+}
+
+fn literal_mapping_notify_with_order(
+    sequence: u16,
+    request: u8,
+    first_keycode: u8,
+    count: u8,
+    order: ClientByteOrder,
+) -> Vec<u8> {
+    let mut event = literal_event_header(34, 0, sequence, order);
     event.extend_from_slice(&[request, first_keycode, count]);
     finish_literal_event(event)
 }
@@ -681,13 +697,15 @@ fn receive_no_policy_aggregate_paths_match_expected_bytes() {
     );
 }
 
-fn run_xi_mapping(deny_receive: bool) -> (Vec<Vec<u8>>, Vec<RecordedExtensionCheck>) {
+fn run_xi_mapping(
+    deny_receive: bool,
+) -> (Vec<Vec<u8>>, Vec<RecordedExtensionCheck>, Option<Vec<u32>>) {
     let mut fixture = NotifyFixture::new();
     fixture.state.start_instant = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let event_type = crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET;
     let class = (u32::from(crate::xinput::DEVICEID_MASTER_KEYBOARD) << 8) | u32::from(event_type);
     let body = xi1_select_extension_event_body(ROOT_WINDOW.0, &[class]);
-    fixture
+    let selection_outcome = fixture
         .request(
             NOTIFY_SENDER,
             SequenceNumber(1),
@@ -699,16 +717,47 @@ fn run_xi_mapping(deny_receive: bool) -> (Vec<Vec<u8>>, Vec<RecordedExtensionChe
             &body,
         )
         .expect("XI SelectExtensionEvent");
-    for client in [
-        NOTIFY_SENDER,
-        NOTIFY_RECEIVER_DENIED,
-        NOTIFY_RECEIVER_ALLOWED,
-    ] {
+    assert!(matches!(selection_outcome, RequestOutcome::Handled));
+    assert!(
+        fixture.state.clients[&NOTIFY_SENDER.0]
+            .xi1_event_classes
+            .contains(&class)
+    );
+    assert!(fixture.drain(NOTIFY_SENDER).is_empty());
+    assert!(crate::core_loop::client_io::failed_writers(&fixture.state.clients).is_empty());
+    for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
         assert!(fixture.drain(client).is_empty(), "selection has no output");
     }
+    fixture
+        .state
+        .clients
+        .get_mut(&NOTIFY_RECEIVER_DENIED.0)
+        .expect("big-endian XI baseline receiver")
+        .byte_order = ClientByteOrder::BigEndian;
+    fixture.state.clients[&NOTIFY_RECEIVER_DENIED.0]
+        .last_sequence
+        .store(0x23, std::sync::atomic::Ordering::Relaxed);
+    fixture.state.clients[&NOTIFY_RECEIVER_ALLOWED.0]
+        .last_sequence
+        .store(0x34, std::sync::atomic::Ordering::Relaxed);
     let checks = deny_receive.then(|| {
         fixture.install_policy(|_, call| {
-            if call.hook == ExtensionHook::Receive {
+            if call.hook == ExtensionHook::Receive
+                && call.client == NOTIFY_SENDER
+                && call.receive
+                    == Some(crate::access::EventSubject::Device(
+                        crate::xinput::DEVICEID_MASTER_KEYBOARD,
+                    ))
+                && call.events.as_ref().is_some_and(|events| {
+                    events.as_slice()
+                        == [EventDescription::extension(
+                            crate::server::XI_FIRST_EVENT
+                                + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
+                            137,
+                            u16::from(crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET),
+                        )]
+                })
+            {
                 Decision::Deny(DENY)
             } else {
                 Decision::Allow
@@ -717,7 +766,7 @@ fn run_xi_mapping(deny_receive: bool) -> (Vec<Vec<u8>>, Vec<RecordedExtensionChe
     });
     let mut change = vec![crate::xinput::DEVICEID_MASTER_KEYBOARD as u8, 8, 1, 1];
     change.extend_from_slice(&0x0061_u32.to_le_bytes());
-    fixture
+    let mapping_outcome = fixture
         .request(
             NOTIFY_SENDER,
             SequenceNumber(2),
@@ -729,6 +778,8 @@ fn run_xi_mapping(deny_receive: bool) -> (Vec<Vec<u8>>, Vec<RecordedExtensionChe
             &change,
         )
         .expect("XI ChangeDeviceKeyMapping");
+    assert!(matches!(mapping_outcome, RequestOutcome::Handled));
+    assert!(crate::core_loop::client_io::failed_writers(&fixture.state.clients).is_empty());
     let outputs = [
         NOTIFY_SENDER,
         NOTIFY_RECEIVER_DENIED,
@@ -738,7 +789,8 @@ fn run_xi_mapping(deny_receive: bool) -> (Vec<Vec<u8>>, Vec<RecordedExtensionChe
     .map(|client| fixture.drain(client))
     .collect();
     let calls = checks.map_or_else(Vec::new, |calls| calls.lock().unwrap().clone());
-    (outputs, calls)
+    let keymap = fixture.state.keymap_overrides.get(&8).cloned();
+    (outputs, calls, keymap)
 }
 
 fn run_xkb_mapping(deny_receive: bool) -> (Vec<Vec<u8>>, Vec<RecordedExtensionCheck>) {
@@ -879,13 +931,16 @@ fn run_present_configure(
 // suppress XI1/XKB/Present/XFIXES output when Receive denies the core event.
 #[test]
 fn receive_deny_all_keeps_later_extension_writers() {
-    let (xi_baseline, _) = run_xi_mapping(false);
+    let (xi_baseline, _, baseline_keymap) = run_xi_mapping(false);
     let xi_sender_expected = [
         literal_mapping_notify(2, 1, 8, 1),
         literal_xi1_mapping_notify(2),
     ]
     .concat();
-    let xi_receiver_expected = literal_mapping_notify(0, 1, 8, 1);
+    let xi_receiver_expected =
+        literal_mapping_notify_with_order(0x23, 1, 8, 1, ClientByteOrder::BigEndian);
+    let xi_second_receiver_expected =
+        literal_mapping_notify_with_order(0x34, 1, 8, 1, ClientByteOrder::LittleEndian);
     assert_eq!(
         xi_baseline[0], xi_sender_expected,
         "complete no-policy XI1 and core event frames"
@@ -895,14 +950,48 @@ fn receive_deny_all_keeps_later_extension_writers() {
         "complete no-policy core event frame for receiver"
     );
     assert_eq!(
-        xi_baseline[2], xi_receiver_expected,
+        xi_baseline[2], xi_second_receiver_expected,
         "complete no-policy core event frame for second receiver"
     );
-    let (xi_denied, xi_calls) = run_xi_mapping(true);
-    assert_eq!(xi_denied, xi_baseline, "XI device mapping event survives");
-    assert!(
-        receive_calls(&xi_calls).is_empty(),
-        "XI/core mapping exemptions add no hooks"
+    let (xi_denied, xi_calls, denied_keymap) = run_xi_mapping(true);
+    assert_eq!(
+        xi_denied[0],
+        literal_mapping_notify(2, 1, 8, 1),
+        "denied originator XI copy leaves the literal core MappingNotify"
+    );
+    assert_eq!(
+        xi_denied[1], xi_baseline[1],
+        "first receiver core event is unchanged"
+    );
+    assert_eq!(
+        xi_denied[2], xi_baseline[2],
+        "second receiver core event is unchanged"
+    );
+    assert_eq!(denied_keymap, baseline_keymap);
+    assert_eq!(denied_keymap.as_deref(), Some([0x61].as_slice()));
+    let xi_receive_calls = receive_calls(&xi_calls);
+    assert_eq!(xi_receive_calls.len(), 1);
+    assert_eq!(xi_receive_calls[0].client, NOTIFY_SENDER);
+    assert_eq!(
+        xi_receive_calls[0].receive,
+        Some(crate::access::EventSubject::Device(
+            crate::xinput::DEVICEID_MASTER_KEYBOARD,
+        ))
+    );
+    assert_eq!(
+        xi_receive_calls[0].events,
+        Some(vec![EventDescription::extension(
+            crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
+            137,
+            u16::from(crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET),
+        )])
+    );
+    assert_eq!(
+        xi_receive_calls[0].request,
+        Some(crate::access::RequestOpcodes {
+            major: 137,
+            minor: 25,
+        })
     );
 
     let (xkb_baseline, _) = run_xkb_mapping(false);
