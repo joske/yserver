@@ -2664,8 +2664,9 @@ fn receive_xkb_compat_map_denied() {
     );
 }
 
-// Mutation: leave K7's IndicatorNames ExtensionDeviceNotify unchecked; the
-// target's literal stream and the Receive count must fail.
+// Mutation: make K7 require a NamesNotify selection; the extension-only
+// recipient must still get K7 under Allow. The combined recipient also pins
+// NamesNotify before ExtensionDeviceNotify.
 #[test]
 fn receive_xkb_indicator_names_denied() {
     let selections = [
@@ -2673,22 +2674,19 @@ fn receive_xkb_indicator_names_denied() {
             NOTIFY_RECEIVER_DENIED,
             XKB_NAMES_SELECT | XKB_EXTENSION_DEVICE_SELECT,
         ),
-        (
-            NOTIFY_RECEIVER_ALLOWED,
-            XKB_NAMES_SELECT | XKB_EXTENSION_DEVICE_SELECT,
-        ),
+        (NOTIFY_RECEIVER_ALLOWED, XKB_EXTENSION_DEVICE_SELECT),
     ];
     let mut denied = indicator_fixture(&selections);
     seed_request_xkb_snapshots(&mut denied);
-    let target_checks = Arc::new(AtomicUsize::new(0));
+    let extension_only_checks = Arc::new(AtomicUsize::new(0));
     let calls = denied.install_policy({
-        let target_checks = Arc::clone(&target_checks);
+        let extension_only_checks = Arc::clone(&extension_only_checks);
         move |_, check| {
             if check.hook == ExtensionHook::Receive
-                && check.client == NOTIFY_RECEIVER_DENIED
+                && check.client == NOTIFY_RECEIVER_ALLOWED
                 && check.receive == Some(EventSubject::Device(1))
                 && check.events == Some(vec![XKB_EVENT_DESCRIPTION])
-                && target_checks.fetch_add(1, Ordering::Relaxed) == 1
+                && extension_only_checks.fetch_add(1, Ordering::Relaxed) == 0
             {
                 Decision::Deny(DENY)
             } else {
@@ -2705,21 +2703,17 @@ fn receive_xkb_indicator_names_denied() {
     );
     assert_eq!(
         denied.drain(NOTIFY_RECEIVER_DENIED),
-        literal_xkb_names_notify(0x1234, names_notify())
+        literal_xkb_names_set_stream(0x1234)
     );
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_xkb_names_set_stream(0x5678)
-    );
+    assert_eq!(denied.drain(NOTIFY_RECEIVER_ALLOWED), Vec::<u8>::new());
     assert_receive_calls_with_requests(
         &receive_log(&calls),
         &[
             NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_ALLOWED,
             NOTIFY_RECEIVER_DENIED,
             NOTIFY_RECEIVER_ALLOWED,
         ],
-        &[request_opcodes(XKB_MAJOR_OPCODE, 18); 4],
+        &[request_opcodes(XKB_MAJOR_OPCODE, 18); 3],
         EventSubject::Device(1),
     );
 
@@ -2733,24 +2727,22 @@ fn receive_xkb_indicator_names_denied() {
         &XKB_SET_NAMES_BODY,
         vec![XkbSetEvent::Names(names_notify()), indicator_names_change()],
     );
-    for (client, sequence) in [
-        (NOTIFY_RECEIVER_DENIED, 0x1234),
-        (NOTIFY_RECEIVER_ALLOWED, 0x5678),
-    ] {
-        assert_eq!(
-            allowed.drain(client),
-            literal_xkb_names_set_stream(sequence)
-        );
-    }
+    assert_eq!(
+        allowed.drain(NOTIFY_RECEIVER_DENIED),
+        literal_xkb_names_set_stream(0x1234)
+    );
+    assert_eq!(
+        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
+        literal_xkb_extension_device_notify(0x5678, names_extension_device_notify())
+    );
     assert_receive_calls_with_requests(
         &receive_log(&allow_calls),
         &[
             NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_ALLOWED,
             NOTIFY_RECEIVER_DENIED,
             NOTIFY_RECEIVER_ALLOWED,
         ],
-        &[request_opcodes(XKB_MAJOR_OPCODE, 18); 4],
+        &[request_opcodes(XKB_MAJOR_OPCODE, 18); 3],
         EventSubject::Device(1),
     );
     assert_xkb_notification_effects_match(&denied, &allowed);
