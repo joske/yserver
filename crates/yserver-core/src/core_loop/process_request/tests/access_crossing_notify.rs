@@ -4643,6 +4643,12 @@ fn receive_barrier_denial_keeps_barrier_state() {
         (NOTIFY_RECEIVER_ALLOWED, BARRIER_WINDOW, 26, None),
     ];
     let assert_selector_calls = |calls: &[RecordedExtensionCheck]| {
+        assert_eq!(
+            receive_calls(calls).len(),
+            4,
+            "two barrier selectors each receive one hit and one leave check"
+        );
+        assert!(calls.iter().all(|call| call.hook != ExtensionHook::Send));
         for (client, expected) in [
             (NOTIFY_RECEIVER_DENIED, &expected_denied_calls[..]),
             (NOTIFY_RECEIVER_ALLOWED, &expected_allowed_calls[..]),
