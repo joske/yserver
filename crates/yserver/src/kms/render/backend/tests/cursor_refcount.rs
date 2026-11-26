@@ -102,11 +102,11 @@ fn recount(b: &KmsBackend) -> HashMap<u32, u32> {
     counts
 }
 
-fn assert_invariants(b: &KmsBackend, m: &Model, reached_reclamation_point: bool) {
+fn assert_invariants(b: &KmsBackend, m: &Model, reached_reclamation_point: bool, context: &str) {
     let counts = recount(b);
     assert_eq!(
         b.cursor_refs, counts,
-        "cursor refs must match a full recount"
+        "{context}: cursor refs must match a full recount"
     );
 
     let mut referenced: HashSet<u32> = counts.keys().copied().collect();
@@ -115,42 +115,51 @@ fn assert_invariants(b: &KmsBackend, m: &Model, reached_reclamation_point: bool)
     for xid in referenced.intersection(&model_xids(m)) {
         assert!(
             b.cursor_records.contains_key(xid),
-            "referenced cursor {xid:#x} lost its record"
+            "{context}: referenced cursor {xid:#x} lost its record"
         );
         if let Some(sources) = m.frames.get(xid) {
-            let anim = b
-                .anim_cursor_records
-                .get(xid)
-                .unwrap_or_else(|| panic!("referenced animation {xid:#x} lost its frames"));
+            let anim = b.anim_cursor_records.get(xid).unwrap_or_else(|| {
+                panic!("{context}: referenced animation {xid:#x} lost its frames")
+            });
             let actual_sources: Vec<_> = anim.frames.iter().map(|frame| frame.source).collect();
-            assert_eq!(actual_sources, *sources, "animation frame list changed");
+            assert_eq!(
+                actual_sources, *sources,
+                "{context}: animation frame list changed"
+            );
             for frame in &anim.frames {
-                let sprite = m
-                    .sprites
-                    .get(&frame.source)
-                    .copied()
-                    .expect("animation source has a model sprite");
-                assert_eq!(frame.pixmap, Some(sprite), "frame sprite alias changed");
+                let sprite =
+                    m.sprites.get(&frame.source).copied().unwrap_or_else(|| {
+                        panic!("{context}: animation source has a model sprite")
+                    });
+                assert_eq!(
+                    frame.pixmap,
+                    Some(sprite),
+                    "{context}: frame sprite alias changed"
+                );
                 assert!(
                     b.store.get(sprite).is_some(),
-                    "frame sprite {sprite:?} was reclaimed early"
+                    "{context}: frame sprite {sprite:?} was reclaimed early"
                 );
             }
             let canonical = b
                 .cursor_pixmaps
                 .get(xid)
-                .expect("animation canonical sprite alias");
+                .unwrap_or_else(|| panic!("{context}: animation canonical sprite alias"));
             assert!(
                 sources
                     .iter()
                     .any(|source| m.sprites.get(source) == Some(canonical)),
-                "animation canonical sprite is not one of its source sprites"
+                "{context}: animation canonical sprite is not one of its source sprites"
             );
         } else if let Some(sprite) = m.sprites.get(xid) {
-            assert_eq!(b.cursor_pixmaps.get(xid), Some(sprite));
+            assert_eq!(
+                b.cursor_pixmaps.get(xid),
+                Some(sprite),
+                "{context}: static cursor sprite alias changed"
+            );
             assert!(
                 b.store.get(*sprite).is_some(),
-                "static cursor sprite {sprite:?} was reclaimed early"
+                "{context}: static cursor sprite {sprite:?} was reclaimed early"
             );
         }
     }
@@ -162,24 +171,24 @@ fn assert_invariants(b: &KmsBackend, m: &Model, reached_reclamation_point: bool)
             }
             assert!(
                 !b.cursor_records.contains_key(xid),
-                "record leaked for {xid:#x}"
+                "{context}: record leaked for {xid:#x}"
             );
             assert!(
                 !b.cursor_pixmaps.contains_key(xid),
-                "sprite alias leaked for {xid:#x}"
+                "{context}: sprite alias leaked for {xid:#x}"
             );
             assert!(
                 !b.anim_cursor_records.contains_key(xid),
-                "animation leaked for {xid:#x}"
+                "{context}: animation leaked for {xid:#x}"
             );
             assert!(
                 !b.released_cursors.contains(xid),
-                "release marker leaked for {xid:#x}"
+                "{context}: release marker leaked for {xid:#x}"
             );
             if let Some(sprite) = m.sprites.get(xid) {
                 assert!(
                     b.store.get(*sprite).is_none(),
-                    "freed cursor sprite {sprite:?} remains in the store"
+                    "{context}: freed cursor sprite {sprite:?} remains in the store"
                 );
             }
         }
@@ -191,18 +200,23 @@ fn model_xids(m: &Model) -> HashSet<u32> {
 }
 
 fn live_cursors(m: &Model) -> Vec<u32> {
-    model_xids(m)
+    let mut cursors: Vec<_> = model_xids(m)
         .into_iter()
         .filter(|xid| !m.freed.contains(xid))
-        .collect()
+        .collect();
+    cursors.sort_unstable();
+    cursors
 }
 
 fn live_static_cursors(m: &Model) -> Vec<u32> {
-    m.sprites
+    let mut cursors: Vec<_> = m
+        .sprites
         .keys()
         .copied()
         .filter(|xid| !m.freed.contains(xid))
-        .collect()
+        .collect();
+    cursors.sort_unstable();
+    cursors
 }
 
 fn create_window(
@@ -383,11 +397,22 @@ fn cursor_refs_match_recount_under_random_sequences() {
         Backend::define_cursor(&mut b, None, prefix.host_xid, prefix_cursor)
             .expect("define prefix cursor");
         free_cursor(&mut b, &mut model, prefix_cursor);
+        assert_invariants(
+            &b,
+            &model,
+            true,
+            &format!("seed {seed} step prefix-after-free"),
+        );
         let before_destroy = b.windows.get(&prefix.host_xid).unwrap().cursor.is_some();
         destroy_window(&mut state, &mut b, prefix);
         windows.retain(|window| window.host_xid != prefix.host_xid);
         assert!(before_destroy);
-        assert_invariants(&b, &model, true);
+        assert_invariants(
+            &b,
+            &model,
+            true,
+            &format!("seed {seed} step prefix-after-destroy"),
+        );
 
         let probe = create_window(&mut state, &mut b, ResourceId(next_resource), 50, 50);
         next_resource += 1;
@@ -396,11 +421,15 @@ fn cursor_refs_match_recount_under_random_sequences() {
         Backend::define_cursor(&mut b, None, probe.host_xid, probe_cursor)
             .expect("define pointer probe cursor");
         move_pointer(&mut state, &mut b, probe);
-        assert_eq!(b.effective_cursor_xid, Some(probe_cursor));
-        assert_invariants(&b, &model, true);
+        assert_eq!(
+            b.effective_cursor_xid,
+            Some(probe_cursor),
+            "seed {seed} step pointer-probe"
+        );
+        assert_invariants(&b, &model, true, &format!("seed {seed} step pointer-probe"));
 
         let mut deferred_cycle = 0;
-        for _ in 0..300 {
+        for step in 0..300 {
             let before_effective = b.effective_cursor_xid;
             let mut reached_reclamation_point = false;
             match rng.index(16) {
@@ -550,9 +579,46 @@ fn cursor_refs_match_recount_under_random_sequences() {
             if b.effective_cursor_xid != before_effective {
                 reached_reclamation_point = true;
             }
-            assert_invariants(&b, &model, reached_reclamation_point);
+            assert_invariants(
+                &b,
+                &model,
+                reached_reclamation_point,
+                &format!("seed {seed} step {step}"),
+            );
         }
     }
+}
+
+// Mutation: skip window_set_cursor in ReplaceCursor; the slot assertion must fail.
+#[test]
+fn replace_cursor_moves_window_and_keeps_animation_frame() {
+    let mut state = ServerState::new();
+    let _peer = kbd_map_client_id(&mut state, 14);
+    let mut b = KmsBackend::for_tests();
+    let mut model = Model::default();
+    let window = create_window(&mut state, &mut b, ResourceId(0x0010_1234), 5, 5);
+    let old = sprite_cursor(&mut b, &mut model);
+    let new = sprite_cursor(&mut b, &mut model);
+    let old_sprite = model.sprites[&old];
+    let animation = create_animation(&mut b, &mut model, &[old]);
+    Backend::define_cursor(&mut b, None, window.host_xid, old).expect("define old cursor");
+
+    Backend::replace_cursor(&mut b, None, old, new).expect("replace old cursor");
+
+    assert_eq!(
+        b.windows.get(&window.host_xid).and_then(|geom| geom.cursor),
+        Some(new),
+        "ReplaceCursor must move the window slot"
+    );
+    let frames = &b.anim_cursor_records[&animation].frames;
+    assert_eq!(
+        frames.iter().map(|frame| frame.source).collect::<Vec<_>>(),
+        vec![old],
+        "ReplaceCursor must preserve the animation's old frame source"
+    );
+    assert_eq!(frames[0].pixmap, Some(old_sprite));
+    assert!(b.store.get(old_sprite).is_some());
+    assert_invariants(&b, &model, false, "ReplaceCursor animation witness");
 }
 
 // Mutation: skip cursor_ref_add for animation frames; duplicate source c1 must count twice.
@@ -571,7 +637,7 @@ fn duplicate_frame_sources_count_per_frame() {
     free_cursor(&mut b, &mut model, anim);
 
     assert!(b.cursor_refs.is_empty());
-    assert_invariants(&b, &model, true);
+    assert_invariants(&b, &model, true, "duplicate frame sources");
 }
 
 // Mutation: omit the replaced-entry cursor drop in window_geom_insert; reacquiring
@@ -589,8 +655,8 @@ fn cow_reacquisition_drops_the_overwritten_cursor_reference() {
     install_deferred_cow_release(&mut b, 0);
     assert!(b.deferred_cow_release);
     Backend::get_overlay_window(&mut b, None).expect("reacquire COW");
-    b.stop_direct_after_scanout_replaced(DirectScope::Root, "cursor refcount test COW replacement");
     assert_eq!(b.cursor_refs.get(&c), None);
+    b.stop_direct_after_scanout_replaced(DirectScope::Root, "cursor refcount test COW replacement");
     Backend::set_grab_cursor(&mut b, None, None).expect("next reclamation point");
-    assert_invariants(&b, &model, true);
+    assert_invariants(&b, &model, true, "COW reacquisition");
 }
