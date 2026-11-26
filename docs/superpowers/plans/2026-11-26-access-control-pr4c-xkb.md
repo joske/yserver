@@ -78,8 +78,10 @@ Unchanged by this plan:
   `core_loop/xkb_layout.rs`.
   - It returns `EventDescription::extension(xkb_event_base, crate::nested::XKB_MAJOR_OPCODE, 0)`.
   - `XKB_MAJOR_OPCODE` becomes `pub(crate)`.
-  - Its doc comment states that it matches `describe_wire_event` (XKB has one event code; the `xkbType` byte is not
-    part of the description).
+  - Its doc comment says it supplies the native XKB metadata, and that for any wire code the live registry resolves
+    to XKB it matches `describe_wire_event` (XKB has one event code; the `xkbType` byte is not part of the
+    description). It does not claim equivalence for the base-zero fallback (`xkb_info()` absent), which
+    `describe_wire_event` classifies as `core(0)`.
 - **No-policy shortcut.** With an empty policy list, no policy is called. That is the shortcut that already exists
   inside the checked fanout.
 - **Request context.**
@@ -119,6 +121,9 @@ Unchanged by this plan:
   - **Expected descriptions.** Write them as `EventDescription::extension(85, 136, 0)` with
     `backend.xkb_info_result = Some((136, 85, 0))`, from constants, not through the production helper.
   - **Red steps fail on assertions,** not on compile errors.
+  - **Every test names a compiling mutation** in its comment, including the byte baselines (mutate one encoded field
+    at the site, e.g. the device byte or the request minor) and the Allow controls (drop the site's check, so the
+    Receive count falls). The per-task lists below are the minimum, not the whole set.
   - **Builders.** Reuse existing test builders and the `xkb_request`-style drivers. Use one literal builder per frame
     layout and one definition per expected stream.
 - **Commits.** Each task is one reviewable commit, signed (`-S`), with `cargo +nightly fmt` and
@@ -140,7 +145,8 @@ Unchanged by this plan:
      `state.xkb_announced_indicators` equals the new lit mask. The IndicatorStateNotify and ExtensionDeviceNotify
      selectors still get their literal frames. A repeated request cannot show this, because the handler resyncs
      `xkb_announced` first (`process_request/xkb.rs:234`).
-   - Test: Task 1 `receive_xkb_state_denied_snapshot_advances`.
+   - Tests: Task 1 `receive_xkb_state_denied_snapshot_advances` (state snapshot), Task 3
+     `receive_xkb_state_indicator_followups` (indicator snapshot and follow-up frames).
 4. **One request emits several XKB events.** In the IndicatorMaps change, every XKB event is checked on its own, in
    today's order, and denying one leaves the others: IndicatorMapNotify, then IndicatorStateNotify, then
    ExtensionDeviceNotify. Test: Task 3 `receive_xkb_indicator_maps_denies_one_kind`.
@@ -185,7 +191,9 @@ Unchanged by this plan:
   - `receive_xkb_state_denied_one_recipient` (K11): the denied selector gets nothing, the other gets the literal
     frame, and `backend.xkb_mods` changes. The Receive log holds one call per selector with
     `EventSubject::Device(1)`, `EventDescription::extension(85, 136, 0)` and the request context.
-  - `receive_xkb_state_denied_snapshot_advances` (Review Focus 3).
+  - `receive_xkb_state_denied_snapshot_advances` (Review Focus 3, StateNotify part): deny every selected StateNotify
+    copy of a LatchLockState; right after that request `state.xkb_announced` equals the new state. The indicator
+    follow-ups are Task 3's test, because their Receive calls only exist after Task 3.
   - `receive_xkb_state_from_key_has_no_request` (Review Focus 5): a key press through the existing key fanout entry.
     The StateNotify Receive call has request `None`.
   - `receive_xkb_controls_denied_one_recipient` (K12) and `receive_xkb_per_key_repeat_denied` (K9). In each, the
@@ -193,7 +201,8 @@ Unchanged by this plan:
   - `receive_xkb_state_allow_control`: an allow-all policy gives the literal baseline frames, with the expected call
     count.
   - Mutations to name: leave K11 unchecked; check K11 with `EventSubject::Global`; describe with event type 2
-    (`xkbType`); move the snapshot update after a denial short-circuit.
+    (`xkbType`); move the snapshot update after a denial short-circuit; pass the requester's request to the
+    key-path check instead of `state.receive_request`; leave K12 unchecked; leave K9 unchecked.
 - [ ] **Step 2: Run** `cargo test -p yserver-core access_xkb_notify`. Expected: the baseline passes. Every other
   Task 1 test fails on assertions: the denial tests, the Allow control (its Receive call count) and
   `receive_xkb_state_from_key_has_no_request` (no Receive call yet).
@@ -232,7 +241,12 @@ Unchanged by this plan:
   - `receive_xkb_set_new_keyboard_denied` (K3).
   - `receive_xkb_map_denied_keeps_legacy_filter` (Review Focus 1).
   - `receive_xkb_new_keyboard_allow_control`.
-  - Mutations to name: leave K2 unchecked; filter the core MappingNotify recipients by the XKB MapNotify Receive
+  - `receive_xkb_map_payload_device_subject`: the existing K4 helper-test shape (`xkb_layout.rs:809-845`, notify
+    `device_id` 3) with a policy that denies one selector. Asserts the subject `EventSubject::Device(3)` and that the
+    returned list still contains the denied selector. This is the helper's own contract, so the test calls the
+    helper directly, like the existing unit test.
+  - Mutations to name: leave K2 unchecked; leave K3 unchecked; return only allowed recipients from
+    `send_xkb_map_notify`; filter the core MappingNotify recipients by the XKB MapNotify Receive
     outcome; check K4 with `EventSubject::Device(1)` instead of `notify.device_id` (caught by a K4 run whose notify
     carries device id 3, through the existing helper test's shape); check K1 with `EventSubject::Global`.
 - [ ] **Step 2: Run** the module and `cargo test -p yserver-core access_notify_exemptions`. Expected: exactly the
@@ -257,13 +271,23 @@ Unchanged by this plan:
 
 - [ ] **Step 1: Write the tests**
   - `receive_xkb_indicators_no_policy_bytes`: K5–K8 and K10, literal frames in today's order.
-  - `receive_xkb_indicator_maps_denies_one_kind` (Review Focus 4): deny only IndicatorStateNotify for one client.
-    That client still gets IndicatorMapNotify and ExtensionDeviceNotify, in order.
+  - `receive_xkb_indicator_maps_denies_one_kind` (Review Focus 4): the target client selects all three
+    (IndicatorMap, IndicatorState, ExtensionDevice). The three calls share subject, description and request, so the
+    policy denies the target's second matching Receive call (the IndicatorStateNotify). It still gets
+    IndicatorMapNotify and ExtensionDeviceNotify, in order. A second client selects ExtensionDevice only; both K8
+    calls (target and second client) are asserted.
+  - `receive_xkb_state_indicator_followups` (Review Focus 3, indicator part): driven through
+    `key_event_fanout_to_state` with `backend.xkb_mods` and `backend.xkb_indicators_result` seeded to a new lit mask
+    (the fresh `state.xkb_announced_indicators` differs). Every StateNotify copy is denied. Afterwards
+    `state.xkb_announced_indicators` equals the new mask, and the IndicatorStateNotify and ExtensionDeviceNotify
+    selectors get their literal frames.
   - `receive_xkb_names_denied`, `receive_xkb_compat_map_denied` and `receive_xkb_indicator_names_denied`, each for one
     recipient.
   - `receive_xkb_indicators_allow_control`.
-  - Mutations to name: leave K10 unchecked; check K8 once per emission instead of once per recipient.
-- [ ] **Step 2: Run** the module. Expected: exactly the Task 3 denial tests fail.
+  - Mutations to name: leave K10 unchecked; check K8 once per emission instead of once per recipient; leave K5,
+    K6, K7 unchecked (one each); return early from `announce_xkb_state` when every StateNotify copy is denied.
+- [ ] **Step 2: Run** the module. Expected: exactly the Task 3 denial tests and its Allow control fail (its Receive
+  count); `receive_xkb_state_indicator_followups` fails on its K8/K10 Receive assertions. Task 1 and 2 tests pass.
 - [ ] **Step 3: Implement** K5–K8 and K10.
 - [ ] **Step 4: Run** the module, then `cargo test -p yserver-core`. Afterwards run the plan gate: the workspace
   tests, the lavapipe `--ignored` suite, clippy for Linux and FreeBSD, and `tools/check-layout.sh`. Expected: all
