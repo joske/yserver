@@ -9,8 +9,9 @@
 //! full-reload notification path.
 
 use crate::{
+    access::{EventBatch, EventDescription, EventSubject},
     backend::{Backend, KeyboardMappingChange},
-    core_loop::fanout::fanout_event_to_clients,
+    core_loop::fanout::{fanout_event_to_clients, fanout_event_to_clients_with_receive},
     properties::{PropertyFormat, PropertyValue},
     resources::ROOT_WINDOW,
     server::ServerState,
@@ -190,6 +191,17 @@ pub(crate) fn send_xkb_map_notify(
 
 /// yserver's one XKB keyboard, as every XKB reply and event names it.
 pub(crate) const XKB_DEVICE_ID: u8 = 1;
+
+/// Supplies the native XKB metadata for one XKB notification. For any wire
+/// code the live registry resolves to XKB, this matches `describe_wire_event`:
+/// XKB has one event code and the `xkbType` byte is not part of the description.
+/// The base-zero fallback when `xkb_info()` is absent is not equivalent:
+/// `describe_wire_event` classifies that fallback as `core(0)`.
+#[must_use]
+pub(crate) fn xkb_event_description(xkb_event_base: u8) -> EventDescription {
+    EventDescription::extension(xkb_event_base, crate::nested::XKB_MAJOR_OPCODE, 0)
+}
+
 /// `XkbPerKeyRepeatMask` in `XkbControlsNotify.changedControls`.
 const XKB_PER_KEY_REPEAT_MASK: u32 = 1 << 30;
 /// Core `X_ChangeKeyboardMapping`: the cause Xorg's `XkbApplyMappingChange`
@@ -410,9 +422,19 @@ pub(crate) fn apply_keyboard_mapping_repeats(
     let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| {
         i.controls & XKB_PER_KEY_REPEAT_MASK != 0
     });
-    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-        let _ = x11::write_xkb_controls_notify(buf, order, seq, xkb_event_base, notify);
-    });
+    let description = xkb_event_description(xkb_event_base);
+    let events = EventBatch::new(std::slice::from_ref(&description));
+    // This XKB Receive check is a yserver rule; Xorg emits native XKB events
+    // without one.
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &recipients,
+        EventSubject::Device(u16::from(notify.device_id)),
+        &events,
+        |buf, seq, order| {
+            let _ = x11::write_xkb_controls_notify(buf, order, seq, xkb_event_base, notify);
+        },
+    );
 }
 
 /// Copy re-derived per-key repeat bits into the core keyboard feedback
@@ -602,10 +624,19 @@ pub fn announce_xkb_state(
     };
     let recipients =
         crate::core_loop::xkb_select::interest_recipients(state, |i| i.state & changed != 0);
-    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-        let _ = x11::write_xkb_state_notify(buf, order, seq, xkb_event_base, notify);
-    });
-
+    let description = xkb_event_description(xkb_event_base);
+    let events = EventBatch::new(std::slice::from_ref(&description));
+    // This XKB Receive check is a yserver rule; Xorg emits native XKB events
+    // without one. The snapshot above advances even when every copy is denied.
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &recipients,
+        EventSubject::Device(u16::from(notify.device_id)),
+        &events,
+        |buf, seq, order| {
+            let _ = x11::write_xkb_state_notify(buf, order, seq, xkb_event_base, notify);
+        },
+    );
     let (lit, defined) = backend.xkb_indicators();
     let lit_changed = lit ^ state.xkb_announced_indicators;
     state.xkb_announced_indicators = lit;

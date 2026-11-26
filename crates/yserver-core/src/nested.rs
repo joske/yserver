@@ -47,7 +47,7 @@ const BIG_REQUESTS_MAJOR_OPCODE: u8 = 135;
 const BIG_REQUESTS_FIRST_EVENT: u8 = 0;
 const BIG_REQUESTS_FIRST_ERROR: u8 = 0;
 
-const XKB_MAJOR_OPCODE: u8 = 136;
+pub(crate) const XKB_MAJOR_OPCODE: u8 = 136;
 
 const XI2_MAJOR_OPCODE: u8 = 137;
 /// First event code reserved for the XInput extension. Despite the name,

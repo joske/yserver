@@ -5,8 +5,13 @@
 //! ChangeKeyboardControl change them and send Xorg's `XkbControlsNotify`.
 
 use crate::{
+    access::{EventBatch, EventSubject},
     backend::Backend,
-    core_loop::{fanout::fanout_event_to_clients, xkb_layout::XKB_DEVICE_ID, xkb_select},
+    core_loop::{
+        fanout::fanout_event_to_clients_with_receive,
+        xkb_layout::{XKB_DEVICE_ID, xkb_event_description},
+        xkb_select,
+    },
     server::ServerState,
 };
 use yserver_protocol::x11::{self, error};
@@ -181,7 +186,17 @@ pub(crate) fn send_controls_notify(
     };
     let xkb_event_base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
     let recipients = xkb_select::interest_recipients(state, |i| i.controls & changed != 0);
-    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-        let _ = x11::write_xkb_controls_notify(buf, order, seq, xkb_event_base, notify);
-    });
+    let description = xkb_event_description(xkb_event_base);
+    let events = EventBatch::new(std::slice::from_ref(&description));
+    // This XKB Receive check is a yserver rule; Xorg emits native XKB events
+    // without one.
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &recipients,
+        EventSubject::Device(u16::from(notify.device_id)),
+        &events,
+        |buf, seq, order| {
+            let _ = x11::write_xkb_controls_notify(buf, order, seq, xkb_event_base, notify);
+        },
+    );
 }

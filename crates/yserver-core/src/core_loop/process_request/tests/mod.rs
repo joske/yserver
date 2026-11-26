@@ -26,6 +26,7 @@ mod access_send;
 mod access_shm;
 mod access_sync;
 mod access_xi_notify;
+mod access_xkb_notify;
 mod composite;
 mod core_misc;
 mod damage_ext;
