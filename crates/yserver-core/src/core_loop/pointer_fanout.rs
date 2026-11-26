@@ -961,7 +961,8 @@ fn pointer_event_fanout_to_state_inner(
             }
         }
     }
-    // Tree-change is not user input; it resets no idle clocks and wakes no DPMS/screensaver.
+    // A tree-change crossing is not user input: it neither resets the idle
+    // clocks nor wakes DPMS or the screen saver.
     if !event.tree_change {
         let now = std::time::Instant::now();
         // Capture priors BEFORE mutating; needed by the IDLETIME wake handler.
@@ -4858,7 +4859,6 @@ pub(crate) fn emit_barrier_event(
     if state.active_pointer_grab.is_some() {
         flags |= 0x0000_0002;
     }
-
     let grabbed_targets =
         active_grab_target(state).and_then(|(grab_window, grab_client, _, _, _, _, _)| {
             (grab_client == barrier_owner && grab_window == barrier_window)

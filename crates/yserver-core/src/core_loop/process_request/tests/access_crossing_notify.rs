@@ -4244,6 +4244,7 @@ fn receive_xi1_focus_and_state_batches_independent() {
 }
 
 const BARRIER_XID: u32 = 0x0051_0044;
+const BARRIER_WINDOW: ResourceId = ResourceId(0x0051_0045);
 const BARRIER_HIT_MASK: u64 = 1 << 25;
 const BARRIER_LEAVE_MASK: u64 = 1 << 26;
 const BARRIER_EVENT_MASK: u64 = BARRIER_HIT_MASK | BARRIER_LEAVE_MASK;
@@ -4272,23 +4273,35 @@ fn barrier_fixture() -> NotifyFixture {
         state.byte_order = order;
         state.last_sequence.store(sequence, Ordering::Relaxed);
     }
+    fixture.state.resources.create_window(
+        NOTIFY_SENDER,
+        yserver_protocol::x11::CreateWindowRequest {
+            depth: 24,
+            window: BARRIER_WINDOW,
+            parent: ROOT_WINDOW,
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+            class: 1,
+            visual: crate::resources::ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    let _ = fixture.state.resources.map_window(BARRIER_WINDOW);
     for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
-        fixture
-            .state
-            .clients
-            .get_mut(&client.0)
-            .unwrap()
-            .xi2_masks
-            .insert(
-                (ROOT_WINDOW, crate::xinput::DEVICEID_MASTER_POINTER),
-                BARRIER_EVENT_MASK,
-            );
+        let state = fixture.state.clients.get_mut(&client.0).unwrap();
+        state.event_masks.insert(ROOT_WINDOW, POINTER_MOTION_MASK);
+        state.xi2_masks.insert(
+            (BARRIER_WINDOW, crate::xinput::DEVICEID_MASTER_POINTER),
+            BARRIER_EVENT_MASK,
+        );
     }
     fixture.state.pointer_barriers.insert(
         BARRIER_XID,
         crate::server::PointerBarrier {
             owner: NOTIFY_SENDER,
-            window: ROOT_WINDOW,
+            window: BARRIER_WINDOW,
             x1: 100,
             y1: 0,
             x2: 100,
@@ -4338,7 +4351,7 @@ fn literal_barrier_event(
     append_event_u32(&mut event, order, time);
     append_event_u32(&mut event, order, event_id);
     append_event_u32(&mut event, order, ROOT_WINDOW.0);
-    append_event_u32(&mut event, order, ROOT_WINDOW.0);
+    append_event_u32(&mut event, order, BARRIER_WINDOW.0);
     append_event_u32(&mut event, order, BARRIER_XID);
     append_event_u32(&mut event, order, dtime);
     append_event_u32(&mut event, order, flags);
@@ -4354,85 +4367,30 @@ fn literal_barrier_event(
     event
 }
 
-fn literal_barrier_hit_leave(order: ClientByteOrder, sequence: u16, flags: u32) -> Vec<u8> {
-    literal_barrier_hit_leave_at(order, sequence, flags, 100, 1, 120, 1, 20)
+fn literal_grabbed_barrier_hit() -> Vec<u8> {
+    literal_barrier_event(
+        ClientByteOrder::LittleEndian,
+        GRAB_SEQUENCE,
+        25,
+        200,
+        1,
+        0,
+        2,
+        99,
+        50,
+        4,
+        0,
+    )
 }
 
-fn literal_barrier_hit_leave_at(
-    order: ClientByteOrder,
-    sequence: u16,
-    flags: u32,
-    hit_time: u32,
-    hit_event_id: u32,
-    leave_time: u32,
-    leave_event_id: u32,
-    leave_dtime: u32,
-) -> Vec<u8> {
+fn literal_ungrabbed_barrier_frames(order: ClientByteOrder, sequence: u16) -> [Vec<u8>; 5] {
     [
-        literal_barrier_event(
-            order,
-            sequence,
-            25,
-            hit_time,
-            hit_event_id,
-            0,
-            flags,
-            99,
-            50,
-            9,
-            0,
-        )
-        .as_slice(),
-        literal_barrier_event(
-            order,
-            sequence,
-            26,
-            leave_time,
-            leave_event_id,
-            leave_dtime,
-            flags,
-            99,
-            203,
-            0,
-            0,
-        )
-        .as_slice(),
+        literal_core_motion(order, sequence, 90, ROOT_WINDOW, 95, 50, 95, 50),
+        literal_barrier_event(order, sequence, 25, 100, 1, 0, 0, 99, 50, 4, 0),
+        literal_core_motion(order, sequence, 100, ROOT_WINDOW, 99, 50, 99, 50),
+        literal_barrier_event(order, sequence, 26, 120, 1, 20, 0, 99, 203, 0, 0),
+        literal_core_motion(order, sequence, 120, ROOT_WINDOW, 99, 203, 99, 203),
     ]
-    .concat()
-}
-
-fn assert_barrier_receive_calls(calls: &[RecordedExtensionCheck], expected: &[(ClientId, u16)]) {
-    let rows = receive_calls(calls);
-    assert_eq!(
-        rows.len(),
-        expected.len(),
-        "one Receive call per barrier copy"
-    );
-    for client in [
-        NOTIFY_SENDER,
-        NOTIFY_RECEIVER_DENIED,
-        NOTIFY_RECEIVER_ALLOWED,
-    ] {
-        let expected_events: Vec<_> = expected
-            .iter()
-            .filter(|(expected_client, _)| *expected_client == client)
-            .map(|(_, evtype)| vec![EventDescription::extension(35, 137, *evtype)])
-            .collect();
-        let actual_events: Vec<_> = rows
-            .iter()
-            .filter(|call| call.client == client)
-            .map(|call| {
-                assert_eq!(call.receive, Some(EventSubject::Window(ROOT_WINDOW)));
-                assert!(call.request.is_none());
-                call.events.clone().expect("barrier Receive description")
-            })
-            .collect();
-        assert_eq!(
-            actual_events, expected_events,
-            "ordered Receive descriptions for client {client:?}"
-        );
-    }
-    assert!(calls.iter().all(|call| call.hook != ExtensionHook::Send));
 }
 
 // mutation: swap BarrierHit and BarrierLeave evtypes
@@ -4441,6 +4399,8 @@ fn receive_barrier_baseline_frames() {
     let mut fixture = barrier_fixture();
     assert!(!fixture.state.policies_installed());
 
+    feed_barrier_motion(&mut fixture, 90, 95, 50);
+    assert_eq!(fixture.state.pointer_root, (95, 50));
     feed_barrier_motion(&mut fixture, 100, 110, 50);
     assert_eq!(
         fixture.state.pointer_root,
@@ -4467,78 +4427,154 @@ fn receive_barrier_baseline_frames() {
             ROOT_SEQUENCE,
         ),
     ] {
+        let frames = literal_ungrabbed_barrier_frames(order, sequence);
         assert_eq!(
             fixture.drain(client),
-            literal_barrier_hit_leave(order, sequence, 0),
-            "ungrabbed BarrierHit then BarrierLeave stream"
+            [
+                frames[0].as_slice(),
+                frames[1].as_slice(),
+                frames[2].as_slice(),
+                frames[3].as_slice(),
+                frames[4].as_slice(),
+            ]
+            .concat(),
+            "ungrabbed motion, BarrierHit, motion, BarrierLeave, motion stream"
         );
     }
 
-    feed_barrier_motion(&mut fixture, 130, 90, 50);
-    assert_eq!(fixture.state.pointer_root, (90, 50));
+    let mut grabbed = barrier_fixture();
+    assert!(!grabbed.state.policies_installed());
     assert!(matches!(
         grab_pointer(
-            &mut fixture,
+            &mut grabbed,
             NOTIFY_SENDER,
             false,
-            ROOT_WINDOW,
-            0,
+            BARRIER_WINDOW,
+            POINTER_MOTION_MASK as u16,
             GRAB_SEQUENCE,
         ),
         RequestOutcome::Handled
     ));
-    assert!(fixture.state.active_pointer_grab.is_some());
+    assert!(grabbed.state.active_pointer_grab.is_some());
     assert_eq!(
-        fixture.drain(NOTIFY_SENDER),
+        grabbed.drain(NOTIFY_SENDER),
         literal_grab_reply(ClientByteOrder::LittleEndian, GRAB_SEQUENCE, 0),
         "GrabPointer succeeds with its literal reply"
     );
 
-    feed_barrier_motion(&mut fixture, 140, 110, 50);
-    assert_eq!(fixture.state.pointer_root, (99, 50));
-    assert_eq!(fixture.state.master_sprite_root, (99, 50));
-    assert!(fixture.state.pointer_barriers[&BARRIER_XID].hit);
-    feed_barrier_motion(&mut fixture, 160, 99, 203);
-    assert_eq!(fixture.state.pointer_root, (99, 203));
-    assert_eq!(fixture.state.master_sprite_root, (99, 203));
-    assert!(!fixture.state.pointer_barriers[&BARRIER_XID].hit);
-    assert_eq!(fixture.state.pointer_barriers[&BARRIER_XID].event_id, 3);
+    feed_barrier_motion(&mut grabbed, 190, 95, 50);
+    assert_eq!(grabbed.state.pointer_root, (95, 50));
+    assert!(!grabbed.state.pointer_barriers[&BARRIER_XID].hit);
+    feed_barrier_motion(&mut grabbed, 200, 110, 50);
+    assert_eq!(grabbed.state.pointer_root, (99, 50));
+    assert_eq!(grabbed.state.master_sprite_root, (99, 50));
+    assert!(grabbed.state.pointer_barriers[&BARRIER_XID].hit);
+    assert_eq!(grabbed.state.pointer_barriers[&BARRIER_XID].event_id, 1);
+    feed_barrier_motion(&mut grabbed, 220, 99, 203);
+    assert_eq!(grabbed.state.pointer_root, (99, 203));
+    assert_eq!(grabbed.state.master_sprite_root, (99, 203));
+    assert!(!grabbed.state.pointer_barriers[&BARRIER_XID].hit);
+    assert_eq!(grabbed.state.pointer_barriers[&BARRIER_XID].event_id, 2);
     assert_eq!(
-        fixture.drain(NOTIFY_SENDER),
-        literal_barrier_hit_leave_at(
-            ClientByteOrder::LittleEndian,
-            GRAB_SEQUENCE,
-            2,
-            140,
-            2,
-            160,
-            2,
-            20,
-        ),
-        "grab owner receives literal hit then leave with the grab flag"
+        grabbed.drain(NOTIFY_SENDER),
+        [
+            literal_core_motion(
+                ClientByteOrder::LittleEndian,
+                GRAB_SEQUENCE,
+                190,
+                BARRIER_WINDOW,
+                95,
+                50,
+                95,
+                50,
+            )
+            .as_slice(),
+            literal_grabbed_barrier_hit().as_slice(),
+            literal_core_motion(
+                ClientByteOrder::LittleEndian,
+                GRAB_SEQUENCE,
+                200,
+                BARRIER_WINDOW,
+                99,
+                50,
+                99,
+                50,
+            )
+            .as_slice(),
+            literal_barrier_event(
+                ClientByteOrder::LittleEndian,
+                GRAB_SEQUENCE,
+                26,
+                220,
+                1,
+                20,
+                2,
+                99,
+                203,
+                0,
+                0,
+            )
+            .as_slice(),
+            literal_core_motion(
+                ClientByteOrder::LittleEndian,
+                GRAB_SEQUENCE,
+                220,
+                BARRIER_WINDOW,
+                99,
+                203,
+                99,
+                203,
+            )
+            .as_slice(),
+        ]
+        .concat(),
+        "grab owner receives literal motion, BarrierHit, motion, BarrierLeave, motion stream"
     );
-    assert!(fixture.drain(NOTIFY_RECEIVER_DENIED).is_empty());
-    assert!(fixture.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
-    assert!(fixture.state.active_pointer_grab.is_some());
-    assert_no_writer_failures(&fixture);
+    assert!(grabbed.drain(NOTIFY_RECEIVER_DENIED).is_empty());
+    assert!(grabbed.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
+    assert!(grabbed.state.active_pointer_grab.is_some());
+    assert_no_writer_failures(&grabbed);
 }
 
 // mutation: leave B1 unchecked
 // mutation: on owner denial fall back to selector targets
+// mutation: use ROOT_WINDOW for the barrier Receive subject
 #[test]
 fn receive_barrier_denial_keeps_barrier_state() {
     let mut allowed = barrier_fixture();
     let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
+    feed_barrier_motion(&mut allowed, 90, 95, 50);
     feed_barrier_motion(&mut allowed, 100, 110, 50);
     assert_eq!(allowed.state.pointer_root, (99, 50));
     assert_eq!(allowed.state.master_sprite_root, (99, 50));
     assert!(allowed.state.pointer_barriers[&BARRIER_XID].hit);
     feed_barrier_motion(&mut allowed, 120, 99, 203);
     assert_eq!(allowed.state.master_sprite_root, (99, 203));
-    let expected_allowed = literal_barrier_hit_leave(ClientByteOrder::BigEndian, DUAL_SEQUENCE, 0);
-    let expected_other = literal_barrier_hit_leave(ClientByteOrder::LittleEndian, ROOT_SEQUENCE, 0);
-    assert_eq!(allowed.drain(NOTIFY_RECEIVER_DENIED), expected_allowed);
-    assert_eq!(allowed.drain(NOTIFY_RECEIVER_ALLOWED), expected_other);
+    let denied_frames = literal_ungrabbed_barrier_frames(ClientByteOrder::BigEndian, DUAL_SEQUENCE);
+    let allowed_frames =
+        literal_ungrabbed_barrier_frames(ClientByteOrder::LittleEndian, ROOT_SEQUENCE);
+    assert_eq!(
+        allowed.drain(NOTIFY_RECEIVER_DENIED),
+        [
+            denied_frames[0].as_slice(),
+            denied_frames[1].as_slice(),
+            denied_frames[2].as_slice(),
+            denied_frames[3].as_slice(),
+            denied_frames[4].as_slice(),
+        ]
+        .concat()
+    );
+    assert_eq!(
+        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
+        [
+            allowed_frames[0].as_slice(),
+            allowed_frames[1].as_slice(),
+            allowed_frames[2].as_slice(),
+            allowed_frames[3].as_slice(),
+            allowed_frames[4].as_slice(),
+        ]
+        .concat()
+    );
     assert!(allowed.drain(NOTIFY_SENDER).is_empty());
     assert_eq!(allowed.state.pointer_root, (99, 203));
     assert!(!allowed.state.pointer_barriers[&BARRIER_XID].hit);
@@ -4549,7 +4585,7 @@ fn receive_barrier_denial_keeps_barrier_state() {
     let calls = denied.install_policy(|_, call| {
         if call.hook == ExtensionHook::Receive
             && call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
+            && call.receive == Some(EventSubject::Window(BARRIER_WINDOW))
             && call.events == Some(vec![EventDescription::extension(35, 137, 25)])
         {
             Decision::Deny(DENY)
@@ -4557,6 +4593,7 @@ fn receive_barrier_denial_keeps_barrier_state() {
             Decision::Allow
         }
     });
+    feed_barrier_motion(&mut denied, 90, 95, 50);
     feed_barrier_motion(&mut denied, 100, 110, 50);
     assert_eq!(
         denied.state.pointer_root,
@@ -4576,41 +4613,50 @@ fn receive_barrier_denial_keeps_barrier_state() {
     assert_eq!(denied.state.pointer_barriers[&BARRIER_XID].event_id, 2);
     assert_eq!(
         denied.drain(NOTIFY_RECEIVER_DENIED),
-        literal_barrier_event(
-            ClientByteOrder::BigEndian,
-            DUAL_SEQUENCE,
-            26,
-            120,
-            1,
-            20,
-            0,
-            99,
-            203,
-            0,
-            0,
-        ),
-        "denied BarrierHit is dropped but the later BarrierLeave is checked and delivered"
+        [
+            denied_frames[0].as_slice(),
+            denied_frames[2].as_slice(),
+            denied_frames[3].as_slice(),
+            denied_frames[4].as_slice(),
+        ]
+        .concat(),
+        "denied BarrierHit is dropped; motion and the later BarrierLeave remain"
     );
-    assert_eq!(denied.drain(NOTIFY_RECEIVER_ALLOWED), expected_other);
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_ALLOWED),
+        [
+            allowed_frames[0].as_slice(),
+            allowed_frames[1].as_slice(),
+            allowed_frames[2].as_slice(),
+            allowed_frames[3].as_slice(),
+            allowed_frames[4].as_slice(),
+        ]
+        .concat()
+    );
     assert!(denied.drain(NOTIFY_SENDER).is_empty());
-    assert_barrier_receive_calls(
-        &allow_calls.lock().unwrap(),
-        &[
-            (NOTIFY_RECEIVER_DENIED, 25),
-            (NOTIFY_RECEIVER_ALLOWED, 25),
-            (NOTIFY_RECEIVER_DENIED, 26),
-            (NOTIFY_RECEIVER_ALLOWED, 26),
-        ],
-    );
-    assert_barrier_receive_calls(
-        &calls.lock().unwrap(),
-        &[
-            (NOTIFY_RECEIVER_DENIED, 25),
-            (NOTIFY_RECEIVER_ALLOWED, 25),
-            (NOTIFY_RECEIVER_DENIED, 26),
-            (NOTIFY_RECEIVER_ALLOWED, 26),
-        ],
-    );
+    let expected_denied_calls = [
+        (NOTIFY_RECEIVER_DENIED, BARRIER_WINDOW, 25, None),
+        (NOTIFY_RECEIVER_DENIED, BARRIER_WINDOW, 26, None),
+    ];
+    let expected_allowed_calls = [
+        (NOTIFY_RECEIVER_ALLOWED, BARRIER_WINDOW, 25, None),
+        (NOTIFY_RECEIVER_ALLOWED, BARRIER_WINDOW, 26, None),
+    ];
+    let assert_selector_calls = |calls: &[RecordedExtensionCheck]| {
+        for (client, expected) in [
+            (NOTIFY_RECEIVER_DENIED, &expected_denied_calls[..]),
+            (NOTIFY_RECEIVER_ALLOWED, &expected_allowed_calls[..]),
+        ] {
+            let client_calls: Vec<_> = calls
+                .iter()
+                .filter(|call| call.client == client)
+                .cloned()
+                .collect();
+            assert_xi2_receive_call_order(&client_calls, expected);
+        }
+    };
+    assert_selector_calls(&allow_calls.lock().unwrap());
+    assert_selector_calls(&calls.lock().unwrap());
     assert_no_writer_failures(&denied);
 
     let run_grabbed_owner = |deny_owner: bool| {
@@ -4620,8 +4666,8 @@ fn receive_barrier_denial_keeps_barrier_state() {
                 &mut fixture,
                 NOTIFY_SENDER,
                 false,
-                ROOT_WINDOW,
-                0,
+                BARRIER_WINDOW,
+                POINTER_MOTION_MASK as u16,
                 GRAB_SEQUENCE,
             ),
             RequestOutcome::Handled
@@ -4634,7 +4680,7 @@ fn receive_barrier_denial_keeps_barrier_state() {
             if deny_owner
                 && call.hook == ExtensionHook::Receive
                 && call.client == NOTIFY_SENDER
-                && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
+                && call.receive == Some(EventSubject::Window(BARRIER_WINDOW))
                 && call.events == Some(vec![EventDescription::extension(35, 137, 25)])
             {
                 Decision::Deny(DENY)
@@ -4660,6 +4706,9 @@ fn receive_barrier_denial_keeps_barrier_state() {
                 grab.xi2_mask,
             )
         };
+        feed_barrier_motion(&mut fixture, 190, 95, 50);
+        assert_eq!(fixture.state.pointer_root, (95, 50));
+        assert!(!fixture.state.pointer_barriers[&BARRIER_XID].hit);
         feed_barrier_motion(&mut fixture, 200, 110, 50);
         assert_eq!(fixture.state.pointer_root, (99, 50));
         assert_eq!(fixture.state.master_sprite_root, (99, 50));
@@ -4669,31 +4718,46 @@ fn receive_barrier_denial_keeps_barrier_state() {
             .active_pointer_grab
             .expect("grab remains active");
         assert_eq!(grab_signature(current_grab), grab_signature(grab));
-        assert!(fixture.state.pointer_barriers[&BARRIER_XID].hit);
+        let pre_hit_motion = literal_core_motion(
+            ClientByteOrder::LittleEndian,
+            GRAB_SEQUENCE,
+            190,
+            BARRIER_WINDOW,
+            95,
+            50,
+            95,
+            50,
+        );
+        let hit_motion = literal_core_motion(
+            ClientByteOrder::LittleEndian,
+            GRAB_SEQUENCE,
+            200,
+            BARRIER_WINDOW,
+            99,
+            50,
+            99,
+            50,
+        );
         assert_eq!(
             fixture.drain(NOTIFY_SENDER),
             if deny_owner {
-                Vec::new()
+                [pre_hit_motion.as_slice(), hit_motion.as_slice()].concat()
             } else {
-                literal_barrier_event(
-                    ClientByteOrder::LittleEndian,
-                    GRAB_SEQUENCE,
-                    25,
-                    200,
-                    1,
-                    0,
-                    2,
-                    99,
-                    50,
-                    9,
-                    0,
-                )
+                [
+                    pre_hit_motion.as_slice(),
+                    literal_grabbed_barrier_hit().as_slice(),
+                    hit_motion.as_slice(),
+                ]
+                .concat()
             },
-            "the grabbed owner receives the allowed hit or has only that copy denied"
+            "grab denial drops only BarrierHit; cooked motion remains unchanged"
         );
         assert!(fixture.drain(NOTIFY_RECEIVER_DENIED).is_empty());
         assert!(fixture.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
-        assert_barrier_receive_calls(&calls.lock().unwrap(), &[(NOTIFY_SENDER, 25)]);
+        assert_xi2_receive_call_order(
+            &calls.lock().unwrap(),
+            &[(NOTIFY_SENDER, BARRIER_WINDOW, 25, None)],
+        );
         assert_no_writer_failures(&fixture);
         (
             fixture.state.pointer_root,
