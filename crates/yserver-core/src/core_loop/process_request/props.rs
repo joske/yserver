@@ -712,13 +712,12 @@ pub(in crate::core_loop) fn emit_property_dispatch_error(
     )
 }
 
-/// Emit the property-change notification(s) to every client that
-/// selected for them on this device. Single fan-out for both XI2
-/// (`XI_PropertyEvent`, evtype 12) and XI1 (`DevicePropertyNotify`,
-/// XI1 event code 16 within the XInput event block, delivered as wire
-/// type `XI_FIRST_EVENT + 16 = 82`), keyed by the same
-/// `(deviceid, property, what)` tuple so the two notifications can
-/// never diverge.
+/// Emit the property-change notifications to clients that selected for
+/// them on this device. XI2 (`XI_PropertyEvent`, evtype 12) and XI1
+/// (`DevicePropertyNotify`, XI1 event code 16 within the XInput event
+/// block, delivered as wire type `XI_FIRST_EVENT + 16 = 82`) use separate
+/// fan-outs in that order. They share the same `(deviceid, property, what)`
+/// tuple, but have independent recipients and Receive decisions.
 ///
 /// Xorg's `send_property_event` broadcasts both forms through
 /// `SendEventToAllWindows` (`Xi/xiproperty.c:206-208`,
@@ -749,18 +748,17 @@ pub(crate) fn emit_property_change(
 ) -> Vec<ClientId> {
     // XI2 emit: clients select XI_PropertyEvent via
     // `xi2_masks[(window, deviceid)]` keyed by the deviceid they asked
-    // for. A client targeting `XIAllDevices(0)` or — when the event
-    // device is a master — `XIAllMasterDevices(1)` selects with that
-    // wildcard id, so a property event on a master reaches its exact
-    // selector AND `dev == 1` selectors. A slave property event reaches
-    // its exact selector AND `dev == 0` selectors. xinput's
-    // `watch-props` uses `dev == 0`; without the wildcard match it
-    // sees nothing.
-    // XI device-id wildcards from `XI2.h`: XIAllDevices=0 selects any
-    // device; XIAllMasterDevices=1 selects any master. Physical touchpad
-    // facets use registry-assigned IDs; the reserved XTEST ID is only
-    // used for virtual-device properties. Slaves never match the
-    // master-only wildcard.
+    // for. This recipient predicate matches the exact device ID and
+    // `XIAllDevices(0)`. It does not treat `XIAllMasterDevices(1)` as a
+    // wildcard: `dev == 1` matches only when the event's device ID is 1.
+    // xinput's `watch-props` uses `dev == 0`; without that wildcard match
+    // it sees nothing.
+    // XI device-id identifiers from `XI2.h`: XIAllDevices=0 selects any
+    // device and XIAllMasterDevices=1 selects masters at selection time.
+    // This property emitter's existing predicate recognizes only the
+    // exact device ID and XIAllDevices. Physical touchpad facets use
+    // registry-assigned IDs; the reserved XTEST ID is only used for
+    // virtual-device properties.
     const XI_ALL_DEVICES: u16 = 0;
     let xi2_targets: Vec<ClientId> = state
         .clients

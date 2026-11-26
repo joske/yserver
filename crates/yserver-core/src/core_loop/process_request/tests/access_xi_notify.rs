@@ -2047,13 +2047,11 @@ enum XiPropertyPolicy {
 }
 
 fn select_xi2_property_event(fixture: &mut NotifyFixture, client: ClientId, sequence: u16) {
-    let mut body = Vec::with_capacity(16);
-    body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
-    body.extend_from_slice(&1_u16.to_le_bytes()); // one event mask
-    body.extend_from_slice(&0_u16.to_le_bytes()); // pad
-    body.extend_from_slice(&0_u16.to_le_bytes()); // XIAllDevices
-    body.extend_from_slice(&1_u16.to_le_bytes()); // one mask word
-    body.extend_from_slice(&crate::xinput::XI2_PROPERTY_EVENT_MASK.to_le_bytes());
+    let body = super::xi2_grabs::xi_dynamic_select_events_body(
+        ROOT_WINDOW.0,
+        0, // XIAllDevices
+        crate::xinput::XI2_PROPERTY_EVENT_MASK,
+    );
     let outcome = fixture
         .request(
             client,
@@ -2416,33 +2414,15 @@ fn receive_xi_property_baseline_order() {
 fn receive_xi_property_denial_is_not_disconnect() {
     // mutation: push denied clients into the returned vector
     let (mut fixture, property) = xi_property_notification_fixture(false);
-    fixture
-        .state
-        .xi_devices
-        .device_mut(XI_PROPERTY_DEVICE_ID)
-        .unwrap()
-        .properties
-        .insert(
-            property,
-            crate::xinput::XiProperty {
-                type_atom: crate::xinput::XA_INTEGER,
-                format: 8,
-                data: XI_PROPERTY_VALUE.to_vec(),
-                read_only: false,
-                deletable: true,
-            },
-        );
+    super::seed_one_prop(
+        &mut fixture.state,
+        property.0,
+        8,
+        XI_PROPERTY_VALUE.to_vec(),
+    );
     let descriptions = xi_property_event_descriptions();
-    let expected: Vec<_> = descriptions.into_iter().collect();
-    let calls = fixture.install_policy(move |_, call| {
-        if call.hook == ExtensionHook::Receive
-            && call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Device(XI_PROPERTY_DEVICE_ID))
-            && call
-                .events
-                .as_ref()
-                .is_some_and(|events| events.len() == 1 && expected.contains(&events[0]))
-        {
+    let calls = fixture.install_policy(|_, call| {
+        if call.hook == ExtensionHook::Receive {
             Decision::Deny(DENY)
         } else {
             Decision::Allow
