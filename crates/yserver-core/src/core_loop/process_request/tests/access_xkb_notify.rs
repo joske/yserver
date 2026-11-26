@@ -15,7 +15,10 @@ use crate::{
     host_x11::HostKeyEvent,
 };
 use std::{
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
@@ -719,6 +722,403 @@ fn install_deny_for(
             Decision::Allow
         }
     })
+}
+
+const XKB_INDICATOR_STATE_SELECT: u16 = 1 << 4;
+const XKB_INDICATOR_MAP_SELECT: u16 = 1 << 5;
+const XKB_NAMES_SELECT: u16 = 1 << 6;
+const XKB_COMPAT_MAP_SELECT: u16 = 1 << 7;
+const XKB_EXTENSION_DEVICE_SELECT: u16 = 1 << 11;
+const XKB_INDICATOR_EVENTS_SELECT: u16 = XKB_INDICATOR_STATE_SELECT
+    | XKB_INDICATOR_MAP_SELECT
+    | XKB_NAMES_SELECT
+    | XKB_COMPAT_MAP_SELECT
+    | XKB_EXTENSION_DEVICE_SELECT;
+const XKB_INDICATOR_FOLLOWUPS_SELECT: u16 =
+    (1 << 2) | XKB_INDICATOR_STATE_SELECT | XKB_EXTENSION_DEVICE_SELECT;
+
+fn indicator_fixture(selections: &[(ClientId, u16)]) -> NotifyFixture {
+    let mut fixture = NotifyFixture::new();
+    fixture.backend.xkb_info_result = Some((XKB_MAJOR_OPCODE, XKB_EVENT_BASE, 0));
+    for client in [
+        NOTIFY_SENDER,
+        NOTIFY_RECEIVER_DENIED,
+        NOTIFY_RECEIVER_ALLOWED,
+    ] {
+        initialize_xkb_client(&mut fixture, client, 0, 0);
+        let selected = selections
+            .iter()
+            .find_map(|(selected, which)| (*selected == client).then_some(*which))
+            .unwrap_or(0);
+        if selected != 0 {
+            let mut body = Vec::with_capacity(12);
+            body.extend_from_slice(&0x0100u16.to_le_bytes()); // XkbUseCoreKbd
+            body.extend_from_slice(&selected.to_le_bytes()); // affectWhich
+            body.extend_from_slice(&0u16.to_le_bytes()); // clear
+            body.extend_from_slice(&selected.to_le_bytes()); // selectAll
+            body.extend_from_slice(&0u16.to_le_bytes()); // affectMap
+            body.extend_from_slice(&0u16.to_le_bytes()); // map
+            assert!(matches!(
+                xkb_request(&mut fixture, client, 0x2020 + client.0 as u16, 1, &body),
+                RequestOutcome::Handled
+            ));
+            assert!(fixture.drain(client).is_empty(), "XkbSelectEvents is void");
+        }
+    }
+    for (client, sequence) in [
+        (NOTIFY_RECEIVER_DENIED, 0x1234),
+        (NOTIFY_RECEIVER_ALLOWED, 0x5678),
+    ] {
+        fixture
+            .state
+            .clients
+            .get(&client.0)
+            .expect("fixture client")
+            .last_sequence
+            .store(sequence, Ordering::Relaxed);
+    }
+    fixture.state.start_instant = std::time::Instant::now() + Duration::from_secs(30);
+    fixture
+}
+
+fn compat_map_notify() -> yserver_protocol::x11::XkbCompatMapNotify {
+    yserver_protocol::x11::XkbCompatMapNotify {
+        device_id: 1,
+        changed_groups: 5,
+        first_si: 0x0102,
+        n_si: 0x0304,
+        n_total_si: 0x0506,
+    }
+}
+
+fn names_notify() -> yserver_protocol::x11::XkbNamesNotify {
+    yserver_protocol::x11::XkbNamesNotify {
+        device_id: 1,
+        changed: 0x0123,
+        first_type: 0x12,
+        n_types: 0x03,
+        first_level_name: 0x04,
+        n_level_names: 0x05,
+        n_radio_groups: 0x06,
+        n_aliases: 0x07,
+        changed_group_names: 0x08,
+        changed_virtual_mods: 0x0910,
+        first_key: 0x0b,
+        n_keys: 0x0c,
+        changed_indicators: 0x0d0e_0f10,
+    }
+}
+
+fn indicator_maps_change() -> crate::backend::XkbIndicatorMapsChange {
+    crate::backend::XkbIndicatorMapsChange {
+        maps_changed: 0x0000_0002,
+        state_changed: 0x0000_0004,
+        state: 0x0000_0020,
+        leds_defined: 0x0000_0023,
+    }
+}
+
+fn indicator_names_change() -> XkbSetEvent {
+    XkbSetEvent::IndicatorNames {
+        leds_defined: 0x0000_0030,
+        state: 0x0000_0020,
+    }
+}
+
+fn drive_scripted_set_map(fixture: &mut NotifyFixture, events: Vec<XkbSetEvent>) {
+    script_xkb_set_outcome(
+        fixture,
+        XkbSetOutcome {
+            error: None,
+            events,
+        },
+    );
+    assert!(matches!(
+        drive_xkb_set_map(fixture, SET_MAP_SEQUENCE, &range_change_set_map_body()),
+        RequestOutcome::Handled
+    ));
+    assert!(fixture.drain(NOTIFY_SENDER).is_empty(), "XkbSetMap is void");
+    assert_no_writer_failures(fixture);
+}
+
+fn assert_xkb_notification_effects_match(denied: &NotifyFixture, allowed: &NotifyFixture) {
+    assert_eq!(denied.backend.xkb_mods, allowed.backend.xkb_mods);
+    assert_eq!(denied.state.xkb_announced, allowed.state.xkb_announced);
+    assert_eq!(
+        denied.state.xkb_announced_indicators,
+        allowed.state.xkb_announced_indicators
+    );
+    assert_eq!(
+        denied.state.keyboard_control.auto_repeats,
+        allowed.state.keyboard_control.auto_repeats
+    );
+}
+
+fn literal_xkb_indicator_notify(
+    sequence: u16,
+    kind: yserver_protocol::x11::XkbIndicatorNotifyKind,
+    state: u32,
+    changed: u32,
+) -> Vec<u8> {
+    let mut event = vec![
+        XKB_EVENT_BASE,
+        match kind {
+            yserver_protocol::x11::XkbIndicatorNotifyKind::State => 4,
+            yserver_protocol::x11::XkbIndicatorNotifyKind::Map => 5,
+        },
+    ];
+    append_event_u16(
+        &mut event,
+        yserver_protocol::x11::ClientByteOrder::LittleEndian,
+        sequence,
+    );
+    event.extend_from_slice(&[0; 4]); // timestamp
+    event.extend_from_slice(&[1, 0, 0, 0]); // device and pad
+    append_event_u32(
+        &mut event,
+        yserver_protocol::x11::ClientByteOrder::LittleEndian,
+        state,
+    );
+    append_event_u32(
+        &mut event,
+        yserver_protocol::x11::ClientByteOrder::LittleEndian,
+        changed,
+    );
+    finish_literal_event(event)
+}
+
+fn literal_xkb_compat_map_notify(
+    sequence: u16,
+    notify: yserver_protocol::x11::XkbCompatMapNotify,
+) -> Vec<u8> {
+    let mut event = vec![XKB_EVENT_BASE, 7]; // XkbCompatMapNotify
+    append_event_u16(
+        &mut event,
+        yserver_protocol::x11::ClientByteOrder::LittleEndian,
+        sequence,
+    );
+    event.extend_from_slice(&[0; 4]); // timestamp
+    event.extend_from_slice(&[notify.device_id, notify.changed_groups]);
+    for value in [notify.first_si, notify.n_si, notify.n_total_si] {
+        append_event_u16(
+            &mut event,
+            yserver_protocol::x11::ClientByteOrder::LittleEndian,
+            value,
+        );
+    }
+    finish_literal_event(event)
+}
+
+fn literal_xkb_names_notify(
+    sequence: u16,
+    notify: yserver_protocol::x11::XkbNamesNotify,
+) -> Vec<u8> {
+    let mut event = vec![XKB_EVENT_BASE, 6]; // XkbNamesNotify
+    append_event_u16(
+        &mut event,
+        yserver_protocol::x11::ClientByteOrder::LittleEndian,
+        sequence,
+    );
+    event.extend_from_slice(&[0; 4]); // timestamp
+    event.extend_from_slice(&[notify.device_id, 0]); // device and pad
+    append_event_u16(
+        &mut event,
+        yserver_protocol::x11::ClientByteOrder::LittleEndian,
+        notify.changed,
+    );
+    event.extend_from_slice(&[
+        notify.first_type,
+        notify.n_types,
+        notify.first_level_name,
+        notify.n_level_names,
+        0,
+        notify.n_radio_groups,
+        notify.n_aliases,
+        notify.changed_group_names,
+    ]);
+    append_event_u16(
+        &mut event,
+        yserver_protocol::x11::ClientByteOrder::LittleEndian,
+        notify.changed_virtual_mods,
+    );
+    event.extend_from_slice(&[notify.first_key, notify.n_keys]);
+    append_event_u32(
+        &mut event,
+        yserver_protocol::x11::ClientByteOrder::LittleEndian,
+        notify.changed_indicators,
+    );
+    finish_literal_event(event)
+}
+
+fn literal_xkb_extension_device_notify(
+    sequence: u16,
+    notify: yserver_protocol::x11::XkbExtensionDeviceNotify,
+) -> Vec<u8> {
+    let mut event = vec![XKB_EVENT_BASE, 11]; // XkbExtensionDeviceNotify
+    append_event_u16(
+        &mut event,
+        yserver_protocol::x11::ClientByteOrder::LittleEndian,
+        sequence,
+    );
+    event.extend_from_slice(&[0; 4]); // timestamp
+    event.extend_from_slice(&[notify.device_id, 0]); // device and pad
+    for value in [notify.reason, notify.led_class, notify.led_id] {
+        append_event_u16(
+            &mut event,
+            yserver_protocol::x11::ClientByteOrder::LittleEndian,
+            value,
+        );
+    }
+    for value in [notify.leds_defined, notify.led_state] {
+        append_event_u32(
+            &mut event,
+            yserver_protocol::x11::ClientByteOrder::LittleEndian,
+            value,
+        );
+    }
+    event.extend_from_slice(&[notify.first_btn, notify.n_btns]);
+    for value in [notify.supported, notify.unsupported] {
+        append_event_u16(
+            &mut event,
+            yserver_protocol::x11::ClientByteOrder::LittleEndian,
+            value,
+        );
+    }
+    finish_literal_event(event)
+}
+
+fn maps_extension_device_notify() -> yserver_protocol::x11::XkbExtensionDeviceNotify {
+    yserver_protocol::x11::XkbExtensionDeviceNotify {
+        device_id: 1,
+        reason: 0x18,
+        leds_defined: 0x23,
+        led_state: 0x20,
+        supported: 0x001f,
+        ..Default::default()
+    }
+}
+
+fn names_extension_device_notify() -> yserver_protocol::x11::XkbExtensionDeviceNotify {
+    yserver_protocol::x11::XkbExtensionDeviceNotify {
+        device_id: 1,
+        reason: 0x04,
+        leds_defined: 0x30,
+        led_state: 0x20,
+        supported: 0x001f,
+        ..Default::default()
+    }
+}
+
+fn literal_xkb_indicator_set_stream(sequence: u16) -> Vec<u8> {
+    let mut stream = literal_xkb_compat_map_notify(sequence, compat_map_notify());
+    append_frame(
+        &mut stream,
+        literal_xkb_names_notify(sequence, names_notify()),
+    );
+    append_frame(
+        &mut stream,
+        literal_xkb_indicator_notify(
+            sequence,
+            yserver_protocol::x11::XkbIndicatorNotifyKind::Map,
+            0x20,
+            0x02,
+        ),
+    );
+    append_frame(
+        &mut stream,
+        literal_xkb_indicator_notify(
+            sequence,
+            yserver_protocol::x11::XkbIndicatorNotifyKind::State,
+            0x20,
+            0x04,
+        ),
+    );
+    append_frame(
+        &mut stream,
+        literal_xkb_extension_device_notify(sequence, maps_extension_device_notify()),
+    );
+    append_frame(
+        &mut stream,
+        literal_xkb_extension_device_notify(sequence, names_extension_device_notify()),
+    );
+    stream
+}
+
+fn literal_xkb_key_indicator_stream(sequence: u16, include_state: bool) -> Vec<u8> {
+    let mut stream = Vec::new();
+    if include_state {
+        append_frame(
+            &mut stream,
+            literal_state_notify(sequence, 0x40, 0x40, 0, 0x1f03, 38, 2, 0, 0),
+        );
+    }
+    append_frame(
+        &mut stream,
+        literal_xkb_indicator_notify(
+            sequence,
+            yserver_protocol::x11::XkbIndicatorNotifyKind::State,
+            0x20,
+            0x20,
+        ),
+    );
+    append_frame(
+        &mut stream,
+        literal_xkb_extension_device_notify(
+            sequence,
+            yserver_protocol::x11::XkbExtensionDeviceNotify {
+                device_id: 1,
+                reason: 0x10,
+                leds_defined: 0x3f,
+                led_state: 0x20,
+                supported: 0x001f,
+                ..Default::default()
+            },
+        ),
+    );
+    stream
+}
+
+fn assert_single_xkb_notification_denied(
+    selection: u16,
+    event: XkbSetEvent,
+    expected_frame: impl Fn(u16) -> Vec<u8>,
+) {
+    let selections = [
+        (NOTIFY_RECEIVER_DENIED, selection),
+        (NOTIFY_RECEIVER_ALLOWED, selection),
+    ];
+    let mut denied = indicator_fixture(&selections);
+    let calls = install_deny_for(&mut denied, NOTIFY_RECEIVER_DENIED);
+    drive_scripted_set_map(&mut denied, vec![event.clone()]);
+    assert!(denied.drain(NOTIFY_RECEIVER_DENIED).is_empty());
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_ALLOWED),
+        expected_frame(0x5678)
+    );
+    assert_receive_calls(
+        &calls,
+        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
+        request_opcodes(XKB_MAJOR_OPCODE, 9),
+    );
+    let mut allowed = indicator_fixture(&selections);
+    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
+    drive_scripted_set_map(&mut allowed, vec![event]);
+    assert_eq!(
+        allowed.drain(NOTIFY_RECEIVER_DENIED),
+        expected_frame(0x1234)
+    );
+    assert_eq!(
+        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
+        expected_frame(0x5678)
+    );
+    assert_receive_calls(
+        &allow_calls,
+        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
+        request_opcodes(XKB_MAJOR_OPCODE, 9),
+    );
+    assert_xkb_notification_effects_match(&denied, &allowed);
+    assert_no_writer_failures(&denied);
+    assert_no_writer_failures(&allowed);
 }
 
 // Mutation: change K11's encoded request_minor from 5; this literal byte
@@ -1924,6 +2324,351 @@ fn receive_xkb_map_payload_device_subject() {
         &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
         &[None; 2],
         EventSubject::Device(3),
+    );
+    assert_no_writer_failures(&fixture);
+}
+
+// Mutation: change the encoded CompatMapNotify changed_groups field from 5;
+// the literal baseline must catch a valid-looking but different event.
+#[test]
+fn receive_xkb_indicators_no_policy_bytes() {
+    let selections = [
+        (NOTIFY_RECEIVER_DENIED, XKB_INDICATOR_EVENTS_SELECT),
+        (NOTIFY_RECEIVER_ALLOWED, XKB_INDICATOR_EVENTS_SELECT),
+    ];
+    let mut fixture = indicator_fixture(&selections);
+    assert!(!fixture.state.policies_installed());
+    drive_scripted_set_map(
+        &mut fixture,
+        vec![
+            XkbSetEvent::CompatMap(compat_map_notify()),
+            XkbSetEvent::Names(names_notify()),
+            XkbSetEvent::IndicatorMaps(indicator_maps_change()),
+            indicator_names_change(),
+        ],
+    );
+    assert!(fixture.drain(NOTIFY_SENDER).is_empty());
+    assert_eq!(
+        fixture.drain(NOTIFY_RECEIVER_DENIED),
+        literal_xkb_indicator_set_stream(0x1234)
+    );
+    assert_eq!(
+        fixture.drain(NOTIFY_RECEIVER_ALLOWED),
+        literal_xkb_indicator_set_stream(0x5678)
+    );
+}
+
+// Mutation: check K8 once per emission, then reuse that decision for every
+// recipient; the whole-log assertion requires a Receive call for each one.
+#[test]
+fn receive_xkb_indicator_maps_denies_one_kind() {
+    let selections = [
+        (
+            NOTIFY_RECEIVER_DENIED,
+            XKB_INDICATOR_MAP_SELECT | XKB_INDICATOR_STATE_SELECT | XKB_EXTENSION_DEVICE_SELECT,
+        ),
+        (NOTIFY_RECEIVER_ALLOWED, XKB_EXTENSION_DEVICE_SELECT),
+    ];
+    let mut denied = indicator_fixture(&selections);
+    let target_checks = Arc::new(AtomicUsize::new(0));
+    let calls = denied.install_policy({
+        let target_checks = Arc::clone(&target_checks);
+        move |_, check| {
+            if check.hook == ExtensionHook::Receive
+                && check.client == NOTIFY_RECEIVER_DENIED
+                && check.receive == Some(EventSubject::Device(1))
+                && check.events == Some(vec![XKB_EVENT_DESCRIPTION])
+                && target_checks.fetch_add(1, Ordering::Relaxed) == 1
+            {
+                Decision::Deny(DENY)
+            } else {
+                Decision::Allow
+            }
+        }
+    });
+    drive_scripted_set_map(
+        &mut denied,
+        vec![XkbSetEvent::IndicatorMaps(indicator_maps_change())],
+    );
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_DENIED),
+        [
+            literal_xkb_indicator_notify(
+                0x1234,
+                yserver_protocol::x11::XkbIndicatorNotifyKind::Map,
+                0x20,
+                0x02,
+            ),
+            literal_xkb_extension_device_notify(0x1234, maps_extension_device_notify()),
+        ]
+        .concat()
+    );
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_ALLOWED),
+        literal_xkb_extension_device_notify(0x5678, maps_extension_device_notify())
+    );
+    let expected_clients = [
+        NOTIFY_RECEIVER_DENIED,
+        NOTIFY_RECEIVER_DENIED,
+        NOTIFY_RECEIVER_DENIED,
+        NOTIFY_RECEIVER_ALLOWED,
+    ];
+    let expected_requests = [request_opcodes(XKB_MAJOR_OPCODE, 9); 4];
+    let log = receive_log(&calls);
+    assert_receive_calls_with_requests(
+        &log,
+        &expected_clients,
+        &expected_requests,
+        EventSubject::Device(1),
+    );
+    let receives: Vec<_> = log
+        .iter()
+        .filter(|call| call.hook == ExtensionHook::Receive)
+        .collect();
+    assert_eq!(
+        receives[2..]
+            .iter()
+            .map(|call| call.client)
+            .collect::<Vec<_>>(),
+        [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
+        "K8's ExtensionDeviceNotify is checked once for each selected recipient"
+    );
+    let mut allowed = indicator_fixture(&selections);
+    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
+    drive_scripted_set_map(
+        &mut allowed,
+        vec![XkbSetEvent::IndicatorMaps(indicator_maps_change())],
+    );
+    assert_eq!(
+        allowed.drain(NOTIFY_RECEIVER_DENIED),
+        [
+            literal_xkb_indicator_notify(
+                0x1234,
+                yserver_protocol::x11::XkbIndicatorNotifyKind::Map,
+                0x20,
+                0x02,
+            ),
+            literal_xkb_indicator_notify(
+                0x1234,
+                yserver_protocol::x11::XkbIndicatorNotifyKind::State,
+                0x20,
+                0x04,
+            ),
+            literal_xkb_extension_device_notify(0x1234, maps_extension_device_notify()),
+        ]
+        .concat()
+    );
+    assert_eq!(
+        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
+        literal_xkb_extension_device_notify(0x5678, maps_extension_device_notify())
+    );
+    assert_receive_calls_with_requests(
+        &receive_log(&allow_calls),
+        &expected_clients,
+        &expected_requests,
+        EventSubject::Device(1),
+    );
+    assert_xkb_notification_effects_match(&denied, &allowed);
+    assert_no_writer_failures(&denied);
+    assert_no_writer_failures(&allowed);
+}
+
+// Mutations: leave K10 unchecked, or return early from announce_xkb_state
+// after all StateNotify copies are denied; the indicator follow-ups and their
+// Receive assertions must still prove the snapshot and delivery order.
+#[test]
+fn receive_xkb_state_indicator_followups() {
+    let selections = [
+        (NOTIFY_RECEIVER_DENIED, XKB_INDICATOR_FOLLOWUPS_SELECT),
+        (NOTIFY_RECEIVER_ALLOWED, XKB_INDICATOR_FOLLOWUPS_SELECT),
+    ];
+    let mut denied = indicator_fixture(&selections);
+    denied.backend.xkb_mods = (0x40, 0x40, 0, 0);
+    denied.backend.xkb_indicators_result = (0x20, 0x3f);
+    let denied_checks = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+    let calls = denied.install_policy({
+        let denied_checks = denied_checks.clone();
+        move |_, check| {
+            if check.hook == ExtensionHook::Receive
+                && check.receive == Some(EventSubject::Device(1))
+                && check.events == Some(vec![XKB_EVENT_DESCRIPTION])
+            {
+                let count = match check.client {
+                    NOTIFY_RECEIVER_DENIED => denied_checks[0].fetch_add(1, Ordering::Relaxed),
+                    NOTIFY_RECEIVER_ALLOWED => denied_checks[1].fetch_add(1, Ordering::Relaxed),
+                    _ => return Decision::Allow,
+                };
+                if count == 0 {
+                    return Decision::Deny(DENY);
+                }
+            }
+            Decision::Allow
+        }
+    });
+    let dropped = key_event_fanout_to_state(
+        &mut denied.state,
+        &mut denied.backend,
+        HostKeyEvent {
+            origin: InputOrigin::NestedHost,
+            pressed: true,
+            keycode: 38,
+            time: 0x5678,
+            root_x: 0,
+            root_y: 0,
+            event_x: 0,
+            event_y: 0,
+            state: 0,
+        },
+    );
+    assert!(dropped.is_empty());
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_DENIED),
+        literal_xkb_key_indicator_stream(0x1234, false)
+    );
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_ALLOWED),
+        literal_xkb_key_indicator_stream(0x5678, false)
+    );
+    assert_eq!(denied.state.xkb_announced, (0, (0x40, 0x40, 0, 0)));
+    assert_eq!(denied.state.xkb_announced_indicators, 0x20);
+    assert_receive_calls_with_requests(
+        &receive_log(&calls),
+        &[
+            NOTIFY_RECEIVER_DENIED,
+            NOTIFY_RECEIVER_ALLOWED,
+            NOTIFY_RECEIVER_DENIED,
+            NOTIFY_RECEIVER_ALLOWED,
+            NOTIFY_RECEIVER_DENIED,
+            NOTIFY_RECEIVER_ALLOWED,
+        ],
+        &[None; 6],
+        EventSubject::Device(1),
+    );
+    let mut allowed = indicator_fixture(&selections);
+    allowed.backend.xkb_mods = (0x40, 0x40, 0, 0);
+    allowed.backend.xkb_indicators_result = (0x20, 0x3f);
+    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
+    let dropped = key_event_fanout_to_state(
+        &mut allowed.state,
+        &mut allowed.backend,
+        HostKeyEvent {
+            origin: InputOrigin::NestedHost,
+            pressed: true,
+            keycode: 38,
+            time: 0x5678,
+            root_x: 0,
+            root_y: 0,
+            event_x: 0,
+            event_y: 0,
+            state: 0,
+        },
+    );
+    assert!(dropped.is_empty());
+    assert_eq!(
+        allowed.drain(NOTIFY_RECEIVER_DENIED),
+        literal_xkb_key_indicator_stream(0x1234, true)
+    );
+    assert_eq!(
+        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
+        literal_xkb_key_indicator_stream(0x5678, true)
+    );
+    assert_receive_calls_with_requests(
+        &receive_log(&allow_calls),
+        &[
+            NOTIFY_RECEIVER_DENIED,
+            NOTIFY_RECEIVER_ALLOWED,
+            NOTIFY_RECEIVER_DENIED,
+            NOTIFY_RECEIVER_ALLOWED,
+            NOTIFY_RECEIVER_DENIED,
+            NOTIFY_RECEIVER_ALLOWED,
+        ],
+        &[None; 6],
+        EventSubject::Device(1),
+    );
+    assert_xkb_notification_effects_match(&denied, &allowed);
+    assert_no_writer_failures(&denied);
+    assert_no_writer_failures(&allowed);
+}
+
+// Mutation: leave K6 (NamesNotify) unchecked; its target's literal stream
+// and the Receive count must fail.
+#[test]
+fn receive_xkb_names_denied() {
+    assert_single_xkb_notification_denied(
+        XKB_NAMES_SELECT,
+        XkbSetEvent::Names(names_notify()),
+        |sequence| literal_xkb_names_notify(sequence, names_notify()),
+    );
+}
+
+// Mutation: leave K5 (CompatMapNotify) unchecked; its target's literal stream
+// and the Receive count must fail.
+#[test]
+fn receive_xkb_compat_map_denied() {
+    assert_single_xkb_notification_denied(
+        XKB_COMPAT_MAP_SELECT,
+        XkbSetEvent::CompatMap(compat_map_notify()),
+        |sequence| literal_xkb_compat_map_notify(sequence, compat_map_notify()),
+    );
+}
+
+// Mutation: leave K7's IndicatorNames ExtensionDeviceNotify unchecked; the
+// target's literal stream and the Receive count must fail.
+#[test]
+fn receive_xkb_indicator_names_denied() {
+    assert_single_xkb_notification_denied(
+        XKB_EXTENSION_DEVICE_SELECT,
+        indicator_names_change(),
+        |sequence| literal_xkb_extension_device_notify(sequence, names_extension_device_notify()),
+    );
+}
+
+// Mutation: leave K5 unchecked; this explicit Allow control pins all six
+// event emissions and each recipient's per-event Receive call.
+#[test]
+fn receive_xkb_indicators_allow_control() {
+    let selections = [
+        (NOTIFY_RECEIVER_DENIED, XKB_INDICATOR_EVENTS_SELECT),
+        (NOTIFY_RECEIVER_ALLOWED, XKB_INDICATOR_EVENTS_SELECT),
+    ];
+    let mut fixture = indicator_fixture(&selections);
+    let calls = fixture.install_policy(|_, _| Decision::Allow);
+    drive_scripted_set_map(
+        &mut fixture,
+        vec![
+            XkbSetEvent::CompatMap(compat_map_notify()),
+            XkbSetEvent::Names(names_notify()),
+            XkbSetEvent::IndicatorMaps(indicator_maps_change()),
+            indicator_names_change(),
+        ],
+    );
+    assert_eq!(
+        fixture.drain(NOTIFY_RECEIVER_DENIED),
+        literal_xkb_indicator_set_stream(0x1234)
+    );
+    assert_eq!(
+        fixture.drain(NOTIFY_RECEIVER_ALLOWED),
+        literal_xkb_indicator_set_stream(0x5678)
+    );
+    let clients = [
+        NOTIFY_RECEIVER_DENIED,
+        NOTIFY_RECEIVER_ALLOWED,
+        NOTIFY_RECEIVER_DENIED,
+        NOTIFY_RECEIVER_ALLOWED,
+        NOTIFY_RECEIVER_DENIED,
+        NOTIFY_RECEIVER_ALLOWED,
+        NOTIFY_RECEIVER_DENIED,
+        NOTIFY_RECEIVER_ALLOWED,
+        NOTIFY_RECEIVER_DENIED,
+        NOTIFY_RECEIVER_ALLOWED,
+        NOTIFY_RECEIVER_DENIED,
+        NOTIFY_RECEIVER_ALLOWED,
+    ];
+    assert_receive_calls_with_requests(
+        &receive_log(&calls),
+        &clients,
+        &[request_opcodes(XKB_MAJOR_OPCODE, 9); 12],
+        EventSubject::Device(1),
     );
     assert_no_writer_failures(&fixture);
 }

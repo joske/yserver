@@ -284,9 +284,19 @@ pub(crate) fn send_xkb_compat_map_notify(
     notify: x11::XkbCompatMapNotify,
 ) {
     let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| i.compat != 0);
-    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-        let _ = x11::write_xkb_compat_map_notify(buf, order, seq, xkb_event_base, notify);
-    });
+    let description = xkb_event_description(xkb_event_base);
+    let events = EventBatch::new(std::slice::from_ref(&description));
+    // This XKB Receive check is a yserver rule; Xorg emits native XKB events
+    // without one.
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &recipients,
+        EventSubject::Device(u16::from(notify.device_id)),
+        &events,
+        |buf, seq, order| {
+            let _ = x11::write_xkb_compat_map_notify(buf, order, seq, xkb_event_base, notify);
+        },
+    );
 }
 
 /// `XkbSendNamesNotify`: to every XKB-initialised client whose names
@@ -298,9 +308,19 @@ pub(crate) fn send_xkb_names_notify(
 ) {
     let recipients =
         crate::core_loop::xkb_select::interest_recipients(state, |i| i.names & notify.changed != 0);
-    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-        let _ = x11::write_xkb_names_notify(buf, order, seq, xkb_event_base, notify);
-    });
+    let description = xkb_event_description(xkb_event_base);
+    let events = EventBatch::new(std::slice::from_ref(&description));
+    // This XKB Receive check is a yserver rule; Xorg emits native XKB events
+    // without one.
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &recipients,
+        EventSubject::Device(u16::from(notify.device_id)),
+        &events,
+        |buf, seq, order| {
+            let _ = x11::write_xkb_names_notify(buf, order, seq, xkb_event_base, notify);
+        },
+    );
 }
 
 /// `_XkbSetNames`' ExtensionDeviceNotify after new indicator names: reason
@@ -328,9 +348,19 @@ pub(crate) fn send_indicator_names_change(
     let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| {
         i.extension_device & XI_INDICATOR_NAMES_MASK != 0
     });
-    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-        let _ = x11::write_xkb_extension_device_notify(buf, order, seq, xkb_event_base, notify);
-    });
+    let description = xkb_event_description(xkb_event_base);
+    let events = EventBatch::new(std::slice::from_ref(&description));
+    // This XKB Receive check is a yserver rule; Xorg emits native XKB events
+    // without one.
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &recipients,
+        EventSubject::Device(u16::from(notify.device_id)),
+        &events,
+        |buf, seq, order| {
+            let _ = x11::write_xkb_extension_device_notify(buf, order, seq, xkb_event_base, notify);
+        },
+    );
 }
 
 /// `XkbXI_IndicatorNamesMask`.
@@ -404,9 +434,19 @@ fn send_led_extension_device_notify(
     let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| {
         i.extension_device & reason != 0
     });
-    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-        let _ = x11::write_xkb_extension_device_notify(buf, order, seq, xkb_event_base, notify);
-    });
+    let description = xkb_event_description(xkb_event_base);
+    let events = EventBatch::new(std::slice::from_ref(&description));
+    // This XKB Receive check is a yserver rule; Xorg emits native XKB events
+    // without one.
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &recipients,
+        EventSubject::Device(u16::from(notify.device_id)),
+        &events,
+        |buf, seq, order| {
+            let _ = x11::write_xkb_extension_device_notify(buf, order, seq, xkb_event_base, notify);
+        },
+    );
 }
 
 /// Apply the per-key auto-repeat a mapping change re-derived for its keys
@@ -499,9 +539,19 @@ fn send_indicator_notify(
         x11::XkbIndicatorNotifyKind::Map => i.indicator_map & changed != 0,
         x11::XkbIndicatorNotifyKind::State => i.indicator_state & changed != 0,
     });
-    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-        let _ = x11::write_xkb_indicator_notify(buf, order, seq, xkb_event_base, notify);
-    });
+    let description = xkb_event_description(xkb_event_base);
+    let events = EventBatch::new(std::slice::from_ref(&description));
+    // This XKB Receive check is a yserver rule; Xorg emits native XKB events
+    // without one.
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &recipients,
+        EventSubject::Device(u16::from(notify.device_id)),
+        &events,
+        |buf, seq, order| {
+            let _ = x11::write_xkb_indicator_notify(buf, order, seq, xkb_event_base, notify);
+        },
+    );
 }
 
 /// Decode the group-lock target from an `xkbLatchLockStateReq` body (the bytes
