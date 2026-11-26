@@ -143,22 +143,30 @@ pub fn apply_rules_names_change(state: &mut ServerState, backend: &mut dyn Backe
 
     // 2. XKB events only to clients that selected them (XkbSelectEvents).
     let nkn = subscribers(state, 0x0001); // XkbNewKeyboardNotifyMask
-    let _dropped = fanout_event_to_clients(state, &nkn, |buf, seq, order| {
-        let _ = x11::write_xkb_new_keyboard_notify(
-            buf,
-            order,
-            seq,
-            xkb_event_base,
-            1,
-            min_kc,
-            max_kc,
-            min_kc,
-            max_kc,
-            0,      // requestMajor — internal rules-names change, no request
-            0,      // requestMinor
-            0x0001, // changed = XkbNKN_KeycodesMask
-        );
-    });
+    let description = [xkb_event_description(xkb_event_base)];
+    let events = EventBatch::new(&description);
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &nkn,
+        EventSubject::Device(1),
+        &events,
+        |buf, seq, order| {
+            let _ = x11::write_xkb_new_keyboard_notify(
+                buf,
+                order,
+                seq,
+                xkb_event_base,
+                1,
+                min_kc,
+                max_kc,
+                min_kc,
+                max_kc,
+                0,      // requestMajor — internal rules-names change, no request
+                0,      // requestMinor
+                0x0001, // changed = XkbNKN_KeycodesMask
+            );
+        },
+    );
     // n_types = 4 in phase A; a later task (C2) changes this to the
     // backend's derived type count once GetMap publishes the real table.
     send_xkb_map_notify(
@@ -183,9 +191,17 @@ pub(crate) fn send_xkb_map_notify(
     notify: x11::XkbMapNotify,
 ) -> Vec<ClientId> {
     let recipients = crate::core_loop::xkb_select::map_notify_recipients(state, notify.changed);
-    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-        let _ = x11::write_xkb_map_notify(buf, order, seq, xkb_event_base, notify);
-    });
+    let description = [xkb_event_description(xkb_event_base)];
+    let events = EventBatch::new(&description);
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &recipients,
+        EventSubject::Device(u16::from(notify.device_id)),
+        &events,
+        |buf, seq, order| {
+            let _ = x11::write_xkb_map_notify(buf, order, seq, xkb_event_base, notify);
+        },
+    );
     recipients
 }
 

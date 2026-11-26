@@ -750,7 +750,9 @@ fn run_xi_mapping(
     (outputs, calls, keymap)
 }
 
-fn run_xkb_mapping(deny_receive: bool) -> (Vec<Vec<u8>>, Vec<RecordedExtensionCheck>) {
+fn run_xkb_mapping(
+    deny_receive: bool,
+) -> (Vec<Vec<u8>>, Vec<RecordedExtensionCheck>, Vec<ClientId>) {
     let mut fixture = NotifyFixture::new();
     fixture.state.start_instant = std::time::Instant::now() + std::time::Duration::from_secs(30);
     assert!(crate::core_loop::xkb_select::use_extension(
@@ -786,7 +788,14 @@ fn run_xkb_mapping(deny_receive: bool) -> (Vec<Vec<u8>>, Vec<RecordedExtensionCh
             }
         })
     });
-    fixture
+    let receive_order: Vec<_> = fixture
+        .state
+        .clients
+        .keys()
+        .copied()
+        .map(ClientId)
+        .collect();
+    let outcome = fixture
         .request(
             NOTIFY_SENDER,
             SequenceNumber(3),
@@ -798,6 +807,11 @@ fn run_xkb_mapping(deny_receive: bool) -> (Vec<Vec<u8>>, Vec<RecordedExtensionCh
             &[],
         )
         .expect("XkbGetKbdByName");
+    assert!(matches!(outcome, RequestOutcome::Handled));
+    assert!(
+        client_io::failed_writers(&fixture.state.clients).is_empty(),
+        "XKB notification fanout has no failed writers"
+    );
     let outputs = [
         NOTIFY_SENDER,
         NOTIFY_RECEIVER_DENIED,
@@ -807,7 +821,7 @@ fn run_xkb_mapping(deny_receive: bool) -> (Vec<Vec<u8>>, Vec<RecordedExtensionCh
     .map(|client| fixture.drain(client))
     .collect();
     let calls = checks.map_or_else(Vec::new, |calls| calls.lock().unwrap().clone());
-    (outputs, calls)
+    (outputs, calls, receive_order)
 }
 
 fn run_present_configure(
@@ -948,7 +962,7 @@ fn receive_deny_all_keeps_later_extension_writers() {
         })
     );
 
-    let (xkb_baseline, _) = run_xkb_mapping(false);
+    let (xkb_baseline, _, _) = run_xkb_mapping(false);
     let mut expected_new_keyboard = [0_u8; 32];
     expected_new_keyboard[0] = 85;
     expected_new_keyboard[2..4].copy_from_slice(&3_u16.to_le_bytes());
@@ -988,19 +1002,53 @@ fn receive_deny_all_keeps_later_extension_writers() {
         xkb_baseline[2], xkb_receiver_expected,
         "complete no-policy XKB legacy frames for second receiver"
     );
-    let (xkb_denied, xkb_calls) = run_xkb_mapping(true);
+    let (xkb_denied, xkb_calls, xkb_receive_order) = run_xkb_mapping(true);
+    let xkb_sender_denied_expected = [
+        literal_mapping_notify(3, 1, 8, 248),
+        literal_mapping_notify(3, 0, 0, 0),
+        literal_empty_reply(3, 0),
+    ]
+    .concat();
     assert_eq!(
-        xkb_denied, xkb_baseline,
-        "XKB and direct reply bytes survive"
+        xkb_denied[0], xkb_sender_denied_expected,
+        "NewKeyboardNotify is denied but core MappingNotify and reply remain in order"
     );
+    let xkb_receiver_denied_expected = [
+        literal_mapping_notify(0, 1, 8, 248),
+        literal_mapping_notify(0, 0, 0, 0),
+    ]
+    .concat();
+    assert_eq!(xkb_denied[1], xkb_receiver_denied_expected);
+    assert_eq!(xkb_denied[2], xkb_receiver_denied_expected);
     assert_eq!(
-        xkb_denied[0], xkb_sender_expected,
-        "XKB output stays complete"
+        xkb_calls
+            .iter()
+            .filter(|call| call.hook == ExtensionHook::Receive)
+            .count(),
+        3,
+        "whole-log Receive count"
     );
     assert!(
-        receive_calls(&xkb_calls).is_empty(),
-        "MappingNotify remains exempt"
+        xkb_calls
+            .iter()
+            .all(|call| call.hook != ExtensionHook::Send)
     );
+    let xkb_receive_calls = receive_calls(&xkb_calls);
+    for (call, client) in xkb_receive_calls.iter().zip(xkb_receive_order) {
+        assert_eq!(call.client, client);
+        assert_eq!(call.receive, Some(crate::access::EventSubject::Device(1)));
+        assert_eq!(
+            call.events,
+            Some(vec![EventDescription::extension(85, 136, 0)])
+        );
+        assert_eq!(
+            call.request,
+            Some(crate::access::RequestOpcodes {
+                major: 136,
+                minor: 23,
+            })
+        );
+    }
 
     let (present_baseline, _, baseline_position) = run_present_configure(None);
     let present_expected = [literal_present_configure(4), literal_core_configure(4)].concat();
