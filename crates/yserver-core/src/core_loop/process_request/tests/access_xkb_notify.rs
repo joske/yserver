@@ -2664,9 +2664,9 @@ fn receive_xkb_compat_map_denied() {
     );
 }
 
-// Mutation: make K7 require a NamesNotify selection; the extension-only
-// recipient must still get K7 under Allow. The combined recipient also pins
-// NamesNotify before ExtensionDeviceNotify.
+// Mutations: leave K7 unchecked (the combined subscriber's denied K7 copy
+// leaks), or add a NamesNotify requirement to K7's subscription predicate (the
+// extension-only recipient loses its K7 check). Both fail this test.
 #[test]
 fn receive_xkb_indicator_names_denied() {
     let selections = [
@@ -2678,15 +2678,15 @@ fn receive_xkb_indicator_names_denied() {
     ];
     let mut denied = indicator_fixture(&selections);
     seed_request_xkb_snapshots(&mut denied);
-    let extension_only_checks = Arc::new(AtomicUsize::new(0));
+    let combined_subscriber_checks = Arc::new(AtomicUsize::new(0));
     let calls = denied.install_policy({
-        let extension_only_checks = Arc::clone(&extension_only_checks);
+        let combined_subscriber_checks = Arc::clone(&combined_subscriber_checks);
         move |_, check| {
             if check.hook == ExtensionHook::Receive
-                && check.client == NOTIFY_RECEIVER_ALLOWED
+                && check.client == NOTIFY_RECEIVER_DENIED
                 && check.receive == Some(EventSubject::Device(1))
                 && check.events == Some(vec![XKB_EVENT_DESCRIPTION])
-                && extension_only_checks.fetch_add(1, Ordering::Relaxed) == 0
+                && combined_subscriber_checks.fetch_add(1, Ordering::Relaxed) == 1
             {
                 Decision::Deny(DENY)
             } else {
@@ -2701,11 +2701,6 @@ fn receive_xkb_indicator_names_denied() {
         &XKB_SET_NAMES_BODY,
         vec![XkbSetEvent::Names(names_notify()), indicator_names_change()],
     );
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_DENIED),
-        literal_xkb_names_set_stream(0x1234)
-    );
-    assert_eq!(denied.drain(NOTIFY_RECEIVER_ALLOWED), Vec::<u8>::new());
     assert_receive_calls_with_requests(
         &receive_log(&calls),
         &[
@@ -2715,6 +2710,14 @@ fn receive_xkb_indicator_names_denied() {
         ],
         &[request_opcodes(XKB_MAJOR_OPCODE, 18); 3],
         EventSubject::Device(1),
+    );
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_DENIED),
+        literal_xkb_names_notify(0x1234, names_notify())
+    );
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_ALLOWED),
+        literal_xkb_extension_device_notify(0x5678, names_extension_device_notify())
     );
 
     let mut allowed = indicator_fixture(&selections);

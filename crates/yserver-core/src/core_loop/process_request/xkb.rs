@@ -280,9 +280,9 @@ pub(super) fn handle_xkb_request(
                 // overrides must not keep shadowing it (see the identical
                 // fix + rationale in `apply_rules_names_change`).
                 state.keymap_overrides.clear();
-                // Legacy core MappingNotify(Keyboard) + MappingNotify(Modifier)
-                // to ALL clients, mirroring Xorg's XkbSendLegacyMapNotify
-                // companion to XkbSendNewKeyboardNotify. XKB-unaware clients
+                // yserver currently sends the legacy core
+                // MappingNotify(Keyboard) + MappingNotify(Modifier) pair to
+                // ALL clients before NewKeyboardNotify. XKB-unaware clients
                 // (any plain-X11 WM that never calls XkbSelectEvents — e.g.
                 // one that resolves keybinds via XKeysymToKeycode once at
                 // startup) never see XkbNewKeyboardNotify, so without this
