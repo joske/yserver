@@ -4,7 +4,8 @@
 
 Issue #387: Marvel Rivals runs at parity with Xorg in its menu. During a match it drops to 100–170 fps, against
 ~190 on Xorg, and it gets worse the longer the session lasts. During the match the GPU sits at 54–65%, against 86%
-on Xorg, so the frame rate is limited on the server side.
+on Xorg. The likely limit is on the server side, but the sweep's share of the frame-rate gap is not measured;
+the branch build's before/after run is what quantifies it.
 
 The reporter's CPU profile of yserver during a match (`perf`, 21K samples) settles where the time goes:
 - `XBackend::collect_released_cursors` accounts for **31.6% of sampled cycles**;
@@ -29,13 +30,16 @@ The core calls `backend.free_cursor` only once no cursor XID and no core window 
   `cursor_referenced` about it. `cursor_referenced` scans every window and every frame of every animated cursor.
   One call costs O(R × (W + F)) per pass. R is released cursors still referenced, which in practice means the
   frames of live animated cursors. W is windows and F is animation frames.
-- **How often it runs.** It runs after every `FreeCursor`, every effective-cursor refresh, every grab-cursor change,
+- **How often it runs.** It runs after every backend `free_cursor` of a known record, every effective-cursor refresh, every grab-cursor change,
   every window-cursor change, every `ReplaceCursor` and every window destruction with a cursor (`cursor.rs:405, 996,
   1033, 1049, 1145`, `windows.rs:1990`).
   - In a match the game sends about 60 `ChangeWindowAttributes` a second, and it is the longest request at
     1.6–2.5 ms. The opcode telemetry does not record the attribute mask, so how many of those change the cursor is
     not known. The refresh path also returns early when the effective cursor does not change.
-  - Proton re-grabs the pointer about 60 times a second, and every grab calls the sweep.
+  - Proton re-grabs the pointer about 60 times a second, and every successful grab activation calls the sweep.
+  - A cursor-changing `ChangeWindowAttributes` can also run the core's `cursor_host_referenced` scan when it drops
+    the old host cursor (`windows.rs:1738`). That stays in the request path. It is outside this fix and outside the
+    measured hotspot.
 - **Why it gets worse over time.** This is plausible but not measured: the logs track neither R nor F over time,
   and reclamation can shrink both. Both grow with the animated cursors alive in the session: themed progress and
   busy cursors from browsers and desktops, plus the game's own. That would match the slowdown over session time,
@@ -105,6 +109,10 @@ zero-count path does screen cleanup and can release animation frames.
     destruction (`windows.rs:1983-1990`), window creation (`windows.rs:1708`), and the Composite overlay paths:
     teardown in `finish_cow_release` (`overlay.rs:19`), the projection rebuilt on deferred reacquisition
     (`overlay.rs:94-110`), and the fresh overlay insertion (`overlay.rs:193`).
+  - Test fixtures that insert populated window entries directly (for example `tests/pointer.rs:868`) or clear
+    scalar slots directly (`tests/commit_identity/recording_scene.rs:800-859`) bypass the bookkeeping. That is
+    allowed only in tests that do not exercise cursor lifecycle. The lifecycle and scaling tests go through the
+    helpers and the backend entry points.
   - The InputOnly stand-in projection (`pointer.rs:100-115`) copies cursor state only to select a cursor, and it is
     not part of today's reference predicate. It stays excluded from `cursor_refs`, so a cached stand-in can never
     extend a cursor's lifetime.
@@ -129,9 +137,16 @@ zero-count path does screen cleanup and can release animation frames.
   increments a cumulative `cursor_reclaim_checks: u64` on `XBackend`. It is cumulative, not a per-second bucket. Any
   scan over `released_cursors`, rejected visits included, has to pass through it. The scaling test reads the delta;
   production code has no `cfg(test)`. The existing cursor telemetry can report its rate.
-- **Single decref site.** A cursor's records and sprite are removed only inside `collect_released_cursors`. This is
-  grep-checkable: `cursor_records.remove`, `cursor_pixmaps.remove` and the sprite `store_decref_with_invalidate`
-  for cursors appear nowhere else. That alone keeps reclamation at the existing points.
+- **Single reclamation site.** Reclaiming a published cursor, meaning removing its `cursor_records` /
+  `anim_cursor_records` entry and decref'ing the sprite it owns, happens only inside `collect_released_cursors`.
+  - Two other sprite operations stay where they are, because they are not reclamation: the stale pixmap-alias swap
+    in `swap_anim_frame_into_maps` (`cursor.rs:630`), and the decref of a freshly allocated sprite whose upload
+    failed (`cursor.rs:171`).
+  - **Ordering.** Reclamation order relative to the effective-cursor assignment, animation sync and `CursorNotify`
+    queueing is preserved by leaving every `collect_released_cursors` call site exactly where it is. That is a
+    review check on the diff, not a runtime assertion. The order is internal: it is not observable by clients.
+    Testing it at runtime would need instrumentation at the decref, and a real sprite's store entry can outlive the
+    decref behind a GPU fence.
 
 ## Tests
 
