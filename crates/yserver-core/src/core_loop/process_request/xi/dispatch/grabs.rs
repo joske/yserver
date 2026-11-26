@@ -1,8 +1,8 @@
 use crate::{
-    access::{AccessMode, RequestOpcodes, ResourceKind},
+    access::{AccessMode, EventBatch, EventSubject, RequestOpcodes, ResourceKind},
     backend::{Backend, OriginContext},
     core_loop::{
-        fanout::fanout_event_to_clients,
+        fanout::fanout_event_to_clients_with_receive,
         key_fanout::replay_frozen_key_to_focus,
         pointer_fanout::{PointerReplay, replay_frozen_pointer_event_to_state},
         process_request::{
@@ -299,10 +299,9 @@ pub(super) fn handle_xi_grab_device(
                 "client {} #{} XIGrabDevice window=0x{:x} deviceid={} cursor=0x{:x} -> Success",
                 client_id.0, sequence.0, grab_window, deviceid, cursor
             );
-            // Synthesised XI2 crossings on grab activation. Matches
-            // Xorg `Xi/exevents.c::ActivateKeyboardGrab` /
-            // `ActivatePointerGrab` (which call `DoEnterLeaveEvents`
-            // with `NotifyGrab`). Without these GTK3 popup state
+            // yserver synthesizes these XI2 notifications directly to the
+            // grab owner. Xorg's keyboard-grab FocusIn goes through the
+            // selected window path (`dix/enterleave.c:817`). Without these GTK3 popup state
             // machines never engage their hover/click tracking — the
             // menu is visible but items don't highlight or activate
             // on click. Captured in `mate-xorg.xtrace` as the pair
@@ -319,11 +318,9 @@ pub(super) fn handle_xi_grab_device(
             let (root_x, root_y) = pointer_xy;
             let server_time = state.timestamp_now();
             // Emit one XI2 crossing (Enter/Leave/FocusIn/FocusOut) on a
-            // single window with an explicit detail code, mode
-            // NotifyGrab. The keyboard-focus path drives this directly;
-            // the pointer path drives it from a crossing chain so the
-            // detail codes — and the `from == to` no-op — match Xorg's
-            // `DoEnterLeaveEvents`.
+            // single window with an explicit detail code and NotifyGrab
+            // mode. The pointer path uses a crossing chain so its detail
+            // codes and `from == to` no-op match Xorg's transition.
             let emit_xi_crossing = |state: &mut ServerState,
                                     evtype: u16,
                                     target_window: ResourceId,
@@ -334,28 +331,36 @@ pub(super) fn handle_xi_grab_device(
                 let event_y =
                     i16::try_from(i32::from(root_y).saturating_sub(origin_y)).unwrap_or(i16::MAX);
                 let focus = !matches!(evtype, 9 | 10) && state.crossing_has_focus(target_window);
-                let _dropped = fanout_event_to_clients(state, &[client_id], |out, seq, order| {
-                    x11::encode_xi2_crossing_event(
-                        out,
-                        order,
-                        seq,
-                        XI2_MAJOR_OPCODE,
-                        evtype,
-                        deviceid,
-                        server_time,
-                        ROOT_WINDOW,
-                        target_window,
-                        root_x,
-                        root_y,
-                        event_x,
-                        event_y,
-                        0,
-                        1, // mode = NotifyGrab
-                        detail,
-                        deviceid,
-                        focus,
-                    );
-                });
+                let description = crate::xinput::xi2_event_description(evtype);
+                let events = EventBatch::new(std::slice::from_ref(&description));
+                let _dropped = fanout_event_to_clients_with_receive(
+                    state,
+                    &[client_id],
+                    EventSubject::Window(target_window),
+                    &events,
+                    |out, seq, order| {
+                        x11::encode_xi2_crossing_event(
+                            out,
+                            order,
+                            seq,
+                            XI2_MAJOR_OPCODE,
+                            evtype,
+                            deviceid,
+                            server_time,
+                            ROOT_WINDOW,
+                            target_window,
+                            root_x,
+                            root_y,
+                            event_x,
+                            event_y,
+                            0,
+                            1, // mode = NotifyGrab
+                            detail,
+                            deviceid,
+                            focus,
+                        );
+                    },
+                );
             };
             if is_keyboard {
                 // Keyboard grab → focus transitions (Xorg
@@ -461,8 +466,8 @@ pub(super) fn handle_xi_ungrab_device(
 }
 
 /// Deactivate `owner`'s XI2 grab on `deviceid`, if it holds one, and send the
-/// owner the `NotifyUngrab` events (Xorg `DeactivatePointerGrab` /
-/// `DeactivateKeyboardGrab`). XIUngrabDevice and window destroy.
+/// owner's yserver-synthesized `NotifyUngrab` events. XIUngrabDevice and
+/// window destroy.
 pub(in crate::core_loop::process_request) fn deactivate_xi2_device_grab(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -472,12 +477,10 @@ pub(in crate::core_loop::process_request) fn deactivate_xi2_device_grab(
     is_keyboard: bool,
     is_master: bool,
 ) {
-    // Capture grab_window BEFORE clearing — we synthesize the
-    // matching XI2 crossing with `NotifyUngrab` on the way out
-    // so the client's grab state machine pairs cleanly with
-    // its earlier NotifyGrab. Matches Xorg
-    // `Xi/exevents.c::DeactivateKeyboardGrab` /
-    // `DeactivatePointerGrab`.
+    // Capture grab_window BEFORE clearing — yserver synthesizes the
+    // matching `NotifyUngrab` events directly to the owner so its grab state
+    // machine pairs cleanly with its earlier NotifyGrab. Xorg's keyboard
+    // focus events go through window selections (`dix/enterleave.c:817`).
     let grab_window_for_event: Option<ResourceId> = if is_keyboard && is_master {
         state
             .active_keyboard_grab
@@ -550,28 +553,36 @@ pub(in crate::core_loop::process_request) fn deactivate_xi2_device_grab(
                 let event_y =
                     i16::try_from(i32::from(root_y).saturating_sub(origin_y)).unwrap_or(i16::MAX);
                 let focus = !matches!(evtype, 9 | 10) && state.crossing_has_focus(target_window);
-                let _dropped = fanout_event_to_clients(state, &[owner], |out, seq, order| {
-                    x11::encode_xi2_crossing_event(
-                        out,
-                        order,
-                        seq,
-                        XI2_MAJOR_OPCODE,
-                        evtype,
-                        deviceid,
-                        server_time,
-                        ROOT_WINDOW,
-                        target_window,
-                        root_x,
-                        root_y,
-                        event_x,
-                        event_y,
-                        0,
-                        2, // mode = NotifyUngrab
-                        detail,
-                        deviceid,
-                        focus,
-                    );
-                });
+                let description = crate::xinput::xi2_event_description(evtype);
+                let events = EventBatch::new(std::slice::from_ref(&description));
+                let _dropped = fanout_event_to_clients_with_receive(
+                    state,
+                    &[owner],
+                    EventSubject::Window(target_window),
+                    &events,
+                    |out, seq, order| {
+                        x11::encode_xi2_crossing_event(
+                            out,
+                            order,
+                            seq,
+                            XI2_MAJOR_OPCODE,
+                            evtype,
+                            deviceid,
+                            server_time,
+                            ROOT_WINDOW,
+                            target_window,
+                            root_x,
+                            root_y,
+                            event_x,
+                            event_y,
+                            0,
+                            2, // mode = NotifyUngrab
+                            detail,
+                            deviceid,
+                            focus,
+                        );
+                    },
+                );
             };
         if is_keyboard {
             // Keyboard ungrab → focus restore. Unchanged.

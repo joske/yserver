@@ -2531,10 +2531,9 @@ fn pointer_event_fanout_to_state_inner(
             )
             .1;
         }
-        // An exact slave grab uses the grab's XI2 mask and device identity
-        // for grab delivery. There need not be a separate XISelectEvents
-        // selection on that device, and a detached source has no master
-        // cooked-event form to fall back to.
+        // Exact slave grabs use their XI2 mask/device identity without a
+        // separate XISelectEvents selection; detached sources have no master
+        // cooked-event fallback.
         let exact_slave_grab = xi2_grab_delivery
             && active_source_grab.is_some_and(|grab| grab.owner == *cid && grab.via_xi2)
             && xi_source.slave_deviceid.is_some_and(|device_id| {
@@ -2581,10 +2580,8 @@ fn pointer_event_fanout_to_state_inner(
             || owner_events_master_route.is_some_and(|(grab, _)| grab.owner == *cid));
         let mut forms = Vec::with_capacity(2);
         if is_crossing_evt {
-            // A crossing exists in exactly one form (`xi2_crossing_form`):
-            // an attached slave never gets its own Enter/Leave, so a client
-            // selecting XIAllDevices sees one crossing, not a second,
-            // unbalanced per-slave one, like Xorg.
+            // `xi2_crossing_form` emits one crossing; attached slaves do not
+            // get unbalanced per-slave Enter/Leave events, as in Xorg.
             let (form, deviceid) = xi2_crossing_form(xi_source);
             forms.push((deviceid, true, form));
         } else if let Some(slave_deviceid) = xi_source.slave_deviceid
@@ -2596,11 +2593,9 @@ fn pointer_event_fanout_to_state_inner(
                 Xi2PointerForm::Slave,
             ));
         }
-        // Master form for master / `XIAllMasterDevices` / `XIAllDevices`
-        // selectors, AND as the default when the client has no matching
-        // window selection (grab owners receive via their grab mask, not
-        // `XISelectEvents`, and that funnel is master-routed). A source with
-        // no published slave can only deliver its master form.
+        // Master form serves master / `XIAllMasterDevices` / `XIAllDevices`
+        // selectors, grab owners without a matching selection (master-routed),
+        // and sources without a published slave.
         if !is_crossing_evt
             && replay_has_master_form
             && (replay.is_some()
@@ -2623,9 +2618,8 @@ fn pointer_event_fanout_to_state_inner(
             if !button_want {
                 continue;
             }
-            // Master-form routing can be grab-scoped while the same source's
-            // slave form remains natural. Keep the fixed geometry local to
-            // the form that made the routing decision.
+            // Keep each form's geometry local to the routing decision: master
+            // can be grab-scoped while the same source's slave form is natural.
             let fixed_geometry = if form == Xi2PointerForm::Slave
                 && let Some((grab, route)) = owner_events_slave_route
                 && grab.owner == *cid
@@ -2704,10 +2698,8 @@ fn pointer_event_fanout_to_state_inner(
                 } else {
                     target
                 };
-                // Xorg's FindChildForEvent reports the sprite path's child
-                // for XI2 fixup (21.1.24 dix/events.c:2598-2619, 2623-2642).
-                // The slave pass uses the prior sprite target even when the
-                // event window is also the post-move target.
+                // Xorg FindChildForEvent reports the sprite-path child for
+                // XI2 fixup (21.1.24 dix/events.c:2598-2619, 2623-2642); slave uses prior target.
                 let child = xi2_child_toward(state, win, child_target);
                 if win == nested_id {
                     let child = if form == Xi2PointerForm::Slave {
@@ -2728,19 +2720,51 @@ fn pointer_event_fanout_to_state_inner(
                 }
             });
             let focus = state.crossing_has_focus(ev_win);
-            // Xorg snapshots the slave's `axisVal` into DeviceChanged
-            // (dix/getevents.c:265-286), then copies the slave event to its
-            // master (mi/mieq.c:422-425). Keep both XI forms on that same
-            // source counter so a source switch cannot create a false delta.
+            // Xorg snapshots slave axisVal into DeviceChanged, then copies its
+            // event to the master (dix/getevents.c:265-286; mi/mieq.c:422-425).
+            // Both XI forms share that counter so a source switch cannot create a false delta.
             let scroll_motion_only_grab = match form {
                 Xi2PointerForm::Slave => xi2_scroll_slave_grab_motion_only,
                 Xi2PointerForm::Master => xi2_scroll_master_grab_motion_only,
             } && grab_for_form(state, xi_source, form, replay)
                 .is_some_and(|grab| grab.owner == *cid);
-            let extras =
-                fanout_event_to_clients(state, std::slice::from_ref(cid), |buf, seq, order| {
-                    if is_crossing_evt {
-                        x11::encode_xi2_crossing_event(
+            let encode = |buf: &mut Vec<u8>, seq, order| {
+                if is_crossing_evt {
+                    x11::encode_xi2_crossing_event(
+                        buf,
+                        order,
+                        seq,
+                        XI2_MAJOR_OPCODE,
+                        xi2_evtype,
+                        deviceid,
+                        event.time,
+                        ROOT_WINDOW,
+                        ev_win,
+                        event.root_x,
+                        event.root_y,
+                        ev_x,
+                        ev_y,
+                        event.state,
+                        event.crossing_mode,
+                        event.detail,
+                        xi_source.sourceid,
+                        focus,
+                    );
+                } else {
+                    // Mark scroll-emulated XI buttons 4..7 with XIPointerEmulated;
+                    // XI2 clients discard the legacy button after its matching XI_Motion update
+                    // (`yserver-protocol::x11::XI_POINTER_EMULATED`).
+                    let xi2_flags: u32 = if matches!(
+                        event.kind,
+                        PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
+                    ) && source_has_scroll_class
+                    {
+                        x11::XI_POINTER_EMULATED
+                    } else {
+                        0
+                    };
+                    if button_want && !scroll_motion_only_grab {
+                        x11::encode_xi2_device_event(
                             buf,
                             order,
                             seq,
@@ -2750,58 +2774,35 @@ fn pointer_event_fanout_to_state_inner(
                             event.time,
                             ROOT_WINDOW,
                             ev_win,
+                            ev_child,
                             event.root_x,
                             event.root_y,
                             ev_x,
                             ev_y,
                             event.state,
-                            event.crossing_mode,
-                            event.detail,
+                            u32::from(event.detail),
                             xi_source.sourceid,
-                            focus,
+                            xi2_flags,
+                            xi2_motion_valuators
+                                .as_ref()
+                                .map(|(first, values)| (*first, values.as_slice())),
                         );
-                    } else {
-                        // Mark scroll-emulated XI_ButtonPress/Release(4..7)
-                        // with XIPointerEmulated so XI2-aware clients discard
-                        // the legacy button after consuming the matching
-                        // XI_Motion scroll-axis update (see
-                        // `yserver-protocol::x11::XI_POINTER_EMULATED`).
-                        let xi2_flags: u32 = if matches!(
-                            event.kind,
-                            PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
-                        ) && source_has_scroll_class
-                        {
-                            x11::XI_POINTER_EMULATED
-                        } else {
-                            0
-                        };
-                        if button_want && !scroll_motion_only_grab {
-                            x11::encode_xi2_device_event(
-                                buf,
-                                order,
-                                seq,
-                                XI2_MAJOR_OPCODE,
-                                xi2_evtype,
-                                deviceid,
-                                event.time,
-                                ROOT_WINDOW,
-                                ev_win,
-                                ev_child,
-                                event.root_x,
-                                event.root_y,
-                                ev_x,
-                                ev_y,
-                                event.state,
-                                u32::from(event.detail),
-                                xi_source.sourceid,
-                                xi2_flags,
-                                xi2_motion_valuators
-                                    .as_ref()
-                                    .map(|(first, values)| (*first, values.as_slice())),
-                            );
-                        }
                     }
-                });
+                }
+            };
+            let extras = if is_crossing_evt {
+                let description = crate::xinput::xi2_event_description(xi2_evtype);
+                let events = EventBatch::new(std::slice::from_ref(&description));
+                fanout_event_to_clients_with_receive(
+                    state,
+                    std::slice::from_ref(cid),
+                    EventSubject::Window(ev_win),
+                    &events,
+                    encode,
+                )
+            } else {
+                fanout_event_to_clients(state, std::slice::from_ref(cid), encode)
+            };
             let delivered = !extras.contains(cid);
             merge_dropped(&mut dropped, extras);
             if event.kind == PointerEventKind::ButtonPress
@@ -2809,10 +2810,9 @@ fn pointer_event_fanout_to_state_inner(
                 && delivered
                 && grab_for_form(state, xi_source, form, replay).is_none()
             {
-                // Under a grab this records the grab owner, and the
-                // lifecycle's no-grab gate discards it. Natural delivery is
-                // the only path that can install. Snapshot the selection for
-                // this form's device, as Xorg xi2mask_isset does.
+                // A grab records the owner, then the no-grab gate discards
+                // it; only natural delivery can install. Snapshot this form's
+                // selection as Xorg xi2mask_isset does.
                 info.consider_xi2_press(
                     &state.resources,
                     form,

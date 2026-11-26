@@ -1237,6 +1237,7 @@ fn receive_core_crossing_baseline_frames() {
     let (mut fixture, xid_map) = core_crossing_fixture();
     assert!(!fixture.state.policies_installed());
     run_explicit_parent_child_crossings(&mut fixture, &xid_map);
+    assert!(fixture.drain(NOTIFY_SENDER).is_empty());
     for (client, order, sequence) in [
         (
             NOTIFY_RECEIVER_DENIED,
@@ -1911,6 +1912,1265 @@ fn literal_xi2_button_press(
     append_event_u32(&mut event, order, 0); // valuator mask word 1
     assert_eq!(event.len(), 120);
     event
+}
+
+const XI2_ENTER_LEAVE_MASK: u64 = (1 << 7) | (1 << 8);
+const XI_GRAB_SEQUENCE: u16 = 0x5151;
+const XI_UNGRAB_SEQUENCE: u16 = 0x5252;
+
+fn xi2_crossing_fixture() -> (NotifyFixture, HostXidMap) {
+    let (mut fixture, xid_map) = core_crossing_fixture();
+    for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+        let client_state = fixture.state.clients.get_mut(&client.0).unwrap();
+        client_state.xi2_masks.insert(
+            (CROSS_PARENT, crate::xinput::DEVICEID_MASTER_POINTER),
+            XI2_ENTER_LEAVE_MASK,
+        );
+        client_state.xi2_masks.insert(
+            (CROSS_CHILD, crate::xinput::DEVICEID_MASTER_POINTER),
+            XI2_ENTER_LEAVE_MASK,
+        );
+    }
+    (fixture, xid_map)
+}
+
+fn literal_xi2_crossing(
+    order: ClientByteOrder,
+    sequence: u16,
+    evtype: u16,
+    deviceid: u16,
+    time: u32,
+    sourceid: u16,
+    mode: u8,
+    detail: u8,
+    window: ResourceId,
+    root_x: i16,
+    root_y: i16,
+    event_x: i16,
+    event_y: i16,
+    focus: bool,
+) -> Vec<u8> {
+    let mut event = vec![35, 137]; // GenericEvent, XI2 major opcode
+    append_event_u16(&mut event, order, sequence);
+    append_event_u32(&mut event, order, 11); // XGE length
+    append_event_u16(&mut event, order, evtype);
+    append_event_u16(&mut event, order, deviceid);
+    append_event_u32(&mut event, order, time);
+    append_event_u16(&mut event, order, sourceid);
+    event.extend_from_slice(&[mode, detail]);
+    append_event_u32(&mut event, order, ROOT_WINDOW.0);
+    append_event_u32(&mut event, order, window.0);
+    append_event_u32(&mut event, order, 0); // no child
+    for coordinate in [root_x, root_y, event_x, event_y] {
+        append_event_u32(&mut event, order, (i32::from(coordinate) << 16) as u32);
+    }
+    event.extend_from_slice(&[1, u8::from(focus)]); // same_screen, focus
+    append_event_u16(&mut event, order, 1); // buttons_len
+    append_event_u32(&mut event, order, 0); // mods.base
+    append_event_u32(&mut event, order, 0); // mods.latched
+    append_event_u32(&mut event, order, 0); // mods.locked
+    append_event_u32(&mut event, order, 0); // mods.effective
+    event.extend_from_slice(&[0; 4]); // group
+    append_event_u32(&mut event, order, 0); // buttons mask
+    assert_eq!(event.len(), 76);
+    event
+}
+
+fn literal_xi2_explicit_crossings(order: ClientByteOrder, sequence: u16) -> Vec<u8> {
+    [
+        literal_xi2_crossing(
+            order,
+            sequence,
+            8,
+            2,
+            0x1357,
+            4,
+            0,
+            2,
+            CROSS_PARENT,
+            CROSS_X,
+            CROSS_Y,
+            15,
+            10,
+            true,
+        )
+        .as_slice(),
+        literal_xi2_crossing(
+            order,
+            sequence,
+            7,
+            2,
+            0x1357,
+            4,
+            0,
+            0,
+            CROSS_CHILD,
+            CROSS_X,
+            CROSS_Y,
+            5,
+            5,
+            true,
+        )
+        .as_slice(),
+        literal_core_motion(order, sequence, 0x1358, CROSS_CHILD, CROSS_X, CROSS_Y, 5, 5)
+            .as_slice(),
+    ]
+    .concat()
+}
+
+fn literal_xi2_grab_chain(order: ClientByteOrder, sequence: u16, mode: u8) -> Vec<u8> {
+    [
+        literal_xi2_crossing(
+            order,
+            sequence,
+            8,
+            2,
+            0,
+            2,
+            mode,
+            0,
+            CROSS_CHILD,
+            CROSS_X,
+            CROSS_Y,
+            5,
+            5,
+            true,
+        )
+        .as_slice(),
+        literal_xi2_crossing(
+            order,
+            sequence,
+            7,
+            2,
+            0,
+            2,
+            mode,
+            2,
+            CROSS_PARENT,
+            CROSS_X,
+            CROSS_Y,
+            15,
+            10,
+            true,
+        )
+        .as_slice(),
+    ]
+    .concat()
+}
+
+fn literal_xi2_ungrab_pointer_chain(order: ClientByteOrder, sequence: u16, mode: u8) -> Vec<u8> {
+    [
+        literal_xi2_crossing(
+            order,
+            sequence,
+            8,
+            2,
+            0,
+            2,
+            mode,
+            2,
+            CROSS_PARENT,
+            CROSS_X,
+            CROSS_Y,
+            15,
+            10,
+            true,
+        )
+        .as_slice(),
+        literal_xi2_crossing(
+            order,
+            sequence,
+            7,
+            2,
+            0,
+            2,
+            mode,
+            0,
+            CROSS_CHILD,
+            CROSS_X,
+            CROSS_Y,
+            5,
+            5,
+            true,
+        )
+        .as_slice(),
+    ]
+    .concat()
+}
+
+fn assert_xi2_receive_calls(
+    calls: &[RecordedExtensionCheck],
+    expected: &[(
+        ClientId,
+        ResourceId,
+        u16,
+        Option<crate::access::RequestOpcodes>,
+    )],
+) {
+    let rows = receive_calls(calls);
+    assert_eq!(rows.len(), expected.len(), "one Receive check per XI2 copy");
+    for (client, window, evtype, request) in expected {
+        assert_eq!(
+            rows.iter()
+                .filter(|call| {
+                    call.client == *client
+                        && call.receive == Some(EventSubject::Window(*window))
+                        && call.events == Some(vec![EventDescription::extension(35, 137, *evtype)])
+                        && call.request == *request
+                })
+                .count(),
+            1,
+            "one matching Receive call for client {client:?}, W({window:?}), XI2({evtype})"
+        );
+    }
+    assert!(calls.iter().all(|call| call.hook != ExtensionHook::Send));
+}
+
+fn xi2_grab_fixture() -> NotifyFixture {
+    let mut fixture = core_crossing_fixture().0;
+    for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+        let client_state = fixture.state.clients.get_mut(&client.0).unwrap();
+        client_state.event_masks.clear();
+        client_state.xi2_masks.clear();
+    }
+    fixture
+}
+
+fn xi_grab_device(
+    fixture: &mut NotifyFixture,
+    deviceid: u16,
+    window: ResourceId,
+    sequence: u16,
+) -> RequestOutcome {
+    let mut body = Vec::with_capacity(20);
+    body.extend_from_slice(&window.0.to_le_bytes());
+    body.extend_from_slice(&0_u32.to_le_bytes()); // CurrentTime
+    body.extend_from_slice(&0_u32.to_le_bytes()); // no cursor
+    body.extend_from_slice(&deviceid.to_le_bytes());
+    body.extend_from_slice(&[1, 1, 0, 0]); // async modes, owner_events false, pad
+    body.extend_from_slice(&0_u16.to_le_bytes()); // no event mask
+    fixture
+        .request(
+            NOTIFY_RECEIVER_DENIED,
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: 137,
+                data: 51,
+                length_units: 6,
+            },
+            &body,
+        )
+        .expect("XIGrabDevice through process_request")
+}
+
+fn xi_ungrab_device(fixture: &mut NotifyFixture, deviceid: u16, sequence: u16) -> RequestOutcome {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&0_u32.to_le_bytes()); // CurrentTime
+    body.extend_from_slice(&deviceid.to_le_bytes());
+    body.extend_from_slice(&0_u16.to_le_bytes());
+    fixture
+        .request(
+            NOTIFY_RECEIVER_DENIED,
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: 137,
+                data: 52,
+                length_units: 3,
+            },
+            &body,
+        )
+        .expect("XIUngrabDevice through process_request")
+}
+
+fn literal_xi_grab_reply(order: ClientByteOrder, sequence: u16, status: u8) -> Vec<u8> {
+    let mut reply = literal_event_header(1, 0, sequence, order);
+    append_event_u32(&mut reply, order, 0); // no reply payload
+    reply.push(status);
+    reply.resize(32, 0);
+    reply
+}
+
+fn literal_xi2_pointer_grab_chain(order: ClientByteOrder, sequence: u16, mode: u8) -> Vec<u8> {
+    [
+        literal_xi2_crossing(
+            order,
+            sequence,
+            8,
+            2,
+            0,
+            2,
+            mode,
+            2,
+            ROOT_WINDOW,
+            0,
+            0,
+            0,
+            0,
+            true,
+        )
+        .as_slice(),
+        literal_xi2_crossing(
+            order,
+            sequence,
+            7,
+            2,
+            0,
+            2,
+            mode,
+            1,
+            CROSS_PARENT,
+            0,
+            0,
+            -20,
+            -10,
+            true,
+        )
+        .as_slice(),
+        literal_xi2_crossing(
+            order,
+            sequence,
+            7,
+            2,
+            0,
+            2,
+            mode,
+            0,
+            CROSS_CHILD,
+            0,
+            0,
+            -30,
+            -15,
+            true,
+        )
+        .as_slice(),
+    ]
+    .concat()
+}
+
+fn literal_xi2_pointer_ungrab_chain(order: ClientByteOrder, sequence: u16) -> Vec<u8> {
+    [
+        literal_xi2_crossing(
+            order,
+            sequence,
+            8,
+            2,
+            0,
+            2,
+            2,
+            0,
+            CROSS_CHILD,
+            0,
+            0,
+            -30,
+            -15,
+            true,
+        )
+        .as_slice(),
+        literal_xi2_crossing(
+            order,
+            sequence,
+            8,
+            2,
+            0,
+            2,
+            2,
+            1,
+            CROSS_PARENT,
+            0,
+            0,
+            -20,
+            -10,
+            true,
+        )
+        .as_slice(),
+        literal_xi2_crossing(
+            order,
+            sequence,
+            7,
+            2,
+            0,
+            2,
+            2,
+            2,
+            ROOT_WINDOW,
+            0,
+            0,
+            0,
+            0,
+            true,
+        )
+        .as_slice(),
+    ]
+    .concat()
+}
+
+fn assert_xi_grab_device_baseline(deviceid: u16) {
+    let mut fixture = xi2_grab_fixture();
+    assert!(!fixture.state.policies_installed());
+    assert!(matches!(
+        xi_grab_device(&mut fixture, deviceid, CROSS_CHILD, XI_GRAB_SEQUENCE,),
+        RequestOutcome::Handled
+    ));
+    let active = if deviceid == crate::xinput::DEVICEID_MASTER_POINTER {
+        fixture.state.active_pointer_grab.is_some()
+    } else {
+        fixture.state.active_keyboard_grab.is_some()
+    };
+    assert!(active, "XIGrabDevice activates its master device grab");
+    let activation = if deviceid == crate::xinput::DEVICEID_MASTER_POINTER {
+        literal_xi2_pointer_grab_chain(ClientByteOrder::BigEndian, XI_GRAB_SEQUENCE, 1)
+    } else {
+        literal_xi2_crossing(
+            ClientByteOrder::BigEndian,
+            XI_GRAB_SEQUENCE,
+            9,
+            deviceid,
+            0,
+            deviceid,
+            1,
+            3,
+            CROSS_CHILD,
+            0,
+            0,
+            -30,
+            -15,
+            false,
+        )
+    };
+    assert_eq!(
+        fixture.drain(NOTIFY_RECEIVER_DENIED),
+        [
+            activation.as_slice(),
+            literal_xi_grab_reply(ClientByteOrder::BigEndian, XI_GRAB_SEQUENCE, 0).as_slice(),
+        ]
+        .concat(),
+        "XIGrabDevice activation notification precedes its successful reply"
+    );
+    assert!(matches!(
+        xi_ungrab_device(&mut fixture, deviceid, XI_UNGRAB_SEQUENCE),
+        RequestOutcome::Handled
+    ));
+    let active = if deviceid == crate::xinput::DEVICEID_MASTER_POINTER {
+        fixture.state.active_pointer_grab.is_some()
+    } else {
+        fixture.state.active_keyboard_grab.is_some()
+    };
+    assert!(!active, "XIUngrabDevice releases its master device grab");
+    let deactivation = if deviceid == crate::xinput::DEVICEID_MASTER_POINTER {
+        literal_xi2_pointer_ungrab_chain(ClientByteOrder::BigEndian, XI_UNGRAB_SEQUENCE)
+    } else {
+        literal_xi2_crossing(
+            ClientByteOrder::BigEndian,
+            XI_UNGRAB_SEQUENCE,
+            10,
+            deviceid,
+            0,
+            deviceid,
+            2,
+            3,
+            CROSS_CHILD,
+            0,
+            0,
+            -30,
+            -15,
+            false,
+        )
+    };
+    assert_eq!(fixture.drain(NOTIFY_RECEIVER_DENIED), deactivation);
+    assert!(fixture.drain(NOTIFY_SENDER).is_empty());
+    assert!(fixture.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
+    assert_no_writer_failures(&fixture);
+}
+
+// mutation: drop the focus flag from the XI2 crossing encoder call
+#[test]
+fn receive_xi2_crossing_baseline_frames() {
+    let (mut fixture, xid_map) = xi2_crossing_fixture();
+    assert!(!fixture.state.policies_installed());
+    run_explicit_parent_child_crossings(&mut fixture, &xid_map);
+    for (client, order, sequence) in [
+        (
+            NOTIFY_RECEIVER_DENIED,
+            ClientByteOrder::BigEndian,
+            DUAL_SEQUENCE,
+        ),
+        (
+            NOTIFY_RECEIVER_ALLOWED,
+            ClientByteOrder::LittleEndian,
+            ROOT_SEQUENCE,
+        ),
+    ] {
+        assert_eq!(
+            fixture.drain(client),
+            literal_xi2_explicit_crossings(order, sequence),
+            "XI2 Leave/Enter followed by the core MotionNotify stream"
+        );
+    }
+    assert_eq!(fixture.state.master_sprite_root, (CROSS_X, CROSS_Y));
+
+    assert!(matches!(
+        grab_pointer(
+            &mut fixture,
+            NOTIFY_SENDER,
+            false,
+            CROSS_PARENT,
+            0,
+            GRAB_SEQUENCE,
+        ),
+        RequestOutcome::Handled
+    ));
+    assert!(fixture.state.active_pointer_grab.is_some());
+    assert_eq!(
+        fixture.drain(NOTIFY_SENDER),
+        literal_grab_reply(ClientByteOrder::LittleEndian, GRAB_SEQUENCE, 0)
+    );
+    for (client, order, sequence) in [
+        (
+            NOTIFY_RECEIVER_DENIED,
+            ClientByteOrder::BigEndian,
+            DUAL_SEQUENCE,
+        ),
+        (
+            NOTIFY_RECEIVER_ALLOWED,
+            ClientByteOrder::LittleEndian,
+            ROOT_SEQUENCE,
+        ),
+    ] {
+        assert_eq!(
+            fixture.drain(client),
+            [
+                grab_chain_child_to_parent(order, sequence, 1).as_slice(),
+                literal_xi2_grab_chain(order, sequence, 1).as_slice(),
+            ]
+            .concat(),
+            "core and XI2 NotifyGrab chains preserve their literal order"
+        );
+    }
+    assert!(matches!(
+        ungrab_pointer(&mut fixture, NOTIFY_SENDER, UNGRAB_SEQUENCE),
+        RequestOutcome::Handled
+    ));
+    assert!(fixture.state.active_pointer_grab.is_none());
+    for (client, order, sequence) in [
+        (
+            NOTIFY_RECEIVER_DENIED,
+            ClientByteOrder::BigEndian,
+            DUAL_SEQUENCE,
+        ),
+        (
+            NOTIFY_RECEIVER_ALLOWED,
+            ClientByteOrder::LittleEndian,
+            ROOT_SEQUENCE,
+        ),
+    ] {
+        assert_eq!(
+            fixture.drain(client),
+            [
+                grab_chain_parent_to_child(order, sequence, 2).as_slice(),
+                literal_xi2_ungrab_pointer_chain(order, sequence, 2).as_slice(),
+            ]
+            .concat(),
+            "core and XI2 NotifyUngrab chains preserve their literal order"
+        );
+    }
+    assert_no_writer_failures(&fixture);
+
+    assert_xi_grab_device_baseline(crate::xinput::DEVICEID_MASTER_POINTER);
+    assert_xi_grab_device_baseline(crate::xinput::DEVICEID_MASTER_KEYBOARD);
+}
+
+// mutation: when the dual selector's XI2 copy is denied, deliver its core copy
+#[test]
+fn receive_xi2_crossing_denial_keeps_core_dedup() {
+    let make_fixture = || {
+        let (mut fixture, xid_map) = core_crossing_fixture();
+        fixture
+            .state
+            .clients
+            .get_mut(&NOTIFY_RECEIVER_DENIED.0)
+            .unwrap()
+            .event_masks
+            .insert(CROSS_CHILD, ENTER_LEAVE_MASK);
+        fixture
+            .state
+            .clients
+            .get_mut(&NOTIFY_RECEIVER_ALLOWED.0)
+            .unwrap()
+            .event_masks
+            .clear();
+        for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+            fixture
+                .state
+                .clients
+                .get_mut(&client.0)
+                .unwrap()
+                .xi2_masks
+                .insert(
+                    (CROSS_CHILD, crate::xinput::DEVICEID_MASTER_POINTER),
+                    1 << 7,
+                );
+        }
+        (fixture, xid_map)
+    };
+    let run_enter_and_motion = |fixture: &mut NotifyFixture, xid_map: &HostXidMap| {
+        feed_core_pointer_event(
+            fixture,
+            xid_map,
+            core_pointer_event(
+                PointerEventKind::EnterNotify,
+                CROSS_CHILD_XID,
+                0,
+                0x2468,
+                CROSS_X,
+                CROSS_Y,
+            ),
+        );
+        feed_core_pointer_event(
+            fixture,
+            xid_map,
+            core_pointer_event(
+                PointerEventKind::MotionNotify,
+                CROSS_CHILD_XID,
+                0,
+                0x2469,
+                CROSS_X,
+                CROSS_Y,
+            ),
+        );
+        assert_eq!(fixture.state.master_sprite_root, (CROSS_X, CROSS_Y));
+    };
+    let expected = literal_xi2_crossing(
+        ClientByteOrder::LittleEndian,
+        ROOT_SEQUENCE,
+        7,
+        2,
+        0x2468,
+        4,
+        0,
+        0,
+        CROSS_CHILD,
+        CROSS_X,
+        CROSS_Y,
+        5,
+        5,
+        true,
+    );
+    let (mut allowed, allowed_xid_map) = make_fixture();
+    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
+    run_enter_and_motion(&mut allowed, &allowed_xid_map);
+    assert_eq!(
+        allowed.drain(NOTIFY_RECEIVER_DENIED),
+        literal_xi2_crossing(
+            ClientByteOrder::BigEndian,
+            DUAL_SEQUENCE,
+            7,
+            2,
+            0x2468,
+            4,
+            0,
+            0,
+            CROSS_CHILD,
+            CROSS_X,
+            CROSS_Y,
+            5,
+            5,
+            true,
+        ),
+        "allow-control dual selector receives XI2 and keeps its core copy shadowed"
+    );
+    assert_eq!(
+        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
+        expected,
+        "XI2-only selector receives the literal Enter"
+    );
+    let (mut denied, xid_map) = make_fixture();
+    let calls = denied.install_policy(|_, call| {
+        if call.hook == ExtensionHook::Receive
+            && call.client == NOTIFY_RECEIVER_DENIED
+            && call.receive == Some(EventSubject::Window(CROSS_CHILD))
+            && call.events == Some(vec![EventDescription::extension(35, 137, 7)])
+        {
+            Decision::Deny(DENY)
+        } else {
+            Decision::Allow
+        }
+    });
+    run_enter_and_motion(&mut denied, &xid_map);
+    assert!(
+        denied.drain(NOTIFY_RECEIVER_DENIED).is_empty(),
+        "denying the XI2 Enter does not reveal the shadowed core Enter"
+    );
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_ALLOWED),
+        expected,
+        "other XI2 selector keeps its literal Enter"
+    );
+    assert_eq!(
+        denied.state.master_sprite_root,
+        allowed.state.master_sprite_root
+    );
+    assert_xi2_receive_calls(
+        &calls.lock().unwrap(),
+        &[
+            (NOTIFY_RECEIVER_DENIED, CROSS_CHILD, 7, None),
+            (NOTIFY_RECEIVER_ALLOWED, CROSS_CHILD, 7, None),
+        ],
+    );
+    assert!(
+        calls.lock().unwrap().iter().all(|call| {
+            call.hook != ExtensionHook::Receive
+                || call.events != Some(vec![EventDescription::core(7)])
+        }),
+        "the shadowed core copy has no Receive call"
+    );
+    assert!(denied.drain(NOTIFY_SENDER).is_empty());
+    assert_xi2_receive_calls(
+        &allow_calls.lock().unwrap(),
+        &[
+            (NOTIFY_RECEIVER_DENIED, CROSS_CHILD, 7, None),
+            (NOTIFY_RECEIVER_ALLOWED, CROSS_CHILD, 7, None),
+        ],
+    );
+    assert_no_writer_failures(&denied);
+}
+
+// mutation: leave C4 unchecked
+#[test]
+fn receive_xi2_grab_chain_denial() {
+    let make_fixture = || {
+        let (mut fixture, _) = xi2_crossing_fixture();
+        for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+            fixture
+                .state
+                .clients
+                .get_mut(&client.0)
+                .unwrap()
+                .event_masks
+                .clear();
+        }
+        fixture
+    };
+    let (allowed, allowed_calls) = {
+        let mut fixture = make_fixture();
+        let calls = fixture.install_policy(|_, _| Decision::Allow);
+        fixture.state.pointer_root = (CROSS_X, CROSS_Y);
+        fixture.state.master_sprite_root = (CROSS_X, CROSS_Y);
+        assert!(matches!(
+            grab_pointer(
+                &mut fixture,
+                NOTIFY_SENDER,
+                false,
+                CROSS_PARENT,
+                0,
+                GRAB_SEQUENCE,
+            ),
+            RequestOutcome::Handled
+        ));
+        assert!(fixture.state.active_pointer_grab.is_some());
+        assert_eq!(
+            fixture.drain(NOTIFY_SENDER),
+            literal_grab_reply(ClientByteOrder::LittleEndian, GRAB_SEQUENCE, 0)
+        );
+        for (client, order, sequence) in [
+            (
+                NOTIFY_RECEIVER_DENIED,
+                ClientByteOrder::BigEndian,
+                DUAL_SEQUENCE,
+            ),
+            (
+                NOTIFY_RECEIVER_ALLOWED,
+                ClientByteOrder::LittleEndian,
+                ROOT_SEQUENCE,
+            ),
+        ] {
+            assert_eq!(
+                fixture.drain(client),
+                literal_xi2_grab_chain(order, sequence, 1),
+                "allow-control NotifyGrab chain"
+            );
+        }
+        assert!(matches!(
+            ungrab_pointer(&mut fixture, NOTIFY_SENDER, UNGRAB_SEQUENCE),
+            RequestOutcome::Handled
+        ));
+        assert!(fixture.state.active_pointer_grab.is_none());
+        assert!(fixture.drain(NOTIFY_SENDER).is_empty());
+        for (client, order, sequence) in [
+            (
+                NOTIFY_RECEIVER_DENIED,
+                ClientByteOrder::BigEndian,
+                DUAL_SEQUENCE,
+            ),
+            (
+                NOTIFY_RECEIVER_ALLOWED,
+                ClientByteOrder::LittleEndian,
+                ROOT_SEQUENCE,
+            ),
+        ] {
+            assert_eq!(
+                fixture.drain(client),
+                literal_xi2_ungrab_pointer_chain(order, sequence, 2),
+                "allow-control NotifyUngrab chain"
+            );
+        }
+        (fixture, calls)
+    };
+    assert_no_writer_failures(&allowed);
+
+    let mut denied = make_fixture();
+    let calls = denied.install_policy(|_, call| {
+        if call.hook == ExtensionHook::Receive
+            && call.client == NOTIFY_RECEIVER_DENIED
+            && call.receive == Some(EventSubject::Window(CROSS_CHILD))
+            && call.events.as_ref().is_some_and(|events| {
+                events.as_slice() == [EventDescription::extension(35, 137, 7)]
+                    || events.as_slice() == [EventDescription::extension(35, 137, 8)]
+            })
+        {
+            Decision::Deny(DENY)
+        } else {
+            Decision::Allow
+        }
+    });
+    denied.state.pointer_root = (CROSS_X, CROSS_Y);
+    denied.state.master_sprite_root = (CROSS_X, CROSS_Y);
+    assert!(matches!(
+        grab_pointer(
+            &mut denied,
+            NOTIFY_SENDER,
+            false,
+            CROSS_PARENT,
+            0,
+            GRAB_SEQUENCE,
+        ),
+        RequestOutcome::Handled
+    ));
+    assert!(denied.state.active_pointer_grab.is_some());
+    assert_eq!(
+        denied.drain(NOTIFY_SENDER),
+        literal_grab_reply(ClientByteOrder::LittleEndian, GRAB_SEQUENCE, 0),
+        "denied NotifyGrab does not change the successful reply"
+    );
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_DENIED),
+        literal_xi2_crossing(
+            ClientByteOrder::BigEndian,
+            DUAL_SEQUENCE,
+            7,
+            2,
+            0,
+            2,
+            1,
+            2,
+            CROSS_PARENT,
+            CROSS_X,
+            CROSS_Y,
+            15,
+            10,
+            true,
+        ),
+        "denied child Leave leaves the parent Enter"
+    );
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_ALLOWED),
+        literal_xi2_grab_chain(ClientByteOrder::LittleEndian, ROOT_SEQUENCE, 1)
+    );
+    assert!(matches!(
+        ungrab_pointer(&mut denied, NOTIFY_SENDER, UNGRAB_SEQUENCE),
+        RequestOutcome::Handled
+    ));
+    assert!(denied.state.active_pointer_grab.is_none());
+    assert!(denied.drain(NOTIFY_SENDER).is_empty());
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_DENIED),
+        literal_xi2_crossing(
+            ClientByteOrder::BigEndian,
+            DUAL_SEQUENCE,
+            8,
+            2,
+            0,
+            2,
+            2,
+            2,
+            CROSS_PARENT,
+            CROSS_X,
+            CROSS_Y,
+            15,
+            10,
+            true,
+        ),
+        "denied child Enter leaves the parent Leave"
+    );
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_ALLOWED),
+        literal_xi2_ungrab_pointer_chain(ClientByteOrder::LittleEndian, ROOT_SEQUENCE, 2)
+    );
+    assert_xi2_receive_calls(
+        &calls.lock().unwrap(),
+        &[
+            (
+                NOTIFY_RECEIVER_DENIED,
+                CROSS_CHILD,
+                8,
+                request_opcodes(26, 0),
+            ),
+            (
+                NOTIFY_RECEIVER_ALLOWED,
+                CROSS_CHILD,
+                8,
+                request_opcodes(26, 0),
+            ),
+            (
+                NOTIFY_RECEIVER_DENIED,
+                CROSS_PARENT,
+                7,
+                request_opcodes(26, 0),
+            ),
+            (
+                NOTIFY_RECEIVER_ALLOWED,
+                CROSS_PARENT,
+                7,
+                request_opcodes(26, 0),
+            ),
+            (
+                NOTIFY_RECEIVER_DENIED,
+                CROSS_PARENT,
+                8,
+                request_opcodes(27, 0),
+            ),
+            (
+                NOTIFY_RECEIVER_ALLOWED,
+                CROSS_PARENT,
+                8,
+                request_opcodes(27, 0),
+            ),
+            (
+                NOTIFY_RECEIVER_DENIED,
+                CROSS_CHILD,
+                7,
+                request_opcodes(27, 0),
+            ),
+            (
+                NOTIFY_RECEIVER_ALLOWED,
+                CROSS_CHILD,
+                7,
+                request_opcodes(27, 0),
+            ),
+        ],
+    );
+    assert_xi2_receive_calls(
+        &allowed_calls.lock().unwrap(),
+        &[
+            (
+                NOTIFY_RECEIVER_DENIED,
+                CROSS_CHILD,
+                8,
+                request_opcodes(26, 0),
+            ),
+            (
+                NOTIFY_RECEIVER_ALLOWED,
+                CROSS_CHILD,
+                8,
+                request_opcodes(26, 0),
+            ),
+            (
+                NOTIFY_RECEIVER_DENIED,
+                CROSS_PARENT,
+                7,
+                request_opcodes(26, 0),
+            ),
+            (
+                NOTIFY_RECEIVER_ALLOWED,
+                CROSS_PARENT,
+                7,
+                request_opcodes(26, 0),
+            ),
+            (
+                NOTIFY_RECEIVER_DENIED,
+                CROSS_PARENT,
+                8,
+                request_opcodes(27, 0),
+            ),
+            (
+                NOTIFY_RECEIVER_ALLOWED,
+                CROSS_PARENT,
+                8,
+                request_opcodes(27, 0),
+            ),
+            (
+                NOTIFY_RECEIVER_DENIED,
+                CROSS_CHILD,
+                7,
+                request_opcodes(27, 0),
+            ),
+            (
+                NOTIFY_RECEIVER_ALLOWED,
+                CROSS_CHILD,
+                7,
+                request_opcodes(27, 0),
+            ),
+        ],
+    );
+    assert_no_writer_failures(&denied);
+}
+
+// mutation: leave the ungrab site (553) unchecked
+#[test]
+fn receive_xi_grab_device_synthetic_denial() {
+    let run_case = |deviceid: u16, denied_types: &[u16]| {
+        let mut allowed = xi2_grab_fixture();
+        let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
+        assert!(matches!(
+            xi_grab_device(&mut allowed, deviceid, CROSS_CHILD, XI_GRAB_SEQUENCE,),
+            RequestOutcome::Handled
+        ));
+        let allowed_grab_state = if deviceid == crate::xinput::DEVICEID_MASTER_POINTER {
+            allowed
+                .state
+                .active_pointer_grab
+                .map(|grab| (grab.owner, grab.grab_window))
+        } else {
+            allowed
+                .state
+                .active_keyboard_grab
+                .map(|grab| (grab.owner, grab.grab_window))
+        };
+        let allow_activation = if deviceid == crate::xinput::DEVICEID_MASTER_POINTER {
+            literal_xi2_pointer_grab_chain(ClientByteOrder::BigEndian, XI_GRAB_SEQUENCE, 1)
+        } else {
+            literal_xi2_crossing(
+                ClientByteOrder::BigEndian,
+                XI_GRAB_SEQUENCE,
+                9,
+                deviceid,
+                0,
+                deviceid,
+                1,
+                3,
+                CROSS_CHILD,
+                0,
+                0,
+                -30,
+                -15,
+                false,
+            )
+        };
+        assert_eq!(
+            allowed.drain(NOTIFY_RECEIVER_DENIED),
+            [
+                allow_activation.as_slice(),
+                literal_xi_grab_reply(ClientByteOrder::BigEndian, XI_GRAB_SEQUENCE, 0).as_slice(),
+            ]
+            .concat(),
+            "allow-control successful grab keeps its synthetic activation"
+        );
+        let mut expected_allow = if deviceid == crate::xinput::DEVICEID_MASTER_POINTER {
+            vec![
+                (
+                    NOTIFY_RECEIVER_DENIED,
+                    ROOT_WINDOW,
+                    8,
+                    request_opcodes(137, 51),
+                ),
+                (
+                    NOTIFY_RECEIVER_DENIED,
+                    CROSS_PARENT,
+                    7,
+                    request_opcodes(137, 51),
+                ),
+                (
+                    NOTIFY_RECEIVER_DENIED,
+                    CROSS_CHILD,
+                    7,
+                    request_opcodes(137, 51),
+                ),
+            ]
+        } else {
+            vec![(
+                NOTIFY_RECEIVER_DENIED,
+                CROSS_CHILD,
+                9,
+                request_opcodes(137, 51),
+            )]
+        };
+        assert!(matches!(
+            xi_ungrab_device(&mut allowed, deviceid, XI_UNGRAB_SEQUENCE),
+            RequestOutcome::Handled
+        ));
+        assert!(allowed.drain(NOTIFY_SENDER).is_empty());
+        let allow_deactivation = if deviceid == crate::xinput::DEVICEID_MASTER_POINTER {
+            literal_xi2_pointer_ungrab_chain(ClientByteOrder::BigEndian, XI_UNGRAB_SEQUENCE)
+        } else {
+            literal_xi2_crossing(
+                ClientByteOrder::BigEndian,
+                XI_UNGRAB_SEQUENCE,
+                10,
+                deviceid,
+                0,
+                deviceid,
+                2,
+                3,
+                CROSS_CHILD,
+                0,
+                0,
+                -30,
+                -15,
+                false,
+            )
+        };
+        assert_eq!(allowed.drain(NOTIFY_RECEIVER_DENIED), allow_deactivation);
+        if deviceid == crate::xinput::DEVICEID_MASTER_POINTER {
+            expected_allow.extend([
+                (
+                    NOTIFY_RECEIVER_DENIED,
+                    CROSS_CHILD,
+                    8,
+                    request_opcodes(137, 52),
+                ),
+                (
+                    NOTIFY_RECEIVER_DENIED,
+                    CROSS_PARENT,
+                    8,
+                    request_opcodes(137, 52),
+                ),
+                (
+                    NOTIFY_RECEIVER_DENIED,
+                    ROOT_WINDOW,
+                    7,
+                    request_opcodes(137, 52),
+                ),
+            ]);
+        } else {
+            expected_allow.push((
+                NOTIFY_RECEIVER_DENIED,
+                CROSS_CHILD,
+                10,
+                request_opcodes(137, 52),
+            ));
+        }
+        assert!(
+            allowed.state.active_pointer_grab.is_none()
+                && allowed.state.active_keyboard_grab.is_none(),
+            "allow-control ungrab releases the master grab"
+        );
+
+        let mut denied = xi2_grab_fixture();
+        let denied_pairs = if deviceid == crate::xinput::DEVICEID_MASTER_POINTER {
+            vec![
+                (ROOT_WINDOW, 8),
+                (CROSS_PARENT, 7),
+                (CROSS_CHILD, 7),
+                (CROSS_CHILD, 8),
+                (CROSS_PARENT, 8),
+                (ROOT_WINDOW, 7),
+            ]
+        } else {
+            denied_types
+                .iter()
+                .map(|evtype| (CROSS_CHILD, *evtype))
+                .collect()
+        };
+        let calls = denied.install_policy(move |_, call| {
+            if call.hook == ExtensionHook::Receive
+                && call.client == NOTIFY_RECEIVER_DENIED
+                && call.receive.is_some_and(|subject| match subject {
+                    EventSubject::Window(window) => call.events.as_ref().is_some_and(|events| {
+                        events.len() == 1
+                            && denied_pairs.iter().any(|(expected_window, evtype)| {
+                                *expected_window == window
+                                    && events[0] == EventDescription::extension(35, 137, *evtype)
+                            })
+                    }),
+                    _ => false,
+                })
+            {
+                Decision::Deny(DENY)
+            } else {
+                Decision::Allow
+            }
+        });
+        assert!(matches!(
+            xi_grab_device(&mut denied, deviceid, CROSS_CHILD, XI_GRAB_SEQUENCE,),
+            RequestOutcome::Handled
+        ));
+        let active = if deviceid == crate::xinput::DEVICEID_MASTER_POINTER {
+            denied.state.active_pointer_grab.is_some()
+        } else {
+            denied.state.active_keyboard_grab.is_some()
+        };
+        assert!(active, "denial leaves the XIGrabDevice active");
+        if deviceid == crate::xinput::DEVICEID_MASTER_POINTER {
+            let denied_grab = denied
+                .state
+                .active_pointer_grab
+                .map(|grab| (grab.owner, grab.grab_window));
+            assert_eq!(denied_grab, Some((NOTIFY_RECEIVER_DENIED, CROSS_CHILD)));
+            assert_eq!(
+                allowed_grab_state, denied_grab,
+                "denial keeps the same pointer grab as the Allow run"
+            );
+        } else {
+            let denied_grab = denied
+                .state
+                .active_keyboard_grab
+                .map(|grab| (grab.owner, grab.grab_window));
+            assert_eq!(denied_grab, Some((NOTIFY_RECEIVER_DENIED, CROSS_CHILD)));
+            assert_eq!(
+                allowed_grab_state, denied_grab,
+                "denial keeps the same keyboard grab as the Allow run"
+            );
+        }
+        assert_eq!(
+            denied.drain(NOTIFY_RECEIVER_DENIED),
+            literal_xi_grab_reply(ClientByteOrder::BigEndian, XI_GRAB_SEQUENCE, 0),
+            "denied synthetic activation does not alter the Success reply"
+        );
+        assert!(denied.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
+        assert!(matches!(
+            xi_ungrab_device(&mut denied, deviceid, XI_UNGRAB_SEQUENCE),
+            RequestOutcome::Handled
+        ));
+        let active = if deviceid == crate::xinput::DEVICEID_MASTER_POINTER {
+            denied.state.active_pointer_grab.is_some()
+        } else {
+            denied.state.active_keyboard_grab.is_some()
+        };
+        assert!(!active, "denial does not prevent XIUngrabDevice release");
+        assert!(
+            denied.drain(NOTIFY_RECEIVER_DENIED).is_empty(),
+            "denied synthetic deactivation is absent"
+        );
+        assert!(denied.drain(NOTIFY_SENDER).is_empty());
+        assert!(denied.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
+        let expected_types = if deviceid == crate::xinput::DEVICEID_MASTER_POINTER {
+            vec![
+                (ROOT_WINDOW, 8, request_opcodes(137, 51)),
+                (CROSS_PARENT, 7, request_opcodes(137, 51)),
+                (CROSS_CHILD, 7, request_opcodes(137, 51)),
+                (CROSS_CHILD, 8, request_opcodes(137, 52)),
+                (CROSS_PARENT, 8, request_opcodes(137, 52)),
+                (ROOT_WINDOW, 7, request_opcodes(137, 52)),
+            ]
+        } else {
+            vec![
+                (CROSS_CHILD, 9, request_opcodes(137, 51)),
+                (CROSS_CHILD, 10, request_opcodes(137, 52)),
+            ]
+        };
+        assert_xi2_receive_calls(
+            &calls.lock().unwrap(),
+            &expected_types
+                .iter()
+                .map(|(window, evtype, request)| {
+                    (NOTIFY_RECEIVER_DENIED, *window, *evtype, *request)
+                })
+                .collect::<Vec<_>>(),
+        );
+        assert_xi2_receive_calls(&allow_calls.lock().unwrap(), &expected_allow);
+        assert_no_writer_failures(&denied);
+    };
+    run_case(crate::xinput::DEVICEID_MASTER_POINTER, &[7, 8]);
+    run_case(crate::xinput::DEVICEID_MASTER_KEYBOARD, &[9, 10]);
 }
 
 // mutation: check every kind in C1's writer

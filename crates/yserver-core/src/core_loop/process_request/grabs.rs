@@ -4,7 +4,7 @@ use crate::{
     },
     backend::Backend,
     core_loop::{
-        fanout::{emit_window_event_to_state_with_receive, fanout_event_to_clients},
+        fanout::{emit_window_event_to_state_with_receive, fanout_event_to_clients_with_receive},
         key_fanout::replay_frozen_key_to_focus,
         pointer_fanout::{PointerReplay, replay_frozen_pointer_event_to_state},
         process_request::{
@@ -1197,28 +1197,36 @@ pub(crate) fn emit_core_pointer_grab_chain(
         let event_x = i16::try_from(i32::from(root_x) - ox).unwrap_or(i16::MAX);
         let event_y = i16::try_from(i32::from(root_y) - oy).unwrap_or(i16::MAX);
         let focus = state.crossing_has_focus(e.window);
-        let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
-            x11::encode_xi2_crossing_event(
-                buf,
-                order,
-                seq,
-                XI2_MAJOR_OPCODE,
-                evtype,
-                2,
-                server_time,
-                ROOT_WINDOW,
-                e.window,
-                root_x,
-                root_y,
-                event_x,
-                event_y,
-                0,
-                mode,
-                e.detail,
-                2,
-                focus,
-            );
-        });
+        let description = crate::xinput::xi2_event_description(evtype);
+        let events = EventBatch::new(std::slice::from_ref(&description));
+        let _dropped = fanout_event_to_clients_with_receive(
+            state,
+            &targets,
+            crate::access::EventSubject::Window(e.window),
+            &events,
+            |buf, seq, order| {
+                x11::encode_xi2_crossing_event(
+                    buf,
+                    order,
+                    seq,
+                    XI2_MAJOR_OPCODE,
+                    evtype,
+                    2,
+                    server_time,
+                    ROOT_WINDOW,
+                    e.window,
+                    root_x,
+                    root_y,
+                    event_x,
+                    event_y,
+                    0,
+                    mode,
+                    e.detail,
+                    2,
+                    focus,
+                );
+            },
+        );
     }
 }
 
