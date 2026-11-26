@@ -731,13 +731,10 @@ pub(in crate::core_loop) fn emit_property_dispatch_error(
 /// `deviceid` is the literal device id the change applied to (the
 /// reserved XTEST ID for a virtual-device change, or a registry-assigned
 /// facet ID for a physical source). The XISelectEvents storage keys masks by
-/// the deviceid the client *requested*, which may be `XIAllDevices(0)`
-/// (a client that wants events from every device) or
-/// `XIAllMasterDevices(1)` (every master). xserver's delivery walks
-/// `dix/events.c::EventMaskForClient` and OR's the masks stored under
-/// the specific id AND the wildcard ids — we must mirror that here, or
-/// a client that called `xinput watch-props` (which selects with
-/// `deviceid=0`) silently receives nothing. The XI2 and XI1 emits are
+/// the deviceid the client *requested*. The XI2 emit matches a selection
+/// stored under the exact device id or under `XIAllDevices(0)`, so a client
+/// that called `xinput watch-props` (which selects with `deviceid=0`) still
+/// receives the event. The XI2 and XI1 emits are
 /// independent: a client may have selected via either (or both) paths
 /// and receives one copy per path.
 pub(crate) fn emit_property_change(
