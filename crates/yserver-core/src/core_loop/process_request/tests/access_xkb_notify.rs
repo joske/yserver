@@ -179,8 +179,12 @@ fn drive_set_controls(fixture: &mut NotifyFixture) {
 
 fn drive_set_per_key_repeat(fixture: &mut NotifyFixture) {
     script_repeat_outcome(fixture);
+    let mut body = [0; 32];
+    body[..2].copy_from_slice(&0x0100u16.to_le_bytes()); // XkbUseCoreKbd
+    body[6] = 8; // minimum legal keycode
+    body[7] = u8::MAX;
     assert!(matches!(
-        xkb_request(fixture, NOTIFY_SENDER, REQUEST_SEQUENCE, 9, &[0; 32]),
+        xkb_request(fixture, NOTIFY_SENDER, REQUEST_SEQUENCE, 9, &body),
         RequestOutcome::Handled
     ));
     assert_eq!(fixture.drain(NOTIFY_SENDER), Vec::<u8>::new());
@@ -285,6 +289,15 @@ fn literal_request_stream(sequence: u16) -> Vec<u8> {
     stream
 }
 
+fn literal_request_stream_prefix(sequence: u16, frame_count: usize) -> Vec<u8> {
+    literal_request_stream(sequence)
+        .chunks_exact(32)
+        .take(frame_count)
+        .flatten()
+        .copied()
+        .collect()
+}
+
 fn assert_no_writer_failures(fixture: &NotifyFixture) {
     assert!(
         crate::core_loop::client_io::failed_writers(&fixture.state.clients).is_empty(),
@@ -360,36 +373,14 @@ fn receive_xkb_state_no_policy_bytes() {
     drive_latch_lock(&mut fixture);
     append_frame(&mut denied_stream, fixture.drain(NOTIFY_RECEIVER_DENIED));
     append_frame(&mut allowed_stream, fixture.drain(NOTIFY_RECEIVER_ALLOWED));
-    assert_eq!(
-        denied_stream,
-        literal_state_notify(0x1234, 0x10, 0, 0x10, 0x1f09, 0, 0, 136, 5)
-    );
-    assert_eq!(
-        allowed_stream,
-        literal_state_notify(0x5678, 0x10, 0, 0x10, 0x1f09, 0, 0, 136, 5)
-    );
+    assert_eq!(denied_stream, literal_request_stream_prefix(0x1234, 1));
+    assert_eq!(allowed_stream, literal_request_stream_prefix(0x5678, 1));
 
     drive_set_controls(&mut fixture);
     append_frame(&mut denied_stream, fixture.drain(NOTIFY_RECEIVER_DENIED));
     append_frame(&mut allowed_stream, fixture.drain(NOTIFY_RECEIVER_ALLOWED));
-    let expected_denied_controls = literal_controls_notify(0x1234, 1, REPEAT_KEYS_MASK, 1, 7);
-    let expected_allowed_controls = literal_controls_notify(0x5678, 1, REPEAT_KEYS_MASK, 1, 7);
-    assert_eq!(
-        denied_stream,
-        [
-            literal_state_notify(0x1234, 0x10, 0, 0x10, 0x1f09, 0, 0, 136, 5),
-            expected_denied_controls.clone(),
-        ]
-        .concat()
-    );
-    assert_eq!(
-        allowed_stream,
-        [
-            literal_state_notify(0x5678, 0x10, 0, 0x10, 0x1f09, 0, 0, 136, 5),
-            expected_allowed_controls.clone(),
-        ]
-        .concat()
-    );
+    assert_eq!(denied_stream, literal_request_stream_prefix(0x1234, 2));
+    assert_eq!(allowed_stream, literal_request_stream_prefix(0x5678, 2));
 
     drive_set_per_key_repeat(&mut fixture);
     append_frame(&mut denied_stream, fixture.drain(NOTIFY_RECEIVER_DENIED));
@@ -486,8 +477,8 @@ fn receive_xkb_state_denied_one_recipient() {
     );
 }
 
-// Mutation: move xkb_announced advancement after the Receive denial
-// short-circuit; denying every selected copy must still leave the snapshot new.
+// Mutation: put xkb_announced advancement after a denial-driven early return;
+// denying every selected copy must still leave the snapshot new.
 #[test]
 fn receive_xkb_state_denied_snapshot_advances() {
     let mut denied = notify_fixture(STATE_DETAILS, 0);
@@ -621,8 +612,8 @@ fn receive_xkb_controls_denied_one_recipient() {
     assert_eq!((denied_effect.1, denied_effect.2), (200, 20));
 }
 
-// Mutation: leave K9 unchecked; the denied client must not receive its
-// per-key ControlsNotify while the core repeat bitmap still changes.
+// Mutations: leave K9 unchecked, or change another repeat bit only in the
+// denied run; the stream and full bitmap comparison must catch both.
 #[test]
 fn receive_xkb_per_key_repeat_denied() {
     let mut denied = notify_fixture(0, PER_KEY_REPEAT_MASK);
@@ -639,11 +630,12 @@ fn receive_xkb_per_key_repeat_denied() {
         request_opcodes(136, 9),
     );
     let repeat_bit = 1u8 << (REPEAT_KEYCODE & 7);
+    let repeat_byte = usize::from(REPEAT_KEYCODE >> 3);
     let denied_effect = (
-        denied.state.keyboard_control.auto_repeats[usize::from(REPEAT_KEYCODE >> 3)] & repeat_bit,
+        denied.state.keyboard_control.auto_repeats,
         denied.state.keyboard_control.global_auto_repeat,
     );
-    assert_eq!(denied_effect.0, repeat_bit);
+    assert_ne!(denied_effect.0[repeat_byte] & repeat_bit, 0);
 
     let mut allowed = notify_fixture(0, PER_KEY_REPEAT_MASK);
     let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
@@ -664,11 +656,10 @@ fn receive_xkb_per_key_repeat_denied() {
     assert_eq!(
         denied_effect,
         (
-            allowed.state.keyboard_control.auto_repeats[usize::from(REPEAT_KEYCODE >> 3)]
-                & repeat_bit,
+            allowed.state.keyboard_control.auto_repeats,
             allowed.state.keyboard_control.global_auto_repeat,
         ),
-        "denial keeps repeat bits and enabled-controls value"
+        "denial keeps the full repeat bitmap and enabled-controls value"
     );
 }
 
