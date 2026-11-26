@@ -24,6 +24,7 @@ mod screen;
 mod xinerama;
 
 use crate::{
+    access::{EventBatch, EventDescription},
     backend::{Backend, CrtcConfigToken},
     core_loop::process_request::{
         RANDR_REQUEST_COUNT, RequestOutcome, emit_x11_error_with_minor,
@@ -130,10 +131,13 @@ fn send_root_config_notify(state: &mut ServerState) {
         depth: root.depth,
     };
     let override_redirect = root.override_redirect;
-    let _dropped = crate::core_loop::fanout::emit_window_event_to_state(
+    let event_description = EventDescription::core(22);
+    let event_batch = EventBatch::new(std::slice::from_ref(&event_description));
+    let _dropped = crate::core_loop::fanout::emit_window_event_to_state_with_receive(
         state,
         crate::resources::ROOT_WINDOW,
         0x0002_0000, // StructureNotifyMask
+        &event_batch,
         |buf, seq, order| {
             x11::encode_configure_notify_event(
                 buf,
