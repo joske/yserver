@@ -752,10 +752,8 @@ fn pointer_event_fanout_to_state_inner(
             }
         }
     }
-    // Pointer barriers only constrain genuine relative motion. The
-    // motion source is already encoded in the event kind/producer:
-    // absolute device motion and warps are marked non-relative and
-    // skip this block via `barrier_bypass`.
+    // Only relative motion is constrained; absolute-device motion and warps are marked non-relative
+    // by event kind/producer and bypass through `barrier_bypass`.
     if !state.pointer_barriers.is_empty() && matches!(event.kind, PointerEventKind::MotionNotify) {
         log::trace!(
             target: "yserver_core::barriers",
@@ -963,8 +961,7 @@ fn pointer_event_fanout_to_state_inner(
             }
         }
     }
-    // A tree-change crossing is not user input: it neither resets the idle
-    // clocks nor wakes DPMS or the screen saver.
+    // Tree-change is not user input; it resets no idle clocks and wakes no DPMS/screensaver.
     if !event.tree_change {
         let now = std::time::Instant::now();
         // Capture priors BEFORE mutating; needed by the IDLETIME wake handler.
@@ -4824,13 +4821,9 @@ fn barrier_xi2_targets(state: &ServerState, window: ResourceId, evtype: u16) -> 
         .clients
         .iter()
         .filter_map(|(id, client)| {
-            // Match the device-candidate order the normal pointer fanout
-            // uses: a client may have selected under the concrete master
-            // pointer OR the `XIAllMasterDevices` (1) / `XIAllDevices` (0)
-            // wildcards. Querying only the concrete master id missed
-            // wildcard selections (e.g. libXi's `XIAllMasterDevices`), so
-            // BarrierHit/Leave never reached the client — leaving the
-            // pointer pinned at the wall with no way to release it.
+            // Match normal pointer fanout's candidate order, including master and wildcard selectors.
+            // Concrete-only lookup missed `XIAllMasterDevices` (1) / `XIAllDevices` (0) selections,
+            // so BarrierHit/Leave never reached those clients, pinning the pointer without release.
             let mask = xi2_mask_for_client(
                 client,
                 window,
@@ -4876,28 +4869,35 @@ pub(crate) fn emit_barrier_event(
     if targets.is_empty() {
         return Vec::new();
     }
-    fanout_event_to_clients(state, &targets, |buf, seq, order| {
-        let _ = x11::write_xi_barrier_event(
-            buf,
-            order,
-            seq,
-            XI2_MAJOR_OPCODE,
-            evtype,
-            XI2_MASTER_POINTER_DEVICE_ID,
-            time,
-            eventid,
-            ROOT_WINDOW.0,
-            barrier_window.0,
-            barrier_xid,
-            dtime,
-            flags,
-            sourceid,
-            root_x,
-            root_y,
-            dx,
-            dy,
-        );
-    })
+    let description = crate::xinput::xi2_event_description(evtype);
+    fanout_event_to_clients_with_receive(
+        state,
+        &targets,
+        EventSubject::Window(barrier_window),
+        &EventBatch::new(std::slice::from_ref(&description)),
+        |buf, seq, order| {
+            let _ = x11::write_xi_barrier_event(
+                buf,
+                order,
+                seq,
+                XI2_MAJOR_OPCODE,
+                evtype,
+                XI2_MASTER_POINTER_DEVICE_ID,
+                time,
+                eventid,
+                ROOT_WINDOW.0,
+                barrier_window.0,
+                barrier_xid,
+                dtime,
+                flags,
+                sourceid,
+                root_x,
+                root_y,
+                dx,
+                dy,
+            );
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
