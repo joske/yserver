@@ -30,8 +30,10 @@ use owner_events::{
 use yserver_protocol::x11::{self, ClientId, ResourceId, SequenceNumber};
 
 use crate::{
+    access::{EventBatch, EventDescription, EventSubject},
     core_loop::fanout::{
-        client_target_id, fanout_event_to_clients, pointer_propagation_target_by_id,
+        client_target_id, fanout_event_to_clients, fanout_event_to_clients_with_receive,
+        pointer_propagation_target_by_id,
     },
     host_x11::{HostPointerEvent, HostXidMap, PointerEventKind},
     resources::ROOT_WINDOW,
@@ -1814,15 +1816,12 @@ fn pointer_event_fanout_to_state_inner(
             .unwrap_or((cross_start, cross_x, cross_y, Vec::new(), ResourceId(0)))
         };
 
-        // XI2 shadows core per client (Xorg behaviour, mirrors
-        // `deliver_key_to_window`): a client that receives the XI2
-        // form of this event must NOT also receive the core form, or
-        // it processes every click/motion twice. Chromium's Ozone X11
-        // layer selects both core and XI2 on its windows; without this
-        // dedup its 3-dots / extensions menu got two ButtonPress
-        // events and opened-then-closed. Skip on replay — the XI2
-        // fanout below is skipped on replay, so there is no XI2 form
-        // to dedup against.
+        // yserver shadows the core form per client when that client also gets
+        // XI2 on the same window. For crossings this is a yserver rule: Xorg
+        // dispatches core and XI2 separately (`dix/enterleave.c:596-607`).
+        // Other pointer kinds mirror `deliver_key_to_window`; without this,
+        // clients selecting both forms process clicks and motion twice. Skip
+        // on replay because the XI2 fanout below is skipped as well.
         if !is_replay {
             let xi2_evt = xi2_evtype(event.kind);
             if xi2_evt != 0 {
@@ -4094,7 +4093,7 @@ fn fanout_core_pointer_event_ordered(
             immediate.push(*target);
         }
     }
-    fanout_event_to_clients(state, &immediate, |buf, seq, order| {
+    let encode = |buf: &mut Vec<u8>, seq, order| {
         encode_pointer_event(
             buf,
             order,
@@ -4109,7 +4108,21 @@ fn fanout_core_pointer_event_ordered(
             event_y,
             focus,
         );
-    })
+    };
+    let event_type = match event.kind {
+        PointerEventKind::EnterNotify => 7,
+        PointerEventKind::LeaveNotify => 8,
+        _ => return fanout_event_to_clients(state, &immediate, encode),
+    };
+    let description = EventDescription::core(event_type);
+    let events = EventBatch::new(std::slice::from_ref(&description));
+    fanout_event_to_clients_with_receive(
+        state,
+        &immediate,
+        EventSubject::Window(window),
+        &events,
+        encode,
+    )
 }
 
 fn fanout_deferred_core_pointer_event(

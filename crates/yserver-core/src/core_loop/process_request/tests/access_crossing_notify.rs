@@ -10,6 +10,8 @@ use super::{
 use crate::{
     access::{Decision, DenyError, EventDescription, EventSubject},
     backend::WindowHandle,
+    core_loop::message::InputOrigin,
+    host_x11::{HostPointerEvent, HostXidMap, PointerEventKind},
     resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_WINDOW},
     server::PresentEventSelection,
 };
@@ -851,4 +853,1121 @@ fn receive_root_config_notify_denial() {
         &calls.lock().unwrap(),
         yserver_protocol::x11::randr::RR_SET_MONITOR,
     );
+}
+
+const CROSS_PARENT: ResourceId = ResourceId(0x0051_0010);
+const CROSS_CHILD: ResourceId = ResourceId(0x0051_0011);
+const CROSS_PARENT_XID: u32 = 0xA010;
+const CROSS_CHILD_XID: u32 = 0xA011;
+const ENTER_LEAVE_MASK: u32 = 0x0000_0030;
+const POINTER_MOTION_MASK: u32 = 0x0000_0040;
+const BUTTON_PRESS_MASK: u32 = 0x0000_0004;
+const CROSS_X: i16 = 35;
+const CROSS_Y: i16 = 20;
+const GRAB_SEQUENCE: u16 = 0x0041;
+const UNGRAB_SEQUENCE: u16 = 0x0042;
+
+fn core_crossing_fixture() -> (NotifyFixture, HostXidMap) {
+    let mut fixture = NotifyFixture::new();
+    fixture.state.start_instant = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    for (client, sequence, order) in [
+        (
+            NOTIFY_SENDER,
+            SENDER_SEQUENCE,
+            ClientByteOrder::LittleEndian,
+        ),
+        (
+            NOTIFY_RECEIVER_DENIED,
+            DUAL_SEQUENCE,
+            ClientByteOrder::BigEndian,
+        ),
+        (
+            NOTIFY_RECEIVER_ALLOWED,
+            ROOT_SEQUENCE,
+            ClientByteOrder::LittleEndian,
+        ),
+    ] {
+        let state = fixture.state.clients.get_mut(&client.0).unwrap();
+        state.byte_order = order;
+        state.last_sequence.store(sequence, Ordering::Relaxed);
+    }
+    for (window, parent, x, y, width, height) in [
+        (CROSS_PARENT, ROOT_WINDOW, 20, 10, 100, 80),
+        (CROSS_CHILD, CROSS_PARENT, 10, 5, 40, 30),
+    ] {
+        fixture.state.resources.create_window(
+            NOTIFY_SENDER,
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window,
+                parent,
+                x,
+                y,
+                width,
+                height,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = fixture.state.resources.map_window(window);
+    }
+    for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+        let state = fixture.state.clients.get_mut(&client.0).unwrap();
+        state.event_masks.insert(CROSS_PARENT, ENTER_LEAVE_MASK);
+        state.event_masks.insert(
+            CROSS_CHILD,
+            ENTER_LEAVE_MASK | POINTER_MOTION_MASK | BUTTON_PRESS_MASK,
+        );
+    }
+    fixture.state.pointer_root = (CROSS_X, CROSS_Y);
+    fixture.state.master_sprite_root = (CROSS_X, CROSS_Y);
+    let mut xid_map = HostXidMap::new();
+    xid_map.insert(CROSS_PARENT_XID, CROSS_PARENT);
+    xid_map.insert(CROSS_CHILD_XID, CROSS_CHILD);
+    (fixture, xid_map)
+}
+
+fn core_pointer_event(
+    kind: PointerEventKind,
+    host_xid: u32,
+    detail: u8,
+    time: u32,
+    root_x: i16,
+    root_y: i16,
+) -> HostPointerEvent {
+    let (host_x, host_y) = if host_xid == CROSS_PARENT_XID {
+        (20, 10)
+    } else {
+        (10, 5)
+    };
+    HostPointerEvent {
+        origin: InputOrigin::XTest(4),
+        kind,
+        host_xid,
+        detail,
+        time,
+        root_x,
+        root_y,
+        // translate_host_event uses the producer window's parent-relative
+        // origin plus these coordinates to recover the root position.
+        event_x: root_x - host_x,
+        event_y: root_y - host_y,
+        state: 0,
+        crossing_mode: 0,
+        child: 0,
+        raw_dx: 0,
+        raw_dy: 0,
+        device_axes: None,
+        tree_change: false,
+    }
+}
+
+fn feed_core_pointer_event(
+    fixture: &mut NotifyFixture,
+    xid_map: &HostXidMap,
+    event: HostPointerEvent,
+) {
+    let _dropped = crate::core_loop::pointer_fanout::pointer_event_fanout_to_state(
+        &mut fixture.state,
+        &mut fixture.backend,
+        xid_map,
+        event,
+        true,
+        false,
+    );
+}
+
+fn literal_core_crossing(
+    order: ClientByteOrder,
+    event_type: u8,
+    detail: u8,
+    sequence: u16,
+    time: u32,
+    window: ResourceId,
+    child: ResourceId,
+    root_x: i16,
+    root_y: i16,
+    event_x: i16,
+    event_y: i16,
+    mode: u8,
+    focus: bool,
+) -> Vec<u8> {
+    let mut event = literal_event_header(event_type, detail, sequence, order);
+    append_event_u32(&mut event, order, time);
+    append_event_u32(&mut event, order, ROOT_WINDOW.0);
+    append_event_u32(&mut event, order, window.0);
+    append_event_u32(&mut event, order, child.0);
+    append_event_u16(&mut event, order, root_x as u16);
+    append_event_u16(&mut event, order, root_y as u16);
+    append_event_u16(&mut event, order, event_x as u16);
+    append_event_u16(&mut event, order, event_y as u16);
+    append_event_u16(&mut event, order, 0); // state
+    event.extend_from_slice(&[mode, 0x02 | u8::from(focus)]);
+    finish_literal_event(event)
+}
+
+fn literal_core_motion(
+    order: ClientByteOrder,
+    sequence: u16,
+    time: u32,
+    window: ResourceId,
+    root_x: i16,
+    root_y: i16,
+    event_x: i16,
+    event_y: i16,
+) -> Vec<u8> {
+    let mut event = literal_event_header(6, 0, sequence, order);
+    append_event_u32(&mut event, order, time);
+    append_event_u32(&mut event, order, ROOT_WINDOW.0);
+    append_event_u32(&mut event, order, window.0);
+    append_event_u32(&mut event, order, 0); // no child
+    append_event_u16(&mut event, order, root_x as u16);
+    append_event_u16(&mut event, order, root_y as u16);
+    append_event_u16(&mut event, order, event_x as u16);
+    append_event_u16(&mut event, order, event_y as u16);
+    append_event_u16(&mut event, order, 0); // state
+    event.extend_from_slice(&[1, 0]); // same_screen, pad
+    finish_literal_event(event)
+}
+
+fn literal_core_button_press(
+    order: ClientByteOrder,
+    sequence: u16,
+    time: u32,
+    window: ResourceId,
+    root_x: i16,
+    root_y: i16,
+    event_x: i16,
+    event_y: i16,
+) -> Vec<u8> {
+    let mut event = literal_event_header(4, 1, sequence, order);
+    append_event_u32(&mut event, order, time);
+    append_event_u32(&mut event, order, ROOT_WINDOW.0);
+    append_event_u32(&mut event, order, window.0);
+    append_event_u32(&mut event, order, 0); // no child
+    append_event_u16(&mut event, order, root_x as u16);
+    append_event_u16(&mut event, order, root_y as u16);
+    append_event_u16(&mut event, order, event_x as u16);
+    append_event_u16(&mut event, order, event_y as u16);
+    append_event_u16(&mut event, order, 0); // state
+    event.extend_from_slice(&[1, 0]); // same_screen, pad
+    finish_literal_event(event)
+}
+
+fn literal_grab_reply(order: ClientByteOrder, sequence: u16, status: u8) -> Vec<u8> {
+    let mut reply = literal_event_header(1, status, sequence, order);
+    append_event_u32(&mut reply, order, 0); // no reply payload
+    reply.extend_from_slice(&[0; 24]);
+    reply
+}
+
+fn grab_pointer(
+    fixture: &mut NotifyFixture,
+    owner: ClientId,
+    owner_events: bool,
+    window: ResourceId,
+    event_mask: u16,
+    sequence: u16,
+) -> RequestOutcome {
+    let mut body = Vec::with_capacity(20);
+    body.extend_from_slice(&window.0.to_le_bytes());
+    body.extend_from_slice(&event_mask.to_le_bytes());
+    body.extend_from_slice(&[1, 1]); // async pointer and keyboard modes
+    body.extend_from_slice(&0_u32.to_le_bytes()); // no confinement
+    body.extend_from_slice(&0_u32.to_le_bytes()); // no cursor
+    body.extend_from_slice(&0_u32.to_le_bytes()); // CurrentTime
+    fixture
+        .request(
+            owner,
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: 26,
+                data: u8::from(owner_events),
+                length_units: 6,
+            },
+            &body,
+        )
+        .expect("GrabPointer through process_request")
+}
+
+fn ungrab_pointer(fixture: &mut NotifyFixture, owner: ClientId, sequence: u16) -> RequestOutcome {
+    fixture
+        .request(
+            owner,
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: 27,
+                data: 0,
+                length_units: 2,
+            },
+            &0_u32.to_le_bytes(),
+        )
+        .expect("UngrabPointer through process_request")
+}
+
+fn grab_chain_child_to_parent(order: ClientByteOrder, sequence: u16, mode: u8) -> Vec<u8> {
+    [
+        literal_core_crossing(
+            order,
+            8,
+            0,
+            sequence,
+            0,
+            CROSS_CHILD,
+            ResourceId(0),
+            CROSS_X,
+            CROSS_Y,
+            5,
+            5,
+            mode,
+            true,
+        )
+        .as_slice(),
+        literal_core_crossing(
+            order,
+            7,
+            2,
+            sequence,
+            0,
+            CROSS_PARENT,
+            ResourceId(0),
+            CROSS_X,
+            CROSS_Y,
+            15,
+            10,
+            mode,
+            true,
+        )
+        .as_slice(),
+    ]
+    .concat()
+}
+
+fn grab_chain_parent_to_child(order: ClientByteOrder, sequence: u16, mode: u8) -> Vec<u8> {
+    [
+        literal_core_crossing(
+            order,
+            8,
+            2,
+            sequence,
+            0,
+            CROSS_PARENT,
+            ResourceId(0),
+            CROSS_X,
+            CROSS_Y,
+            15,
+            10,
+            mode,
+            true,
+        )
+        .as_slice(),
+        literal_core_crossing(
+            order,
+            7,
+            0,
+            sequence,
+            0,
+            CROSS_CHILD,
+            ResourceId(0),
+            CROSS_X,
+            CROSS_Y,
+            5,
+            5,
+            mode,
+            true,
+        )
+        .as_slice(),
+    ]
+    .concat()
+}
+
+fn assert_no_writer_failures(fixture: &NotifyFixture) {
+    assert!(
+        crate::core_loop::client_io::failed_writers(&fixture.state.clients).is_empty(),
+        "Receive denial is not a transport failure"
+    );
+}
+
+fn assert_core_receive_calls(
+    calls: &[RecordedExtensionCheck],
+    expected: &[(
+        ClientId,
+        ResourceId,
+        u8,
+        Option<crate::access::RequestOpcodes>,
+    )],
+) {
+    let rows = receive_calls(calls);
+    assert_eq!(
+        rows.len(),
+        expected.len(),
+        "one Receive check per selected copy"
+    );
+    for (client, window, evtype, request) in expected {
+        assert_eq!(
+            rows.iter()
+                .filter(|call| {
+                    call.client == *client
+                        && call.receive == Some(EventSubject::Window(*window))
+                        && call.events == Some(vec![EventDescription::core(*evtype)])
+                        && call.request == *request
+                })
+                .count(),
+            1,
+            "one matching Receive call for client {client:?}, W({window:?}), core({evtype})"
+        );
+    }
+    assert!(calls.iter().all(|call| call.hook != ExtensionHook::Send));
+}
+
+// mutation: reverse C2's chain order
+#[test]
+fn receive_core_crossing_baseline_frames() {
+    let (mut fixture, xid_map) = core_crossing_fixture();
+    assert!(!fixture.state.policies_installed());
+    feed_core_pointer_event(
+        &mut fixture,
+        &xid_map,
+        core_pointer_event(
+            PointerEventKind::LeaveNotify,
+            CROSS_PARENT_XID,
+            2,
+            0x1357,
+            CROSS_X,
+            CROSS_Y,
+        ),
+    );
+    feed_core_pointer_event(
+        &mut fixture,
+        &xid_map,
+        core_pointer_event(
+            PointerEventKind::EnterNotify,
+            CROSS_CHILD_XID,
+            0,
+            0x1357,
+            CROSS_X,
+            CROSS_Y,
+        ),
+    );
+    feed_core_pointer_event(
+        &mut fixture,
+        &xid_map,
+        core_pointer_event(
+            PointerEventKind::MotionNotify,
+            CROSS_CHILD_XID,
+            0,
+            0x1358,
+            CROSS_X,
+            CROSS_Y,
+        ),
+    );
+    for (client, order, sequence) in [
+        (
+            NOTIFY_RECEIVER_DENIED,
+            ClientByteOrder::BigEndian,
+            DUAL_SEQUENCE,
+        ),
+        (
+            NOTIFY_RECEIVER_ALLOWED,
+            ClientByteOrder::LittleEndian,
+            ROOT_SEQUENCE,
+        ),
+    ] {
+        assert_eq!(
+            fixture.drain(client),
+            [
+                literal_core_crossing(
+                    order,
+                    8,
+                    2,
+                    sequence,
+                    0x1357,
+                    CROSS_PARENT,
+                    ResourceId(0),
+                    CROSS_X,
+                    CROSS_Y,
+                    15,
+                    10,
+                    0,
+                    true,
+                )
+                .as_slice(),
+                literal_core_crossing(
+                    order,
+                    7,
+                    0,
+                    sequence,
+                    0x1357,
+                    CROSS_CHILD,
+                    ResourceId(0),
+                    CROSS_X,
+                    CROSS_Y,
+                    5,
+                    5,
+                    0,
+                    true,
+                )
+                .as_slice(),
+                literal_core_motion(order, sequence, 0x1358, CROSS_CHILD, CROSS_X, CROSS_Y, 5, 5,)
+                    .as_slice(),
+            ]
+            .concat(),
+            "explicit Leave/Enter followed by MotionNotify stream"
+        );
+    }
+    assert_eq!(fixture.state.master_sprite_root, (CROSS_X, CROSS_Y));
+    assert_eq!(fixture.state.pointer_root, (CROSS_X, CROSS_Y));
+
+    assert!(matches!(
+        grab_pointer(
+            &mut fixture,
+            NOTIFY_SENDER,
+            false,
+            CROSS_PARENT,
+            0,
+            GRAB_SEQUENCE,
+        ),
+        RequestOutcome::Handled
+    ));
+    assert!(fixture.state.active_pointer_grab.is_some());
+    assert_eq!(
+        fixture.drain(NOTIFY_SENDER),
+        literal_grab_reply(ClientByteOrder::LittleEndian, GRAB_SEQUENCE, 0),
+        "GrabPointer succeeds with its literal reply"
+    );
+    assert_eq!(
+        fixture.drain(NOTIFY_RECEIVER_DENIED),
+        grab_chain_child_to_parent(ClientByteOrder::BigEndian, DUAL_SEQUENCE, 1),
+        "big-endian NotifyGrab chain is Leave child then Enter parent"
+    );
+    assert_eq!(
+        fixture.drain(NOTIFY_RECEIVER_ALLOWED),
+        grab_chain_child_to_parent(ClientByteOrder::LittleEndian, ROOT_SEQUENCE, 1),
+        "little-endian NotifyGrab chain is Leave child then Enter parent"
+    );
+    assert!(matches!(
+        ungrab_pointer(&mut fixture, NOTIFY_SENDER, UNGRAB_SEQUENCE),
+        RequestOutcome::Handled
+    ));
+    assert!(fixture.state.active_pointer_grab.is_none());
+    assert!(
+        fixture.drain(NOTIFY_SENDER).is_empty(),
+        "UngrabPointer is void"
+    );
+    assert_eq!(
+        fixture.drain(NOTIFY_RECEIVER_DENIED),
+        grab_chain_parent_to_child(ClientByteOrder::BigEndian, DUAL_SEQUENCE, 2),
+        "big-endian NotifyUngrab chain is Leave parent then Enter child"
+    );
+    assert_eq!(
+        fixture.drain(NOTIFY_RECEIVER_ALLOWED),
+        grab_chain_parent_to_child(ClientByteOrder::LittleEndian, ROOT_SEQUENCE, 2),
+        "little-endian NotifyUngrab chain is Leave parent then Enter child"
+    );
+    assert_no_writer_failures(&fixture);
+}
+
+fn run_explicit_parent_child_crossings(fixture: &mut NotifyFixture, xid_map: &HostXidMap) {
+    feed_core_pointer_event(
+        fixture,
+        xid_map,
+        core_pointer_event(
+            PointerEventKind::LeaveNotify,
+            CROSS_PARENT_XID,
+            2,
+            0x1357,
+            CROSS_X,
+            CROSS_Y,
+        ),
+    );
+    feed_core_pointer_event(
+        fixture,
+        xid_map,
+        core_pointer_event(
+            PointerEventKind::EnterNotify,
+            CROSS_CHILD_XID,
+            0,
+            0x1357,
+            CROSS_X,
+            CROSS_Y,
+        ),
+    );
+    feed_core_pointer_event(
+        fixture,
+        xid_map,
+        core_pointer_event(
+            PointerEventKind::MotionNotify,
+            CROSS_CHILD_XID,
+            0,
+            0x1358,
+            CROSS_X,
+            CROSS_Y,
+        ),
+    );
+}
+
+fn literal_explicit_crossings(
+    order: ClientByteOrder,
+    sequence: u16,
+    include_enter: bool,
+) -> Vec<u8> {
+    let leave = literal_core_crossing(
+        order,
+        8,
+        2,
+        sequence,
+        0x1357,
+        CROSS_PARENT,
+        ResourceId(0),
+        CROSS_X,
+        CROSS_Y,
+        15,
+        10,
+        0,
+        true,
+    );
+    let motion = literal_core_motion(order, sequence, 0x1358, CROSS_CHILD, CROSS_X, CROSS_Y, 5, 5);
+    if include_enter {
+        [
+            leave.as_slice(),
+            literal_core_crossing(
+                order,
+                7,
+                0,
+                sequence,
+                0x1357,
+                CROSS_CHILD,
+                ResourceId(0),
+                CROSS_X,
+                CROSS_Y,
+                5,
+                5,
+                0,
+                true,
+            )
+            .as_slice(),
+            motion.as_slice(),
+        ]
+        .concat()
+    } else {
+        [leave.as_slice(), motion.as_slice()].concat()
+    }
+}
+
+// mutation: leave C1 unchecked
+#[test]
+fn receive_core_crossing_chain_denies_one_window() {
+    let (mut allowed, xid_map) = core_crossing_fixture();
+    let allowed_calls = allowed.install_policy(|_, _| Decision::Allow);
+    run_explicit_parent_child_crossings(&mut allowed, &xid_map);
+    assert_eq!(
+        allowed.drain(NOTIFY_RECEIVER_DENIED),
+        literal_explicit_crossings(ClientByteOrder::BigEndian, DUAL_SEQUENCE, true),
+        "allow control denial-recipient baseline"
+    );
+    assert_eq!(
+        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
+        literal_explicit_crossings(ClientByteOrder::LittleEndian, ROOT_SEQUENCE, true),
+        "allow control other-recipient baseline"
+    );
+    assert_eq!(allowed.state.master_sprite_root, (CROSS_X, CROSS_Y));
+    assert_core_receive_calls(
+        &allowed_calls.lock().unwrap(),
+        &[
+            (NOTIFY_RECEIVER_DENIED, CROSS_PARENT, 8, None),
+            (NOTIFY_RECEIVER_ALLOWED, CROSS_PARENT, 8, None),
+            (NOTIFY_RECEIVER_DENIED, CROSS_CHILD, 7, None),
+            (NOTIFY_RECEIVER_ALLOWED, CROSS_CHILD, 7, None),
+        ],
+    );
+
+    let (mut denied, xid_map) = core_crossing_fixture();
+    let calls = denied.install_policy(|_, call| {
+        if call.hook == ExtensionHook::Receive
+            && call.client == NOTIFY_RECEIVER_DENIED
+            && call.receive == Some(EventSubject::Window(CROSS_CHILD))
+            && call.events == Some(vec![EventDescription::core(7)])
+        {
+            Decision::Deny(DENY)
+        } else {
+            Decision::Allow
+        }
+    });
+    run_explicit_parent_child_crossings(&mut denied, &xid_map);
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_DENIED),
+        literal_explicit_crossings(ClientByteOrder::BigEndian, DUAL_SEQUENCE, false),
+        "denying child Enter keeps parent Leave and unchecked motion"
+    );
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_ALLOWED),
+        literal_explicit_crossings(ClientByteOrder::LittleEndian, ROOT_SEQUENCE, true),
+        "other recipient keeps every literal event"
+    );
+    assert_eq!(denied.state.master_sprite_root, (CROSS_X, CROSS_Y));
+    assert_eq!(denied.state.pointer_root, (CROSS_X, CROSS_Y));
+    assert_core_receive_calls(
+        &calls.lock().unwrap(),
+        &[
+            (NOTIFY_RECEIVER_DENIED, CROSS_PARENT, 8, None),
+            (NOTIFY_RECEIVER_ALLOWED, CROSS_PARENT, 8, None),
+            (NOTIFY_RECEIVER_DENIED, CROSS_CHILD, 7, None),
+            (NOTIFY_RECEIVER_ALLOWED, CROSS_CHILD, 7, None),
+        ],
+    );
+    assert_no_writer_failures(&denied);
+}
+
+fn activate_parent_grab(
+    fixture: &mut NotifyFixture,
+    owner: ClientId,
+    owner_events: bool,
+    sequence: u16,
+) {
+    assert!(matches!(
+        grab_pointer(
+            fixture,
+            owner,
+            owner_events,
+            CROSS_PARENT,
+            BUTTON_PRESS_MASK as u16,
+            sequence,
+        ),
+        RequestOutcome::Handled
+    ));
+    assert!(fixture.state.active_pointer_grab.is_some());
+    let order = if owner == NOTIFY_RECEIVER_DENIED {
+        ClientByteOrder::BigEndian
+    } else {
+        ClientByteOrder::LittleEndian
+    };
+    assert_eq!(
+        fixture.drain(owner),
+        [
+            grab_chain_child_to_parent(order, sequence, 1).as_slice(),
+            literal_grab_reply(order, sequence, 0).as_slice(),
+        ]
+        .concat(),
+        "grab owner sees NotifyGrab before the successful reply"
+    );
+    let other = if owner == NOTIFY_RECEIVER_DENIED {
+        NOTIFY_RECEIVER_ALLOWED
+    } else {
+        NOTIFY_RECEIVER_DENIED
+    };
+    let other_order = if other == NOTIFY_RECEIVER_DENIED {
+        ClientByteOrder::BigEndian
+    } else {
+        ClientByteOrder::LittleEndian
+    };
+    let other_sequence = if other == NOTIFY_RECEIVER_DENIED {
+        DUAL_SEQUENCE
+    } else {
+        ROOT_SEQUENCE
+    };
+    assert_eq!(
+        fixture.drain(other),
+        grab_chain_child_to_parent(other_order, other_sequence, 1),
+        "other selectors receive the activation chain"
+    );
+    assert!(fixture.drain(NOTIFY_SENDER).is_empty());
+    assert_no_writer_failures(fixture);
+}
+
+// mutation: check the grab window instead of the crossing window
+#[test]
+fn receive_core_grabbed_crossing_owner_denied() {
+    let (mut allowed, allowed_xid_map) = core_crossing_fixture();
+    activate_parent_grab(&mut allowed, NOTIFY_RECEIVER_DENIED, true, GRAB_SEQUENCE);
+    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
+    feed_core_pointer_event(
+        &mut allowed,
+        &allowed_xid_map,
+        core_pointer_event(
+            PointerEventKind::EnterNotify,
+            CROSS_CHILD_XID,
+            0,
+            0x2468,
+            CROSS_X,
+            CROSS_Y,
+        ),
+    );
+    assert_eq!(
+        allowed.drain(NOTIFY_RECEIVER_DENIED),
+        literal_core_crossing(
+            ClientByteOrder::BigEndian,
+            7,
+            0,
+            GRAB_SEQUENCE,
+            0x2468,
+            CROSS_CHILD,
+            ResourceId(0),
+            CROSS_X,
+            CROSS_Y,
+            5,
+            5,
+            0,
+            true,
+        ),
+        "allow control delivers the crossing to the grab owner on its selected child"
+    );
+    assert!(allowed.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
+    assert_core_receive_calls(
+        &allow_calls.lock().unwrap(),
+        &[(NOTIFY_RECEIVER_DENIED, CROSS_CHILD, 7, None)],
+    );
+
+    let (mut denied, xid_map) = core_crossing_fixture();
+    activate_parent_grab(&mut denied, NOTIFY_RECEIVER_DENIED, true, GRAB_SEQUENCE);
+    let calls = denied.install_policy(|_, call| {
+        if call.hook == ExtensionHook::Receive
+            && call.client == NOTIFY_RECEIVER_DENIED
+            && call.receive == Some(EventSubject::Window(CROSS_CHILD))
+            && call.events == Some(vec![EventDescription::core(7)])
+        {
+            Decision::Deny(DENY)
+        } else {
+            Decision::Allow
+        }
+    });
+    feed_core_pointer_event(
+        &mut denied,
+        &xid_map,
+        core_pointer_event(
+            PointerEventKind::EnterNotify,
+            CROSS_CHILD_XID,
+            0,
+            0x2468,
+            CROSS_X,
+            CROSS_Y,
+        ),
+    );
+    assert!(
+        denied.drain(NOTIFY_RECEIVER_DENIED).is_empty(),
+        "denied crossing copy is absent from the grab owner"
+    );
+    assert!(denied.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
+    assert!(
+        denied.state.active_pointer_grab.is_some(),
+        "grab remains active"
+    );
+    assert_core_receive_calls(
+        &calls.lock().unwrap(),
+        &[(NOTIFY_RECEIVER_DENIED, CROSS_CHILD, 7, None)],
+    );
+
+    feed_core_pointer_event(
+        &mut denied,
+        &xid_map,
+        core_pointer_event(
+            PointerEventKind::ButtonPress,
+            CROSS_CHILD_XID,
+            1,
+            0x2469,
+            CROSS_X,
+            CROSS_Y,
+        ),
+    );
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_DENIED),
+        literal_core_button_press(
+            ClientByteOrder::BigEndian,
+            GRAB_SEQUENCE,
+            0x2469,
+            CROSS_CHILD,
+            CROSS_X,
+            CROSS_Y,
+            5,
+            5,
+        ),
+        "following cooked ButtonPress still reaches the owner without Receive"
+    );
+    assert!(denied.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
+    assert!(
+        denied.state.active_pointer_grab.is_some(),
+        "button does not end grab"
+    );
+    assert_eq!(
+        receive_calls(&calls.lock().unwrap()).len(),
+        1,
+        "cooked button path adds no Receive call"
+    );
+    assert_no_writer_failures(&denied);
+}
+
+// mutation: leave C2 unchecked
+#[test]
+fn receive_core_grab_chain_denial() {
+    let mut allowed = core_crossing_fixture().0;
+    let allowed_calls = allowed.install_policy(|_, _| Decision::Allow);
+    assert!(matches!(
+        grab_pointer(
+            &mut allowed,
+            NOTIFY_SENDER,
+            false,
+            CROSS_PARENT,
+            0,
+            GRAB_SEQUENCE,
+        ),
+        RequestOutcome::Handled
+    ));
+    assert_eq!(
+        allowed.drain(NOTIFY_SENDER),
+        literal_grab_reply(ClientByteOrder::LittleEndian, GRAB_SEQUENCE, 0)
+    );
+    for (client, order, sequence) in [
+        (
+            NOTIFY_RECEIVER_DENIED,
+            ClientByteOrder::BigEndian,
+            DUAL_SEQUENCE,
+        ),
+        (
+            NOTIFY_RECEIVER_ALLOWED,
+            ClientByteOrder::LittleEndian,
+            ROOT_SEQUENCE,
+        ),
+    ] {
+        assert_eq!(
+            allowed.drain(client),
+            grab_chain_child_to_parent(order, sequence, 1),
+            "allow-control NotifyGrab stream"
+        );
+    }
+    assert!(allowed.state.active_pointer_grab.is_some());
+    assert_core_receive_calls(
+        &allowed_calls.lock().unwrap(),
+        &[
+            (
+                NOTIFY_RECEIVER_DENIED,
+                CROSS_CHILD,
+                8,
+                request_opcodes(26, 0),
+            ),
+            (
+                NOTIFY_RECEIVER_ALLOWED,
+                CROSS_CHILD,
+                8,
+                request_opcodes(26, 0),
+            ),
+            (
+                NOTIFY_RECEIVER_DENIED,
+                CROSS_PARENT,
+                7,
+                request_opcodes(26, 0),
+            ),
+            (
+                NOTIFY_RECEIVER_ALLOWED,
+                CROSS_PARENT,
+                7,
+                request_opcodes(26, 0),
+            ),
+        ],
+    );
+
+    let (mut denied, _) = core_crossing_fixture();
+    let calls = denied.install_policy(|_, call| {
+        if call.hook == ExtensionHook::Receive
+            && call.client == NOTIFY_RECEIVER_DENIED
+            && call.receive == Some(EventSubject::Window(CROSS_CHILD))
+            && call.events == Some(vec![EventDescription::core(8)])
+        {
+            Decision::Deny(DENY)
+        } else {
+            Decision::Allow
+        }
+    });
+    assert!(matches!(
+        grab_pointer(
+            &mut denied,
+            NOTIFY_SENDER,
+            false,
+            CROSS_PARENT,
+            0,
+            GRAB_SEQUENCE,
+        ),
+        RequestOutcome::Handled
+    ));
+    assert_eq!(
+        denied.drain(NOTIFY_SENDER),
+        literal_grab_reply(ClientByteOrder::LittleEndian, GRAB_SEQUENCE, 0),
+        "denied chain copy does not affect GrabPointer's Success reply"
+    );
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_DENIED),
+        literal_core_crossing(
+            ClientByteOrder::BigEndian,
+            7,
+            2,
+            DUAL_SEQUENCE,
+            0,
+            CROSS_PARENT,
+            ResourceId(0),
+            CROSS_X,
+            CROSS_Y,
+            15,
+            10,
+            1,
+            true,
+        ),
+        "denying child Leave keeps the later parent Enter"
+    );
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_ALLOWED),
+        grab_chain_child_to_parent(ClientByteOrder::LittleEndian, ROOT_SEQUENCE, 1),
+        "other selectors keep the full literal chain"
+    );
+    assert!(
+        denied.state.active_pointer_grab.is_some(),
+        "grab remains active"
+    );
+    assert_core_receive_calls(
+        &calls.lock().unwrap(),
+        &[
+            (
+                NOTIFY_RECEIVER_DENIED,
+                CROSS_CHILD,
+                8,
+                request_opcodes(26, 0),
+            ),
+            (
+                NOTIFY_RECEIVER_ALLOWED,
+                CROSS_CHILD,
+                8,
+                request_opcodes(26, 0),
+            ),
+            (
+                NOTIFY_RECEIVER_DENIED,
+                CROSS_PARENT,
+                7,
+                request_opcodes(26, 0),
+            ),
+            (
+                NOTIFY_RECEIVER_ALLOWED,
+                CROSS_PARENT,
+                7,
+                request_opcodes(26, 0),
+            ),
+        ],
+    );
+    assert_no_writer_failures(&denied);
+}
+
+fn literal_xi2_button_press(
+    order: ClientByteOrder,
+    sequence: u16,
+    time: u32,
+    window: ResourceId,
+    root_x: i16,
+    root_y: i16,
+    event_x: i16,
+    event_y: i16,
+) -> Vec<u8> {
+    let mut event = vec![35, 137]; // GenericEvent, XI2 major opcode
+    append_event_u16(&mut event, order, sequence);
+    append_event_u32(&mut event, order, 22); // 88 bytes after 32-byte header
+    append_event_u16(&mut event, order, 4); // XI_ButtonPress
+    append_event_u16(&mut event, order, 4); // XTEST pointer device
+    append_event_u32(&mut event, order, time);
+    append_event_u32(&mut event, order, 1); // button detail
+    append_event_u32(&mut event, order, ROOT_WINDOW.0);
+    append_event_u32(&mut event, order, window.0);
+    append_event_u32(&mut event, order, 0); // child
+    for coordinate in [root_x, root_y, event_x, event_y] {
+        append_event_u32(&mut event, order, (i32::from(coordinate) << 16) as u32);
+    }
+    append_event_u16(&mut event, order, 8); // buttons length
+    append_event_u16(&mut event, order, 2); // valuators length
+    append_event_u16(&mut event, order, 4); // sourceid
+    append_event_u16(&mut event, order, 0); // pad
+    append_event_u32(&mut event, order, 0); // flags
+    append_event_u32(&mut event, order, 0); // mods.base
+    append_event_u32(&mut event, order, 0); // mods.latched
+    append_event_u32(&mut event, order, 0); // mods.locked
+    append_event_u32(&mut event, order, 0); // mods.effective
+    event.extend_from_slice(&[0; 4]); // group
+    for _ in 0..8 {
+        append_event_u32(&mut event, order, 0); // buttons mask
+    }
+    append_event_u32(&mut event, order, 0); // valuator mask word 0
+    append_event_u32(&mut event, order, 0); // valuator mask word 1
+    assert_eq!(event.len(), 120);
+    event
+}
+
+// mutation: check every kind in C1's writer
+#[test]
+fn receive_core_cooked_pointer_unchecked() {
+    let (mut fixture, xid_map) = core_crossing_fixture();
+    fixture
+        .state
+        .clients
+        .get_mut(&NOTIFY_RECEIVER_ALLOWED.0)
+        .unwrap()
+        .event_masks
+        .insert(CROSS_CHILD, BUTTON_PRESS_MASK);
+    fixture
+        .state
+        .clients
+        .get_mut(&NOTIFY_RECEIVER_DENIED.0)
+        .unwrap()
+        .xi2_masks
+        .insert((CROSS_CHILD, 4), 1 << 4); // XI_ButtonPress on XTEST pointer
+    fixture
+        .state
+        .clients
+        .get_mut(&NOTIFY_RECEIVER_DENIED.0)
+        .unwrap()
+        .event_masks
+        .insert(CROSS_CHILD, ENTER_LEAVE_MASK);
+    let calls = fixture.install_policy(|_, call| {
+        if call.hook == ExtensionHook::Receive {
+            Decision::Deny(DENY)
+        } else {
+            Decision::Allow
+        }
+    });
+    feed_core_pointer_event(
+        &mut fixture,
+        &xid_map,
+        core_pointer_event(
+            PointerEventKind::ButtonPress,
+            CROSS_CHILD_XID,
+            1,
+            0x3579,
+            CROSS_X,
+            CROSS_Y,
+        ),
+    );
+    assert_eq!(
+        fixture.drain(NOTIFY_RECEIVER_ALLOWED),
+        literal_core_button_press(
+            ClientByteOrder::LittleEndian,
+            ROOT_SEQUENCE,
+            0x3579,
+            CROSS_CHILD,
+            CROSS_X,
+            CROSS_Y,
+            5,
+            5,
+        ),
+        "core cooked ButtonPress remains unchecked"
+    );
+    assert_eq!(
+        fixture.drain(NOTIFY_RECEIVER_DENIED),
+        literal_xi2_button_press(
+            ClientByteOrder::BigEndian,
+            DUAL_SEQUENCE,
+            0x3579,
+            CROSS_CHILD,
+            CROSS_X,
+            CROSS_Y,
+            5,
+            5,
+        ),
+        "XI2 cooked ButtonPress remains unchecked"
+    );
+    assert!(receive_calls(&calls.lock().unwrap()).is_empty());
+    assert_eq!(fixture.state.master_sprite_root, (CROSS_X, CROSS_Y));
+    assert_no_writer_failures(&fixture);
 }
