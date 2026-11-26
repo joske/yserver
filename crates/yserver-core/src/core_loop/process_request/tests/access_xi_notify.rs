@@ -2032,3 +2032,463 @@ fn receive_xi_mapping_after_xkb_change() {
         None,
     );
 }
+
+const XI_PROPERTY_DEVICE_ID: u16 = crate::xinput::DEVICEID_XTEST_POINTER;
+const XI_PROPERTY_REQUEST_SEQUENCE: u16 = 0x31;
+const XI_PROPERTY_DENIED_SEQUENCE: u16 = 0x42;
+const XI_PROPERTY_ALLOWED_SEQUENCE: u16 = 0x53;
+const XI_PROPERTY_VALUE: [u8; 1] = [0x5a];
+
+#[derive(Clone, Copy)]
+enum XiPropertyPolicy {
+    None,
+    AllowAll,
+    Deny(EventDescription),
+}
+
+fn select_xi2_property_event(fixture: &mut NotifyFixture, client: ClientId, sequence: u16) {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+    body.extend_from_slice(&1_u16.to_le_bytes()); // one event mask
+    body.extend_from_slice(&0_u16.to_le_bytes()); // pad
+    body.extend_from_slice(&0_u16.to_le_bytes()); // XIAllDevices
+    body.extend_from_slice(&1_u16.to_le_bytes()); // one mask word
+    body.extend_from_slice(&crate::xinput::XI2_PROPERTY_EVENT_MASK.to_le_bytes());
+    let outcome = fixture
+        .request(
+            client,
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: 137,
+                data: 46,
+                length_units: 5,
+            },
+            &body,
+        )
+        .expect("XISelectEvents through production dispatcher");
+    assert!(matches!(outcome, RequestOutcome::Handled));
+    assert_eq!(
+        fixture.state.clients[&client.0]
+            .xi2_masks
+            .get(&(ROOT_WINDOW, 0)),
+        Some(&u64::from(crate::xinput::XI2_PROPERTY_EVENT_MASK)),
+        "XIAllDevices PropertyEvent selection is stored"
+    );
+    assert!(
+        fixture.drain(client).is_empty(),
+        "XISelectEvents has no reply or error"
+    );
+    assert!(crate::core_loop::client_io::failed_writers(&fixture.state.clients).is_empty());
+}
+
+fn xi_property_event_descriptions() -> [EventDescription; 2] {
+    [
+        EventDescription::extension(35, 137, 12),
+        EventDescription::extension(
+            crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET,
+            137,
+            u16::from(crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET),
+        ),
+    ]
+}
+
+fn xi_property_notification_fixture(select_allowed: bool) -> (NotifyFixture, AtomId) {
+    let mut fixture = NotifyFixture::new();
+    fixture.state.start_instant = std::time::Instant::now() + Duration::from_secs(30);
+    fixture
+        .state
+        .clients
+        .get_mut(&NOTIFY_RECEIVER_DENIED.0)
+        .unwrap()
+        .byte_order = ClientByteOrder::BigEndian;
+    fixture
+        .state
+        .clients
+        .get_mut(&NOTIFY_RECEIVER_ALLOWED.0)
+        .unwrap()
+        .byte_order = ClientByteOrder::LittleEndian;
+    let property = AtomId(
+        fixture
+            .state
+            .atoms
+            .intern("yserver-test-xi-property-notify", false)
+            .0,
+    );
+
+    for (client, sequence) in [
+        (NOTIFY_RECEIVER_DENIED, 0x11),
+        (NOTIFY_RECEIVER_ALLOWED, 0x22),
+    ] {
+        if client == NOTIFY_RECEIVER_ALLOWED && !select_allowed {
+            continue;
+        }
+        select_xi2_property_event(&mut fixture, client, sequence);
+        select_xi1_class(
+            &mut fixture,
+            client,
+            sequence + 1,
+            XI_PROPERTY_DEVICE_ID,
+            crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET,
+        );
+    }
+    fixture.state.clients[&NOTIFY_RECEIVER_DENIED.0]
+        .last_sequence
+        .store(XI_PROPERTY_DENIED_SEQUENCE, Ordering::Relaxed);
+    fixture.state.clients[&NOTIFY_RECEIVER_ALLOWED.0]
+        .last_sequence
+        .store(XI_PROPERTY_ALLOWED_SEQUENCE, Ordering::Relaxed);
+    assert!(fixture.drain(NOTIFY_SENDER).is_empty());
+    (fixture, property)
+}
+
+fn literal_xi2_property_event(
+    sequence: u16,
+    device_id: u16,
+    property: AtomId,
+    what: u8,
+    order: ClientByteOrder,
+) -> Vec<u8> {
+    let mut bytes = vec![35, 137]; // GenericEvent, XI extension opcode
+    super::access_notify_support::append_event_u16(&mut bytes, order, sequence);
+    super::access_notify_support::append_event_u32(&mut bytes, order, 0); // no payload
+    super::access_notify_support::append_event_u16(&mut bytes, order, 12); // XI_PropertyEvent
+    super::access_notify_support::append_event_u16(&mut bytes, order, device_id);
+    super::access_notify_support::append_event_u32(&mut bytes, order, 0); // pinned timestamp
+    super::access_notify_support::append_event_u32(&mut bytes, order, property.0);
+    bytes.push(what);
+    bytes.extend_from_slice(&[0; 11]);
+    bytes
+}
+
+fn literal_xi1_property_event(
+    sequence: u16,
+    device_id: u16,
+    property: AtomId,
+    order: ClientByteOrder,
+) -> Vec<u8> {
+    let mut bytes = vec![
+        crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET,
+        0, // PropertyNewValue
+    ];
+    super::access_notify_support::append_event_u16(&mut bytes, order, sequence);
+    super::access_notify_support::append_event_u32(&mut bytes, order, 0); // pinned timestamp
+    super::access_notify_support::append_event_u32(&mut bytes, order, property.0);
+    bytes.extend_from_slice(&[0; 19]);
+    bytes.push(u8::try_from(device_id).unwrap());
+    bytes
+}
+
+fn literal_xi_property_stream(
+    sequence: u16,
+    device_id: u16,
+    property: AtomId,
+    order: ClientByteOrder,
+) -> Vec<u8> {
+    [
+        literal_xi2_property_event(sequence, device_id, property, 1, order), // PropertyCreated
+        literal_xi1_property_event(sequence, device_id, property, order),
+    ]
+    .concat()
+}
+
+fn run_xi_property_change(
+    policy: XiPropertyPolicy,
+) -> (Vec<u8>, Vec<u8>, Vec<RecordedExtensionCheck>, AtomId) {
+    let (mut fixture, property) = xi_property_notification_fixture(true);
+    let calls = match policy {
+        XiPropertyPolicy::None => None,
+        XiPropertyPolicy::AllowAll => Some(fixture.install_policy(|_, _| Decision::Allow)),
+        XiPropertyPolicy::Deny(description) => {
+            let events = vec![description];
+            Some(fixture.install_policy(move |_, call| {
+                if call.hook == ExtensionHook::Receive
+                    && call.client == NOTIFY_RECEIVER_DENIED
+                    && call.receive == Some(EventSubject::Device(XI_PROPERTY_DEVICE_ID))
+                    && call.events.as_ref() == Some(&events)
+                {
+                    Decision::Deny(DENY)
+                } else {
+                    Decision::Allow
+                }
+            }))
+        }
+    };
+    let body = xi2_change_property_body(
+        XI_PROPERTY_DEVICE_ID,
+        crate::xinput::XI_PROP_MODE_REPLACE,
+        8,
+        property.0,
+        crate::xinput::XA_INTEGER.0,
+        &XI_PROPERTY_VALUE,
+    );
+    let outcome = fixture
+        .request(
+            NOTIFY_SENDER,
+            SequenceNumber(XI_PROPERTY_REQUEST_SEQUENCE),
+            RequestHeader {
+                opcode: 137,
+                data: 57,
+                length_units: u32::try_from((4 + body.len()).div_ceil(4)).unwrap(),
+            },
+            &body,
+        )
+        .expect("XIChangeProperty through production dispatcher");
+    assert!(matches!(outcome, RequestOutcome::Handled));
+    assert!(
+        fixture.drain(NOTIFY_SENDER).is_empty(),
+        "XIChangeProperty has no reply or error"
+    );
+    assert_eq!(
+        fixture
+            .state
+            .xi_devices
+            .device(XI_PROPERTY_DEVICE_ID)
+            .unwrap()
+            .properties[&property]
+            .data
+            .as_slice(),
+        XI_PROPERTY_VALUE.as_slice(),
+        "the property write remains applied"
+    );
+    assert!(crate::core_loop::client_io::failed_writers(&fixture.state.clients).is_empty());
+    assert!(
+        fixture
+            .state
+            .clients
+            .contains_key(&NOTIFY_RECEIVER_DENIED.0)
+    );
+    assert!(
+        fixture
+            .state
+            .clients
+            .contains_key(&NOTIFY_RECEIVER_ALLOWED.0)
+    );
+
+    let denied = fixture.drain(NOTIFY_RECEIVER_DENIED);
+    let allowed = fixture.drain(NOTIFY_RECEIVER_ALLOWED);
+    let calls = calls.map_or_else(Vec::new, |calls| calls.lock().unwrap().clone());
+    (denied, allowed, calls, property)
+}
+
+fn assert_xi_property_receive_calls(calls: &[RecordedExtensionCheck]) {
+    let receives: Vec<_> = calls
+        .iter()
+        .filter(|call| call.hook == ExtensionHook::Receive)
+        .collect();
+    let descriptions = xi_property_event_descriptions();
+    assert_eq!(receives.len(), 4, "one check per form for both recipients");
+    for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+        for description in descriptions {
+            assert_eq!(
+                receives
+                    .iter()
+                    .filter(|call| {
+                        call.client == client
+                            && call.receive == Some(EventSubject::Device(XI_PROPERTY_DEVICE_ID))
+                            && call.events.as_deref() == Some(std::slice::from_ref(&description))
+                    })
+                    .count(),
+                1,
+                "one matching Receive check for client {} and {description:?}",
+                client.0
+            );
+        }
+    }
+    assert!(receives.iter().all(|call| {
+        call.request
+            == Some(RequestOpcodes {
+                major: 137,
+                minor: 57,
+            })
+    }));
+}
+
+#[test]
+fn receive_xi_property_forms_checked_independently() {
+    // mutation: skip the check on the XI1 path (X10)
+    let allow_all = run_xi_property_change(XiPropertyPolicy::AllowAll);
+    let property = allow_all.3;
+    let denied_baseline = literal_xi_property_stream(
+        XI_PROPERTY_DENIED_SEQUENCE,
+        XI_PROPERTY_DEVICE_ID,
+        property,
+        ClientByteOrder::BigEndian,
+    );
+    let allowed_baseline = literal_xi_property_stream(
+        XI_PROPERTY_ALLOWED_SEQUENCE,
+        XI_PROPERTY_DEVICE_ID,
+        property,
+        ClientByteOrder::LittleEndian,
+    );
+    let deny_xi2 = run_xi_property_change(XiPropertyPolicy::Deny(EventDescription::extension(
+        35, 137, 12,
+    )));
+    assert_eq!(
+        deny_xi2.0,
+        literal_xi1_property_event(
+            XI_PROPERTY_DENIED_SEQUENCE,
+            XI_PROPERTY_DEVICE_ID,
+            deny_xi2.3,
+            ClientByteOrder::BigEndian,
+        ),
+        "XI1 literal copy remains after denying XI2"
+    );
+    assert_eq!(
+        deny_xi2.1,
+        literal_xi_property_stream(
+            XI_PROPERTY_ALLOWED_SEQUENCE,
+            XI_PROPERTY_DEVICE_ID,
+            deny_xi2.3,
+            ClientByteOrder::LittleEndian,
+        ),
+        "allowed recipient keeps both literal copies"
+    );
+    assert_xi_property_receive_calls(&deny_xi2.2);
+
+    let deny_xi1 = run_xi_property_change(XiPropertyPolicy::Deny(EventDescription::extension(
+        crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET,
+        137,
+        u16::from(crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET),
+    )));
+    assert_eq!(
+        deny_xi1.0,
+        literal_xi2_property_event(
+            XI_PROPERTY_DENIED_SEQUENCE,
+            XI_PROPERTY_DEVICE_ID,
+            deny_xi1.3,
+            1,
+            ClientByteOrder::BigEndian,
+        ),
+        "XI2 literal copy remains after denying XI1"
+    );
+    assert_eq!(
+        deny_xi1.1,
+        literal_xi_property_stream(
+            XI_PROPERTY_ALLOWED_SEQUENCE,
+            XI_PROPERTY_DEVICE_ID,
+            deny_xi1.3,
+            ClientByteOrder::LittleEndian,
+        ),
+        "allowed recipient keeps both literal copies"
+    );
+    assert_xi_property_receive_calls(&deny_xi1.2);
+
+    assert_eq!(
+        allow_all.0, denied_baseline,
+        "all-Allow literal stream for A"
+    );
+    assert_eq!(
+        allow_all.1, allowed_baseline,
+        "all-Allow literal stream for B"
+    );
+    assert_xi_property_receive_calls(&allow_all.2);
+}
+
+#[test]
+fn receive_xi_property_baseline_order() {
+    // mutation: swap the X9 and X10 blocks
+    let run = run_xi_property_change(XiPropertyPolicy::None);
+    let property = run.3;
+    assert_eq!(
+        run.0,
+        literal_xi_property_stream(
+            XI_PROPERTY_DENIED_SEQUENCE,
+            XI_PROPERTY_DEVICE_ID,
+            property,
+            ClientByteOrder::BigEndian,
+        ),
+        "complete no-policy XI2 then XI1 stream for A"
+    );
+    assert_eq!(
+        run.1,
+        literal_xi_property_stream(
+            XI_PROPERTY_ALLOWED_SEQUENCE,
+            XI_PROPERTY_DEVICE_ID,
+            property,
+            ClientByteOrder::LittleEndian,
+        ),
+        "complete no-policy XI2 then XI1 stream for B"
+    );
+    assert!(run.2.is_empty(), "empty policy list means no policy calls");
+}
+
+#[test]
+fn receive_xi_property_denial_is_not_disconnect() {
+    // mutation: push denied clients into the returned vector
+    let (mut fixture, property) = xi_property_notification_fixture(false);
+    fixture
+        .state
+        .xi_devices
+        .device_mut(XI_PROPERTY_DEVICE_ID)
+        .unwrap()
+        .properties
+        .insert(
+            property,
+            crate::xinput::XiProperty {
+                type_atom: crate::xinput::XA_INTEGER,
+                format: 8,
+                data: XI_PROPERTY_VALUE.to_vec(),
+                read_only: false,
+                deletable: true,
+            },
+        );
+    let descriptions = xi_property_event_descriptions();
+    let expected: Vec<_> = descriptions.into_iter().collect();
+    let calls = fixture.install_policy(move |_, call| {
+        if call.hook == ExtensionHook::Receive
+            && call.client == NOTIFY_RECEIVER_DENIED
+            && call.receive == Some(EventSubject::Device(XI_PROPERTY_DEVICE_ID))
+            && call
+                .events
+                .as_ref()
+                .is_some_and(|events| events.len() == 1 && expected.contains(&events[0]))
+        {
+            Decision::Deny(DENY)
+        } else {
+            Decision::Allow
+        }
+    });
+    let disconnected = crate::core_loop::process_request::props::emit_property_change(
+        &mut fixture.state,
+        XI_PROPERTY_DEVICE_ID,
+        property,
+        crate::xinput::PropWhat::Modified,
+    );
+    assert!(disconnected.is_empty(), "policy denial is not a disconnect");
+    assert!(fixture.drain(NOTIFY_RECEIVER_DENIED).is_empty());
+    assert!(fixture.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
+    assert!(
+        fixture
+            .state
+            .clients
+            .contains_key(&NOTIFY_RECEIVER_DENIED.0)
+    );
+    assert!(crate::core_loop::client_io::failed_writers(&fixture.state.clients).is_empty());
+    assert_eq!(
+        fixture
+            .state
+            .xi_devices
+            .device(XI_PROPERTY_DEVICE_ID)
+            .unwrap()
+            .properties[&property]
+            .data,
+        XI_PROPERTY_VALUE,
+        "direct emission publishes an already-applied change"
+    );
+    let receives = receive_checks(&calls);
+    assert_eq!(receives.len(), 2);
+    assert!(receives.iter().all(|call| {
+        call.client == NOTIFY_RECEIVER_DENIED
+            && call.receive == Some(EventSubject::Device(XI_PROPERTY_DEVICE_ID))
+            && call.request.is_none()
+    }));
+    for description in descriptions {
+        assert_eq!(
+            receives
+                .iter()
+                .filter(|call| call.events.as_deref() == Some(std::slice::from_ref(&description)))
+                .count(),
+            1
+        );
+    }
+}

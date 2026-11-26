@@ -1,8 +1,11 @@
 use crate::{
-    access::{AccessMode, Decision, RequestOpcodes, ResourceKind, ResourceTarget},
+    access::{
+        AccessMode, Decision, EventBatch, EventSubject, RequestOpcodes, ResourceKind,
+        ResourceTarget,
+    },
     backend::{Backend, OriginContext},
     core_loop::{
-        fanout::fanout_event_to_clients,
+        fanout::fanout_event_to_clients_with_receive,
         process_request::{
             RequestOutcome, XI2_FIRST_ERROR, XI2_MAJOR_OPCODE, emit_x11_error,
             emit_x11_error_with_minor, write_to_client,
@@ -717,16 +720,14 @@ pub(in crate::core_loop) fn emit_property_dispatch_error(
 /// `(deviceid, property, what)` tuple so the two notifications can
 /// never diverge.
 ///
-/// Delivery follows xserver's `send_property_event`
-/// (`Xi/xiproperty.c:189-208`) via `SendEventToAllWindows`: every
-/// client that has selected `XI_PropertyEventMask` (XI2) or a matching
-/// `XEventClass` via `SelectExtensionEvent` (XI1) for the affected
-/// device on **any** window receives one copy of the event. Because
-/// neither `xXIPropertyEvent` nor `devicePropertyNotify` carries an
-/// event-window field, per-window distinctions only affect *which
-/// clients* receive — the wire bytes are identical for every
-/// recipient. Deduplication by client id is handled inside
-/// `fanout_event_to_clients`.
+/// Xorg's `send_property_event` broadcasts both forms through
+/// `SendEventToAllWindows` (`Xi/xiproperty.c:206-208`,
+/// `Xi/exevents.c:3300-3312`), once for each selecting window. yserver
+/// aggregates those selections and emits one copy per client and form;
+/// its `EventSubject::Device` check is also a yserver rule. Neither
+/// `xXIPropertyEvent` nor `devicePropertyNotify` carries a window on the
+/// wire, so the per-window selections affect only the existing recipient
+/// aggregation here.
 ///
 /// `deviceid` is the literal device id the change applied to (the
 /// reserved XTEST ID for a virtual-device change, or a registry-assigned
@@ -773,11 +774,15 @@ pub(crate) fn emit_property_change(
         })
         .collect();
     let time = state.timestamp_now();
-    let mut dropped = Vec::new();
+    let mut disconnected = Vec::new();
+    let xi2_description = crate::xinput::xi2_event_description(12);
+    let xi2_events = EventBatch::new(std::slice::from_ref(&xi2_description));
     if !xi2_targets.is_empty() {
-        dropped.extend(fanout_event_to_clients(
+        disconnected.extend(fanout_event_to_clients_with_receive(
             state,
             &xi2_targets,
+            EventSubject::Device(deviceid),
+            &xi2_events,
             |buf, seq, order| {
                 let event = crate::xinput::encode_xi2_property_event(
                     order,
@@ -818,9 +823,14 @@ pub(crate) fn emit_property_change(
         .collect();
     if !xi1_targets.is_empty() {
         let deleted = matches!(what, crate::xinput::PropWhat::Deleted);
-        dropped.extend(fanout_event_to_clients(
+        let xi1_description =
+            crate::xinput::xi1_event_description(XI_DEVICE_PROPERTY_NOTIFY_OFFSET);
+        let xi1_events = EventBatch::new(std::slice::from_ref(&xi1_description));
+        disconnected.extend(fanout_event_to_clients_with_receive(
             state,
             &xi1_targets,
+            EventSubject::Device(deviceid),
+            &xi1_events,
             |buf, seq, order| {
                 let event = crate::xinput::encode_xi1_device_property_notify(
                     order,
@@ -835,7 +845,7 @@ pub(crate) fn emit_property_change(
             },
         ));
     }
-    dropped
+    disconnected
 }
 
 pub(super) fn handle_intern_atom(
