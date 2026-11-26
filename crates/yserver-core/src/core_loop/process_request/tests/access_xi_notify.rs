@@ -616,6 +616,76 @@ fn literal_device_changed_event(
     bytes
 }
 
+fn literal_xtest_device_changed_event(sequence: u16, order: ClientByteOrder) -> Vec<u8> {
+    // The existing emitter builds this shared class block in little endian;
+    // preserve those bytes while the event header follows the recipient.
+    let class_order = ClientByteOrder::LittleEndian;
+    let mut classes = Vec::new();
+    super::access_notify_support::append_event_u16(&mut classes, class_order, 1); // ButtonClass
+    super::access_notify_support::append_event_u16(&mut classes, class_order, 13); // 13 four-byte units
+    super::access_notify_support::append_event_u16(
+        &mut classes,
+        class_order,
+        crate::xinput::DEVICEID_XTEST_POINTER,
+    );
+    super::access_notify_support::append_event_u16(&mut classes, class_order, 10); // CorePointerProc buttons
+    classes.extend_from_slice(&[0; 4]); // DeviceChanged does not report button state
+    for atom in 0x4b_u32..=0x51 {
+        super::access_notify_support::append_event_u32(&mut classes, class_order, atom);
+    }
+    for _ in 0..3 {
+        super::access_notify_support::append_event_u32(&mut classes, class_order, 0);
+    }
+
+    for (axis, label, value) in [(0_u16, 0x52_u32, 400_i32), (1, 0x53, 300)] {
+        super::access_notify_support::append_event_u16(&mut classes, class_order, 2); // ValuatorClass
+        super::access_notify_support::append_event_u16(&mut classes, class_order, 11); // 11 units
+        super::access_notify_support::append_event_u16(
+            &mut classes,
+            class_order,
+            crate::xinput::DEVICEID_XTEST_POINTER,
+        );
+        super::access_notify_support::append_event_u16(&mut classes, class_order, axis);
+        super::access_notify_support::append_event_u32(&mut classes, class_order, label);
+        super::access_notify_support::append_event_u32(&mut classes, class_order, u32::MAX); // minimum = -1
+        super::access_notify_support::append_event_u32(&mut classes, class_order, 0);
+        super::access_notify_support::append_event_u32(&mut classes, class_order, u32::MAX); // maximum = -1
+        super::access_notify_support::append_event_u32(&mut classes, class_order, 0);
+        super::access_notify_support::append_event_u32(&mut classes, class_order, value as u32);
+        super::access_notify_support::append_event_u32(&mut classes, class_order, 0);
+        super::access_notify_support::append_event_u32(&mut classes, class_order, 0);
+        classes.extend_from_slice(&[0; 4]); // relative mode and padding
+    }
+    assert_eq!(classes.len(), 140, "complete XTEST pointer class payload");
+
+    let mut bytes = vec![35, 137]; // GenericEvent, XInput major opcode
+    super::access_notify_support::append_event_u16(&mut bytes, order, sequence);
+    super::access_notify_support::append_event_u32(
+        &mut bytes,
+        order,
+        u32::try_from(classes.len() / 4).unwrap(),
+    );
+    super::access_notify_support::append_event_u16(&mut bytes, order, 1); // XI_DeviceChanged
+    super::access_notify_support::append_event_u16(
+        &mut bytes,
+        order,
+        crate::xinput::DEVICEID_XTEST_POINTER,
+    );
+    super::access_notify_support::append_event_u32(&mut bytes, order, 0); // zero timestamp
+    super::access_notify_support::append_event_u16(&mut bytes, order, 3); // three classes
+    super::access_notify_support::append_event_u16(
+        &mut bytes,
+        order,
+        crate::xinput::DEVICEID_XTEST_POINTER,
+    );
+    bytes.extend_from_slice(&[2, 0]); // XIDeviceChange, pad0
+    super::access_notify_support::append_event_u16(&mut bytes, order, 0);
+    super::access_notify_support::append_event_u32(&mut bytes, order, 0);
+    super::access_notify_support::append_event_u32(&mut bytes, order, 0);
+    bytes.extend_from_slice(&classes);
+    bytes
+}
+
 fn literal_physical_pointer_classes(source_id: u16, order: ClientByteOrder) -> Vec<u8> {
     let mut classes = Vec::new();
     super::access_notify_support::append_event_u16(&mut classes, order, 1); // ButtonClass
@@ -1157,6 +1227,175 @@ fn receive_xi_device_changed_baseline_frames() {
         ),
         "bootstrap encodes both complete frames and class payloads in recipient byte order"
     );
+}
+
+#[test]
+fn receive_xtest_device_changed_checks_root_selectors() {
+    // mutation: leave emit_xi2_device_changed_slave_pointer on unchecked fanout_event_to_clients
+    let select_root_recipients = |fixture: &mut NotifyFixture| {
+        fixture.state.randr.screen_width = 800;
+        fixture.state.randr.screen_height = 600;
+        fixture.state.start_instant = std::time::Instant::now() + Duration::from_secs(30);
+
+        select_device_changed(
+            fixture,
+            NOTIFY_RECEIVER_DENIED,
+            0x31,
+            ROOT_WINDOW,
+            crate::xinput::DEVICEID_XTEST_POINTER,
+        );
+        assert!(
+            fixture.drain(NOTIFY_RECEIVER_DENIED).is_empty(),
+            "XISelectEvents has no requester reply or error"
+        );
+        assert!(crate::core_loop::client_io::failed_writers(&fixture.state.clients).is_empty());
+        assert_eq!(
+            fixture.state.clients[&NOTIFY_RECEIVER_DENIED.0]
+                .xi2_masks
+                .get(&(ROOT_WINDOW, crate::xinput::DEVICEID_XTEST_POINTER)),
+            Some(&u64::from(crate::xinput::XI2_DEVICE_CHANGED_MASK)),
+            "the denied recipient's ROOT selection is installed"
+        );
+
+        select_device_changed_with_order(
+            fixture,
+            NOTIFY_RECEIVER_ALLOWED,
+            0x42,
+            ROOT_WINDOW,
+            crate::xinput::DEVICEID_XTEST_POINTER,
+            ClientByteOrder::BigEndian,
+        );
+        assert!(
+            fixture.drain(NOTIFY_RECEIVER_ALLOWED).is_empty(),
+            "XISelectEvents has no requester reply or error"
+        );
+        assert!(crate::core_loop::client_io::failed_writers(&fixture.state.clients).is_empty());
+        assert_eq!(
+            fixture.state.clients[&NOTIFY_RECEIVER_ALLOWED.0]
+                .xi2_masks
+                .get(&(ROOT_WINDOW, crate::xinput::DEVICEID_XTEST_POINTER)),
+            Some(&u64::from(crate::xinput::XI2_DEVICE_CHANGED_MASK)),
+            "the allowed recipient's ROOT selection is installed"
+        );
+    };
+    let expected_denied = literal_xtest_device_changed_event(0x31, ClientByteOrder::LittleEndian);
+    let expected_allowed = literal_xtest_device_changed_event(0x42, ClientByteOrder::BigEndian);
+
+    let no_policy = {
+        let mut fixture = NotifyFixture::new();
+        select_root_recipients(&mut fixture);
+        let disconnected = crate::core_loop::fanout::emit_xi2_device_changed_slave_pointer(
+            &mut fixture.state,
+            137,
+        );
+        assert!(disconnected.is_empty());
+        assert!(crate::core_loop::client_io::failed_writers(&fixture.state.clients).is_empty());
+        assert!(fixture.drain(NOTIFY_SENDER).is_empty());
+        (
+            fixture.drain(NOTIFY_RECEIVER_DENIED),
+            fixture.drain(NOTIFY_RECEIVER_ALLOWED),
+        )
+    };
+    assert_eq!(
+        no_policy.0, expected_denied,
+        "literal no-policy little-endian frame"
+    );
+    assert_eq!(
+        no_policy.1, expected_allowed,
+        "literal no-policy big-endian frame"
+    );
+
+    let mut all_allow = NotifyFixture::new();
+    select_root_recipients(&mut all_allow);
+    let all_allow_calls = all_allow.install_policy(|_, _| Decision::Allow);
+    let disconnected =
+        crate::core_loop::fanout::emit_xi2_device_changed_slave_pointer(&mut all_allow.state, 137);
+    assert!(disconnected.is_empty());
+    assert!(crate::core_loop::client_io::failed_writers(&all_allow.state.clients).is_empty());
+    assert!(all_allow.drain(NOTIFY_SENDER).is_empty());
+    assert_eq!(all_allow.drain(NOTIFY_RECEIVER_DENIED), expected_denied);
+    assert_eq!(all_allow.drain(NOTIFY_RECEIVER_ALLOWED), expected_allowed);
+    let all_allow_receives = receive_checks(&all_allow_calls);
+    assert_eq!(
+        all_allow_receives.len(),
+        2,
+        "one Receive call per ROOT selector"
+    );
+    for recipient in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+        let recipient_calls = all_allow_receives
+            .iter()
+            .filter(|call| call.client == recipient)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recipient_calls.len(),
+            1,
+            "one Receive call for {recipient:?}"
+        );
+        assert_eq!(
+            recipient_calls[0].receive,
+            Some(EventSubject::Window(ROOT_WINDOW))
+        );
+        assert_eq!(
+            recipient_calls[0].events,
+            Some(vec![crate::xinput::xi2_event_description(1)])
+        );
+        assert_eq!(recipient_calls[0].request, None);
+    }
+
+    let mut denied = NotifyFixture::new();
+    select_root_recipients(&mut denied);
+    let denied_calls = denied.install_policy(|_, call| {
+        if call.hook == ExtensionHook::Receive
+            && call.client == NOTIFY_RECEIVER_DENIED
+            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
+            && call.events.as_ref().is_some_and(|events| {
+                events.as_slice() == [crate::xinput::xi2_event_description(1)]
+            })
+        {
+            Decision::Deny(DENY)
+        } else {
+            Decision::Allow
+        }
+    });
+    let disconnected =
+        crate::core_loop::fanout::emit_xi2_device_changed_slave_pointer(&mut denied.state, 137);
+    assert!(
+        disconnected.is_empty(),
+        "denial is not a transport disconnect"
+    );
+    assert!(crate::core_loop::client_io::failed_writers(&denied.state.clients).is_empty());
+    assert!(denied.drain(NOTIFY_SENDER).is_empty());
+    assert!(
+        denied.drain(NOTIFY_RECEIVER_DENIED).is_empty(),
+        "denied selector gets nothing"
+    );
+    assert_eq!(denied.drain(NOTIFY_RECEIVER_ALLOWED), expected_allowed);
+    let denied_receives = receive_checks(&denied_calls);
+    assert_eq!(
+        denied_receives.len(),
+        2,
+        "one Receive call per ROOT selector"
+    );
+    for recipient in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+        let recipient_calls = denied_receives
+            .iter()
+            .filter(|call| call.client == recipient)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recipient_calls.len(),
+            1,
+            "one Receive call for {recipient:?}"
+        );
+        assert_eq!(
+            recipient_calls[0].receive,
+            Some(EventSubject::Window(ROOT_WINDOW))
+        );
+        assert_eq!(
+            recipient_calls[0].events,
+            Some(vec![crate::xinput::xi2_event_description(1)])
+        );
+        assert_eq!(recipient_calls[0].request, None);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2015,10 +2254,6 @@ fn receive_xi_mapping_after_xkb_change() {
         "denial removes only A's XI copy while all clients keep core MappingNotify"
     );
 
-    assert!(
-        no_policy.1.is_empty(),
-        "empty policy list adds no Receive calls"
-    );
     assert_mapping_receive_calls(
         &all_allow.1,
         request,

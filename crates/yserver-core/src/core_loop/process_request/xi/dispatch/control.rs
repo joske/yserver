@@ -634,8 +634,10 @@ pub(super) fn handle_xi1_set_device_modifier_mapping(
         // SetDeviceModifierMapping-8 probes MinKeyCode-1) or listed
         // twice is BadValue; a held modifier key is MappingBusy.
         // Busy changed nothing and notifies nothing (Xi/setmmap.c). On
-        // success the DeviceMappingNotify goes out before the XKB and
-        // core notifications: to the requester (xts5 does
+        // success yserver sends DeviceMappingNotify before the XKB and
+        // core notifications. Xorg writes core MappingNotify first
+        // (xkb/xkbEvents.c:117-126). yserver sends DeviceMappingNotify
+        // to the requester (xts5 does
         // `Expect_Event` then `Expect_Reply`, so ahead of the reply too)
         // and to every other client that selected it.
         // request_kind=0 = MappingModifier.

@@ -500,20 +500,28 @@ pub fn emit_xi2_device_changed_slave_pointer(
 
     let (classes, num_classes) = build_slave_pointer_class_block(state);
     let time = state.timestamp_now();
-    fanout_event_to_clients(state, &targets, |buf, seq, order| {
-        x11::encode_xi2_device_changed_event(
-            buf,
-            order,
-            seq,
-            xi2_major_opcode,
-            XTEST_POINTER,
-            time,
-            num_classes,
-            XTEST_POINTER, // sourceid = the XTEST device itself
-            XI_REASON_DEVICE_CHANGE,
-            &classes,
-        );
-    })
+    let event_description = crate::xinput::xi2_event_description(1);
+    let events = EventBatch::new(std::slice::from_ref(&event_description));
+    fanout_event_to_clients_with_receive(
+        state,
+        &targets,
+        EventSubject::Window(ROOT_WINDOW),
+        &events,
+        |buf, seq, order| {
+            x11::encode_xi2_device_changed_event(
+                buf,
+                order,
+                seq,
+                xi2_major_opcode,
+                XTEST_POINTER,
+                time,
+                num_classes,
+                XTEST_POINTER, // sourceid = the XTEST device itself
+                XI_REASON_DEVICE_CHANGE,
+                &classes,
+            );
+        },
+    )
 }
 
 /// Build the XI2 device-class block for the virtual XTEST pointer.
