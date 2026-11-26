@@ -460,12 +460,14 @@ impl<P: Platform> XBackend<P> {
         self.released_cursors.contains(&xid) && !self.cursor_referenced(xid)
     }
 
-    /// Destroy every released cursor nothing references any more, and its
-    /// sprite pixmap, as Xorg `FreeCursor` does at `refcnt == 0`
-    /// (`dix/cursor.c`). An animated cursor's canonical sprite aliases a
-    /// frame's pixmap, so only a static cursor frees one; dropping an animated
-    /// cursor drops its frame references, which can release those cursors in
-    /// turn (`render/animcur.c:247`).
+    /// Destroy the pending candidates that are released and no longer
+    /// referenced. A cursor goes once its reference count is zero and its XID
+    /// is gone (Xorg `FreeCursor`, `dix/cursor.c:105`), and an animated cursor
+    /// drops a reference on each frame when it goes (`render/animcur.c:247`),
+    /// which can release those frames in the same call. Deferring the check
+    /// to this function's existing call sites, and freeing the sprite pixmap
+    /// here, are yserver's own: an animated cursor's canonical sprite aliases
+    /// a frame's pixmap, so only a static cursor frees one.
     pub(in crate::kms::render::backend) fn collect_released_cursors(&mut self) {
         while let Some(xid) = self.reclaim_pending.pop() {
             if self.cursor_reclaimable(xid) {
