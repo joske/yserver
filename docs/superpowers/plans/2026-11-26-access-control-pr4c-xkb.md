@@ -15,7 +15,8 @@ A denial drops that recipient's copy only. These stay exactly as they are:
 - the keymap, control, indicator and state change;
 - the recipient lists, including the list `send_xkb_map_notify` returns;
 - the announced-state snapshots;
-- the core `MappingNotify` legacy fanout.
+- the core `MappingNotify` legacy fanout. Its recipients come from selection masks, not from deliveries, so a client
+  whose XKB MapNotify is denied still gets exactly the core MappingNotify it gets today.
 
 **Tech Stack:** Rust, crate `yserver-core`; existing encoders, recording backend and access policy; std only.
 
@@ -46,14 +47,17 @@ boundaries". Line numbers below are navigation anchors at `e811c098` (plan 2 hea
 | K11 | `core_loop/xkb_layout.rs:605` `announce_xkb_state` | StateNotify | state interest |
 | K12 | `core_loop/xkb_controls.rs:184` `send_controls_notify` | ControlsNotify | controls interest |
 
-The subject for every site is `EventSubject::Device(u16::from(XKB_DEVICE_ID))`, which is device 1. K1–K3 write
-device byte `1` as a literal today, and the others write `XKB_DEVICE_ID`.
+The subject is `EventSubject::Device(<the device id the encoder writes>)`:
+- **K1–K3:** the literal `1` they pass as the device byte today.
+- **K4–K12:** `u16::from(notify.device_id)` of the notify struct they encode. Production callers pass
+  `XKB_DEVICE_ID` (1) today; the existing K4 helper test passes `3`, and the subject follows the payload.
 
-Unchecked, as today:
-- core `MappingNotify` (exempt, 4b);
-- `xkb_select::send_legacy_map_notify`;
-- the XI1 mapping notices (plan 1);
-- the test-only call at `xkb_layout.rs:833`.
+Unchanged by this plan:
+- The core `MappingNotify` copies, including those sent by `xkb_select::send_legacy_map_notify` and
+  `send_legacy_core_map_notify`, stay exempt (4b).
+- That helper's XI1 `DeviceMappingNotify` companions already run Receive (plan 1).
+- `send_xkb_map_notify`'s return value stays the selected list. No production caller reads it; its unit test at
+  `xkb_layout.rs:818-845` stays unmodified.
 
 ## Global Constraints
 
@@ -61,15 +65,15 @@ Unchecked, as today:
   the same: events, replies, errors, their order, sequence numbers and multiplicity. The existing suite passes
   unmodified, except `receive_deny_all_keeps_later_extension_writers` (Task 2 states the one change).
 - **No new rules.** No new recipient selection, event production or deduplication rule.
-- **Returned recipients.** `send_xkb_map_notify` keeps returning the selected recipients, denied ones included.
 - **Snapshots.** `state.xkb_announced` and `state.xkb_announced_indicators` advance before the fanout, as today.
 - **Reuse first:**
   - Use the existing helpers: `fanout_event_to_clients_with_receive`, `EventBatch::new`, `EventSubject::Device`, the
     existing encoders, and the test fixture `NotifyFixture` (`tests/access_notify_support.rs`).
-  - Add exactly two things:
-    1. the description helper in Task 1;
-    2. the scripted `xkb_set` result on `RecordingBackend` in Task 1. The test backend has no other way to reach
-       `send_xkb_set_events` through `process_request`.
+  - Add exactly these things, all in Task 1:
+    1. the description helper;
+    2. two scripted results on the `RecordingBackend` test double: `xkb_set` (the test backend has no other way to
+       reach `send_xkb_set_events` through `process_request`) and `xkb_indicators` (needed to make a StateNotify
+       carry pending indicator notifications).
 - **Description helper.** `pub(crate) fn xkb_event_description(xkb_event_base: u8) -> EventDescription` lives in
   `core_loop/xkb_layout.rs`.
   - It returns `EventDescription::extension(xkb_event_base, crate::nested::XKB_MAJOR_OPCODE, 0)`.
@@ -122,22 +126,28 @@ Unchecked, as today:
 
 ## Review Focus
 
-1. **A denied MapNotify must not turn into a core MappingNotify.**
-   - Setup: a client that selected XKB MapNotify, whose copy is denied.
-   - Expected: it gets nothing. It does not get a legacy core MappingNotify instead, because `send_legacy_map_notify`
-     still sees it as an XKB map client.
+1. **A denied MapNotify leaves the core MappingNotify exactly as today.**
+   - Setup: a keysym change through a request. Two XKB clients: one selected the changed MapNotify detail (Xorg
+     `xkb/xkbEvents.c:84` gives it the core MappingNotify too), one did not select it (no core copy today).
+   - Expected: denying the first client's XKB MapNotify removes only that frame. Each client's core MappingNotify
+     frames match the no-policy baseline exactly: the first keeps its core copy, the second still gets none.
    - Test: Task 2 `receive_xkb_map_denied_keeps_legacy_filter`.
 2. **K2 reaches clients that never initialised XKB.** Its denial and baseline cover such a client, including a
    big-endian one. Test: Task 2 `receive_xkb_kbd_by_name_all_clients`.
-3. **A denied StateNotify still advances `xkb_announced`.**
-   - Setup: the StateNotify is denied, then the same LatchLockState is sent again.
-   - Expected: the repeated request produces no event for anyone.
+3. **A denied StateNotify still advances the snapshots and keeps the indicator follow-ups.**
+   - Setup: every selected StateNotify copy is denied, while the same request also changes the lit indicators.
+   - Expected: right after that request, `state.xkb_announced` equals the new state and
+     `state.xkb_announced_indicators` equals the new lit mask. The IndicatorStateNotify and ExtensionDeviceNotify
+     selectors still get their literal frames. A repeated request cannot show this, because the handler resyncs
+     `xkb_announced` first (`process_request/xkb.rs:234`).
    - Test: Task 1 `receive_xkb_state_denied_snapshot_advances`.
 4. **One request emits several XKB events.** In the IndicatorMaps change, every XKB event is checked on its own, in
    today's order, and denying one leaves the others: IndicatorMapNotify, then IndicatorStateNotify, then
    ExtensionDeviceNotify. Test: Task 3 `receive_xkb_indicator_maps_denies_one_kind`.
 5. **The physical-key path** of K11 carries no request context. Test: Task 1
-   `receive_xkb_state_from_key_has_no_request`, driven through the key fanout entry used in `access_input.rs`.
+   `receive_xkb_state_from_key_has_no_request`, driven through `key_event_fanout_to_state` with
+   `RecordingBackend::xkb_mods` seeded before the press, as `key_fanout.rs:2403`
+   (`modifier_change_emits_xkb_state_notify_with_real_mods`) does.
 
 ---
 
@@ -158,6 +168,8 @@ Unchecked, as today:
     `#[must_use] pub fn with_xkb_set_outcome(self, outcome: XkbSetOutcome) -> Self`.
   - `RecordingBackend::xkb_set` returns `self.xkb_set_outcome.take()`, and otherwise `None`, as today. If needed,
     `XkbSetOutcome` derives `Clone`/`Debug`.
+  - `pub xkb_indicators_result: (u32, u32)` on `RecordingBackend` (default: what `xkb_indicators` returns today),
+    returned by `RecordingBackend::xkb_indicators` as `(lit, defined)`.
 - Test drivers:
   - **K11:** XkbLatchLockState (minor 5). The `select_state_details` and `lock_mods_body` shapes are in
     `tests/xkb.rs:508-530`; copy them into the new file or move them to a shared helper.
@@ -165,6 +177,8 @@ Unchecked, as today:
   - **K9:** an XkbSet* request whose scripted outcome is `XkbSetEvent::Notification` with non-empty `repeats` that
     change the core per-key bits.
 
+- [ ] **Step 0: Add the two `RecordingBackend` scripted results** (test double only, no production change). Run
+  `cargo test -p yserver-core` → all pass; this keeps the Step 2 red gate about Receive, not about missing fixtures.
 - [ ] **Step 1: Write the baseline and denial tests**
   - `receive_xkb_state_no_policy_bytes` covers K11, K12 and K9. Two XKB selectors with distinct sequences each get
     the literal frames in order. The requester gets no reply.
@@ -180,9 +194,10 @@ Unchecked, as today:
     count.
   - Mutations to name: leave K11 unchecked; check K11 with `EventSubject::Global`; describe with event type 2
     (`xkbType`); move the snapshot update after a denial short-circuit.
-- [ ] **Step 2: Run** `cargo test -p yserver-core access_xkb_notify`. Expected: exactly the denial tests fail, on
-  assertions. The baseline and the Allow control pass.
-- [ ] **Step 3: Implement** the helper, the backend hook, and K9, K11 and K12 through
+- [ ] **Step 2: Run** `cargo test -p yserver-core access_xkb_notify`. Expected: the baseline passes. Every other
+  Task 1 test fails on assertions: the denial tests, the Allow control (its Receive call count) and
+  `receive_xkb_state_from_key_has_no_request` (no Receive call yet).
+- [ ] **Step 3: Implement** the helper and K9, K11 and K12 through
   `fanout_event_to_clients_with_receive`. Build the batch once per emission, outside the per-recipient loop.
 - [ ] **Step 4: Run** the module, then `cargo test -p yserver-core`. Expected: all pass.
 - [ ] **Step 5: Commit** `feat(access): Receive on XKB state and controls notifications`.
@@ -217,10 +232,13 @@ Unchecked, as today:
   - `receive_xkb_set_new_keyboard_denied` (K3).
   - `receive_xkb_map_denied_keeps_legacy_filter` (Review Focus 1).
   - `receive_xkb_new_keyboard_allow_control`.
-  - Mutations to name: leave K2 unchecked; return only the allowed recipients from `send_xkb_map_notify`; check K1
-    with `EventSubject::Global`.
-- [ ] **Step 2: Run** the module. Expected: exactly the Task 2 denial tests fail. The Task 1 tests and the baselines
-  pass. The updated exemption test fails, because XKB output is still delivered.
+  - Mutations to name: leave K2 unchecked; filter the core MappingNotify recipients by the XKB MapNotify Receive
+    outcome; check K4 with `EventSubject::Device(1)` instead of `notify.device_id` (caught by a K4 run whose notify
+    carries device id 3, through the existing helper test's shape); check K1 with `EventSubject::Global`.
+- [ ] **Step 2: Run** the module and `cargo test -p yserver-core access_notify_exemptions`. Expected: exactly the
+  Task 2 denial tests and the Allow control fail. The Task 1 tests and the baselines pass.
+  `receive_deny_all_keeps_later_extension_writers` fails because XKB output is still delivered; once implemented it
+  requires exactly three NewKeyboardNotify Receive calls, one for each client of the existing fixture.
 - [ ] **Step 3: Implement** K1–K4.
 - [ ] **Step 4: Run** the module, `cargo test -p yserver-core access_notify_exemptions`, then
   `cargo test -p yserver-core`. Expected: all pass.
