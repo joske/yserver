@@ -17,7 +17,7 @@ use yserver_protocol::x11::{ClientId, ResourceId};
 
 use crate::{
     access::{EventBatch, EventSubject},
-    core_loop::fanout::{fanout_event_to_clients, fanout_event_to_clients_with_receive},
+    core_loop::fanout::fanout_event_to_clients_with_receive,
     resources::{MapState, ROOT_WINDOW},
     server::{ServerState, Xi1DeviceFocus, Xi1FocusRoute},
 };
@@ -565,11 +565,19 @@ pub(crate) fn emit_device_focus(
             window.0,
             targets.len(),
         );
-        let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
-            crate::xinput::encode_xi1_device_focus_event(
-                buf, order, event_type, detail, seq, time, window.0, mode, deviceid,
-            );
-        });
+        let events = [crate::xinput::xi1_event_description(offset)];
+        let batch = EventBatch::new(&events);
+        let _dropped = fanout_event_to_clients_with_receive(
+            state,
+            &targets,
+            EventSubject::Window(window),
+            &batch,
+            |buf, seq, order| {
+                crate::xinput::encode_xi1_device_focus_event(
+                    buf, order, event_type, detail, seq, time, window.0, mode, deviceid,
+                );
+            },
+        );
     }
     if focus_in {
         crate::core_loop::xi1_state_notify::deliver_state_notify(state, deviceid, window);

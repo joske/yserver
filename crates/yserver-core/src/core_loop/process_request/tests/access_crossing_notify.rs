@@ -3541,3 +3541,681 @@ fn receive_core_cooked_pointer_unchecked() {
     assert_eq!(fixture.state.master_sprite_root, (CROSS_X, CROSS_Y));
     assert_no_writer_failures(&fixture);
 }
+
+const FOCUS_WINDOW: ResourceId = ResourceId(0x0052_0001);
+const FOCUS_XI_SEQUENCE: u16 = 0x2345;
+const FOCUS_OTHER_SEQUENCE: u16 = 0x4567;
+const CORE_FOCUS_CHANGE_MASK: u32 = 0x0020_0000;
+const XI_FOCUS_IN: u16 = 9;
+
+fn focus_notify_fixture() -> (NotifyFixture, u16) {
+    use yserver_protocol::x11::CreateWindowRequest;
+
+    let mut fixture = NotifyFixture::new();
+    fixture.state.start_instant = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    fixture.state.resources.create_window(
+        NOTIFY_SENDER,
+        CreateWindowRequest {
+            depth: 24,
+            window: FOCUS_WINDOW,
+            parent: ROOT_WINDOW,
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 60,
+            class: 1,
+            visual: crate::resources::ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    assert!(
+        fixture
+            .state
+            .resources
+            .map_window(FOCUS_WINDOW)
+            .mapping_changed
+    );
+
+    let pointer = fixture
+        .state
+        .xi_register_source(&crate::core_loop::DeviceInfo {
+            source_id: crate::xinput::InputSourceId(0x5410),
+            enabled: true,
+            resume_key: None,
+            capabilities: crate::xinput::InputCapabilities {
+                pointer: true,
+                ..Default::default()
+            },
+            name: "access-focus-four-axis-pointer".into(),
+            device_node: "/dev/input/event-access-focus-pointer".into(),
+            sysname: "event-access-focus-pointer".into(),
+            vendor_id: 1,
+            product_id: 4,
+            is_touchpad: false,
+            config: Default::default(),
+        })
+        .into_iter()
+        .find(|device| {
+            fixture
+                .state
+                .xi_devices
+                .device(*device)
+                .is_some_and(|entry| entry.facet == Some(crate::xinput::XiFacetKind::PointerTouch))
+        })
+        .expect("physical pointer facet");
+    assert_eq!(
+        fixture
+            .state
+            .xi_devices
+            .device(pointer)
+            .expect("registered physical pointer")
+            .class_shape
+            .valuator_count(),
+        4,
+        "the physical pointer fixture carries four valuators"
+    );
+
+    let focus_in_class = (u32::from(crate::xinput::DEVICEID_XTEST_KEYBOARD) << 8)
+        | u32::from(crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_FOCUS_IN_OFFSET);
+    let state_class = (u32::from(crate::xinput::DEVICEID_XTEST_KEYBOARD) << 8)
+        | u32::from(crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_STATE_NOTIFY_OFFSET);
+    let pointer_focus_in_class = (u32::from(pointer) << 8)
+        | u32::from(crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_FOCUS_IN_OFFSET);
+    let pointer_state_class = (u32::from(pointer) << 8)
+        | u32::from(crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_STATE_NOTIFY_OFFSET);
+    for (client, sequence, order) in [
+        (
+            NOTIFY_RECEIVER_DENIED,
+            FOCUS_XI_SEQUENCE,
+            ClientByteOrder::BigEndian,
+        ),
+        (
+            NOTIFY_RECEIVER_ALLOWED,
+            FOCUS_OTHER_SEQUENCE,
+            ClientByteOrder::LittleEndian,
+        ),
+    ] {
+        let state = fixture.state.clients.get_mut(&client.0).expect("client");
+        state.byte_order = order;
+        state.last_sequence.store(sequence, Ordering::Relaxed);
+        state
+            .event_masks
+            .insert(FOCUS_WINDOW, CORE_FOCUS_CHANGE_MASK);
+        state.xi2_masks.insert(
+            (FOCUS_WINDOW, crate::xinput::DEVICEID_MASTER_KEYBOARD),
+            1 << XI_FOCUS_IN,
+        );
+        state
+            .xi1_window_event_classes
+            .entry(FOCUS_WINDOW)
+            .or_default()
+            .extend([
+                focus_in_class,
+                state_class,
+                pointer_focus_in_class,
+                pointer_state_class,
+            ]);
+    }
+    (fixture, pointer)
+}
+
+fn request_core_focus(fixture: &mut NotifyFixture) -> RequestOutcome {
+    fixture
+        .request(
+            NOTIFY_SENDER,
+            SequenceNumber(51),
+            RequestHeader {
+                opcode: 42,
+                data: 0,
+                length_units: 3,
+            },
+            &[FOCUS_WINDOW.0.to_le_bytes(), 0u32.to_le_bytes()].concat(),
+        )
+        .expect("SetInputFocus through process_request")
+}
+
+fn request_xi1_device_focus(
+    fixture: &mut NotifyFixture,
+    sequence: u16,
+    device: u16,
+) -> RequestOutcome {
+    let mut body = Vec::with_capacity(12);
+    body.extend_from_slice(&FOCUS_WINDOW.0.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+    body.push(0); // RevertToNone
+    body.push(u8::try_from(device).expect("XI1 device id fits CARD8"));
+    body.extend_from_slice(&[0, 0]);
+    fixture
+        .request(
+            NOTIFY_SENDER,
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: 137,
+                data: 21, // XI1 SetDeviceFocus
+                length_units: 4,
+            },
+            &body,
+        )
+        .expect("SetDeviceFocus through process_request")
+}
+
+fn literal_core_focus_in(order: ClientByteOrder, sequence: u16) -> Vec<u8> {
+    let mut event = literal_event_header(9, 3, sequence, order); // FocusIn, NotifyNonlinear
+    append_event_u32(&mut event, order, FOCUS_WINDOW.0);
+    event.push(0); // NotifyNormal
+    finish_literal_event(event)
+}
+
+fn literal_core_focus_out_pointer(order: ClientByteOrder, sequence: u16) -> Vec<u8> {
+    let mut event = literal_event_header(10, 5, sequence, order); // FocusOut, NotifyPointer
+    append_event_u32(&mut event, order, FOCUS_WINDOW.0);
+    event.push(0); // NotifyNormal
+    finish_literal_event(event)
+}
+
+fn literal_xi2_focus_in(order: ClientByteOrder, sequence: u16) -> Vec<u8> {
+    let mut event = vec![35, 137]; // GenericEvent, XI major opcode
+    append_event_u16(&mut event, order, sequence);
+    append_event_u32(&mut event, order, 11); // 11 four-byte words after the header
+    append_event_u16(&mut event, order, XI_FOCUS_IN);
+    append_event_u16(&mut event, order, crate::xinput::DEVICEID_MASTER_KEYBOARD);
+    append_event_u32(&mut event, order, 0); // time
+    append_event_u16(&mut event, order, crate::xinput::DEVICEID_MASTER_KEYBOARD);
+    event.extend_from_slice(&[0, 3]); // NotifyNormal, NotifyNonlinear
+    append_event_u32(&mut event, order, ROOT_WINDOW.0);
+    append_event_u32(&mut event, order, FOCUS_WINDOW.0);
+    append_event_u32(&mut event, order, 0); // child
+    for _ in 0..4 {
+        append_event_u32(&mut event, order, 0); // root/event x/y
+    }
+    event.extend_from_slice(&[1, 0]); // same_screen, focus
+    append_event_u16(&mut event, order, 1); // buttons_len
+    for _ in 0..4 {
+        append_event_u32(&mut event, order, 0); // modifiers, group, button mask
+    }
+    event.extend_from_slice(&[0; 4]); // group
+    append_event_u32(&mut event, order, 0); // button mask
+    assert_eq!(event.len(), 76);
+    event
+}
+
+fn literal_xi1_device_focus_in(order: ClientByteOrder, sequence: u16, device: u16) -> Vec<u8> {
+    let mut event = literal_event_header(
+        crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_FOCUS_IN_OFFSET,
+        3, // NotifyNonlinear
+        sequence,
+        order,
+    );
+    append_event_u32(&mut event, order, 0); // time
+    append_event_u32(&mut event, order, FOCUS_WINDOW.0);
+    event.extend_from_slice(&[0, u8::try_from(device).expect("XI1 device id fits CARD8")]);
+    event.extend_from_slice(&[0; 18]);
+    event
+}
+
+fn literal_xi1_keyboard_state_chain(order: ClientByteOrder, sequence: u16) -> Vec<u8> {
+    let keyboard = crate::xinput::DEVICEID_XTEST_KEYBOARD;
+    let mut lead = literal_event_header(
+        crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_STATE_NOTIFY_OFFSET,
+        u8::try_from(keyboard).unwrap() | crate::xinput::XI1_MORE_EVENTS,
+        sequence,
+        order,
+    );
+    append_event_u32(&mut lead, order, 0); // time
+    lead.extend_from_slice(&[247, 0, 0, 1]); // key count, buttons, valuators, KeyClass
+    lead.extend_from_slice(&[0; 20]); // buttons, first 32 key bits, valuators
+    let mut continuation = literal_event_header(
+        crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_KEY_STATE_NOTIFY_OFFSET,
+        u8::try_from(keyboard).unwrap(),
+        sequence,
+        order,
+    );
+    continuation.extend_from_slice(&[0; 28]); // keycodes 40..255 are up
+    [lead, continuation].concat()
+}
+
+fn literal_xi1_four_valuator_state_chain(
+    order: ClientByteOrder,
+    sequence: u16,
+    device: u16,
+) -> Vec<u8> {
+    let mut lead = literal_event_header(
+        crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_STATE_NOTIFY_OFFSET,
+        u8::try_from(device).unwrap() | crate::xinput::XI1_MORE_EVENTS,
+        sequence,
+        order,
+    );
+    append_event_u32(&mut lead, order, 0); // time
+    lead.extend_from_slice(&[0, 7, 3, 6]); // keys, seven buttons, three axes, Button+Valuator
+    lead.extend_from_slice(&[0; 20]); // buttons, key bits, axes
+    let mut continuation = literal_event_header(
+        crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_VALUATOR_OFFSET,
+        u8::try_from(device).unwrap(),
+        sequence,
+        order,
+    );
+    append_event_u16(&mut continuation, order, 0); // device_state
+    continuation.extend_from_slice(&[1, 3]); // one valuator, starting at axis 3
+    continuation.extend_from_slice(&[0; 24]);
+    [lead, continuation].concat()
+}
+
+fn xi1_focus_descriptions(has_key_continuation: bool) -> Vec<EventDescription> {
+    let focus_type = crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_FOCUS_IN_OFFSET;
+    let state_type = crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_STATE_NOTIFY_OFFSET;
+    let mut descriptions = vec![
+        EventDescription::extension(
+            focus_type,
+            137,
+            u16::from(crate::xinput::XI_DEVICE_FOCUS_IN_OFFSET),
+        ),
+        EventDescription::extension(
+            state_type,
+            137,
+            u16::from(crate::xinput::XI_DEVICE_STATE_NOTIFY_OFFSET),
+        ),
+    ];
+    if has_key_continuation {
+        descriptions.push(EventDescription::extension(
+            crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_KEY_STATE_NOTIFY_OFFSET,
+            137,
+            u16::from(crate::xinput::XI_DEVICE_KEY_STATE_NOTIFY_OFFSET),
+        ));
+    } else {
+        descriptions.push(EventDescription::extension(
+            crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_VALUATOR_OFFSET,
+            137,
+            u16::from(crate::xinput::XI_DEVICE_VALUATOR_OFFSET),
+        ));
+    }
+    descriptions
+}
+
+// mutation: emit the state batch before DeviceFocusIn
+#[test]
+fn receive_focus_baseline_frames() {
+    let (mut fixture, pointer) = focus_notify_fixture();
+    assert!(!fixture.state.policies_installed());
+    assert!(matches!(
+        request_core_focus(&mut fixture),
+        RequestOutcome::Handled
+    ));
+    assert_eq!(fixture.state.core_focus.raw, FOCUS_WINDOW.0);
+    assert!(matches!(
+        request_xi1_device_focus(&mut fixture, 52, crate::xinput::DEVICEID_XTEST_KEYBOARD,),
+        RequestOutcome::Handled
+    ));
+    assert!(matches!(
+        request_xi1_device_focus(&mut fixture, 53, pointer),
+        RequestOutcome::Handled
+    ));
+    assert_eq!(
+        crate::core_loop::xi1_focus::device_focus(
+            &fixture.state,
+            crate::xinput::DEVICEID_XTEST_KEYBOARD,
+        )
+        .focus,
+        FOCUS_WINDOW.0
+    );
+    assert_eq!(
+        crate::core_loop::xi1_focus::device_focus(&fixture.state, pointer).focus,
+        FOCUS_WINDOW.0
+    );
+    assert!(
+        fixture.drain(NOTIFY_SENDER).is_empty(),
+        "void focus requests have no reply"
+    );
+    for (client, order, sequence) in [
+        (
+            NOTIFY_RECEIVER_DENIED,
+            ClientByteOrder::BigEndian,
+            FOCUS_XI_SEQUENCE,
+        ),
+        (
+            NOTIFY_RECEIVER_ALLOWED,
+            ClientByteOrder::LittleEndian,
+            FOCUS_OTHER_SEQUENCE,
+        ),
+    ] {
+        let expected = [
+            literal_core_focus_out_pointer(order, sequence),
+            literal_core_focus_in(order, sequence),
+            literal_xi2_focus_in(order, sequence),
+            literal_xi1_device_focus_in(order, sequence, crate::xinput::DEVICEID_XTEST_KEYBOARD),
+            literal_xi1_keyboard_state_chain(order, sequence),
+            literal_xi1_device_focus_in(order, sequence, pointer),
+            literal_xi1_four_valuator_state_chain(order, sequence, pointer),
+        ]
+        .concat();
+        assert_eq!(
+            fixture.drain(client),
+            expected,
+            "literal focus and state stream"
+        );
+    }
+    assert_no_writer_failures(&fixture);
+}
+
+// mutation: leave F1 unchecked
+#[test]
+fn receive_xi2_focus_denial() {
+    let (mut allowed, _) = focus_notify_fixture();
+    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
+    assert!(matches!(
+        request_core_focus(&mut allowed),
+        RequestOutcome::Handled
+    ));
+    for (client, order, sequence) in [
+        (
+            NOTIFY_RECEIVER_DENIED,
+            ClientByteOrder::BigEndian,
+            FOCUS_XI_SEQUENCE,
+        ),
+        (
+            NOTIFY_RECEIVER_ALLOWED,
+            ClientByteOrder::LittleEndian,
+            FOCUS_OTHER_SEQUENCE,
+        ),
+    ] {
+        assert_eq!(
+            allowed.drain(client),
+            [
+                literal_core_focus_out_pointer(order, sequence),
+                literal_core_focus_in(order, sequence),
+                literal_xi2_focus_in(order, sequence),
+            ]
+            .concat(),
+            "allow-control core and XI2 FocusIn stream"
+        );
+    }
+    assert_eq!(allowed.state.core_focus.raw, FOCUS_WINDOW.0);
+    assert!(
+        allowed.drain(NOTIFY_SENDER).is_empty(),
+        "SetInputFocus has no reply or error"
+    );
+    assert_no_writer_failures(&allowed);
+
+    let (mut denied, _) = focus_notify_fixture();
+    let calls = denied.install_policy(|_, call| {
+        if call.hook == ExtensionHook::Receive
+            && call.client == NOTIFY_RECEIVER_DENIED
+            && call.receive == Some(EventSubject::Window(FOCUS_WINDOW))
+            && call.events == Some(vec![EventDescription::extension(35, 137, XI_FOCUS_IN)])
+        {
+            Decision::Deny(DENY)
+        } else {
+            Decision::Allow
+        }
+    });
+    assert!(matches!(
+        request_core_focus(&mut denied),
+        RequestOutcome::Handled
+    ));
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_DENIED),
+        [
+            literal_core_focus_out_pointer(ClientByteOrder::BigEndian, FOCUS_XI_SEQUENCE),
+            literal_core_focus_in(ClientByteOrder::BigEndian, FOCUS_XI_SEQUENCE),
+        ]
+        .concat(),
+        "denying XI2 FocusIn keeps the 4b core FocusOut and FocusIn copies"
+    );
+    assert_eq!(
+        denied.drain(NOTIFY_RECEIVER_ALLOWED),
+        [
+            literal_core_focus_out_pointer(ClientByteOrder::LittleEndian, FOCUS_OTHER_SEQUENCE),
+            literal_core_focus_in(ClientByteOrder::LittleEndian, FOCUS_OTHER_SEQUENCE),
+            literal_xi2_focus_in(ClientByteOrder::LittleEndian, FOCUS_OTHER_SEQUENCE),
+        ]
+        .concat(),
+        "other recipient keeps its literal core and XI2 FocusIn stream"
+    );
+    assert!(
+        denied.drain(NOTIFY_SENDER).is_empty(),
+        "SetInputFocus has no reply or error"
+    );
+    assert_eq!(
+        denied.state.core_focus.raw, FOCUS_WINDOW.0,
+        "focus transition continues"
+    );
+    let recorded = calls.lock().unwrap();
+    let rows = receive_calls(&recorded);
+    assert_eq!(
+        rows.len(),
+        6,
+        "two core focus events and XI2 FocusIn per recipient"
+    );
+    for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+        let recipient_calls = rows
+            .iter()
+            .filter(|call| call.client == client)
+            .collect::<Vec<_>>();
+        let expected_events = [
+            vec![EventDescription::core(10)],
+            vec![EventDescription::core(9)],
+            vec![EventDescription::extension(35, 137, XI_FOCUS_IN)],
+        ];
+        assert_eq!(recipient_calls.len(), expected_events.len());
+        for (call, events) in recipient_calls.iter().zip(expected_events) {
+            assert_eq!(call.receive, Some(EventSubject::Window(FOCUS_WINDOW)));
+            assert_eq!(call.events, Some(events));
+            assert_eq!(call.request, request_opcodes(42, 0));
+        }
+    }
+    assert_eq!(receive_calls(&allow_calls.lock().unwrap()).len(), 6);
+    assert_no_writer_failures(&denied);
+}
+
+// mutation: describe only the lead DeviceStateNotify in F3
+// second mutation: check the batch once per event instead of once per recipient
+#[test]
+fn receive_xi1_focus_and_state_batches_independent() {
+    for is_keyboard in [true, false] {
+        let (mut seed, pointer) = focus_notify_fixture();
+        let device = if is_keyboard {
+            crate::xinput::DEVICEID_XTEST_KEYBOARD
+        } else {
+            pointer
+        };
+        let descriptions = xi1_focus_descriptions(is_keyboard);
+        let focus_description = descriptions[0];
+        let state_batch = descriptions[1..].to_vec();
+        let sequence = 61;
+
+        let make_run = |deny_focus: bool| {
+            let (mut fixture, seeded_pointer) = focus_notify_fixture();
+            let device = if is_keyboard {
+                crate::xinput::DEVICEID_XTEST_KEYBOARD
+            } else {
+                seeded_pointer
+            };
+            let descriptions = xi1_focus_descriptions(is_keyboard);
+            let denied_events = if deny_focus {
+                vec![descriptions[0]]
+            } else {
+                descriptions[1..].to_vec()
+            };
+            let calls = fixture.install_policy(move |_, call| {
+                if call.hook == ExtensionHook::Receive
+                    && call.client == NOTIFY_RECEIVER_DENIED
+                    && call.receive == Some(EventSubject::Window(FOCUS_WINDOW))
+                    && call.events.as_ref() == Some(&denied_events)
+                {
+                    Decision::Deny(DENY)
+                } else {
+                    Decision::Allow
+                }
+            });
+            assert!(matches!(
+                request_xi1_device_focus(&mut fixture, sequence, device),
+                RequestOutcome::Handled
+            ));
+            assert_eq!(
+                crate::core_loop::xi1_focus::device_focus(&fixture.state, device).focus,
+                FOCUS_WINDOW.0,
+                "Receive denial does not prevent XI1 focus movement"
+            );
+            assert!(
+                fixture.drain(NOTIFY_SENDER).is_empty(),
+                "SetDeviceFocus is void"
+            );
+            let full_stream = if is_keyboard {
+                [
+                    literal_xi1_device_focus_in(
+                        ClientByteOrder::LittleEndian,
+                        FOCUS_OTHER_SEQUENCE,
+                        device,
+                    ),
+                    literal_xi1_keyboard_state_chain(
+                        ClientByteOrder::LittleEndian,
+                        FOCUS_OTHER_SEQUENCE,
+                    ),
+                ]
+                .concat()
+            } else {
+                [
+                    literal_xi1_device_focus_in(
+                        ClientByteOrder::LittleEndian,
+                        FOCUS_OTHER_SEQUENCE,
+                        device,
+                    ),
+                    literal_xi1_four_valuator_state_chain(
+                        ClientByteOrder::LittleEndian,
+                        FOCUS_OTHER_SEQUENCE,
+                        device,
+                    ),
+                ]
+                .concat()
+            };
+            let focus_stream =
+                literal_xi1_device_focus_in(ClientByteOrder::BigEndian, FOCUS_XI_SEQUENCE, device);
+            let state_stream = if is_keyboard {
+                literal_xi1_keyboard_state_chain(ClientByteOrder::BigEndian, FOCUS_XI_SEQUENCE)
+            } else {
+                literal_xi1_four_valuator_state_chain(
+                    ClientByteOrder::BigEndian,
+                    FOCUS_XI_SEQUENCE,
+                    device,
+                )
+            };
+            assert_eq!(
+                fixture.drain(NOTIFY_RECEIVER_ALLOWED),
+                full_stream,
+                "always-allowed subscriber equals the literal baseline"
+            );
+            assert_eq!(
+                fixture.drain(NOTIFY_RECEIVER_DENIED),
+                if deny_focus {
+                    state_stream
+                } else {
+                    focus_stream
+                },
+                "the un-denied XI1 event remains literal"
+            );
+            let rows = calls.lock().unwrap();
+            for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+                let recipient_calls = receive_calls(&rows)
+                    .into_iter()
+                    .filter(|call| call.client == client)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    recipient_calls.len(),
+                    2,
+                    "one focus and one state batch check"
+                );
+                assert_eq!(
+                    recipient_calls[0].receive,
+                    Some(EventSubject::Window(FOCUS_WINDOW))
+                );
+                assert_eq!(recipient_calls[0].events, Some(vec![focus_description]));
+                assert_eq!(
+                    recipient_calls[0].request,
+                    request_opcodes(137, 21),
+                    "Receive uses the triggering SetDeviceFocus request"
+                );
+                assert_eq!(
+                    recipient_calls[1].receive,
+                    Some(EventSubject::Window(FOCUS_WINDOW))
+                );
+                assert_eq!(recipient_calls[1].events, Some(state_batch.clone()));
+                assert_eq!(
+                    recipient_calls[1].request,
+                    request_opcodes(137, 21),
+                    "Receive uses the triggering SetDeviceFocus request"
+                );
+            }
+            drop(rows);
+            assert_no_writer_failures(&fixture);
+            calls
+        };
+
+        let allow_calls = seed.install_policy(|_, _| Decision::Allow);
+        assert!(matches!(
+            request_xi1_device_focus(&mut seed, sequence, device),
+            RequestOutcome::Handled
+        ));
+        assert_eq!(
+            crate::core_loop::xi1_focus::device_focus(&seed.state, device).focus,
+            FOCUS_WINDOW.0,
+            "allow-control focus moves to the selected window"
+        );
+        let allowed_stream = if is_keyboard {
+            [
+                literal_xi1_device_focus_in(ClientByteOrder::BigEndian, FOCUS_XI_SEQUENCE, device),
+                literal_xi1_keyboard_state_chain(ClientByteOrder::BigEndian, FOCUS_XI_SEQUENCE),
+            ]
+            .concat()
+        } else {
+            [
+                literal_xi1_device_focus_in(ClientByteOrder::BigEndian, FOCUS_XI_SEQUENCE, device),
+                literal_xi1_four_valuator_state_chain(
+                    ClientByteOrder::BigEndian,
+                    FOCUS_XI_SEQUENCE,
+                    device,
+                ),
+            ]
+            .concat()
+        };
+        assert_eq!(seed.drain(NOTIFY_RECEIVER_DENIED), allowed_stream);
+        assert_eq!(
+            seed.drain(NOTIFY_RECEIVER_ALLOWED),
+            if is_keyboard {
+                [
+                    literal_xi1_device_focus_in(
+                        ClientByteOrder::LittleEndian,
+                        FOCUS_OTHER_SEQUENCE,
+                        device,
+                    ),
+                    literal_xi1_keyboard_state_chain(
+                        ClientByteOrder::LittleEndian,
+                        FOCUS_OTHER_SEQUENCE,
+                    ),
+                ]
+                .concat()
+            } else {
+                [
+                    literal_xi1_device_focus_in(
+                        ClientByteOrder::LittleEndian,
+                        FOCUS_OTHER_SEQUENCE,
+                        device,
+                    ),
+                    literal_xi1_four_valuator_state_chain(
+                        ClientByteOrder::LittleEndian,
+                        FOCUS_OTHER_SEQUENCE,
+                        device,
+                    ),
+                ]
+                .concat()
+            }
+        );
+        assert_eq!(receive_calls(&allow_calls.lock().unwrap()).len(), 4);
+        assert!(
+            seed.drain(NOTIFY_SENDER).is_empty(),
+            "SetDeviceFocus is void"
+        );
+        assert_no_writer_failures(&seed);
+
+        let _focus_denied_calls = make_run(true);
+        let _state_denied_calls = make_run(false);
+    }
+}
