@@ -1572,13 +1572,12 @@ fn mapping_run_output(run: &XiMappingRun, client: ClientId) -> &[u8] {
 }
 
 fn assert_mapping_receive_calls(
-    run: &XiMappingRun,
+    calls: &[RecordedExtensionCheck],
     request: XiMappingRequest,
     clients: &[ClientId],
     request_opcodes: Option<RequestOpcodes>,
 ) {
-    let receives: Vec<_> = run
-        .calls
+    let receives: Vec<_> = calls
         .iter()
         .filter(|call| call.hook == ExtensionHook::Receive)
         .collect();
@@ -1633,7 +1632,7 @@ fn receive_xi_mapping_fanout_device_subject() {
     }
     assert_eq!(baseline.keymap.as_deref(), Some([0x61].as_slice()));
     assert_mapping_receive_calls(
-        &baseline,
+        &baseline.calls,
         XiMappingRequest::ChangeDeviceKeyMapping,
         &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
         Some(RequestOpcodes {
@@ -1653,6 +1652,17 @@ fn receive_xi_mapping_fanout_device_subject() {
         "denial drops only the selected DeviceMappingNotify copy"
     );
     assert_eq!(
+        mapping_run_output(&denied, NOTIFY_SENDER),
+        literal_mapping_notify(
+            MAPPING_ORIGINATOR_SEQUENCE,
+            1,
+            8,
+            1,
+            ClientByteOrder::LittleEndian,
+        ),
+        "requester receives exactly the core MappingNotify"
+    );
+    assert_eq!(
         mapping_run_output(&denied, NOTIFY_RECEIVER_ALLOWED),
         mapping_run_output(&baseline, NOTIFY_RECEIVER_ALLOWED),
         "allowed recipient stays byte-identical to literal baseline"
@@ -1660,7 +1670,7 @@ fn receive_xi_mapping_fanout_device_subject() {
     assert_eq!(denied.keymap.as_deref(), Some([0x61].as_slice()));
     assert_eq!(denied.keymap, baseline.keymap);
     assert_mapping_receive_calls(
-        &denied,
+        &denied.calls,
         XiMappingRequest::ChangeDeviceKeyMapping,
         &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
         Some(RequestOpcodes {
@@ -1684,7 +1694,7 @@ fn receive_xi_mapping_originator_denial_keeps_reply_order() {
             run_xi_mapping_request(request, true, XiMappingPolicy::Deny(vec![NOTIFY_SENDER]));
         let minor = mapping_request_body(request).0;
         assert_mapping_receive_calls(
-            &all_allow,
+            &all_allow.calls,
             request,
             &MAPPING_CLIENTS,
             Some(RequestOpcodes { major: 137, minor }),
@@ -1756,7 +1766,7 @@ fn receive_xi_mapping_originator_denial_keeps_reply_order() {
             XiMappingRequest::ChangeKeyboardDevice => unreachable!(),
         }
         assert_mapping_receive_calls(
-            &denied,
+            &denied.calls,
             request,
             &MAPPING_CLIENTS,
             Some(RequestOpcodes { major: 137, minor }),
@@ -1776,7 +1786,7 @@ fn receive_change_device_notify_originator_denial_keeps_core_mapping() {
         XiMappingPolicy::Deny(vec![NOTIFY_SENDER, NOTIFY_RECEIVER_DENIED]),
     );
     assert_mapping_receive_calls(
-        &all_allow,
+        &all_allow.calls,
         request,
         &MAPPING_CLIENTS,
         Some(RequestOpcodes {
@@ -1825,7 +1835,7 @@ fn receive_change_device_notify_originator_denial_keeps_core_mapping() {
     }
     assert_eq!(denied.device_state, all_allow.device_state);
     assert_mapping_receive_calls(
-        &denied,
+        &denied.calls,
         request,
         &MAPPING_CLIENTS,
         Some(RequestOpcodes {
@@ -1905,158 +1915,120 @@ fn receive_xi_mapping_change_baseline_order() {
 #[test]
 fn receive_xi_mapping_after_xkb_change() {
     // mutation: leave X5 on the unchecked fanout
-    let mut baseline = NotifyFixture::new();
-    baseline.state.start_instant = std::time::Instant::now() + Duration::from_secs(30);
-    for (client, sequence) in [
-        (NOTIFY_RECEIVER_DENIED, MAPPING_DENIED_SEQUENCE),
-        (NOTIFY_RECEIVER_ALLOWED, MAPPING_ALLOWED_SEQUENCE),
-    ] {
-        select_xi1_class(
-            &mut baseline,
-            client,
-            sequence,
-            crate::xinput::DEVICEID_MASTER_KEYBOARD,
-            crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
+    let request = XiMappingRequest::ChangeDeviceKeyMapping;
+    let run_xkb_notify = |policy: XiMappingPolicy| {
+        let mut fixture = xi_mapping_fixture(request, false);
+        let calls = match policy {
+            XiMappingPolicy::None => None,
+            XiMappingPolicy::AllowAll => Some(fixture.install_policy(|_, _| Decision::Allow)),
+            XiMappingPolicy::Deny(clients) => {
+                let subject = EventSubject::Device(mapping_device(request));
+                let events = vec![mapping_event_description(request)];
+                Some(fixture.install_policy(move |_, call| {
+                    if call.hook == ExtensionHook::Receive
+                        && clients.contains(&call.client)
+                        && call.receive == Some(subject)
+                        && call.events.as_ref() == Some(&events)
+                    {
+                        Decision::Deny(DENY)
+                    } else {
+                        Decision::Allow
+                    }
+                }))
+            }
+        };
+        let keymap_before = fixture.state.keymap_overrides.clone();
+        crate::core_loop::xkb_select::send_legacy_map_notify(
+            &mut fixture.state,
+            crate::core_loop::xkb_select::LegacyCause::MapNotify,
+            0x0002,
+            8,
+            1,
         );
-    }
-    baseline
-        .state
-        .clients
-        .get_mut(&NOTIFY_RECEIVER_DENIED.0)
-        .expect("denied XKB receiver")
-        .byte_order = ClientByteOrder::BigEndian;
-    let keymap_before = baseline.state.keymap_overrides.clone();
-    crate::core_loop::xkb_select::send_legacy_map_notify(
-        &mut baseline.state,
-        crate::core_loop::xkb_select::LegacyCause::MapNotify,
-        0x0002,
-        8,
-        1,
-    );
-    assert!(
-        crate::core_loop::client_io::failed_writers(&baseline.state.clients).is_empty(),
-        "server XKB notification does not fail a writer"
-    );
-    let baseline_denied = baseline.drain(NOTIFY_RECEIVER_DENIED);
-    let baseline_allowed = baseline.drain(NOTIFY_RECEIVER_ALLOWED);
-    assert_eq!(
-        baseline_denied,
-        [
-            literal_mapping_notify(MAPPING_DENIED_SEQUENCE, 1, 8, 1, ClientByteOrder::BigEndian),
-            literal_xi1_mapping_notify(
-                MAPPING_DENIED_SEQUENCE,
-                crate::xinput::DEVICEID_MASTER_KEYBOARD,
-                1,
-                8,
-                1,
-                ClientByteOrder::BigEndian,
-            ),
-        ]
-        .concat(),
-        "all-Allow literal core-then-XI stream for the big-endian client"
-    );
-    assert_eq!(
-        baseline_allowed,
-        [
-            literal_mapping_notify(
-                MAPPING_ALLOWED_SEQUENCE,
-                1,
-                8,
-                1,
-                ClientByteOrder::LittleEndian
-            ),
-            literal_xi1_mapping_notify(
-                MAPPING_ALLOWED_SEQUENCE,
-                crate::xinput::DEVICEID_MASTER_KEYBOARD,
-                1,
-                8,
-                1,
-                ClientByteOrder::LittleEndian,
-            ),
-        ]
-        .concat(),
-        "all-Allow literal core-then-XI stream for the second client"
-    );
-    assert_eq!(baseline.state.keymap_overrides, keymap_before);
+        assert!(
+            crate::core_loop::client_io::failed_writers(&fixture.state.clients).is_empty(),
+            "server XKB notification does not fail a writer"
+        );
+        assert_eq!(fixture.state.keymap_overrides, keymap_before);
+        let outputs: Vec<Vec<u8>> = MAPPING_CLIENTS
+            .into_iter()
+            .map(|client| fixture.drain(client))
+            .collect();
+        let calls = calls.map_or_else(Vec::new, |calls| calls.lock().unwrap().clone());
+        (outputs, calls)
+    };
 
-    let mut denied = NotifyFixture::new();
-    denied.state.start_instant = std::time::Instant::now() + Duration::from_secs(30);
-    for (client, sequence) in [
-        (NOTIFY_RECEIVER_DENIED, MAPPING_DENIED_SEQUENCE),
-        (NOTIFY_RECEIVER_ALLOWED, MAPPING_ALLOWED_SEQUENCE),
-    ] {
-        select_xi1_class(
-            &mut denied,
-            client,
-            sequence,
-            crate::xinput::DEVICEID_MASTER_KEYBOARD,
-            crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
-        );
-    }
-    denied
-        .state
-        .clients
-        .get_mut(&NOTIFY_RECEIVER_DENIED.0)
-        .expect("denied XKB receiver")
-        .byte_order = ClientByteOrder::BigEndian;
-    let calls = denied.install_policy(|_, call| {
-        if call.hook == ExtensionHook::Receive
-            && call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive
-                == Some(EventSubject::Device(
-                    crate::xinput::DEVICEID_MASTER_KEYBOARD,
-                ))
-            && call.events.as_ref().is_some_and(|events| {
-                events.as_slice()
-                    == [EventDescription::extension(
-                        crate::server::XI_FIRST_EVENT
-                            + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
-                        137,
-                        u16::from(crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET),
-                    )]
-            })
-        {
-            Decision::Deny(DENY)
-        } else {
-            Decision::Allow
-        }
-    });
-    let keymap_before = denied.state.keymap_overrides.clone();
-    crate::core_loop::xkb_select::send_legacy_map_notify(
-        &mut denied.state,
-        crate::core_loop::xkb_select::LegacyCause::MapNotify,
-        0x0002,
-        8,
-        1,
-    );
-    assert!(
-        crate::core_loop::client_io::failed_writers(&denied.state.clients).is_empty(),
-        "Receive denial does not fail an XKB recipient writer"
-    );
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_DENIED),
+    let no_policy = run_xkb_notify(XiMappingPolicy::None);
+    let all_allow = run_xkb_notify(XiMappingPolicy::AllowAll);
+    let denied = run_xkb_notify(XiMappingPolicy::Deny(vec![NOTIFY_RECEIVER_DENIED]));
+    let denied_client_baseline = [
         literal_mapping_notify(MAPPING_DENIED_SEQUENCE, 1, 8, 1, ClientByteOrder::BigEndian),
-        "denied XI copy leaves the core MappingNotify"
+        literal_xi1_mapping_notify(
+            MAPPING_DENIED_SEQUENCE,
+            crate::xinput::DEVICEID_MASTER_KEYBOARD,
+            1,
+            8,
+            1,
+            ClientByteOrder::BigEndian,
+        ),
+    ]
+    .concat();
+    let allowed_client_baseline = [
+        literal_mapping_notify(
+            MAPPING_ALLOWED_SEQUENCE,
+            1,
+            8,
+            1,
+            ClientByteOrder::LittleEndian,
+        ),
+        literal_xi1_mapping_notify(
+            MAPPING_ALLOWED_SEQUENCE,
+            crate::xinput::DEVICEID_MASTER_KEYBOARD,
+            1,
+            8,
+            1,
+            ClientByteOrder::LittleEndian,
+        ),
+    ]
+    .concat();
+    let sender_core_mapping = literal_mapping_notify(0, 1, 8, 1, ClientByteOrder::LittleEndian);
+    let expected_baseline = vec![
+        sender_core_mapping.clone(),
+        denied_client_baseline.clone(),
+        allowed_client_baseline.clone(),
+    ];
+    assert_eq!(
+        no_policy.0, expected_baseline,
+        "complete no-policy XKB streams"
     );
     assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_ALLOWED),
-        baseline_allowed,
-        "allowed stream equals the literal all-Allow stream"
+        all_allow.0, expected_baseline,
+        "complete explicit-Allow XKB streams"
     );
-    let receives = receive_checks(&calls);
-    assert_eq!(receives.len(), 2);
-    assert!(receives.iter().all(|call| {
-        call.receive
-            == Some(EventSubject::Device(
-                crate::xinput::DEVICEID_MASTER_KEYBOARD,
-            ))
-            && call.events
-                == Some(vec![EventDescription::extension(
-                    crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
-                    137,
-                    u16::from(crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET),
-                )])
-            && call.request.is_none()
-    }));
-    assert_eq!(denied.state.keymap_overrides, keymap_before);
+    assert_eq!(
+        denied.0,
+        vec![
+            sender_core_mapping,
+            literal_mapping_notify(MAPPING_DENIED_SEQUENCE, 1, 8, 1, ClientByteOrder::BigEndian,),
+            allowed_client_baseline,
+        ],
+        "denial removes only A's XI copy while all clients keep core MappingNotify"
+    );
+
+    assert!(
+        no_policy.1.is_empty(),
+        "empty policy list adds no Receive calls"
+    );
+    assert_mapping_receive_calls(
+        &all_allow.1,
+        request,
+        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
+        None,
+    );
+    assert_mapping_receive_calls(
+        &denied.1,
+        request,
+        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
+        None,
+    );
 }

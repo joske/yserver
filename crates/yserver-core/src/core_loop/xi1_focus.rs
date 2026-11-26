@@ -585,11 +585,10 @@ pub(crate) fn emit_device_focus(
 /// per window (`dix/inpututils.c:103`).
 ///
 /// `originator` is the client that sent the request that triggered the
-/// notify. The caller is expected to splice the event into `originator`'s
-/// reply buffer (event-after-reply on the wire), so we don't fanout to
-/// it here — doing so would either duplicate the event or land it
-/// before the reply, which xts5 SetDeviceButtonMapping rejects with
-/// `wanted REPLY got EVENT`. `None` (a void request, e.g. XKB SetMap)
+/// notify. Its request handler emits the selected copy inline in that
+/// request's order: key-map after core MappingNotify, modifier-map before
+/// core MappingNotify and reply, and button-map after reply. We exclude it
+/// here to avoid a duplicate. `None` (a void request, e.g. XKB SetMap)
 /// sends to every client that selected it.
 ///
 /// `request_kind` is the mapping flavour (0=Modifier, 1=Keyboard,

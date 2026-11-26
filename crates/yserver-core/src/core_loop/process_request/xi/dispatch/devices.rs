@@ -624,8 +624,9 @@ pub(super) fn handle_xi1_set_device_mode(
     xi_write_reply(state, client_id, buf)
 }
 
-// ChangeKeyboardDevice: { deviceid }. Needs a device with keys
-// (Xorg Xi/chgkbd.c). xts5 expects:
+// ChangeKeyboardDevice: { deviceid }. yserver requires the selected device
+// to have keys; Xorg validates request size then returns BadDevice
+// (Xi/chgkbd.c:92). xts5 expects:
 //   1. ChangeDeviceNotify (request=1 = NewKeyboard)
 //   2. core MappingNotify (request=1 = MappingKeyboard)
 //   3. reply
