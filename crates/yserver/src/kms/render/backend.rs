@@ -543,6 +543,12 @@ pub struct XBackend<P: seam::Platform> {
     /// frame. Destroyed by `collect_released_cursors` once the last of
     /// those goes, as Xorg's `FreeCursor` does on `refcnt == 0`.
     pub(crate) released_cursors: HashSet<u32>,
+    /// References held by backend window cursor slots and animation frames.
+    /// XIDs with no references have no entry.
+    pub(in crate::kms::render::backend) cursor_refs: HashMap<u32, u32>,
+    /// Cursors whose references or release state changed since the last
+    /// existing reclamation point.
+    pub(in crate::kms::render::backend) reclaim_pending: Vec<u32>,
     /// The one running animation (the effective cursor is animated),
     /// or `None`.
     pub(crate) active_cursor_anim: Option<crate::kms::render::cursor::ActiveCursorAnim>,
@@ -620,6 +626,8 @@ impl<P: seam::Platform> XBackend<P> {
             displayed_cursor_pending: None,
             anim_cursor_records: HashMap::new(),
             released_cursors: HashSet::new(),
+            cursor_refs: HashMap::new(),
+            reclaim_pending: Vec::new(),
             active_cursor_anim: None,
             last_drained_fb_opens: 0,
             floating_keyboard_states: HashMap::new(),

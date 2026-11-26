@@ -2,6 +2,7 @@ mod atomic_cursor;
 pub(super) mod commit_identity;
 mod crossings;
 mod cursor;
+mod cursor_refcount;
 mod cursor_sprites;
 mod deadlines;
 mod detectable_autorepeat;

@@ -16,7 +16,7 @@ impl<P: Platform> XBackend<P> {
         // last owner is safe to drop. For a direct frame, this helper runs
         // only after the composed replacement retired and its pins released.
         let cow_host_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
-        self.windows.remove(&cow_host_xid);
+        self.window_geom_remove(cow_host_xid);
         self.scene.mark_scene_structure_dirty();
 
         self.drain_engine_present_batches();
@@ -111,8 +111,7 @@ impl<P: Platform> XBackend<P> {
             // `compoverlay.c:147-158`), whatever the old one was
             // reparented, moved or unmapped to.
             let geom = self.fresh_cow_geometry();
-            self.windows
-                .insert(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0, geom);
+            self.window_geom_insert(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0, geom);
             // The destroy unregistered the COW (`unregister_host_window`);
             // re-register it as the fresh path below does.
             self.core.xid_map.insert(
@@ -190,7 +189,7 @@ impl<P: Platform> XBackend<P> {
         // keys windows on host xid directly.
         let cow_host_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
         let geom = self.fresh_cow_geometry();
-        self.windows.insert(cow_host_xid, geom);
+        self.window_geom_insert(cow_host_xid, geom);
         // The COW takes the pointer until its input region is emptied, so
         // crossings resolve it like any window (Nonlinear to a sibling).
         self.core.xid_map.insert(

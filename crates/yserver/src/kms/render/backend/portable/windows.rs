@@ -1688,7 +1688,7 @@ impl<P: Platform> XBackend<P> {
             return;
         }
         let stack_rank = self.alloc_window_stack_rank();
-        self.windows.insert(
+        self.window_geom_insert(
             host_xid,
             WindowGeometry {
                 border_width,
@@ -1981,8 +1981,7 @@ impl<P: Platform> XBackend<P> {
             self.store_decref_with_invalidate(id);
         }
         if self
-            .windows
-            .remove(&host_xid)
+            .window_geom_remove(host_xid)
             .is_some_and(|geom| geom.cursor.is_some())
         {
             // Xorg `DeleteWindow` drops the window's cursor ref (`dix/window.c:968`).

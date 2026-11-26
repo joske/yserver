@@ -386,6 +386,9 @@ impl<P: Platform> XBackend<P> {
             // frame index (Xorg: "already current → do nothing").
             return;
         }
+        if let Some(old_xid) = self.effective_cursor_xid {
+            self.cursor_release_candidate(old_xid);
+        }
         self.effective_cursor_xid = new_xid;
         self.sync_cursor_animation(new_xid);
         // XFIXES CursorNotify (Xorg `CursorDisplayCursor`: the requested
@@ -449,11 +452,7 @@ impl<P: Platform> XBackend<P> {
             || self.default_cursor_xid == Some(xid)
             || self.core.active_cursor == Some(xid)
             || self.grab_cursor_override == Some(xid)
-            || self.windows.values().any(|geom| geom.cursor == Some(xid))
-            || self
-                .anim_cursor_records
-                .values()
-                .any(|anim| anim.frames.iter().any(|frame| frame.source == xid))
+            || self.cursor_refs.contains_key(&xid)
     }
 
     /// Destroy every released cursor nothing references any more, and its
@@ -461,24 +460,24 @@ impl<P: Platform> XBackend<P> {
     /// pixmap, so only a static cursor frees one; dropping an animated cursor
     /// can release its frames, hence the loop.
     pub(in crate::kms::render::backend) fn collect_released_cursors(&mut self) {
-        loop {
-            let Some(xid) = self
-                .released_cursors
-                .iter()
-                .copied()
-                .find(|&xid| !self.cursor_referenced(xid))
-            else {
-                return;
-            };
+        while let Some(xid) = self
+            .released_cursors
+            .iter()
+            .copied()
+            .find(|&xid| !self.cursor_referenced(xid))
+        {
             self.released_cursors.remove(&xid);
             self.cursor_records.remove(&xid);
             let sprite = self.cursor_pixmaps.remove(&xid);
-            if self.anim_cursor_records.remove(&xid).is_none()
-                && let Some(id) = sprite
-            {
+            if let Some(anim) = self.anim_cursor_records.remove(&xid) {
+                for frame in anim.frames {
+                    self.cursor_ref_drop(frame.source);
+                }
+            } else if let Some(id) = sprite {
                 self.store_decref_with_invalidate(id);
             }
         }
+        self.reclaim_pending.clear();
     }
 
     /// Whether the currently-effective sprite should be visible in the live
@@ -974,6 +973,9 @@ impl<P: Platform> XBackend<P> {
         if let Some(p) = snap[0].pixmap {
             self.cursor_pixmaps.insert(xid, p);
         }
+        for frame in &snap {
+            self.cursor_ref_add(frame.source);
+        }
         self.anim_cursor_records.insert(
             xid,
             crate::kms::render::cursor::AnimCursorRecord {
@@ -993,6 +995,7 @@ impl<P: Platform> XBackend<P> {
         // other references may still hold it (see `cursor_referenced`).
         if self.cursor_records.contains_key(&host_xid) {
             self.released_cursors.insert(host_xid);
+            self.cursor_release_candidate(host_xid);
             self.collect_released_cursors();
         }
         Ok(())
@@ -1023,10 +1026,15 @@ impl<P: Platform> XBackend<P> {
         } else {
             Some(cursor_host_xid)
         };
-        if let Some(geom) = self.windows.get_mut(&host_window_xid) {
-            geom.cursor = nested;
-        }
+        self.window_set_cursor(host_window_xid, nested);
         if cursor_host_xid != 0 && host_window_xid == self.core.window_id {
+            if let Some(old_xid) = self
+                .core
+                .active_cursor
+                .filter(|old| *old != cursor_host_xid)
+            {
+                self.cursor_release_candidate(old_xid);
+            }
             self.core.active_cursor = Some(cursor_host_xid);
         }
         self.refresh_effective_cursor();
@@ -1044,7 +1052,12 @@ impl<P: Platform> XBackend<P> {
         // it when the grab ends. `refresh_effective_cursor` re-evaluates
         // the chain (now short-circuited by the override) and swaps the
         // scene `CursorEntry` when the displayed cursor changed.
-        self.grab_cursor_override = cursor_host_xid;
+        if self.grab_cursor_override != cursor_host_xid {
+            if let Some(old_xid) = self.grab_cursor_override {
+                self.cursor_release_candidate(old_xid);
+            }
+            self.grab_cursor_override = cursor_host_xid;
+        }
         self.refresh_effective_cursor();
         self.collect_released_cursors();
         Ok(())
@@ -1130,15 +1143,20 @@ impl<P: Platform> XBackend<P> {
         if old_host_xid == new_host_xid {
             return Ok(());
         }
-        for geom in self.windows.values_mut() {
-            if geom.cursor == Some(old_host_xid) {
-                geom.cursor = Some(new_host_xid);
-            }
+        let windows: Vec<u32> = self
+            .windows
+            .iter()
+            .filter_map(|(&host_xid, geom)| (geom.cursor == Some(old_host_xid)).then_some(host_xid))
+            .collect();
+        for host_xid in windows {
+            self.window_set_cursor(host_xid, Some(new_host_xid));
         }
         if self.core.active_cursor == Some(old_host_xid) {
+            self.cursor_release_candidate(old_host_xid);
             self.core.active_cursor = Some(new_host_xid);
         }
         if self.grab_cursor_override == Some(old_host_xid) {
+            self.cursor_release_candidate(old_host_xid);
             self.grab_cursor_override = Some(new_host_xid);
         }
         self.refresh_effective_cursor();
