@@ -161,7 +161,8 @@ pub fn apply_rules_names_change(state: &mut ServerState, backend: &mut dyn Backe
                 max_kc,
                 min_kc,
                 max_kc,
-                0,      // requestMajor — internal rules-names change, no request
+                // The wire cause stays (0, 0); Receive context remains the triggering ChangeProperty.
+                0,      // requestMajor
                 0,      // requestMinor
                 0x0001, // changed = XkbNKN_KeycodesMask
             );
@@ -184,7 +185,8 @@ pub fn apply_rules_names_change(state: &mut ServerState, backend: &mut dyn Backe
 
 /// Send an `XkbMapNotify` carrying `notify` to every client whose map
 /// details include one of its changes (Xorg `XkbSendMapNotify`:
-/// `mapNotifyMask & changed`). Returns the recipients.
+/// `mapNotifyMask & changed`). Returns all selected recipients, including
+/// those whose delivery is denied.
 pub(crate) fn send_xkb_map_notify(
     state: &mut ServerState,
     xkb_event_base: u8,

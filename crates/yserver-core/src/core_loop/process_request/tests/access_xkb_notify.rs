@@ -148,21 +148,32 @@ fn script_xkb_set_outcome(fixture: &mut NotifyFixture, outcome: XkbSetOutcome) {
     fixture.backend = backend.with_xkb_set_outcome(outcome);
 }
 
-fn drive_xkb_set_map(fixture: &mut NotifyFixture, sequence: u16) -> RequestOutcome {
+fn range_change_set_map_body() -> [u8; 32] {
     let mut body = [0; 32];
     body[..2].copy_from_slice(&0x0100u16.to_le_bytes()); // XkbUseCoreKbd
-    fixture
-        .request(
-            NOTIFY_SENDER,
-            SequenceNumber(sequence),
-            RequestHeader {
-                opcode: XKB_MAJOR_OPCODE,
-                data: 8, // XkbSetMap
-                length_units: 9,
-            },
-            &body,
-        )
-        .expect("XkbSetMap through process_request")
+    body[6] = 9; // minKeyCode differs from the current range
+    body[7] = u8::MAX;
+    body
+}
+
+fn keysym_set_map_body() -> [u8; 44] {
+    let mut body = [0; 44];
+    body[..2].copy_from_slice(&0x0100u16.to_le_bytes()); // XkbUseCoreKbd
+    body[2..4].copy_from_slice(&0x0002u16.to_le_bytes()); // XkbKeySymsMask
+    body[6] = 8; // current minKeyCode
+    body[7] = u8::MAX;
+    body[10] = 8; // firstKeySym
+    body[11] = 1; // nKeySyms
+    body[12..14].copy_from_slice(&1u16.to_le_bytes()); // totalSyms
+    body[36] = 1; // one group
+    body[37] = 1; // width
+    body[38..40].copy_from_slice(&1u16.to_le_bytes()); // one symbol
+    body[40..44].copy_from_slice(&0x0000_0041u32.to_le_bytes()); // XK_A
+    body
+}
+
+fn drive_xkb_set_map(fixture: &mut NotifyFixture, sequence: u16, body: &[u8]) -> RequestOutcome {
+    xkb_request(fixture, NOTIFY_SENDER, sequence, 9, body)
 }
 
 fn literal_mapping_notify(
@@ -373,33 +384,6 @@ fn run_xkb_kbd_by_name(
     let calls = calls.map_or_else(Vec::new, |calls| calls.lock().unwrap().clone());
     let keymap_cleared = fixture.state.keymap_overrides.is_empty();
     (outputs, calls, receive_order, keymap_cleared)
-}
-
-fn assert_xkb_receive_log(
-    calls: &[RecordedExtensionCheck],
-    clients: &[ClientId],
-    subject: EventSubject,
-    request: Option<RequestOpcodes>,
-) {
-    let receive_count = calls
-        .iter()
-        .filter(|call| call.hook == ExtensionHook::Receive)
-        .count();
-    assert_eq!(receive_count, clients.len(), "whole-log Receive count");
-    assert!(
-        calls.iter().all(|call| call.hook != ExtensionHook::Send),
-        "server-generated notifications run Receive without Send"
-    );
-    let receives: Vec<_> = calls
-        .iter()
-        .filter(|call| call.hook == ExtensionHook::Receive)
-        .collect();
-    for (call, client) in receives.into_iter().zip(clients) {
-        assert_eq!(call.client, *client);
-        assert_eq!(call.receive, Some(subject));
-        assert_eq!(call.events, Some(vec![XKB_EVENT_DESCRIPTION]));
-        assert_eq!(call.request, request);
-    }
 }
 
 fn xkb_request(
@@ -684,28 +668,34 @@ fn assert_receive_calls(
     clients: &[ClientId],
     request: Option<RequestOpcodes>,
 ) {
-    assert_receive_calls_with_requests(calls, clients, &vec![request; clients.len()]);
+    let log = receive_log(calls);
+    assert_receive_calls_with_requests(
+        &log,
+        clients,
+        &vec![request; clients.len()],
+        EventSubject::Device(1),
+    );
 }
 
 fn assert_receive_calls_with_requests(
-    calls: &Arc<Mutex<Vec<RecordedExtensionCheck>>>,
+    calls: &[RecordedExtensionCheck],
     clients: &[ClientId],
     requests: &[Option<RequestOpcodes>],
+    subject: EventSubject,
 ) {
-    let log = receive_log(calls);
-    let receives: Vec<_> = log
+    let receives: Vec<_> = calls
         .iter()
         .filter(|call| call.hook == ExtensionHook::Receive)
         .collect();
     assert_eq!(receives.len(), clients.len(), "whole-log Receive count");
     assert_eq!(requests.len(), clients.len(), "expected request contexts");
     assert!(
-        log.iter().all(|call| call.hook != ExtensionHook::Send),
+        calls.iter().all(|call| call.hook != ExtensionHook::Send),
         "server-generated notifications run Receive without Send"
     );
     for ((call, client), request) in receives.iter().zip(clients).zip(requests) {
         assert_eq!(call.client, *client);
-        assert_eq!(call.receive, Some(EventSubject::Device(1)));
+        assert_eq!(call.receive, Some(subject));
         assert_eq!(
             call.events,
             Some(vec![EventDescription::extension(85, 136, 0)])
@@ -1054,8 +1044,9 @@ fn receive_xkb_state_allow_control() {
 
     assert_eq!(denied_stream, literal_request_stream(0x1234));
     assert_eq!(allowed_stream, literal_request_stream(0x5678));
+    let log = receive_log(&calls);
     assert_receive_calls_with_requests(
-        &calls,
+        &log,
         &[
             NOTIFY_RECEIVER_DENIED,
             NOTIFY_RECEIVER_ALLOWED,
@@ -1072,11 +1063,13 @@ fn receive_xkb_state_allow_control() {
             request_opcodes(136, 9),
             request_opcodes(136, 9),
         ],
+        EventSubject::Device(1),
     );
 }
 
-// Mutation: change the literal K4 MapNotify changed mask from KeySyms (0x0002).
-// The byte baseline covers K1-K4 event order and each recipient's sequence.
+// Mutations: change K4's literal MapNotify changed mask from KeySyms (0x0002),
+// or drive K3 with GetMap minor 8 instead of SetMap minor 9. The byte baseline
+// covers K1-K4 event order and each recipient's sequence.
 #[test]
 fn receive_xkb_new_keyboard_no_policy_bytes() {
     let selected = [
@@ -1158,7 +1151,7 @@ fn receive_xkb_new_keyboard_no_policy_bytes() {
             ],
         },
     );
-    let outcome = drive_xkb_set_map(&mut fixture, SET_MAP_SEQUENCE);
+    let outcome = drive_xkb_set_map(&mut fixture, SET_MAP_SEQUENCE, &range_change_set_map_body());
     assert!(matches!(outcome, RequestOutcome::Handled));
     for (client, sequence) in [
         (NOTIFY_SENDER, SET_MAP_SEQUENCE),
@@ -1171,7 +1164,7 @@ fn receive_xkb_new_keyboard_no_policy_bytes() {
                 sequence,
                 yserver_protocol::x11::ClientByteOrder::LittleEndian,
                 XKB_MAJOR_OPCODE,
-                8,
+                9,
                 1,
             )
         );
@@ -1212,7 +1205,7 @@ fn receive_xkb_new_keyboard_no_policy_bytes() {
             })],
         },
     );
-    let outcome = drive_xkb_set_map(&mut fixture, 0x5d9e);
+    let outcome = drive_xkb_set_map(&mut fixture, 0x5d9e, &keysym_set_map_body());
     assert!(matches!(outcome, RequestOutcome::Handled));
     for (client, sequence) in [
         (NOTIFY_SENDER, 0x5d9e),
@@ -1295,11 +1288,11 @@ fn receive_xkb_kbd_by_name_all_clients() {
             false,
         )
     );
-    assert_xkb_receive_log(
+    assert_receive_calls_with_requests(
         &calls,
         &receive_order,
+        &[request_opcodes(XKB_MAJOR_OPCODE, 23); 3],
         EventSubject::Device(1),
-        request_opcodes(XKB_MAJOR_OPCODE, 23),
     );
 
     let (allowed, allow_calls, allow_order, allow_cleared) = run_xkb_kbd_by_name(true, false);
@@ -1328,11 +1321,11 @@ fn receive_xkb_kbd_by_name_all_clients() {
             false,
         )
     );
-    assert_xkb_receive_log(
+    assert_receive_calls_with_requests(
         &allow_calls,
         &allow_order,
+        &[request_opcodes(XKB_MAJOR_OPCODE, 23); 3],
         EventSubject::Device(1),
-        request_opcodes(XKB_MAJOR_OPCODE, 23),
     );
 }
 
@@ -1370,8 +1363,9 @@ fn receive_xkb_rules_change_denies_new_keyboard_and_map() {
         denied.drain(NOTIFY_RECEIVER_ALLOWED),
         literal_rules_names_stream(0x5678, yserver_protocol::x11::ClientByteOrder::LittleEndian)
     );
+    let log = receive_log(&calls);
     assert_receive_calls_with_requests(
-        &calls,
+        &log,
         &[
             NOTIFY_SENDER,
             NOTIFY_RECEIVER_DENIED,
@@ -1388,6 +1382,7 @@ fn receive_xkb_rules_change_denies_new_keyboard_and_map() {
             request_opcodes(18, 0),
             request_opcodes(18, 0),
         ],
+        EventSubject::Device(1),
     );
     let denied_overrides = denied.state.keymap_overrides.clone();
     assert!(
@@ -1418,8 +1413,9 @@ fn receive_xkb_rules_change_denies_new_keyboard_and_map() {
             )
         );
     }
+    let allow_log = receive_log(&allow_calls);
     assert_receive_calls_with_requests(
-        &allow_calls,
+        &allow_log,
         &[
             NOTIFY_SENDER,
             NOTIFY_RECEIVER_DENIED,
@@ -1436,6 +1432,7 @@ fn receive_xkb_rules_change_denies_new_keyboard_and_map() {
             request_opcodes(18, 0),
             request_opcodes(18, 0),
         ],
+        EventSubject::Device(1),
     );
     assert_eq!(denied_overrides, allowed.state.keymap_overrides);
     assert_no_writer_failures(&allowed);
@@ -1483,7 +1480,7 @@ fn run_xkb_set_new_keyboard(
             ],
         },
     );
-    let outcome = drive_xkb_set_map(&mut fixture, SET_MAP_SEQUENCE);
+    let outcome = drive_xkb_set_map(&mut fixture, SET_MAP_SEQUENCE, &range_change_set_map_body());
     assert_no_writer_failures(&fixture);
     let outputs = [
         NOTIFY_SENDER,
@@ -1499,8 +1496,9 @@ fn run_xkb_set_new_keyboard(
     (outputs, calls, repeats, outcome)
 }
 
-// Mutation: leave K3 unchecked; the denied client's stream and the complete
-// Receive call log must fail while repeats and legacy MappingNotify stay.
+// Mutations: leave K3 unchecked or drive it with GetMap minor 8 instead of
+// SetMap minor 9. The stream and Receive context must fail while repeats and
+// legacy MappingNotify stay.
 #[test]
 fn receive_xkb_set_new_keyboard_denied() {
     let (denied, calls, denied_repeats, outcome) = run_xkb_set_new_keyboard(true, true);
@@ -1511,7 +1509,7 @@ fn receive_xkb_set_new_keyboard_denied() {
             SET_MAP_SEQUENCE,
             yserver_protocol::x11::ClientByteOrder::LittleEndian,
             XKB_MAJOR_OPCODE,
-            8,
+            9,
             1,
         ),
         "requester's complete XkbSetMap notification stream"
@@ -1526,21 +1524,21 @@ fn receive_xkb_set_new_keyboard_denied() {
             0x5678,
             yserver_protocol::x11::ClientByteOrder::LittleEndian,
             XKB_MAJOR_OPCODE,
-            8,
+            9,
             1,
         )
     );
     let legacy = literal_mapping_pair(0x6a2f, yserver_protocol::x11::ClientByteOrder::LittleEndian);
     assert_eq!(denied[3], legacy, "legacy core MappingNotify is unchanged");
-    assert_xkb_receive_log(
+    assert_receive_calls_with_requests(
         &calls,
         &[
             NOTIFY_SENDER,
             NOTIFY_RECEIVER_DENIED,
             NOTIFY_RECEIVER_ALLOWED,
         ],
+        &[request_opcodes(XKB_MAJOR_OPCODE, 9); 3],
         EventSubject::Device(1),
-        request_opcodes(XKB_MAJOR_OPCODE, 8),
     );
     let repeat_bit = 1 << (REPEAT_KEYCODE & 7);
     let repeat_byte = usize::from(REPEAT_KEYCODE >> 3);
@@ -1555,7 +1553,7 @@ fn receive_xkb_set_new_keyboard_denied() {
             SET_MAP_SEQUENCE,
             yserver_protocol::x11::ClientByteOrder::LittleEndian,
             XKB_MAJOR_OPCODE,
-            8,
+            9,
             1,
         )
     );
@@ -1565,7 +1563,7 @@ fn receive_xkb_set_new_keyboard_denied() {
             0x1234,
             yserver_protocol::x11::ClientByteOrder::LittleEndian,
             XKB_MAJOR_OPCODE,
-            8,
+            9,
             1,
         )
     );
@@ -1575,20 +1573,20 @@ fn receive_xkb_set_new_keyboard_denied() {
             0x5678,
             yserver_protocol::x11::ClientByteOrder::LittleEndian,
             XKB_MAJOR_OPCODE,
-            8,
+            9,
             1,
         )
     );
     assert_eq!(allowed[3], legacy);
-    assert_xkb_receive_log(
+    assert_receive_calls_with_requests(
         &allow_calls,
         &[
             NOTIFY_SENDER,
             NOTIFY_RECEIVER_DENIED,
             NOTIFY_RECEIVER_ALLOWED,
         ],
+        &[request_opcodes(XKB_MAJOR_OPCODE, 9); 3],
         EventSubject::Device(1),
-        request_opcodes(XKB_MAJOR_OPCODE, 8),
     );
     assert_eq!(
         denied_repeats, allow_repeats,
@@ -1640,7 +1638,7 @@ fn run_xkb_map_change(
             })],
         },
     );
-    let outcome = drive_xkb_set_map(&mut fixture, SET_MAP_SEQUENCE);
+    let outcome = drive_xkb_set_map(&mut fixture, SET_MAP_SEQUENCE, &keysym_set_map_body());
     assert_no_writer_failures(&fixture);
     let outputs = [
         NOTIFY_SENDER,
@@ -1655,8 +1653,9 @@ fn run_xkb_map_change(
     (outputs, calls, outcome)
 }
 
-// Mutation: filter core MappingNotify by the XKB MapNotify Receive outcome.
-// The selected client must keep its core copy when its XKB copy is denied.
+// Mutations: filter core MappingNotify by the XKB MapNotify Receive outcome,
+// or drive the keysym-only case with GetMap minor 8. The selected client must
+// keep its core copy when its XKB copy is denied.
 #[test]
 fn receive_xkb_map_denied_keeps_legacy_filter() {
     let (baseline, baseline_calls, baseline_outcome) = run_xkb_map_change(false, false);
@@ -1713,11 +1712,11 @@ fn receive_xkb_map_denied_keeps_legacy_filter() {
             1,
         )
     );
-    assert_xkb_receive_log(
+    assert_receive_calls_with_requests(
         &calls,
         &[NOTIFY_RECEIVER_DENIED],
+        &[request_opcodes(XKB_MAJOR_OPCODE, 9)],
         EventSubject::Device(1),
-        request_opcodes(XKB_MAJOR_OPCODE, 8),
     );
 }
 
@@ -1803,7 +1802,7 @@ fn receive_xkb_new_keyboard_allow_control() {
         },
     );
     assert!(matches!(
-        drive_xkb_set_map(&mut fixture, SET_MAP_SEQUENCE),
+        drive_xkb_set_map(&mut fixture, SET_MAP_SEQUENCE, &range_change_set_map_body(),),
         RequestOutcome::Handled
     ));
     for (client, sequence) in [
@@ -1817,7 +1816,7 @@ fn receive_xkb_new_keyboard_allow_control() {
                 sequence,
                 yserver_protocol::x11::ClientByteOrder::LittleEndian,
                 XKB_MAJOR_OPCODE,
-                8,
+                9,
                 1,
             )
         );
@@ -1840,8 +1839,14 @@ fn receive_xkb_new_keyboard_allow_control() {
     ]);
     let mut receive_requests = vec![request_opcodes(18, 0); 6];
     receive_requests.extend([request_opcodes(XKB_MAJOR_OPCODE, 23); 3]);
-    receive_requests.extend([request_opcodes(XKB_MAJOR_OPCODE, 8); 3]);
-    assert_receive_calls_with_requests(&calls, &receive_clients, &receive_requests);
+    receive_requests.extend([request_opcodes(XKB_MAJOR_OPCODE, 9); 3]);
+    let log = receive_log(&calls);
+    assert_receive_calls_with_requests(
+        &log,
+        &receive_clients,
+        &receive_requests,
+        EventSubject::Device(1),
+    );
 }
 
 // Mutations: use Device(1) for K4 instead of notify.device_id, or return only
@@ -1913,11 +1918,12 @@ fn receive_xkb_map_payload_device_subject() {
             0
         )
     );
-    assert_xkb_receive_log(
-        &calls.lock().unwrap(),
+    let log = receive_log(&calls);
+    assert_receive_calls_with_requests(
+        &log,
         &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
+        &[None; 2],
         EventSubject::Device(3),
-        None,
     );
     assert_no_writer_failures(&fixture);
 }
