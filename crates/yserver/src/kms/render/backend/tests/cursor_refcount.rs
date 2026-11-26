@@ -544,9 +544,15 @@ fn cursor_refs_match_recount_under_random_sequences() {
                 }
                 12 => {
                     if b.cow_id.is_some() && !b.deferred_cow_release {
+                        let prepared = Backend::prepare_overlay_release(&mut b, None)
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "seed {seed} step {step}: prepare immediate COW release failed: {error:?}"
+                                )
+                            });
                         assert!(
-                            Backend::prepare_overlay_release(&mut b, None)
-                                .expect("prepare immediate COW release")
+                            prepared,
+                            "seed {seed} step {step}: expected immediate COW release"
                         );
                         Backend::retire_overlay_window(&mut b, None);
                     }
