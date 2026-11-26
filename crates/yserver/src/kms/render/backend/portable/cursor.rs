@@ -455,29 +455,32 @@ impl<P: Platform> XBackend<P> {
             || self.cursor_refs.contains_key(&xid)
     }
 
+    fn cursor_reclaimable(&mut self, xid: u32) -> bool {
+        self.cursor_reclaim_checks += 1;
+        self.released_cursors.contains(&xid) && !self.cursor_referenced(xid)
+    }
+
     /// Destroy every released cursor nothing references any more, and its
-    /// sprite pixmap. An animated cursor's canonical sprite aliases a frame's
-    /// pixmap, so only a static cursor frees one; dropping an animated cursor
-    /// can release its frames, hence the loop.
+    /// sprite pixmap, as Xorg `FreeCursor` does at `refcnt == 0`
+    /// (`dix/cursor.c`). An animated cursor's canonical sprite aliases a
+    /// frame's pixmap, so only a static cursor frees one; dropping an animated
+    /// cursor drops its frame references, which can release those cursors in
+    /// turn (`render/animcur.c:247`).
     pub(in crate::kms::render::backend) fn collect_released_cursors(&mut self) {
-        while let Some(xid) = self
-            .released_cursors
-            .iter()
-            .copied()
-            .find(|&xid| !self.cursor_referenced(xid))
-        {
-            self.released_cursors.remove(&xid);
-            self.cursor_records.remove(&xid);
-            let sprite = self.cursor_pixmaps.remove(&xid);
-            if let Some(anim) = self.anim_cursor_records.remove(&xid) {
-                for frame in anim.frames {
-                    self.cursor_ref_drop(frame.source);
+        while let Some(xid) = self.reclaim_pending.pop() {
+            if self.cursor_reclaimable(xid) {
+                self.released_cursors.remove(&xid);
+                self.cursor_records.remove(&xid);
+                let sprite = self.cursor_pixmaps.remove(&xid);
+                if let Some(anim) = self.anim_cursor_records.remove(&xid) {
+                    for frame in anim.frames {
+                        self.cursor_ref_drop(frame.source);
+                    }
+                } else if let Some(id) = sprite {
+                    self.store_decref_with_invalidate(id);
                 }
-            } else if let Some(id) = sprite {
-                self.store_decref_with_invalidate(id);
             }
         }
-        self.reclaim_pending.clear();
     }
 
     /// Whether the currently-effective sprite should be visible in the live

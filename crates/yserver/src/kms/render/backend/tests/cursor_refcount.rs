@@ -666,3 +666,141 @@ fn cow_reacquisition_drops_the_overwritten_cursor_reference() {
     Backend::set_grab_cursor(&mut b, None, None).expect("next reclamation point");
     assert_invariants(&b, &model, true, "COW reacquisition");
 }
+
+// Mutation: reclaim immediately after cursor_ref_drop reaches zero; teardown
+// must leave this released cursor alive until the next existing reclaim point.
+#[test]
+fn overlay_orphaned_cursor_survives_teardown_until_next_reclamation_point() {
+    let mut b = KmsBackend::for_tests();
+    let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+    Backend::get_overlay_window(&mut b, None).expect("materialize COW");
+    let mut model = Model::default();
+    let c = sprite_cursor(&mut b, &mut model);
+    let sprite = model.sprites[&c];
+    Backend::define_cursor(&mut b, None, cow_xid, c).expect("define COW cursor");
+
+    install_deferred_cow_release(&mut b, 0);
+    assert!(b.deferred_cow_release);
+    free_cursor(&mut b, &mut model, c);
+    assert!(b.cursor_records.contains_key(&c));
+
+    b.stop_direct_after_scanout_replaced(DirectScope::Root, "cursor refcount test COW teardown");
+    assert!(b.cursor_records.contains_key(&c));
+    assert!(b.store.get(sprite).is_some());
+
+    Backend::set_grab_cursor(&mut b, None, None).expect("next reclamation point");
+    assert!(!b.cursor_records.contains_key(&c));
+    assert!(b.store.get(sprite).is_none());
+    assert!(!b.released_cursors.contains(&c));
+}
+
+// Mutation: omit cursor_ref_drop when window_set_cursor clears a slot; the
+// shared cursor would remain alive after its last window loses it.
+#[test]
+fn shared_cursor_goes_with_the_last_window() {
+    let mut state = ServerState::new();
+    let _peer = kbd_map_client_id(&mut state, 14);
+    let mut b = KmsBackend::for_tests();
+    let mut model = Model::default();
+    let windows = [
+        create_window(&mut state, &mut b, ResourceId(0x0010_2101), 5, 5),
+        create_window(&mut state, &mut b, ResourceId(0x0010_2102), 120, 5),
+        create_window(&mut state, &mut b, ResourceId(0x0010_2103), 235, 5),
+    ];
+    let c = sprite_cursor(&mut b, &mut model);
+    for window in windows {
+        Backend::define_cursor(&mut b, None, window.host_xid, c).expect("define shared cursor");
+    }
+    free_cursor(&mut b, &mut model, c);
+    assert!(b.cursor_records.contains_key(&c));
+
+    Backend::define_cursor(&mut b, None, windows[0].host_xid, 0).expect("clear first window");
+    assert!(b.cursor_records.contains_key(&c));
+    Backend::define_cursor(&mut b, None, windows[1].host_xid, 0).expect("clear second window");
+    assert!(b.cursor_records.contains_key(&c));
+    Backend::define_cursor(&mut b, None, windows[2].host_xid, 0).expect("clear last window");
+    assert!(!b.cursor_records.contains_key(&c));
+    assert!(!b.released_cursors.contains(&c));
+}
+
+// Mutation: scan released_cursors in collect_released_cursors; cursor changes
+// would perform one eligibility check per released frame instead of per candidate.
+#[test]
+fn reclaim_checks_stay_bounded_with_a_large_released_backlog() {
+    let mut b = KmsBackend::for_tests();
+    let mut frame_xids = Vec::with_capacity(2_000);
+    let mut animations = Vec::with_capacity(100);
+    for _ in 0..100 {
+        let mut frames = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let frame = test_cursor(&mut b);
+            frames.push(frame);
+            frame_xids.push(frame);
+        }
+        let cursors: Vec<_> = frames
+            .iter()
+            .map(|xid| (CursorHandle::from_raw(*xid).expect("frame xid"), 10))
+            .collect();
+        let animation = Backend::create_anim_cursor(&mut b, None, &cursors)
+            .expect("create animation")
+            .expect("animation handle");
+        animations.push(animation.as_raw());
+    }
+    for xid in frame_xids {
+        Backend::free_cursor(&mut b, None, xid).expect("free frame cursor");
+    }
+    assert_eq!(b.released_cursors.len(), 2_000);
+    assert_eq!(b.anim_cursor_records.len(), 100);
+    assert!(animations.iter().all(|xid| {
+        b.cursor_records.contains_key(xid) && b.anim_cursor_records.contains_key(xid)
+    }));
+
+    let a = sprite_cursor(&mut b, &mut Model::default());
+    let cursor_b = sprite_cursor(&mut b, &mut Model::default());
+    let mut windows = Vec::with_capacity(20);
+    for index in 0..20u32 {
+        let host_xid = 0x7f00_0000 + index;
+        let stack_rank = b.alloc_window_stack_rank();
+        b.window_geom_insert(
+            host_xid,
+            WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                depth: 24,
+                mapped: true,
+                viewable: true,
+                parent: None,
+                stack_rank,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+        windows.push(host_xid);
+    }
+    b.core.prev_pointer_window = Some(windows[0]);
+    Backend::define_cursor(&mut b, None, windows[0], a).expect("define initial cursor");
+    assert_eq!(b.effective_cursor_xid, Some(a));
+    Backend::define_cursor(&mut b, None, windows[0], cursor_b).expect("prime alternate cursor");
+    assert_eq!(b.effective_cursor_xid, Some(cursor_b));
+
+    let before = b.cursor_reclaim_checks;
+    for index in 0..1_000 {
+        let xid = if index % 2 == 0 { a } else { cursor_b };
+        Backend::define_cursor(&mut b, None, windows[0], xid).expect("alternate window cursor");
+        assert_eq!(b.effective_cursor_xid, Some(xid));
+    }
+    for index in 0..1_000 {
+        let cursor = if index % 2 == 0 { Some(a) } else { None };
+        Backend::set_grab_cursor(&mut b, None, cursor).expect("alternate grab cursor");
+        assert_eq!(b.effective_cursor_xid, Some(cursor.unwrap_or(cursor_b)));
+    }
+
+    assert!(b.cursor_reclaim_checks - before <= 4 * 2_000);
+    assert_eq!(b.released_cursors.len(), 2_000);
+}

@@ -549,6 +549,9 @@ pub struct XBackend<P: seam::Platform> {
     /// Cursors whose references or release state changed since the last
     /// existing reclamation point.
     pub(in crate::kms::render::backend) reclaim_pending: Vec<u32>,
+    /// Number of pending-candidate eligibility checks performed by the
+    /// released-cursor collector.
+    pub(crate) cursor_reclaim_checks: u64,
     /// The one running animation (the effective cursor is animated),
     /// or `None`.
     pub(crate) active_cursor_anim: Option<crate::kms::render::cursor::ActiveCursorAnim>,
@@ -628,6 +631,7 @@ impl<P: seam::Platform> XBackend<P> {
             released_cursors: HashSet::new(),
             cursor_refs: HashMap::new(),
             reclaim_pending: Vec::new(),
+            cursor_reclaim_checks: 0,
             active_cursor_anim: None,
             last_drained_fb_opens: 0,
             floating_keyboard_states: HashMap::new(),
