@@ -8,8 +8,9 @@ installed.
 **Architecture:** The 12 native XKB emission expressions all have fixed recipient lists. Each one switches from
 `fanout_event_to_clients` to `fanout_event_to_clients_with_receive`, which takes:
 - the subject `EventSubject::Device(<device id in the event payload>)`;
-- a one-event batch described as `EventDescription::extension(xkb_event_base, XKB_MAJOR_OPCODE, 0)`. That is the same
-  description `describe_wire_event` gives a `SendEvent` of an XKB event.
+- a one-event batch described as `EventDescription::extension(xkb_event_base, XKB_MAJOR_OPCODE, 0)`. For any wire
+  code the live registry resolves to XKB, that is the description `describe_wire_event` gives a `SendEvent` of the
+  same event (not for the base-zero fallback when `xkb_info()` is absent, which it classifies as `core(0)`).
 
 A denial drops that recipient's copy only. These stay exactly as they are:
 - the keymap, control, indicator and state change;
@@ -110,14 +111,16 @@ Unchanged by this plan:
     denying. Request admission and other hooks are allowed.
   - **Per-request checks.** After each driven request:
     - `RequestOutcome::Handled`;
-    - the requester's stream holds exactly the expected reply or error, if any;
+    - the requester's complete stream is asserted exactly: its notifications (for example the core MappingNotify
+      pair and NewKeyboardNotify that precede the XkbGetKbdByName reply), then its reply or error, in order;
     - `client_io::failed_writers` is empty;
     - the state effect is present, compared with the Allow run: the keymap override cleared, the mods, the repeat
       bits, `xkb_announced`.
   - **Hook log.** The whole-log Receive count and the absence of any Send call are asserted before the log is
     filtered by client.
-  - **Red gates.** The module accumulates tests across tasks. At each task's red step, exactly the denial tests that
-    task adds fail. Its baseline and every earlier test pass.
+  - **Red gates.** The module accumulates tests across tasks. Each task's Step 2 lists exactly which tests fail at
+    its red step, and that list is authoritative (it includes the Allow controls and the no-request key test, whose
+    Receive assertions cannot pass before the hook exists). Its baseline and every earlier test pass.
   - **Expected descriptions.** Write them as `EventDescription::extension(85, 136, 0)` with
     `backend.xkb_info_result = Some((136, 85, 0))`, from constants, not through the production helper.
   - **Red steps fail on assertions,** not on compile errors.
@@ -139,12 +142,15 @@ Unchanged by this plan:
    - Test: Task 2 `receive_xkb_map_denied_keeps_legacy_filter`.
 2. **K2 reaches clients that never initialised XKB.** Its denial and baseline cover such a client, including a
    big-endian one. Test: Task 2 `receive_xkb_kbd_by_name_all_clients`.
-3. **A denied StateNotify still advances the snapshots and keeps the indicator follow-ups.**
-   - Setup: every selected StateNotify copy is denied, while the same request also changes the lit indicators.
-   - Expected: right after that request, `state.xkb_announced` equals the new state and
-     `state.xkb_announced_indicators` equals the new lit mask. The IndicatorStateNotify and ExtensionDeviceNotify
-     selectors still get their literal frames. A repeated request cannot show this, because the handler resyncs
+3. **A denied StateNotify still advances the snapshots and keeps the indicator follow-ups.** The existing order
+   stays: `xkb_announced` advances before StateNotify; `xkb_announced_indicators` advances after StateNotify and before
+   its indicator follow-ups (`xkb_layout.rs:576-625`).
+   - State part (Task 1): every selected StateNotify copy of a LatchLockState is denied; right after that request
+     `state.xkb_announced` equals the new state. A repeated request cannot show this, because the handler resyncs
      `xkb_announced` first (`process_request/xkb.rs:234`).
+   - Indicator part (Task 3): a physical key through `key_event_fanout_to_state` with seeded `xkb_mods` and a new
+     lit mask; every StateNotify copy is denied; afterwards `xkb_announced_indicators` equals the new mask and the
+     IndicatorStateNotify and ExtensionDeviceNotify selectors get their literal frames.
    - Tests: Task 1 `receive_xkb_state_denied_snapshot_advances` (state snapshot), Task 3
      `receive_xkb_state_indicator_followups` (indicator snapshot and follow-up frames).
 4. **One request emits several XKB events.** In the IndicatorMaps change, every XKB event is checked on its own, in
@@ -228,8 +234,10 @@ Unchanged by this plan:
     (`props.rs:1191`), with `RecordingBackend::with_keymap_rmlvo_result`.
   - **K2:** XkbGetKbdByName (minor 23) with `with_kbd_by_name_result`. `run_xkb_mapping` in
     `access_notify_exemptions.rs:753` shows the setup.
-  - **K3 and K4 (partial):** an XkbSet* request with a scripted outcome holding `NewKeyboard` and a `Notification`
-    whose `map_notify.changed != 0`.
+  - **K3:** an XkbSetMap request whose scripted outcome is what the backend emits for a keycode-range change:
+    `NewKeyboard` followed by `Repeats` (`portable/keyboard.rs:437`).
+  - **K4 (partial):** a separate XkbSetMap request without a range change, whose scripted outcome is a
+    `Notification` with `map_notify.changed != 0`.
 
 - [ ] **Step 1: Write the tests**
   - `receive_xkb_new_keyboard_no_policy_bytes`: K1–K4, literal frames for every recipient. The surrounding core
@@ -238,7 +246,9 @@ Unchanged by this plan:
     big-endian one, get the literal NewKeyboardNotify.
   - `receive_xkb_rules_change_denies_new_keyboard_and_map`: the denied client gets neither event, and
     `state.keymap_overrides` is cleared in both runs.
-  - `receive_xkb_set_new_keyboard_denied` (K3).
+  - `receive_xkb_set_new_keyboard_denied` (K3): the denied client gets no NewKeyboardNotify; the scripted repeat
+    bits are still applied to the core per-key repeat state, and the legacy core MappingNotify frames match the
+    baseline.
   - `receive_xkb_map_denied_keeps_legacy_filter` (Review Focus 1).
   - `receive_xkb_new_keyboard_allow_control`.
   - `receive_xkb_map_payload_device_subject`: the existing K4 helper-test shape (`xkb_layout.rs:809-845`, notify
