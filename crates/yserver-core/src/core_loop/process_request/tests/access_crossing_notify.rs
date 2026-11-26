@@ -405,10 +405,15 @@ fn receive_screen_config_baseline_frames() {
         monitor_request(&mut monitor),
         RequestOutcome::Handled
     ));
+    let requested_name = monitor.state.atoms.intern("PR4C_CONFIGURE_NOTIFY", false).0;
     assert_eq!(
         monitor.state.randr_client_monitors.len(),
         1,
         "SetMonitor took effect"
+    );
+    assert_eq!(
+        monitor.state.randr_client_monitors[0].name, requested_name,
+        "SetMonitor stores the requested monitor name"
     );
     assert!(crate::core_loop::client_io::failed_writers(&monitor.state.clients).is_empty());
     assert!(
@@ -448,6 +453,10 @@ fn receive_cow_resize_subjects_independent() {
     let allowed_calls = allowed.install_policy(|_, _| Decision::Allow);
     assert!(matches!(resize(&mut allowed), RequestOutcome::Handled));
     assert_resized(&allowed);
+    assert!(
+        allowed.drain(NOTIFY_SENDER).is_empty(),
+        "void request has no reply or error"
+    );
     assert_eq!(
         allowed.drain(NOTIFY_RECEIVER_DENIED),
         [
@@ -484,6 +493,18 @@ fn receive_cow_resize_subjects_independent() {
         ]
         .concat(),
         "allow control has both COW copies"
+    );
+    assert_eq!(
+        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
+        literal_configure_notify(
+            ClientByteOrder::LittleEndian,
+            ROOT_SEQUENCE,
+            ROOT_WINDOW,
+            ROOT_WINDOW,
+            SCREEN_WIDTH,
+            SCREEN_HEIGHT,
+        ),
+        "unaffected root selector keeps its literal stream"
     );
 
     let mut deny_parent = resize_fixture();
@@ -532,6 +553,18 @@ fn receive_cow_resize_subjects_independent() {
         .concat(),
         "denied parent copy leaves overlay and extension copies"
     );
+    assert_eq!(
+        deny_parent.drain(NOTIFY_RECEIVER_ALLOWED),
+        literal_configure_notify(
+            ClientByteOrder::LittleEndian,
+            ROOT_SEQUENCE,
+            ROOT_WINDOW,
+            ROOT_WINDOW,
+            SCREEN_WIDTH,
+            SCREEN_HEIGHT,
+        ),
+        "unaffected root selector keeps its literal stream"
+    );
 
     let mut deny_overlay = resize_fixture();
     let overlay_calls = deny_overlay.install_policy(|_, call| {
@@ -579,6 +612,18 @@ fn receive_cow_resize_subjects_independent() {
         .concat(),
         "denied overlay copy leaves parent and extension copies"
     );
+    assert_eq!(
+        deny_overlay.drain(NOTIFY_RECEIVER_ALLOWED),
+        literal_configure_notify(
+            ClientByteOrder::LittleEndian,
+            ROOT_SEQUENCE,
+            ROOT_WINDOW,
+            ROOT_WINDOW,
+            SCREEN_WIDTH,
+            SCREEN_HEIGHT,
+        ),
+        "unaffected root selector keeps its literal stream"
+    );
     assert_resize_receive_calls(&allowed_calls.lock().unwrap());
     assert_resize_receive_calls(&parent_calls.lock().unwrap());
     assert_resize_receive_calls(&overlay_calls.lock().unwrap());
@@ -590,6 +635,11 @@ fn receive_screen_resize_root_denial() {
     let mut allowed = resize_fixture();
     let allowed_calls = allowed.install_policy(|_, _| Decision::Allow);
     assert!(matches!(resize(&mut allowed), RequestOutcome::Handled));
+    assert_resized(&allowed);
+    assert!(
+        allowed.drain(NOTIFY_SENDER).is_empty(),
+        "void request has no reply or error"
+    );
     assert_eq!(
         allowed.drain(NOTIFY_RECEIVER_ALLOWED),
         literal_configure_notify(
@@ -601,6 +651,43 @@ fn receive_screen_resize_root_denial() {
             SCREEN_HEIGHT,
         ),
         "allow control root stream"
+    );
+    assert_eq!(
+        allowed.drain(NOTIFY_RECEIVER_DENIED),
+        [
+            literal_configure_notify(
+                ClientByteOrder::BigEndian,
+                DUAL_SEQUENCE,
+                COMPOSITE_OVERLAY_WINDOW,
+                COMPOSITE_OVERLAY_WINDOW,
+                SCREEN_WIDTH,
+                SCREEN_HEIGHT,
+            )
+            .as_slice(),
+            literal_configure_notify(
+                ClientByteOrder::BigEndian,
+                DUAL_SEQUENCE,
+                ROOT_WINDOW,
+                COMPOSITE_OVERLAY_WINDOW,
+                SCREEN_WIDTH,
+                SCREEN_HEIGHT,
+            )
+            .as_slice(),
+            literal_present_configure_notify(
+                ClientByteOrder::BigEndian,
+                DUAL_SEQUENCE,
+                COMPOSITE_OVERLAY_WINDOW,
+            )
+            .as_slice(),
+            literal_screen_change_notify(
+                ClientByteOrder::BigEndian,
+                DUAL_SEQUENCE,
+                COMPOSITE_OVERLAY_WINDOW,
+            )
+            .as_slice(),
+        ]
+        .concat(),
+        "allow control dual core and extension streams"
     );
 
     let mut denied = resize_fixture();
@@ -671,6 +758,7 @@ fn receive_screen_resize_root_denial() {
 fn receive_root_config_notify_denial() {
     let mut allowed = monitor_fixture();
     let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
+    let allowed_name = allowed.state.atoms.intern("PR4C_CONFIGURE_NOTIFY", false).0;
     assert!(matches!(
         monitor_request(&mut allowed),
         RequestOutcome::Handled
@@ -679,6 +767,10 @@ fn receive_root_config_notify_denial() {
         allowed.state.randr_client_monitors.len(),
         1,
         "SetMonitor took effect"
+    );
+    assert_eq!(
+        allowed.state.randr_client_monitors[0].name, allowed_name,
+        "SetMonitor stores the requested monitor name"
     );
     assert!(crate::core_loop::client_io::failed_writers(&allowed.state.clients).is_empty());
     assert!(
@@ -711,8 +803,14 @@ fn receive_root_config_notify_denial() {
         "allow control big-endian root stream"
     );
     let mut denied = monitor_fixture();
+    let denied_name = denied.state.atoms.intern("PR4C_CONFIGURE_NOTIFY", false).0;
     let calls = denied.install_policy(|_, call| {
-        if call.hook == ExtensionHook::Receive && call.client == NOTIFY_RECEIVER_DENIED {
+        if call.hook == ExtensionHook::Receive
+            && call.client == NOTIFY_RECEIVER_DENIED
+            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
+            && call.events == Some(vec![EventDescription::core(22)])
+            && call.request == request_opcodes(128, yserver_protocol::x11::randr::RR_SET_MONITOR)
+        {
             Decision::Deny(DENY)
         } else {
             Decision::Allow
@@ -726,6 +824,10 @@ fn receive_root_config_notify_denial() {
         denied.state.randr_client_monitors.len(),
         1,
         "SetMonitor took effect"
+    );
+    assert_eq!(
+        denied.state.randr_client_monitors[0].name, denied_name,
+        "SetMonitor stores the requested monitor name"
     );
     assert!(crate::core_loop::client_io::failed_writers(&denied.state.clients).is_empty());
     assert!(
