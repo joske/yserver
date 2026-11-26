@@ -66,7 +66,9 @@ Unchanged by this plan:
   the same: events, replies, errors, their order, sequence numbers and multiplicity. The existing suite passes
   unmodified, except `receive_deny_all_keeps_later_extension_writers` (Task 2 states the one change).
 - **No new rules.** No new recipient selection, event production or deduplication rule.
-- **Snapshots.** `state.xkb_announced` and `state.xkb_announced_indicators` advance before the fanout, as today.
+- **Snapshots.** The existing order stays: `state.xkb_announced` advances before the StateNotify fanout;
+  `state.xkb_announced_indicators` advances after the StateNotify fanout and before its indicator follow-ups
+  (`xkb_layout.rs:576-625`). A denial never skips either update.
 - **Reuse first:**
   - Use the existing helpers: `fanout_event_to_clients_with_receive`, `EventBatch::new`, `EventSubject::Device`, the
     existing encoders, and the test fixture `NotifyFixture` (`tests/access_notify_support.rs`).
@@ -115,7 +117,10 @@ Unchanged by this plan:
       pair and NewKeyboardNotify that precede the XkbGetKbdByName reply), then its reply or error, in order;
     - `client_io::failed_writers` is empty;
     - the state effect is present, compared with the Allow run: the keymap override cleared, the mods, the repeat
-      bits, `xkb_announced`.
+      bits, `xkb_announced`. For scripted `xkb_set` outcomes the backend's own changes (compat map, names, indicator
+      maps) happen inside the real backend before the core sees the outcome (`portable/keyboard.rs`); the scripted
+      double does not model them, so those tests assert only core-observable effects (repeat bits, snapshots) and
+      notification delivery.
   - **Hook log.** The whole-log Receive count and the absence of any Send call are asserted before the log is
     filtered by client.
   - **Red gates.** The module accumulates tests across tasks. Each task's Step 2 lists exactly which tests fail at
@@ -207,8 +212,9 @@ Unchanged by this plan:
   - `receive_xkb_state_allow_control`: an allow-all policy gives the literal baseline frames, with the expected call
     count.
   - Mutations to name: leave K11 unchecked; check K11 with `EventSubject::Global`; describe with event type 2
-    (`xkbType`); move the snapshot update after a denial short-circuit; pass the requester's request to the
-    key-path check instead of `state.receive_request`; leave K12 unchecked; leave K9 unchecked.
+    (`xkbType`); move the snapshot update after a denial short-circuit; at the key-path check pass
+    `Some(RequestOpcodes { major: 0, minor: 0 })` (the physical event's wire cause) instead of
+    `state.receive_request`; leave K12 unchecked; leave K9 unchecked.
 - [ ] **Step 2: Run** `cargo test -p yserver-core access_xkb_notify`. Expected: the baseline passes. Every other
   Task 1 test fails on assertions: the denial tests, the Allow control (its Receive call count) and
   `receive_xkb_state_from_key_has_no_request` (no Receive call yet).
@@ -245,7 +251,9 @@ Unchanged by this plan:
   - `receive_xkb_kbd_by_name_all_clients` (Review Focus 2): denial for one non-XKB client. The others, including a
     big-endian one, get the literal NewKeyboardNotify.
   - `receive_xkb_rules_change_denies_new_keyboard_and_map`: the denied client gets neither event, and
-    `state.keymap_overrides` is cleared in both runs.
+    `state.keymap_overrides` is cleared in both runs. Both Receive calls (NewKeyboardNotify, MapNotify) record request
+    `Some(RequestOpcodes { major: 18, minor: 0 })` (ChangeProperty), while the NewKeyboardNotify wire cause stays
+    `(0, 0)`. Mutation: pass `None` instead of `state.receive_request` at K1.
   - `receive_xkb_set_new_keyboard_denied` (K3): the denied client gets no NewKeyboardNotify; the scripted repeat
     bits are still applied to the core per-key repeat state, and the legacy core MappingNotify frames match the
     baseline.
