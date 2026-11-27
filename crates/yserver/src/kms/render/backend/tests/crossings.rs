@@ -153,6 +153,22 @@ fn pointer_enters_input_only_window_and_shows_its_cursor() {
         ],
     );
     assert_eq!(b.effective_cursor_xid, Some(CURSOR_HOST));
+    // Mutation: counting InputOnly stand-ins in cursor_refs must fail this assertion.
+    assert!(
+        b.input_only_pointer_hosts
+            .values()
+            .any(|host| host.cursor == Some(CURSOR_HOST))
+    );
+    assert_eq!(
+        b.cursor_refs.get(&CURSOR_HOST).copied().unwrap_or(0),
+        u32::try_from(
+            b.windows
+                .values()
+                .filter(|geom| geom.cursor == Some(CURSOR_HOST))
+                .count()
+        )
+        .expect("window count fits u32"),
+    );
 
     b.on_host_input(
         &mut state,

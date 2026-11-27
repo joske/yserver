@@ -1,6 +1,7 @@
 mod clip;
 mod compose;
 mod cursor;
+mod cursor_refs;
 mod devices;
 mod draw;
 mod dump;
