@@ -238,8 +238,15 @@ jobs:
         with:
           components: clippy
           toolchain: stable
+      - name: Brew versions
+        # Build scripts bake Homebrew Cellar paths into the cache; a brew
+        # upgrade must start a fresh one.
+        id: brew
+        run: echo "hash=$(brew list --versions libxkbcommon fontconfig freetype | shasum | cut -c1-12)" >> "$GITHUB_OUTPUT"
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          key: brew-${{ steps.brew.outputs.hash }}
       - name: Vulkan environment
         # The loader and the KosmicKrisp ICD come from Homebrew, off dyld's
         # default search path.
