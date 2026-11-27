@@ -1,8 +1,8 @@
 use super::{
     access_notify_support::{
-        NOTIFY_RECEIVER_ALLOWED, NOTIFY_RECEIVER_DENIED, NOTIFY_SENDER, NotifyFixture,
-        append_event_u16, append_event_u32, finish_literal_event, literal_event_header,
-        request_opcodes,
+        CallOrder, CaseExpect, ExpectedReceive, NOTIFY_RECEIVER_ALLOWED, NOTIFY_RECEIVER_DENIED,
+        NOTIFY_SENDER, NotifyFixture, ReceiveCase, Stream, append_event_u16, append_event_u32,
+        check_receive_case, finish_literal_event, literal_event_header, request_opcodes,
     },
     extensions::{ExtensionHook, RecordedExtensionCheck},
     *,
@@ -173,6 +173,7 @@ fn resize_fixture() -> NotifyFixture {
             event_mask: yserver_protocol::x11::present::EVENT_MASK_CONFIGURE_NOTIFY,
         },
     );
+    assert!(!fixture.state.policies_installed());
     fixture
 }
 
@@ -218,50 +219,130 @@ fn assert_resized(fixture: &NotifyFixture) {
     assert!(crate::core_loop::client_io::failed_writers(&fixture.state.clients).is_empty());
 }
 
-fn assert_resize_receive_calls(calls: &[RecordedExtensionCheck]) {
-    let rows = receive_calls(calls);
-    assert_eq!(rows.len(), 3, "root, overlay and parent copies are checked");
-    let dual: Vec<_> = rows
-        .iter()
-        .filter(|call| call.client == NOTIFY_RECEIVER_DENIED)
-        .copied()
-        .collect();
-    assert_eq!(
-        dual.len(),
-        2,
-        "dual selector gets overlay then parent checks"
-    );
-    assert_eq!(
-        dual.iter()
-            .map(|call| (call.receive, call.events.clone(), call.request))
-            .collect::<Vec<_>>(),
-        [
-            (
-                Some(EventSubject::Window(COMPOSITE_OVERLAY_WINDOW)),
-                Some(vec![EventDescription::core(22)]),
-                request_opcodes(128, yserver_protocol::x11::randr::RR_SET_SCREEN_SIZE),
+fn run_screen_resize_receive_case(
+    name: &'static str,
+    denied_client: ClientId,
+    denied_subject: EventSubject,
+    no_policy_last: bool,
+) {
+    let build = || (resize_fixture(), ());
+    let act = |fixture: &mut NotifyFixture, _: &()| {
+        assert!(matches!(resize(fixture), RequestOutcome::Handled));
+        assert_resized(fixture);
+        assert!(fixture.drain(NOTIFY_SENDER).is_empty());
+    };
+    let expect = |_: &()| {
+        let request = request_opcodes(128, yserver_protocol::x11::randr::RR_SET_SCREEN_SIZE);
+        let description = EventDescription::core(22);
+        let receives = vec![
+            ExpectedReceive {
+                client: NOTIFY_RECEIVER_DENIED,
+                request,
+                subject: EventSubject::Window(COMPOSITE_OVERLAY_WINDOW),
+                events: vec![description],
+            },
+            ExpectedReceive {
+                client: NOTIFY_RECEIVER_DENIED,
+                request,
+                subject: EventSubject::Window(ROOT_WINDOW),
+                events: vec![description],
+            },
+            ExpectedReceive {
+                client: NOTIFY_RECEIVER_ALLOWED,
+                request,
+                subject: EventSubject::Window(ROOT_WINDOW),
+                events: vec![description],
+            },
+        ];
+        let overlay = literal_configure_notify(
+            ClientByteOrder::BigEndian,
+            DUAL_SEQUENCE,
+            COMPOSITE_OVERLAY_WINDOW,
+            COMPOSITE_OVERLAY_WINDOW,
+            SCREEN_WIDTH,
+            SCREEN_HEIGHT,
+        );
+        let parent = literal_configure_notify(
+            ClientByteOrder::BigEndian,
+            DUAL_SEQUENCE,
+            ROOT_WINDOW,
+            COMPOSITE_OVERLAY_WINDOW,
+            SCREEN_WIDTH,
+            SCREEN_HEIGHT,
+        );
+        let extension_suffix = [
+            literal_present_configure_notify(
+                ClientByteOrder::BigEndian,
+                DUAL_SEQUENCE,
+                COMPOSITE_OVERLAY_WINDOW,
             ),
-            (
-                Some(EventSubject::Window(ROOT_WINDOW)),
-                Some(vec![EventDescription::core(22)]),
-                request_opcodes(128, yserver_protocol::x11::randr::RR_SET_SCREEN_SIZE),
+            literal_screen_change_notify(
+                ClientByteOrder::BigEndian,
+                DUAL_SEQUENCE,
+                COMPOSITE_OVERLAY_WINDOW,
             ),
-        ],
-        "the dual subscriber's call order and arguments"
-    );
-    let root: Vec<_> = rows
-        .iter()
-        .filter(|call| call.client == NOTIFY_RECEIVER_ALLOWED)
-        .copied()
-        .collect();
-    assert_eq!(root.len(), 1, "root selector gets one root check");
-    assert_eq!(root[0].receive, Some(EventSubject::Window(ROOT_WINDOW)));
-    assert_eq!(root[0].events, Some(vec![EventDescription::core(22)]));
-    assert_eq!(
-        root[0].request,
-        request_opcodes(128, yserver_protocol::x11::randr::RR_SET_SCREEN_SIZE)
-    );
-    assert!(calls.iter().all(|call| call.hook != ExtensionHook::Send));
+        ]
+        .concat();
+        let dual = [
+            overlay.as_slice(),
+            parent.as_slice(),
+            extension_suffix.as_slice(),
+        ]
+        .concat();
+        let dual_denied = match denied_subject {
+            EventSubject::Window(COMPOSITE_OVERLAY_WINDOW) => {
+                [parent.as_slice(), extension_suffix.as_slice()].concat()
+            }
+            EventSubject::Window(ROOT_WINDOW) if denied_client == NOTIFY_RECEIVER_DENIED => {
+                [overlay.as_slice(), extension_suffix.as_slice()].concat()
+            }
+            _ => dual.clone(),
+        };
+        let root = literal_configure_notify(
+            ClientByteOrder::LittleEndian,
+            ROOT_SEQUENCE,
+            ROOT_WINDOW,
+            ROOT_WINDOW,
+            SCREEN_WIDTH,
+            SCREEN_HEIGHT,
+        );
+        let mut root_denied = None;
+        let mut dual_stream_denied = None;
+        if denied_client == NOTIFY_RECEIVER_ALLOWED {
+            root_denied = Some(Vec::new());
+        } else if denied_client == NOTIFY_RECEIVER_DENIED {
+            dual_stream_denied = Some(dual_denied);
+        }
+        let streams = vec![
+            Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+            Stream {
+                client: NOTIFY_RECEIVER_DENIED,
+                bytes: dual,
+                denied: dual_stream_denied,
+            },
+            Stream {
+                client: NOTIFY_RECEIVER_ALLOWED,
+                bytes: root,
+                denied: root_denied,
+            },
+        ];
+        let denied_call = receives
+            .iter()
+            .find(|receive| receive.client == denied_client && receive.subject == denied_subject)
+            .expect("denied resize copy is in the full trace")
+            .clone();
+        let mut expectation =
+            CaseExpect::new(streams, receives, CallOrder::PerClient, vec![denied_call]);
+        expectation.no_policy_last = no_policy_last;
+        expectation.deny_before_allow = denied_client == NOTIFY_RECEIVER_ALLOWED;
+        expectation
+    };
+    check_receive_case(&ReceiveCase {
+        name,
+        build: &build,
+        act: &act,
+        expect: &expect,
+    });
 }
 
 fn monitor_request(fixture: &mut NotifyFixture) -> RequestOutcome {
@@ -322,537 +403,104 @@ fn monitor_fixture() -> NotifyFixture {
             state.event_masks.insert(ROOT_WINDOW, STRUCTURE_NOTIFY);
         }
     }
+    assert!(!fixture.state.policies_installed());
     fixture
 }
 
-fn assert_root_notify_receive_calls(calls: &[RecordedExtensionCheck], request_minor: u8) {
-    let rows = receive_calls(calls);
-    assert_eq!(rows.len(), 2, "both selected root copies are checked");
-    assert!(rows.iter().all(|call| {
-        call.receive == Some(EventSubject::Window(ROOT_WINDOW))
-            && call.events == Some(vec![EventDescription::core(22)])
-            && call.request == request_opcodes(128, request_minor)
-    }));
-    let mut clients: Vec<_> = rows.iter().map(|call| call.client).collect();
-    clients.sort_by_key(|client| client.0);
-    assert_eq!(clients, [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED]);
-    assert!(calls.iter().all(|call| call.hook != ExtensionHook::Send));
-}
-
-// mutation: swap R3 and R4
+// mutation: swap R3 and R4 (C01)
 #[test]
-fn receive_screen_config_baseline_frames() {
-    let mut fixture = resize_fixture();
-    assert!(!fixture.state.policies_installed());
-    assert!(matches!(resize(&mut fixture), RequestOutcome::Handled));
-    assert_resized(&fixture);
-    assert!(
-        fixture.drain(NOTIFY_SENDER).is_empty(),
-        "void request has no reply or error"
-    );
-    assert_eq!(
-        fixture.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_configure_notify(
-            ClientByteOrder::LittleEndian,
-            ROOT_SEQUENCE,
-            ROOT_WINDOW,
-            ROOT_WINDOW,
-            SCREEN_WIDTH,
-            SCREEN_HEIGHT,
-        ),
-        "root StructureNotify stream"
-    );
-    let expected_dual = [
-        literal_configure_notify(
-            ClientByteOrder::BigEndian,
-            DUAL_SEQUENCE,
-            COMPOSITE_OVERLAY_WINDOW,
-            COMPOSITE_OVERLAY_WINDOW,
-            SCREEN_WIDTH,
-            SCREEN_HEIGHT,
-        )
-        .as_slice(),
-        literal_configure_notify(
-            ClientByteOrder::BigEndian,
-            DUAL_SEQUENCE,
-            ROOT_WINDOW,
-            COMPOSITE_OVERLAY_WINDOW,
-            SCREEN_WIDTH,
-            SCREEN_HEIGHT,
-        )
-        .as_slice(),
-        literal_present_configure_notify(
-            ClientByteOrder::BigEndian,
-            DUAL_SEQUENCE,
-            COMPOSITE_OVERLAY_WINDOW,
-        )
-        .as_slice(),
-        literal_screen_change_notify(
-            ClientByteOrder::BigEndian,
-            DUAL_SEQUENCE,
-            COMPOSITE_OVERLAY_WINDOW,
-        )
-        .as_slice(),
-    ]
-    .concat();
-    assert_eq!(
-        fixture.drain(NOTIFY_RECEIVER_DENIED),
-        expected_dual,
-        "dual core and extension notification stream"
-    );
-
-    let mut monitor = monitor_fixture();
-    assert!(!monitor.state.policies_installed());
-    assert!(matches!(
-        monitor_request(&mut monitor),
-        RequestOutcome::Handled
-    ));
-    let requested_name = monitor.state.atoms.intern("PR4C_CONFIGURE_NOTIFY", false).0;
-    assert_eq!(
-        monitor.state.randr_client_monitors.len(),
-        1,
-        "SetMonitor took effect"
-    );
-    assert_eq!(
-        monitor.state.randr_client_monitors[0].name, requested_name,
-        "SetMonitor stores the requested monitor name"
-    );
-    assert!(crate::core_loop::client_io::failed_writers(&monitor.state.clients).is_empty());
-    assert!(
-        monitor.drain(NOTIFY_SENDER).is_empty(),
-        "void request has no reply"
-    );
-    assert_eq!(
-        monitor.drain(NOTIFY_RECEIVER_DENIED),
-        literal_configure_notify(
-            ClientByteOrder::BigEndian,
-            DUAL_SEQUENCE,
-            ROOT_WINDOW,
-            ROOT_WINDOW,
-            800,
-            600,
-        ),
-        "big-endian root ConfigureNotify from RRSetMonitor"
-    );
-    assert_eq!(
-        monitor.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_configure_notify(
-            ClientByteOrder::LittleEndian,
-            ROOT_SEQUENCE,
-            ROOT_WINDOW,
-            ROOT_WINDOW,
-            800,
-            600,
-        ),
-        "little-endian root ConfigureNotify from RRSetMonitor"
+fn receive_screen_resize_overlay_copy_denial() {
+    run_screen_resize_receive_case(
+        "screen resize denies the overlay StructureNotify copy",
+        NOTIFY_RECEIVER_DENIED,
+        EventSubject::Window(COMPOSITE_OVERLAY_WINDOW),
+        false,
     );
 }
 
-// mutation: pass the overlay as R4's window
+// mutation: pass the overlay as R4's window (C02)
 #[test]
-fn receive_cow_resize_subjects_independent() {
-    let mut allowed = resize_fixture();
-    let allowed_calls = allowed.install_policy(|_, _| Decision::Allow);
-    assert!(matches!(resize(&mut allowed), RequestOutcome::Handled));
-    assert_resized(&allowed);
-    assert!(
-        allowed.drain(NOTIFY_SENDER).is_empty(),
-        "void request has no reply or error"
+fn receive_screen_resize_parent_copy_denial() {
+    run_screen_resize_receive_case(
+        "screen resize denies the COW parent SubstructureNotify copy",
+        NOTIFY_RECEIVER_DENIED,
+        EventSubject::Window(ROOT_WINDOW),
+        true,
     );
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_DENIED),
-        [
-            literal_configure_notify(
-                ClientByteOrder::BigEndian,
-                DUAL_SEQUENCE,
-                COMPOSITE_OVERLAY_WINDOW,
-                COMPOSITE_OVERLAY_WINDOW,
-                SCREEN_WIDTH,
-                SCREEN_HEIGHT,
-            )
-            .as_slice(),
-            literal_configure_notify(
-                ClientByteOrder::BigEndian,
-                DUAL_SEQUENCE,
-                ROOT_WINDOW,
-                COMPOSITE_OVERLAY_WINDOW,
-                SCREEN_WIDTH,
-                SCREEN_HEIGHT,
-            )
-            .as_slice(),
-            literal_present_configure_notify(
-                ClientByteOrder::BigEndian,
-                DUAL_SEQUENCE,
-                COMPOSITE_OVERLAY_WINDOW,
-            )
-            .as_slice(),
-            literal_screen_change_notify(
-                ClientByteOrder::BigEndian,
-                DUAL_SEQUENCE,
-                COMPOSITE_OVERLAY_WINDOW,
-            )
-            .as_slice(),
-        ]
-        .concat(),
-        "allow control has both COW copies"
-    );
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_configure_notify(
-            ClientByteOrder::LittleEndian,
-            ROOT_SEQUENCE,
-            ROOT_WINDOW,
-            ROOT_WINDOW,
-            SCREEN_WIDTH,
-            SCREEN_HEIGHT,
-        ),
-        "unaffected root selector keeps its literal stream"
-    );
-
-    let mut deny_parent = resize_fixture();
-    let parent_calls = deny_parent.install_policy(|_, call| {
-        if call.hook == ExtensionHook::Receive
-            && call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
-            && call.events == Some(vec![EventDescription::core(22)])
-        {
-            Decision::Deny(DENY)
-        } else {
-            Decision::Allow
-        }
-    });
-    assert!(matches!(resize(&mut deny_parent), RequestOutcome::Handled));
-    assert_resized(&deny_parent);
-    assert!(
-        deny_parent.drain(NOTIFY_SENDER).is_empty(),
-        "void request has no reply or error"
-    );
-    assert_eq!(
-        deny_parent.drain(NOTIFY_RECEIVER_DENIED),
-        [
-            literal_configure_notify(
-                ClientByteOrder::BigEndian,
-                DUAL_SEQUENCE,
-                COMPOSITE_OVERLAY_WINDOW,
-                COMPOSITE_OVERLAY_WINDOW,
-                SCREEN_WIDTH,
-                SCREEN_HEIGHT,
-            )
-            .as_slice(),
-            literal_present_configure_notify(
-                ClientByteOrder::BigEndian,
-                DUAL_SEQUENCE,
-                COMPOSITE_OVERLAY_WINDOW,
-            )
-            .as_slice(),
-            literal_screen_change_notify(
-                ClientByteOrder::BigEndian,
-                DUAL_SEQUENCE,
-                COMPOSITE_OVERLAY_WINDOW,
-            )
-            .as_slice(),
-        ]
-        .concat(),
-        "denied parent copy leaves overlay and extension copies"
-    );
-    assert_eq!(
-        deny_parent.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_configure_notify(
-            ClientByteOrder::LittleEndian,
-            ROOT_SEQUENCE,
-            ROOT_WINDOW,
-            ROOT_WINDOW,
-            SCREEN_WIDTH,
-            SCREEN_HEIGHT,
-        ),
-        "unaffected root selector keeps its literal stream"
-    );
-
-    let mut deny_overlay = resize_fixture();
-    let overlay_calls = deny_overlay.install_policy(|_, call| {
-        if call.hook == ExtensionHook::Receive
-            && call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Window(COMPOSITE_OVERLAY_WINDOW))
-            && call.events == Some(vec![EventDescription::core(22)])
-        {
-            Decision::Deny(DENY)
-        } else {
-            Decision::Allow
-        }
-    });
-    assert!(matches!(resize(&mut deny_overlay), RequestOutcome::Handled));
-    assert_resized(&deny_overlay);
-    assert!(
-        deny_overlay.drain(NOTIFY_SENDER).is_empty(),
-        "void request has no reply or error"
-    );
-    assert_eq!(
-        deny_overlay.drain(NOTIFY_RECEIVER_DENIED),
-        [
-            literal_configure_notify(
-                ClientByteOrder::BigEndian,
-                DUAL_SEQUENCE,
-                ROOT_WINDOW,
-                COMPOSITE_OVERLAY_WINDOW,
-                SCREEN_WIDTH,
-                SCREEN_HEIGHT,
-            )
-            .as_slice(),
-            literal_present_configure_notify(
-                ClientByteOrder::BigEndian,
-                DUAL_SEQUENCE,
-                COMPOSITE_OVERLAY_WINDOW,
-            )
-            .as_slice(),
-            literal_screen_change_notify(
-                ClientByteOrder::BigEndian,
-                DUAL_SEQUENCE,
-                COMPOSITE_OVERLAY_WINDOW,
-            )
-            .as_slice(),
-        ]
-        .concat(),
-        "denied overlay copy leaves parent and extension copies"
-    );
-    assert_eq!(
-        deny_overlay.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_configure_notify(
-            ClientByteOrder::LittleEndian,
-            ROOT_SEQUENCE,
-            ROOT_WINDOW,
-            ROOT_WINDOW,
-            SCREEN_WIDTH,
-            SCREEN_HEIGHT,
-        ),
-        "unaffected root selector keeps its literal stream"
-    );
-    assert_resize_receive_calls(&allowed_calls.lock().unwrap());
-    assert_resize_receive_calls(&parent_calls.lock().unwrap());
-    assert_resize_receive_calls(&overlay_calls.lock().unwrap());
 }
 
-// mutation: leave R2 unchecked
+// mutation: leave R2 unchecked (C03)
 #[test]
 fn receive_screen_resize_root_denial() {
-    let mut allowed = resize_fixture();
-    let allowed_calls = allowed.install_policy(|_, _| Decision::Allow);
-    assert!(matches!(resize(&mut allowed), RequestOutcome::Handled));
-    assert_resized(&allowed);
-    assert!(
-        allowed.drain(NOTIFY_SENDER).is_empty(),
-        "void request has no reply or error"
+    run_screen_resize_receive_case(
+        "screen resize denies the independent root selector copy",
+        NOTIFY_RECEIVER_ALLOWED,
+        EventSubject::Window(ROOT_WINDOW),
+        false,
     );
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_configure_notify(
-            ClientByteOrder::LittleEndian,
-            ROOT_SEQUENCE,
-            ROOT_WINDOW,
-            ROOT_WINDOW,
-            SCREEN_WIDTH,
-            SCREEN_HEIGHT,
-        ),
-        "allow control root stream"
-    );
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_DENIED),
-        [
-            literal_configure_notify(
-                ClientByteOrder::BigEndian,
-                DUAL_SEQUENCE,
-                COMPOSITE_OVERLAY_WINDOW,
-                COMPOSITE_OVERLAY_WINDOW,
-                SCREEN_WIDTH,
-                SCREEN_HEIGHT,
-            )
-            .as_slice(),
-            literal_configure_notify(
-                ClientByteOrder::BigEndian,
-                DUAL_SEQUENCE,
-                ROOT_WINDOW,
-                COMPOSITE_OVERLAY_WINDOW,
-                SCREEN_WIDTH,
-                SCREEN_HEIGHT,
-            )
-            .as_slice(),
-            literal_present_configure_notify(
-                ClientByteOrder::BigEndian,
-                DUAL_SEQUENCE,
-                COMPOSITE_OVERLAY_WINDOW,
-            )
-            .as_slice(),
-            literal_screen_change_notify(
-                ClientByteOrder::BigEndian,
-                DUAL_SEQUENCE,
-                COMPOSITE_OVERLAY_WINDOW,
-            )
-            .as_slice(),
-        ]
-        .concat(),
-        "allow control dual core and extension streams"
-    );
-
-    let mut denied = resize_fixture();
-    let calls = denied.install_policy(|_, call| {
-        if call.hook == ExtensionHook::Receive
-            && call.client == NOTIFY_RECEIVER_ALLOWED
-            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
-            && call.events == Some(vec![EventDescription::core(22)])
-        {
-            Decision::Deny(DENY)
-        } else {
-            Decision::Allow
-        }
-    });
-    assert!(matches!(resize(&mut denied), RequestOutcome::Handled));
-    assert_resized(&denied);
-    assert!(
-        denied.drain(NOTIFY_SENDER).is_empty(),
-        "void request has no reply or error"
-    );
-    assert!(
-        denied.drain(NOTIFY_RECEIVER_ALLOWED).is_empty(),
-        "denied root StructureNotify copy is absent"
-    );
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_DENIED),
-        [
-            literal_configure_notify(
-                ClientByteOrder::BigEndian,
-                DUAL_SEQUENCE,
-                COMPOSITE_OVERLAY_WINDOW,
-                COMPOSITE_OVERLAY_WINDOW,
-                SCREEN_WIDTH,
-                SCREEN_HEIGHT,
-            )
-            .as_slice(),
-            literal_configure_notify(
-                ClientByteOrder::BigEndian,
-                DUAL_SEQUENCE,
-                ROOT_WINDOW,
-                COMPOSITE_OVERLAY_WINDOW,
-                SCREEN_WIDTH,
-                SCREEN_HEIGHT,
-            )
-            .as_slice(),
-            literal_present_configure_notify(
-                ClientByteOrder::BigEndian,
-                DUAL_SEQUENCE,
-                COMPOSITE_OVERLAY_WINDOW,
-            )
-            .as_slice(),
-            literal_screen_change_notify(
-                ClientByteOrder::BigEndian,
-                DUAL_SEQUENCE,
-                COMPOSITE_OVERLAY_WINDOW,
-            )
-            .as_slice(),
-        ]
-        .concat(),
-        "COW and extension recipients remain unaffected"
-    );
-    assert_resize_receive_calls(&allowed_calls.lock().unwrap());
-    assert_resize_receive_calls(&calls.lock().unwrap());
 }
 
-// mutation: leave R1 unchecked
+// mutation: leave R1 unchecked (C04)
 #[test]
 fn receive_root_config_notify_denial() {
-    let mut allowed = monitor_fixture();
-    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
-    let allowed_name = allowed.state.atoms.intern("PR4C_CONFIGURE_NOTIFY", false).0;
-    assert!(matches!(
-        monitor_request(&mut allowed),
-        RequestOutcome::Handled
-    ));
-    assert_eq!(
-        allowed.state.randr_client_monitors.len(),
-        1,
-        "SetMonitor took effect"
-    );
-    assert_eq!(
-        allowed.state.randr_client_monitors[0].name, allowed_name,
-        "SetMonitor stores the requested monitor name"
-    );
-    assert!(crate::core_loop::client_io::failed_writers(&allowed.state.clients).is_empty());
-    assert!(
-        allowed.drain(NOTIFY_SENDER).is_empty(),
-        "void request has no reply"
-    );
-    let allowed_frame = literal_configure_notify(
-        ClientByteOrder::LittleEndian,
-        ROOT_SEQUENCE,
-        ROOT_WINDOW,
-        ROOT_WINDOW,
-        800,
-        600,
-    );
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
-        allowed_frame,
-        "allow control selected root stream"
-    );
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_DENIED),
-        literal_configure_notify(
-            ClientByteOrder::BigEndian,
-            DUAL_SEQUENCE,
-            ROOT_WINDOW,
-            ROOT_WINDOW,
-            800,
-            600,
-        ),
-        "allow control big-endian root stream"
-    );
-    let mut denied = monitor_fixture();
-    let denied_name = denied.state.atoms.intern("PR4C_CONFIGURE_NOTIFY", false).0;
-    let calls = denied.install_policy(|_, call| {
-        if call.hook == ExtensionHook::Receive
-            && call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
-            && call.events == Some(vec![EventDescription::core(22)])
-            && call.request == request_opcodes(128, yserver_protocol::x11::randr::RR_SET_MONITOR)
-        {
-            Decision::Deny(DENY)
-        } else {
-            Decision::Allow
-        }
+    let build = || (monitor_fixture(), ());
+    let act = |fixture: &mut NotifyFixture, _: &()| {
+        let expected_name = fixture.state.atoms.intern("PR4C_CONFIGURE_NOTIFY", false).0;
+        assert!(matches!(monitor_request(fixture), RequestOutcome::Handled));
+        assert_eq!(fixture.state.randr_client_monitors.len(), 1);
+        assert_eq!(fixture.state.randr_client_monitors[0].name, expected_name);
+        assert!(fixture.drain(NOTIFY_SENDER).is_empty());
+        assert!(crate::core_loop::client_io::failed_writers(&fixture.state.clients).is_empty());
+    };
+    let expect = |_: &()| {
+        let request = request_opcodes(128, yserver_protocol::x11::randr::RR_SET_MONITOR);
+        let receive = |client| ExpectedReceive {
+            client,
+            request,
+            subject: EventSubject::Window(ROOT_WINDOW),
+            events: vec![EventDescription::core(22)],
+        };
+        let denied = receive(NOTIFY_RECEIVER_DENIED);
+        let mut expectation = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: literal_configure_notify(
+                        ClientByteOrder::BigEndian,
+                        DUAL_SEQUENCE,
+                        ROOT_WINDOW,
+                        ROOT_WINDOW,
+                        800,
+                        600,
+                    ),
+                    denied: Some(Vec::new()),
+                },
+                Stream::unchanged(
+                    NOTIFY_RECEIVER_ALLOWED,
+                    literal_configure_notify(
+                        ClientByteOrder::LittleEndian,
+                        ROOT_SEQUENCE,
+                        ROOT_WINDOW,
+                        ROOT_WINDOW,
+                        800,
+                        600,
+                    ),
+                ),
+            ],
+            vec![denied.clone(), receive(NOTIFY_RECEIVER_ALLOWED)],
+            CallOrder::Multiset,
+            vec![denied],
+        );
+        expectation.deny_before_allow = true;
+        expectation
+    };
+    check_receive_case(&ReceiveCase {
+        name: "RRSetMonitor root ConfigureNotify denial",
+        build: &build,
+        act: &act,
+        expect: &expect,
     });
-    assert!(matches!(
-        monitor_request(&mut denied),
-        RequestOutcome::Handled
-    ));
-    assert_eq!(
-        denied.state.randr_client_monitors.len(),
-        1,
-        "SetMonitor took effect"
-    );
-    assert_eq!(
-        denied.state.randr_client_monitors[0].name, denied_name,
-        "SetMonitor stores the requested monitor name"
-    );
-    assert!(crate::core_loop::client_io::failed_writers(&denied.state.clients).is_empty());
-    assert!(
-        denied.drain(NOTIFY_SENDER).is_empty(),
-        "void request has no reply or error"
-    );
-    assert!(
-        denied.drain(NOTIFY_RECEIVER_DENIED).is_empty(),
-        "denied root selector receives no ConfigureNotify"
-    );
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_ALLOWED),
-        allowed_frame,
-        "other root selector equals its literal baseline"
-    );
-    assert_root_notify_receive_calls(
-        &allow_calls.lock().unwrap(),
-        yserver_protocol::x11::randr::RR_SET_MONITOR,
-    );
-    assert_root_notify_receive_calls(
-        &calls.lock().unwrap(),
-        yserver_protocol::x11::randr::RR_SET_MONITOR,
-    );
 }
 
 const CROSS_PARENT: ResourceId = ResourceId(0x0051_0010);
@@ -1231,7 +879,8 @@ fn assert_core_receive_calls(
     assert!(calls.iter().all(|call| call.hook != ExtensionHook::Send));
 }
 
-// mutation: reverse C2's chain order
+// Kept focused: this case checkpoints explicit crossings, GrabPointer, and UngrabPointer streams.
+// mutation: reverse C2's chain order (C05)
 #[test]
 fn receive_core_crossing_baseline_frames() {
     let (mut fixture, xid_map) = core_crossing_fixture();
@@ -1423,68 +1072,70 @@ fn literal_explicit_crossings(
     }
 }
 
-// mutation: leave C1 unchecked
+// mutation: leave C1 unchecked (C06)
 #[test]
 fn receive_core_crossing_chain_denies_one_window() {
-    let (mut allowed, xid_map) = core_crossing_fixture();
-    let allowed_calls = allowed.install_policy(|_, _| Decision::Allow);
-    run_explicit_parent_child_crossings(&mut allowed, &xid_map);
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_DENIED),
-        literal_explicit_crossings(ClientByteOrder::BigEndian, DUAL_SEQUENCE, true),
-        "allow control denial-recipient baseline"
-    );
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_explicit_crossings(ClientByteOrder::LittleEndian, ROOT_SEQUENCE, true),
-        "allow control other-recipient baseline"
-    );
-    assert_eq!(allowed.state.master_sprite_root, (CROSS_X, CROSS_Y));
-    assert_core_receive_calls(
-        &allowed_calls.lock().unwrap(),
-        &[
-            (NOTIFY_RECEIVER_DENIED, CROSS_PARENT, 8, None),
-            (NOTIFY_RECEIVER_ALLOWED, CROSS_PARENT, 8, None),
-            (NOTIFY_RECEIVER_DENIED, CROSS_CHILD, 7, None),
-            (NOTIFY_RECEIVER_ALLOWED, CROSS_CHILD, 7, None),
-        ],
-    );
-
-    let (mut denied, xid_map) = core_crossing_fixture();
-    let calls = denied.install_policy(|_, call| {
-        if call.hook == ExtensionHook::Receive
-            && call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Window(CROSS_CHILD))
-            && call.events == Some(vec![EventDescription::core(7)])
-        {
-            Decision::Deny(DENY)
-        } else {
-            Decision::Allow
-        }
+    let build = || {
+        let (fixture, xid_map) = core_crossing_fixture();
+        (fixture, xid_map)
+    };
+    let act = |fixture: &mut NotifyFixture, xid_map: &HostXidMap| {
+        run_explicit_parent_child_crossings(fixture, xid_map);
+        assert_eq!(fixture.state.master_sprite_root, (CROSS_X, CROSS_Y));
+        assert_eq!(fixture.state.pointer_root, (CROSS_X, CROSS_Y));
+        assert_no_writer_failures(fixture);
+    };
+    let expect = |_: &HostXidMap| {
+        let parent_leave = |client| ExpectedReceive {
+            client,
+            request: None,
+            subject: EventSubject::Window(CROSS_PARENT),
+            events: vec![EventDescription::core(8)],
+        };
+        let child_enter = |client| ExpectedReceive {
+            client,
+            request: None,
+            subject: EventSubject::Window(CROSS_CHILD),
+            events: vec![EventDescription::core(7)],
+        };
+        let denied_enter = child_enter(NOTIFY_RECEIVER_DENIED);
+        CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: literal_explicit_crossings(
+                        ClientByteOrder::BigEndian,
+                        DUAL_SEQUENCE,
+                        true,
+                    ),
+                    denied: Some(literal_explicit_crossings(
+                        ClientByteOrder::BigEndian,
+                        DUAL_SEQUENCE,
+                        false,
+                    )),
+                },
+                Stream::unchanged(
+                    NOTIFY_RECEIVER_ALLOWED,
+                    literal_explicit_crossings(ClientByteOrder::LittleEndian, ROOT_SEQUENCE, true),
+                ),
+            ],
+            vec![
+                parent_leave(NOTIFY_RECEIVER_DENIED),
+                parent_leave(NOTIFY_RECEIVER_ALLOWED),
+                denied_enter.clone(),
+                child_enter(NOTIFY_RECEIVER_ALLOWED),
+            ],
+            CallOrder::Multiset,
+            vec![denied_enter],
+        )
+    };
+    check_receive_case(&ReceiveCase {
+        name: "core crossing denies only the child Enter copy",
+        build: &build,
+        act: &act,
+        expect: &expect,
     });
-    run_explicit_parent_child_crossings(&mut denied, &xid_map);
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_DENIED),
-        literal_explicit_crossings(ClientByteOrder::BigEndian, DUAL_SEQUENCE, false),
-        "denying child Enter keeps parent Leave and unchecked motion"
-    );
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_explicit_crossings(ClientByteOrder::LittleEndian, ROOT_SEQUENCE, true),
-        "other recipient keeps every literal event"
-    );
-    assert_eq!(denied.state.master_sprite_root, (CROSS_X, CROSS_Y));
-    assert_eq!(denied.state.pointer_root, (CROSS_X, CROSS_Y));
-    assert_core_receive_calls(
-        &calls.lock().unwrap(),
-        &[
-            (NOTIFY_RECEIVER_DENIED, CROSS_PARENT, 8, None),
-            (NOTIFY_RECEIVER_ALLOWED, CROSS_PARENT, 8, None),
-            (NOTIFY_RECEIVER_DENIED, CROSS_CHILD, 7, None),
-            (NOTIFY_RECEIVER_ALLOWED, CROSS_CHILD, 7, None),
-        ],
-    );
-    assert_no_writer_failures(&denied);
 }
 
 fn activate_parent_grab(
@@ -1553,7 +1204,8 @@ fn activate_parent_grab(
     assert_no_writer_failures(fixture);
 }
 
-// mutation: check the grab window instead of the crossing window
+// Kept focused: owner routing and the button event continue on one active-grab fixture.
+// mutation: check the grab window instead of the crossing window (C07)
 #[test]
 fn receive_core_grabbed_crossing_owner_denied() {
     let (mut allowed, allowed_xid_map) = core_crossing_fixture();
@@ -1711,165 +1363,148 @@ fn receive_core_grabbed_crossing_owner_denied() {
     assert_no_writer_failures(&denied);
 }
 
-// mutation: leave C2 unchecked
+fn assert_pointer_grabs_equal(
+    left: Option<crate::server::ActivePointerGrab>,
+    right: Option<crate::server::ActivePointerGrab>,
+) {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            assert_eq!(left.owner, right.owner);
+            assert_eq!(left.grab_window, right.grab_window);
+            assert_eq!(left.event_mask, right.event_mask);
+            assert_eq!(left.cursor, right.cursor);
+            assert_eq!(left.time, right.time);
+            assert_eq!(left.owner_events, right.owner_events);
+            assert_eq!(left.via_xi2, right.via_xi2);
+            assert_eq!(left.implicit, right.implicit);
+            assert_eq!(left.passive, right.passive);
+            assert_eq!(left.xi2_mask, right.xi2_mask);
+        }
+        (None, None) => {}
+        _ => panic!("active pointer grab presence differs"),
+    }
+}
+
+// mutation: leave C2 unchecked (C08)
 #[test]
 fn receive_core_grab_chain_denial() {
-    let mut allowed = core_crossing_fixture().0;
-    let allowed_calls = allowed.install_policy(|_, _| Decision::Allow);
-    allowed.state.pointer_root = (CROSS_X, CROSS_Y);
-    allowed.state.master_sprite_root = (CROSS_X, CROSS_Y);
-    assert!(matches!(
-        grab_pointer(
-            &mut allowed,
-            NOTIFY_SENDER,
-            false,
-            CROSS_PARENT,
-            0,
-            GRAB_SEQUENCE,
-        ),
-        RequestOutcome::Handled
-    ));
-    assert_eq!(
-        allowed.drain(NOTIFY_SENDER),
-        literal_grab_reply(ClientByteOrder::LittleEndian, GRAB_SEQUENCE, 0)
-    );
-    for (client, order, sequence) in [
-        (
-            NOTIFY_RECEIVER_DENIED,
-            ClientByteOrder::BigEndian,
-            DUAL_SEQUENCE,
-        ),
-        (
-            NOTIFY_RECEIVER_ALLOWED,
-            ClientByteOrder::LittleEndian,
-            ROOT_SEQUENCE,
-        ),
-    ] {
+    let build = || {
+        let mut fixture = core_crossing_fixture().0;
+        fixture.state.pointer_root = (CROSS_X, CROSS_Y);
+        fixture.state.master_sprite_root = (CROSS_X, CROSS_Y);
+        (fixture, ())
+    };
+    let act = |fixture: &mut NotifyFixture, _: &()| {
+        assert!(matches!(
+            grab_pointer(
+                fixture,
+                NOTIFY_SENDER,
+                false,
+                CROSS_PARENT,
+                0,
+                GRAB_SEQUENCE,
+            ),
+            RequestOutcome::Handled
+        ));
         assert_eq!(
-            allowed.drain(client),
-            grab_chain_child_to_parent(order, sequence, 1),
-            "allow-control NotifyGrab stream"
+            fixture
+                .state
+                .active_pointer_grab
+                .map(|grab| grab.grab_window),
+            Some(CROSS_PARENT),
+            "denying a grab crossing does not change the active grab"
         );
-    }
-    assert!(allowed.state.active_pointer_grab.is_some());
-    assert_core_receive_calls(
-        &allowed_calls.lock().unwrap(),
-        &[
-            (
-                NOTIFY_RECEIVER_DENIED,
-                CROSS_CHILD,
-                8,
-                request_opcodes(26, 0),
-            ),
-            (
-                NOTIFY_RECEIVER_ALLOWED,
-                CROSS_CHILD,
-                8,
-                request_opcodes(26, 0),
-            ),
-            (
-                NOTIFY_RECEIVER_DENIED,
-                CROSS_PARENT,
-                7,
-                request_opcodes(26, 0),
-            ),
-            (
-                NOTIFY_RECEIVER_ALLOWED,
-                CROSS_PARENT,
-                7,
-                request_opcodes(26, 0),
-            ),
-        ],
-    );
-
-    let (mut denied, _) = core_crossing_fixture();
-    let calls = denied.install_policy(|_, call| {
-        if call.hook == ExtensionHook::Receive
-            && call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Window(CROSS_CHILD))
-            && call.events == Some(vec![EventDescription::core(8)])
-        {
-            Decision::Deny(DENY)
-        } else {
-            Decision::Allow
-        }
+        assert_eq!(
+            fixture.drain(NOTIFY_SENDER),
+            literal_grab_reply(ClientByteOrder::LittleEndian, GRAB_SEQUENCE, 0),
+            "Receive denial does not change GrabPointer's Success reply"
+        );
+        assert_no_writer_failures(fixture);
+    };
+    let expect = |_: &()| {
+        let request = request_opcodes(26, 0);
+        let child_leave = |client| ExpectedReceive {
+            client,
+            request,
+            subject: EventSubject::Window(CROSS_CHILD),
+            events: vec![EventDescription::core(8)],
+        };
+        let parent_enter = |client| ExpectedReceive {
+            client,
+            request,
+            subject: EventSubject::Window(CROSS_PARENT),
+            events: vec![EventDescription::core(7)],
+        };
+        let denied_leave = child_leave(NOTIFY_RECEIVER_DENIED);
+        let mut expectation = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: grab_chain_child_to_parent(ClientByteOrder::BigEndian, DUAL_SEQUENCE, 1),
+                    denied: Some(literal_core_crossing(
+                        ClientByteOrder::BigEndian,
+                        7,
+                        2,
+                        DUAL_SEQUENCE,
+                        0,
+                        CROSS_PARENT,
+                        ResourceId(0),
+                        CROSS_X,
+                        CROSS_Y,
+                        15,
+                        10,
+                        1,
+                        true,
+                    )),
+                },
+                Stream::unchanged(
+                    NOTIFY_RECEIVER_ALLOWED,
+                    grab_chain_child_to_parent(ClientByteOrder::LittleEndian, ROOT_SEQUENCE, 1),
+                ),
+            ],
+            vec![
+                child_leave(NOTIFY_RECEIVER_DENIED),
+                child_leave(NOTIFY_RECEIVER_ALLOWED),
+                parent_enter(NOTIFY_RECEIVER_DENIED),
+                parent_enter(NOTIFY_RECEIVER_ALLOWED),
+            ],
+            CallOrder::Multiset,
+            vec![denied_leave],
+        );
+        expectation.after_deny = Some(Box::new(|allow, denied| {
+            assert_pointer_grabs_equal(
+                denied.state.active_pointer_grab,
+                allow.state.active_pointer_grab,
+            );
+            assert_pointer_grabs_equal(
+                denied.state.active_pointer_grab,
+                Some(crate::server::ActivePointerGrab {
+                    owner: NOTIFY_SENDER,
+                    grab_window: CROSS_PARENT,
+                    event_mask: 0,
+                    cursor: ResourceId(0),
+                    time: 0,
+                    owner_events: false,
+                    via_xi2: false,
+                    implicit: false,
+                    passive: false,
+                    xi2_mask: 0,
+                }),
+            );
+            assert!(
+                denied.state.active_pointer_grab.is_some(),
+                "active pointer grab remains established"
+            );
+        }));
+        expectation
+    };
+    check_receive_case(&ReceiveCase {
+        name: "GrabPointer chain drops only the denied child Leave",
+        build: &build,
+        act: &act,
+        expect: &expect,
     });
-    denied.state.pointer_root = (CROSS_X, CROSS_Y);
-    denied.state.master_sprite_root = (CROSS_X, CROSS_Y);
-    assert!(matches!(
-        grab_pointer(
-            &mut denied,
-            NOTIFY_SENDER,
-            false,
-            CROSS_PARENT,
-            0,
-            GRAB_SEQUENCE,
-        ),
-        RequestOutcome::Handled
-    ));
-    assert_eq!(
-        denied.drain(NOTIFY_SENDER),
-        literal_grab_reply(ClientByteOrder::LittleEndian, GRAB_SEQUENCE, 0),
-        "denied chain copy does not affect GrabPointer's Success reply"
-    );
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_DENIED),
-        literal_core_crossing(
-            ClientByteOrder::BigEndian,
-            7,
-            2,
-            DUAL_SEQUENCE,
-            0,
-            CROSS_PARENT,
-            ResourceId(0),
-            CROSS_X,
-            CROSS_Y,
-            15,
-            10,
-            1,
-            true,
-        ),
-        "denying child Leave keeps the later parent Enter"
-    );
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_ALLOWED),
-        grab_chain_child_to_parent(ClientByteOrder::LittleEndian, ROOT_SEQUENCE, 1),
-        "other selectors keep the full literal chain"
-    );
-    assert!(
-        denied.state.active_pointer_grab.is_some(),
-        "grab remains active"
-    );
-    assert_core_receive_calls(
-        &calls.lock().unwrap(),
-        &[
-            (
-                NOTIFY_RECEIVER_DENIED,
-                CROSS_CHILD,
-                8,
-                request_opcodes(26, 0),
-            ),
-            (
-                NOTIFY_RECEIVER_ALLOWED,
-                CROSS_CHILD,
-                8,
-                request_opcodes(26, 0),
-            ),
-            (
-                NOTIFY_RECEIVER_DENIED,
-                CROSS_PARENT,
-                7,
-                request_opcodes(26, 0),
-            ),
-            (
-                NOTIFY_RECEIVER_ALLOWED,
-                CROSS_PARENT,
-                7,
-                request_opcodes(26, 0),
-            ),
-        ],
-    );
-    assert_no_writer_failures(&denied);
 }
 
 fn literal_xi2_device_press(
@@ -2596,9 +2231,10 @@ fn assert_xi_grab_device_baseline(deviceid: u16) {
     assert_no_writer_failures(&fixture);
 }
 
-// mutation: drop the focus flag from the XI2 crossing encoder call
-// mutation: swap the high and low bytes of a client sequence number
-// mutation: skip keyboard FocusOut when re-grabbing another window
+// Kept focused: byte order, sequence numbers, pointer/keyboard grabs, and ungrabs are checkpointed across requests.
+// mutation: drop the focus flag from the XI2 crossing encoder call (C09)
+// mutation: swap the high and low bytes of a client sequence number (C10)
+// mutation: skip keyboard FocusOut when re-grabbing another window (C11)
 #[test]
 fn receive_xi2_crossing_baseline_frames() {
     let (mut fixture, xid_map) = xi2_crossing_fixture();
@@ -2699,10 +2335,10 @@ fn receive_xi2_crossing_baseline_frames() {
     assert_xi_grab_device_baseline(crate::xinput::DEVICEID_MASTER_KEYBOARD);
 }
 
-// mutation: when the dual selector's XI2 copy is denied, deliver its core copy
+// mutation: when the dual selector's XI2 copy is denied, deliver its core copy (C12)
 #[test]
 fn receive_xi2_crossing_denial_keeps_core_dedup() {
-    let make_fixture = || {
+    let build = || {
         let (mut fixture, xid_map) = core_crossing_fixture();
         fixture
             .state
@@ -2732,7 +2368,7 @@ fn receive_xi2_crossing_denial_keeps_core_dedup() {
         }
         (fixture, xid_map)
     };
-    let run_enter_and_motion = |fixture: &mut NotifyFixture, xid_map: &HostXidMap| {
+    let act = |fixture: &mut NotifyFixture, xid_map: &HostXidMap| {
         feed_core_pointer_event(
             fixture,
             xid_map,
@@ -2758,103 +2394,84 @@ fn receive_xi2_crossing_denial_keeps_core_dedup() {
             ),
         );
         assert_eq!(fixture.state.master_sprite_root, (CROSS_X, CROSS_Y));
+        assert_eq!(fixture.state.pointer_root, (CROSS_X, CROSS_Y));
+        assert_no_writer_failures(fixture);
     };
-    let expected = literal_xi2_crossing(
-        ClientByteOrder::LittleEndian,
-        ROOT_SEQUENCE,
-        7,
-        2,
-        0x2468,
-        4,
-        0,
-        0,
-        CROSS_CHILD,
-        CROSS_X,
-        CROSS_Y,
-        5,
-        5,
-        true,
-    );
-    let (mut allowed, allowed_xid_map) = make_fixture();
-    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
-    run_enter_and_motion(&mut allowed, &allowed_xid_map);
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_DENIED),
-        literal_xi2_crossing(
-            ClientByteOrder::BigEndian,
-            DUAL_SEQUENCE,
-            7,
-            2,
-            0x2468,
-            4,
-            0,
-            0,
-            CROSS_CHILD,
-            CROSS_X,
-            CROSS_Y,
-            5,
-            5,
-            true,
-        ),
-        "allow-control dual selector receives XI2 and keeps its core copy shadowed"
-    );
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
-        expected,
-        "XI2-only selector receives the literal Enter"
-    );
-    let (mut denied, xid_map) = make_fixture();
-    let calls = denied.install_policy(|_, call| {
-        if call.hook == ExtensionHook::Receive
-            && call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Window(CROSS_CHILD))
-            && call.events == Some(vec![EventDescription::extension(35, 137, 7)])
-        {
-            Decision::Deny(DENY)
-        } else {
-            Decision::Allow
-        }
+    let expect = |_: &HostXidMap| {
+        let receive = |client| ExpectedReceive {
+            client,
+            request: None,
+            subject: EventSubject::Window(CROSS_CHILD),
+            events: vec![EventDescription::extension(35, 137, 7)],
+        };
+        let denied = receive(NOTIFY_RECEIVER_DENIED);
+        let mut expectation = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: literal_xi2_crossing(
+                        ClientByteOrder::BigEndian,
+                        DUAL_SEQUENCE,
+                        7,
+                        2,
+                        0x2468,
+                        4,
+                        0,
+                        0,
+                        CROSS_CHILD,
+                        CROSS_X,
+                        CROSS_Y,
+                        5,
+                        5,
+                        true,
+                    ),
+                    denied: Some(Vec::new()),
+                },
+                Stream::unchanged(
+                    NOTIFY_RECEIVER_ALLOWED,
+                    literal_xi2_crossing(
+                        ClientByteOrder::LittleEndian,
+                        ROOT_SEQUENCE,
+                        7,
+                        2,
+                        0x2468,
+                        4,
+                        0,
+                        0,
+                        CROSS_CHILD,
+                        CROSS_X,
+                        CROSS_Y,
+                        5,
+                        5,
+                        true,
+                    ),
+                ),
+            ],
+            vec![denied.clone(), receive(NOTIFY_RECEIVER_ALLOWED)],
+            CallOrder::Multiset,
+            vec![denied],
+        );
+        expectation.deny_before_allow = true;
+        expectation.after_deny = Some(Box::new(|allow, denied| {
+            assert_eq!(
+                denied.state.master_sprite_root,
+                allow.state.master_sprite_root
+            );
+            assert_eq!(denied.state.pointer_root, allow.state.pointer_root);
+        }));
+        expectation
+    };
+    check_receive_case(&ReceiveCase {
+        name: "denying XI2 Enter keeps the shadowed core Enter suppressed",
+        build: &build,
+        act: &act,
+        expect: &expect,
     });
-    run_enter_and_motion(&mut denied, &xid_map);
-    assert!(
-        denied.drain(NOTIFY_RECEIVER_DENIED).is_empty(),
-        "denying the XI2 Enter does not reveal the shadowed core Enter"
-    );
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_ALLOWED),
-        expected,
-        "other XI2 selector keeps its literal Enter"
-    );
-    assert_eq!(
-        denied.state.master_sprite_root,
-        allowed.state.master_sprite_root
-    );
-    assert_xi2_receive_calls(
-        &calls.lock().unwrap(),
-        &[
-            (NOTIFY_RECEIVER_DENIED, CROSS_CHILD, 7, None),
-            (NOTIFY_RECEIVER_ALLOWED, CROSS_CHILD, 7, None),
-        ],
-    );
-    assert!(
-        calls.lock().unwrap().iter().all(|call| {
-            call.hook != ExtensionHook::Receive
-                || call.events != Some(vec![EventDescription::core(7)])
-        }),
-        "the shadowed core copy has no Receive call"
-    );
-    assert!(denied.drain(NOTIFY_SENDER).is_empty());
-    assert_xi2_receive_calls(
-        &allow_calls.lock().unwrap(),
-        &[
-            (NOTIFY_RECEIVER_DENIED, CROSS_CHILD, 7, None),
-            (NOTIFY_RECEIVER_ALLOWED, CROSS_CHILD, 7, None),
-        ],
-    );
-    assert_no_writer_failures(&denied);
 }
 
-// mutation: leave C4 unchecked
+// Kept focused: this case checks grab reply, active state, and both crossing streams before ungrab.
+// mutation: leave C4 unchecked (C13)
 #[test]
 fn receive_xi2_grab_chain_denial() {
     let make_fixture = || {
@@ -3080,9 +2697,10 @@ fn receive_xi2_grab_chain_denial() {
     assert_no_writer_failures(&denied);
 }
 
-// mutation: leave the ungrab site (553) unchecked
-// mutation: omit keyboard FocusOut when re-grabbing another window
-// mutation: suppress a selected XI2 button/key event during an active grab
+// mutation: leave the XIUngrabDevice site unchecked (C14)
+// mutation: omit keyboard FocusOut when re-grabbing another window (C15)
+// mutation: suppress a selected XI2 button/key event during an active grab (C16)
+// Focused multi-request scenario: keeps activation, re-grab, input, and ungrab checkpoints.
 #[test]
 fn receive_xi_grab_device_synthetic_denial() {
     let run_case = |deviceid: u16| {
@@ -3461,7 +3079,8 @@ fn receive_xi_grab_device_synthetic_denial() {
     run_case(crate::xinput::DEVICEID_MASTER_KEYBOARD);
 }
 
-// mutation: check every kind in C1's writer
+// Kept focused: this is the explicit no-Receive assertion for cooked core ButtonPress.
+// mutation: check every kind in C1's writer (C17)
 #[test]
 fn receive_core_cooked_pointer_unchecked() {
     let (mut fixture, xid_map) = core_crossing_fixture();
@@ -3874,9 +3493,10 @@ fn xi1_focus_descriptions(has_key_continuation: bool) -> Vec<EventDescription> {
     descriptions
 }
 
-// mutation: emit the state batch before DeviceFocusIn
-// mutation: omit the XI2 FocusOut frame
-// mutation: omit the XI1 DeviceFocusOut frame
+// Kept focused: core SetInputFocus and XI1 keyboard/pointer SetDeviceFocus retain separate request checkpoints.
+// mutation: emit the state batch before DeviceFocusIn (C18)
+// mutation: omit the XI2 FocusOut frame (C19)
+// mutation: omit the XI1 DeviceFocusOut frame (C20)
 #[test]
 fn receive_focus_baseline_frames() {
     let (mut fixture, pointer) = focus_notify_fixture();
@@ -3974,273 +3594,341 @@ fn receive_focus_baseline_frames() {
     assert_no_writer_failures(&fixture);
 }
 
-// mutation: leave F1 unchecked
+// mutation: leave F1 unchecked (C21)
 #[test]
 fn receive_xi2_focus_denial() {
-    let (mut allowed, _) = focus_notify_fixture();
-    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
-    assert!(matches!(
-        request_core_focus(&mut allowed),
-        RequestOutcome::Handled
-    ));
-    for (client, order, sequence) in [
-        (
-            NOTIFY_RECEIVER_DENIED,
-            ClientByteOrder::BigEndian,
-            FOCUS_XI_SEQUENCE,
-        ),
-        (
-            NOTIFY_RECEIVER_ALLOWED,
-            ClientByteOrder::LittleEndian,
-            FOCUS_OTHER_SEQUENCE,
-        ),
-    ] {
-        assert_eq!(
-            allowed.drain(client),
-            [
-                literal_core_focus_out_pointer(order, sequence),
-                literal_core_focus_in(order, sequence),
-                literal_xi2_focus_in(order, sequence),
-            ]
-            .concat(),
-            "allow-control core and XI2 FocusIn stream"
+    let build = || focus_notify_fixture();
+    let act = |fixture: &mut NotifyFixture, _: &u16| {
+        assert!(matches!(
+            request_core_focus(fixture),
+            RequestOutcome::Handled
+        ));
+        assert_eq!(fixture.state.core_focus.raw, FOCUS_WINDOW.0);
+        assert!(fixture.drain(NOTIFY_SENDER).is_empty());
+        assert_no_writer_failures(fixture);
+    };
+    let expect = |_: &u16| {
+        let core_out = |client| ExpectedReceive {
+            client,
+            request: request_opcodes(42, 0),
+            subject: EventSubject::Window(FOCUS_WINDOW),
+            events: vec![EventDescription::core(10)],
+        };
+        let core_in = |client| ExpectedReceive {
+            client,
+            request: request_opcodes(42, 0),
+            subject: EventSubject::Window(FOCUS_WINDOW),
+            events: vec![EventDescription::core(9)],
+        };
+        let xi_in = |client| ExpectedReceive {
+            client,
+            request: request_opcodes(42, 0),
+            subject: EventSubject::Window(FOCUS_WINDOW),
+            events: vec![EventDescription::extension(35, 137, XI_FOCUS_IN)],
+        };
+        let denied = xi_in(NOTIFY_RECEIVER_DENIED);
+        let mut expectation = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: [
+                        literal_core_focus_out_pointer(
+                            ClientByteOrder::BigEndian,
+                            FOCUS_XI_SEQUENCE,
+                        )
+                        .as_slice(),
+                        literal_core_focus_in(ClientByteOrder::BigEndian, FOCUS_XI_SEQUENCE)
+                            .as_slice(),
+                        literal_xi2_focus_in(ClientByteOrder::BigEndian, FOCUS_XI_SEQUENCE)
+                            .as_slice(),
+                    ]
+                    .concat(),
+                    denied: Some(
+                        [
+                            literal_core_focus_out_pointer(
+                                ClientByteOrder::BigEndian,
+                                FOCUS_XI_SEQUENCE,
+                            )
+                            .as_slice(),
+                            literal_core_focus_in(ClientByteOrder::BigEndian, FOCUS_XI_SEQUENCE)
+                                .as_slice(),
+                        ]
+                        .concat(),
+                    ),
+                },
+                Stream::unchanged(
+                    NOTIFY_RECEIVER_ALLOWED,
+                    [
+                        literal_core_focus_out_pointer(
+                            ClientByteOrder::LittleEndian,
+                            FOCUS_OTHER_SEQUENCE,
+                        )
+                        .as_slice(),
+                        literal_core_focus_in(ClientByteOrder::LittleEndian, FOCUS_OTHER_SEQUENCE)
+                            .as_slice(),
+                        literal_xi2_focus_in(ClientByteOrder::LittleEndian, FOCUS_OTHER_SEQUENCE)
+                            .as_slice(),
+                    ]
+                    .concat(),
+                ),
+            ],
+            vec![
+                core_out(NOTIFY_RECEIVER_DENIED),
+                core_in(NOTIFY_RECEIVER_DENIED),
+                denied.clone(),
+                core_out(NOTIFY_RECEIVER_ALLOWED),
+                core_in(NOTIFY_RECEIVER_ALLOWED),
+                xi_in(NOTIFY_RECEIVER_ALLOWED),
+            ],
+            CallOrder::PerClient,
+            vec![denied],
         );
-    }
-    assert_eq!(allowed.state.core_focus.raw, FOCUS_WINDOW.0);
-    assert!(
-        allowed.drain(NOTIFY_SENDER).is_empty(),
-        "SetInputFocus has no reply or error"
-    );
-    assert_no_writer_failures(&allowed);
-
-    let (mut denied, _) = focus_notify_fixture();
-    let calls = denied.install_policy(|_, call| {
-        if call.hook == ExtensionHook::Receive
-            && call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Window(FOCUS_WINDOW))
-            && call.events == Some(vec![EventDescription::extension(35, 137, XI_FOCUS_IN)])
-        {
-            Decision::Deny(DENY)
-        } else {
-            Decision::Allow
-        }
+        expectation.deny_before_allow = true;
+        expectation.after_deny = Some(Box::new(|allow, denied| {
+            assert_eq!(denied.state.core_focus.raw, allow.state.core_focus.raw);
+        }));
+        expectation
+    };
+    check_receive_case(&ReceiveCase {
+        name: "XI2 FocusIn denial preserves the core focus stream",
+        build: &build,
+        act: &act,
+        expect: &expect,
     });
-    assert!(matches!(
-        request_core_focus(&mut denied),
-        RequestOutcome::Handled
-    ));
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_DENIED),
-        [
-            literal_core_focus_out_pointer(ClientByteOrder::BigEndian, FOCUS_XI_SEQUENCE),
-            literal_core_focus_in(ClientByteOrder::BigEndian, FOCUS_XI_SEQUENCE),
-        ]
-        .concat(),
-        "denying XI2 FocusIn keeps the 4b core FocusOut and FocusIn copies"
-    );
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_ALLOWED),
-        [
-            literal_core_focus_out_pointer(ClientByteOrder::LittleEndian, FOCUS_OTHER_SEQUENCE),
-            literal_core_focus_in(ClientByteOrder::LittleEndian, FOCUS_OTHER_SEQUENCE),
-            literal_xi2_focus_in(ClientByteOrder::LittleEndian, FOCUS_OTHER_SEQUENCE),
-        ]
-        .concat(),
-        "other recipient keeps its literal core and XI2 FocusIn stream"
-    );
-    assert!(
-        denied.drain(NOTIFY_SENDER).is_empty(),
-        "SetInputFocus has no reply or error"
-    );
-    assert_eq!(
-        denied.state.core_focus.raw, FOCUS_WINDOW.0,
-        "focus transition continues"
-    );
-    let recorded = calls.lock().unwrap();
-    let rows = receive_calls(&recorded);
-    assert_eq!(
-        rows.len(),
-        6,
-        "two core focus events and XI2 FocusIn per recipient"
-    );
-    for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
-        let recipient_calls = rows
-            .iter()
-            .filter(|call| call.client == client)
-            .collect::<Vec<_>>();
-        let expected_events = [
-            vec![EventDescription::core(10)],
-            vec![EventDescription::core(9)],
-            vec![EventDescription::extension(35, 137, XI_FOCUS_IN)],
-        ];
-        assert_eq!(recipient_calls.len(), expected_events.len());
-        for (call, events) in recipient_calls.iter().zip(expected_events) {
-            assert_eq!(call.receive, Some(EventSubject::Window(FOCUS_WINDOW)));
-            assert_eq!(call.events, Some(events));
-            assert_eq!(call.request, request_opcodes(42, 0));
-        }
-    }
-    assert_eq!(receive_calls(&allow_calls.lock().unwrap()).len(), 6);
-    assert_no_writer_failures(&denied);
 }
 
-// mutation: describe only the lead DeviceStateNotify in F3
-// second mutation: check the batch once per event instead of once per recipient
-#[test]
-fn receive_xi1_focus_and_state_batches_independent() {
-    for is_keyboard in [true, false] {
-        let (mut seed, pointer) = focus_notify_fixture();
+fn run_xi1_focus_receive_case(is_keyboard: bool, deny_focus: bool, name: &'static str) {
+    let build = || focus_notify_fixture();
+    let act = |fixture: &mut NotifyFixture, pointer: &u16| {
         let device = if is_keyboard {
             crate::xinput::DEVICEID_XTEST_KEYBOARD
         } else {
-            pointer
+            *pointer
+        };
+        assert!(matches!(
+            request_xi1_device_focus(fixture, 61, device),
+            RequestOutcome::Handled
+        ));
+        assert_eq!(
+            crate::core_loop::xi1_focus::device_focus(&fixture.state, device).focus,
+            FOCUS_WINDOW.0,
+            "Receive denial does not prevent XI1 focus movement"
+        );
+        assert!(
+            fixture.drain(NOTIFY_SENDER).is_empty(),
+            "SetDeviceFocus is void"
+        );
+        assert_no_writer_failures(fixture);
+    };
+    let expect = |pointer: &u16| {
+        let device = if is_keyboard {
+            crate::xinput::DEVICEID_XTEST_KEYBOARD
+        } else {
+            *pointer
         };
         let descriptions = xi1_focus_descriptions(is_keyboard);
         let focus_description = descriptions[0];
         let state_batch = descriptions[1..].to_vec();
-        let sequence = 61;
-
-        let make_run = |deny_focus: bool| {
-            let (mut fixture, seeded_pointer) = focus_notify_fixture();
-            let device = if is_keyboard {
-                crate::xinput::DEVICEID_XTEST_KEYBOARD
-            } else {
-                seeded_pointer
-            };
-            let descriptions = xi1_focus_descriptions(is_keyboard);
-            let denied_events = if deny_focus {
-                vec![descriptions[0]]
-            } else {
-                descriptions[1..].to_vec()
-            };
-            let calls = fixture.install_policy(move |_, call| {
-                if call.hook == ExtensionHook::Receive
-                    && call.client == NOTIFY_RECEIVER_DENIED
-                    && call.receive == Some(EventSubject::Window(FOCUS_WINDOW))
-                    && call.events.as_ref() == Some(&denied_events)
-                {
-                    Decision::Deny(DENY)
-                } else {
-                    Decision::Allow
-                }
-            });
-            assert!(matches!(
-                request_xi1_device_focus(&mut fixture, sequence, device),
-                RequestOutcome::Handled
-            ));
-            assert_eq!(
-                crate::core_loop::xi1_focus::device_focus(&fixture.state, device).focus,
-                FOCUS_WINDOW.0,
-                "Receive denial does not prevent XI1 focus movement"
-            );
-            assert!(
-                fixture.drain(NOTIFY_SENDER).is_empty(),
-                "SetDeviceFocus is void"
-            );
-            let full_stream = literal_xi1_focus_and_state_chain(
-                ClientByteOrder::LittleEndian,
-                FOCUS_OTHER_SEQUENCE,
-                device,
-                is_keyboard,
-            );
-            let focus_stream =
-                literal_xi1_device_focus_in(ClientByteOrder::BigEndian, FOCUS_XI_SEQUENCE, device);
-            let state_stream = if is_keyboard {
-                literal_xi1_keyboard_state_chain(ClientByteOrder::BigEndian, FOCUS_XI_SEQUENCE)
-            } else {
-                literal_xi1_four_valuator_state_chain(
-                    ClientByteOrder::BigEndian,
-                    FOCUS_XI_SEQUENCE,
-                    device,
-                )
-            };
-            assert_eq!(
-                fixture.drain(NOTIFY_RECEIVER_ALLOWED),
-                full_stream,
-                "always-allowed subscriber equals the literal baseline"
-            );
-            assert_eq!(
-                fixture.drain(NOTIFY_RECEIVER_DENIED),
-                if deny_focus {
-                    state_stream
-                } else {
-                    focus_stream
-                },
-                "the un-denied XI1 event remains literal"
-            );
-            let rows = calls.lock().unwrap();
-            for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
-                let recipient_calls = receive_calls(&rows)
-                    .into_iter()
-                    .filter(|call| call.client == client)
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    recipient_calls.len(),
-                    2,
-                    "one focus and one state batch check"
-                );
-                assert_eq!(
-                    recipient_calls[0].receive,
-                    Some(EventSubject::Window(FOCUS_WINDOW))
-                );
-                assert_eq!(recipient_calls[0].events, Some(vec![focus_description]));
-                assert_eq!(
-                    recipient_calls[0].request,
-                    request_opcodes(137, 21),
-                    "Receive uses the triggering SetDeviceFocus request"
-                );
-                assert_eq!(
-                    recipient_calls[1].receive,
-                    Some(EventSubject::Window(FOCUS_WINDOW))
-                );
-                assert_eq!(recipient_calls[1].events, Some(state_batch.clone()));
-                assert_eq!(
-                    recipient_calls[1].request,
-                    request_opcodes(137, 21),
-                    "Receive uses the triggering SetDeviceFocus request"
-                );
-            }
-            drop(rows);
-            assert_no_writer_failures(&fixture);
-            calls
+        let focus = |client| ExpectedReceive {
+            client,
+            request: request_opcodes(137, 21),
+            subject: EventSubject::Window(FOCUS_WINDOW),
+            events: vec![focus_description],
         };
-
-        let allow_calls = seed.install_policy(|_, _| Decision::Allow);
-        assert!(matches!(
-            request_xi1_device_focus(&mut seed, sequence, device),
-            RequestOutcome::Handled
-        ));
-        assert_eq!(
-            crate::core_loop::xi1_focus::device_focus(&seed.state, device).focus,
-            FOCUS_WINDOW.0,
-            "allow-control focus moves to the selected window"
-        );
-        let allowed_stream = literal_xi1_focus_and_state_chain(
+        let batch = |client| ExpectedReceive {
+            client,
+            request: request_opcodes(137, 21),
+            subject: EventSubject::Window(FOCUS_WINDOW),
+            events: state_batch.clone(),
+        };
+        let denied = if deny_focus {
+            focus(NOTIFY_RECEIVER_DENIED)
+        } else {
+            batch(NOTIFY_RECEIVER_DENIED)
+        };
+        let full_denied = literal_xi1_focus_and_state_chain(
             ClientByteOrder::BigEndian,
             FOCUS_XI_SEQUENCE,
             device,
             is_keyboard,
         );
-        assert_eq!(seed.drain(NOTIFY_RECEIVER_DENIED), allowed_stream);
-        assert_eq!(
-            seed.drain(NOTIFY_RECEIVER_ALLOWED),
-            literal_xi1_focus_and_state_chain(
-                ClientByteOrder::LittleEndian,
-                FOCUS_OTHER_SEQUENCE,
+        let focus_only =
+            literal_xi1_device_focus_in(ClientByteOrder::BigEndian, FOCUS_XI_SEQUENCE, device);
+        let state_only = if is_keyboard {
+            literal_xi1_keyboard_state_chain(ClientByteOrder::BigEndian, FOCUS_XI_SEQUENCE)
+        } else {
+            literal_xi1_four_valuator_state_chain(
+                ClientByteOrder::BigEndian,
+                FOCUS_XI_SEQUENCE,
                 device,
-                is_keyboard,
             )
+        };
+        let other = literal_xi1_focus_and_state_chain(
+            ClientByteOrder::LittleEndian,
+            FOCUS_OTHER_SEQUENCE,
+            device,
+            is_keyboard,
         );
-        assert!(
-            seed.drain(NOTIFY_SENDER).is_empty(),
-            "SetDeviceFocus is void"
+        let mut expectation = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: full_denied,
+                    denied: Some(if deny_focus { state_only } else { focus_only }),
+                },
+                Stream::unchanged(NOTIFY_RECEIVER_ALLOWED, other),
+            ],
+            vec![
+                focus(NOTIFY_RECEIVER_DENIED),
+                batch(NOTIFY_RECEIVER_DENIED),
+                focus(NOTIFY_RECEIVER_ALLOWED),
+                batch(NOTIFY_RECEIVER_ALLOWED),
+            ],
+            CallOrder::PerClient,
+            vec![denied],
         );
-        assert_no_writer_failures(&seed);
+        expectation.deny_before_allow = true;
+        expectation.trace_before_deny_streams = deny_focus;
+        let focus_device = if is_keyboard {
+            crate::xinput::DEVICEID_XTEST_KEYBOARD
+        } else {
+            *pointer
+        };
+        expectation.after_deny = Some(Box::new(move |allow, denied| {
+            assert_eq!(
+                crate::core_loop::xi1_focus::device_focus(&denied.state, focus_device).focus,
+                crate::core_loop::xi1_focus::device_focus(&allow.state, focus_device).focus
+            );
+        }));
+        expectation
+    };
+    check_receive_case(&ReceiveCase {
+        name,
+        build: &build,
+        act: &act,
+        expect: &expect,
+    });
+}
 
-        let _focus_denied_calls = make_run(true);
-        let _state_denied_calls = make_run(false);
-        assert_eq!(receive_calls(&allow_calls.lock().unwrap()).len(), 4);
-    }
+// mutation: describe only the lead DeviceStateNotify in F3 (C22)
+// mutation: check the batch once per event instead of once per recipient (C23)
+#[test]
+fn receive_xi1_focus_and_state_batches_independent() {
+    run_xi1_focus_receive_case(
+        true,
+        true,
+        "XI1 keyboard focus denial keeps the state batch",
+    );
+    run_xi1_focus_receive_case(true, false, "XI1 keyboard state batch once check");
+    run_xi1_focus_receive_case(
+        false,
+        true,
+        "XI1 pointer focus denial keeps the state batch",
+    );
+    run_xi1_focus_receive_case(false, false, "XI1 pointer state batch once check");
+}
+
+// mutation: on owner denial fall back to selector targets (C26)
+// Focused scenario: checks the post-grab snapshot and reply before BarrierHit.
+#[test]
+fn receive_barrier_grab_owner_denial() {
+    let run_grabbed_owner = |deny_owner: bool| {
+        let mut fixture = barrier_fixture();
+        assert!(matches!(
+            grab_pointer(
+                &mut fixture,
+                NOTIFY_SENDER,
+                false,
+                BARRIER_WINDOW,
+                POINTER_MOTION_MASK as u16,
+                GRAB_SEQUENCE,
+            ),
+            RequestOutcome::Handled
+        ));
+        assert_eq!(
+            fixture.drain(NOTIFY_SENDER),
+            literal_grab_reply(ClientByteOrder::LittleEndian, GRAB_SEQUENCE, 0)
+        );
+        let grab_after_reply = fixture
+            .state
+            .active_pointer_grab
+            .expect("active owner grab after successful reply");
+        let calls = fixture.install_policy(move |_, call| {
+            if deny_owner
+                && call.hook == ExtensionHook::Receive
+                && call.client == NOTIFY_SENDER
+                && call.receive == Some(EventSubject::Window(BARRIER_WINDOW))
+                && call.events == Some(vec![EventDescription::extension(35, 137, 25)])
+            {
+                Decision::Deny(DENY)
+            } else {
+                Decision::Allow
+            }
+        });
+        feed_barrier_motion(&mut fixture, 190, 95, 50);
+        assert_eq!(fixture.state.pointer_root, (95, 50));
+        assert!(!fixture.state.pointer_barriers[&BARRIER_XID].hit);
+        feed_barrier_motion(&mut fixture, 200, 110, 50);
+        assert_eq!(fixture.state.pointer_root, (99, 50));
+        assert_eq!(fixture.state.master_sprite_root, (99, 50));
+        assert!(fixture.state.pointer_barriers[&BARRIER_XID].hit);
+        assert_eq!(fixture.state.pointer_barriers[&BARRIER_XID].event_id, 1);
+        assert_pointer_grabs_equal(fixture.state.active_pointer_grab, Some(grab_after_reply));
+        let pre_hit_motion = literal_core_motion(
+            ClientByteOrder::LittleEndian,
+            GRAB_SEQUENCE,
+            190,
+            BARRIER_WINDOW,
+            95,
+            50,
+            95,
+            50,
+        );
+        let hit_motion = literal_core_motion(
+            ClientByteOrder::LittleEndian,
+            GRAB_SEQUENCE,
+            200,
+            BARRIER_WINDOW,
+            99,
+            50,
+            99,
+            50,
+        );
+        assert_eq!(
+            fixture.drain(NOTIFY_SENDER),
+            if deny_owner {
+                [pre_hit_motion.as_slice(), hit_motion.as_slice()].concat()
+            } else {
+                [
+                    pre_hit_motion.as_slice(),
+                    literal_grabbed_barrier_hit().as_slice(),
+                    hit_motion.as_slice(),
+                ]
+                .concat()
+            },
+            "grab denial drops only BarrierHit; cooked motion remains unchanged"
+        );
+        assert!(fixture.drain(NOTIFY_RECEIVER_DENIED).is_empty());
+        assert!(fixture.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
+        assert_xi2_receive_call_order(
+            &calls.lock().unwrap(),
+            &[(NOTIFY_SENDER, BARRIER_WINDOW, 25, None)],
+        );
+        assert_no_writer_failures(&fixture);
+        (
+            fixture.state.pointer_root,
+            fixture.state.pointer_barriers[&BARRIER_XID].clone(),
+            fixture.state.active_pointer_grab,
+        )
+    };
+
+    let denied_owner_state = run_grabbed_owner(true);
+    let allowed_owner_state = run_grabbed_owner(false);
+    assert_eq!(denied_owner_state.0, allowed_owner_state.0);
+    assert_eq!(denied_owner_state.1, allowed_owner_state.1);
+    assert_pointer_grabs_equal(denied_owner_state.2, allowed_owner_state.2);
 }
 
 const BARRIER_XID: u32 = 0x0051_0044;
@@ -4393,7 +4081,8 @@ fn literal_ungrabbed_barrier_frames(order: ClientByteOrder, sequence: u16) -> [V
     ]
 }
 
-// mutation: swap BarrierHit and BarrierLeave evtypes
+// Kept focused: the ungrabbed and grabbed motion sequences retain every pointer, barrier, and byte-stream checkpoint.
+// mutation: swap BarrierHit and BarrierLeave evtypes (C24)
 #[test]
 fn receive_barrier_baseline_frames() {
     let mut fixture = barrier_fixture();
@@ -4536,243 +4225,82 @@ fn receive_barrier_baseline_frames() {
     assert_no_writer_failures(&grabbed);
 }
 
-// mutation: leave B1 unchecked
-// mutation: on owner denial fall back to selector targets
-// mutation: use ROOT_WINDOW for the barrier Receive subject
+// mutation: leave B1 unchecked (C25)
+// mutation: use ROOT_WINDOW for the barrier Receive subject (C27)
 #[test]
-fn receive_barrier_denial_keeps_barrier_state() {
-    let mut allowed = barrier_fixture();
-    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
-    feed_barrier_motion(&mut allowed, 90, 95, 50);
-    feed_barrier_motion(&mut allowed, 100, 110, 50);
-    assert_eq!(allowed.state.pointer_root, (99, 50));
-    assert_eq!(allowed.state.master_sprite_root, (99, 50));
-    assert!(allowed.state.pointer_barriers[&BARRIER_XID].hit);
-    feed_barrier_motion(&mut allowed, 120, 99, 203);
-    assert_eq!(allowed.state.master_sprite_root, (99, 203));
-    let denied_frames = literal_ungrabbed_barrier_frames(ClientByteOrder::BigEndian, DUAL_SEQUENCE);
-    let allowed_frames =
-        literal_ungrabbed_barrier_frames(ClientByteOrder::LittleEndian, ROOT_SEQUENCE);
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_DENIED),
-        [
-            denied_frames[0].as_slice(),
-            denied_frames[1].as_slice(),
-            denied_frames[2].as_slice(),
-            denied_frames[3].as_slice(),
-            denied_frames[4].as_slice(),
-        ]
-        .concat()
-    );
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
-        [
-            allowed_frames[0].as_slice(),
-            allowed_frames[1].as_slice(),
-            allowed_frames[2].as_slice(),
-            allowed_frames[3].as_slice(),
-            allowed_frames[4].as_slice(),
-        ]
-        .concat()
-    );
-    assert!(allowed.drain(NOTIFY_SENDER).is_empty());
-    assert_eq!(allowed.state.pointer_root, (99, 203));
-    assert!(!allowed.state.pointer_barriers[&BARRIER_XID].hit);
-    assert_eq!(allowed.state.pointer_barriers[&BARRIER_XID].event_id, 2);
-    let allowed_barrier = allowed.state.pointer_barriers[&BARRIER_XID].clone();
-
-    let mut denied = barrier_fixture();
-    let calls = denied.install_policy(|_, call| {
-        if call.hook == ExtensionHook::Receive
-            && call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Window(BARRIER_WINDOW))
-            && call.events == Some(vec![EventDescription::extension(35, 137, 25)])
-        {
-            Decision::Deny(DENY)
-        } else {
-            Decision::Allow
-        }
-    });
-    feed_barrier_motion(&mut denied, 90, 95, 50);
-    feed_barrier_motion(&mut denied, 100, 110, 50);
-    assert_eq!(
-        denied.state.pointer_root,
-        (99, 50),
-        "denial keeps the pointer constrained"
-    );
-    assert_eq!(denied.state.master_sprite_root, (99, 50));
-    assert!(denied.state.pointer_barriers[&BARRIER_XID].hit);
-    feed_barrier_motion(&mut denied, 120, 99, 203);
-    assert_eq!(denied.state.pointer_root, allowed.state.pointer_root);
-    assert_eq!(
-        denied.state.master_sprite_root,
-        allowed.state.master_sprite_root
-    );
-    assert_eq!(denied.state.pointer_barriers[&BARRIER_XID], allowed_barrier);
-    assert!(!denied.state.pointer_barriers[&BARRIER_XID].hit);
-    assert_eq!(denied.state.pointer_barriers[&BARRIER_XID].event_id, 2);
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_DENIED),
-        [
-            denied_frames[0].as_slice(),
-            denied_frames[2].as_slice(),
-            denied_frames[3].as_slice(),
-            denied_frames[4].as_slice(),
-        ]
-        .concat(),
-        "denied BarrierHit is dropped; motion and the later BarrierLeave remain"
-    );
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_ALLOWED),
-        [
-            allowed_frames[0].as_slice(),
-            allowed_frames[1].as_slice(),
-            allowed_frames[2].as_slice(),
-            allowed_frames[3].as_slice(),
-            allowed_frames[4].as_slice(),
-        ]
-        .concat()
-    );
-    assert!(denied.drain(NOTIFY_SENDER).is_empty());
-    let expected_denied_calls = [
-        (NOTIFY_RECEIVER_DENIED, BARRIER_WINDOW, 25, None),
-        (NOTIFY_RECEIVER_DENIED, BARRIER_WINDOW, 26, None),
-    ];
-    let expected_allowed_calls = [
-        (NOTIFY_RECEIVER_ALLOWED, BARRIER_WINDOW, 25, None),
-        (NOTIFY_RECEIVER_ALLOWED, BARRIER_WINDOW, 26, None),
-    ];
-    let assert_selector_calls = |calls: &[RecordedExtensionCheck]| {
-        assert_eq!(
-            receive_calls(calls).len(),
-            4,
-            "two barrier selectors each receive one hit and one leave check"
-        );
-        assert!(calls.iter().all(|call| call.hook != ExtensionHook::Send));
-        for (client, expected) in [
-            (NOTIFY_RECEIVER_DENIED, &expected_denied_calls[..]),
-            (NOTIFY_RECEIVER_ALLOWED, &expected_allowed_calls[..]),
-        ] {
-            let client_calls: Vec<_> = calls
-                .iter()
-                .filter(|call| call.client == client)
-                .cloned()
-                .collect();
-            assert_xi2_receive_call_order(&client_calls, expected);
-        }
-    };
-    assert_selector_calls(&allow_calls.lock().unwrap());
-    assert_selector_calls(&calls.lock().unwrap());
-    assert_no_writer_failures(&denied);
-
-    let run_grabbed_owner = |deny_owner: bool| {
-        let mut fixture = barrier_fixture();
-        assert!(matches!(
-            grab_pointer(
-                &mut fixture,
-                NOTIFY_SENDER,
-                false,
-                BARRIER_WINDOW,
-                POINTER_MOTION_MASK as u16,
-                GRAB_SEQUENCE,
-            ),
-            RequestOutcome::Handled
-        ));
-        assert_eq!(
-            fixture.drain(NOTIFY_SENDER),
-            literal_grab_reply(ClientByteOrder::LittleEndian, GRAB_SEQUENCE, 0)
-        );
-        let calls = fixture.install_policy(move |_, call| {
-            if deny_owner
-                && call.hook == ExtensionHook::Receive
-                && call.client == NOTIFY_SENDER
-                && call.receive == Some(EventSubject::Window(BARRIER_WINDOW))
-                && call.events == Some(vec![EventDescription::extension(35, 137, 25)])
-            {
-                Decision::Deny(DENY)
-            } else {
-                Decision::Allow
-            }
-        });
-        let grab = fixture
-            .state
-            .active_pointer_grab
-            .expect("active owner grab");
-        let grab_signature = |grab: crate::server::ActivePointerGrab| {
-            (
-                grab.owner,
-                grab.grab_window,
-                grab.event_mask,
-                grab.cursor,
-                grab.time,
-                grab.owner_events,
-                grab.via_xi2,
-                grab.implicit,
-                grab.passive,
-                grab.xi2_mask,
-            )
-        };
-        feed_barrier_motion(&mut fixture, 190, 95, 50);
+fn receive_barrier_selector_denial() {
+    let build = || (barrier_fixture(), ());
+    let act = |fixture: &mut NotifyFixture, _: &()| {
+        feed_barrier_motion(fixture, 90, 95, 50);
         assert_eq!(fixture.state.pointer_root, (95, 50));
-        assert!(!fixture.state.pointer_barriers[&BARRIER_XID].hit);
-        feed_barrier_motion(&mut fixture, 200, 110, 50);
+        feed_barrier_motion(fixture, 100, 110, 50);
         assert_eq!(fixture.state.pointer_root, (99, 50));
         assert_eq!(fixture.state.master_sprite_root, (99, 50));
         assert!(fixture.state.pointer_barriers[&BARRIER_XID].hit);
-        let current_grab = fixture
-            .state
-            .active_pointer_grab
-            .expect("grab remains active");
-        assert_eq!(grab_signature(current_grab), grab_signature(grab));
-        let pre_hit_motion = literal_core_motion(
-            ClientByteOrder::LittleEndian,
-            GRAB_SEQUENCE,
-            190,
-            BARRIER_WINDOW,
-            95,
-            50,
-            95,
-            50,
-        );
-        let hit_motion = literal_core_motion(
-            ClientByteOrder::LittleEndian,
-            GRAB_SEQUENCE,
-            200,
-            BARRIER_WINDOW,
-            99,
-            50,
-            99,
-            50,
-        );
-        assert_eq!(
-            fixture.drain(NOTIFY_SENDER),
-            if deny_owner {
-                [pre_hit_motion.as_slice(), hit_motion.as_slice()].concat()
-            } else {
-                [
-                    pre_hit_motion.as_slice(),
-                    literal_grabbed_barrier_hit().as_slice(),
-                    hit_motion.as_slice(),
-                ]
-                .concat()
-            },
-            "grab denial drops only BarrierHit; cooked motion remains unchanged"
-        );
-        assert!(fixture.drain(NOTIFY_RECEIVER_DENIED).is_empty());
-        assert!(fixture.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
-        assert_xi2_receive_call_order(
-            &calls.lock().unwrap(),
-            &[(NOTIFY_SENDER, BARRIER_WINDOW, 25, None)],
-        );
-        assert_no_writer_failures(&fixture);
-        (
-            fixture.state.pointer_root,
-            fixture.state.pointer_barriers[&BARRIER_XID].clone(),
-            grab_signature(current_grab),
-        )
+        feed_barrier_motion(fixture, 120, 99, 203);
+        assert_eq!(fixture.state.pointer_root, (99, 203));
+        assert_eq!(fixture.state.master_sprite_root, (99, 203));
+        assert!(!fixture.state.pointer_barriers[&BARRIER_XID].hit);
+        assert_eq!(fixture.state.pointer_barriers[&BARRIER_XID].event_id, 2);
+        assert!(fixture.drain(NOTIFY_SENDER).is_empty());
+        assert_no_writer_failures(fixture);
     };
-
-    let denied_owner_state = run_grabbed_owner(true);
-    let allowed_owner_state = run_grabbed_owner(false);
-    assert_eq!(denied_owner_state, allowed_owner_state);
+    let expect = |_: &()| {
+        let receive = |client, evtype| ExpectedReceive {
+            client,
+            request: None,
+            subject: EventSubject::Window(BARRIER_WINDOW),
+            events: vec![EventDescription::extension(35, 137, evtype)],
+        };
+        let denied_hit = receive(NOTIFY_RECEIVER_DENIED, 25);
+        let denied_frames =
+            literal_ungrabbed_barrier_frames(ClientByteOrder::BigEndian, DUAL_SEQUENCE);
+        let allowed_frames =
+            literal_ungrabbed_barrier_frames(ClientByteOrder::LittleEndian, ROOT_SEQUENCE);
+        let denied_bytes = [
+            denied_frames[0].as_slice(),
+            denied_frames[2].as_slice(),
+            denied_frames[3].as_slice(),
+            denied_frames[4].as_slice(),
+        ]
+        .concat();
+        let mut expectation = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: denied_frames.concat(),
+                    denied: Some(denied_bytes),
+                },
+                Stream::unchanged(NOTIFY_RECEIVER_ALLOWED, allowed_frames.concat()),
+            ],
+            vec![
+                receive(NOTIFY_RECEIVER_DENIED, 25),
+                receive(NOTIFY_RECEIVER_DENIED, 26),
+                receive(NOTIFY_RECEIVER_ALLOWED, 25),
+                receive(NOTIFY_RECEIVER_ALLOWED, 26),
+            ],
+            CallOrder::PerClient,
+            vec![denied_hit],
+        );
+        expectation.deny_before_allow = true;
+        expectation.after_deny = Some(Box::new(|allow, denied| {
+            assert_eq!(denied.state.pointer_root, allow.state.pointer_root);
+            assert_eq!(
+                denied.state.master_sprite_root,
+                allow.state.master_sprite_root
+            );
+            assert_eq!(
+                denied.state.pointer_barriers[&BARRIER_XID],
+                allow.state.pointer_barriers[&BARRIER_XID]
+            );
+        }));
+        expectation
+    };
+    check_receive_case(&ReceiveCase {
+        name: "BarrierHit denial preserves selectors and barrier state",
+        build: &build,
+        act: &act,
+        expect: &expect,
+    });
 }
