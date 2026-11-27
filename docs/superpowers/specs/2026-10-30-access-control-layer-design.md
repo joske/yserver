@@ -291,7 +291,10 @@ it through `events()`. An `EventDescription` stores `type_code: u8` and
 `extension: Option<ExtensionEventDescription>`; extension metadata stores
 `major_opcode: u8` and `event_type: u16`. The `type_code` is the core event
 type with the send-event bit removed; `event_type` is the extension event code
-or XI2 `evtype`. For a GenericEvent,
+or XI2 `evtype`. Every XKB event shares one event code, so for an XKB
+event `event_type` is its `xkbType`, wire byte 1, whether the server
+emits it or a client sends it with `SendEvent`; this is a yserver rule.
+For a GenericEvent,
 the major opcode is wire byte 1 and the `evtype` is bytes 8–9 interpreted in
 the sender's byte order. `describe_wire_event` is the single function that
 builds descriptions from wire events: it resolves ordinary extension event
@@ -495,7 +498,12 @@ eligibility. Xorg emits that release inside the press's delivery attempt
 - Xorg has no Receive hook on grabbed Enter/Leave legs
   (`dix/events.c:4730-4805, 4809-4883`) or on native XKB events
   (`xkb/xkbEvents.c:252`). Under this policy yserver checks both. An XKB
-  event has the device as its subject. These two checks are yserver rules.
+  event has the device as its subject: the device id the event carries,
+  which is 1 (`XKB_DEVICE_ID`). Xorg's XKB events carry the master
+  keyboard's id, 3, which the XI paths use as their subject, so a policy
+  that matches XI device ids must also match XKB's 1. Moving the wire id
+  to Xorg's value is a follow-up outside this series. These two checks
+  are yserver rules.
 
 **Differences from Xorg that stay.** With no policy installed, yserver
 differs from Xorg in the following ways. Each one needs its own routing fix,
