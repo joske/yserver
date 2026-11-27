@@ -1,9 +1,9 @@
 use super::{
     access_notify_support::{
-        NOTIFY_RECEIVER_ALLOWED, NOTIFY_RECEIVER_DENIED, NOTIFY_SENDER, NotifyFixture,
-        finish_literal_event, literal_event_header,
+        CallOrder, CaseExpect, ExpectedReceive, NOTIFY_RECEIVER_ALLOWED, NOTIFY_RECEIVER_DENIED,
+        NOTIFY_SENDER, NotifyFixture, ReceiveCase, Stream, check_receive_case,
+        finish_literal_event, literal_event_header, receive_checks, request_opcodes,
     },
-    extensions::{ExtensionHook, RecordedExtensionCheck},
     xi_hotplug::{
         xi_hotplug_create_child, xi_hotplug_select_hierarchy, xi_hotplug_select_presence,
         xi_hotplug_set_enabled,
@@ -11,26 +11,16 @@ use super::{
     *,
 };
 use crate::{
-    access::{Decision, DenyError, EventDescription, EventSubject, RequestOpcodes},
+    access::{Decision, EventDescription, EventSubject, RequestOpcodes},
     core_loop::process_request::RequestOutcome,
     resources::ROOT_WINDOW,
 };
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::{sync::atomic::Ordering, time::Duration};
 use yserver_protocol::x11::{ClientId, ResourceId};
 
-const CHILD_WINDOW: ResourceId = ResourceId(0x0071_0001);
-const DENY: DenyError = DenyError {
-    code: yserver_protocol::x11::error::BAD_ACCESS,
-    value: 0,
-};
+pub(super) const CHILD_WINDOW: ResourceId = ResourceId(0x0071_0001);
 
-fn hotplug_fixture() -> (NotifyFixture, u16) {
+pub(super) fn hotplug_fixture() -> (NotifyFixture, u16) {
     let mut fixture = NotifyFixture::new();
     let device_id = seed_pointer_for_t3(&mut fixture.state);
     xi_hotplug_set_enabled(
@@ -59,7 +49,7 @@ fn hotplug_fixture() -> (NotifyFixture, u16) {
     (fixture, device_id)
 }
 
-fn disable_device(fixture: &mut NotifyFixture, device_id: u16) {
+pub(super) fn disable_device(fixture: &mut NotifyFixture, device_id: u16) {
     xi_hotplug_set_enabled(
         &mut fixture.state,
         &mut fixture.backend,
@@ -92,7 +82,7 @@ fn literal_presence_with_order(
     bytes
 }
 
-fn literal_hierarchy_disabled(sequence: u16) -> Vec<u8> {
+pub(super) fn literal_hierarchy_disabled(sequence: u16) -> Vec<u8> {
     literal_hierarchy_disabled_with_order(sequence, ClientByteOrder::LittleEndian)
 }
 
@@ -149,19 +139,7 @@ fn literal_disabled_stream_with_order(
     .concat()
 }
 
-fn receive_checks(
-    calls: &Arc<std::sync::Mutex<Vec<RecordedExtensionCheck>>>,
-) -> Vec<RecordedExtensionCheck> {
-    calls
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|call| call.hook == ExtensionHook::Receive)
-        .cloned()
-        .collect()
-}
-
-fn select_hierarchy_on_root_and_child(fixture: &mut NotifyFixture, client: ClientId) {
+pub(super) fn select_hierarchy_on_root_and_child(fixture: &mut NotifyFixture, client: ClientId) {
     xi_hotplug_select_hierarchy(
         &mut fixture.state,
         &mut fixture.backend,
@@ -183,244 +161,151 @@ fn select_hierarchy_on_root_and_child(fixture: &mut NotifyFixture, client: Clien
 #[test]
 fn receive_xi_hierarchy_subject_is_selected_window() {
     // mutation: pass W(ROOT_WINDOW) instead of the selected window in X2
-    let (mut allowed, allowed_device) = hotplug_fixture();
-    select_hierarchy_on_root_and_child(&mut allowed, NOTIFY_RECEIVER_DENIED);
-    let allowed_calls = allowed.install_policy(|_, _| Decision::Allow);
-    disable_device(&mut allowed, allowed_device);
-    assert!(allowed.drain(NOTIFY_SENDER).is_empty());
-    let all_allow = allowed.drain(NOTIFY_RECEIVER_DENIED);
-    assert_eq!(
-        all_allow,
-        [literal_hierarchy_disabled(4), literal_hierarchy_disabled(4)].concat()
-    );
-    let allowed_receives = receive_checks(&allowed_calls);
-    assert_eq!(allowed_receives.len(), 2);
-    assert!(
-        allowed_receives
-            .iter()
-            .any(|call| { call.receive == Some(EventSubject::Window(ROOT_WINDOW)) })
-    );
-    assert!(
-        allowed_receives
-            .iter()
-            .any(|call| { call.receive == Some(EventSubject::Window(CHILD_WINDOW)) })
-    );
+    let build = || {
+        let (mut fixture, device_id) = hotplug_fixture();
+        select_hierarchy_on_root_and_child(&mut fixture, NOTIFY_RECEIVER_DENIED);
+        (fixture, device_id)
+    };
+    let act = |fixture: &mut NotifyFixture, device_id: &u16| {
+        disable_device(fixture, *device_id);
+        let device = fixture.state.xi_devices.device(*device_id).unwrap();
+        assert!(
+            !device.enabled,
+            "device disable persists in every policy mode"
+        );
+        assert_eq!(
+            device.properties[&fixture.state.xi_device_enabled_atom].data,
+            [0]
+        );
+        assert_eq!(fixture.state.xi_devices.attachment(*device_id), None);
+    };
 
-    let (mut denied, denied_device) = hotplug_fixture();
-    select_hierarchy_on_root_and_child(&mut denied, NOTIFY_RECEIVER_DENIED);
-    let calls = denied.install_policy(|_, call| {
-        if call.hook == ExtensionHook::Receive
-            && call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Window(CHILD_WINDOW))
-            && call.events.as_ref().is_some_and(|events| {
-                events.as_slice() == [EventDescription::extension(35, 137, 11)]
-            })
-        {
-            Decision::Deny(DENY)
-        } else {
-            Decision::Allow
-        }
-    });
-    disable_device(&mut denied, denied_device);
-    assert!(
-        crate::core_loop::client_io::failed_writers(&denied.state.clients).is_empty(),
-        "denying the hierarchy copy does not queue a writer for disconnect"
-    );
-    assert!(denied.drain(NOTIFY_SENDER).is_empty());
-    let received = denied.drain(NOTIFY_RECEIVER_DENIED);
-    assert_eq!(
-        received,
-        literal_hierarchy_disabled(4),
-        "only the root-selected copy remains"
-    );
-    assert!(
-        !denied
-            .state
-            .xi_devices
-            .device(denied_device)
-            .unwrap()
-            .enabled,
-        "denying the notification leaves the device disabled"
-    );
-    assert_eq!(
-        denied
-            .state
-            .xi_devices
-            .device(denied_device)
-            .unwrap()
-            .properties[&denied.state.xi_device_enabled_atom]
-            .data,
-        [0],
-        "denying the notification leaves Device Enabled at zero"
-    );
-    assert_eq!(
-        denied.state.xi_devices.attachment(denied_device),
-        None,
-        "the disabled live facet is floated after its hierarchy snapshot is published"
-    );
-    assert!(denied.state.clients.contains_key(&NOTIFY_RECEIVER_DENIED.0));
-
-    let receives = receive_checks(&calls);
-    assert_eq!(receives.len(), 2);
-    assert!(
-        receives
-            .iter()
-            .any(|call| call.receive == Some(EventSubject::Window(ROOT_WINDOW)))
-    );
-    assert!(
-        receives
-            .iter()
-            .any(|call| call.receive == Some(EventSubject::Window(CHILD_WINDOW)))
-    );
-    assert!(
-        receives
-            .iter()
-            .all(|call| { call.events == Some(vec![EventDescription::extension(35, 137, 11)]) })
-    );
+    for (name, denied_window) in [
+        ("hierarchy root copy denied", ROOT_WINDOW),
+        ("hierarchy child copy denied", CHILD_WINDOW),
+    ] {
+        let expect = |_: &u16| {
+            let event = EventDescription::extension(35, 137, 11);
+            let root = ExpectedReceive {
+                client: NOTIFY_RECEIVER_DENIED,
+                request: request_opcodes(137, 57),
+                subject: EventSubject::Window(ROOT_WINDOW),
+                events: vec![event],
+            };
+            let child = ExpectedReceive {
+                subject: EventSubject::Window(CHILD_WINDOW),
+                ..root.clone()
+            };
+            let frame = literal_hierarchy_disabled(4);
+            CaseExpect::new(
+                vec![
+                    Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                    Stream {
+                        client: NOTIFY_RECEIVER_DENIED,
+                        bytes: [frame.clone(), frame.clone()].concat(),
+                        denied: Some(frame),
+                    },
+                    Stream::unchanged(NOTIFY_RECEIVER_ALLOWED, Vec::new()),
+                ],
+                vec![root.clone(), child.clone()],
+                CallOrder::Multiset,
+                vec![if denied_window == ROOT_WINDOW {
+                    root
+                } else {
+                    child
+                }],
+            )
+        };
+        let case = ReceiveCase {
+            name,
+            build: &build,
+            act: &act,
+            expect: &expect,
+        };
+        check_receive_case(&case);
+    }
 }
 
 #[test]
 fn receive_xi_presence_denial_keeps_other_client() {
     // mutation: skip the receive check in X1 (use fanout_event_to_clients)
-    let (mut allowed, allowed_device) = hotplug_fixture();
-    xi_hotplug_select_presence(
-        &mut allowed.state,
-        &mut allowed.backend,
-        NOTIFY_RECEIVER_DENIED.0,
-        3,
-        ROOT_WINDOW,
-    );
-    xi_hotplug_select_presence(
-        &mut allowed.state,
-        &mut allowed.backend,
-        NOTIFY_RECEIVER_ALLOWED.0,
-        3,
-        CHILD_WINDOW,
-    );
-    let allowed_calls = allowed.install_policy(|_, _| Decision::Allow);
-    disable_device(&mut allowed, allowed_device);
-    assert!(allowed.drain(NOTIFY_SENDER).is_empty());
-    let all_allow_denied = allowed.drain(NOTIFY_RECEIVER_DENIED);
-    let all_allow_other = allowed.drain(NOTIFY_RECEIVER_ALLOWED);
-    assert_eq!(
-        all_allow_denied,
-        literal_presence_disabled(3, allowed_device)
-    );
-    assert_eq!(
-        all_allow_other,
-        literal_presence_disabled(3, allowed_device)
-    );
-    let allowed_receives = receive_checks(&allowed_calls);
-    assert_eq!(allowed_receives.len(), 2);
-    assert!(allowed_receives.iter().any(|call| {
-        call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
-    }));
-    assert!(allowed_receives.iter().any(|call| {
-        call.client == NOTIFY_RECEIVER_ALLOWED
-            && call.receive == Some(EventSubject::Window(CHILD_WINDOW))
-    }));
-
-    let (mut denied, denied_device) = hotplug_fixture();
-    xi_hotplug_select_presence(
-        &mut denied.state,
-        &mut denied.backend,
-        NOTIFY_RECEIVER_DENIED.0,
-        3,
-        ROOT_WINDOW,
-    );
-    xi_hotplug_select_presence(
-        &mut denied.state,
-        &mut denied.backend,
-        NOTIFY_RECEIVER_ALLOWED.0,
-        3,
-        CHILD_WINDOW,
-    );
-    let calls = denied.install_policy(|_, call| {
-        if call.hook == ExtensionHook::Receive
-            && call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
-            && call.events.as_ref().is_some_and(|events| {
-                events.as_slice()
-                    == [EventDescription::extension(
-                        crate::server::XI_FIRST_EVENT + 15,
-                        137,
-                        15,
-                    )]
-            })
-        {
-            Decision::Deny(DENY)
-        } else {
-            Decision::Allow
-        }
-    });
-    disable_device(&mut denied, denied_device);
-    assert!(
-        crate::core_loop::client_io::failed_writers(&denied.state.clients).is_empty(),
-        "denying the presence copy does not queue a writer for disconnect"
-    );
-    assert!(denied.drain(NOTIFY_SENDER).is_empty());
-    let denied_bytes = denied.drain(NOTIFY_RECEIVER_DENIED);
-    let allowed_bytes = denied.drain(NOTIFY_RECEIVER_ALLOWED);
-    assert!(
-        denied_bytes.is_empty(),
-        "denied client gets no event or error"
-    );
-    assert_eq!(allowed_bytes, all_allow_other);
-    assert!(
-        !denied
-            .state
-            .xi_devices
-            .device(denied_device)
-            .unwrap()
-            .enabled,
-        "denying one copy does not undo the device disable"
-    );
-    assert_eq!(
-        denied
-            .state
-            .xi_devices
-            .device(denied_device)
-            .unwrap()
-            .properties[&denied.state.xi_device_enabled_atom]
-            .data,
-        [0]
-    );
-    assert_eq!(
-        denied.state.xi_devices.attachment(denied_device),
-        None,
-        "the disabled live facet is floated after its presence publication"
-    );
-    assert!(denied.state.clients.contains_key(&NOTIFY_RECEIVER_DENIED.0));
-    assert!(
-        denied
-            .state
-            .clients
-            .contains_key(&NOTIFY_RECEIVER_ALLOWED.0)
-    );
-
-    let receives = receive_checks(&calls);
-    assert_eq!(receives.len(), 2);
-    assert!(receives.iter().any(|call| {
-        call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
-    }));
-    assert!(receives.iter().any(|call| {
-        call.client == NOTIFY_RECEIVER_ALLOWED
-            && call.receive == Some(EventSubject::Window(CHILD_WINDOW))
-    }));
-    assert!(receives.iter().all(|call| {
-        call.events
-            == Some(vec![EventDescription::extension(
-                crate::server::XI_FIRST_EVENT + 15,
-                137,
-                15,
-            )])
-    }));
+    let build = || {
+        let (mut fixture, device_id) = hotplug_fixture();
+        xi_hotplug_select_presence(
+            &mut fixture.state,
+            &mut fixture.backend,
+            NOTIFY_RECEIVER_DENIED.0,
+            3,
+            ROOT_WINDOW,
+        );
+        xi_hotplug_select_presence(
+            &mut fixture.state,
+            &mut fixture.backend,
+            NOTIFY_RECEIVER_ALLOWED.0,
+            3,
+            CHILD_WINDOW,
+        );
+        (fixture, device_id)
+    };
+    let act = |fixture: &mut NotifyFixture, device_id: &u16| {
+        disable_device(fixture, *device_id);
+        let device = fixture.state.xi_devices.device(*device_id).unwrap();
+        assert!(
+            !device.enabled,
+            "device disable persists in every policy mode"
+        );
+        assert_eq!(
+            device.properties[&fixture.state.xi_device_enabled_atom].data,
+            [0]
+        );
+        assert_eq!(fixture.state.xi_devices.attachment(*device_id), None);
+    };
+    let expect = |device_id: &u16| {
+        let device_id = *device_id;
+        let event = EventDescription::extension(crate::server::XI_FIRST_EVENT + 15, 137, 15);
+        let denied_receive = ExpectedReceive {
+            client: NOTIFY_RECEIVER_DENIED,
+            request: request_opcodes(137, 57),
+            subject: EventSubject::Window(ROOT_WINDOW),
+            events: vec![event],
+        };
+        let allowed_receive = ExpectedReceive {
+            client: NOTIFY_RECEIVER_ALLOWED,
+            request: request_opcodes(137, 57),
+            subject: EventSubject::Window(CHILD_WINDOW),
+            events: vec![event],
+        };
+        let denied_bytes = literal_presence_disabled(3, device_id);
+        CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: denied_bytes,
+                    denied: Some(Vec::new()),
+                },
+                Stream::unchanged(
+                    NOTIFY_RECEIVER_ALLOWED,
+                    literal_presence_disabled(3, device_id),
+                ),
+            ],
+            vec![denied_receive.clone(), allowed_receive],
+            CallOrder::PerClient,
+            vec![denied_receive],
+        )
+    };
+    let case = ReceiveCase {
+        name: "XI presence denial keeps other client",
+        build: &build,
+        act: &act,
+        expect: &expect,
+    };
+    check_receive_case(&case);
 }
 
 #[test]
 fn receive_xi_presence_from_server_work_has_no_request() {
+    // Focused because it checks and clears the Receive log between two checkpoints.
     // mutation: hard-code Some(RequestOpcodes) in the check
     let (mut fixture, device_id) = hotplug_fixture();
     xi_hotplug_select_presence(
@@ -473,6 +358,7 @@ fn receive_xi_presence_from_server_work_has_no_request() {
 
 #[test]
 fn receive_xi_hotplug_baseline_frames() {
+    // Focused because it is a byte-only baseline-frame test.
     // mutation: drop the last hierarchy device record
     let (mut fixture, device_id) = hotplug_fixture();
     for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
@@ -820,152 +706,97 @@ fn device_changed_description() -> EventDescription {
     EventDescription::extension(35, 137, 1)
 }
 
-fn is_device_changed_receive(call: &RecordedExtensionCheck) -> bool {
-    call.hook == ExtensionHook::Receive
-        && call
-            .events
-            .as_ref()
-            .is_some_and(|events| events.as_slice() == [EventDescription::extension(35, 137, 1)])
-}
-
 #[test]
 fn receive_xi_device_changed_denial_per_window() {
     // mutation: drop the subject loop variable and check W(ROOT_WINDOW)
-    let (mut allowed, device_id) = hotplug_fixture();
-    select_device_changed(
-        &mut allowed,
-        NOTIFY_RECEIVER_DENIED,
-        3,
-        ROOT_WINDOW,
-        crate::xinput::DEVICEID_MASTER_POINTER,
-    );
-    select_device_changed(
-        &mut allowed,
-        NOTIFY_RECEIVER_DENIED,
-        4,
-        CHILD_WINDOW,
-        crate::xinput::DEVICEID_MASTER_POINTER,
-    );
-    let allowed_calls = allowed.install_policy(|_, _| Decision::Allow);
-    assert!(
-        crate::xinput::hotplug::announce_xi2_slave_switch(
-            &mut allowed.state,
+    let build = || {
+        let (mut fixture, device_id) = hotplug_fixture();
+        select_device_changed(
+            &mut fixture,
+            NOTIFY_RECEIVER_DENIED,
+            3,
+            ROOT_WINDOW,
             crate::xinput::DEVICEID_MASTER_POINTER,
-            device_id,
-        )
-        .is_empty()
-    );
-    assert!(allowed.drain(NOTIFY_SENDER).is_empty());
-    let all_allow_wire = allowed.drain(NOTIFY_RECEIVER_DENIED);
-    let event = literal_device_changed_event(
-        4,
-        crate::xinput::DEVICEID_MASTER_POINTER,
-        device_id,
-        7,
-        &literal_physical_pointer_classes(device_id, ClientByteOrder::LittleEndian),
-        ClientByteOrder::LittleEndian,
-    );
-    assert_eq!(
-        all_allow_wire,
-        [event.clone(), event.clone()].concat(),
-        "explicit-Allow control emits two complete literal frames"
-    );
-    assert_eq!(
-        allowed
-            .state
-            .xi_last_slave(crate::xinput::DEVICEID_MASTER_POINTER),
-        Some(device_id)
-    );
-    let allowed_receives = receive_checks(&allowed_calls);
-    assert_eq!(allowed_receives.len(), 2);
-    assert!(allowed_receives.iter().any(|call| {
-        call.receive == Some(EventSubject::Window(ROOT_WINDOW))
-            && call.request.is_none()
-            && call.events == Some(vec![device_changed_description()])
-    }));
-    assert!(allowed_receives.iter().any(|call| {
-        call.receive == Some(EventSubject::Window(CHILD_WINDOW))
-            && call.request.is_none()
-            && call.events == Some(vec![device_changed_description()])
-    }));
-
-    let (mut denied, device_id) = hotplug_fixture();
-    select_device_changed(
-        &mut denied,
-        NOTIFY_RECEIVER_DENIED,
-        3,
-        ROOT_WINDOW,
-        crate::xinput::DEVICEID_MASTER_POINTER,
-    );
-    select_device_changed(
-        &mut denied,
-        NOTIFY_RECEIVER_DENIED,
-        4,
-        CHILD_WINDOW,
-        crate::xinput::DEVICEID_MASTER_POINTER,
-    );
-    let calls = denied.install_policy(|_, call| {
-        if call.hook == ExtensionHook::Receive
-            && call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Window(CHILD_WINDOW))
-            && call.events.as_ref().is_some_and(|events| {
-                events.as_slice() == [EventDescription::extension(35, 137, 1)]
-            })
-        {
-            Decision::Deny(DENY)
-        } else {
-            Decision::Allow
-        }
-    });
-    assert!(
-        crate::xinput::hotplug::announce_xi2_slave_switch(
-            &mut denied.state,
+        );
+        select_device_changed(
+            &mut fixture,
+            NOTIFY_RECEIVER_DENIED,
+            4,
+            CHILD_WINDOW,
             crate::xinput::DEVICEID_MASTER_POINTER,
-            device_id,
-        )
-        .is_empty()
-    );
-    let expected_event = literal_device_changed_event(
-        4,
-        crate::xinput::DEVICEID_MASTER_POINTER,
-        device_id,
-        7,
-        &literal_physical_pointer_classes(device_id, ClientByteOrder::LittleEndian),
-        ClientByteOrder::LittleEndian,
-    );
-    assert!(
-        crate::core_loop::client_io::failed_writers(&denied.state.clients).is_empty(),
-        "denying one copy does not queue a writer for disconnect"
-    );
-    assert!(denied.drain(NOTIFY_SENDER).is_empty());
-    let received_wire = denied.drain(NOTIFY_RECEIVER_DENIED);
-    assert_eq!(
-        received_wire, expected_event,
-        "only the root-selected literal frame remains"
-    );
-    assert_eq!(
-        denied
-            .state
-            .xi_last_slave(crate::xinput::DEVICEID_MASTER_POINTER),
-        Some(device_id),
-        "denying a copy leaves the master switch applied"
-    );
-    assert!(denied.state.clients.contains_key(&NOTIFY_RECEIVER_DENIED.0));
-    let denied_receives = receive_checks(&calls)
-        .into_iter()
-        .filter(is_device_changed_receive)
-        .collect::<Vec<_>>();
-    assert_eq!(denied_receives.len(), 2);
-    assert!(denied_receives.iter().any(|call| {
-        call.receive == Some(EventSubject::Window(ROOT_WINDOW))
-            && call.events == Some(vec![EventDescription::extension(35, 137, 1)])
-            && call.request.is_none()
-    }));
-    assert!(denied_receives.iter().any(|call| {
-        call.receive == Some(EventSubject::Window(CHILD_WINDOW))
-            && call.events == Some(vec![EventDescription::extension(35, 137, 1)])
-            && call.request.is_none()
-    }));
+        );
+        (fixture, device_id)
+    };
+    let act = |fixture: &mut NotifyFixture, device_id: &u16| {
+        assert!(
+            crate::xinput::hotplug::announce_xi2_slave_switch(
+                &mut fixture.state,
+                crate::xinput::DEVICEID_MASTER_POINTER,
+                *device_id,
+            )
+            .is_empty(),
+            "notification denial is not a disconnect"
+        );
+        assert_eq!(
+            fixture
+                .state
+                .xi_last_slave(crate::xinput::DEVICEID_MASTER_POINTER),
+            Some(*device_id),
+            "denying a copy leaves the master switch applied"
+        );
+    };
+    for (name, denied_window) in [
+        ("DeviceChanged root copy denied", ROOT_WINDOW),
+        ("DeviceChanged child copy denied", CHILD_WINDOW),
+    ] {
+        let expect = |device_id: &u16| {
+            let device_id = *device_id;
+            let event = literal_device_changed_event(
+                4,
+                crate::xinput::DEVICEID_MASTER_POINTER,
+                device_id,
+                7,
+                &literal_physical_pointer_classes(device_id, ClientByteOrder::LittleEndian),
+                ClientByteOrder::LittleEndian,
+            );
+            let description = device_changed_description();
+            let root = ExpectedReceive {
+                client: NOTIFY_RECEIVER_DENIED,
+                request: None,
+                subject: EventSubject::Window(ROOT_WINDOW),
+                events: vec![description],
+            };
+            let child = ExpectedReceive {
+                subject: EventSubject::Window(CHILD_WINDOW),
+                ..root.clone()
+            };
+            CaseExpect::new(
+                vec![
+                    Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                    Stream {
+                        client: NOTIFY_RECEIVER_DENIED,
+                        bytes: [event.clone(), event.clone()].concat(),
+                        denied: Some(event),
+                    },
+                    Stream::unchanged(NOTIFY_RECEIVER_ALLOWED, Vec::new()),
+                ],
+                vec![root.clone(), child.clone()],
+                CallOrder::Multiset,
+                vec![if denied_window == ROOT_WINDOW {
+                    root
+                } else {
+                    child
+                }],
+            )
+        };
+        let case = ReceiveCase {
+            name,
+            build: &build,
+            act: &act,
+            expect: &expect,
+        };
+        check_receive_case(&case);
+    }
 }
 
 #[test]
@@ -974,154 +805,90 @@ fn receive_xi_bootstrap_denies_one_master_only() {
     // mutation: pass EventSubject::Global to the bootstrap Receive check
     // mutation: skip the bootstrap Receive check (the explicit-Allow count must fail)
     // mutation: return RequestOutcome::Disconnect from XISelectEvents
-    let (mut allowed, pointer_id, keyboard_id) = bootstrap_device_changed_fixture();
-    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
-    select_device_changed(
-        &mut allowed,
-        NOTIFY_RECEIVER_DENIED,
-        20,
-        ROOT_WINDOW,
-        0, // XIAllDevices
+    let build = || {
+        let (fixture, pointer_id, keyboard_id) = bootstrap_device_changed_fixture();
+        (fixture, (pointer_id, keyboard_id))
+    };
+    let act = |fixture: &mut NotifyFixture, _: &(u16, u16)| {
+        select_device_changed(fixture, NOTIFY_RECEIVER_DENIED, 20, ROOT_WINDOW, 0);
+        assert_eq!(
+            fixture.state.clients[&NOTIFY_RECEIVER_DENIED.0]
+                .xi2_masks
+                .get(&(ROOT_WINDOW, 0)),
+            Some(&u64::from(crate::xinput::XI2_DEVICE_CHANGED_MASK)),
+            "XISelectEvents remains installed in every policy mode"
+        );
+    };
+    // This explicit-Allow execution preserves the original mode of the
+    // Handled-result probe before the runner's no-policy pass.
+    let (mut explicit_allow, explicit_allow_context) = build();
+    explicit_allow.install_policy(|_, _| Decision::Allow);
+    super::access_notify_support::run_with_context(
+        "XISelectEvents bootstrap result",
+        "explicit allow-all",
+        || act(&mut explicit_allow, &explicit_allow_context),
     );
-    let all_allow_wire = allowed.drain(NOTIFY_RECEIVER_DENIED);
-    let all_allow_literal = literal_bootstrap_device_changed_stream(
-        20,
-        pointer_id,
-        keyboard_id,
-        ClientByteOrder::LittleEndian,
-    );
-    assert_eq!(
-        all_allow_wire, all_allow_literal,
-        "explicit-Allow bootstrap control emits both complete literal frames in order"
-    );
-    let allow_receives = receive_checks(&allow_calls)
-        .into_iter()
-        .filter(is_device_changed_receive)
-        .collect::<Vec<_>>();
-    assert_eq!(allow_receives.len(), 2);
-    assert!(allow_receives.iter().all(|call| {
-        call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
-            && call.events == Some(vec![EventDescription::extension(35, 137, 1)])
-            && call.request
-                == Some(RequestOpcodes {
-                    major: 137,
-                    minor: 46,
-                })
-    }));
 
-    let (mut denied, _, denied_keyboard_id) = bootstrap_device_changed_fixture();
-    let matched = Arc::new(AtomicUsize::new(0));
-    let matched_for_policy = Arc::clone(&matched);
-    let calls = denied.install_policy(move |_, call| {
-        if call.hook == ExtensionHook::Receive
-            && call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
-            && is_device_changed_receive(call)
-            && matched_for_policy.fetch_add(1, Ordering::Relaxed) == 0
-        {
-            Decision::Deny(DENY)
-        } else {
-            Decision::Allow
-        }
-    });
-    select_device_changed(
-        &mut denied,
-        NOTIFY_RECEIVER_DENIED,
-        20,
-        ROOT_WINDOW,
-        0, // XIAllDevices
-    );
-    let received_wire = denied.drain(NOTIFY_RECEIVER_DENIED);
-    let expected_keyboard = literal_device_changed_event(
-        20,
-        crate::xinput::DEVICEID_MASTER_KEYBOARD,
-        denied_keyboard_id,
-        1,
-        &literal_keyboard_classes(denied_keyboard_id, ClientByteOrder::LittleEndian),
-        ClientByteOrder::LittleEndian,
-    );
-    assert_eq!(
-        received_wire, expected_keyboard,
-        "keyboard literal frame survives pointer denial"
-    );
-    assert!(denied.state.clients.contains_key(&NOTIFY_RECEIVER_DENIED.0));
-    assert!(crate::core_loop::client_io::failed_writers(&denied.state.clients).is_empty());
-    assert_eq!(
-        denied.state.clients[&NOTIFY_RECEIVER_DENIED.0]
-            .xi2_masks
-            .get(&(ROOT_WINDOW, 0)),
-        Some(&u64::from(crate::xinput::XI2_DEVICE_CHANGED_MASK)),
-        "denial does not undo XISelectEvents"
-    );
-    let receives = receive_checks(&calls)
-        .into_iter()
-        .filter(is_device_changed_receive)
-        .collect::<Vec<_>>();
-    assert_eq!(receives.len(), 2);
-    assert!(receives.iter().all(|call| {
-        call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
-            && call.events == Some(vec![EventDescription::extension(35, 137, 1)])
-            && call.request
-                == Some(RequestOpcodes {
-                    major: 137,
-                    minor: 46,
-                })
-    }));
-
-    let (mut deny_all_events, _, _) = bootstrap_device_changed_fixture();
-    let calls = deny_all_events.install_policy(|_, call| {
-        if call.hook == ExtensionHook::Receive
-            && call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
-            && is_device_changed_receive(call)
-        {
-            Decision::Deny(DENY)
-        } else {
-            Decision::Allow
-        }
-    });
-    select_device_changed(
-        &mut deny_all_events,
-        NOTIFY_RECEIVER_DENIED,
-        20,
-        ROOT_WINDOW,
-        0, // XIAllDevices
-    );
-    assert!(deny_all_events.drain(NOTIFY_RECEIVER_DENIED).is_empty());
-    assert!(
-        deny_all_events
-            .state
-            .clients
-            .contains_key(&NOTIFY_RECEIVER_DENIED.0)
-    );
-    assert!(crate::core_loop::client_io::failed_writers(&deny_all_events.state.clients).is_empty());
-    assert_eq!(
-        deny_all_events.state.clients[&NOTIFY_RECEIVER_DENIED.0]
-            .xi2_masks
-            .get(&(ROOT_WINDOW, 0)),
-        Some(&u64::from(crate::xinput::XI2_DEVICE_CHANGED_MASK))
-    );
-    let receives = receive_checks(&calls)
-        .into_iter()
-        .filter(is_device_changed_receive)
-        .collect::<Vec<_>>();
-    assert_eq!(receives.len(), 2);
-    assert!(receives.iter().all(|call| {
-        call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
-            && call.events == Some(vec![EventDescription::extension(35, 137, 1)])
-            && call.request
-                == Some(RequestOpcodes {
-                    major: 137,
-                    minor: 46,
-                })
-    }));
+    for (name, denied_count, deny_first_only) in [
+        ("bootstrap denies first master copy", 1, true),
+        ("bootstrap denies both master copies", 2, false),
+    ] {
+        let expect = |(pointer_id, keyboard_id): &(u16, u16)| {
+            let event = EventDescription::extension(35, 137, 1);
+            let receive = ExpectedReceive {
+                client: NOTIFY_RECEIVER_DENIED,
+                request: request_opcodes(137, 46),
+                subject: EventSubject::Window(ROOT_WINDOW),
+                events: vec![event],
+            };
+            let allow_bytes = literal_bootstrap_device_changed_stream(
+                20,
+                *pointer_id,
+                *keyboard_id,
+                ClientByteOrder::LittleEndian,
+            );
+            let denied_bytes = if denied_count == 1 {
+                literal_device_changed_event(
+                    20,
+                    crate::xinput::DEVICEID_MASTER_KEYBOARD,
+                    *keyboard_id,
+                    1,
+                    &literal_keyboard_classes(*keyboard_id, ClientByteOrder::LittleEndian),
+                    ClientByteOrder::LittleEndian,
+                )
+            } else {
+                Vec::new()
+            };
+            let mut expectations = CaseExpect::new(
+                vec![
+                    Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                    Stream {
+                        client: NOTIFY_RECEIVER_DENIED,
+                        bytes: allow_bytes,
+                        denied: Some(denied_bytes),
+                    },
+                    Stream::unchanged(NOTIFY_RECEIVER_ALLOWED, Vec::new()),
+                ],
+                vec![receive.clone(), receive.clone()],
+                CallOrder::Total,
+                vec![receive; denied_count],
+            );
+            expectations.deny_first_only = deny_first_only;
+            expectations
+        };
+        let case = ReceiveCase {
+            name,
+            build: &build,
+            act: &act,
+            expect: &expect,
+        };
+        check_receive_case(&case);
+    }
 }
 
 #[test]
 fn receive_xi_device_changed_baseline_frames() {
+    // Focused because it is a byte-only baseline-frame test.
     // mutation: swap the bootstrap master order
     // mutation: hard-code little-endian class encoding at X3 or X4
     let (mut changed, device_id) = hotplug_fixture();
@@ -1281,121 +1048,70 @@ fn receive_xtest_device_changed_checks_root_selectors() {
     let expected_denied = literal_xtest_device_changed_event(0x31, ClientByteOrder::LittleEndian);
     let expected_allowed = literal_xtest_device_changed_event(0x42, ClientByteOrder::BigEndian);
 
-    let no_policy = {
+    let build = || {
         let mut fixture = NotifyFixture::new();
         select_root_recipients(&mut fixture);
-        let disconnected = crate::core_loop::fanout::emit_xi2_device_changed_slave_pointer(
-            &mut fixture.state,
-            137,
-        );
-        assert!(disconnected.is_empty());
-        assert!(crate::core_loop::client_io::failed_writers(&fixture.state.clients).is_empty());
-        assert!(fixture.drain(NOTIFY_SENDER).is_empty());
-        (
-            fixture.drain(NOTIFY_RECEIVER_DENIED),
-            fixture.drain(NOTIFY_RECEIVER_ALLOWED),
-        )
+        (fixture, ())
     };
-    assert_eq!(
-        no_policy.0, expected_denied,
-        "literal no-policy little-endian frame"
-    );
-    assert_eq!(
-        no_policy.1, expected_allowed,
-        "literal no-policy big-endian frame"
-    );
-
-    let mut all_allow = NotifyFixture::new();
-    select_root_recipients(&mut all_allow);
-    let all_allow_calls = all_allow.install_policy(|_, _| Decision::Allow);
-    let disconnected =
-        crate::core_loop::fanout::emit_xi2_device_changed_slave_pointer(&mut all_allow.state, 137);
-    assert!(disconnected.is_empty());
-    assert!(crate::core_loop::client_io::failed_writers(&all_allow.state.clients).is_empty());
-    assert!(all_allow.drain(NOTIFY_SENDER).is_empty());
-    assert_eq!(all_allow.drain(NOTIFY_RECEIVER_DENIED), expected_denied);
-    assert_eq!(all_allow.drain(NOTIFY_RECEIVER_ALLOWED), expected_allowed);
-    let all_allow_receives = receive_checks(&all_allow_calls);
-    assert_eq!(
-        all_allow_receives.len(),
-        2,
-        "one Receive call per ROOT selector"
-    );
-    for recipient in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
-        let recipient_calls = all_allow_receives
-            .iter()
-            .filter(|call| call.client == recipient)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            recipient_calls.len(),
-            1,
-            "one Receive call for {recipient:?}"
+    let act = |fixture: &mut NotifyFixture, _: &()| {
+        assert!(
+            crate::core_loop::fanout::emit_xi2_device_changed_slave_pointer(
+                &mut fixture.state,
+                137,
+            )
+            .is_empty(),
+            "policy denial is not a transport disconnect"
         );
-        assert_eq!(
-            recipient_calls[0].receive,
-            Some(EventSubject::Window(ROOT_WINDOW))
-        );
-        assert_eq!(
-            recipient_calls[0].events,
-            Some(vec![crate::xinput::xi2_event_description(1)])
-        );
-        assert_eq!(recipient_calls[0].request, None);
-    }
-
-    let mut denied = NotifyFixture::new();
-    select_root_recipients(&mut denied);
-    let denied_calls = denied.install_policy(|_, call| {
-        if call.hook == ExtensionHook::Receive
-            && call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Window(ROOT_WINDOW))
-            && call.events.as_ref().is_some_and(|events| {
-                events.as_slice() == [crate::xinput::xi2_event_description(1)]
+    };
+    let expect = |_: &()| {
+        let event = EventDescription::extension(35, 137, 1);
+        let receives = [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED]
+            .into_iter()
+            .map(|client| ExpectedReceive {
+                client,
+                request: None,
+                subject: EventSubject::Window(ROOT_WINDOW),
+                events: vec![event],
             })
-        {
-            Decision::Deny(DENY)
-        } else {
-            Decision::Allow
-        }
-    });
-    let disconnected =
-        crate::core_loop::fanout::emit_xi2_device_changed_slave_pointer(&mut denied.state, 137);
-    assert!(
-        disconnected.is_empty(),
-        "denial is not a transport disconnect"
-    );
-    assert!(crate::core_loop::client_io::failed_writers(&denied.state.clients).is_empty());
-    assert!(denied.drain(NOTIFY_SENDER).is_empty());
-    assert!(
-        denied.drain(NOTIFY_RECEIVER_DENIED).is_empty(),
-        "denied selector gets nothing"
-    );
-    assert_eq!(denied.drain(NOTIFY_RECEIVER_ALLOWED), expected_allowed);
-    let denied_receives = receive_checks(&denied_calls);
-    assert_eq!(
-        denied_receives.len(),
-        2,
-        "one Receive call per ROOT selector"
-    );
-    for recipient in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
-        let recipient_calls = denied_receives
-            .iter()
-            .filter(|call| call.client == recipient)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            recipient_calls.len(),
-            1,
-            "one Receive call for {recipient:?}"
+            .collect();
+        let mut expectations = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: expected_denied.clone(),
+                    denied: Some(Vec::new()),
+                },
+                Stream::unchanged(NOTIFY_RECEIVER_ALLOWED, expected_allowed.clone()),
+            ],
+            receives,
+            CallOrder::Multiset,
+            vec![ExpectedReceive {
+                client: NOTIFY_RECEIVER_DENIED,
+                request: None,
+                subject: EventSubject::Window(ROOT_WINDOW),
+                events: vec![event],
+            }],
         );
-        assert_eq!(
-            recipient_calls[0].receive,
-            Some(EventSubject::Window(ROOT_WINDOW))
-        );
-        assert_eq!(
-            recipient_calls[0].events,
-            Some(vec![crate::xinput::xi2_event_description(1)])
-        );
-        assert_eq!(recipient_calls[0].request, None);
-    }
+        expectations.after_deny = Some(Box::new(|allow, denied| {
+            assert_eq!(
+                allow.state.clients[&NOTIFY_RECEIVER_DENIED.0]
+                    .xi2_masks
+                    .get(&(ROOT_WINDOW, crate::xinput::DEVICEID_XTEST_POINTER)),
+                denied.state.clients[&NOTIFY_RECEIVER_DENIED.0]
+                    .xi2_masks
+                    .get(&(ROOT_WINDOW, crate::xinput::DEVICEID_XTEST_POINTER))
+            );
+        }));
+        expectations
+    };
+    let case = ReceiveCase {
+        name: "XTEST DeviceChanged root selectors",
+        build: &build,
+        act: &act,
+        expect: &expect,
+    };
+    check_receive_case(&case);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1404,13 +1120,6 @@ enum XiMappingRequest {
     SetDeviceModifierMapping,
     SetDeviceButtonMapping,
     ChangeKeyboardDevice,
-}
-
-#[derive(Clone, Debug)]
-enum XiMappingPolicy {
-    None,
-    AllowAll,
-    Deny(Vec<ClientId>),
 }
 
 const MAPPING_ORIGINATOR_SEQUENCE: u16 = 0x31;
@@ -1490,15 +1199,6 @@ fn mapping_device_state(state: &ServerState) -> Vec<(u16, Option<u16>, bool)> {
         .collect()
 }
 
-struct XiMappingRun {
-    outputs: Vec<Vec<u8>>,
-    calls: Vec<RecordedExtensionCheck>,
-    keymap: Option<Vec<u32>>,
-    modifier_mapping: Option<(u8, Vec<u8>)>,
-    button_mapping: Option<Vec<u8>>,
-    device_state: Vec<(u16, Option<u16>, bool)>,
-}
-
 fn select_xi1_class(
     fixture: &mut NotifyFixture,
     client: ClientId,
@@ -1572,32 +1272,7 @@ fn xi_mapping_fixture(request: XiMappingRequest, select_originator: bool) -> Not
     fixture
 }
 
-fn run_xi_mapping_request(
-    request: XiMappingRequest,
-    select_originator: bool,
-    policy: XiMappingPolicy,
-) -> XiMappingRun {
-    let mut fixture = xi_mapping_fixture(request, select_originator);
-    let calls = match policy {
-        XiMappingPolicy::None => None,
-        XiMappingPolicy::AllowAll => Some(fixture.install_policy(|_, _| Decision::Allow)),
-        XiMappingPolicy::Deny(clients) => {
-            let subject = EventSubject::Device(mapping_device(request));
-            let events = vec![mapping_event_description(request)];
-            Some(fixture.install_policy(move |_, call| {
-                if call.hook == ExtensionHook::Receive
-                    && clients.contains(&call.client)
-                    && call.receive == Some(subject)
-                    && call.events.as_ref() == Some(&events)
-                {
-                    Decision::Deny(DENY)
-                } else {
-                    Decision::Allow
-                }
-            }))
-        }
-    };
-
+fn issue_xi_mapping_request(fixture: &mut NotifyFixture, request: XiMappingRequest) {
     let device_state_before = mapping_device_state(&fixture.state);
     fixture.state.clients[&NOTIFY_SENDER.0]
         .last_sequence
@@ -1626,27 +1301,6 @@ fn run_xi_mapping_request(
             device_state, device_state_before,
             "ChangeKeyboardDevice preserves the XI device attachments and enabled state"
         );
-    }
-    let outputs = MAPPING_CLIENTS
-        .into_iter()
-        .map(|client| fixture.drain(client))
-        .collect();
-    let calls = calls.map_or_else(Vec::new, |calls| calls.lock().unwrap().clone());
-    XiMappingRun {
-        outputs,
-        calls,
-        keymap: fixture.state.keymap_overrides.get(&8).cloned(),
-        modifier_mapping: fixture
-            .state
-            .xi1_modifier_map
-            .get(&mapping_device(request))
-            .cloned(),
-        button_mapping: fixture
-            .state
-            .xi1_button_map
-            .get(&mapping_device(request))
-            .cloned(),
-        device_state,
     }
 }
 
@@ -1802,214 +1456,204 @@ fn literal_mapping_stream(
     }
 }
 
-fn mapping_run_output(run: &XiMappingRun, client: ClientId) -> &[u8] {
-    let index = MAPPING_CLIENTS
-        .iter()
-        .position(|candidate| *candidate == client)
-        .expect("mapping fixture client");
-    &run.outputs[index]
-}
-
-fn assert_mapping_receive_calls(
-    calls: &[RecordedExtensionCheck],
+fn expected_mapping_receive(
+    client: ClientId,
     request: XiMappingRequest,
-    clients: &[ClientId],
-    request_opcodes: Option<RequestOpcodes>,
-) {
-    let receives: Vec<_> = calls
-        .iter()
-        .filter(|call| call.hook == ExtensionHook::Receive)
-        .collect();
-    assert_eq!(receives.len(), clients.len());
-    for client in clients {
-        assert!(receives.iter().any(|call| {
-            call.client == *client
-                && call.receive == Some(EventSubject::Device(mapping_device(request)))
-                && call.events == Some(vec![mapping_event_description(request)])
-                && call.request == request_opcodes
-        }));
+    opcodes: Option<RequestOpcodes>,
+) -> ExpectedReceive {
+    ExpectedReceive {
+        client,
+        request: opcodes,
+        subject: EventSubject::Device(mapping_device(request)),
+        events: vec![mapping_event_description(request)],
     }
 }
 
 #[test]
 fn receive_xi_mapping_fanout_device_subject() {
     // mutation: use EventSubject::Global in X5
-    let baseline = run_xi_mapping_request(
-        XiMappingRequest::ChangeDeviceKeyMapping,
-        false,
-        XiMappingPolicy::AllowAll,
-    );
-    for (client, sequence, order) in [
-        (
-            NOTIFY_SENDER,
-            MAPPING_ORIGINATOR_SEQUENCE,
-            ClientByteOrder::LittleEndian,
-        ),
-        (
-            NOTIFY_RECEIVER_DENIED,
-            MAPPING_DENIED_SEQUENCE,
-            ClientByteOrder::BigEndian,
-        ),
-        (
-            NOTIFY_RECEIVER_ALLOWED,
-            MAPPING_ALLOWED_SEQUENCE,
-            ClientByteOrder::LittleEndian,
-        ),
-    ] {
+    let request = XiMappingRequest::ChangeDeviceKeyMapping;
+    let build = || (xi_mapping_fixture(request, false), ());
+    let act = |fixture: &mut NotifyFixture, _: &()| {
+        issue_xi_mapping_request(fixture, request);
         assert_eq!(
-            mapping_run_output(&baseline, client),
-            literal_mapping_stream(
-                XiMappingRequest::ChangeDeviceKeyMapping,
-                client,
-                sequence,
-                order,
-                false,
-            ),
-            "allow control matches literal key-map output for client {}",
-            client.0
+            fixture.state.keymap_overrides.get(&8).map(Vec::as_slice),
+            Some([0x61].as_slice()),
+            "the keymap update remains applied"
         );
-    }
-    assert_eq!(baseline.keymap.as_deref(), Some([0x61].as_slice()));
-    assert_mapping_receive_calls(
-        &baseline.calls,
-        XiMappingRequest::ChangeDeviceKeyMapping,
-        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
-        Some(RequestOpcodes {
-            major: 137,
-            minor: 25,
-        }),
-    );
-
-    let denied = run_xi_mapping_request(
-        XiMappingRequest::ChangeDeviceKeyMapping,
-        false,
-        XiMappingPolicy::Deny(vec![NOTIFY_RECEIVER_DENIED]),
-    );
-    assert_eq!(
-        mapping_run_output(&denied, NOTIFY_RECEIVER_DENIED),
-        literal_mapping_notify(MAPPING_DENIED_SEQUENCE, 1, 8, 1, ClientByteOrder::BigEndian,),
-        "denial drops only the selected DeviceMappingNotify copy"
-    );
-    assert_eq!(
-        mapping_run_output(&denied, NOTIFY_SENDER),
-        literal_mapping_notify(
-            MAPPING_ORIGINATOR_SEQUENCE,
+    };
+    let expect = |_: &()| {
+        let opcodes = request_opcodes(137, 25);
+        let base = MAPPING_CLIENTS
+            .into_iter()
+            .map(|client| {
+                Stream::unchanged(
+                    client,
+                    literal_mapping_stream(
+                        request,
+                        client,
+                        match client {
+                            NOTIFY_SENDER => MAPPING_ORIGINATOR_SEQUENCE,
+                            NOTIFY_RECEIVER_DENIED => MAPPING_DENIED_SEQUENCE,
+                            _ => MAPPING_ALLOWED_SEQUENCE,
+                        },
+                        if client == NOTIFY_RECEIVER_DENIED {
+                            ClientByteOrder::BigEndian
+                        } else {
+                            ClientByteOrder::LittleEndian
+                        },
+                        false,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut streams = base;
+        streams[1].denied = Some(literal_mapping_notify(
+            MAPPING_DENIED_SEQUENCE,
             1,
             8,
             1,
-            ClientByteOrder::LittleEndian,
-        ),
-        "requester receives exactly the core MappingNotify"
-    );
-    assert_eq!(
-        mapping_run_output(&denied, NOTIFY_RECEIVER_ALLOWED),
-        mapping_run_output(&baseline, NOTIFY_RECEIVER_ALLOWED),
-        "allowed recipient stays byte-identical to literal baseline"
-    );
-    assert_eq!(denied.keymap.as_deref(), Some([0x61].as_slice()));
-    assert_eq!(denied.keymap, baseline.keymap);
-    assert_mapping_receive_calls(
-        &denied.calls,
-        XiMappingRequest::ChangeDeviceKeyMapping,
-        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
-        Some(RequestOpcodes {
-            major: 137,
-            minor: 25,
-        }),
-    );
+            ClientByteOrder::BigEndian,
+        ));
+        let receives = vec![
+            expected_mapping_receive(NOTIFY_RECEIVER_DENIED, request, opcodes),
+            expected_mapping_receive(NOTIFY_RECEIVER_ALLOWED, request, opcodes),
+        ];
+        CaseExpect::new(
+            streams,
+            receives.clone(),
+            CallOrder::PerClient,
+            vec![receives[0].clone()],
+        )
+    };
+    check_receive_case(&ReceiveCase {
+        name: "key-map Device subject fanout",
+        build: &build,
+        act: &act,
+        expect: &expect,
+    });
 }
 
 #[test]
 fn receive_xi_mapping_originator_denial_keeps_reply_order() {
     // mutation: skip the check at the button-mapping site only
     // mutation: move X7b's write into the reply buffer
+    // mutation: append X7a's button-map copy before the reply
+    // mutation: move X5's write ahead of the core MappingNotify
     for request in [
         XiMappingRequest::ChangeDeviceKeyMapping,
         XiMappingRequest::SetDeviceModifierMapping,
         XiMappingRequest::SetDeviceButtonMapping,
     ] {
-        let all_allow = run_xi_mapping_request(request, true, XiMappingPolicy::AllowAll);
-        let denied =
-            run_xi_mapping_request(request, true, XiMappingPolicy::Deny(vec![NOTIFY_SENDER]));
         let minor = mapping_request_body(request).0;
-        assert_mapping_receive_calls(
-            &all_allow.calls,
-            request,
-            &MAPPING_CLIENTS,
-            Some(RequestOpcodes { major: 137, minor }),
-        );
-        for (client, sequence, order) in [
-            (
-                NOTIFY_SENDER,
-                MAPPING_ORIGINATOR_SEQUENCE,
-                ClientByteOrder::LittleEndian,
-            ),
-            (
-                NOTIFY_RECEIVER_DENIED,
-                MAPPING_DENIED_SEQUENCE,
-                ClientByteOrder::BigEndian,
-            ),
-            (
-                NOTIFY_RECEIVER_ALLOWED,
-                MAPPING_ALLOWED_SEQUENCE,
-                ClientByteOrder::LittleEndian,
-            ),
-        ] {
-            assert_eq!(
-                mapping_run_output(&all_allow, client),
-                literal_mapping_stream(request, client, sequence, order, true),
-                "all-Allow literal frames for {request:?}, client {}",
-                client.0
-            );
-            let expected_denied = if client == NOTIFY_SENDER {
-                match request {
-                    XiMappingRequest::ChangeDeviceKeyMapping => {
-                        literal_mapping_notify(sequence, 1, 8, 1, order)
-                    }
-                    XiMappingRequest::SetDeviceModifierMapping => [
-                        literal_mapping_notify(sequence, 0, 0, 0, order),
-                        literal_xi1_reply(sequence, 27, 0, order),
-                    ]
-                    .concat(),
-                    XiMappingRequest::SetDeviceButtonMapping => {
-                        literal_xi1_reply(sequence, 0, 0, order)
-                    }
-                    XiMappingRequest::ChangeKeyboardDevice => unreachable!(),
-                }
-            } else {
-                literal_mapping_stream(request, client, sequence, order, true)
-            };
-            assert_eq!(
-                mapping_run_output(&denied, client),
-                expected_denied,
-                "denial removes only the XI copy for {request:?}, client {}",
-                client.0
-            );
-        }
-        match request {
+        let case_name = match request {
             XiMappingRequest::ChangeDeviceKeyMapping => {
-                assert_eq!(denied.keymap.as_deref(), Some([0x61].as_slice()));
-                assert_eq!(denied.keymap, all_allow.keymap);
+                "ChangeDeviceKeyMapping originator denial preserves reply order"
             }
             XiMappingRequest::SetDeviceModifierMapping => {
-                assert_eq!(denied.modifier_mapping, all_allow.modifier_mapping);
-                assert_eq!(
-                    denied.modifier_mapping.as_ref().map(|mapping| mapping.0),
-                    Some(1)
-                );
+                "SetDeviceModifierMapping originator denial preserves reply order"
             }
             XiMappingRequest::SetDeviceButtonMapping => {
-                assert_eq!(denied.button_mapping, all_allow.button_mapping);
-                assert_eq!(denied.button_mapping.as_ref().unwrap()[0], 2);
+                "SetDeviceButtonMapping originator denial preserves reply order"
             }
             XiMappingRequest::ChangeKeyboardDevice => unreachable!(),
-        }
-        assert_mapping_receive_calls(
-            &denied.calls,
-            request,
-            &MAPPING_CLIENTS,
-            Some(RequestOpcodes { major: 137, minor }),
-        );
+        };
+        let build = || (xi_mapping_fixture(request, true), ());
+        let act = |fixture: &mut NotifyFixture, _: &()| {
+            issue_xi_mapping_request(fixture, request);
+            match request {
+                XiMappingRequest::ChangeDeviceKeyMapping => assert_eq!(
+                    fixture.state.keymap_overrides.get(&8).map(Vec::as_slice),
+                    Some([0x61].as_slice())
+                ),
+                XiMappingRequest::SetDeviceModifierMapping => assert_eq!(
+                    fixture.state.xi1_modifier_map[&mapping_device(request)].0,
+                    1
+                ),
+                XiMappingRequest::SetDeviceButtonMapping => {
+                    assert_eq!(fixture.state.xi1_button_map[&mapping_device(request)][0], 2)
+                }
+                XiMappingRequest::ChangeKeyboardDevice => unreachable!(),
+            }
+        };
+        let expect = |_: &()| {
+            let opcodes = request_opcodes(137, minor);
+            let streams = MAPPING_CLIENTS
+                .into_iter()
+                .map(|client| {
+                    let (sequence, order) = match client {
+                        NOTIFY_SENDER => {
+                            (MAPPING_ORIGINATOR_SEQUENCE, ClientByteOrder::LittleEndian)
+                        }
+                        NOTIFY_RECEIVER_DENIED => {
+                            (MAPPING_DENIED_SEQUENCE, ClientByteOrder::BigEndian)
+                        }
+                        _ => (MAPPING_ALLOWED_SEQUENCE, ClientByteOrder::LittleEndian),
+                    };
+                    let bytes = literal_mapping_stream(request, client, sequence, order, true);
+                    let denied = if client == NOTIFY_SENDER {
+                        Some(match request {
+                            XiMappingRequest::ChangeDeviceKeyMapping => {
+                                literal_mapping_notify(sequence, 1, 8, 1, order)
+                            }
+                            XiMappingRequest::SetDeviceModifierMapping => [
+                                literal_mapping_notify(sequence, 0, 0, 0, order),
+                                literal_xi1_reply(sequence, 27, 0, order),
+                            ]
+                            .concat(),
+                            XiMappingRequest::SetDeviceButtonMapping => {
+                                literal_xi1_reply(sequence, 0, 0, order)
+                            }
+                            XiMappingRequest::ChangeKeyboardDevice => unreachable!(),
+                        })
+                    } else {
+                        None
+                    };
+                    Stream {
+                        client,
+                        bytes,
+                        denied,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let receives = MAPPING_CLIENTS
+                .into_iter()
+                .map(|client| expected_mapping_receive(client, request, opcodes))
+                .collect::<Vec<_>>();
+            let mut expectations = CaseExpect::new(
+                streams,
+                receives.clone(),
+                CallOrder::PerClient,
+                vec![receives[0].clone()],
+            );
+            match request {
+                XiMappingRequest::SetDeviceModifierMapping => {
+                    expectations.after_deny = Some(Box::new(|allow, denied| {
+                        assert_eq!(
+                            allow.state.xi1_modifier_map, denied.state.xi1_modifier_map,
+                            "allow-all and deny preserve the complete XI1 modifier map"
+                        );
+                    }));
+                }
+                XiMappingRequest::SetDeviceButtonMapping => {
+                    expectations.after_deny = Some(Box::new(|allow, denied| {
+                        assert_eq!(
+                            allow.state.xi1_button_map, denied.state.xi1_button_map,
+                            "allow-all and deny preserve the complete XI1 button map"
+                        );
+                    }));
+                }
+                XiMappingRequest::ChangeDeviceKeyMapping
+                | XiMappingRequest::ChangeKeyboardDevice => {}
+            }
+            expectations
+        };
+        check_receive_case(&ReceiveCase {
+            name: case_name,
+            build: &build,
+            act: &act,
+            expect: &expect,
+        });
     }
 }
 
@@ -2017,165 +1661,97 @@ fn receive_xi_mapping_originator_denial_keeps_reply_order() {
 fn receive_change_device_notify_originator_denial_keeps_core_mapping() {
     // mutation: leave X6 on the unchecked fanout
     // mutation: route the core MappingNotify through the checked fanout
-    let request = XiMappingRequest::ChangeKeyboardDevice;
-    let all_allow = run_xi_mapping_request(request, true, XiMappingPolicy::AllowAll);
-    let denied = run_xi_mapping_request(
-        request,
-        true,
-        XiMappingPolicy::Deny(vec![NOTIFY_SENDER, NOTIFY_RECEIVER_DENIED]),
-    );
-    assert_mapping_receive_calls(
-        &all_allow.calls,
-        request,
-        &MAPPING_CLIENTS,
-        Some(RequestOpcodes {
-            major: 137,
-            minor: 11,
-        }),
-    );
-    for (client, sequence, order) in [
-        (
-            NOTIFY_SENDER,
-            MAPPING_ORIGINATOR_SEQUENCE,
-            ClientByteOrder::LittleEndian,
-        ),
-        (
-            NOTIFY_RECEIVER_DENIED,
-            MAPPING_DENIED_SEQUENCE,
-            ClientByteOrder::BigEndian,
-        ),
-        (
-            NOTIFY_RECEIVER_ALLOWED,
-            MAPPING_ALLOWED_SEQUENCE,
-            ClientByteOrder::LittleEndian,
-        ),
-    ] {
-        assert_eq!(
-            mapping_run_output(&all_allow, client),
-            literal_mapping_stream(request, client, sequence, order, true),
-            "all-Allow literal ChangeDeviceNotify and core MappingNotify frames"
-        );
-        let expected_denied = if client == NOTIFY_SENDER {
-            [
-                literal_mapping_notify(sequence, 1, 0, 0, order),
-                literal_xi1_reply(sequence, 0, 0, order),
-            ]
-            .concat()
-        } else if client == NOTIFY_RECEIVER_DENIED {
-            literal_mapping_notify(sequence, 1, 0, 0, order)
-        } else {
-            literal_mapping_stream(request, client, sequence, order, true)
-        };
-        assert_eq!(
-            mapping_run_output(&denied, client),
-            expected_denied,
-            "denied ChangeDeviceNotify leaves core MappingNotify and reply"
-        );
-    }
-    assert_eq!(denied.device_state, all_allow.device_state);
-    assert_mapping_receive_calls(
-        &denied.calls,
-        request,
-        &MAPPING_CLIENTS,
-        Some(RequestOpcodes {
-            major: 137,
-            minor: 11,
-        }),
-    );
-    assert!(
-        denied
-            .calls
-            .iter()
-            .filter(|call| call.hook == ExtensionHook::Receive)
-            .all(|call| call.events
-                == Some(vec![EventDescription::extension(
-                    crate::server::XI_FIRST_EVENT + crate::xinput::XI_CHANGE_DEVICE_NOTIFY_OFFSET,
-                    137,
-                    u16::from(crate::xinput::XI_CHANGE_DEVICE_NOTIFY_OFFSET),
-                )]))
-    );
-}
-
-#[test]
-fn receive_xi_mapping_change_baseline_order() {
-    // mutation: append X7a's button-map copy before the reply
     // mutation: give X6 the request's sequence instead of the recipient's
-    // mutation: move X5's write ahead of the core MappingNotify
-    for request in [
-        XiMappingRequest::SetDeviceButtonMapping,
-        XiMappingRequest::ChangeKeyboardDevice,
-        XiMappingRequest::SetDeviceModifierMapping,
-        XiMappingRequest::ChangeDeviceKeyMapping,
-    ] {
-        let run = run_xi_mapping_request(request, true, XiMappingPolicy::None);
-        for (client, sequence, order) in [
-            (
-                NOTIFY_SENDER,
-                MAPPING_ORIGINATOR_SEQUENCE,
-                ClientByteOrder::LittleEndian,
-            ),
-            (
-                NOTIFY_RECEIVER_DENIED,
-                MAPPING_DENIED_SEQUENCE,
-                ClientByteOrder::BigEndian,
-            ),
-            (
-                NOTIFY_RECEIVER_ALLOWED,
-                MAPPING_ALLOWED_SEQUENCE,
-                ClientByteOrder::LittleEndian,
-            ),
-        ] {
+    let request = XiMappingRequest::ChangeKeyboardDevice;
+    let build = || {
+        let fixture = xi_mapping_fixture(request, true);
+        let before = mapping_device_state(&fixture.state);
+        (fixture, before)
+    };
+    let act = |fixture: &mut NotifyFixture, _: &Vec<(u16, Option<u16>, bool)>| {
+        issue_xi_mapping_request(fixture, request);
+    };
+    let expect = |before: &Vec<(u16, Option<u16>, bool)>| {
+        let state_before = before.clone();
+        let opcodes = request_opcodes(137, 11);
+        let mut streams = MAPPING_CLIENTS
+            .into_iter()
+            .map(|client| {
+                let (sequence, order) = match client {
+                    NOTIFY_SENDER => (MAPPING_ORIGINATOR_SEQUENCE, ClientByteOrder::LittleEndian),
+                    NOTIFY_RECEIVER_DENIED => (MAPPING_DENIED_SEQUENCE, ClientByteOrder::BigEndian),
+                    _ => (MAPPING_ALLOWED_SEQUENCE, ClientByteOrder::LittleEndian),
+                };
+                Stream {
+                    client,
+                    bytes: literal_mapping_stream(request, client, sequence, order, true),
+                    denied: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        streams[0].denied = Some(
+            [
+                literal_mapping_notify(
+                    MAPPING_ORIGINATOR_SEQUENCE,
+                    1,
+                    0,
+                    0,
+                    ClientByteOrder::LittleEndian,
+                ),
+                literal_xi1_reply(
+                    MAPPING_ORIGINATOR_SEQUENCE,
+                    0,
+                    0,
+                    ClientByteOrder::LittleEndian,
+                ),
+            ]
+            .concat(),
+        );
+        streams[1].denied = Some(literal_mapping_notify(
+            MAPPING_DENIED_SEQUENCE,
+            1,
+            0,
+            0,
+            ClientByteOrder::BigEndian,
+        ));
+        let receives = MAPPING_CLIENTS
+            .into_iter()
+            .map(|client| expected_mapping_receive(client, request, opcodes))
+            .collect::<Vec<_>>();
+        let mut expectations = CaseExpect::new(
+            streams,
+            receives[..].to_vec(),
+            CallOrder::PerClient,
+            receives[..2].to_vec(),
+        );
+        expectations.after_deny = Some(Box::new(move |allow, denied| {
             assert_eq!(
-                mapping_run_output(&run, client),
-                literal_mapping_stream(request, client, sequence, order, true),
-                "no-policy complete literal stream for {request:?}, client {}",
-                client.0
+                mapping_device_state(&allow.state),
+                mapping_device_state(&denied.state),
+                "allow-all and deny preserve the same complete device snapshot"
             );
-        }
-        assert!(run.calls.is_empty(), "no policy means no Receive calls");
-        match request {
-            XiMappingRequest::ChangeDeviceKeyMapping => {
-                assert_eq!(run.keymap.as_deref(), Some([0x61].as_slice()));
-            }
-            XiMappingRequest::SetDeviceModifierMapping => {
-                assert_eq!(
-                    run.modifier_mapping.as_ref().map(|mapping| mapping.0),
-                    Some(1)
-                );
-            }
-            XiMappingRequest::SetDeviceButtonMapping => {
-                assert_eq!(run.button_mapping.as_ref().unwrap()[0], 2);
-            }
-            XiMappingRequest::ChangeKeyboardDevice => {}
-        }
-    }
+            assert_eq!(
+                mapping_device_state(&denied.state),
+                state_before,
+                "ChangeKeyboardDevice leaves the complete device snapshot unchanged"
+            );
+        }));
+        expectations
+    };
+    check_receive_case(&ReceiveCase {
+        name: "ChangeKeyboardDevice denial preserves core MappingNotify and device snapshot",
+        build: &build,
+        act: &act,
+        expect: &expect,
+    });
 }
 
 #[test]
 fn receive_xi_mapping_after_xkb_change() {
     // mutation: leave X5 on the unchecked fanout
     let request = XiMappingRequest::ChangeDeviceKeyMapping;
-    let run_xkb_notify = |policy: XiMappingPolicy| {
-        let mut fixture = xi_mapping_fixture(request, false);
-        let calls = match policy {
-            XiMappingPolicy::None => None,
-            XiMappingPolicy::AllowAll => Some(fixture.install_policy(|_, _| Decision::Allow)),
-            XiMappingPolicy::Deny(clients) => {
-                let subject = EventSubject::Device(mapping_device(request));
-                let events = vec![mapping_event_description(request)];
-                Some(fixture.install_policy(move |_, call| {
-                    if call.hook == ExtensionHook::Receive
-                        && clients.contains(&call.client)
-                        && call.receive == Some(subject)
-                        && call.events.as_ref() == Some(&events)
-                    {
-                        Decision::Deny(DENY)
-                    } else {
-                        Decision::Allow
-                    }
-                }))
-            }
-        };
+    let build = || (xi_mapping_fixture(request, false), ());
+    let act = |fixture: &mut NotifyFixture, _: &()| {
         let keymap_before = fixture.state.keymap_overrides.clone();
         crate::core_loop::xkb_select::send_legacy_map_notify(
             &mut fixture.state,
@@ -2189,83 +1765,72 @@ fn receive_xi_mapping_after_xkb_change() {
             "server XKB notification does not fail a writer"
         );
         assert_eq!(fixture.state.keymap_overrides, keymap_before);
-        let outputs: Vec<Vec<u8>> = MAPPING_CLIENTS
-            .into_iter()
-            .map(|client| fixture.drain(client))
-            .collect();
-        let calls = calls.map_or_else(Vec::new, |calls| calls.lock().unwrap().clone());
-        (outputs, calls)
     };
-
-    let no_policy = run_xkb_notify(XiMappingPolicy::None);
-    let all_allow = run_xkb_notify(XiMappingPolicy::AllowAll);
-    let denied = run_xkb_notify(XiMappingPolicy::Deny(vec![NOTIFY_RECEIVER_DENIED]));
-    let denied_client_baseline = [
-        literal_mapping_notify(MAPPING_DENIED_SEQUENCE, 1, 8, 1, ClientByteOrder::BigEndian),
-        literal_xi1_mapping_notify(
-            MAPPING_DENIED_SEQUENCE,
-            crate::xinput::DEVICEID_MASTER_KEYBOARD,
-            1,
-            8,
-            1,
-            ClientByteOrder::BigEndian,
-        ),
-    ]
-    .concat();
-    let allowed_client_baseline = [
-        literal_mapping_notify(
-            MAPPING_ALLOWED_SEQUENCE,
-            1,
-            8,
-            1,
-            ClientByteOrder::LittleEndian,
-        ),
-        literal_xi1_mapping_notify(
-            MAPPING_ALLOWED_SEQUENCE,
-            crate::xinput::DEVICEID_MASTER_KEYBOARD,
-            1,
-            8,
-            1,
-            ClientByteOrder::LittleEndian,
-        ),
-    ]
-    .concat();
-    let sender_core_mapping = literal_mapping_notify(0, 1, 8, 1, ClientByteOrder::LittleEndian);
-    let expected_baseline = vec![
-        sender_core_mapping.clone(),
-        denied_client_baseline.clone(),
-        allowed_client_baseline.clone(),
-    ];
-    assert_eq!(
-        no_policy.0, expected_baseline,
-        "complete no-policy XKB streams"
-    );
-    assert_eq!(
-        all_allow.0, expected_baseline,
-        "complete explicit-Allow XKB streams"
-    );
-    assert_eq!(
-        denied.0,
-        vec![
-            sender_core_mapping,
-            literal_mapping_notify(MAPPING_DENIED_SEQUENCE, 1, 8, 1, ClientByteOrder::BigEndian,),
-            allowed_client_baseline,
-        ],
-        "denial removes only A's XI copy while all clients keep core MappingNotify"
-    );
-
-    assert_mapping_receive_calls(
-        &all_allow.1,
-        request,
-        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
-        None,
-    );
-    assert_mapping_receive_calls(
-        &denied.1,
-        request,
-        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
-        None,
-    );
+    let expect = |_: &()| {
+        let sender_core_mapping = literal_mapping_notify(0, 1, 8, 1, ClientByteOrder::LittleEndian);
+        let denied_full = [
+            literal_mapping_notify(MAPPING_DENIED_SEQUENCE, 1, 8, 1, ClientByteOrder::BigEndian),
+            literal_xi1_mapping_notify(
+                MAPPING_DENIED_SEQUENCE,
+                mapping_device(request),
+                1,
+                8,
+                1,
+                ClientByteOrder::BigEndian,
+            ),
+        ]
+        .concat();
+        let allowed_full = [
+            literal_mapping_notify(
+                MAPPING_ALLOWED_SEQUENCE,
+                1,
+                8,
+                1,
+                ClientByteOrder::LittleEndian,
+            ),
+            literal_xi1_mapping_notify(
+                MAPPING_ALLOWED_SEQUENCE,
+                mapping_device(request),
+                1,
+                8,
+                1,
+                ClientByteOrder::LittleEndian,
+            ),
+        ]
+        .concat();
+        let receives = [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED]
+            .into_iter()
+            .map(|client| expected_mapping_receive(client, request, None))
+            .collect::<Vec<_>>();
+        let mut expectations = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, sender_core_mapping),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: denied_full,
+                    denied: Some(literal_mapping_notify(
+                        MAPPING_DENIED_SEQUENCE,
+                        1,
+                        8,
+                        1,
+                        ClientByteOrder::BigEndian,
+                    )),
+                },
+                Stream::unchanged(NOTIFY_RECEIVER_ALLOWED, allowed_full),
+            ],
+            receives.clone(),
+            CallOrder::PerClient,
+            vec![receives[0].clone()],
+        );
+        expectations.deny_before_allow = true;
+        expectations
+    };
+    check_receive_case(&ReceiveCase {
+        name: "server XKB MappingNotify Receive check",
+        build: &build,
+        act: &act,
+        expect: &expect,
+    });
 }
 
 const XI_PROPERTY_DEVICE_ID: u16 = crate::xinput::DEVICEID_XTEST_POINTER;
@@ -2273,13 +1838,6 @@ const XI_PROPERTY_REQUEST_SEQUENCE: u16 = 0x31;
 const XI_PROPERTY_DENIED_SEQUENCE: u16 = 0x42;
 const XI_PROPERTY_ALLOWED_SEQUENCE: u16 = 0x53;
 const XI_PROPERTY_VALUE: [u8; 1] = [0x5a];
-
-#[derive(Clone, Copy)]
-enum XiPropertyPolicy {
-    None,
-    AllowAll,
-    Deny(EventDescription),
-}
 
 fn select_xi2_property_event(fixture: &mut NotifyFixture, client: ClientId, sequence: u16) {
     let body = super::xi2_grabs::xi_dynamic_select_events_body(
@@ -2424,28 +1982,7 @@ fn literal_xi_property_stream(
     .concat()
 }
 
-fn run_xi_property_change(
-    policy: XiPropertyPolicy,
-) -> (Vec<u8>, Vec<u8>, Vec<RecordedExtensionCheck>, AtomId) {
-    let (mut fixture, property) = xi_property_notification_fixture(true);
-    let calls = match policy {
-        XiPropertyPolicy::None => None,
-        XiPropertyPolicy::AllowAll => Some(fixture.install_policy(|_, _| Decision::Allow)),
-        XiPropertyPolicy::Deny(description) => {
-            let events = vec![description];
-            Some(fixture.install_policy(move |_, call| {
-                if call.hook == ExtensionHook::Receive
-                    && call.client == NOTIFY_RECEIVER_DENIED
-                    && call.receive == Some(EventSubject::Device(XI_PROPERTY_DEVICE_ID))
-                    && call.events.as_ref() == Some(&events)
-                {
-                    Decision::Deny(DENY)
-                } else {
-                    Decision::Allow
-                }
-            }))
-        }
-    };
+fn issue_xi_property_change(fixture: &mut NotifyFixture, property: AtomId) {
     let body = xi2_change_property_body(
         XI_PROPERTY_DEVICE_ID,
         crate::xinput::XI_PROP_MODE_REPLACE,
@@ -2496,214 +2033,167 @@ fn run_xi_property_change(
             .clients
             .contains_key(&NOTIFY_RECEIVER_ALLOWED.0)
     );
-
-    let denied = fixture.drain(NOTIFY_RECEIVER_DENIED);
-    let allowed = fixture.drain(NOTIFY_RECEIVER_ALLOWED);
-    let calls = calls.map_or_else(Vec::new, |calls| calls.lock().unwrap().clone());
-    (denied, allowed, calls, property)
-}
-
-fn assert_xi_property_receive_calls(calls: &[RecordedExtensionCheck]) {
-    let receives: Vec<_> = calls
-        .iter()
-        .filter(|call| call.hook == ExtensionHook::Receive)
-        .collect();
-    let descriptions = xi_property_event_descriptions();
-    assert_eq!(receives.len(), 4, "one check per form for both recipients");
-    for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
-        for description in descriptions {
-            assert_eq!(
-                receives
-                    .iter()
-                    .filter(|call| {
-                        call.client == client
-                            && call.receive == Some(EventSubject::Device(XI_PROPERTY_DEVICE_ID))
-                            && call.events.as_deref() == Some(std::slice::from_ref(&description))
-                    })
-                    .count(),
-                1,
-                "one matching Receive check for client {} and {description:?}",
-                client.0
-            );
-        }
-    }
-    assert!(receives.iter().all(|call| {
-        call.request
-            == Some(RequestOpcodes {
-                major: 137,
-                minor: 57,
-            })
-    }));
 }
 
 #[test]
 fn receive_xi_property_forms_checked_independently() {
     // mutation: skip the check on the XI1 path (X10)
-    let allow_all = run_xi_property_change(XiPropertyPolicy::AllowAll);
-    let property = allow_all.3;
-    let denied_baseline = literal_xi_property_stream(
-        XI_PROPERTY_DENIED_SEQUENCE,
-        XI_PROPERTY_DEVICE_ID,
-        property,
-        ClientByteOrder::BigEndian,
-    );
-    let allowed_baseline = literal_xi_property_stream(
-        XI_PROPERTY_ALLOWED_SEQUENCE,
-        XI_PROPERTY_DEVICE_ID,
-        property,
-        ClientByteOrder::LittleEndian,
-    );
-    let deny_xi2 = run_xi_property_change(XiPropertyPolicy::Deny(EventDescription::extension(
-        35, 137, 12,
-    )));
-    assert_eq!(
-        deny_xi2.0,
-        literal_xi1_property_event(
-            XI_PROPERTY_DENIED_SEQUENCE,
-            XI_PROPERTY_DEVICE_ID,
-            deny_xi2.3,
-            ClientByteOrder::BigEndian,
-        ),
-        "XI1 literal copy remains after denying XI2"
-    );
-    assert_eq!(
-        deny_xi2.1,
-        literal_xi_property_stream(
-            XI_PROPERTY_ALLOWED_SEQUENCE,
-            XI_PROPERTY_DEVICE_ID,
-            deny_xi2.3,
-            ClientByteOrder::LittleEndian,
-        ),
-        "allowed recipient keeps both literal copies"
-    );
-    assert_xi_property_receive_calls(&deny_xi2.2);
-
-    let deny_xi1 = run_xi_property_change(XiPropertyPolicy::Deny(EventDescription::extension(
-        crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET,
-        137,
-        u16::from(crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET),
-    )));
-    assert_eq!(
-        deny_xi1.0,
-        literal_xi2_property_event(
-            XI_PROPERTY_DENIED_SEQUENCE,
-            XI_PROPERTY_DEVICE_ID,
-            deny_xi1.3,
-            1,
-            ClientByteOrder::BigEndian,
-        ),
-        "XI2 literal copy remains after denying XI1"
-    );
-    assert_eq!(
-        deny_xi1.1,
-        literal_xi_property_stream(
-            XI_PROPERTY_ALLOWED_SEQUENCE,
-            XI_PROPERTY_DEVICE_ID,
-            deny_xi1.3,
-            ClientByteOrder::LittleEndian,
-        ),
-        "allowed recipient keeps both literal copies"
-    );
-    assert_xi_property_receive_calls(&deny_xi1.2);
-
-    assert_eq!(
-        allow_all.0, denied_baseline,
-        "all-Allow literal stream for A"
-    );
-    assert_eq!(
-        allow_all.1, allowed_baseline,
-        "all-Allow literal stream for B"
-    );
-    assert_xi_property_receive_calls(&allow_all.2);
-}
-
-#[test]
-fn receive_xi_property_baseline_order() {
     // mutation: swap the X9 and X10 blocks
-    let run = run_xi_property_change(XiPropertyPolicy::None);
-    let property = run.3;
-    assert_eq!(
-        run.0,
-        literal_xi_property_stream(
-            XI_PROPERTY_DENIED_SEQUENCE,
-            XI_PROPERTY_DEVICE_ID,
-            property,
-            ClientByteOrder::BigEndian,
-        ),
-        "complete no-policy XI2 then XI1 stream for A"
-    );
-    assert_eq!(
-        run.1,
-        literal_xi_property_stream(
-            XI_PROPERTY_ALLOWED_SEQUENCE,
-            XI_PROPERTY_DEVICE_ID,
-            property,
-            ClientByteOrder::LittleEndian,
-        ),
-        "complete no-policy XI2 then XI1 stream for B"
-    );
-    assert!(run.2.is_empty(), "empty policy list means no policy calls");
+    let descriptions = xi_property_event_descriptions();
+    for (name, denied_form) in [
+        ("XI2 PropertyEvent denial", 0_usize),
+        ("XI1 DevicePropertyNotify denial", 1_usize),
+    ] {
+        let build = || xi_property_notification_fixture(true);
+        let act = |fixture: &mut NotifyFixture, property: &AtomId| {
+            issue_xi_property_change(fixture, *property);
+        };
+        let expect = |property: &AtomId| {
+            let receives = [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED]
+                .into_iter()
+                .flat_map(|client| {
+                    descriptions.map(|description| ExpectedReceive {
+                        client,
+                        request: request_opcodes(137, 57),
+                        subject: EventSubject::Device(XI_PROPERTY_DEVICE_ID),
+                        events: vec![description],
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut streams = vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: literal_xi_property_stream(
+                        XI_PROPERTY_DENIED_SEQUENCE,
+                        XI_PROPERTY_DEVICE_ID,
+                        *property,
+                        ClientByteOrder::BigEndian,
+                    ),
+                    denied: None,
+                },
+                Stream::unchanged(
+                    NOTIFY_RECEIVER_ALLOWED,
+                    literal_xi_property_stream(
+                        XI_PROPERTY_ALLOWED_SEQUENCE,
+                        XI_PROPERTY_DEVICE_ID,
+                        *property,
+                        ClientByteOrder::LittleEndian,
+                    ),
+                ),
+            ];
+            streams[1].denied = Some(if denied_form == 0 {
+                literal_xi1_property_event(
+                    XI_PROPERTY_DENIED_SEQUENCE,
+                    XI_PROPERTY_DEVICE_ID,
+                    *property,
+                    ClientByteOrder::BigEndian,
+                )
+            } else {
+                literal_xi2_property_event(
+                    XI_PROPERTY_DENIED_SEQUENCE,
+                    XI_PROPERTY_DEVICE_ID,
+                    *property,
+                    1,
+                    ClientByteOrder::BigEndian,
+                )
+            });
+            let mut expectations = CaseExpect::new(
+                streams,
+                receives.clone(),
+                CallOrder::Multiset,
+                vec![receives[denied_form].clone()],
+            );
+            expectations.deny_before_allow = true;
+            expectations
+        };
+        check_receive_case(&ReceiveCase {
+            name,
+            build: &build,
+            act: &act,
+            expect: &expect,
+        });
+    }
 }
 
 #[test]
 fn receive_xi_property_denial_is_not_disconnect() {
     // mutation: push denied clients into the returned vector
-    let (mut fixture, property) = xi_property_notification_fixture(false);
-    super::seed_one_prop(
-        &mut fixture.state,
-        property.0,
-        8,
-        XI_PROPERTY_VALUE.to_vec(),
-    );
     let descriptions = xi_property_event_descriptions();
-    let calls = fixture.install_policy(|_, call| {
-        if call.hook == ExtensionHook::Receive {
-            Decision::Deny(DENY)
-        } else {
-            Decision::Allow
-        }
-    });
-    let disconnected = crate::core_loop::process_request::props::emit_property_change(
-        &mut fixture.state,
-        XI_PROPERTY_DEVICE_ID,
-        property,
-        crate::xinput::PropWhat::Modified,
-    );
-    assert!(disconnected.is_empty(), "policy denial is not a disconnect");
-    assert!(fixture.drain(NOTIFY_RECEIVER_DENIED).is_empty());
-    assert!(fixture.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
-    assert!(
-        fixture
-            .state
-            .clients
-            .contains_key(&NOTIFY_RECEIVER_DENIED.0)
-    );
-    assert!(crate::core_loop::client_io::failed_writers(&fixture.state.clients).is_empty());
-    assert_eq!(
-        fixture
-            .state
-            .xi_devices
-            .device(XI_PROPERTY_DEVICE_ID)
-            .unwrap()
-            .properties[&property]
-            .data,
-        XI_PROPERTY_VALUE,
-        "direct emission publishes an already-applied change"
-    );
-    let receives = receive_checks(&calls);
-    assert_eq!(receives.len(), 2);
-    assert!(receives.iter().all(|call| {
-        call.client == NOTIFY_RECEIVER_DENIED
-            && call.receive == Some(EventSubject::Device(XI_PROPERTY_DEVICE_ID))
-            && call.request.is_none()
-    }));
-    for description in descriptions {
-        assert_eq!(
-            receives
-                .iter()
-                .filter(|call| call.events.as_deref() == Some(std::slice::from_ref(&description)))
-                .count(),
-            1
+    let build = || {
+        let (mut fixture, property) = xi_property_notification_fixture(false);
+        super::seed_one_prop(
+            &mut fixture.state,
+            property.0,
+            8,
+            XI_PROPERTY_VALUE.to_vec(),
         );
-    }
+        (fixture, property)
+    };
+    let act = |fixture: &mut NotifyFixture, property: &AtomId| {
+        let disconnected = crate::core_loop::process_request::props::emit_property_change(
+            &mut fixture.state,
+            XI_PROPERTY_DEVICE_ID,
+            *property,
+            crate::xinput::PropWhat::Modified,
+        );
+        assert!(disconnected.is_empty(), "policy denial is not a disconnect");
+        assert_eq!(
+            fixture
+                .state
+                .xi_devices
+                .device(XI_PROPERTY_DEVICE_ID)
+                .unwrap()
+                .properties[property]
+                .data,
+            XI_PROPERTY_VALUE,
+            "direct emission preserves the applied property"
+        );
+    };
+    let expect = |property: &AtomId| {
+        let receives = descriptions
+            .into_iter()
+            .map(|description| ExpectedReceive {
+                client: NOTIFY_RECEIVER_DENIED,
+                request: None,
+                subject: EventSubject::Device(XI_PROPERTY_DEVICE_ID),
+                events: vec![description],
+            })
+            .collect::<Vec<_>>();
+        CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: [
+                        literal_xi2_property_event(
+                            XI_PROPERTY_DENIED_SEQUENCE,
+                            XI_PROPERTY_DEVICE_ID,
+                            *property,
+                            2,
+                            ClientByteOrder::BigEndian,
+                        ),
+                        literal_xi1_property_event(
+                            XI_PROPERTY_DENIED_SEQUENCE,
+                            XI_PROPERTY_DEVICE_ID,
+                            *property,
+                            ClientByteOrder::BigEndian,
+                        ),
+                    ]
+                    .concat(),
+                    denied: Some(Vec::new()),
+                },
+                Stream::unchanged(NOTIFY_RECEIVER_ALLOWED, Vec::new()),
+            ],
+            receives.clone(),
+            CallOrder::Multiset,
+            receives,
+        )
+    };
+    check_receive_case(&ReceiveCase {
+        name: "property denial is not a disconnect",
+        build: &build,
+        act: &act,
+        expect: &expect,
+    });
 }
