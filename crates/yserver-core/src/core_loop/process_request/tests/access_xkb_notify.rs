@@ -25,7 +25,15 @@ use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
 
 const XKB_EVENT_BASE: u8 = 85;
 const XKB_MAJOR_OPCODE: u8 = 136;
-const XKB_EVENT_DESCRIPTION: EventDescription = EventDescription::extension(85, 136, 0);
+const XKB_NEW_KEYBOARD_NOTIFY_TYPE: u8 = 0;
+const XKB_MAP_NOTIFY_TYPE: u8 = 1;
+const XKB_STATE_NOTIFY_TYPE: u8 = 2;
+const XKB_CONTROLS_NOTIFY_TYPE: u8 = 3;
+const XKB_INDICATOR_STATE_NOTIFY_TYPE: u8 = 4;
+const XKB_INDICATOR_MAP_NOTIFY_TYPE: u8 = 5;
+const XKB_NAMES_NOTIFY_TYPE: u8 = 6;
+const XKB_COMPAT_MAP_NOTIFY_TYPE: u8 = 7;
+const XKB_EXTENSION_DEVICE_NOTIFY_TYPE: u8 = 11;
 const STATE_DETAILS: u16 = 0x3fff;
 const REPEAT_KEYS_MASK: u32 = 1;
 const PER_KEY_REPEAT_MASK: u32 = 1 << 30;
@@ -45,6 +53,16 @@ const XKB_SET_INDICATOR_MAP_BODY: [u8; 8] = [0x00, 0x01, 0, 0, 0, 0, 0, 0];
 const XKB_SET_NAMES_BODY: [u8; 24] = [
     0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
+
+fn xkb_event_description_for_test(xkb_type: u8) -> EventDescription {
+    EventDescription::extension(XKB_EVENT_BASE, XKB_MAJOR_OPCODE, u16::from(xkb_type))
+}
+
+fn recorded_xkb_type(check: &RecordedExtensionCheck, xkb_types: &[u8]) -> bool {
+    xkb_types
+        .iter()
+        .any(|xkb_type| check.events == Some(vec![xkb_event_description_for_test(*xkb_type)]))
+}
 const DENY: DenyError = DenyError {
     code: yserver_protocol::x11::error::BAD_ACCESS,
     value: 0,
@@ -374,7 +392,10 @@ fn run_xkb_kbd_by_name(
                 && check.hook == ExtensionHook::Receive
                 && check.client == NOTIFY_RECEIVER_DENIED
                 && check.receive == Some(EventSubject::Device(1))
-                && check.events == Some(vec![XKB_EVENT_DESCRIPTION])
+                && check.events
+                    == Some(vec![xkb_event_description_for_test(
+                        XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+                    )])
             {
                 Decision::Deny(DENY)
             } else {
@@ -681,6 +702,7 @@ fn assert_receive_calls(
     calls: &Arc<Mutex<Vec<RecordedExtensionCheck>>>,
     clients: &[ClientId],
     request: Option<RequestOpcodes>,
+    xkb_type: u8,
 ) {
     let log = receive_log(calls);
     assert_receive_calls_with_requests(
@@ -688,6 +710,7 @@ fn assert_receive_calls(
         clients,
         &vec![request; clients.len()],
         EventSubject::Device(1),
+        &vec![xkb_type; clients.len()],
     );
 }
 
@@ -696,6 +719,7 @@ fn assert_receive_calls_with_requests(
     clients: &[ClientId],
     requests: &[Option<RequestOpcodes>],
     subject: EventSubject,
+    xkb_types: &[u8],
 ) {
     let receives: Vec<_> = calls
         .iter()
@@ -703,16 +727,21 @@ fn assert_receive_calls_with_requests(
         .collect();
     assert_eq!(receives.len(), clients.len(), "whole-log Receive count");
     assert_eq!(requests.len(), clients.len(), "expected request contexts");
+    assert_eq!(xkb_types.len(), clients.len(), "expected per-event xkbType");
     assert!(
         calls.iter().all(|call| call.hook != ExtensionHook::Send),
         "server-generated notifications run Receive without Send"
     );
-    for ((call, client), request) in receives.iter().zip(clients).zip(requests) {
+    for (((call, client), request), xkb_type) in
+        receives.iter().zip(clients).zip(requests).zip(xkb_types)
+    {
         assert_eq!(call.client, *client);
         assert_eq!(call.receive, Some(subject));
+        // Mutation: make xkb_event_description ignore xkbType and return 0;
+        // every nonzero per-event expectation here must fail.
         assert_eq!(
             call.events,
-            Some(vec![EventDescription::extension(85, 136, 0)])
+            Some(vec![xkb_event_description_for_test(*xkb_type)])
         );
         assert_eq!(call.request, *request);
     }
@@ -721,12 +750,13 @@ fn assert_receive_calls_with_requests(
 fn install_deny_for(
     fixture: &mut NotifyFixture,
     client: ClientId,
+    xkb_types: Vec<u8>,
 ) -> Arc<Mutex<Vec<RecordedExtensionCheck>>> {
     fixture.install_policy(move |_, check| {
         if check.hook == ExtensionHook::Receive
             && check.client == client
             && check.receive == Some(EventSubject::Device(1))
-            && check.events == Some(vec![XKB_EVENT_DESCRIPTION])
+            && recorded_xkb_type(check, &xkb_types)
         {
             Decision::Deny(DENY)
         } else {
@@ -1128,6 +1158,7 @@ fn assert_single_xkb_notification_denied(
     sequence: u16,
     minor: u8,
     expected_request: Option<RequestOpcodes>,
+    xkb_type: u8,
     body: &[u8],
     event: XkbSetEvent,
     expected_frame: impl Fn(u16) -> Vec<u8>,
@@ -1138,7 +1169,7 @@ fn assert_single_xkb_notification_denied(
     ];
     let mut denied = indicator_fixture(&selections);
     seed_request_xkb_snapshots(&mut denied);
-    let calls = install_deny_for(&mut denied, NOTIFY_RECEIVER_DENIED);
+    let calls = install_deny_for(&mut denied, NOTIFY_RECEIVER_DENIED, vec![xkb_type]);
     drive_scripted_xkb_set(&mut denied, sequence, minor, body, vec![event.clone()]);
     assert!(denied.drain(NOTIFY_RECEIVER_DENIED).is_empty());
     assert_eq!(
@@ -1149,6 +1180,7 @@ fn assert_single_xkb_notification_denied(
         &calls,
         &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
         expected_request,
+        xkb_type,
     );
     let mut allowed = indicator_fixture(&selections);
     seed_request_xkb_snapshots(&mut allowed);
@@ -1166,6 +1198,7 @@ fn assert_single_xkb_notification_denied(
         &allow_calls,
         &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
         expected_request,
+        xkb_type,
     );
     assert_xkb_notification_effects_match(&denied, &allowed);
     assert_no_writer_failures(&denied);
@@ -1243,12 +1276,16 @@ fn receive_xkb_state_no_policy_bytes() {
     assert_no_writer_failures(&fixture);
 }
 
-// Mutations: leave K11 unchecked, use EventSubject::Global, or describe the
-// xkbType byte as the event type; each must invalidate the denial/log checks.
+// Mutation: leave K11 unchecked, use EventSubject::Global, or force
+// xkb_event_description to return type 0; each must invalidate the denial/log checks.
 #[test]
 fn receive_xkb_state_denied_one_recipient() {
     let mut denied = notify_fixture(STATE_DETAILS, 0);
-    let calls = install_deny_for(&mut denied, NOTIFY_RECEIVER_DENIED);
+    let calls = install_deny_for(
+        &mut denied,
+        NOTIFY_RECEIVER_DENIED,
+        vec![XKB_STATE_NOTIFY_TYPE],
+    );
     drive_latch_lock(&mut denied);
     assert_eq!(denied.drain(NOTIFY_RECEIVER_DENIED), Vec::<u8>::new());
     assert_eq!(
@@ -1259,6 +1296,7 @@ fn receive_xkb_state_denied_one_recipient() {
         &calls,
         &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
         request_opcodes(136, 5),
+        XKB_STATE_NOTIFY_TYPE,
     );
     let denied_effect = (denied.backend.xkb_mods, denied.state.xkb_announced);
 
@@ -1277,6 +1315,7 @@ fn receive_xkb_state_denied_one_recipient() {
         &allow_calls,
         &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
         request_opcodes(136, 5),
+        XKB_STATE_NOTIFY_TYPE,
     );
     assert_eq!(
         denied_effect.0, allowed.backend.xkb_mods,
@@ -1307,6 +1346,7 @@ fn receive_xkb_state_denied_snapshot_advances() {
         &calls,
         &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
         request_opcodes(136, 5),
+        XKB_STATE_NOTIFY_TYPE,
     );
     let denied_effect = (denied.backend.xkb_mods, denied.state.xkb_announced);
     assert_eq!(denied.state.xkb_announced, (0, (0x10, 0, 0, 0x10)));
@@ -1326,6 +1366,7 @@ fn receive_xkb_state_denied_snapshot_advances() {
         &allow_calls,
         &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
         request_opcodes(136, 5),
+        XKB_STATE_NOTIFY_TYPE,
     );
     assert_eq!(denied_effect.0, allowed.backend.xkb_mods);
     assert_eq!(denied_effect.1, allowed.state.xkb_announced);
@@ -1366,6 +1407,7 @@ fn receive_xkb_state_from_key_has_no_request() {
         &calls,
         &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
         None,
+        XKB_STATE_NOTIFY_TYPE,
     );
     assert_no_writer_failures(&fixture);
 }
@@ -1375,7 +1417,11 @@ fn receive_xkb_state_from_key_has_no_request() {
 #[test]
 fn receive_xkb_controls_denied_one_recipient() {
     let mut denied = notify_fixture(0, REPEAT_KEYS_MASK);
-    let calls = install_deny_for(&mut denied, NOTIFY_RECEIVER_DENIED);
+    let calls = install_deny_for(
+        &mut denied,
+        NOTIFY_RECEIVER_DENIED,
+        vec![XKB_CONTROLS_NOTIFY_TYPE],
+    );
     drive_set_controls(&mut denied);
     assert_eq!(denied.drain(NOTIFY_RECEIVER_DENIED), Vec::<u8>::new());
     assert_eq!(
@@ -1386,6 +1432,7 @@ fn receive_xkb_controls_denied_one_recipient() {
         &calls,
         &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
         request_opcodes(136, 7),
+        XKB_CONTROLS_NOTIFY_TYPE,
     );
     let denied_effect = (
         denied.state.keyboard_control.global_auto_repeat,
@@ -1409,6 +1456,7 @@ fn receive_xkb_controls_denied_one_recipient() {
         &allow_calls,
         &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
         request_opcodes(136, 7),
+        XKB_CONTROLS_NOTIFY_TYPE,
     );
     assert_eq!(
         denied_effect,
@@ -1428,7 +1476,11 @@ fn receive_xkb_controls_denied_one_recipient() {
 #[test]
 fn receive_xkb_per_key_repeat_denied() {
     let mut denied = notify_fixture(0, PER_KEY_REPEAT_MASK);
-    let calls = install_deny_for(&mut denied, NOTIFY_RECEIVER_DENIED);
+    let calls = install_deny_for(
+        &mut denied,
+        NOTIFY_RECEIVER_DENIED,
+        vec![XKB_CONTROLS_NOTIFY_TYPE],
+    );
     drive_set_per_key_repeat(&mut denied);
     assert_eq!(denied.drain(NOTIFY_RECEIVER_DENIED), Vec::<u8>::new());
     assert_eq!(
@@ -1439,6 +1491,7 @@ fn receive_xkb_per_key_repeat_denied() {
         &calls,
         &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
         request_opcodes(136, 9),
+        XKB_CONTROLS_NOTIFY_TYPE,
     );
     let repeat_bit = 1u8 << (REPEAT_KEYCODE & 7);
     let repeat_byte = usize::from(REPEAT_KEYCODE >> 3);
@@ -1463,6 +1516,7 @@ fn receive_xkb_per_key_repeat_denied() {
         &allow_calls,
         &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
         request_opcodes(136, 9),
+        XKB_CONTROLS_NOTIFY_TYPE,
     );
     assert_eq!(
         denied_effect,
@@ -1515,6 +1569,14 @@ fn receive_xkb_state_allow_control() {
             request_opcodes(136, 9),
         ],
         EventSubject::Device(1),
+        &[
+            XKB_STATE_NOTIFY_TYPE,
+            XKB_STATE_NOTIFY_TYPE,
+            XKB_CONTROLS_NOTIFY_TYPE,
+            XKB_CONTROLS_NOTIFY_TYPE,
+            XKB_CONTROLS_NOTIFY_TYPE,
+            XKB_CONTROLS_NOTIFY_TYPE,
+        ],
     );
 }
 
@@ -1744,6 +1806,7 @@ fn receive_xkb_kbd_by_name_all_clients() {
         &receive_order,
         &[request_opcodes(XKB_MAJOR_OPCODE, 23); 3],
         EventSubject::Device(1),
+        &[XKB_NEW_KEYBOARD_NOTIFY_TYPE; 3],
     );
 
     let (allowed, allow_calls, allow_order, allow_cleared) = run_xkb_kbd_by_name(true, false);
@@ -1777,6 +1840,7 @@ fn receive_xkb_kbd_by_name_all_clients() {
         &allow_order,
         &[request_opcodes(XKB_MAJOR_OPCODE, 23); 3],
         EventSubject::Device(1),
+        &[XKB_NEW_KEYBOARD_NOTIFY_TYPE; 3],
     );
 }
 
@@ -1794,7 +1858,11 @@ fn receive_xkb_rules_change_denies_new_keyboard_and_map() {
     let backend = std::mem::take(&mut denied.backend);
     denied.backend = backend.with_keymap_rmlvo_result((8, 255));
     denied.state.keymap_overrides.insert(38, vec![0x0071]);
-    let calls = install_deny_for(&mut denied, NOTIFY_RECEIVER_DENIED);
+    let calls = install_deny_for(
+        &mut denied,
+        NOTIFY_RECEIVER_DENIED,
+        vec![XKB_NEW_KEYBOARD_NOTIFY_TYPE, XKB_MAP_NOTIFY_TYPE],
+    );
     assert!(matches!(
         drive_rules_names_change(&mut denied, REQUEST_SEQUENCE, b"evdev\0pc105\0de\0\0\0"),
         RequestOutcome::Handled
@@ -1834,6 +1902,14 @@ fn receive_xkb_rules_change_denies_new_keyboard_and_map() {
             request_opcodes(18, 0),
         ],
         EventSubject::Device(1),
+        &[
+            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+            XKB_MAP_NOTIFY_TYPE,
+            XKB_MAP_NOTIFY_TYPE,
+            XKB_MAP_NOTIFY_TYPE,
+        ],
     );
     let denied_overrides = denied.state.keymap_overrides.clone();
     assert!(
@@ -1884,6 +1960,14 @@ fn receive_xkb_rules_change_denies_new_keyboard_and_map() {
             request_opcodes(18, 0),
         ],
         EventSubject::Device(1),
+        &[
+            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+            XKB_MAP_NOTIFY_TYPE,
+            XKB_MAP_NOTIFY_TYPE,
+            XKB_MAP_NOTIFY_TYPE,
+        ],
     );
     assert_eq!(denied_overrides, allowed.state.keymap_overrides);
     assert_no_writer_failures(&allowed);
@@ -1913,7 +1997,10 @@ fn run_xkb_set_new_keyboard(
                 && check.hook == ExtensionHook::Receive
                 && check.client == NOTIFY_RECEIVER_DENIED
                 && check.receive == Some(EventSubject::Device(1))
-                && check.events == Some(vec![XKB_EVENT_DESCRIPTION])
+                && check.events
+                    == Some(vec![xkb_event_description_for_test(
+                        XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+                    )])
             {
                 Decision::Deny(DENY)
             } else {
@@ -1990,6 +2077,7 @@ fn receive_xkb_set_new_keyboard_denied() {
         ],
         &[request_opcodes(XKB_MAJOR_OPCODE, 9); 3],
         EventSubject::Device(1),
+        &[XKB_NEW_KEYBOARD_NOTIFY_TYPE; 3],
     );
     let repeat_bit = 1 << (REPEAT_KEYCODE & 7);
     let repeat_byte = usize::from(REPEAT_KEYCODE >> 3);
@@ -2038,6 +2126,7 @@ fn receive_xkb_set_new_keyboard_denied() {
         ],
         &[request_opcodes(XKB_MAJOR_OPCODE, 9); 3],
         EventSubject::Device(1),
+        &[XKB_NEW_KEYBOARD_NOTIFY_TYPE; 3],
     );
     assert_eq!(
         denied_repeats, allow_repeats,
@@ -2057,7 +2146,7 @@ fn run_xkb_map_change(
                 && check.hook == ExtensionHook::Receive
                 && check.client == NOTIFY_RECEIVER_DENIED
                 && check.receive == Some(EventSubject::Device(1))
-                && check.events == Some(vec![XKB_EVENT_DESCRIPTION])
+                && check.events == Some(vec![xkb_event_description_for_test(XKB_MAP_NOTIFY_TYPE)])
             {
                 Decision::Deny(DENY)
             } else {
@@ -2168,6 +2257,7 @@ fn receive_xkb_map_denied_keeps_legacy_filter() {
         &[NOTIFY_RECEIVER_DENIED],
         &[request_opcodes(XKB_MAJOR_OPCODE, 9)],
         EventSubject::Device(1),
+        &[XKB_MAP_NOTIFY_TYPE],
     );
 }
 
@@ -2297,6 +2387,20 @@ fn receive_xkb_new_keyboard_allow_control() {
         &receive_clients,
         &receive_requests,
         EventSubject::Device(1),
+        &[
+            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+            XKB_MAP_NOTIFY_TYPE,
+            XKB_MAP_NOTIFY_TYPE,
+            XKB_MAP_NOTIFY_TYPE,
+            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+        ],
     );
 }
 
@@ -2330,7 +2434,7 @@ fn receive_xkb_map_payload_device_subject() {
         if check.hook == ExtensionHook::Receive
             && check.client == NOTIFY_RECEIVER_DENIED
             && check.receive == Some(EventSubject::Device(3))
-            && check.events == Some(vec![XKB_EVENT_DESCRIPTION])
+            && check.events == Some(vec![xkb_event_description_for_test(XKB_MAP_NOTIFY_TYPE)])
         {
             Decision::Deny(DENY)
         } else {
@@ -2375,6 +2479,7 @@ fn receive_xkb_map_payload_device_subject() {
         &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
         &[None; 2],
         EventSubject::Device(3),
+        &[XKB_MAP_NOTIFY_TYPE; 2],
     );
     assert_no_writer_failures(&fixture);
 }
@@ -2421,8 +2526,9 @@ fn receive_xkb_indicators_no_policy_bytes() {
     );
 }
 
-// Mutation: check K8 once per emission, then reuse that decision for every
-// recipient; the whole-log assertion requires a Receive call for each one.
+// Mutations: make the State/Map description subtype differ from the writer's
+// `XkbIndicatorNotifyKind::xkb_type`; check K8 once per emission, then reuse
+// that decision for every recipient. The assertions catch each change.
 #[test]
 fn receive_xkb_indicator_maps_denies_one_kind() {
     let selections = [
@@ -2441,7 +2547,14 @@ fn receive_xkb_indicator_maps_denies_one_kind() {
             if check.hook == ExtensionHook::Receive
                 && check.client == NOTIFY_RECEIVER_DENIED
                 && check.receive == Some(EventSubject::Device(1))
-                && check.events == Some(vec![XKB_EVENT_DESCRIPTION])
+                && recorded_xkb_type(
+                    check,
+                    &[
+                        XKB_INDICATOR_MAP_NOTIFY_TYPE,
+                        XKB_INDICATOR_STATE_NOTIFY_TYPE,
+                        XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
+                    ],
+                )
                 && target_checks.fetch_add(1, Ordering::Relaxed) == 1
             {
                 Decision::Deny(DENY)
@@ -2487,6 +2600,12 @@ fn receive_xkb_indicator_maps_denies_one_kind() {
         &expected_clients,
         &expected_requests,
         EventSubject::Device(1),
+        &[
+            XKB_INDICATOR_MAP_NOTIFY_TYPE,
+            XKB_INDICATOR_STATE_NOTIFY_TYPE,
+            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
+            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
+        ],
     );
     let mut allowed = indicator_fixture(&selections);
     seed_request_xkb_snapshots(&mut allowed);
@@ -2511,6 +2630,12 @@ fn receive_xkb_indicator_maps_denies_one_kind() {
         &expected_clients,
         &expected_requests,
         EventSubject::Device(1),
+        &[
+            XKB_INDICATOR_MAP_NOTIFY_TYPE,
+            XKB_INDICATOR_STATE_NOTIFY_TYPE,
+            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
+            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
+        ],
     );
     assert_xkb_notification_effects_match(&denied, &allowed);
     assert_no_writer_failures(&denied);
@@ -2535,7 +2660,14 @@ fn receive_xkb_state_indicator_followups() {
         move |_, check| {
             if check.hook == ExtensionHook::Receive
                 && check.receive == Some(EventSubject::Device(1))
-                && check.events == Some(vec![XKB_EVENT_DESCRIPTION])
+                && recorded_xkb_type(
+                    check,
+                    &[
+                        XKB_STATE_NOTIFY_TYPE,
+                        XKB_INDICATOR_STATE_NOTIFY_TYPE,
+                        XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
+                    ],
+                )
             {
                 let count = match check.client {
                     NOTIFY_RECEIVER_DENIED => denied_checks[0].fetch_add(1, Ordering::Relaxed),
@@ -2587,6 +2719,14 @@ fn receive_xkb_state_indicator_followups() {
         ],
         &[None; 6],
         EventSubject::Device(1),
+        &[
+            XKB_STATE_NOTIFY_TYPE,
+            XKB_STATE_NOTIFY_TYPE,
+            XKB_INDICATOR_STATE_NOTIFY_TYPE,
+            XKB_INDICATOR_STATE_NOTIFY_TYPE,
+            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
+            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
+        ],
     );
     let mut allowed = indicator_fixture(&selections);
     allowed.backend.xkb_mods = (0x40, 0x40, 0, 0);
@@ -2628,6 +2768,14 @@ fn receive_xkb_state_indicator_followups() {
         ],
         &[None; 6],
         EventSubject::Device(1),
+        &[
+            XKB_STATE_NOTIFY_TYPE,
+            XKB_STATE_NOTIFY_TYPE,
+            XKB_INDICATOR_STATE_NOTIFY_TYPE,
+            XKB_INDICATOR_STATE_NOTIFY_TYPE,
+            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
+            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
+        ],
     );
     assert_xkb_notification_effects_match(&denied, &allowed);
     assert_no_writer_failures(&denied);
@@ -2643,6 +2791,7 @@ fn receive_xkb_names_denied() {
         SET_NAMES_SEQUENCE,
         XKB_SET_NAMES,
         request_opcodes(XKB_MAJOR_OPCODE, 18),
+        XKB_NAMES_NOTIFY_TYPE,
         &XKB_SET_NAMES_BODY,
         XkbSetEvent::Names(names_notify()),
         |sequence| literal_xkb_names_notify(sequence, names_notify()),
@@ -2658,6 +2807,7 @@ fn receive_xkb_compat_map_denied() {
         SET_COMPAT_SEQUENCE,
         XKB_SET_COMPAT_MAP,
         request_opcodes(XKB_MAJOR_OPCODE, 11),
+        XKB_COMPAT_MAP_NOTIFY_TYPE,
         &XKB_SET_COMPAT_BODY,
         XkbSetEvent::CompatMap(compat_map_notify()),
         |sequence| literal_xkb_compat_map_notify(sequence, compat_map_notify()),
@@ -2685,7 +2835,10 @@ fn receive_xkb_indicator_names_denied() {
             if check.hook == ExtensionHook::Receive
                 && check.client == NOTIFY_RECEIVER_DENIED
                 && check.receive == Some(EventSubject::Device(1))
-                && check.events == Some(vec![XKB_EVENT_DESCRIPTION])
+                && recorded_xkb_type(
+                    check,
+                    &[XKB_NAMES_NOTIFY_TYPE, XKB_EXTENSION_DEVICE_NOTIFY_TYPE],
+                )
                 && combined_subscriber_checks.fetch_add(1, Ordering::Relaxed) == 1
             {
                 Decision::Deny(DENY)
@@ -2710,6 +2863,11 @@ fn receive_xkb_indicator_names_denied() {
         ],
         &[request_opcodes(XKB_MAJOR_OPCODE, 18); 3],
         EventSubject::Device(1),
+        &[
+            XKB_NAMES_NOTIFY_TYPE,
+            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
+            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
+        ],
     );
     assert_eq!(
         denied.drain(NOTIFY_RECEIVER_DENIED),
@@ -2747,6 +2905,11 @@ fn receive_xkb_indicator_names_denied() {
         ],
         &[request_opcodes(XKB_MAJOR_OPCODE, 18); 3],
         EventSubject::Device(1),
+        &[
+            XKB_NAMES_NOTIFY_TYPE,
+            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
+            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
+        ],
     );
     assert_xkb_notification_effects_match(&denied, &allowed);
     assert_no_writer_failures(&denied);
@@ -2825,6 +2988,20 @@ fn receive_xkb_indicators_allow_control() {
             request_opcodes(XKB_MAJOR_OPCODE, 14),
         ],
         EventSubject::Device(1),
+        &[
+            XKB_COMPAT_MAP_NOTIFY_TYPE,
+            XKB_COMPAT_MAP_NOTIFY_TYPE,
+            XKB_NAMES_NOTIFY_TYPE,
+            XKB_NAMES_NOTIFY_TYPE,
+            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
+            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
+            XKB_INDICATOR_MAP_NOTIFY_TYPE,
+            XKB_INDICATOR_MAP_NOTIFY_TYPE,
+            XKB_INDICATOR_STATE_NOTIFY_TYPE,
+            XKB_INDICATOR_STATE_NOTIFY_TYPE,
+            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
+            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
+        ],
     );
     assert_no_writer_failures(&fixture);
 }

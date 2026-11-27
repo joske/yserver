@@ -460,14 +460,15 @@ fn send_event_ask_describes_advertised_extension_metadata() {
     assert_extension_receive(&calls[1], RECEIVER_A, LEAF, 89, 128, 0);
 }
 
-// Mutation: filter extension events by the registry's static first_event,
-// which omits XKEYBOARD's live event base.
+// Mutations: filter extension events by the registry's static first_event,
+// which omits XKEYBOARD's live event base; make describe_wire_event use the
+// XKB code offset instead of event[1] for xkbType.
 #[test]
-fn send_event_xkb_live_event_base_is_described_and_denied() {
+fn send_event_xkb_state_notify_type_uses_wire_byte() {
     let mut fixture = Fixture::new();
     fixture.backend.xkb_info_result = Some((136, 85, 162));
     fixture.select(RECEIVER_A, LEAF, EVENT_MASK);
-    let xkb_description = EventDescription::extension(85, 136, 0);
+    let xkb_description = EventDescription::extension(85, 136, 2);
     let calls = fixture.install_policy(move |_, call| {
         if call.hook == ExtensionHook::Receive
             && call.events.as_deref() == Some(std::slice::from_ref(&xkb_description))
@@ -479,8 +480,10 @@ fn send_event_xkb_live_event_base_is_described_and_denied() {
     });
     let backend_before = fixture.backend.calls();
     let state_before = send_state_snapshot(&fixture.state);
-    let mut event = key_event();
+    let mut event = [0; 32];
     event[0] = 85; // XKB's live first event code from xkb_info().
+    event[1] = 2; // XkbStateNotify xkbType.
+    event[8] = 1; // The native StateNotify's XKB device ID.
 
     assert!(
         fixture
@@ -497,8 +500,8 @@ fn send_event_xkb_live_event_base_is_described_and_denied() {
 
     let calls = calls.lock().unwrap();
     assert_eq!(calls.len(), 2);
-    assert_extension_send(&calls[0], LEAF, 85, 136, 0);
-    assert_extension_receive(&calls[1], RECEIVER_A, LEAF, 85, 136, 0);
+    assert_extension_send(&calls[0], LEAF, 85, 136, 2);
+    assert_extension_receive(&calls[1], RECEIVER_A, LEAF, 85, 136, 2);
 }
 
 // Mutation: skip the destination send check and allow selected clients to receive.

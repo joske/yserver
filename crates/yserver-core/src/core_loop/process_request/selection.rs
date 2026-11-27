@@ -834,9 +834,10 @@ pub(super) fn handle_send_event(
 /// event codes through the same live registry used by SendEvent. Core events
 /// have `type_code < 64` and no extension metadata. A code `>= 64` with no
 /// extension metadata is unassigned; core `SendEvent` accepts such codes
-/// today. A GenericEvent (`type_code == 35`) carries extension metadata whose
-/// `major_opcode` is wire byte 1 and whose `event_type` is the `evtype` in
-/// bytes 8–9, read in the sender's byte order.
+/// today. XKB has one event code, so its `event_type` is wire byte 1
+/// (`xkbType`). A GenericEvent (`type_code == 35`) carries extension metadata
+/// whose `major_opcode` is wire byte 1 and whose `event_type` is the `evtype`
+/// in bytes 8–9, read in the sender's byte order.
 pub(crate) fn describe_wire_event(
     event: &[u8; 32],
     byte_order: yserver_protocol::x11::ClientByteOrder,
@@ -867,10 +868,16 @@ pub(crate) fn describe_wire_event(
                     } else {
                         extension.event_count
                     };
+                let extension_event_type =
+                    if extension.availability == crate::nested::ExtensionAvailability::HostXkb {
+                        u16::from(event[1])
+                    } else {
+                        u16::from(event_offset)
+                    };
                 (event_offset < event_count).then_some(EventDescription::extension(
                     event_type,
                     major_opcode,
-                    u16::from(event_offset),
+                    extension_event_type,
                 ))
             })
             .unwrap_or_else(|| EventDescription::core(event_type))

@@ -311,7 +311,10 @@ pub(super) fn handle_xkb_request(
                 let _dropped = fanout_event_to_clients(state, &all, |buf, seq, order| {
                     let _ = x11::write_mapping_notify_event(buf, order, seq, 0, 0, 0);
                 });
-                let description = [crate::core_loop::xkb_layout::xkb_event_description(base)];
+                let description = [crate::core_loop::xkb_layout::xkb_event_description(
+                    base,
+                    x11::XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+                )];
                 let events = EventBatch::new(&description);
                 let _dropped = fanout_event_to_clients_with_receive(
                     state,
@@ -620,7 +623,10 @@ fn send_xkb_set_events(
         match event {
             XkbSetEvent::NewKeyboard(info) => {
                 let recipients = xkb_select::new_keyboard_recipients(state, info.changed);
-                let description = [crate::core_loop::xkb_layout::xkb_event_description(base)];
+                let description = [crate::core_loop::xkb_layout::xkb_event_description(
+                    base,
+                    x11::XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+                )];
                 let events = EventBatch::new(&description);
                 let _dropped = fanout_event_to_clients_with_receive(
                     state,

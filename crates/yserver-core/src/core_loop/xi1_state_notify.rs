@@ -83,20 +83,21 @@ pub fn deliver_state_notify(state: &mut ServerState, deviceid: u16, window: Reso
         window.0,
         targets.len(),
     );
-    let mut descriptions = vec![crate::xinput::xi1_event_description(
-        crate::xinput::XI_DEVICE_STATE_NOTIFY_OFFSET,
-    )];
+    let state_description =
+        crate::xinput::xi1_event_description(crate::xinput::XI_DEVICE_STATE_NOTIFY_OFFSET);
+    let mut descriptions = [state_description; 3];
+    let mut description_count = 1;
     if more_keys {
-        descriptions.push(crate::xinput::xi1_event_description(
-            crate::xinput::XI_DEVICE_KEY_STATE_NOTIFY_OFFSET,
-        ));
+        descriptions[description_count] =
+            crate::xinput::xi1_event_description(crate::xinput::XI_DEVICE_KEY_STATE_NOTIFY_OFFSET);
+        description_count += 1;
     }
     if more_valuators {
-        descriptions.push(crate::xinput::xi1_event_description(
-            crate::xinput::XI_DEVICE_VALUATOR_OFFSET,
-        ));
+        descriptions[description_count] =
+            crate::xinput::xi1_event_description(crate::xinput::XI_DEVICE_VALUATOR_OFFSET);
+        description_count += 1;
     }
-    let batch = EventBatch::new(&descriptions);
+    let batch = EventBatch::new(&descriptions[..description_count]);
     let _dropped = fanout_event_to_clients_with_receive(
         state,
         &targets,

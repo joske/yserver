@@ -49,7 +49,7 @@ const BIG_REQUESTS_FIRST_ERROR: u8 = 0;
 
 pub(crate) const XKB_MAJOR_OPCODE: u8 = 136;
 
-const XI2_MAJOR_OPCODE: u8 = 137;
+pub(crate) const XI2_MAJOR_OPCODE: u8 = 137;
 /// First event code reserved for the XInput extension. Despite the name,
 /// this is the same base for XI1 *and* XI2 — Xorg assigns one contiguous
 /// `first_event..first_event+16` block to XInput. XI1 event codes 0..16

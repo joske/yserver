@@ -186,7 +186,7 @@ pub(crate) fn send_controls_notify(
     };
     let xkb_event_base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
     let recipients = xkb_select::interest_recipients(state, |i| i.controls & changed != 0);
-    let description = xkb_event_description(xkb_event_base);
+    let description = xkb_event_description(xkb_event_base, x11::XKB_CONTROLS_NOTIFY_TYPE);
     let events = EventBatch::new(std::slice::from_ref(&description));
     // This XKB Receive check is a yserver rule; Xorg emits native XKB events
     // without one.

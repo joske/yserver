@@ -36,11 +36,11 @@ use crate::{
         pointer_propagation_target_by_id,
     },
     host_x11::{HostPointerEvent, HostXidMap, PointerEventKind},
+    nested::XI2_MAJOR_OPCODE,
     resources::ROOT_WINDOW,
     server::{ServerState, xi2_mask_for_client},
 };
 
-const XI2_MAJOR_OPCODE: u8 = 137;
 const XI2_MASTER_POINTER_DEVICE_ID: u16 = 2;
 const XI2_XTEST_POINTER_DEVICE_ID: u16 = crate::xinput::DEVICEID_XTEST_POINTER;
 

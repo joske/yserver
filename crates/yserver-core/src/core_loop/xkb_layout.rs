@@ -143,7 +143,10 @@ pub fn apply_rules_names_change(state: &mut ServerState, backend: &mut dyn Backe
 
     // 2. XKB events only to clients that selected them (XkbSelectEvents).
     let nkn = subscribers(state, 0x0001); // XkbNewKeyboardNotifyMask
-    let description = [xkb_event_description(xkb_event_base)];
+    let description = [xkb_event_description(
+        xkb_event_base,
+        x11::XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+    )];
     let events = EventBatch::new(&description);
     let _dropped = fanout_event_to_clients_with_receive(
         state,
@@ -193,7 +196,10 @@ pub(crate) fn send_xkb_map_notify(
     notify: x11::XkbMapNotify,
 ) -> Vec<ClientId> {
     let recipients = crate::core_loop::xkb_select::map_notify_recipients(state, notify.changed);
-    let description = [xkb_event_description(xkb_event_base)];
+    let description = [xkb_event_description(
+        xkb_event_base,
+        x11::XKB_MAP_NOTIFY_TYPE,
+    )];
     let events = EventBatch::new(&description);
     let _dropped = fanout_event_to_clients_with_receive(
         state,
@@ -212,12 +218,16 @@ pub(crate) const XKB_DEVICE_ID: u8 = 1;
 
 /// Supplies the native XKB metadata for one XKB notification. For any wire
 /// code the live registry resolves to XKB, this matches `describe_wire_event`:
-/// XKB has one event code and the `xkbType` byte is not part of the description.
+/// XKB has one event code and its `xkbType` byte is the event type.
 /// The base-zero fallback when `xkb_info()` is absent is not equivalent:
 /// `describe_wire_event` classifies that fallback as `core(0)`.
 #[must_use]
-pub(crate) fn xkb_event_description(xkb_event_base: u8) -> EventDescription {
-    EventDescription::extension(xkb_event_base, crate::nested::XKB_MAJOR_OPCODE, 0)
+pub(crate) fn xkb_event_description(xkb_event_base: u8, xkb_type: u8) -> EventDescription {
+    EventDescription::extension(
+        xkb_event_base,
+        crate::nested::XKB_MAJOR_OPCODE,
+        u16::from(xkb_type),
+    )
 }
 
 /// `XkbPerKeyRepeatMask` in `XkbControlsNotify.changedControls`.
@@ -284,7 +294,7 @@ pub(crate) fn send_xkb_compat_map_notify(
     notify: x11::XkbCompatMapNotify,
 ) {
     let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| i.compat != 0);
-    let description = xkb_event_description(xkb_event_base);
+    let description = xkb_event_description(xkb_event_base, x11::XKB_COMPAT_MAP_NOTIFY_TYPE);
     let events = EventBatch::new(std::slice::from_ref(&description));
     // This XKB Receive check is a yserver rule; Xorg emits native XKB events
     // without one.
@@ -308,7 +318,7 @@ pub(crate) fn send_xkb_names_notify(
 ) {
     let recipients =
         crate::core_loop::xkb_select::interest_recipients(state, |i| i.names & notify.changed != 0);
-    let description = xkb_event_description(xkb_event_base);
+    let description = xkb_event_description(xkb_event_base, x11::XKB_NAMES_NOTIFY_TYPE);
     let events = EventBatch::new(std::slice::from_ref(&description));
     // This XKB Receive check is a yserver rule; Xorg emits native XKB events
     // without one.
@@ -348,7 +358,7 @@ pub(crate) fn send_indicator_names_change(
     let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| {
         i.extension_device & XI_INDICATOR_NAMES_MASK != 0
     });
-    let description = xkb_event_description(xkb_event_base);
+    let description = xkb_event_description(xkb_event_base, x11::XKB_EXTENSION_DEVICE_NOTIFY_TYPE);
     let events = EventBatch::new(std::slice::from_ref(&description));
     // This XKB Receive check is a yserver rule; Xorg emits native XKB events
     // without one.
@@ -434,7 +444,7 @@ fn send_led_extension_device_notify(
     let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| {
         i.extension_device & reason != 0
     });
-    let description = xkb_event_description(xkb_event_base);
+    let description = xkb_event_description(xkb_event_base, x11::XKB_EXTENSION_DEVICE_NOTIFY_TYPE);
     let events = EventBatch::new(std::slice::from_ref(&description));
     // This XKB Receive check is a yserver rule; Xorg emits native XKB events
     // without one.
@@ -480,7 +490,7 @@ pub(crate) fn apply_keyboard_mapping_repeats(
     let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| {
         i.controls & XKB_PER_KEY_REPEAT_MASK != 0
     });
-    let description = xkb_event_description(xkb_event_base);
+    let description = xkb_event_description(xkb_event_base, x11::XKB_CONTROLS_NOTIFY_TYPE);
     let events = EventBatch::new(std::slice::from_ref(&description));
     // This XKB Receive check is a yserver rule; Xorg emits native XKB events
     // without one.
@@ -539,7 +549,7 @@ fn send_indicator_notify(
         x11::XkbIndicatorNotifyKind::Map => i.indicator_map & changed != 0,
         x11::XkbIndicatorNotifyKind::State => i.indicator_state & changed != 0,
     });
-    let description = xkb_event_description(xkb_event_base);
+    let description = xkb_event_description(xkb_event_base, kind.xkb_type());
     let events = EventBatch::new(std::slice::from_ref(&description));
     // This XKB Receive check is a yserver rule; Xorg emits native XKB events
     // without one.
@@ -692,7 +702,7 @@ pub fn announce_xkb_state(
     };
     let recipients =
         crate::core_loop::xkb_select::interest_recipients(state, |i| i.state & changed != 0);
-    let description = xkb_event_description(xkb_event_base);
+    let description = xkb_event_description(xkb_event_base, x11::XKB_STATE_NOTIFY_TYPE);
     let events = EventBatch::new(std::slice::from_ref(&description));
     // This XKB Receive check is a yserver rule; Xorg emits native XKB events
     // without one. The snapshot above advances even when every copy is denied.
