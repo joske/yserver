@@ -25,7 +25,7 @@ fn xi_hotplug_hierarchy_selection_body(window: ResourceId, selected: bool) -> Ve
     body
 }
 
-fn xi_hotplug_select_hierarchy(
+pub(super) fn xi_hotplug_select_hierarchy(
     state: &mut ServerState,
     backend: &mut RecordingBackend,
     client: u32,
@@ -37,7 +37,7 @@ fn xi_hotplug_select_hierarchy(
     xi_hotplug_dispatch(state, backend, client, sequence, 137, 46, &body);
 }
 
-fn xi_hotplug_select_presence(
+pub(super) fn xi_hotplug_select_presence(
     state: &mut ServerState,
     backend: &mut RecordingBackend,
     client: u32,
@@ -48,7 +48,7 @@ fn xi_hotplug_select_presence(
     xi_hotplug_dispatch(state, backend, client, sequence, 137, 6, &body);
 }
 
-fn xi_hotplug_set_enabled(
+pub(super) fn xi_hotplug_set_enabled(
     state: &mut ServerState,
     backend: &mut RecordingBackend,
     client: u32,
@@ -223,7 +223,7 @@ fn xi_hotplug_state_snapshot(state: &ServerState) -> XiHotplugStateSnapshot {
     }
 }
 
-fn xi_hotplug_create_child(
+pub(super) fn xi_hotplug_create_child(
     state: &mut ServerState,
     backend: &mut RecordingBackend,
     client: u32,

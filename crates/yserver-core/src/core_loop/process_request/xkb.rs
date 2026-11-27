@@ -1,8 +1,8 @@
 use crate::{
-    access::{AccessMode, RequestOpcodes, ResourceKind},
+    access::{AccessMode, EventBatch, EventSubject, RequestOpcodes, ResourceKind},
     backend::{Backend, OriginContext},
     core_loop::{
-        fanout::fanout_event_to_clients,
+        fanout::{fanout_event_to_clients, fanout_event_to_clients_with_receive},
         process_request::{
             RequestOutcome, X_KB_GET_CONTROLS, X_KB_SELECT_EVENTS, X_KB_SET_COMPAT_MAP,
             X_KB_SET_CONTROLS, X_KB_SET_GEOMETRY, X_KB_SET_INDICATOR_MAP, X_KB_SET_MAP,
@@ -280,9 +280,9 @@ pub(super) fn handle_xkb_request(
                 // overrides must not keep shadowing it (see the identical
                 // fix + rationale in `apply_rules_names_change`).
                 state.keymap_overrides.clear();
-                // Legacy core MappingNotify(Keyboard) + MappingNotify(Modifier)
-                // to ALL clients, mirroring Xorg's XkbSendLegacyMapNotify
-                // companion to XkbSendNewKeyboardNotify. XKB-unaware clients
+                // yserver currently sends the legacy core
+                // MappingNotify(Keyboard) + MappingNotify(Modifier) pair to
+                // ALL clients before NewKeyboardNotify. XKB-unaware clients
                 // (any plain-X11 WM that never calls XkbSelectEvents — e.g.
                 // one that resolves keybinds via XKeysymToKeycode once at
                 // startup) never see XkbNewKeyboardNotify, so without this
@@ -311,22 +311,33 @@ pub(super) fn handle_xkb_request(
                 let _dropped = fanout_event_to_clients(state, &all, |buf, seq, order| {
                     let _ = x11::write_mapping_notify_event(buf, order, seq, 0, 0, 0);
                 });
-                let _dropped = fanout_event_to_clients(state, &all, |buf, seq, order| {
-                    let _ = x11::write_xkb_new_keyboard_notify(
-                        buf,
-                        order,
-                        seq,
-                        base,
-                        1,
-                        info.min_keycode,
-                        info.max_keycode,
-                        info.old_min_keycode,
-                        info.old_max_keycode,
-                        136, // requestMajor = XkbReqCode
-                        23,  // requestMinor = X_kbGetKbdByName
-                        info.changed,
-                    );
-                });
+                let description = [crate::core_loop::xkb_layout::xkb_event_description(
+                    base,
+                    x11::XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+                )];
+                let events = EventBatch::new(&description);
+                let _dropped = fanout_event_to_clients_with_receive(
+                    state,
+                    &all,
+                    EventSubject::Device(1),
+                    &events,
+                    |buf, seq, order| {
+                        let _ = x11::write_xkb_new_keyboard_notify(
+                            buf,
+                            order,
+                            seq,
+                            base,
+                            1,
+                            info.min_keycode,
+                            info.max_keycode,
+                            info.old_min_keycode,
+                            info.old_max_keycode,
+                            136, // requestMajor = XkbReqCode
+                            23,  // requestMinor = X_kbGetKbdByName
+                            info.changed,
+                        );
+                    },
+                );
                 // Refresh `_XKB_RULES_NAMES` on the root so it reflects the
                 // newly-loaded layout — Xorg keeps this property current on
                 // every keymap change (e.g. Cinnamon's runtime layout-add).
@@ -612,22 +623,33 @@ fn send_xkb_set_events(
         match event {
             XkbSetEvent::NewKeyboard(info) => {
                 let recipients = xkb_select::new_keyboard_recipients(state, info.changed);
-                let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-                    let _ = x11::write_xkb_new_keyboard_notify(
-                        buf,
-                        order,
-                        seq,
-                        base,
-                        1,
-                        info.min_keycode,
-                        info.max_keycode,
-                        info.old_min_keycode,
-                        info.old_max_keycode,
-                        major,
-                        minor,
-                        info.changed,
-                    );
-                });
+                let description = [crate::core_loop::xkb_layout::xkb_event_description(
+                    base,
+                    x11::XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+                )];
+                let events = EventBatch::new(&description);
+                let _dropped = fanout_event_to_clients_with_receive(
+                    state,
+                    &recipients,
+                    EventSubject::Device(1),
+                    &events,
+                    |buf, seq, order| {
+                        let _ = x11::write_xkb_new_keyboard_notify(
+                            buf,
+                            order,
+                            seq,
+                            base,
+                            1,
+                            info.min_keycode,
+                            info.max_keycode,
+                            info.old_min_keycode,
+                            info.old_max_keycode,
+                            major,
+                            minor,
+                            info.changed,
+                        );
+                    },
+                );
                 let num = info
                     .max_keycode
                     .wrapping_sub(info.min_keycode)

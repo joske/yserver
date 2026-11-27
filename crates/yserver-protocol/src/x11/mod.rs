@@ -3703,6 +3703,18 @@ pub fn write_mapping_notify_event(
     writer.write_all(&buf)
 }
 
+/// XKB `xkbType` values written in event byte 1 and used by access-policy
+/// event descriptions.
+pub const XKB_NEW_KEYBOARD_NOTIFY_TYPE: u8 = 0;
+pub const XKB_MAP_NOTIFY_TYPE: u8 = 1;
+pub const XKB_STATE_NOTIFY_TYPE: u8 = 2;
+pub const XKB_CONTROLS_NOTIFY_TYPE: u8 = 3;
+pub const XKB_INDICATOR_STATE_NOTIFY_TYPE: u8 = 4;
+pub const XKB_INDICATOR_MAP_NOTIFY_TYPE: u8 = 5;
+pub const XKB_NAMES_NOTIFY_TYPE: u8 = 6;
+pub const XKB_COMPAT_MAP_NOTIFY_TYPE: u8 = 7;
+pub const XKB_EXTENSION_DEVICE_NOTIFY_TYPE: u8 = 11;
+
 /// `XkbNewKeyboardNotify` (xkbType=0). Tells clients the keyboard map
 /// may have changed and they must re-query GetMap/GetNames. Layout per
 /// XKBproto.h `xkbNewKeyboardNotify` (1028-1048). `changed` is fixed at
@@ -3728,7 +3740,7 @@ pub fn write_xkb_new_keyboard_notify(
 ) -> io::Result<()> {
     let mut buf = [0u8; 32];
     buf[0] = xkb_event_base; // type = base + XkbEventCode(0)
-    buf[1] = 0; // xkbType = XkbNewKeyboardNotify
+    buf[1] = XKB_NEW_KEYBOARD_NOTIFY_TYPE; // xkbType = XkbNewKeyboardNotify
     let mut seq_buf = Vec::with_capacity(2);
     write_u16(byte_order, &mut seq_buf, sequence.0);
     buf[2..4].copy_from_slice(&seq_buf);
@@ -3818,7 +3830,7 @@ pub fn write_xkb_map_notify(
 ) -> io::Result<()> {
     let mut buf = [0u8; 32];
     buf[0] = xkb_event_base;
-    buf[1] = 1; // xkbType = XkbMapNotify
+    buf[1] = XKB_MAP_NOTIFY_TYPE; // xkbType = XkbMapNotify
     let mut seq_buf = Vec::with_capacity(2);
     write_u16(byte_order, &mut seq_buf, sequence.0);
     buf[2..4].copy_from_slice(&seq_buf);
@@ -3881,7 +3893,7 @@ pub fn write_xkb_controls_notify(
 ) -> io::Result<()> {
     let mut buf = [0u8; 32];
     buf[0] = xkb_event_base;
-    buf[1] = 3; // xkbType = XkbControlsNotify
+    buf[1] = XKB_CONTROLS_NOTIFY_TYPE; // xkbType = XkbControlsNotify
     let mut seq_buf = Vec::with_capacity(2);
     write_u16(byte_order, &mut seq_buf, sequence.0);
     buf[2..4].copy_from_slice(&seq_buf);
@@ -3916,6 +3928,16 @@ pub enum XkbIndicatorNotifyKind {
     Map,
 }
 
+impl XkbIndicatorNotifyKind {
+    #[must_use]
+    pub const fn xkb_type(self) -> u8 {
+        match self {
+            Self::State => XKB_INDICATOR_STATE_NOTIFY_TYPE,
+            Self::Map => XKB_INDICATOR_MAP_NOTIFY_TYPE,
+        }
+    }
+}
+
 /// Fields of an [`write_xkb_indicator_notify`] event (XKBproto.h
 /// `xkbIndicatorNotify`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3946,10 +3968,7 @@ pub fn write_xkb_indicator_notify(
     } = n;
     let mut buf = [0u8; 32];
     buf[0] = xkb_event_base;
-    buf[1] = match kind {
-        XkbIndicatorNotifyKind::State => 4,
-        XkbIndicatorNotifyKind::Map => 5,
-    };
+    buf[1] = kind.xkb_type();
     let mut seq_buf = Vec::with_capacity(2);
     write_u16(byte_order, &mut seq_buf, sequence.0);
     buf[2..4].copy_from_slice(&seq_buf);
@@ -3991,7 +4010,7 @@ pub fn write_xkb_compat_map_notify(
 ) -> io::Result<()> {
     let mut buf = [0u8; 32];
     buf[0] = xkb_event_base;
-    buf[1] = 7; // xkbType = XkbCompatMapNotify
+    buf[1] = XKB_COMPAT_MAP_NOTIFY_TYPE; // xkbType = XkbCompatMapNotify
     let mut b = Vec::with_capacity(2);
     write_u16(byte_order, &mut b, sequence.0);
     buf[2..4].copy_from_slice(&b);
@@ -4042,7 +4061,7 @@ pub fn write_xkb_names_notify(
 ) -> io::Result<()> {
     let mut buf = [0u8; 32];
     buf[0] = xkb_event_base;
-    buf[1] = 6; // xkbType = XkbNamesNotify
+    buf[1] = XKB_NAMES_NOTIFY_TYPE; // xkbType = XkbNamesNotify
     let mut b = Vec::with_capacity(2);
     write_u16(byte_order, &mut b, sequence.0);
     buf[2..4].copy_from_slice(&b);
@@ -4102,7 +4121,7 @@ pub fn write_xkb_extension_device_notify(
 ) -> io::Result<()> {
     let mut buf = [0u8; 32];
     buf[0] = xkb_event_base;
-    buf[1] = 11; // xkbType = XkbExtensionDeviceNotify
+    buf[1] = XKB_EXTENSION_DEVICE_NOTIFY_TYPE; // xkbType = XkbExtensionDeviceNotify
     let mut b = Vec::with_capacity(2);
     write_u16(byte_order, &mut b, sequence.0);
     buf[2..4].copy_from_slice(&b);
@@ -4175,7 +4194,7 @@ pub fn write_xkb_state_notify(
 ) -> io::Result<()> {
     let mut buf = [0u8; 32];
     buf[0] = xkb_event_base; // type = base + XkbEventCode
-    buf[1] = 2; // xkbType = XkbStateNotify
+    buf[1] = XKB_STATE_NOTIFY_TYPE; // xkbType = XkbStateNotify
     let mut seq_buf = Vec::with_capacity(2);
     write_u16(byte_order, &mut seq_buf, sequence.0);
     buf[2..4].copy_from_slice(&seq_buf);

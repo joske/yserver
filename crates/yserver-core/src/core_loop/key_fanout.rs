@@ -17,13 +17,13 @@ use yserver_protocol::x11::{self, ClientId, ResourceId};
 use crate::{
     core_loop::fanout::{fanout_event_to_clients, subscribers_by_id},
     host_x11::HostKeyEvent,
+    nested::XI2_MAJOR_OPCODE,
     resources::ROOT_WINDOW,
     server::{ActiveKeyboardGrab, ActiveKeyboardGrabSource, ServerState, xi2_mask_for_client},
 };
 
 const KEY_PRESS_MASK: u32 = 0x0000_0001;
 const KEY_RELEASE_MASK: u32 = 0x0000_0002;
-const XI2_MAJOR_OPCODE: u8 = 137;
 const XI2_KEYPRESS_EVTYPE: u16 = 2;
 const XI2_KEYRELEASE_EVTYPE: u16 = 3;
 /// XIKeyRepeat is bit 16 in the XI2 device-event flags word for key presses.

@@ -145,6 +145,7 @@ use crate::{
     backend::{Backend, OriginContext},
     core_loop::{client_io, client_io::WriteOutcome},
     fd::OwnedFd,
+    nested::XI2_MAJOR_OPCODE,
     server::ServerState,
 };
 
@@ -212,10 +213,6 @@ macro_rules! check_creation {
 }
 pub(crate) use check_creation;
 
-/// XI2 major opcode assigned by `extension_metadata("XInputExtension")`.
-/// This matches the `XI2_MAJOR_OPCODE` constant in nested.rs and goes
-/// away in H1 with that file.
-const XI2_MAJOR_OPCODE: u8 = 137;
 /// XInput extension first-error base (matches `nested.rs::XI2_FIRST_ERROR`).
 /// `XI_BadDevice = 0`, so the wire `BadDevice` code is `XI2_FIRST_ERROR + 0`.
 const XI2_FIRST_ERROR: u8 = 157;

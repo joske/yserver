@@ -1,8 +1,10 @@
 use crate::{
-    access::{AccessMode, RequestOpcodes, ResourceKind, ResourceTarget},
+    access::{
+        AccessMode, EventBatch, EventDescription, RequestOpcodes, ResourceKind, ResourceTarget,
+    },
     backend::Backend,
     core_loop::{
-        fanout::{emit_window_event_to_state, fanout_event_to_clients},
+        fanout::{emit_window_event_to_state_with_receive, fanout_event_to_clients_with_receive},
         key_fanout::replay_frozen_key_to_focus,
         pointer_fanout::{PointerReplay, replay_frozen_pointer_event_to_state},
         process_request::{
@@ -1123,9 +1125,10 @@ pub(crate) fn confine_pointer_now(state: &mut ServerState, backend: &mut dyn Bac
 /// Full Enter/Leave chain for pointer-grab activation/deactivation —
 /// Xorg `ActivatePointerGrab`/`DeactivatePointerGrab` →
 /// `DoEnterLeaveEvents(sprite.win ↔ grab window, NotifyGrab/Ungrab)`.
-/// Events flow through the normal per-window mask filter (EnterWindow
-/// 0x10 / LeaveWindow 0x20) to every selecting client, then the same chain
-/// in XI2 form (`DeviceEnterLeaveEvents`), from the master pointer.
+/// Events flow through yserver's per-window subscriber fanout (EnterWindow
+/// 0x10 / LeaveWindow 0x20), then the same chain in XI2 form
+/// (`DeviceEnterLeaveEvents`), from the master pointer. Xorg can retain the
+/// old grab and write directly to its client during this transition.
 pub(crate) fn emit_core_pointer_grab_chain(
     state: &mut ServerState,
     from_win: ResourceId,
@@ -1143,40 +1146,48 @@ pub(crate) fn emit_core_pointer_grab_chain(
             crate::crossings::CrossingKind::Enter => (0x10u32, true),
             crate::crossings::CrossingKind::Leave => (0x20u32, false),
         };
+        let event_type = if enter { 7 } else { 8 };
+        let description = EventDescription::core(event_type);
+        let events = EventBatch::new(std::slice::from_ref(&description));
         let (ox, oy) = state.resources.window_absolute_position(e.window);
         let event_x = i16::try_from(i32::from(root_x) - ox).unwrap_or(i16::MAX);
         let event_y = i16::try_from(i32::from(root_y) - oy).unwrap_or(i16::MAX);
         let focus = state.crossing_has_focus(e.window);
-        let _dropped = emit_window_event_to_state(state, e.window, mask, |buf, seq, order| {
-            let crossing = yserver_protocol::x11::CrossingEvent {
-                sequence: seq,
-                time: server_time,
-                root: ROOT_WINDOW,
-                event: e.window,
-                child: e.child,
-                root_x,
-                root_y,
-                event_x,
-                event_y,
-                state: 0,
-                detail: e.detail,
-                mode,
-                focus,
-            };
-            if enter {
-                x11::encode_enter_notify_event(buf, order, crossing);
-            } else {
-                x11::encode_leave_notify_event(buf, order, crossing);
-            }
-        });
+        let _dropped = emit_window_event_to_state_with_receive(
+            state,
+            e.window,
+            mask,
+            &events,
+            |buf, seq, order| {
+                let crossing = yserver_protocol::x11::CrossingEvent {
+                    sequence: seq,
+                    time: server_time,
+                    root: ROOT_WINDOW,
+                    event: e.window,
+                    child: e.child,
+                    root_x,
+                    root_y,
+                    event_x,
+                    event_y,
+                    state: 0,
+                    detail: e.detail,
+                    mode,
+                    focus,
+                };
+                if enter {
+                    x11::encode_enter_notify_event(buf, order, crossing);
+                } else {
+                    x11::encode_leave_notify_event(buf, order, crossing);
+                }
+            },
+        );
     }
     for e in chain {
         let evtype: u16 = match e.kind {
             crate::crossings::CrossingKind::Enter => 7,
             crate::crossings::CrossingKind::Leave => 8,
         };
-        // Xorg sends these before the grab is installed and after it is
-        // gone, so the window's selections get them, whatever the grab.
+        // yserver fans this chain out to each window's selectors.
         let targets =
             crate::core_loop::pointer_fanout::xi2_master_selectors(state, e.window, evtype);
         if targets.is_empty() {
@@ -1186,28 +1197,36 @@ pub(crate) fn emit_core_pointer_grab_chain(
         let event_x = i16::try_from(i32::from(root_x) - ox).unwrap_or(i16::MAX);
         let event_y = i16::try_from(i32::from(root_y) - oy).unwrap_or(i16::MAX);
         let focus = state.crossing_has_focus(e.window);
-        let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
-            x11::encode_xi2_crossing_event(
-                buf,
-                order,
-                seq,
-                XI2_MAJOR_OPCODE,
-                evtype,
-                2,
-                server_time,
-                ROOT_WINDOW,
-                e.window,
-                root_x,
-                root_y,
-                event_x,
-                event_y,
-                0,
-                mode,
-                e.detail,
-                2,
-                focus,
-            );
-        });
+        let description = crate::xinput::xi2_event_description(evtype);
+        let events = EventBatch::new(std::slice::from_ref(&description));
+        let _dropped = fanout_event_to_clients_with_receive(
+            state,
+            &targets,
+            crate::access::EventSubject::Window(e.window),
+            &events,
+            |buf, seq, order| {
+                x11::encode_xi2_crossing_event(
+                    buf,
+                    order,
+                    seq,
+                    XI2_MAJOR_OPCODE,
+                    evtype,
+                    2,
+                    server_time,
+                    ROOT_WINDOW,
+                    e.window,
+                    root_x,
+                    root_y,
+                    event_x,
+                    event_y,
+                    0,
+                    mode,
+                    e.detail,
+                    2,
+                    focus,
+                );
+            },
+        );
     }
 }
 

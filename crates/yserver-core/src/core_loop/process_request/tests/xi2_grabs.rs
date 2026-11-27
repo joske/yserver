@@ -192,7 +192,7 @@ fn xi_dynamic_wire_grab_body(
     body
 }
 
-fn xi_dynamic_select_events_body(window: u32, device_id: u16, mask: u32) -> Vec<u8> {
+pub(super) fn xi_dynamic_select_events_body(window: u32, device_id: u16, mask: u32) -> Vec<u8> {
     let mut body = Vec::with_capacity(16);
     body.extend_from_slice(&window.to_le_bytes());
     body.extend_from_slice(&1u16.to_le_bytes()); // one device mask

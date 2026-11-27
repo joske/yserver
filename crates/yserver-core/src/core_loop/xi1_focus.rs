@@ -16,7 +16,8 @@
 use yserver_protocol::x11::{ClientId, ResourceId};
 
 use crate::{
-    core_loop::fanout::fanout_event_to_clients,
+    access::{EventBatch, EventSubject},
+    core_loop::fanout::fanout_event_to_clients_with_receive,
     resources::{MapState, ROOT_WINDOW},
     server::{ServerState, Xi1DeviceFocus, Xi1FocusRoute},
 };
@@ -564,11 +565,19 @@ pub(crate) fn emit_device_focus(
             window.0,
             targets.len(),
         );
-        let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
-            crate::xinput::encode_xi1_device_focus_event(
-                buf, order, event_type, detail, seq, time, window.0, mode, deviceid,
-            );
-        });
+        let events = [crate::xinput::xi1_event_description(offset)];
+        let batch = EventBatch::new(&events);
+        let _dropped = fanout_event_to_clients_with_receive(
+            state,
+            &targets,
+            EventSubject::Window(window),
+            &batch,
+            |buf, seq, order| {
+                crate::xinput::encode_xi1_device_focus_event(
+                    buf, order, event_type, detail, seq, time, window.0, mode, deviceid,
+                );
+            },
+        );
     }
     if focus_in {
         crate::core_loop::xi1_state_notify::deliver_state_notify(state, deviceid, window);
@@ -579,17 +588,15 @@ pub(crate) fn emit_device_focus(
 /// event class for `deviceid` *other than* `originator`. Class encoding:
 /// `(deviceid << 8) | type` where
 /// `type = XI_FIRST_EVENT + XI_DEVICE_MAPPING_NOTIFY_OFFSET`.
-/// Selection lives in `client.xi1_event_classes` (server-wide, not
-/// window-scoped — mapping is a per-device property, not a window
-/// property, so Xorg `Xi/exevents.c::SendMappingNotify` sends it to
-/// every client that picked the class on any window).
+/// Selection lives in `client.xi1_event_classes` and yserver aggregates
+/// matching window selections into one per-client copy. Xorg broadcasts
+/// per window (`dix/inpututils.c:103`).
 ///
 /// `originator` is the client that sent the request that triggered the
-/// notify. The caller is expected to splice the event into `originator`'s
-/// reply buffer (event-after-reply on the wire), so we don't fanout to
-/// it here — doing so would either duplicate the event or land it
-/// before the reply, which xts5 SetDeviceButtonMapping rejects with
-/// `wanted REPLY got EVENT`. `None` (a void request, e.g. XKB SetMap)
+/// notify. Its request handler emits the selected copy inline in that
+/// request's order: key-map after core MappingNotify, modifier-map before
+/// core MappingNotify and reply, and button-map after reply. We exclude it
+/// here to avoid a duplicate. `None` (a void request, e.g. XKB SetMap)
 /// sends to every client that selected it.
 ///
 /// `request_kind` is the mapping flavour (0=Modifier, 1=Keyboard,
@@ -615,6 +622,9 @@ pub(crate) fn emit_device_mapping_notify(
     if targets.is_empty() {
         return;
     }
+    let event_description =
+        crate::xinput::xi1_event_description(crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET);
+    let events = EventBatch::new(std::slice::from_ref(&event_description));
     let time = state.timestamp_now();
     log::debug!(
         "xi1_mapping_notify: device={deviceid} request_kind={request_kind} \
@@ -623,19 +633,25 @@ pub(crate) fn emit_device_mapping_notify(
     );
     #[allow(clippy::cast_possible_truncation)]
     let device_byte = deviceid as u8;
-    let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
-        crate::xinput::encode_xi1_device_mapping_notify(
-            buf,
-            order,
-            event_type,
-            device_byte,
-            seq,
-            time,
-            request_kind,
-            first_keycode,
-            count,
-        );
-    });
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &targets,
+        EventSubject::Device(deviceid),
+        &events,
+        |buf, seq, order| {
+            crate::xinput::encode_xi1_device_mapping_notify(
+                buf,
+                order,
+                event_type,
+                device_byte,
+                seq,
+                time,
+                request_kind,
+                first_keycode,
+                count,
+            );
+        },
+    );
 }
 
 /// True if `client` has selected the XI 1.x `DeviceMappingNotify` class
@@ -690,20 +706,29 @@ pub(crate) fn emit_change_device_notify(
     if targets.is_empty() {
         return;
     }
+    let event_description =
+        crate::xinput::xi1_event_description(crate::xinput::XI_CHANGE_DEVICE_NOTIFY_OFFSET);
+    let events = EventBatch::new(std::slice::from_ref(&event_description));
     let time = state.timestamp_now();
     #[allow(clippy::cast_possible_truncation)]
     let device_byte = deviceid as u8;
-    let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
-        crate::xinput::encode_xi1_change_device_notify(
-            buf,
-            order,
-            event_type,
-            device_byte,
-            seq,
-            time,
-            request_kind,
-        );
-    });
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &targets,
+        EventSubject::Device(deviceid),
+        &events,
+        |buf, seq, order| {
+            crate::xinput::encode_xi1_change_device_notify(
+                buf,
+                order,
+                event_type,
+                device_byte,
+                seq,
+                time,
+                request_kind,
+            );
+        },
+    );
 }
 
 #[cfg(test)]

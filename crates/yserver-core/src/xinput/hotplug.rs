@@ -4,11 +4,16 @@ use std::collections::HashSet;
 
 use yserver_protocol::x11::{self, ClientByteOrder, ClientId, ResourceId};
 
-use crate::{core_loop::fanout::fanout_event_to_clients, server::ServerState};
+use crate::{
+    access::{EventBatch, EventSubject},
+    core_loop::fanout::fanout_event_to_clients_with_receive,
+    server::ServerState,
+};
 
-use super::{XI2_DEVICE_CHANGED_MASK, XI2_HIERARCHY_CHANGED_MASK, XiDevice, XiDeviceRole};
+use super::{
+    XI2_DEVICE_CHANGED_MASK, XI2_HIERARCHY_CHANGED_MASK, XI2_MAJOR_OPCODE, XiDevice, XiDeviceRole,
+};
 
-const XI2_MAJOR_OPCODE: u8 = 137;
 const XI_HIERARCHY_CHANGED_MASK_WIDE: u64 = XI2_HIERARCHY_CHANGED_MASK as u64;
 const XI_DEVICE_CHANGED_MASK_WIDE: u64 = XI2_DEVICE_CHANGED_MASK as u64;
 const XI_SLAVE_SWITCH: u8 = 1;
@@ -59,15 +64,21 @@ pub fn emit_xi1_device_presence(
 
     let time = state.timestamp_now();
     let device_id = u8::try_from(id).expect("physical XI device ids fit in one byte");
+    let events = [super::xi1_event_description(
+        super::XI_DEVICE_PRESENCE_NOTIFY_OFFSET,
+    )];
+    let batch = EventBatch::new(&events);
     let mut disconnected = HashSet::new();
-    for (client_id, _selected_window) in targets {
+    for (client_id, selected_window) in targets {
         if disconnected.contains(&client_id.0) {
             continue;
         }
         disconnected.extend(
-            crate::core_loop::fanout::fanout_event_to_clients(
+            fanout_event_to_clients_with_receive(
                 state,
                 std::slice::from_ref(&client_id),
+                EventSubject::Window(selected_window),
+                &batch,
                 |buf, sequence, order| {
                     x11::encode_xi1_device_presence_notify_event(
                         buf,
@@ -255,14 +266,18 @@ pub fn emit_xi2_device_changed(
 
     let time = state.timestamp_now();
     let mut disconnected = HashSet::new();
-    for (client_id, _selected_window) in targets {
+    let events = [super::xi2_event_description(1)];
+    let batch = EventBatch::new(&events);
+    for (client_id, selected_window) in targets {
         if disconnected.contains(&client_id.0) {
             continue;
         }
         disconnected.extend(
-            crate::core_loop::fanout::fanout_event_to_clients(
+            fanout_event_to_clients_with_receive(
                 state,
                 std::slice::from_ref(&client_id),
+                EventSubject::Window(selected_window),
+                &batch,
                 |buf, sequence, order| {
                     let (classes, num_classes) = encode_device_classes(source_classes, order);
                     x11::encode_xi2_device_changed_event(
@@ -408,15 +423,21 @@ pub fn emit_xi_hierarchy_changed(
     }
 
     let time = state.timestamp_now();
+    let event_type =
+        u16::try_from(super::XI2_HIERARCHY_CHANGED_EVENT_TYPE).expect("XI2 event types fit in u16");
+    let events = [super::xi2_event_description(event_type)];
+    let batch = EventBatch::new(&events);
     let mut disconnected = HashSet::new();
-    for (client_id, _selected_window) in targets {
+    for (client_id, selected_window) in targets {
         if disconnected.contains(&client_id.0) {
             continue;
         }
         disconnected.extend(
-            fanout_event_to_clients(
+            fanout_event_to_clients_with_receive(
                 state,
                 std::slice::from_ref(&client_id),
+                EventSubject::Window(selected_window),
+                &batch,
                 |buf, sequence, order| {
                     x11::encode_xi2_hierarchy_changed_event(
                         buf,

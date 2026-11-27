@@ -561,6 +561,10 @@ pub struct RecordingBackend {
     /// by `xkb_info`. `None` (the default) keeps XKB unavailable in tests
     /// that do not explicitly model a host XKB extension.
     pub xkb_info_result: Option<(u8, u8, u8)>,
+    /// One scripted XKB Set* result returned by `xkb_set`, then consumed.
+    pub xkb_set_outcome: Option<crate::backend::XkbSetOutcome>,
+    /// Lit and defined XKB indicator masks returned by `xkb_indicators`.
+    pub xkb_indicators_result: (u32, u32),
     /// Return value for `set_keymap_rmlvo`. `None` (the default) models
     /// a backend without a real keymap (matches the trait default);
     /// tests that need `apply_rules_names_change` to take its recompile
@@ -840,6 +844,8 @@ impl RecordingBackend {
             vidmode_gamma: None,
             xkb_rules_names: None,
             xkb_info_result: None,
+            xkb_set_outcome: None,
+            xkb_indicators_result: (0, 0),
             keymap_rmlvo_result: None,
             kbd_by_name_result: None,
             xkb_mods: (0, 0, 0, 0),
@@ -964,6 +970,14 @@ impl RecordingBackend {
         notify: Option<crate::backend::XkbNewKeyboardInfo>,
     ) -> Self {
         self.kbd_by_name_result = Some((bytes, notify));
+        self
+    }
+
+    /// Script the next XKB Set* outcome, allowing request-path tests to
+    /// exercise `send_xkb_set_events` without a real keyboard backend.
+    #[must_use]
+    pub fn with_xkb_set_outcome(mut self, outcome: crate::backend::XkbSetOutcome) -> Self {
+        self.xkb_set_outcome = Some(outcome);
         self
     }
 
@@ -1514,6 +1528,20 @@ impl Backend for RecordingBackend {
 
     fn current_xkb_mods(&self) -> (u8, u8, u8, u8) {
         self.xkb_mods
+    }
+
+    fn xkb_indicators(&mut self) -> (u32, u32) {
+        self.xkb_indicators_result
+    }
+
+    fn xkb_set(
+        &mut self,
+        _minor: u8,
+        _body: &[u8],
+        _client_is_ancient: bool,
+        _atom_name: &dyn Fn(u32) -> Option<String>,
+    ) -> Option<crate::backend::XkbSetOutcome> {
+        self.xkb_set_outcome.take()
     }
 
     fn current_xkb_rules_names(&self) -> Option<[String; 5]> {

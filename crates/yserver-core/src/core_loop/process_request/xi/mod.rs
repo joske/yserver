@@ -1,7 +1,7 @@
 mod dispatch;
 
 use crate::{
-    access::{AccessMode, ResourceKind},
+    access::{AccessMode, Decision, EventBatch, EventSubject, ResourceKind},
     backend::{Backend, OriginContext},
     core_loop::process_request::{
         RequestOutcome, SendEventCandidate, XI2_MAJOR_OPCODE, emit_x11_error_with_minor,
@@ -597,6 +597,8 @@ fn emit_xi2_device_changed_bootstrap(
         return Ok(());
     };
     let mut buf = Vec::new();
+    let events = [crate::xinput::xi2_event_description(1)];
+    let batch = EventBatch::new(&events);
     for master_id in selected_masters {
         // Xorg serializes the source ID retained by each copied class
         // (`Xi/xiquerydevice.c:278,326`); it is independent of `lastSlave`,
@@ -621,6 +623,14 @@ fn emit_xi2_device_changed_bootstrap(
         else {
             continue;
         };
+        if let Decision::Deny(_) = state.check_receive(
+            client_id,
+            EventSubject::Window(ROOT_WINDOW),
+            &batch,
+            state.receive_request,
+        ) {
+            continue;
+        }
         let Some((classes, num_classes)) =
             crate::xinput::hotplug::device_changed_class_block(state, master_id, byte_order)
         else {

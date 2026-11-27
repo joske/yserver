@@ -431,24 +431,32 @@ pub fn emit_xi2_focus_event_to_state(
     let (origin_x, origin_y) = state.resources.window_absolute_position(window);
     let event_x = i16::try_from(i32::from(root_x).saturating_sub(origin_x)).unwrap_or(i16::MAX);
     let event_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y)).unwrap_or(i16::MAX);
-    fanout_event_to_clients(state, &targets, |buf, seq, order| {
-        x11::encode_xi2_focus_event(
-            buf,
-            order,
-            seq,
-            xi2_major_opcode,
-            evtype,
-            3,
-            0,
-            window,
-            root_x,
-            root_y,
-            event_x,
-            event_y,
-            mode,
-            detail,
-        );
-    })
+    let events = [EventDescription::extension(35, xi2_major_opcode, evtype)];
+    let batch = EventBatch::new(&events);
+    fanout_event_to_clients_with_receive(
+        state,
+        &targets,
+        EventSubject::Window(window),
+        &batch,
+        |buf, seq, order| {
+            x11::encode_xi2_focus_event(
+                buf,
+                order,
+                seq,
+                xi2_major_opcode,
+                evtype,
+                3,
+                0,
+                window,
+                root_x,
+                root_y,
+                event_x,
+                event_y,
+                mode,
+                detail,
+            );
+        },
+    )
 }
 
 /// `XIDeviceChange` reason (XI2.h:108) — the device's own classes/name
@@ -500,20 +508,28 @@ pub fn emit_xi2_device_changed_slave_pointer(
 
     let (classes, num_classes) = build_slave_pointer_class_block(state);
     let time = state.timestamp_now();
-    fanout_event_to_clients(state, &targets, |buf, seq, order| {
-        x11::encode_xi2_device_changed_event(
-            buf,
-            order,
-            seq,
-            xi2_major_opcode,
-            XTEST_POINTER,
-            time,
-            num_classes,
-            XTEST_POINTER, // sourceid = the XTEST device itself
-            XI_REASON_DEVICE_CHANGE,
-            &classes,
-        );
-    })
+    let event_description = crate::xinput::xi2_event_description(1);
+    let events = EventBatch::new(std::slice::from_ref(&event_description));
+    fanout_event_to_clients_with_receive(
+        state,
+        &targets,
+        EventSubject::Window(ROOT_WINDOW),
+        &events,
+        |buf, seq, order| {
+            x11::encode_xi2_device_changed_event(
+                buf,
+                order,
+                seq,
+                xi2_major_opcode,
+                XTEST_POINTER,
+                time,
+                num_classes,
+                XTEST_POINTER, // sourceid = the XTEST device itself
+                XI_REASON_DEVICE_CHANGE,
+                &classes,
+            );
+        },
+    )
 }
 
 /// Build the XI2 device-class block for the virtual XTEST pointer.

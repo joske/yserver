@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use yserver_protocol::x11::{AtomId, ClientByteOrder, SequenceNumber};
 
-use crate::core_loop::DeviceInfo;
+use crate::{access::EventDescription, core_loop::DeviceInfo, nested::XI2_MAJOR_OPCODE};
 
 pub mod hotplug;
 pub mod libinput_props;
@@ -53,6 +53,20 @@ pub const NAME_MASTER_KEYBOARD: &str = "Virtual core keyboard";
 /// XISelectEvents bootstrap and the touchpad-add/remove fanout so both
 /// match the same selection bit.
 pub const XI2_DEVICE_CHANGED_MASK: u32 = 1 << 1;
+
+/// Describe one XI1 event code for access-policy Receive checks.
+pub(crate) fn xi1_event_description(offset: u8) -> EventDescription {
+    EventDescription::extension(
+        crate::server::XI_FIRST_EVENT + offset,
+        XI2_MAJOR_OPCODE,
+        u16::from(offset),
+    )
+}
+
+/// Describe one XI2 GenericEvent for access-policy Receive checks.
+pub(crate) fn xi2_event_description(evtype: u16) -> EventDescription {
+    EventDescription::extension(35, XI2_MAJOR_OPCODE, evtype)
+}
 
 /// XI2 `XI_HierarchyChanged` event number (XI2.h:99).
 pub const XI2_HIERARCHY_CHANGED_EVENT_TYPE: u32 = 11;

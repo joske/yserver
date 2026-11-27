@@ -578,11 +578,12 @@ pub(super) fn handle_xi1_select_extension_event(
         #[allow(clippy::cast_possible_truncation)]
         let dev_byte = (class >> 8) as u8;
         let recognized = if crate::server::xi1_class_is_global_notification(class) {
-            // DevicePropertyNotify / DeviceMappingNotify /
-            // ChangeDeviceNotify are server-wide per-device
-            // events: Xorg `Xi/exevents.c::SendMappingNotify` /
-            // `SendDeviceNotify` fan them out by walking the
-            // global client list, NOT a per-window event-mask.
+            // yserver aggregates DevicePropertyNotify,
+            // DeviceMappingNotify and ChangeDeviceNotify per client.
+            // Xorg broadcasts property and mapping notifications per
+            // selecting window (`Xi/xiproperty.c:206`,
+            // `xkb/xkbEvents.c:142`); its ChangeKeyboardDevice request
+            // returns BadDevice (`Xi/chgkbd.c:97`).
             accepted_classes.push(class);
             true
         } else if class_low <= crate::xinput::XI1_DEVICE_OWNER_GRAB_BUTTON_CLASS {

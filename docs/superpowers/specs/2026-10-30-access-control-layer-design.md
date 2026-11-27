@@ -291,7 +291,10 @@ it through `events()`. An `EventDescription` stores `type_code: u8` and
 `extension: Option<ExtensionEventDescription>`; extension metadata stores
 `major_opcode: u8` and `event_type: u16`. The `type_code` is the core event
 type with the send-event bit removed; `event_type` is the extension event code
-or XI2 `evtype`. For a GenericEvent,
+or XI2 `evtype`. Every XKB event shares one event code, so for an XKB
+event `event_type` is its `xkbType`, wire byte 1, whether the server
+emits it or a client sends it with `SendEvent`; this is a yserver rule.
+For a GenericEvent,
 the major opcode is wire byte 1 and the `evtype` is bytes 8–9 interpreted in
 the sender's byte order. `describe_wire_event` is the single function that
 builds descriptions from wire events: it resolves ordinary extension event
@@ -300,7 +303,9 @@ metadata from its wire fields. This supplies the event identity policies
 need without encoding per recipient. Xorg's SECURITY policy checks the sender
 and window once and, if that is denied, denies the whole batch unless every
 event in it is an `UnmapNotify`, `ConfigureRequest` or `ClientMessage`
-(`Xext/security.c:869-899`), and its dispatch uses the
+(`Xext/security.c:869-899`). That exception compares the raw type, and core
+`SendEvent` sets the synthetic bit before the hook runs
+(`dix/events.c:5621`), so it never matches a core `SendEvent`. Xorg's dispatch uses the
 extension and `evtype` to identify GenericEvents (`dix/events.c:183-191,
 419-435, 459-468`).
 
@@ -345,16 +350,206 @@ early return (`dix/events.c:5622-5630`), its receive-denied input-client path
 and delivery count (`dix/events.c:2291-2295, 2377-2433`), and its creator
 delivery result (`dix/events.c:2201-2224`).
 
+### Input delivery under denial
+
+Physical input keeps yserver's present routing. This section does not
+describe that routing. It states how a Receive denial enters the decisions
+the routing already makes. With no policy installed, or with every check
+allowed, every decision takes the same inputs as today, and the output is
+byte-identical. Where today's routing differs from Xorg's, the difference is
+listed at the end of this section and stays out of this series.
+
+**The principle.** Today the input resolvers make decisions from selections
+before they write anything:
+- whether a selection stops a walk;
+- whether one form shadows another for the same client;
+- which candidate becomes the implicit-grab owner;
+- whether a foreign selector rejects a grabbed walk;
+- whether a grabbed walk falls back to the grab window.
+
+Under a policy, a selection takes part in these decisions only if the copy
+it would produce is allowed. A denied copy is a non-delivery. It does not
+stop a walk, shadow another form, qualify an owner, or reject a grab, and the
+decision continues with the remaining selections exactly as it does today.
+A denial reopens only the decision it affects. A selection that stops a walk
+or shadows another form today without producing bytes, for example because
+of detectable-repeat eligibility or XI2 release suppression, still does so.
+No copy exists to check, so Receive is not asked. This takes precedence over
+the per-form check of grabbed key selectors below: a foreign selector whose
+selected form yserver suppresses still rejects the grabbed walk as today.
+
+Each routed delivery attempt gets one Receive result per recipient. That
+result feeds the routing decisions and is reused for the write, even when the
+write happens later in the same input dispatch, for example an XI2 key copy
+that shadows a core copy before its own writer runs. A distinct attempt, such
+as a grab-window fallback or a replay, gets a fresh check.
+
+The plan names each decision site. Selection-based decisions take a
+Receive outcome. Fixed recipients keep a local check at their existing
+fanout. The encoders and the write order stay. A policy denial is a separate
+outcome from the fanout result that reports transport failures and
+disconnects.
+
+Xorg, unlike yserver, has a single walk per device that tries the next form
+at a window only when the previous form returned no delivery there
+(`dix/events.c:2897-2930`); a suppressed motion hint counts as a delivery
+without bytes (`dix/events.c:2080`). yserver's per-client form shadowing, and its
+reopening under denial, are yserver rules.
+
+**Consequences that need a ruling.**
+- **Implicit grab.** Receive-denied candidates are removed from each existing
+  winner calculation, and the calculation then runs as today, including its
+  present handling of transport failures. When the denials leave no
+  candidate, there is no implicit grab.
+- **Deferred core copies.** A core copy that the existing path defers behind
+  the slave pass is checked once, when it is admitted to the deferred output
+  of the same input dispatch. The decisions above use that result. The flush
+  does not check again and keeps today's slave-before-core order. A copy that
+  is written immediately is checked at its write.
+- **Focus.** A denial can advance the existing bounded focus walk. yserver
+  adds no separate direct attempt at the focus. For a concrete focus, Xorg
+  tries the focus directly when its bounded walk delivers nothing, or
+  without a bounded walk when the sprite is outside the focus
+  (`dix/events.c:4267-4337`).
+- **Grabbed key selectors.** Today core and XI2 key selections are merged
+  per client to pick the natural target. Each foreign selector is checked in
+  the form it selected at the candidate window, and only an allowed one can
+  reject the walk. The owner is checked in the grab protocol it would
+  receive. Xorg also checks the candidate form before its foreign-client
+  rejection (`dix/events.c:2291-2295`).
+- **Grabbed key owner.** A grab owner that qualifies through one selected
+  form, while the copy actually written in the grab's protocol is denied,
+  does not stop the natural walk. If no allowed foreign selector rejects
+  the walk, it continues to the next ancestor. If one does, the existing
+  rejection applies and delivery falls back to the grab window.
+- **Grab window.** At the grab window, with `owner_events` false or as the
+  fallback, a denial counts as delivered: the owner gets no bytes and input
+  stays captured. As in Xorg, the Receive check comes before the grab mask
+  and the core interference guard, so a denial counts as delivered even
+  where the mask would have filtered the event (`dix/events.c:4388-4398`).
+- **Freeze.** A sync grab freezes on today's triggers. A denial at the grab
+  window counts as a delivery for any trigger that depends on one. Xorg
+  takes the freeze-next transition only for a delivered key or button event
+  that does not deactivate the grab, and a denied grab-window delivery
+  counts as delivered there (`dix/events.c:4390`, `4467-4473`). Making that gate
+  universal would change output with every check allowed, so yserver does
+  not.
+
+**Passive grab activation.** Xorg has no hook on the activating write
+(`dix/events.c:3833-3919`). Under this policy every recipient of a
+server-generated event is checked, apart from the exemptions in "Who is
+checked", so yserver checks the activating event for the grab owner. A denial
+drops only those bytes. The grab still activates, a sync grab still freezes
+and stores the event, and replay works as it does today. This is a yserver
+rule. The grab itself is authorized when it is established, by the device
+checks of PR 5.
+
+**Replay and thaw.** Queue bookkeeping, thaw, the choice of event to replay,
+and a passive grab matching again are not checked. A RECORD copy emitted
+when input is queued follows the event-record rule. Replay and thaw keep
+their present routing. A replayed or thawed event is checked again at each
+write, under whichever rule above applies there. Xorg's replay rematches
+passive grabs below the old grab window (`dix/events.c:1318-1371`). Where
+yserver's replay differs from that, it is a routing difference and stays.
+
+**Raw events.** Today's raw recipients, their multiplicity and order, and the
+root filters stay. Each copy to a root selector is checked with that root as
+its subject, and a denial drops only that copy. The master raw-key grab leg
+sends at most one copy to the grab owner. Under a policy, it tries the
+owner's root selection first, with the root as subject. On a non-delivery it
+falls back to the grab window, with the grab window as subject. The
+separately filtered root fanout runs after it, as today.
+
+**Batches.** A batch is checked once for each recipient, and a denial drops
+the whole batch for that recipient:
+- an XI1 `DeviceStateNotify` chain (`dix/enterleave.c:698-763`);
+- an XI1 `DeviceMotionNotify` together with its `DeviceValuator`
+  continuations, which Xorg builds as one batch (`dix/eventconvert.c:369`).
+An independently selected focus event and a state batch are checked
+separately. yserver's two-event smooth-scroll stop goes to the window it
+resolves today; a denial drops it there, and the motion walk does not
+resume. Ordinary scroll events follow the ordinary walk. In key repeat, the
+legacy release and the repeated press are checked independently, keep their
+release-before-press order, and keep today's per-client detectable-repeat
+eligibility. Xorg emits that release inside the press's delivery attempt
+(`dix/events.c:2100`). The stop batch and the repeat rule are yserver rules.
+
+**Notifications.** This covers crossings, focus, barriers, root and COW
+`ConfigureNotify`, XI device notifications, and XKB.
+- A denial drops that recipient's copy only. The transition chain, the
+  device or property change, and the barrier state all continue unchanged.
+- A denial does not reopen a shadow among notifications. Crossings keep
+  their existing XI2-over-core deduplication, and the local check runs after
+  it. A denied XI2 crossing does not expose a core crossing.
+- Each copy keeps today's recipients and multiplicity. The grabbed-crossing,
+  synthetic XI grab and ungrab, and grabbed-barrier recipients stay as they
+  are. Xorg's grabbed barrier event uses the active-grab walk
+  (`Xi/exevents.c:1738`); yserver chooses the owner directly.
+- The subject is the selection or transition window wherever the producer
+  keeps it. That includes the root for the `XISelectEvents` bootstrap and
+  the overlay parent's `SubstructureNotify` copy. XI hotplug, mapping,
+  device-change and device-property copies that yserver sends once per
+  client, including the originator's selected copy, use
+  `EventSubject::Device`. Xorg broadcasts XI2 `DeviceChanged` and the
+  device notifications once per selecting window (`Xi/exevents.c:3280`).
+  Xorg never emits XI1 `ChangeDeviceNotify`: `ChangeKeyboardDevice` returns
+  `BadDevice` (`Xi/chgkbd.c:92`). Choosing the device as
+  subject keeps today's multiplicity and is a yserver rule.
+- Xorg has no Receive hook on grabbed Enter/Leave legs
+  (`dix/events.c:4730-4805, 4809-4883`) or on native XKB events
+  (`xkb/xkbEvents.c:252`). Under this policy yserver checks both. An XKB
+  event has the device as its subject: the device id the event carries,
+  which is 1 (`XKB_DEVICE_ID`). Xorg's XKB events carry the master
+  keyboard's id, 3, which the XI paths use as their subject, so a policy
+  that matches XI device ids must also match XKB's 1. Moving the wire id
+  to Xorg's value is a follow-up outside this series. These two checks
+  are yserver rules.
+
+**Differences from Xorg that stay.** With no policy installed, yserver
+differs from Xorg in the following ways. Each one needs its own routing fix,
+measured against Xorg, and stays out of this series:
+- Xorg ends a device's walk at the first form that delivers. yserver can
+  emit XI2 and core at the same window, for example to a master XI2 key
+  subscriber and a different core subscriber (`dix/events.c:2897`).
+- The implicit-grab owner. Within its input-client list, Xorg keeps the first
+  successful entry that holds `DeviceButtonGrabMask`, or the last successful
+  one otherwise (`dix/events.c:2291-2316`). It considers the core window
+  owner separately, and that owner stays the winner if no list entry
+  succeeds (`dix/events.c:2373-2433`). yserver prefers the window owner among XI2
+  candidates at the same window, and gives core precedence over XI2 there.
+- Motion hints. Xorg keeps hint state, and a suppressed repeated hint counts
+  as a delivery without a write (`dix/events.c:2078`, `4464`, `4745`).
+  yserver encodes core motion with detail zero and treats the XI1 hint
+  selection as a qualifier; it keeps no hint state. A denial changes no hint
+  state.
+- An active-grab rejection. In Xorg, a later form can overwrite an earlier
+  rejection (`dix/events.c:2924`); yserver's pointer resolver latches the
+  first.
+- Raw events. Xorg attempts the grab leg before its root filters
+  (`dix/events.c:2445-2523`). yserver has no grab leg for raw pointer input
+  or for slave raw keyboard input, and skips Xorg's grab filtering of raw
+  pointer roots.
+- The physical-input walks do not apply the core and XI1 do-not-propagate
+  stops.
+- Replay rematching, as described under "Replay and thaw".
+
 ### Who is checked
 
-Checks run only for work done on behalf of a client request. Hit testing,
+Request checks, the send check among them, run only for work done on behalf
+of a client request. The receive check is the one exception: it also runs for
+server-generated output, as described below. Hit testing,
 ancestor walks, clipping, damage propagation, reset, disconnect, deferred
 completion and rootless window management run as the server and are not
 checked. The internal clipboard bridge is a real client and goes through the
 same checks; a policy decides how to treat it.
 
 Server-generated events have no sender, so the send check does not run for
-them. Their recipients do go through the receive check.
+them. Their recipients do go through the receive check, except where an
+exemption below applies, such as core `MappingNotify`. Xorg's cooked input
+does call the send hook with a null client (`dix/events.c:4389`), which
+SECURITY ignores (`Xext/security.c:875`). Leaving that call out is a yserver
+interface rule. Synthetic core `SendEvent` and XI `SendExtensionEvent` keep
+their existing propagation rules.
 
 MIT-SCREEN-SAVER attributes saved by `SetAttributes` are deferred work of the
 client that installed them. When activation computes the effective values for

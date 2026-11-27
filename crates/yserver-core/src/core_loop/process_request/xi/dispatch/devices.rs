@@ -1,5 +1,5 @@
 use crate::{
-    access::{AccessMode, RequestOpcodes},
+    access::{AccessMode, Decision, EventBatch, EventSubject, RequestOpcodes},
     core_loop::process_request::{
         RequestOutcome, XI2_FIRST_ERROR, XI2_MAJOR_OPCODE, XI2_SERVER_MAJOR_VERSION,
         XI2_SERVER_MINOR_VERSION, emit_x11_error_with_minor,
@@ -624,8 +624,9 @@ pub(super) fn handle_xi1_set_device_mode(
     xi_write_reply(state, client_id, buf)
 }
 
-// ChangeKeyboardDevice: { deviceid }. Needs a device with keys
-// (Xorg Xi/chgkbd.c). xts5 expects:
+// ChangeKeyboardDevice: { deviceid }. yserver requires the selected device
+// to have keys; Xorg validates request size then returns BadDevice
+// (Xi/chgkbd.c:92). xts5 expects:
 //   1. ChangeDeviceNotify (request=1 = NewKeyboard)
 //   2. core MappingNotify (request=1 = MappingKeyboard)
 //   3. reply
@@ -657,18 +658,28 @@ pub(super) fn handle_xi1_change_keyboard_device(
         // 1. ChangeDeviceNotify for originator (if selected) + fanout.
         if crate::core_loop::xi1_focus::xi1_client_wants_change_device_notify(state, client_id, dev)
         {
-            let time = state.timestamp_now();
-            #[allow(clippy::cast_possible_truncation)]
-            let device_byte = dev as u8;
-            crate::xinput::encode_xi1_change_device_notify(
-                &mut buf,
-                byte_order,
-                crate::server::XI_FIRST_EVENT + crate::xinput::XI_CHANGE_DEVICE_NOTIFY_OFFSET,
-                device_byte,
-                sequence,
-                time,
-                1, // NewKeyboard
-            );
+            let event_description =
+                crate::xinput::xi1_event_description(crate::xinput::XI_CHANGE_DEVICE_NOTIFY_OFFSET);
+            let events = EventBatch::new(std::slice::from_ref(&event_description));
+            if let Decision::Allow = state.check_receive(
+                client_id,
+                EventSubject::Device(dev),
+                &events,
+                state.receive_request,
+            ) {
+                let time = state.timestamp_now();
+                #[allow(clippy::cast_possible_truncation)]
+                let device_byte = dev as u8;
+                crate::xinput::encode_xi1_change_device_notify(
+                    &mut buf,
+                    byte_order,
+                    crate::server::XI_FIRST_EVENT + crate::xinput::XI_CHANGE_DEVICE_NOTIFY_OFFSET,
+                    device_byte,
+                    sequence,
+                    time,
+                    1, // NewKeyboard
+                );
+            }
         }
         crate::core_loop::xi1_focus::emit_change_device_notify(state, client_id, dev, 1);
         // 2. core MappingNotify (request=1 = MappingKeyboard) to all

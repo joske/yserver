@@ -56,6 +56,7 @@ use super::{
     xdmcp::{XDMCP_TOKEN, XdmcpOutcome, XdmcpService},
 };
 use crate::{
+    access::{EventBatch, EventDescription},
     backend::{Backend, BackendFdKind, CrtcConfigToken, Dri3ExportToken, HostSocketStatus},
     fd::{OwnedFd, RawFd},
     host_x11::HostEvent,
@@ -3964,6 +3965,8 @@ pub(crate) fn emit_screen_resize_window_notifications(
     width: u16,
     height: u16,
 ) {
+    let event_description = EventDescription::core(22);
+    let event_batch = EventBatch::new(std::slice::from_ref(&event_description));
     use yserver_protocol::x11;
 
     let root_geometry = x11::Geometry {
@@ -3981,10 +3984,11 @@ pub(crate) fn emit_screen_resize_window_notifications(
     // before the RANDR fanout so non-RANDR-aware clients (panels,
     // "fill the screen" apps) reflow at the same point in the event
     // stream that RANDR-aware toolkits see screen-change.
-    let _dropped = crate::core_loop::fanout::emit_window_event_to_state(
+    let _dropped = crate::core_loop::fanout::emit_window_event_to_state_with_receive(
         state,
         crate::resources::ROOT_WINDOW,
         0x0002_0000, // StructureNotifyMask
+        &event_batch,
         |buf, seq, order| {
             x11::encode_configure_notify_event(
                 buf,
@@ -4022,10 +4026,11 @@ pub(crate) fn emit_screen_resize_window_notifications(
         let above_sibling = state
             .resources
             .configure_notify_above_sibling(crate::resources::COMPOSITE_OVERLAY_WINDOW);
-        let _dropped = crate::core_loop::fanout::emit_window_event_to_state(
+        let _dropped = crate::core_loop::fanout::emit_window_event_to_state_with_receive(
             state,
             crate::resources::COMPOSITE_OVERLAY_WINDOW,
             0x0002_0000, // StructureNotifyMask
+            &event_batch,
             |buf, seq, order| {
                 x11::encode_configure_notify_event(
                     buf,
@@ -4039,10 +4044,11 @@ pub(crate) fn emit_screen_resize_window_notifications(
                 );
             },
         );
-        let _dropped = crate::core_loop::fanout::emit_window_event_to_state(
+        let _dropped = crate::core_loop::fanout::emit_window_event_to_state_with_receive(
             state,
             parent,
             0x0008_0000, // SubstructureNotifyMask
+            &event_batch,
             |buf, seq, order| {
                 x11::encode_configure_notify_event(
                     buf,

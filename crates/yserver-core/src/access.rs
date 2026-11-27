@@ -154,8 +154,8 @@ impl EventDescription {
 
     /// Describe an extension event from its wire type byte and extension metadata.
     ///
-    /// `event_type` is the extension event code, or the XI2 `evtype` for a
-    /// GenericEvent (`type_code == 35`).
+    /// `event_type` is the extension event code, an XKB `xkbType`, or the XI2
+    /// `evtype` for a GenericEvent (`type_code == 35`).
     #[must_use]
     pub const fn extension(type_code: u8, major_opcode: u8, event_type: u16) -> Self {
         Self {

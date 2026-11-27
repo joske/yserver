@@ -9,8 +9,9 @@
 //! full-reload notification path.
 
 use crate::{
+    access::{EventBatch, EventDescription, EventSubject},
     backend::{Backend, KeyboardMappingChange},
-    core_loop::fanout::fanout_event_to_clients,
+    core_loop::fanout::{fanout_event_to_clients, fanout_event_to_clients_with_receive},
     properties::{PropertyFormat, PropertyValue},
     resources::ROOT_WINDOW,
     server::ServerState,
@@ -142,22 +143,34 @@ pub fn apply_rules_names_change(state: &mut ServerState, backend: &mut dyn Backe
 
     // 2. XKB events only to clients that selected them (XkbSelectEvents).
     let nkn = subscribers(state, 0x0001); // XkbNewKeyboardNotifyMask
-    let _dropped = fanout_event_to_clients(state, &nkn, |buf, seq, order| {
-        let _ = x11::write_xkb_new_keyboard_notify(
-            buf,
-            order,
-            seq,
-            xkb_event_base,
-            1,
-            min_kc,
-            max_kc,
-            min_kc,
-            max_kc,
-            0,      // requestMajor — internal rules-names change, no request
-            0,      // requestMinor
-            0x0001, // changed = XkbNKN_KeycodesMask
-        );
-    });
+    let description = [xkb_event_description(
+        xkb_event_base,
+        x11::XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+    )];
+    let events = EventBatch::new(&description);
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &nkn,
+        EventSubject::Device(1),
+        &events,
+        |buf, seq, order| {
+            let _ = x11::write_xkb_new_keyboard_notify(
+                buf,
+                order,
+                seq,
+                xkb_event_base,
+                1,
+                min_kc,
+                max_kc,
+                min_kc,
+                max_kc,
+                // The wire cause stays (0, 0); Receive context remains the triggering ChangeProperty.
+                0,      // requestMajor
+                0,      // requestMinor
+                0x0001, // changed = XkbNKN_KeycodesMask
+            );
+        },
+    );
     // n_types = 4 in phase A; a later task (C2) changes this to the
     // backend's derived type count once GetMap publishes the real table.
     send_xkb_map_notify(
@@ -175,21 +188,48 @@ pub fn apply_rules_names_change(state: &mut ServerState, backend: &mut dyn Backe
 
 /// Send an `XkbMapNotify` carrying `notify` to every client whose map
 /// details include one of its changes (Xorg `XkbSendMapNotify`:
-/// `mapNotifyMask & changed`). Returns the recipients.
+/// `mapNotifyMask & changed`). Returns all selected recipients, including
+/// those whose delivery is denied.
 pub(crate) fn send_xkb_map_notify(
     state: &mut ServerState,
     xkb_event_base: u8,
     notify: x11::XkbMapNotify,
 ) -> Vec<ClientId> {
     let recipients = crate::core_loop::xkb_select::map_notify_recipients(state, notify.changed);
-    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-        let _ = x11::write_xkb_map_notify(buf, order, seq, xkb_event_base, notify);
-    });
+    let description = [xkb_event_description(
+        xkb_event_base,
+        x11::XKB_MAP_NOTIFY_TYPE,
+    )];
+    let events = EventBatch::new(&description);
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &recipients,
+        EventSubject::Device(u16::from(notify.device_id)),
+        &events,
+        |buf, seq, order| {
+            let _ = x11::write_xkb_map_notify(buf, order, seq, xkb_event_base, notify);
+        },
+    );
     recipients
 }
 
 /// yserver's one XKB keyboard, as every XKB reply and event names it.
 pub(crate) const XKB_DEVICE_ID: u8 = 1;
+
+/// Supplies the native XKB metadata for one XKB notification. For any wire
+/// code the live registry resolves to XKB, this matches `describe_wire_event`:
+/// XKB has one event code and its `xkbType` byte is the event type.
+/// The base-zero fallback when `xkb_info()` is absent is not equivalent:
+/// `describe_wire_event` classifies that fallback as `core(0)`.
+#[must_use]
+pub(crate) fn xkb_event_description(xkb_event_base: u8, xkb_type: u8) -> EventDescription {
+    EventDescription::extension(
+        xkb_event_base,
+        crate::nested::XKB_MAJOR_OPCODE,
+        u16::from(xkb_type),
+    )
+}
+
 /// `XkbPerKeyRepeatMask` in `XkbControlsNotify.changedControls`.
 const XKB_PER_KEY_REPEAT_MASK: u32 = 1 << 30;
 /// Core `X_ChangeKeyboardMapping`: the cause Xorg's `XkbApplyMappingChange`
@@ -254,9 +294,19 @@ pub(crate) fn send_xkb_compat_map_notify(
     notify: x11::XkbCompatMapNotify,
 ) {
     let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| i.compat != 0);
-    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-        let _ = x11::write_xkb_compat_map_notify(buf, order, seq, xkb_event_base, notify);
-    });
+    let description = xkb_event_description(xkb_event_base, x11::XKB_COMPAT_MAP_NOTIFY_TYPE);
+    let events = EventBatch::new(std::slice::from_ref(&description));
+    // This XKB Receive check is a yserver rule; Xorg emits native XKB events
+    // without one.
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &recipients,
+        EventSubject::Device(u16::from(notify.device_id)),
+        &events,
+        |buf, seq, order| {
+            let _ = x11::write_xkb_compat_map_notify(buf, order, seq, xkb_event_base, notify);
+        },
+    );
 }
 
 /// `XkbSendNamesNotify`: to every XKB-initialised client whose names
@@ -268,9 +318,19 @@ pub(crate) fn send_xkb_names_notify(
 ) {
     let recipients =
         crate::core_loop::xkb_select::interest_recipients(state, |i| i.names & notify.changed != 0);
-    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-        let _ = x11::write_xkb_names_notify(buf, order, seq, xkb_event_base, notify);
-    });
+    let description = xkb_event_description(xkb_event_base, x11::XKB_NAMES_NOTIFY_TYPE);
+    let events = EventBatch::new(std::slice::from_ref(&description));
+    // This XKB Receive check is a yserver rule; Xorg emits native XKB events
+    // without one.
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &recipients,
+        EventSubject::Device(u16::from(notify.device_id)),
+        &events,
+        |buf, seq, order| {
+            let _ = x11::write_xkb_names_notify(buf, order, seq, xkb_event_base, notify);
+        },
+    );
 }
 
 /// `_XkbSetNames`' ExtensionDeviceNotify after new indicator names: reason
@@ -298,9 +358,19 @@ pub(crate) fn send_indicator_names_change(
     let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| {
         i.extension_device & XI_INDICATOR_NAMES_MASK != 0
     });
-    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-        let _ = x11::write_xkb_extension_device_notify(buf, order, seq, xkb_event_base, notify);
-    });
+    let description = xkb_event_description(xkb_event_base, x11::XKB_EXTENSION_DEVICE_NOTIFY_TYPE);
+    let events = EventBatch::new(std::slice::from_ref(&description));
+    // This XKB Receive check is a yserver rule; Xorg emits native XKB events
+    // without one.
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &recipients,
+        EventSubject::Device(u16::from(notify.device_id)),
+        &events,
+        |buf, seq, order| {
+            let _ = x11::write_xkb_extension_device_notify(buf, order, seq, xkb_event_base, notify);
+        },
+    );
 }
 
 /// `XkbXI_IndicatorNamesMask`.
@@ -374,9 +444,19 @@ fn send_led_extension_device_notify(
     let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| {
         i.extension_device & reason != 0
     });
-    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-        let _ = x11::write_xkb_extension_device_notify(buf, order, seq, xkb_event_base, notify);
-    });
+    let description = xkb_event_description(xkb_event_base, x11::XKB_EXTENSION_DEVICE_NOTIFY_TYPE);
+    let events = EventBatch::new(std::slice::from_ref(&description));
+    // This XKB Receive check is a yserver rule; Xorg emits native XKB events
+    // without one.
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &recipients,
+        EventSubject::Device(u16::from(notify.device_id)),
+        &events,
+        |buf, seq, order| {
+            let _ = x11::write_xkb_extension_device_notify(buf, order, seq, xkb_event_base, notify);
+        },
+    );
 }
 
 /// Apply the per-key auto-repeat a mapping change re-derived for its keys
@@ -410,9 +490,19 @@ pub(crate) fn apply_keyboard_mapping_repeats(
     let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| {
         i.controls & XKB_PER_KEY_REPEAT_MASK != 0
     });
-    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-        let _ = x11::write_xkb_controls_notify(buf, order, seq, xkb_event_base, notify);
-    });
+    let description = xkb_event_description(xkb_event_base, x11::XKB_CONTROLS_NOTIFY_TYPE);
+    let events = EventBatch::new(std::slice::from_ref(&description));
+    // This XKB Receive check is a yserver rule; Xorg emits native XKB events
+    // without one.
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &recipients,
+        EventSubject::Device(u16::from(notify.device_id)),
+        &events,
+        |buf, seq, order| {
+            let _ = x11::write_xkb_controls_notify(buf, order, seq, xkb_event_base, notify);
+        },
+    );
 }
 
 /// Copy re-derived per-key repeat bits into the core keyboard feedback
@@ -459,9 +549,19 @@ fn send_indicator_notify(
         x11::XkbIndicatorNotifyKind::Map => i.indicator_map & changed != 0,
         x11::XkbIndicatorNotifyKind::State => i.indicator_state & changed != 0,
     });
-    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-        let _ = x11::write_xkb_indicator_notify(buf, order, seq, xkb_event_base, notify);
-    });
+    let description = xkb_event_description(xkb_event_base, kind.xkb_type());
+    let events = EventBatch::new(std::slice::from_ref(&description));
+    // This XKB Receive check is a yserver rule; Xorg emits native XKB events
+    // without one.
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &recipients,
+        EventSubject::Device(u16::from(notify.device_id)),
+        &events,
+        |buf, seq, order| {
+            let _ = x11::write_xkb_indicator_notify(buf, order, seq, xkb_event_base, notify);
+        },
+    );
 }
 
 /// Decode the group-lock target from an `xkbLatchLockStateReq` body (the bytes
@@ -602,10 +702,19 @@ pub fn announce_xkb_state(
     };
     let recipients =
         crate::core_loop::xkb_select::interest_recipients(state, |i| i.state & changed != 0);
-    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-        let _ = x11::write_xkb_state_notify(buf, order, seq, xkb_event_base, notify);
-    });
-
+    let description = xkb_event_description(xkb_event_base, x11::XKB_STATE_NOTIFY_TYPE);
+    let events = EventBatch::new(std::slice::from_ref(&description));
+    // This XKB Receive check is a yserver rule; Xorg emits native XKB events
+    // without one. The snapshot above advances even when every copy is denied.
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &recipients,
+        EventSubject::Device(u16::from(notify.device_id)),
+        &events,
+        |buf, seq, order| {
+            let _ = x11::write_xkb_state_notify(buf, order, seq, xkb_event_base, notify);
+        },
+    );
     let (lit, defined) = backend.xkb_indicators();
     let lit_changed = lit ^ state.xkb_announced_indicators;
     state.xkb_announced_indicators = lit;

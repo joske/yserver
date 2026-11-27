@@ -15,7 +15,8 @@
 use yserver_protocol::x11::{ClientId, ResourceId};
 
 use crate::{
-    core_loop::fanout::fanout_event_to_clients,
+    access::{EventBatch, EventSubject},
+    core_loop::fanout::fanout_event_to_clients_with_receive,
     server::{ServerState, Xi1DeviceInputState},
 };
 
@@ -70,6 +71,9 @@ pub fn deliver_state_notify(state: &mut ServerState, deviceid: u16, window: Reso
         .class_shape;
     let num_buttons = class_shape.button_count();
     let num_axes = class_shape.valuator_count();
+    let num_keys = if has_keys { KEY_MAX - KEY_MIN } else { 0 };
+    let more_keys = num_keys > 32;
+    let more_valuators = has_valuators && num_axes > 3;
     // Stored axis values (Xorg `axisVal`): real motion keeps axes 0/1
     // at the sprite position, device-motion fakes write their payload.
     let axes = dev_state.valuators;
@@ -79,22 +83,45 @@ pub fn deliver_state_notify(state: &mut ServerState, deviceid: u16, window: Reso
         window.0,
         targets.len(),
     );
-    let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
-        encode_state_notify_chain(
-            buf,
-            order,
-            seq,
-            deviceid,
-            time,
-            &dev_state,
-            has_keys,
-            has_buttons,
-            has_valuators,
-            num_buttons,
-            num_axes,
-            &axes,
-        );
-    });
+    let state_description =
+        crate::xinput::xi1_event_description(crate::xinput::XI_DEVICE_STATE_NOTIFY_OFFSET);
+    let mut descriptions = [state_description; 3];
+    let mut description_count = 1;
+    if more_keys {
+        descriptions[description_count] =
+            crate::xinput::xi1_event_description(crate::xinput::XI_DEVICE_KEY_STATE_NOTIFY_OFFSET);
+        description_count += 1;
+    }
+    if more_valuators {
+        descriptions[description_count] =
+            crate::xinput::xi1_event_description(crate::xinput::XI_DEVICE_VALUATOR_OFFSET);
+        description_count += 1;
+    }
+    let batch = EventBatch::new(&descriptions[..description_count]);
+    let _dropped = fanout_event_to_clients_with_receive(
+        state,
+        &targets,
+        EventSubject::Window(window),
+        &batch,
+        |buf, seq, order| {
+            encode_state_notify_chain(
+                buf,
+                order,
+                seq,
+                deviceid,
+                time,
+                &dev_state,
+                has_keys,
+                has_buttons,
+                has_valuators,
+                num_buttons,
+                num_axes,
+                more_keys,
+                more_valuators,
+                &axes,
+            );
+        },
+    );
 }
 
 /// Encode the full wire chain for one client (Xorg
@@ -114,6 +141,8 @@ fn encode_state_notify_chain(
     has_valuators: bool,
     num_buttons: u8,
     num_axes: u8,
+    more_keys: bool,
+    more_valuators: bool,
     axes: &[i32; 4],
 ) {
     let first = crate::server::XI_FIRST_EVENT;
@@ -124,8 +153,6 @@ fn encode_state_notify_chain(
     // FixDeviceStateNotify counting (`dix/enterleave.c:715-729`): keys
     // beyond 32 and valuators beyond the first 3 continue in later events.
     let num_keys: u8 = if has_keys { KEY_MAX - KEY_MIN } else { 0 };
-    let more_keys = has_keys && num_keys > 32;
-    let more_valuators = has_valuators && num_axes > 3;
 
     let mut classes_reported = 0u8;
     if has_keys {
