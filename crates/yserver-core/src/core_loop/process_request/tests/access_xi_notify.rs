@@ -2105,6 +2105,7 @@ fn receive_xi_property_forms_checked_independently() {
                 vec![receives[denied_form].clone()],
             );
             expectations.deny_before_allow = true;
+            expectations.trace_before_deny_streams = true;
             expectations
         };
         check_receive_case(&ReceiveCase {

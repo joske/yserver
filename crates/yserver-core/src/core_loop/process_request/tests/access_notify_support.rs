@@ -261,8 +261,15 @@ pub(super) struct CaseExpect {
     pub(super) order: CallOrder,
     pub(super) denied_calls: Vec<ExpectedReceive>,
     pub(super) deny_first_only: bool,
-    // Keep a deny-mode probe ahead of allow-log checks when the old test did.
+    // Keep the policy target independent of request context when that context is under test.
+    pub(super) deny_match_ignores_request: bool,
+    // Run and assert the deny mode before allow-all when the old test was deny-first.
     pub(super) deny_before_allow: bool,
+    // Preserve trace-first assertion priority only for rows whose original test checked it first.
+    pub(super) trace_before_deny_streams: bool,
+    // Defer no-policy streams for scenarios where an unconditional selection mutant
+    // would otherwise fail that mode before the named policy assertion.
+    pub(super) no_policy_last: bool,
     pub(super) forbidden_hooks: &'static [ExtensionHook],
     pub(super) after_deny: Option<AfterDeny>,
 }
@@ -281,7 +288,10 @@ impl CaseExpect {
             order,
             denied_calls,
             deny_first_only: false,
+            deny_match_ignores_request: false,
             deny_before_allow: false,
+            trace_before_deny_streams: false,
+            no_policy_last: false,
             forbidden_hooks: &[ExtensionHook::Send],
             after_deny: None,
         }
@@ -394,9 +404,17 @@ fn assert_receive_traces(
 }
 
 fn expected_receive_matches(expected: &ExpectedReceive, call: &RecordedExtensionCheck) -> bool {
+    expected_receive_matches_with_request(expected, call, true)
+}
+
+fn expected_receive_matches_with_request(
+    expected: &ExpectedReceive,
+    call: &RecordedExtensionCheck,
+    match_request: bool,
+) -> bool {
     call.hook == ExtensionHook::Receive
         && call.client == expected.client
-        && call.request == expected.request
+        && (!match_request || call.request == expected.request)
         && call.receive == Some(expected.subject)
         && call.events.as_deref() == Some(expected.events.as_slice())
 }
@@ -538,43 +556,52 @@ pub(super) fn check_receive_case<C>(case: &ReceiveCase<'_, C>) {
 fn check_receive_case_with_deny<C>(case: &ReceiveCase<'_, C>, test_deny: Option<ExpectedReceive>) {
     let (mut no_policy, no_policy_context) = (case.build)();
     let no_policy_expect = (case.expect)(&no_policy_context);
-    run_with_context(case.name, "no policy", || {
-        (case.act)(&mut no_policy, &no_policy_context);
-    });
-    assert_healthy_fixture(case.name, "no policy", &no_policy);
-    let no_policy_streams = collect_streams(
-        case.name,
-        "no policy",
-        &mut no_policy,
-        &no_policy_expect.streams,
-    );
-    assert_streams(
-        case.name,
-        "no policy",
-        &no_policy_expect.streams,
-        &no_policy_streams,
-        false,
-    );
+    let no_policy_last = no_policy_expect.no_policy_last;
+    let mut check_no_policy = || {
+        run_with_context(case.name, "no policy", || {
+            (case.act)(&mut no_policy, &no_policy_context);
+        });
+        assert_healthy_fixture(case.name, "no policy", &no_policy);
+        let no_policy_streams = collect_streams(
+            case.name,
+            "no policy",
+            &mut no_policy,
+            &no_policy_expect.streams,
+        );
+        assert_streams(
+            case.name,
+            "no policy",
+            &no_policy_expect.streams,
+            &no_policy_streams,
+            false,
+        );
+    };
+    if !no_policy_last {
+        check_no_policy();
+    }
 
     let (mut allow_all, allow_context) = (case.build)();
     let allow_expect = (case.expect)(&allow_context);
     let allow_calls = allow_all.install_policy(|_, _| Decision::Allow);
-    run_with_context(case.name, "allow-all", || {
-        (case.act)(&mut allow_all, &allow_context);
-    });
-    let allow_streams = collect_streams(
-        case.name,
-        "allow-all",
-        &mut allow_all,
-        &allow_expect.streams,
-    );
-    let allow_log = allow_calls.lock().unwrap().clone();
+    let mut allow_streams = None;
     if !allow_expect.deny_before_allow {
+        run_with_context(case.name, "allow-all", || {
+            (case.act)(&mut allow_all, &allow_context);
+        });
+        allow_streams = Some(collect_streams(
+            case.name,
+            "allow-all",
+            &mut allow_all,
+            &allow_expect.streams,
+        ));
+        let allow_log = allow_calls.lock().unwrap().clone();
         assert_allow_case(
             case.name,
             &allow_all,
             &allow_expect,
-            &allow_streams,
+            allow_streams
+                .as_deref()
+                .expect("allow-all streams were collected"),
             &allow_log,
         );
     }
@@ -592,13 +619,14 @@ fn check_receive_case_with_deny<C>(case: &ReceiveCase<'_, C>, test_deny: Option<
     let deny_once = AtomicUsize::new(0);
     let denied_calls = deny_expect.denied_calls.clone();
     let deny_first_only = deny_expect.deny_first_only;
+    let deny_match_ignores_request = deny_expect.deny_match_ignores_request;
     let deny_log = denied.install_policy(move |_, call| {
         let matches = if let Some(test_deny) = &test_deny {
             expected_receive_matches(test_deny, call)
         } else {
-            denied_calls
-                .iter()
-                .any(|expected| expected_receive_matches(expected, call))
+            denied_calls.iter().any(|expected| {
+                expected_receive_matches_with_request(expected, call, !deny_match_ignores_request)
+            })
         };
         if !matches || (deny_first_only && deny_once.fetch_add(1, Ordering::Relaxed) != 0) {
             return Decision::Allow;
@@ -626,35 +654,72 @@ fn check_receive_case_with_deny<C>(case: &ReceiveCase<'_, C>, test_deny: Option<
     assert_healthy_fixture(case.name, "deny", &denied);
     let deny_log = deny_log.lock().unwrap().clone();
     let actual_denied = denied_actual.lock().unwrap().clone();
+    let check_receive_trace = || {
+        let deny_receives = receive_trace(case.name, "deny", &deny_log);
+        assert_receive_traces(
+            case.name,
+            "deny",
+            deny_expect.order,
+            deny_expect
+                .deny_receives
+                .as_deref()
+                .unwrap_or(&deny_expect.receives),
+            &deny_receives,
+            "Receive trace",
+        );
+        assert_forbidden_hooks(case.name, "deny", &deny_log, deny_expect.forbidden_hooks);
+    };
+    let check_denied_calls = || {
+        assert_case(
+            case.name,
+            "deny",
+            !actual_denied.is_empty(),
+            "deny policy matched no Receive call",
+        );
+        assert_receive_traces(
+            case.name,
+            "deny",
+            deny_expect.order,
+            &deny_expect.denied_calls,
+            &actual_denied,
+            "denied Receive calls",
+        );
+    };
+    let check_deny_trace = || {
+        check_receive_trace();
+        check_denied_calls();
+    };
+    if deny_expect.trace_before_deny_streams {
+        check_deny_trace();
+    }
     let deny_streams = collect_streams(case.name, "deny", &mut denied, &deny_expect.streams);
     assert_streams(case.name, "deny", &deny_expect.streams, &deny_streams, true);
-    assert_case(
-        case.name,
-        "deny",
-        !actual_denied.is_empty(),
-        "deny policy matched no Receive call",
-    );
-    assert_receive_traces(
-        case.name,
-        "deny",
-        deny_expect.order,
-        &deny_expect.denied_calls,
-        &actual_denied,
-        "denied Receive calls",
-    );
-    let deny_receives = receive_trace(case.name, "deny", &deny_log);
-    assert_receive_traces(
-        case.name,
-        "deny",
-        deny_expect.order,
-        deny_expect
-            .deny_receives
-            .as_deref()
-            .unwrap_or(&deny_expect.receives),
-        &deny_receives,
-        "Receive trace",
-    );
-    assert_forbidden_hooks(case.name, "deny", &deny_log, deny_expect.forbidden_hooks);
+    if !deny_expect.trace_before_deny_streams {
+        check_deny_trace();
+    }
+
+    if allow_streams.is_none() {
+        run_with_context(case.name, "allow-all", || {
+            (case.act)(&mut allow_all, &allow_context);
+        });
+        allow_streams = Some(collect_streams(
+            case.name,
+            "allow-all",
+            &mut allow_all,
+            &allow_expect.streams,
+        ));
+        let allow_log = allow_calls.lock().unwrap().clone();
+        assert_allow_case(
+            case.name,
+            &allow_all,
+            &allow_expect,
+            allow_streams
+                .as_deref()
+                .expect("allow-all streams were collected"),
+            &allow_log,
+        );
+    }
+    let allow_streams = allow_streams.expect("allow-all streams were collected");
     for denied_call in &deny_expect.denied_calls {
         let allow_bytes = allow_streams
             .iter()
@@ -674,14 +739,8 @@ fn check_receive_case_with_deny<C>(case: &ReceiveCase<'_, C>, test_deny: Option<
     if let Some(after_deny) = deny_expect.after_deny {
         run_with_context(case.name, "deny", || after_deny(&allow_all, &denied));
     }
-    if allow_expect.deny_before_allow {
-        assert_allow_case(
-            case.name,
-            &allow_all,
-            &allow_expect,
-            &allow_streams,
-            &allow_log,
-        );
+    if no_policy_last {
+        check_no_policy();
     }
 }
 

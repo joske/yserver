@@ -15,13 +15,10 @@ use crate::{
     host_x11::HostKeyEvent,
 };
 use std::{
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex, atomic::Ordering},
     time::Duration,
 };
-use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+use yserver_protocol::x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber};
 
 const XKB_EVENT_BASE: u8 = 85;
 const XKB_MAJOR_OPCODE: u8 = 136;
@@ -54,19 +51,14 @@ const XKB_SET_NAMES_BODY: [u8; 24] = [
     0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 
-fn xkb_event_description_for_test(xkb_type: u8) -> EventDescription {
-    EventDescription::extension(XKB_EVENT_BASE, XKB_MAJOR_OPCODE, u16::from(xkb_type))
-}
-
-fn recorded_xkb_type(check: &RecordedExtensionCheck, xkb_types: &[u8]) -> bool {
-    xkb_types
-        .iter()
-        .any(|xkb_type| check.events == Some(vec![xkb_event_description_for_test(*xkb_type)]))
-}
 const DENY: DenyError = DenyError {
     code: yserver_protocol::x11::error::BAD_ACCESS,
     value: 0,
 };
+
+fn xkb_event_description_for_test(xkb_type: u8) -> EventDescription {
+    EventDescription::extension(XKB_EVENT_BASE, XKB_MAJOR_OPCODE, u16::from(xkb_type))
+}
 
 fn initialize_xkb_notifications(
     fixture: &mut NotifyFixture,
@@ -338,89 +330,6 @@ fn kbd_by_name_backend(fixture: &mut NotifyFixture) {
     fixture.backend = backend.with_kbd_by_name_result(reply, Some(xkb_new_keyboard_info(1)));
 }
 
-fn run_xkb_kbd_by_name(
-    install_policy: bool,
-    deny_one: bool,
-) -> (
-    Vec<Vec<u8>>,
-    Vec<RecordedExtensionCheck>,
-    Vec<ClientId>,
-    bool,
-) {
-    let mut fixture = NotifyFixture::new();
-    fixture.backend.xkb_info_result = Some((XKB_MAJOR_OPCODE, XKB_EVENT_BASE, 0));
-    initialize_xkb_notifications(&mut fixture, NOTIFY_SENDER, false, 0);
-    fixture
-        .state
-        .clients
-        .get_mut(&NOTIFY_RECEIVER_ALLOWED.0)
-        .expect("big-endian non-XKB client")
-        .byte_order = yserver_protocol::x11::ClientByteOrder::BigEndian;
-    for (client, sequence) in [
-        (NOTIFY_RECEIVER_DENIED, 0x1234),
-        (NOTIFY_RECEIVER_ALLOWED, 0x5678),
-    ] {
-        fixture
-            .state
-            .clients
-            .get(&client.0)
-            .expect("non-XKB client")
-            .last_sequence
-            .store(sequence, Ordering::Relaxed);
-    }
-    fixture.state.start_instant = std::time::Instant::now() + Duration::from_secs(30);
-    fixture.state.keymap_overrides.insert(8, vec![0x0061]);
-    kbd_by_name_backend(&mut fixture);
-    assert!(!crate::core_loop::xkb_select::xkb_initialized(
-        &fixture.state,
-        NOTIFY_RECEIVER_DENIED
-    ));
-    assert!(!crate::core_loop::xkb_select::xkb_initialized(
-        &fixture.state,
-        NOTIFY_RECEIVER_ALLOWED
-    ));
-    let receive_order: Vec<_> = fixture
-        .state
-        .clients
-        .keys()
-        .copied()
-        .map(ClientId)
-        .collect();
-    let calls = install_policy.then(|| {
-        fixture.install_policy(move |_, check| {
-            if deny_one
-                && check.hook == ExtensionHook::Receive
-                && check.client == NOTIFY_RECEIVER_DENIED
-                && check.receive == Some(EventSubject::Device(1))
-                && check.events
-                    == Some(vec![xkb_event_description_for_test(
-                        XKB_NEW_KEYBOARD_NOTIFY_TYPE,
-                    )])
-            {
-                Decision::Deny(DENY)
-            } else {
-                Decision::Allow
-            }
-        })
-    });
-    assert!(matches!(
-        xkb_request(&mut fixture, NOTIFY_SENDER, KBD_BY_NAME_SEQUENCE, 23, &[]),
-        RequestOutcome::Handled
-    ));
-    assert_no_writer_failures(&fixture);
-    let outputs = [
-        NOTIFY_SENDER,
-        NOTIFY_RECEIVER_DENIED,
-        NOTIFY_RECEIVER_ALLOWED,
-    ]
-    .into_iter()
-    .map(|client| fixture.drain(client))
-    .collect();
-    let calls = calls.map_or_else(Vec::new, |calls| calls.lock().unwrap().clone());
-    let keymap_cleared = fixture.state.keymap_overrides.is_empty();
-    (outputs, calls, receive_order, keymap_cleared)
-}
-
 fn xkb_request(
     fixture: &mut NotifyFixture,
     client: ClientId,
@@ -678,15 +587,6 @@ fn literal_request_stream(sequence: u16) -> Vec<u8> {
     stream
 }
 
-fn literal_request_stream_prefix(sequence: u16, frame_count: usize) -> Vec<u8> {
-    literal_request_stream(sequence)
-        .chunks_exact(32)
-        .take(frame_count)
-        .flatten()
-        .copied()
-        .collect()
-}
-
 fn assert_no_writer_failures(fixture: &NotifyFixture) {
     assert!(
         crate::core_loop::client_io::failed_writers(&fixture.state.clients).is_empty(),
@@ -696,22 +596,6 @@ fn assert_no_writer_failures(fixture: &NotifyFixture) {
 
 fn receive_log(calls: &Arc<Mutex<Vec<RecordedExtensionCheck>>>) -> Vec<RecordedExtensionCheck> {
     calls.lock().expect("policy call log").clone()
-}
-
-fn assert_receive_calls(
-    calls: &Arc<Mutex<Vec<RecordedExtensionCheck>>>,
-    clients: &[ClientId],
-    request: Option<RequestOpcodes>,
-    xkb_type: u8,
-) {
-    let log = receive_log(calls);
-    assert_receive_calls_with_requests(
-        &log,
-        clients,
-        &vec![request; clients.len()],
-        EventSubject::Device(1),
-        &vec![xkb_type; clients.len()],
-    );
 }
 
 fn assert_receive_calls_with_requests(
@@ -745,24 +629,6 @@ fn assert_receive_calls_with_requests(
         );
         assert_eq!(call.request, *request);
     }
-}
-
-fn install_deny_for(
-    fixture: &mut NotifyFixture,
-    client: ClientId,
-    xkb_types: Vec<u8>,
-) -> Arc<Mutex<Vec<RecordedExtensionCheck>>> {
-    fixture.install_policy(move |_, check| {
-        if check.hook == ExtensionHook::Receive
-            && check.client == client
-            && check.receive == Some(EventSubject::Device(1))
-            && recorded_xkb_type(check, &xkb_types)
-        {
-            Decision::Deny(DENY)
-        } else {
-            Decision::Allow
-        }
-    })
 }
 
 const XKB_INDICATOR_STATE_SELECT: u16 = 1 << 4;
@@ -1153,78 +1019,48 @@ fn literal_xkb_key_indicator_stream(sequence: u16, include_state: bool) -> Vec<u
     stream
 }
 
-fn assert_single_xkb_notification_denied(
-    selection: u16,
-    sequence: u16,
-    minor: u8,
-    expected_request: Option<RequestOpcodes>,
-    xkb_type: u8,
-    body: &[u8],
-    event: XkbSetEvent,
-    expected_frame: impl Fn(u16) -> Vec<u8>,
-) {
-    let selections = [
-        (NOTIFY_RECEIVER_DENIED, selection),
-        (NOTIFY_RECEIVER_ALLOWED, selection),
-    ];
-    let mut denied = indicator_fixture(&selections);
-    seed_request_xkb_snapshots(&mut denied);
-    let calls = install_deny_for(&mut denied, NOTIFY_RECEIVER_DENIED, vec![xkb_type]);
-    drive_scripted_xkb_set(&mut denied, sequence, minor, body, vec![event.clone()]);
-    assert!(denied.drain(NOTIFY_RECEIVER_DENIED).is_empty());
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_ALLOWED),
-        expected_frame(0x5678)
-    );
-    assert_receive_calls(
-        &calls,
-        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
-        expected_request,
-        xkb_type,
-    );
-    let mut allowed = indicator_fixture(&selections);
-    seed_request_xkb_snapshots(&mut allowed);
-    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
-    drive_scripted_xkb_set(&mut allowed, sequence, minor, body, vec![event]);
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_DENIED),
-        expected_frame(0x1234)
-    );
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
-        expected_frame(0x5678)
-    );
-    assert_receive_calls(
-        &allow_calls,
-        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
-        expected_request,
-        xkb_type,
-    );
-    assert_xkb_notification_effects_match(&denied, &allowed);
-    assert_no_writer_failures(&denied);
-    assert_no_writer_failures(&allowed);
-}
-
-// Mutation: change K11's encoded request_minor from 5; this literal byte
-// baseline must fail even though the frame is still a valid XKB event.
 #[test]
-fn receive_xkb_state_no_policy_bytes() {
+// Focused because the original no-policy pipeline compares each request checkpoint.
+// Mutation B1: change the literal StateNotify requestMinor from 5.
+fn receive_xkb_state_no_policy_checkpoints() {
     let mut fixture = notify_fixture(STATE_DETAILS, REPEAT_KEYS_MASK | PER_KEY_REPEAT_MASK);
     assert!(!fixture.state.policies_installed());
-
     let mut denied_stream = Vec::new();
     let mut allowed_stream = Vec::new();
+
     drive_latch_lock(&mut fixture);
     append_frame(&mut denied_stream, fixture.drain(NOTIFY_RECEIVER_DENIED));
     append_frame(&mut allowed_stream, fixture.drain(NOTIFY_RECEIVER_ALLOWED));
-    assert_eq!(denied_stream, literal_request_stream_prefix(0x1234, 1));
-    assert_eq!(allowed_stream, literal_request_stream_prefix(0x5678, 1));
+    assert_eq!(
+        denied_stream,
+        literal_state_notify(0x1234, 0x10, 0, 0x10, 0x1f09, 0, 0, 136, 5)
+    );
+    assert_eq!(
+        allowed_stream,
+        literal_state_notify(0x5678, 0x10, 0, 0x10, 0x1f09, 0, 0, 136, 5)
+    );
+    assert_no_writer_failures(&fixture);
 
     drive_set_controls(&mut fixture);
     append_frame(&mut denied_stream, fixture.drain(NOTIFY_RECEIVER_DENIED));
     append_frame(&mut allowed_stream, fixture.drain(NOTIFY_RECEIVER_ALLOWED));
-    assert_eq!(denied_stream, literal_request_stream_prefix(0x1234, 2));
-    assert_eq!(allowed_stream, literal_request_stream_prefix(0x5678, 2));
+    assert_eq!(
+        denied_stream,
+        [
+            literal_state_notify(0x1234, 0x10, 0, 0x10, 0x1f09, 0, 0, 136, 5),
+            literal_controls_notify(0x1234, 1, REPEAT_KEYS_MASK, 1, 7),
+        ]
+        .concat()
+    );
+    assert_eq!(
+        allowed_stream,
+        [
+            literal_state_notify(0x5678, 0x10, 0, 0x10, 0x1f09, 0, 0, 136, 5),
+            literal_controls_notify(0x5678, 1, REPEAT_KEYS_MASK, 1, 7),
+        ]
+        .concat()
+    );
+    assert_no_writer_failures(&fixture);
 
     drive_set_per_key_repeat(&mut fixture);
     append_frame(&mut denied_stream, fixture.drain(NOTIFY_RECEIVER_DENIED));
@@ -1234,10 +1070,11 @@ fn receive_xkb_state_no_policy_bytes() {
     assert_eq!(fixture.backend.xkb_mods, (0x10, 0, 0, 0x10));
     assert_eq!(fixture.state.keyboard_control.repeat_delay, 200);
     assert_eq!(fixture.state.keyboard_control.repeat_interval, 20);
-    assert!(fixture.state.keyboard_control.auto_repeats[25] & 1 != 0);
-
-    // Physical-key K11 also keeps its complete no-policy event bytes. The
-    // event has no request opcodes and follows the earlier request events.
+    assert_ne!(
+        fixture.state.keyboard_control.auto_repeats[usize::from(REPEAT_KEYCODE >> 3)]
+            & (1 << (REPEAT_KEYCODE & 7)),
+        0
+    );
     fixture.backend.xkb_mods = (0x40, 0x40, 0, 0);
     let dropped = key_event_fanout_to_state(
         &mut fixture.state,
@@ -1276,315 +1113,781 @@ fn receive_xkb_state_no_policy_bytes() {
     assert_no_writer_failures(&fixture);
 }
 
-// Mutation: leave K11 unchecked, use EventSubject::Global, or force
-// xkb_event_description to return type 0; each must invalidate the denial/log checks.
 #[test]
-fn receive_xkb_state_denied_one_recipient() {
-    let mut denied = notify_fixture(STATE_DETAILS, 0);
-    let calls = install_deny_for(
-        &mut denied,
-        NOTIFY_RECEIVER_DENIED,
-        vec![XKB_STATE_NOTIFY_TYPE],
-    );
-    drive_latch_lock(&mut denied);
-    assert_eq!(denied.drain(NOTIFY_RECEIVER_DENIED), Vec::<u8>::new());
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_state_notify(0x5678, 0x10, 0, 0x10, 0x1f09, 0, 0, 136, 5)
-    );
-    assert_receive_calls(
-        &calls,
-        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
-        request_opcodes(136, 5),
-        XKB_STATE_NOTIFY_TYPE,
-    );
-    let denied_effect = (denied.backend.xkb_mods, denied.state.xkb_announced);
+// Mutation B2: skip K11 Receive; the targeted deny must drop this copy.
+// Mutation B3: use a Global subject for K11; the full Receive trace must fail.
+// Mutation B4: force native XKB descriptions to xkbType 0; type 2 must fail.
+fn receive_xkb_state_pipeline_denies_latch_copy() {
+    use super::access_notify_support::{
+        CallOrder, CaseExpect, ExpectedReceive, ReceiveCase, Stream, check_receive_case,
+    };
 
-    let mut allowed = notify_fixture(STATE_DETAILS, 0);
-    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
-    drive_latch_lock(&mut allowed);
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_DENIED),
-        literal_state_notify(0x1234, 0x10, 0, 0x10, 0x1f09, 0, 0, 136, 5)
-    );
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_state_notify(0x5678, 0x10, 0, 0x10, 0x1f09, 0, 0, 136, 5)
-    );
-    assert_receive_calls(
-        &allow_calls,
-        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
-        request_opcodes(136, 5),
-        XKB_STATE_NOTIFY_TYPE,
-    );
-    assert_eq!(
-        denied_effect.0, allowed.backend.xkb_mods,
-        "denial keeps modifiers"
-    );
-    assert_eq!(
-        denied_effect.1, allowed.state.xkb_announced,
-        "denial keeps the state effect"
-    );
-}
-
-// Mutation: put xkb_announced advancement after a denial-driven early return;
-// denying every selected copy must still leave the snapshot new.
-#[test]
-fn receive_xkb_state_denied_snapshot_advances() {
-    let mut denied = notify_fixture(STATE_DETAILS, 0);
-    let calls = denied.install_policy(|_, check| {
-        if check.hook == ExtensionHook::Receive {
-            Decision::Deny(DENY)
-        } else {
-            Decision::Allow
-        }
+    let build = || (notify_fixture(STATE_DETAILS, 0), ());
+    let act = |fixture: &mut NotifyFixture, _: &()| {
+        drive_latch_lock(fixture);
+    };
+    let expect = |_: &()| {
+        let receive = |client, request, xkb_type| ExpectedReceive {
+            client,
+            request,
+            subject: EventSubject::Device(1),
+            events: vec![xkb_event_description_for_test(xkb_type)],
+        };
+        let state_denied = receive(NOTIFY_RECEIVER_DENIED, request_opcodes(136, 5), 2);
+        let receives = vec![
+            state_denied.clone(),
+            receive(NOTIFY_RECEIVER_ALLOWED, request_opcodes(136, 5), 2),
+        ];
+        let denied_stream = vec![
+            Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+            Stream {
+                client: NOTIFY_RECEIVER_DENIED,
+                bytes: literal_state_notify(0x1234, 0x10, 0, 0x10, 0x1f09, 0, 0, 136, 5),
+                denied: Some(Vec::new()),
+            },
+            Stream::unchanged(
+                NOTIFY_RECEIVER_ALLOWED,
+                literal_state_notify(0x5678, 0x10, 0, 0x10, 0x1f09, 0, 0, 136, 5),
+            ),
+        ];
+        let mut expectations = CaseExpect::new(
+            denied_stream,
+            receives,
+            CallOrder::Total,
+            vec![state_denied],
+        );
+        expectations.deny_before_allow = true;
+        expectations.after_deny = Some(Box::new(|allow, denied| {
+            assert_eq!(denied.backend.xkb_mods, allow.backend.xkb_mods);
+            assert_eq!(denied.state.xkb_announced, allow.state.xkb_announced);
+            assert_eq!(denied.state.xkb_announced, (0, (0x10, 0, 0, 0x10)));
+        }));
+        expectations
+    };
+    check_receive_case(&ReceiveCase {
+        name: "XKB state pipeline denies one latch copy",
+        build: &build,
+        act: &act,
+        expect: &expect,
     });
-    drive_latch_lock(&mut denied);
-    assert_eq!(denied.drain(NOTIFY_RECEIVER_DENIED), Vec::<u8>::new());
-    assert_eq!(denied.drain(NOTIFY_RECEIVER_ALLOWED), Vec::<u8>::new());
-    assert_receive_calls(
-        &calls,
-        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
-        request_opcodes(136, 5),
-        XKB_STATE_NOTIFY_TYPE,
-    );
-    let denied_effect = (denied.backend.xkb_mods, denied.state.xkb_announced);
-    assert_eq!(denied.state.xkb_announced, (0, (0x10, 0, 0, 0x10)));
-
-    let mut allowed = notify_fixture(STATE_DETAILS, 0);
-    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
-    drive_latch_lock(&mut allowed);
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_DENIED),
-        literal_state_notify(0x1234, 0x10, 0, 0x10, 0x1f09, 0, 0, 136, 5)
-    );
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_state_notify(0x5678, 0x10, 0, 0x10, 0x1f09, 0, 0, 136, 5)
-    );
-    assert_receive_calls(
-        &allow_calls,
-        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
-        request_opcodes(136, 5),
-        XKB_STATE_NOTIFY_TYPE,
-    );
-    assert_eq!(denied_effect.0, allowed.backend.xkb_mods);
-    assert_eq!(denied_effect.1, allowed.state.xkb_announced);
 }
 
-// Mutation: pass Some(RequestOpcodes { major: 0, minor: 0 }) on K11's key
-// path; the physical event must be recorded with no request context.
 #[test]
-fn receive_xkb_state_from_key_has_no_request() {
-    let mut fixture = notify_fixture(STATE_DETAILS, 0);
-    let calls = fixture.install_policy(|_, _| Decision::Allow);
-    fixture.backend.xkb_mods = (0x40, 0x40, 0, 0);
-    let dropped = key_event_fanout_to_state(
-        &mut fixture.state,
-        &mut fixture.backend,
-        HostKeyEvent {
-            origin: InputOrigin::NestedHost,
-            pressed: true,
-            keycode: 38,
-            time: 0x5678,
-            root_x: 0,
-            root_y: 0,
-            event_x: 0,
-            event_y: 0,
-            state: 0,
-        },
-    );
-    assert!(dropped.is_empty());
-    assert_eq!(
-        fixture.drain(NOTIFY_RECEIVER_DENIED),
-        literal_state_notify(0x1234, 0x40, 0x40, 0, 0x1f03, 38, 2, 0, 0)
-    );
-    assert_eq!(
-        fixture.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_state_notify(0x5678, 0x40, 0x40, 0, 0x1f03, 38, 2, 0, 0)
-    );
-    assert_receive_calls(
-        &calls,
-        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
-        None,
-        XKB_STATE_NOTIFY_TYPE,
-    );
-    assert_no_writer_failures(&fixture);
+// Mutation B5: advance xkb_announced only after an all-recipient denial return.
+fn receive_xkb_state_denied_snapshot_advances() {
+    use super::access_notify_support::{
+        CallOrder, CaseExpect, ExpectedReceive, ReceiveCase, Stream, check_receive_case,
+    };
+
+    let build = || (notify_fixture(STATE_DETAILS, 0), ());
+    let act = |fixture: &mut NotifyFixture, _: &()| {
+        drive_latch_lock(fixture);
+    };
+    let expect = |_: &()| {
+        let receive = |client| ExpectedReceive {
+            client,
+            request: request_opcodes(136, 5),
+            subject: EventSubject::Device(1),
+            events: vec![xkb_event_description_for_test(XKB_STATE_NOTIFY_TYPE)],
+        };
+        let denied = receive(NOTIFY_RECEIVER_DENIED);
+        let allowed = receive(NOTIFY_RECEIVER_ALLOWED);
+        let mut expectations = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: literal_state_notify(0x1234, 0x10, 0, 0x10, 0x1f09, 0, 0, 136, 5),
+                    denied: Some(Vec::new()),
+                },
+                Stream {
+                    client: NOTIFY_RECEIVER_ALLOWED,
+                    bytes: literal_state_notify(0x5678, 0x10, 0, 0x10, 0x1f09, 0, 0, 136, 5),
+                    denied: Some(Vec::new()),
+                },
+            ],
+            vec![denied.clone(), allowed.clone()],
+            CallOrder::Total,
+            vec![denied, allowed],
+        );
+        expectations.deny_before_allow = true;
+        expectations.after_deny = Some(Box::new(|allow, denied| {
+            assert_eq!(denied.backend.xkb_mods, allow.backend.xkb_mods);
+            assert_eq!(denied.state.xkb_announced, allow.state.xkb_announced);
+            assert_eq!(denied.state.xkb_announced, (0, (0x10, 0, 0, 0x10)));
+        }));
+        expectations
+    };
+    check_receive_case(&ReceiveCase {
+        name: "XKB state snapshot advances when both copies are denied",
+        build: &build,
+        act: &act,
+        expect: &expect,
+    });
 }
 
-// Mutation: leave K12 unchecked; the denied recipient's empty stream and the
-// per-request Receive log must both fail.
 #[test]
+// Mutation B7: skip K12 Receive; the targeted deny must drop ControlsNotify.
 fn receive_xkb_controls_denied_one_recipient() {
-    let mut denied = notify_fixture(0, REPEAT_KEYS_MASK);
-    let calls = install_deny_for(
-        &mut denied,
-        NOTIFY_RECEIVER_DENIED,
-        vec![XKB_CONTROLS_NOTIFY_TYPE],
-    );
-    drive_set_controls(&mut denied);
-    assert_eq!(denied.drain(NOTIFY_RECEIVER_DENIED), Vec::<u8>::new());
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_controls_notify(0x5678, 1, REPEAT_KEYS_MASK, 1, 7)
-    );
-    assert_receive_calls(
-        &calls,
-        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
-        request_opcodes(136, 7),
-        XKB_CONTROLS_NOTIFY_TYPE,
-    );
-    let denied_effect = (
-        denied.state.keyboard_control.global_auto_repeat,
-        denied.state.keyboard_control.repeat_delay,
-        denied.state.keyboard_control.repeat_interval,
-        denied.state.keyboard_control.auto_repeats,
-    );
+    use super::access_notify_support::{
+        CallOrder, CaseExpect, ExpectedReceive, ReceiveCase, Stream, check_receive_case,
+    };
 
-    let mut allowed = notify_fixture(0, REPEAT_KEYS_MASK);
-    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
-    drive_set_controls(&mut allowed);
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_DENIED),
-        literal_controls_notify(0x1234, 1, REPEAT_KEYS_MASK, 1, 7)
-    );
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_controls_notify(0x5678, 1, REPEAT_KEYS_MASK, 1, 7)
-    );
-    assert_receive_calls(
-        &allow_calls,
-        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
-        request_opcodes(136, 7),
-        XKB_CONTROLS_NOTIFY_TYPE,
-    );
-    assert_eq!(
-        denied_effect,
-        (
-            allowed.state.keyboard_control.global_auto_repeat,
-            allowed.state.keyboard_control.repeat_delay,
-            allowed.state.keyboard_control.repeat_interval,
-            allowed.state.keyboard_control.auto_repeats,
-        ),
-        "denial keeps SetControls state and enabled-controls value"
-    );
-    assert_eq!((denied_effect.1, denied_effect.2), (200, 20));
+    let build = || (notify_fixture(0, REPEAT_KEYS_MASK), ());
+    let act = |fixture: &mut NotifyFixture, _: &()| {
+        drive_set_controls(fixture);
+        assert_eq!(
+            (
+                fixture.state.keyboard_control.repeat_delay,
+                fixture.state.keyboard_control.repeat_interval
+            ),
+            (200, 20)
+        );
+    };
+    let expect = |_: &()| {
+        let receive = |client| ExpectedReceive {
+            client,
+            request: request_opcodes(136, 7),
+            subject: EventSubject::Device(1),
+            events: vec![xkb_event_description_for_test(XKB_CONTROLS_NOTIFY_TYPE)],
+        };
+        let denied = receive(NOTIFY_RECEIVER_DENIED);
+        let allowed = receive(NOTIFY_RECEIVER_ALLOWED);
+        let mut expectations = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: literal_controls_notify(0x1234, 1, REPEAT_KEYS_MASK, 1, 7),
+                    denied: Some(Vec::new()),
+                },
+                Stream::unchanged(
+                    NOTIFY_RECEIVER_ALLOWED,
+                    literal_controls_notify(0x5678, 1, REPEAT_KEYS_MASK, 1, 7),
+                ),
+            ],
+            vec![denied.clone(), allowed],
+            CallOrder::Total,
+            vec![denied],
+        );
+        expectations.deny_before_allow = true;
+        expectations.after_deny = Some(Box::new(|allow, denied| {
+            assert_eq!(
+                (
+                    denied.state.keyboard_control.global_auto_repeat,
+                    denied.state.keyboard_control.repeat_delay,
+                    denied.state.keyboard_control.repeat_interval,
+                    denied.state.keyboard_control.auto_repeats
+                ),
+                (
+                    allow.state.keyboard_control.global_auto_repeat,
+                    allow.state.keyboard_control.repeat_delay,
+                    allow.state.keyboard_control.repeat_interval,
+                    allow.state.keyboard_control.auto_repeats
+                ),
+            );
+        }));
+        expectations
+    };
+    check_receive_case(&ReceiveCase {
+        name: "XKB controls denial keeps the other recipient",
+        build: &build,
+        act: &act,
+        expect: &expect,
+    });
 }
 
-// Mutations: leave K9 unchecked, or change another repeat bit only in the
-// denied run; the stream and full bitmap comparison must catch both.
 #[test]
+// Mutation B8: skip K9 Receive; the targeted deny must drop the per-key copy.
+// Mutation B9: alter another repeat bit only in the denied run; the full bitmap comparison must fail.
 fn receive_xkb_per_key_repeat_denied() {
-    let mut denied = notify_fixture(0, PER_KEY_REPEAT_MASK);
-    let calls = install_deny_for(
-        &mut denied,
-        NOTIFY_RECEIVER_DENIED,
-        vec![XKB_CONTROLS_NOTIFY_TYPE],
-    );
-    drive_set_per_key_repeat(&mut denied);
-    assert_eq!(denied.drain(NOTIFY_RECEIVER_DENIED), Vec::<u8>::new());
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_controls_notify(0x5678, 2, PER_KEY_REPEAT_MASK, 1, 9)
-    );
-    assert_receive_calls(
-        &calls,
-        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
-        request_opcodes(136, 9),
-        XKB_CONTROLS_NOTIFY_TYPE,
-    );
-    let repeat_bit = 1u8 << (REPEAT_KEYCODE & 7);
-    let repeat_byte = usize::from(REPEAT_KEYCODE >> 3);
-    let denied_effect = (
-        denied.state.keyboard_control.auto_repeats,
-        denied.state.keyboard_control.global_auto_repeat,
-    );
-    assert_ne!(denied_effect.0[repeat_byte] & repeat_bit, 0);
+    use super::access_notify_support::{
+        CallOrder, CaseExpect, ExpectedReceive, ReceiveCase, Stream, check_receive_case,
+    };
 
-    let mut allowed = notify_fixture(0, PER_KEY_REPEAT_MASK);
-    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
-    drive_set_per_key_repeat(&mut allowed);
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_DENIED),
-        literal_controls_notify(0x1234, 2, PER_KEY_REPEAT_MASK, 1, 9)
-    );
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_controls_notify(0x5678, 2, PER_KEY_REPEAT_MASK, 1, 9)
-    );
-    assert_receive_calls(
-        &allow_calls,
-        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
-        request_opcodes(136, 9),
-        XKB_CONTROLS_NOTIFY_TYPE,
-    );
-    assert_eq!(
-        denied_effect,
-        (
-            allowed.state.keyboard_control.auto_repeats,
-            allowed.state.keyboard_control.global_auto_repeat,
-        ),
-        "denial keeps the full repeat bitmap and enabled-controls value"
-    );
+    let build = || (notify_fixture(0, PER_KEY_REPEAT_MASK), ());
+    let act = |fixture: &mut NotifyFixture, _: &()| {
+        drive_set_per_key_repeat(fixture);
+        let repeat_bit = 1u8 << (REPEAT_KEYCODE & 7);
+        let repeat_byte = usize::from(REPEAT_KEYCODE >> 3);
+        assert_ne!(
+            fixture.state.keyboard_control.auto_repeats[repeat_byte] & repeat_bit,
+            0
+        );
+    };
+    let expect = |_: &()| {
+        let receive = |client| ExpectedReceive {
+            client,
+            request: request_opcodes(136, 9),
+            subject: EventSubject::Device(1),
+            events: vec![xkb_event_description_for_test(XKB_CONTROLS_NOTIFY_TYPE)],
+        };
+        let denied = receive(NOTIFY_RECEIVER_DENIED);
+        let allowed = receive(NOTIFY_RECEIVER_ALLOWED);
+        let mut expectations = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: literal_controls_notify(0x1234, 2, PER_KEY_REPEAT_MASK, 1, 9),
+                    denied: Some(Vec::new()),
+                },
+                Stream::unchanged(
+                    NOTIFY_RECEIVER_ALLOWED,
+                    literal_controls_notify(0x5678, 2, PER_KEY_REPEAT_MASK, 1, 9),
+                ),
+            ],
+            vec![denied.clone(), allowed],
+            CallOrder::Total,
+            vec![denied],
+        );
+        expectations.deny_before_allow = true;
+        expectations.after_deny = Some(Box::new(|allow, denied| {
+            assert_eq!(
+                (
+                    denied.state.keyboard_control.auto_repeats,
+                    denied.state.keyboard_control.global_auto_repeat
+                ),
+                (
+                    allow.state.keyboard_control.auto_repeats,
+                    allow.state.keyboard_control.global_auto_repeat
+                ),
+                "denial keeps the full repeat bitmap and enabled-controls value"
+            );
+        }));
+        expectations
+    };
+    check_receive_case(&ReceiveCase {
+        name: "XKB per-key repeat denial keeps the full bitmap",
+        build: &build,
+        act: &act,
+        expect: &expect,
+    });
 }
 
-// Mutation: bypass K11 Receive when a policy is installed; the allow-all
-// policy must still log one Receive per selected recipient per event.
 #[test]
+// Mutation B6: add request context to the physical-key K11 check; Allow must record None.
+fn receive_xkb_physical_key_state_has_no_request() {
+    use super::access_notify_support::{
+        CallOrder, CaseExpect, ExpectedReceive, ReceiveCase, Stream, check_receive_case,
+    };
+
+    let build = || (notify_fixture(STATE_DETAILS, 0), ());
+    let act = |fixture: &mut NotifyFixture, _: &()| {
+        fixture.backend.xkb_mods = (0x40, 0x40, 0, 0);
+        let dropped = key_event_fanout_to_state(
+            &mut fixture.state,
+            &mut fixture.backend,
+            HostKeyEvent {
+                origin: InputOrigin::NestedHost,
+                pressed: true,
+                keycode: 38,
+                time: 0x5678,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            },
+        );
+        assert!(dropped.is_empty());
+        assert_eq!(fixture.state.xkb_announced, (0, (0x40, 0x40, 0, 0)));
+    };
+    let expect = |_: &()| {
+        let receive = |client| ExpectedReceive {
+            client,
+            request: None,
+            subject: EventSubject::Device(1),
+            events: vec![xkb_event_description_for_test(XKB_STATE_NOTIFY_TYPE)],
+        };
+        let denied = receive(NOTIFY_RECEIVER_DENIED);
+        let allowed = receive(NOTIFY_RECEIVER_ALLOWED);
+        let mut expectations = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: literal_state_notify(0x1234, 0x40, 0x40, 0, 0x1f03, 38, 2, 0, 0),
+                    denied: Some(Vec::new()),
+                },
+                Stream::unchanged(
+                    NOTIFY_RECEIVER_ALLOWED,
+                    literal_state_notify(0x5678, 0x40, 0x40, 0, 0x1f03, 38, 2, 0, 0),
+                ),
+            ],
+            vec![denied.clone(), allowed],
+            CallOrder::Total,
+            vec![denied],
+        );
+        expectations.after_deny = Some(Box::new(|allow, denied| {
+            assert_eq!(denied.backend.xkb_mods, allow.backend.xkb_mods);
+            assert_eq!(denied.state.xkb_announced, allow.state.xkb_announced);
+        }));
+        expectations
+    };
+    check_receive_case(&ReceiveCase {
+        name: "XKB physical-key StateNotify has no request context",
+        build: &build,
+        act: &act,
+        expect: &expect,
+    });
+}
+
+#[test]
+// Mutation B10: bypass K11 Receive under allow-all; the full ordered log must fail.
 fn receive_xkb_state_allow_control() {
-    let mut fixture = notify_fixture(STATE_DETAILS, REPEAT_KEYS_MASK | PER_KEY_REPEAT_MASK);
-    let calls = fixture.install_policy(|_, _| Decision::Allow);
-    let mut denied_stream = Vec::new();
-    let mut allowed_stream = Vec::new();
+    use super::access_notify_support::{
+        CallOrder, CaseExpect, ExpectedReceive, ReceiveCase, Stream, check_receive_case,
+    };
 
-    drive_latch_lock(&mut fixture);
-    append_frame(&mut denied_stream, fixture.drain(NOTIFY_RECEIVER_DENIED));
-    append_frame(&mut allowed_stream, fixture.drain(NOTIFY_RECEIVER_ALLOWED));
-    drive_set_controls(&mut fixture);
-    append_frame(&mut denied_stream, fixture.drain(NOTIFY_RECEIVER_DENIED));
-    append_frame(&mut allowed_stream, fixture.drain(NOTIFY_RECEIVER_ALLOWED));
-    drive_set_per_key_repeat(&mut fixture);
-    append_frame(&mut denied_stream, fixture.drain(NOTIFY_RECEIVER_DENIED));
-    append_frame(&mut allowed_stream, fixture.drain(NOTIFY_RECEIVER_ALLOWED));
-
-    assert_eq!(denied_stream, literal_request_stream(0x1234));
-    assert_eq!(allowed_stream, literal_request_stream(0x5678));
-    let log = receive_log(&calls);
-    assert_receive_calls_with_requests(
-        &log,
-        &[
-            NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_ALLOWED,
-            NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_ALLOWED,
-            NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_ALLOWED,
-        ],
-        &[
-            request_opcodes(136, 5),
-            request_opcodes(136, 5),
-            request_opcodes(136, 7),
-            request_opcodes(136, 7),
-            request_opcodes(136, 9),
-            request_opcodes(136, 9),
-        ],
-        EventSubject::Device(1),
-        &[
-            XKB_STATE_NOTIFY_TYPE,
-            XKB_STATE_NOTIFY_TYPE,
-            XKB_CONTROLS_NOTIFY_TYPE,
-            XKB_CONTROLS_NOTIFY_TYPE,
-            XKB_CONTROLS_NOTIFY_TYPE,
-            XKB_CONTROLS_NOTIFY_TYPE,
-        ],
-    );
+    let build = || {
+        (
+            notify_fixture(STATE_DETAILS, REPEAT_KEYS_MASK | PER_KEY_REPEAT_MASK),
+            (),
+        )
+    };
+    let act = |fixture: &mut NotifyFixture, _: &()| {
+        drive_latch_lock(fixture);
+        drive_set_controls(fixture);
+        drive_set_per_key_repeat(fixture);
+        assert_eq!(fixture.state.keyboard_control.repeat_delay, 200);
+        assert_eq!(fixture.state.keyboard_control.repeat_interval, 20);
+        assert_ne!(fixture.state.keyboard_control.auto_repeats[25] & 1, 0);
+    };
+    let expect = |_: &()| {
+        let receive = |client, minor, xkb_type| ExpectedReceive {
+            client,
+            request: request_opcodes(XKB_MAJOR_OPCODE, minor),
+            subject: EventSubject::Device(1),
+            events: vec![xkb_event_description_for_test(xkb_type)],
+        };
+        let state_denied = receive(NOTIFY_RECEIVER_DENIED, 5, XKB_STATE_NOTIFY_TYPE);
+        let mut receives = Vec::new();
+        for (minor, xkb_type) in [
+            (5, XKB_STATE_NOTIFY_TYPE),
+            (7, XKB_CONTROLS_NOTIFY_TYPE),
+            (9, XKB_CONTROLS_NOTIFY_TYPE),
+        ] {
+            receives.push(receive(NOTIFY_RECEIVER_DENIED, minor, xkb_type));
+            receives.push(receive(NOTIFY_RECEIVER_ALLOWED, minor, xkb_type));
+        }
+        let denied_tail = [
+            literal_controls_notify(0x1234, 1, REPEAT_KEYS_MASK, 1, 7),
+            literal_controls_notify(0x1234, 2, PER_KEY_REPEAT_MASK, 1, 9),
+        ]
+        .concat();
+        let mut expectations = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: literal_request_stream(0x1234),
+                    denied: Some(denied_tail),
+                },
+                Stream::unchanged(NOTIFY_RECEIVER_ALLOWED, literal_request_stream(0x5678)),
+            ],
+            receives,
+            CallOrder::Total,
+            vec![state_denied],
+        );
+        expectations.after_deny = Some(Box::new(|allow, denied| {
+            assert_eq!(denied.backend.xkb_mods, allow.backend.xkb_mods);
+            assert_eq!(denied.state.xkb_announced, allow.state.xkb_announced);
+            assert_eq!(
+                denied.state.keyboard_control.auto_repeats,
+                allow.state.keyboard_control.auto_repeats
+            );
+            assert_eq!(
+                (
+                    denied.state.keyboard_control.global_auto_repeat,
+                    denied.state.keyboard_control.repeat_delay,
+                    denied.state.keyboard_control.repeat_interval
+                ),
+                (
+                    allow.state.keyboard_control.global_auto_repeat,
+                    allow.state.keyboard_control.repeat_delay,
+                    allow.state.keyboard_control.repeat_interval
+                ),
+            );
+        }));
+        expectations
+    };
+    check_receive_case(&ReceiveCase {
+        name: "XKB state allow control preserves the full trace and state",
+        build: &build,
+        act: &act,
+        expect: &expect,
+    });
 }
 
-// Mutations: change K4's literal MapNotify changed mask from KeySyms (0x0002),
-// or drive K3 with GetMap minor 8 instead of SetMap minor 9. The byte baseline
-// covers K1-K4 event order and each recipient's sequence.
 #[test]
-fn receive_xkb_new_keyboard_no_policy_bytes() {
+// Mutation B15: pass no request context to K1.
+// Mutation B16: use Global instead of Device(1) for K1.
+fn receive_xkb_rules_change_denies_new_keyboard_and_map() {
+    use super::access_notify_support::{
+        CallOrder, CaseExpect, ExpectedReceive, ReceiveCase, Stream, check_receive_case,
+    };
+
+    let selected = [
+        NOTIFY_SENDER,
+        NOTIFY_RECEIVER_DENIED,
+        NOTIFY_RECEIVER_ALLOWED,
+    ];
+    let map_selected = selected.map(|client| (client, 0x0007));
+    let build = || {
+        let mut fixture = xkb_event_fixture(&selected, &map_selected, false);
+        let backend = std::mem::take(&mut fixture.backend);
+        fixture.backend = backend.with_keymap_rmlvo_result((8, 255));
+        fixture.state.keymap_overrides.insert(38, vec![0x0071]);
+        (fixture, ())
+    };
+    let act = |fixture: &mut NotifyFixture, _: &()| {
+        assert!(matches!(
+            drive_rules_names_change(fixture, REQUEST_SEQUENCE, b"evdev\0pc105\0de\0\0\0"),
+            RequestOutcome::Handled
+        ));
+        assert!(fixture.state.keymap_overrides.is_empty());
+    };
+    let expect = |_: &()| {
+        let receive = |client, xkb_type| ExpectedReceive {
+            client,
+            request: request_opcodes(18, 0),
+            subject: EventSubject::Device(1),
+            events: vec![xkb_event_description_for_test(xkb_type)],
+        };
+        let clients = [
+            NOTIFY_SENDER,
+            NOTIFY_RECEIVER_DENIED,
+            NOTIFY_RECEIVER_ALLOWED,
+        ];
+        let new_keyboard = clients.map(|client| receive(client, XKB_NEW_KEYBOARD_NOTIFY_TYPE));
+        let map = clients.map(|client| receive(client, XKB_MAP_NOTIFY_TYPE));
+        let denied_nkn = receive(NOTIFY_RECEIVER_DENIED, XKB_NEW_KEYBOARD_NOTIFY_TYPE);
+        let denied_map = receive(NOTIFY_RECEIVER_DENIED, XKB_MAP_NOTIFY_TYPE);
+        let full = |sequence| literal_rules_names_stream(sequence, ClientByteOrder::LittleEndian);
+        let mut expectations = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, full(REQUEST_SEQUENCE)),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: full(0x1234),
+                    denied: Some(literal_mapping_pair(0x1234, ClientByteOrder::LittleEndian)),
+                },
+                Stream::unchanged(NOTIFY_RECEIVER_ALLOWED, full(0x5678)),
+            ],
+            new_keyboard.into_iter().chain(map).collect(),
+            CallOrder::Total,
+            vec![denied_nkn, denied_map],
+        );
+        expectations.deny_before_allow = true;
+        // Preserve the original policy target while asserting request context in the trace.
+        expectations.deny_match_ignores_request = true;
+        expectations.after_deny = Some(Box::new(|allow, denied| {
+            assert_eq!(denied.state.keymap_overrides, allow.state.keymap_overrides);
+        }));
+        expectations
+    };
+    check_receive_case(&ReceiveCase {
+        name: "XKB rules change denies only the selected client's copies",
+        build: &build,
+        act: &act,
+        expect: &expect,
+    });
+}
+
+#[test]
+// Mutation B13: skip K2 Receive for GetKbdByName.
+// Mutation B14: encode NewKeyboardNotify in little-endian for the big-endian client;
+// the original no-policy literal bytes must fail first.
+fn receive_xkb_kbd_by_name_all_clients() {
+    use super::access_notify_support::{
+        CallOrder, CaseExpect, ExpectedReceive, ReceiveCase, Stream, check_receive_case,
+    };
+
+    let build = || {
+        let mut fixture = NotifyFixture::new();
+        fixture.backend.xkb_info_result = Some((XKB_MAJOR_OPCODE, XKB_EVENT_BASE, 0));
+        initialize_xkb_notifications(&mut fixture, NOTIFY_SENDER, false, 0);
+        fixture
+            .state
+            .clients
+            .get_mut(&NOTIFY_RECEIVER_ALLOWED.0)
+            .unwrap()
+            .byte_order = ClientByteOrder::BigEndian;
+        for (client, sequence) in [
+            (NOTIFY_RECEIVER_DENIED, 0x1234),
+            (NOTIFY_RECEIVER_ALLOWED, 0x5678),
+        ] {
+            fixture
+                .state
+                .clients
+                .get(&client.0)
+                .unwrap()
+                .last_sequence
+                .store(sequence, Ordering::Relaxed);
+        }
+        fixture.state.start_instant = std::time::Instant::now() + Duration::from_secs(30);
+        fixture.state.keymap_overrides.insert(8, vec![0x0061]);
+        kbd_by_name_backend(&mut fixture);
+        assert!(!crate::core_loop::xkb_select::xkb_initialized(
+            &fixture.state,
+            NOTIFY_RECEIVER_DENIED
+        ));
+        assert!(!crate::core_loop::xkb_select::xkb_initialized(
+            &fixture.state,
+            NOTIFY_RECEIVER_ALLOWED
+        ));
+        let client_map_order = fixture
+            .state
+            .clients
+            .keys()
+            .copied()
+            .map(ClientId)
+            .collect::<Vec<_>>();
+        (fixture, client_map_order)
+    };
+    let act = |fixture: &mut NotifyFixture, _: &Vec<ClientId>| {
+        assert!(matches!(
+            xkb_request(fixture, NOTIFY_SENDER, KBD_BY_NAME_SEQUENCE, 23, &[]),
+            RequestOutcome::Handled
+        ));
+        assert!(fixture.state.keymap_overrides.is_empty());
+    };
+    let expect = |client_map_order: &Vec<ClientId>| {
+        let receives = client_map_order
+            .iter()
+            .copied()
+            .map(|client| ExpectedReceive {
+                client,
+                request: request_opcodes(XKB_MAJOR_OPCODE, 23),
+                subject: EventSubject::Device(1),
+                events: vec![xkb_event_description_for_test(XKB_NEW_KEYBOARD_NOTIFY_TYPE)],
+            })
+            .collect();
+        let denied_receive = ExpectedReceive {
+            client: NOTIFY_RECEIVER_DENIED,
+            request: request_opcodes(XKB_MAJOR_OPCODE, 23),
+            subject: EventSubject::Device(1),
+            events: vec![xkb_event_description_for_test(XKB_NEW_KEYBOARD_NOTIFY_TYPE)],
+        };
+        let mut expectations = CaseExpect::new(
+            vec![
+                Stream::unchanged(
+                    NOTIFY_SENDER,
+                    literal_kbd_by_name_stream(
+                        KBD_BY_NAME_SEQUENCE,
+                        ClientByteOrder::LittleEndian,
+                        true,
+                    ),
+                ),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: literal_kbd_by_name_stream(0x1234, ClientByteOrder::LittleEndian, false),
+                    denied: Some(literal_mapping_pair(0x1234, ClientByteOrder::LittleEndian)),
+                },
+                Stream::unchanged(
+                    NOTIFY_RECEIVER_ALLOWED,
+                    literal_kbd_by_name_stream(0x5678, ClientByteOrder::BigEndian, false),
+                ),
+            ],
+            receives,
+            CallOrder::Total,
+            vec![denied_receive],
+        );
+        expectations.deny_before_allow = true;
+        expectations.after_deny = Some(Box::new(|allow, denied| {
+            assert_eq!(denied.state.keymap_overrides, allow.state.keymap_overrides);
+        }));
+        expectations
+    };
+    check_receive_case(&ReceiveCase {
+        name: "XKB GetKbdByName checks every client in client-map order",
+        build: &build,
+        act: &act,
+        expect: &expect,
+    });
+}
+
+#[test]
+// Mutation B17: skip K3 Receive for SetMap's NewKeyboardNotify.
+// Mutation B18: drive K3 with GetMap minor 8 instead of SetMap minor 9.
+fn receive_xkb_set_new_keyboard_denied() {
+    use super::access_notify_support::{
+        CallOrder, CaseExpect, ExpectedReceive, ReceiveCase, Stream, check_receive_case,
+    };
+
+    let selected = [
+        NOTIFY_SENDER,
+        NOTIFY_RECEIVER_DENIED,
+        NOTIFY_RECEIVER_ALLOWED,
+    ];
+    let build = || {
+        let mut fixture = xkb_event_fixture(&selected, &[], true);
+        let repeat_bit = 1 << (REPEAT_KEYCODE & 7);
+        let repeat_byte = usize::from(REPEAT_KEYCODE >> 3);
+        fixture.state.keyboard_control.auto_repeats[repeat_byte] &= !repeat_bit;
+        (fixture, ())
+    };
+    let act = |fixture: &mut NotifyFixture, _: &()| {
+        script_xkb_set_outcome(
+            fixture,
+            XkbSetOutcome {
+                error: None,
+                events: vec![
+                    XkbSetEvent::NewKeyboard(xkb_new_keyboard_info(1)),
+                    XkbSetEvent::Repeats(vec![(REPEAT_KEYCODE, true)]),
+                ],
+            },
+        );
+        assert!(matches!(
+            drive_xkb_set_map(fixture, SET_MAP_SEQUENCE, &range_change_set_map_body()),
+            RequestOutcome::Handled
+        ));
+        let repeat_bit = 1 << (REPEAT_KEYCODE & 7);
+        let repeat_byte = usize::from(REPEAT_KEYCODE >> 3);
+        assert_ne!(
+            fixture.state.keyboard_control.auto_repeats[repeat_byte] & repeat_bit,
+            0
+        );
+    };
+    let expect = |_: &()| {
+        let receive = |client| ExpectedReceive {
+            client,
+            request: request_opcodes(XKB_MAJOR_OPCODE, 9),
+            subject: EventSubject::Device(1),
+            events: vec![xkb_event_description_for_test(XKB_NEW_KEYBOARD_NOTIFY_TYPE)],
+        };
+        let denied_receive = receive(NOTIFY_RECEIVER_DENIED);
+        let new_keyboard = |sequence| {
+            literal_xkb_new_keyboard_notify(
+                sequence,
+                ClientByteOrder::LittleEndian,
+                XKB_MAJOR_OPCODE,
+                9,
+                1,
+            )
+        };
+        let legacy = literal_mapping_pair(0x6a2f, ClientByteOrder::LittleEndian);
+        let mut expectations = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, new_keyboard(SET_MAP_SEQUENCE)),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: new_keyboard(0x1234),
+                    denied: Some(Vec::new()),
+                },
+                Stream::unchanged(NOTIFY_RECEIVER_ALLOWED, new_keyboard(0x5678)),
+                Stream::unchanged(NON_XKB_CLIENT, legacy),
+            ],
+            [
+                NOTIFY_SENDER,
+                NOTIFY_RECEIVER_DENIED,
+                NOTIFY_RECEIVER_ALLOWED,
+            ]
+            .map(receive)
+            .to_vec(),
+            CallOrder::Total,
+            vec![denied_receive],
+        );
+        expectations.deny_before_allow = true;
+        expectations.after_deny = Some(Box::new(|allow, denied| {
+            assert_eq!(
+                denied.state.keyboard_control.auto_repeats,
+                allow.state.keyboard_control.auto_repeats
+            );
+        }));
+        expectations
+    };
+    check_receive_case(&ReceiveCase {
+        name: "XKB SetMap NewKeyboardNotify denial keeps repeat state and legacy bytes",
+        build: &build,
+        act: &act,
+        expect: &expect,
+    });
+}
+
+#[test]
+// Mutation B19: filter the legacy core MappingNotify by the XKB MapNotify deny.
+// Mutation B20: drive the keysym-only case with GetMap minor 8.
+fn receive_xkb_map_denied_keeps_legacy_filter() {
+    use super::access_notify_support::{
+        CallOrder, CaseExpect, ExpectedReceive, ReceiveCase, Stream, check_receive_case,
+    };
+
+    let map_clients = [(NOTIFY_RECEIVER_DENIED, 0x0002)];
+    let build = || (xkb_event_fixture(&[], &map_clients, true), ());
+    let act = |fixture: &mut NotifyFixture, _: &()| {
+        script_xkb_set_outcome(
+            fixture,
+            XkbSetOutcome {
+                error: None,
+                events: vec![XkbSetEvent::Notification(KeyboardMappingChange {
+                    map_notify: yserver_protocol::x11::XkbMapNotify {
+                        device_id: 1,
+                        changed: 0x0002,
+                        min_keycode: 8,
+                        max_keycode: 255,
+                        first_key_sym: 8,
+                        n_key_syms: 1,
+                        ..Default::default()
+                    },
+                    num_groups: 2,
+                    enabled_controls: 0,
+                    repeats: Vec::new(),
+                    indicator_map_changed: 0,
+                    indicator_state: 0,
+                    compat_changed_groups: 0,
+                    compat_total_si: 0,
+                })],
+            },
+        );
+        assert!(matches!(
+            drive_xkb_set_map(fixture, SET_MAP_SEQUENCE, &keysym_set_map_body()),
+            RequestOutcome::Handled
+        ));
+    };
+    let expect = |_: &()| {
+        let receive = ExpectedReceive {
+            client: NOTIFY_RECEIVER_DENIED,
+            request: request_opcodes(XKB_MAJOR_OPCODE, 9),
+            subject: EventSubject::Device(1),
+            events: vec![xkb_event_description_for_test(XKB_MAP_NOTIFY_TYPE)],
+        };
+        let legacy =
+            |sequence| literal_mapping_notify(sequence, ClientByteOrder::LittleEndian, 1, 8, 1);
+        let mut expectations = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: literal_map_change_stream(0x1234, ClientByteOrder::LittleEndian),
+                    denied: Some(legacy(0x1234)),
+                },
+                Stream::unchanged(NOTIFY_RECEIVER_ALLOWED, Vec::new()),
+                Stream::unchanged(NON_XKB_CLIENT, legacy(0x6a2f)),
+            ],
+            vec![receive.clone()],
+            CallOrder::Total,
+            vec![receive],
+        );
+        expectations.deny_before_allow = true;
+        expectations.trace_before_deny_streams = true;
+        expectations
+    };
+    check_receive_case(&ReceiveCase {
+        name: "XKB MapNotify denial keeps selected legacy MappingNotify",
+        build: &build,
+        act: &act,
+        expect: &expect,
+    });
+}
+
+#[test]
+// Focused because the original four-client K1–K4 sequence uses one fixture and
+// checks each recipient's literal stream and writer health after every request.
+// Mutation B11: change the literal K4 MapNotify changed mask from KeySyms 0x0002.
+// Mutation B12: drive K3 through GetMap minor 8 instead of SetMap minor 9.
+fn receive_xkb_new_keyboard_no_policy_checkpoints() {
     let selected = [
         NOTIFY_SENDER,
         NOTIFY_RECEIVER_DENIED,
@@ -1596,63 +1899,60 @@ fn receive_xkb_new_keyboard_no_policy_bytes() {
     let backend = std::mem::take(&mut fixture.backend);
     fixture.backend = backend.with_keymap_rmlvo_result((8, 255));
 
-    let outcome =
-        drive_rules_names_change(&mut fixture, REQUEST_SEQUENCE, b"evdev\0pc105\0de\0\0\0");
-    assert!(matches!(outcome, RequestOutcome::Handled));
-    assert_eq!(
-        fixture.drain(NOTIFY_SENDER),
-        literal_rules_names_stream(
-            REQUEST_SEQUENCE,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian
-        )
-    );
-    assert_eq!(
-        fixture.drain(NOTIFY_RECEIVER_DENIED),
-        literal_rules_names_stream(0x1234, yserver_protocol::x11::ClientByteOrder::LittleEndian)
-    );
-    assert_eq!(
-        fixture.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_rules_names_stream(0x5678, yserver_protocol::x11::ClientByteOrder::LittleEndian)
-    );
-    assert_eq!(
-        fixture.drain(NON_XKB_CLIENT),
-        literal_mapping_pair(0x6a2f, yserver_protocol::x11::ClientByteOrder::LittleEndian)
-    );
-    assert_no_writer_failures(&fixture);
+    let check_clients = |fixture: &mut NotifyFixture, streams: &[(ClientId, Vec<u8>)]| {
+        for (client, expected) in streams {
+            assert_eq!(fixture.drain(*client), *expected, "client {client:?}");
+        }
+        assert_no_writer_failures(fixture);
+    };
+    let rules_streams = [
+        (
+            NOTIFY_SENDER,
+            literal_rules_names_stream(REQUEST_SEQUENCE, ClientByteOrder::LittleEndian),
+        ),
+        (
+            NOTIFY_RECEIVER_DENIED,
+            literal_rules_names_stream(0x1234, ClientByteOrder::LittleEndian),
+        ),
+        (
+            NOTIFY_RECEIVER_ALLOWED,
+            literal_rules_names_stream(0x5678, ClientByteOrder::LittleEndian),
+        ),
+        (
+            NON_XKB_CLIENT,
+            literal_mapping_pair(0x6a2f, ClientByteOrder::LittleEndian),
+        ),
+    ];
+    assert!(matches!(
+        drive_rules_names_change(&mut fixture, REQUEST_SEQUENCE, b"evdev\0pc105\0de\0\0\0"),
+        RequestOutcome::Handled
+    ));
+    check_clients(&mut fixture, &rules_streams);
 
     kbd_by_name_backend(&mut fixture);
-    let outcome = xkb_request(&mut fixture, NOTIFY_SENDER, KBD_BY_NAME_SEQUENCE, 23, &[]);
-    assert!(matches!(outcome, RequestOutcome::Handled));
-    assert_eq!(
-        fixture.drain(NOTIFY_SENDER),
-        literal_kbd_by_name_stream(
-            KBD_BY_NAME_SEQUENCE,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            true,
-        )
-    );
-    for (client, sequence) in [
-        (NOTIFY_RECEIVER_DENIED, 0x1234),
-        (NOTIFY_RECEIVER_ALLOWED, 0x5678),
-    ] {
-        assert_eq!(
-            fixture.drain(client),
-            literal_kbd_by_name_stream(
-                sequence,
-                yserver_protocol::x11::ClientByteOrder::LittleEndian,
-                false,
-            )
-        );
-    }
-    assert_eq!(
-        fixture.drain(NON_XKB_CLIENT),
-        literal_kbd_by_name_stream(
-            0x6a2f,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            false,
-        )
-    );
-    assert_no_writer_failures(&fixture);
+    assert!(matches!(
+        xkb_request(&mut fixture, NOTIFY_SENDER, KBD_BY_NAME_SEQUENCE, 23, &[]),
+        RequestOutcome::Handled
+    ));
+    let kbd_streams = [
+        (
+            NOTIFY_SENDER,
+            literal_kbd_by_name_stream(KBD_BY_NAME_SEQUENCE, ClientByteOrder::LittleEndian, true),
+        ),
+        (
+            NOTIFY_RECEIVER_DENIED,
+            literal_kbd_by_name_stream(0x1234, ClientByteOrder::LittleEndian, false),
+        ),
+        (
+            NOTIFY_RECEIVER_ALLOWED,
+            literal_kbd_by_name_stream(0x5678, ClientByteOrder::LittleEndian, false),
+        ),
+        (
+            NON_XKB_CLIENT,
+            literal_kbd_by_name_stream(0x6a2f, ClientByteOrder::LittleEndian, false),
+        ),
+    ];
+    check_clients(&mut fixture, &kbd_streams);
 
     script_xkb_set_outcome(
         &mut fixture,
@@ -1664,35 +1964,40 @@ fn receive_xkb_new_keyboard_no_policy_bytes() {
             ],
         },
     );
-    let outcome = drive_xkb_set_map(&mut fixture, SET_MAP_SEQUENCE, &range_change_set_map_body());
-    assert!(matches!(outcome, RequestOutcome::Handled));
-    for (client, sequence) in [
+    assert!(matches!(
+        drive_xkb_set_map(&mut fixture, SET_MAP_SEQUENCE, &range_change_set_map_body()),
+        RequestOutcome::Handled
+    ));
+    let range_change_streams = [
         (NOTIFY_SENDER, SET_MAP_SEQUENCE),
         (NOTIFY_RECEIVER_DENIED, 0x1234),
         (NOTIFY_RECEIVER_ALLOWED, 0x5678),
-    ] {
-        assert_eq!(
-            fixture.drain(client),
+    ]
+    .map(|(client, sequence)| {
+        (
+            client,
             literal_xkb_new_keyboard_notify(
                 sequence,
-                yserver_protocol::x11::ClientByteOrder::LittleEndian,
+                ClientByteOrder::LittleEndian,
                 XKB_MAJOR_OPCODE,
                 9,
                 1,
-            )
-        );
-    }
-    assert_eq!(
-        fixture.drain(NON_XKB_CLIENT),
-        literal_mapping_pair(0x6a2f, yserver_protocol::x11::ClientByteOrder::LittleEndian)
-    );
+            ),
+        )
+    })
+    .into_iter()
+    .chain([(
+        NON_XKB_CLIENT,
+        literal_mapping_pair(0x6a2f, ClientByteOrder::LittleEndian),
+    )])
+    .collect::<Vec<_>>();
+    check_clients(&mut fixture, &range_change_streams);
     assert_ne!(
         fixture.state.keyboard_control.auto_repeats[usize::from(REPEAT_KEYCODE >> 3)]
             & (1 << (REPEAT_KEYCODE & 7)),
         0,
         "scripted Repeats still updates core key repeat state"
     );
-    assert_no_writer_failures(&fixture);
 
     script_xkb_set_outcome(
         &mut fixture,
@@ -1718,550 +2023,31 @@ fn receive_xkb_new_keyboard_no_policy_bytes() {
             })],
         },
     );
-    let outcome = drive_xkb_set_map(&mut fixture, 0x5d9e, &keysym_set_map_body());
-    assert!(matches!(outcome, RequestOutcome::Handled));
-    for (client, sequence) in [
+    assert!(matches!(
+        drive_xkb_set_map(&mut fixture, 0x5d9e, &keysym_set_map_body()),
+        RequestOutcome::Handled
+    ));
+    let keysym_streams = [
         (NOTIFY_SENDER, 0x5d9e),
         (NOTIFY_RECEIVER_DENIED, 0x1234),
         (NOTIFY_RECEIVER_ALLOWED, 0x5678),
-    ] {
-        assert_eq!(
-            fixture.drain(client),
-            literal_map_change_stream(
-                sequence,
-                yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            )
-        );
-    }
-    assert_eq!(
-        fixture.drain(NON_XKB_CLIENT),
-        literal_mapping_notify(
-            0x6a2f,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            1,
-            8,
-            1,
-        )
-    );
-    assert_no_writer_failures(&fixture);
-}
-
-// Mutations: leave K2 unchecked, or encode the NewKeyboardNotify for an
-// uninitialised client in little-endian order; the literal streams and log fail.
-#[test]
-fn receive_xkb_kbd_by_name_all_clients() {
-    let (baseline, baseline_calls, _, baseline_cleared) = run_xkb_kbd_by_name(false, false);
-    assert!(baseline_calls.is_empty(), "no policy means no Receive call");
-    assert!(baseline_cleared, "successful load clears keymap overrides");
-    assert_eq!(
-        baseline[0],
-        literal_kbd_by_name_stream(
-            KBD_BY_NAME_SEQUENCE,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            true,
-        )
-    );
-    assert_eq!(
-        baseline[1],
-        literal_kbd_by_name_stream(
-            0x1234,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            false,
-        )
-    );
-    assert_eq!(
-        baseline[2],
-        literal_kbd_by_name_stream(
-            0x5678,
-            yserver_protocol::x11::ClientByteOrder::BigEndian,
-            false,
-        )
-    );
-
-    let (denied, calls, receive_order, denied_cleared) = run_xkb_kbd_by_name(true, true);
-    assert!(denied_cleared, "Receive denial keeps keymap replacement");
-    assert_eq!(
-        denied[0],
-        literal_kbd_by_name_stream(
-            KBD_BY_NAME_SEQUENCE,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            true,
-        )
-    );
-    assert_eq!(
-        denied[1],
-        literal_mapping_pair(0x1234, yserver_protocol::x11::ClientByteOrder::LittleEndian),
-        "only the denied non-XKB client's NewKeyboardNotify is dropped"
-    );
-    assert_eq!(
-        denied[2],
-        literal_kbd_by_name_stream(
-            0x5678,
-            yserver_protocol::x11::ClientByteOrder::BigEndian,
-            false,
-        )
-    );
-    assert_receive_calls_with_requests(
-        &calls,
-        &receive_order,
-        &[request_opcodes(XKB_MAJOR_OPCODE, 23); 3],
-        EventSubject::Device(1),
-        &[XKB_NEW_KEYBOARD_NOTIFY_TYPE; 3],
-    );
-
-    let (allowed, allow_calls, allow_order, allow_cleared) = run_xkb_kbd_by_name(true, false);
-    assert!(allow_cleared);
-    assert_eq!(
-        allowed[0],
-        literal_kbd_by_name_stream(
-            KBD_BY_NAME_SEQUENCE,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            true,
-        )
-    );
-    assert_eq!(
-        allowed[1],
-        literal_kbd_by_name_stream(
-            0x1234,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            false,
-        )
-    );
-    assert_eq!(
-        allowed[2],
-        literal_kbd_by_name_stream(
-            0x5678,
-            yserver_protocol::x11::ClientByteOrder::BigEndian,
-            false,
-        )
-    );
-    assert_receive_calls_with_requests(
-        &allow_calls,
-        &allow_order,
-        &[request_opcodes(XKB_MAJOR_OPCODE, 23); 3],
-        EventSubject::Device(1),
-        &[XKB_NEW_KEYBOARD_NOTIFY_TYPE; 3],
-    );
-}
-
-// Mutations: pass None instead of state.receive_request at K1, or check K1 as
-// EventSubject::Global; both break the per-recipient Receive assertions.
-#[test]
-fn receive_xkb_rules_change_denies_new_keyboard_and_map() {
-    let selected = [
-        NOTIFY_SENDER,
-        NOTIFY_RECEIVER_DENIED,
-        NOTIFY_RECEIVER_ALLOWED,
-    ];
-    let map_selected = selected.map(|client| (client, 0x0007));
-    let mut denied = xkb_event_fixture(&selected, &map_selected, false);
-    let backend = std::mem::take(&mut denied.backend);
-    denied.backend = backend.with_keymap_rmlvo_result((8, 255));
-    denied.state.keymap_overrides.insert(38, vec![0x0071]);
-    let calls = install_deny_for(
-        &mut denied,
-        NOTIFY_RECEIVER_DENIED,
-        vec![XKB_NEW_KEYBOARD_NOTIFY_TYPE, XKB_MAP_NOTIFY_TYPE],
-    );
-    assert!(matches!(
-        drive_rules_names_change(&mut denied, REQUEST_SEQUENCE, b"evdev\0pc105\0de\0\0\0"),
-        RequestOutcome::Handled
-    ));
-    assert_eq!(
-        denied.drain(NOTIFY_SENDER),
-        literal_rules_names_stream(
-            REQUEST_SEQUENCE,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian
-        )
-    );
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_DENIED),
-        literal_mapping_pair(0x1234, yserver_protocol::x11::ClientByteOrder::LittleEndian)
-    );
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_rules_names_stream(0x5678, yserver_protocol::x11::ClientByteOrder::LittleEndian)
-    );
-    let log = receive_log(&calls);
-    assert_receive_calls_with_requests(
-        &log,
-        &[
-            NOTIFY_SENDER,
-            NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_ALLOWED,
-            NOTIFY_SENDER,
-            NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_ALLOWED,
-        ],
-        &[
-            request_opcodes(18, 0),
-            request_opcodes(18, 0),
-            request_opcodes(18, 0),
-            request_opcodes(18, 0),
-            request_opcodes(18, 0),
-            request_opcodes(18, 0),
-        ],
-        EventSubject::Device(1),
-        &[
-            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
-            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
-            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
-            XKB_MAP_NOTIFY_TYPE,
-            XKB_MAP_NOTIFY_TYPE,
-            XKB_MAP_NOTIFY_TYPE,
-        ],
-    );
-    let denied_overrides = denied.state.keymap_overrides.clone();
-    assert!(
-        denied_overrides.is_empty(),
-        "denial does not skip keymap replacement"
-    );
-    assert_no_writer_failures(&denied);
-
-    let mut allowed = xkb_event_fixture(&selected, &map_selected, false);
-    let backend = std::mem::take(&mut allowed.backend);
-    allowed.backend = backend.with_keymap_rmlvo_result((8, 255));
-    allowed.state.keymap_overrides.insert(38, vec![0x0071]);
-    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
-    assert!(matches!(
-        drive_rules_names_change(&mut allowed, REQUEST_SEQUENCE, b"evdev\0pc105\0de\0\0\0"),
-        RequestOutcome::Handled
-    ));
-    for (client, sequence) in [
-        (NOTIFY_SENDER, REQUEST_SEQUENCE),
-        (NOTIFY_RECEIVER_DENIED, 0x1234),
-        (NOTIFY_RECEIVER_ALLOWED, 0x5678),
-    ] {
-        assert_eq!(
-            allowed.drain(client),
-            literal_rules_names_stream(
-                sequence,
-                yserver_protocol::x11::ClientByteOrder::LittleEndian
-            )
-        );
-    }
-    let allow_log = receive_log(&allow_calls);
-    assert_receive_calls_with_requests(
-        &allow_log,
-        &[
-            NOTIFY_SENDER,
-            NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_ALLOWED,
-            NOTIFY_SENDER,
-            NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_ALLOWED,
-        ],
-        &[
-            request_opcodes(18, 0),
-            request_opcodes(18, 0),
-            request_opcodes(18, 0),
-            request_opcodes(18, 0),
-            request_opcodes(18, 0),
-            request_opcodes(18, 0),
-        ],
-        EventSubject::Device(1),
-        &[
-            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
-            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
-            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
-            XKB_MAP_NOTIFY_TYPE,
-            XKB_MAP_NOTIFY_TYPE,
-            XKB_MAP_NOTIFY_TYPE,
-        ],
-    );
-    assert_eq!(denied_overrides, allowed.state.keymap_overrides);
-    assert_no_writer_failures(&allowed);
-}
-
-fn run_xkb_set_new_keyboard(
-    install_policy: bool,
-    deny_one: bool,
-) -> (
-    Vec<Vec<u8>>,
-    Vec<RecordedExtensionCheck>,
-    [u8; 32],
-    RequestOutcome,
-) {
-    let selected = [
-        NOTIFY_SENDER,
-        NOTIFY_RECEIVER_DENIED,
-        NOTIFY_RECEIVER_ALLOWED,
-    ];
-    let mut fixture = xkb_event_fixture(&selected, &[], true);
-    let repeat_bit = 1 << (REPEAT_KEYCODE & 7);
-    let repeat_byte = usize::from(REPEAT_KEYCODE >> 3);
-    fixture.state.keyboard_control.auto_repeats[repeat_byte] &= !repeat_bit;
-    let calls = install_policy.then(|| {
-        fixture.install_policy(move |_, check| {
-            if deny_one
-                && check.hook == ExtensionHook::Receive
-                && check.client == NOTIFY_RECEIVER_DENIED
-                && check.receive == Some(EventSubject::Device(1))
-                && check.events
-                    == Some(vec![xkb_event_description_for_test(
-                        XKB_NEW_KEYBOARD_NOTIFY_TYPE,
-                    )])
-            {
-                Decision::Deny(DENY)
-            } else {
-                Decision::Allow
-            }
-        })
-    });
-    script_xkb_set_outcome(
-        &mut fixture,
-        XkbSetOutcome {
-            error: None,
-            events: vec![
-                XkbSetEvent::NewKeyboard(xkb_new_keyboard_info(1)),
-                XkbSetEvent::Repeats(vec![(REPEAT_KEYCODE, true)]),
-            ],
-        },
-    );
-    let outcome = drive_xkb_set_map(&mut fixture, SET_MAP_SEQUENCE, &range_change_set_map_body());
-    assert_no_writer_failures(&fixture);
-    let outputs = [
-        NOTIFY_SENDER,
-        NOTIFY_RECEIVER_DENIED,
-        NOTIFY_RECEIVER_ALLOWED,
-        NON_XKB_CLIENT,
     ]
+    .map(|(client, sequence)| {
+        (
+            client,
+            literal_map_change_stream(sequence, ClientByteOrder::LittleEndian),
+        )
+    })
     .into_iter()
-    .map(|client| fixture.drain(client))
-    .collect();
-    let calls = calls.map_or_else(Vec::new, |calls| calls.lock().unwrap().clone());
-    let repeats = fixture.state.keyboard_control.auto_repeats;
-    (outputs, calls, repeats, outcome)
-}
-
-// Mutations: leave K3 unchecked or drive it with GetMap minor 8 instead of
-// SetMap minor 9. The stream and Receive context must fail while repeats and
-// legacy MappingNotify stay.
-#[test]
-fn receive_xkb_set_new_keyboard_denied() {
-    let (denied, calls, denied_repeats, outcome) = run_xkb_set_new_keyboard(true, true);
-    assert!(matches!(outcome, RequestOutcome::Handled));
-    assert_eq!(
-        denied[0],
-        literal_xkb_new_keyboard_notify(
-            SET_MAP_SEQUENCE,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            XKB_MAJOR_OPCODE,
-            9,
-            1,
-        ),
-        "requester's complete XkbSetMap notification stream"
-    );
-    assert!(
-        denied[1].is_empty(),
-        "denied recipient gets no NewKeyboardNotify"
-    );
-    assert_eq!(
-        denied[2],
-        literal_xkb_new_keyboard_notify(
-            0x5678,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            XKB_MAJOR_OPCODE,
-            9,
-            1,
-        )
-    );
-    let legacy = literal_mapping_pair(0x6a2f, yserver_protocol::x11::ClientByteOrder::LittleEndian);
-    assert_eq!(denied[3], legacy, "legacy core MappingNotify is unchanged");
-    assert_receive_calls_with_requests(
-        &calls,
-        &[
-            NOTIFY_SENDER,
-            NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_ALLOWED,
-        ],
-        &[request_opcodes(XKB_MAJOR_OPCODE, 9); 3],
-        EventSubject::Device(1),
-        &[XKB_NEW_KEYBOARD_NOTIFY_TYPE; 3],
-    );
-    let repeat_bit = 1 << (REPEAT_KEYCODE & 7);
-    let repeat_byte = usize::from(REPEAT_KEYCODE >> 3);
-    assert_ne!(denied_repeats[repeat_byte] & repeat_bit, 0);
-
-    let (allowed, allow_calls, allow_repeats, allow_outcome) =
-        run_xkb_set_new_keyboard(true, false);
-    assert!(matches!(allow_outcome, RequestOutcome::Handled));
-    assert_eq!(
-        allowed[0],
-        literal_xkb_new_keyboard_notify(
-            SET_MAP_SEQUENCE,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            XKB_MAJOR_OPCODE,
-            9,
-            1,
-        )
-    );
-    assert_eq!(
-        allowed[1],
-        literal_xkb_new_keyboard_notify(
-            0x1234,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            XKB_MAJOR_OPCODE,
-            9,
-            1,
-        )
-    );
-    assert_eq!(
-        allowed[2],
-        literal_xkb_new_keyboard_notify(
-            0x5678,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            XKB_MAJOR_OPCODE,
-            9,
-            1,
-        )
-    );
-    assert_eq!(allowed[3], legacy);
-    assert_receive_calls_with_requests(
-        &allow_calls,
-        &[
-            NOTIFY_SENDER,
-            NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_ALLOWED,
-        ],
-        &[request_opcodes(XKB_MAJOR_OPCODE, 9); 3],
-        EventSubject::Device(1),
-        &[XKB_NEW_KEYBOARD_NOTIFY_TYPE; 3],
-    );
-    assert_eq!(
-        denied_repeats, allow_repeats,
-        "denial keeps the repeat state effect"
-    );
-}
-
-fn run_xkb_map_change(
-    install_policy: bool,
-    deny_selected: bool,
-) -> (Vec<Vec<u8>>, Vec<RecordedExtensionCheck>, RequestOutcome) {
-    let map_clients = [(NOTIFY_RECEIVER_DENIED, 0x0002)];
-    let mut fixture = xkb_event_fixture(&[], &map_clients, true);
-    let calls = install_policy.then(|| {
-        fixture.install_policy(move |_, check| {
-            if deny_selected
-                && check.hook == ExtensionHook::Receive
-                && check.client == NOTIFY_RECEIVER_DENIED
-                && check.receive == Some(EventSubject::Device(1))
-                && check.events == Some(vec![xkb_event_description_for_test(XKB_MAP_NOTIFY_TYPE)])
-            {
-                Decision::Deny(DENY)
-            } else {
-                Decision::Allow
-            }
-        })
-    });
-    script_xkb_set_outcome(
-        &mut fixture,
-        XkbSetOutcome {
-            error: None,
-            events: vec![XkbSetEvent::Notification(KeyboardMappingChange {
-                map_notify: yserver_protocol::x11::XkbMapNotify {
-                    device_id: 1,
-                    changed: 0x0002,
-                    min_keycode: 8,
-                    max_keycode: 255,
-                    first_key_sym: 8,
-                    n_key_syms: 1,
-                    ..Default::default()
-                },
-                num_groups: 2,
-                enabled_controls: 0,
-                repeats: Vec::new(),
-                indicator_map_changed: 0,
-                indicator_state: 0,
-                compat_changed_groups: 0,
-                compat_total_si: 0,
-            })],
-        },
-    );
-    let outcome = drive_xkb_set_map(&mut fixture, SET_MAP_SEQUENCE, &keysym_set_map_body());
-    assert_no_writer_failures(&fixture);
-    let outputs = [
-        NOTIFY_SENDER,
-        NOTIFY_RECEIVER_DENIED,
-        NOTIFY_RECEIVER_ALLOWED,
+    .chain([(
         NON_XKB_CLIENT,
-    ]
-    .into_iter()
-    .map(|client| fixture.drain(client))
-    .collect();
-    let calls = calls.map_or_else(Vec::new, |calls| calls.lock().unwrap().clone());
-    (outputs, calls, outcome)
+        literal_mapping_notify(0x6a2f, ClientByteOrder::LittleEndian, 1, 8, 1),
+    )])
+    .collect::<Vec<_>>();
+    check_clients(&mut fixture, &keysym_streams);
 }
 
-// Mutations: filter core MappingNotify by the XKB MapNotify Receive outcome,
-// or drive the keysym-only case with GetMap minor 8. The selected client must
-// keep its core copy when its XKB copy is denied.
-#[test]
-fn receive_xkb_map_denied_keeps_legacy_filter() {
-    let (baseline, baseline_calls, baseline_outcome) = run_xkb_map_change(false, false);
-    assert!(matches!(baseline_outcome, RequestOutcome::Handled));
-    assert!(baseline_calls.is_empty());
-    assert!(
-        baseline[0].is_empty(),
-        "requester selected neither map event"
-    );
-    assert_eq!(
-        baseline[1],
-        literal_map_change_stream(0x1234, yserver_protocol::x11::ClientByteOrder::LittleEndian)
-    );
-    assert!(
-        baseline[2].is_empty(),
-        "unselected XKB client gets no legacy copy"
-    );
-    assert_eq!(
-        baseline[3],
-        literal_mapping_notify(
-            0x6a2f,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            1,
-            8,
-            1,
-        )
-    );
-
-    let (denied, calls, outcome) = run_xkb_map_change(true, true);
-    assert!(matches!(outcome, RequestOutcome::Handled));
-    assert!(denied[0].is_empty());
-    assert_eq!(
-        denied[1],
-        literal_mapping_notify(
-            0x1234,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            1,
-            8,
-            1,
-        ),
-        "denying MapNotify leaves the selected client's core MappingNotify"
-    );
-    assert!(
-        denied[2].is_empty(),
-        "unselected XKB client gets no core copy"
-    );
-    assert_eq!(
-        denied[3],
-        literal_mapping_notify(
-            0x6a2f,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            1,
-            8,
-            1,
-        )
-    );
-    assert_receive_calls_with_requests(
-        &calls,
-        &[NOTIFY_RECEIVER_DENIED],
-        &[request_opcodes(XKB_MAJOR_OPCODE, 9)],
-        EventSubject::Device(1),
-        &[XKB_MAP_NOTIFY_TYPE],
-    );
-}
-
-// Mutation: bypass K1's NewKeyboardNotify Receive call; this explicit Allow
+// Mutation B21: bypass K1's NewKeyboardNotify Receive; this explicit Allow
 // policy must still record it while preserving literal bytes.
 #[test]
 fn receive_xkb_new_keyboard_allow_control() {
@@ -2404,9 +2190,10 @@ fn receive_xkb_new_keyboard_allow_control() {
     );
 }
 
-// Mutations: use Device(1) for K4 instead of notify.device_id, or return only
-// allowed recipients from send_xkb_map_notify; both violate this helper contract.
 #[test]
+// Focused because the direct producer's returned recipient list is part of its contract, including denied clients.
+// Mutation B22: use Device(1) rather than the payload device in the Receive subject.
+// Mutation B23: return only policy-allowed recipients from send_xkb_map_notify.
 fn receive_xkb_map_payload_device_subject() {
     let mut fixture = NotifyFixture::new();
     fixture.backend.xkb_info_result = Some((XKB_MAJOR_OPCODE, XKB_EVENT_BASE, 0));
@@ -2426,7 +2213,7 @@ fn receive_xkb_map_payload_device_subject() {
             .state
             .clients
             .get(&client.0)
-            .expect("fixture client")
+            .unwrap()
             .last_sequence
             .store(sequence, Ordering::Relaxed);
     }
@@ -2463,7 +2250,7 @@ fn receive_xkb_map_payload_device_subject() {
         fixture.drain(NOTIFY_RECEIVER_ALLOWED),
         literal_xkb_map_notify(
             0x5678,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian,
+            ClientByteOrder::LittleEndian,
             3,
             0x0002,
             0,
@@ -2484,10 +2271,99 @@ fn receive_xkb_map_payload_device_subject() {
     assert_no_writer_failures(&fixture);
 }
 
-// Mutation: change the encoded CompatMapNotify changed_groups field from 5;
-// the literal baseline must catch a valid-looking but different event.
+fn check_xkb_single_notify_case<Event, EventBytes>(
+    name: &'static str,
+    selection: u16,
+    sequence: u16,
+    request_minor: u8,
+    expected_request_minor: u8,
+    request_body: &'static [u8],
+    xkb_type: u8,
+    make_event: Event,
+    event_bytes: EventBytes,
+) where
+    Event: Fn() -> XkbSetEvent + Copy,
+    EventBytes: Fn(u16) -> Vec<u8> + Copy,
+{
+    use super::access_notify_support::{
+        CallOrder, CaseExpect, ExpectedReceive, ReceiveCase, Stream, check_receive_case,
+    };
+
+    let selections = [
+        (NOTIFY_RECEIVER_DENIED, selection),
+        (NOTIFY_RECEIVER_ALLOWED, selection),
+    ];
+    let build = || {
+        let mut fixture = indicator_fixture(&selections);
+        seed_request_xkb_snapshots(&mut fixture);
+        (fixture, ())
+    };
+    let act = |fixture: &mut NotifyFixture, _: &()| {
+        drive_scripted_xkb_set(
+            fixture,
+            sequence,
+            request_minor,
+            request_body,
+            vec![make_event()],
+        );
+    };
+    let expect = |_: &()| {
+        let receive = |client| ExpectedReceive {
+            client,
+            request: request_opcodes(XKB_MAJOR_OPCODE, expected_request_minor),
+            subject: EventSubject::Device(1),
+            events: vec![xkb_event_description_for_test(xkb_type)],
+        };
+        let denied = receive(NOTIFY_RECEIVER_DENIED);
+        let allowed = receive(NOTIFY_RECEIVER_ALLOWED);
+        let mut expectations = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: event_bytes(0x1234),
+                    denied: Some(Vec::new()),
+                },
+                Stream::unchanged(NOTIFY_RECEIVER_ALLOWED, event_bytes(0x5678)),
+            ],
+            vec![denied.clone(), allowed],
+            CallOrder::Total,
+            vec![denied],
+        );
+        expectations.deny_before_allow = true;
+        expectations.after_deny = Some(Box::new(|allow, denied| {
+            assert_xkb_notification_effects_match(denied, allow);
+        }));
+        expectations
+    };
+    check_receive_case(&ReceiveCase {
+        name,
+        build: &build,
+        act: &act,
+        expect: &expect,
+    });
+}
+
 #[test]
-fn receive_xkb_indicators_no_policy_bytes() {
+// Mutation B31: skip K5 Receive; the targeted CompatMap denial must drop its copy.
+fn receive_xkb_compat_map_denied() {
+    check_xkb_single_notify_case(
+        "XKB CompatMapNotify denial keeps the other recipient",
+        XKB_COMPAT_MAP_SELECT,
+        SET_COMPAT_SEQUENCE,
+        XKB_SET_COMPAT_MAP,
+        11,
+        &XKB_SET_COMPAT_BODY,
+        XKB_COMPAT_MAP_NOTIFY_TYPE,
+        || XkbSetEvent::CompatMap(compat_map_notify()),
+        |sequence| literal_xkb_compat_map_notify(sequence, compat_map_notify()),
+    );
+}
+
+#[test]
+// Focused because the original literal-field mutation belongs to a no-policy-only assertion.
+// Mutation B24: change the literal CompatMapNotify changed_groups field from 5.
+fn receive_xkb_indicator_set_no_policy_bytes() {
     let selections = [
         (NOTIFY_RECEIVER_DENIED, XKB_INDICATOR_EVENTS_SELECT),
         (NOTIFY_RECEIVER_ALLOWED, XKB_INDICATOR_EVENTS_SELECT),
@@ -2524,55 +2400,86 @@ fn receive_xkb_indicators_no_policy_bytes() {
         fixture.drain(NOTIFY_RECEIVER_ALLOWED),
         literal_xkb_indicator_set_stream(0x5678)
     );
+    assert_no_writer_failures(&fixture);
 }
 
-// Mutations: make the State/Map description subtype differ from the writer's
-// `XkbIndicatorNotifyKind::xkb_type`; check K8 once per emission, then reuse
-// that decision for every recipient. The assertions catch each change.
 #[test]
-fn receive_xkb_indicator_maps_denies_one_kind() {
+// Mutation B34: bypass K5 under allow-all; the full Receive log must fail.
+// Mutation B35: drive all scripted Set* events through SetMap minor 9.
+fn receive_xkb_indicator_set_allow_control() {
+    use super::access_notify_support::{
+        CallOrder, CaseExpect, ExpectedReceive, ReceiveCase, Stream, check_receive_case,
+    };
+
     let selections = [
-        (
-            NOTIFY_RECEIVER_DENIED,
-            XKB_INDICATOR_MAP_SELECT | XKB_INDICATOR_STATE_SELECT | XKB_EXTENSION_DEVICE_SELECT,
-        ),
-        (NOTIFY_RECEIVER_ALLOWED, XKB_EXTENSION_DEVICE_SELECT),
+        (NOTIFY_RECEIVER_DENIED, XKB_INDICATOR_EVENTS_SELECT),
+        (NOTIFY_RECEIVER_ALLOWED, XKB_INDICATOR_EVENTS_SELECT),
     ];
-    let mut denied = indicator_fixture(&selections);
-    seed_request_xkb_snapshots(&mut denied);
-    let target_checks = Arc::new(AtomicUsize::new(0));
-    let calls = denied.install_policy({
-        let target_checks = Arc::clone(&target_checks);
-        move |_, check| {
-            if check.hook == ExtensionHook::Receive
-                && check.client == NOTIFY_RECEIVER_DENIED
-                && check.receive == Some(EventSubject::Device(1))
-                && recorded_xkb_type(
-                    check,
-                    &[
-                        XKB_INDICATOR_MAP_NOTIFY_TYPE,
-                        XKB_INDICATOR_STATE_NOTIFY_TYPE,
-                        XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
-                    ],
-                )
-                && target_checks.fetch_add(1, Ordering::Relaxed) == 1
-            {
-                Decision::Deny(DENY)
-            } else {
-                Decision::Allow
+    let build = || {
+        let mut fixture = indicator_fixture(&selections);
+        seed_request_xkb_snapshots(&mut fixture);
+        (fixture, ())
+    };
+    let act = |fixture: &mut NotifyFixture, _: &()| {
+        drive_scripted_xkb_set(
+            fixture,
+            SET_COMPAT_SEQUENCE,
+            XKB_SET_COMPAT_MAP,
+            &XKB_SET_COMPAT_BODY,
+            vec![XkbSetEvent::CompatMap(compat_map_notify())],
+        );
+        drive_scripted_xkb_set(
+            fixture,
+            SET_NAMES_SEQUENCE,
+            XKB_SET_NAMES,
+            &XKB_SET_NAMES_BODY,
+            vec![XkbSetEvent::Names(names_notify()), indicator_names_change()],
+        );
+        drive_scripted_xkb_set(
+            fixture,
+            SET_INDICATOR_MAP_SEQUENCE,
+            XKB_SET_INDICATOR_MAP,
+            &XKB_SET_INDICATOR_MAP_BODY,
+            vec![XkbSetEvent::IndicatorMaps(indicator_maps_change())],
+        );
+    };
+    let expect = |_: &()| {
+        let receive = |client, request, xkb_type| ExpectedReceive {
+            client,
+            request: request_opcodes(XKB_MAJOR_OPCODE, request),
+            subject: EventSubject::Device(1),
+            events: vec![xkb_event_description_for_test(xkb_type)],
+        };
+        let denied_state = receive(
+            NOTIFY_RECEIVER_DENIED,
+            XKB_SET_INDICATOR_MAP,
+            XKB_INDICATOR_STATE_NOTIFY_TYPE,
+        );
+        let mut receives = Vec::new();
+        for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+            receives.push(receive(
+                client,
+                XKB_SET_COMPAT_MAP,
+                XKB_COMPAT_MAP_NOTIFY_TYPE,
+            ));
+        }
+        for xkb_type in [XKB_NAMES_NOTIFY_TYPE, XKB_EXTENSION_DEVICE_NOTIFY_TYPE] {
+            for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+                receives.push(receive(client, XKB_SET_NAMES, xkb_type));
             }
         }
-    });
-    drive_scripted_xkb_set(
-        &mut denied,
-        SET_INDICATOR_MAP_SEQUENCE,
-        XKB_SET_INDICATOR_MAP,
-        &XKB_SET_INDICATOR_MAP_BODY,
-        vec![XkbSetEvent::IndicatorMaps(indicator_maps_change())],
-    );
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_DENIED),
-        [
+        for xkb_type in [
+            XKB_INDICATOR_MAP_NOTIFY_TYPE,
+            XKB_INDICATOR_STATE_NOTIFY_TYPE,
+            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
+        ] {
+            for client in [NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED] {
+                receives.push(receive(client, XKB_SET_INDICATOR_MAP, xkb_type));
+            }
+        }
+        let denied_bytes = [
+            literal_xkb_compat_map_notify(0x1234, compat_map_notify()),
+            literal_xkb_names_set_stream(0x1234),
             literal_xkb_indicator_notify(
                 0x1234,
                 yserver_protocol::x11::XkbIndicatorNotifyKind::Map,
@@ -2581,244 +2488,63 @@ fn receive_xkb_indicator_maps_denies_one_kind() {
             ),
             literal_xkb_extension_device_notify(0x1234, maps_extension_device_notify()),
         ]
-        .concat()
-    );
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_xkb_extension_device_notify(0x5678, maps_extension_device_notify())
-    );
-    let expected_clients = [
-        NOTIFY_RECEIVER_DENIED,
-        NOTIFY_RECEIVER_DENIED,
-        NOTIFY_RECEIVER_DENIED,
-        NOTIFY_RECEIVER_ALLOWED,
-    ];
-    let expected_requests = [request_opcodes(XKB_MAJOR_OPCODE, 14); 4];
-    let log = receive_log(&calls);
-    assert_receive_calls_with_requests(
-        &log,
-        &expected_clients,
-        &expected_requests,
-        EventSubject::Device(1),
-        &[
-            XKB_INDICATOR_MAP_NOTIFY_TYPE,
-            XKB_INDICATOR_STATE_NOTIFY_TYPE,
-            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
-            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
-        ],
-    );
-    let mut allowed = indicator_fixture(&selections);
-    seed_request_xkb_snapshots(&mut allowed);
-    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
-    drive_scripted_xkb_set(
-        &mut allowed,
-        SET_INDICATOR_MAP_SEQUENCE,
-        XKB_SET_INDICATOR_MAP,
-        &XKB_SET_INDICATOR_MAP_BODY,
-        vec![XkbSetEvent::IndicatorMaps(indicator_maps_change())],
-    );
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_DENIED),
-        literal_xkb_indicator_maps_stream(0x1234)
-    );
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_xkb_extension_device_notify(0x5678, maps_extension_device_notify())
-    );
-    assert_receive_calls_with_requests(
-        &receive_log(&allow_calls),
-        &expected_clients,
-        &expected_requests,
-        EventSubject::Device(1),
-        &[
-            XKB_INDICATOR_MAP_NOTIFY_TYPE,
-            XKB_INDICATOR_STATE_NOTIFY_TYPE,
-            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
-            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
-        ],
-    );
-    assert_xkb_notification_effects_match(&denied, &allowed);
-    assert_no_writer_failures(&denied);
-    assert_no_writer_failures(&allowed);
-}
-
-// Mutations: leave K10 unchecked, or return early from announce_xkb_state
-// after all StateNotify copies are denied; the indicator follow-ups and their
-// Receive assertions must still prove the snapshot and delivery order.
-#[test]
-fn receive_xkb_state_indicator_followups() {
-    let selections = [
-        (NOTIFY_RECEIVER_DENIED, XKB_INDICATOR_FOLLOWUPS_SELECT),
-        (NOTIFY_RECEIVER_ALLOWED, XKB_INDICATOR_FOLLOWUPS_SELECT),
-    ];
-    let mut denied = indicator_fixture(&selections);
-    denied.backend.xkb_mods = (0x40, 0x40, 0, 0);
-    denied.backend.xkb_indicators_result = (0x20, 0x3f);
-    let denied_checks = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
-    let calls = denied.install_policy({
-        let denied_checks = denied_checks.clone();
-        move |_, check| {
-            if check.hook == ExtensionHook::Receive
-                && check.receive == Some(EventSubject::Device(1))
-                && recorded_xkb_type(
-                    check,
-                    &[
-                        XKB_STATE_NOTIFY_TYPE,
-                        XKB_INDICATOR_STATE_NOTIFY_TYPE,
-                        XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
-                    ],
-                )
-            {
-                let count = match check.client {
-                    NOTIFY_RECEIVER_DENIED => denied_checks[0].fetch_add(1, Ordering::Relaxed),
-                    NOTIFY_RECEIVER_ALLOWED => denied_checks[1].fetch_add(1, Ordering::Relaxed),
-                    _ => return Decision::Allow,
-                };
-                if count == 0 {
-                    return Decision::Deny(DENY);
-                }
-            }
-            Decision::Allow
-        }
+        .concat();
+        let mut expectations = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: literal_xkb_indicator_set_stream(0x1234),
+                    denied: Some(denied_bytes),
+                },
+                Stream::unchanged(
+                    NOTIFY_RECEIVER_ALLOWED,
+                    literal_xkb_indicator_set_stream(0x5678),
+                ),
+            ],
+            receives,
+            CallOrder::Total,
+            vec![denied_state],
+        );
+        expectations.no_policy_last = true;
+        expectations.after_deny = Some(Box::new(|allow, denied| {
+            assert_xkb_notification_effects_match(denied, allow);
+        }));
+        expectations
+    };
+    check_receive_case(&ReceiveCase {
+        name: "XKB indicator Set* allow control checks every event and request",
+        build: &build,
+        act: &act,
+        expect: &expect,
     });
-    let dropped = key_event_fanout_to_state(
-        &mut denied.state,
-        &mut denied.backend,
-        HostKeyEvent {
-            origin: InputOrigin::NestedHost,
-            pressed: true,
-            keycode: 38,
-            time: 0x5678,
-            root_x: 0,
-            root_y: 0,
-            event_x: 0,
-            event_y: 0,
-            state: 0,
-        },
-    );
-    assert!(dropped.is_empty());
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_DENIED),
-        literal_xkb_key_indicator_stream(0x1234, false)
-    );
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_xkb_key_indicator_stream(0x5678, false)
-    );
-    assert_eq!(denied.state.xkb_announced, (0, (0x40, 0x40, 0, 0)));
-    assert_eq!(denied.state.xkb_announced_indicators, 0x20);
-    assert_receive_calls_with_requests(
-        &receive_log(&calls),
-        &[
-            NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_ALLOWED,
-            NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_ALLOWED,
-            NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_ALLOWED,
-        ],
-        &[None; 6],
-        EventSubject::Device(1),
-        &[
-            XKB_STATE_NOTIFY_TYPE,
-            XKB_STATE_NOTIFY_TYPE,
-            XKB_INDICATOR_STATE_NOTIFY_TYPE,
-            XKB_INDICATOR_STATE_NOTIFY_TYPE,
-            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
-            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
-        ],
-    );
-    let mut allowed = indicator_fixture(&selections);
-    allowed.backend.xkb_mods = (0x40, 0x40, 0, 0);
-    allowed.backend.xkb_indicators_result = (0x20, 0x3f);
-    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
-    let dropped = key_event_fanout_to_state(
-        &mut allowed.state,
-        &mut allowed.backend,
-        HostKeyEvent {
-            origin: InputOrigin::NestedHost,
-            pressed: true,
-            keycode: 38,
-            time: 0x5678,
-            root_x: 0,
-            root_y: 0,
-            event_x: 0,
-            event_y: 0,
-            state: 0,
-        },
-    );
-    assert!(dropped.is_empty());
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_DENIED),
-        literal_xkb_key_indicator_stream(0x1234, true)
-    );
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_xkb_key_indicator_stream(0x5678, true)
-    );
-    assert_receive_calls_with_requests(
-        &receive_log(&allow_calls),
-        &[
-            NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_ALLOWED,
-            NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_ALLOWED,
-            NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_ALLOWED,
-        ],
-        &[None; 6],
-        EventSubject::Device(1),
-        &[
-            XKB_STATE_NOTIFY_TYPE,
-            XKB_STATE_NOTIFY_TYPE,
-            XKB_INDICATOR_STATE_NOTIFY_TYPE,
-            XKB_INDICATOR_STATE_NOTIFY_TYPE,
-            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
-            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
-        ],
-    );
-    assert_xkb_notification_effects_match(&denied, &allowed);
-    assert_no_writer_failures(&denied);
-    assert_no_writer_failures(&allowed);
 }
 
-// Mutations: leave K6 (NamesNotify) unchecked, or drive SetNames through
-// XkbSetMap (minor 9); the literal stream and pinned Receive request must fail.
 #[test]
+// Mutation B29: skip K6 Receive for NamesNotify.
+// Mutation B30: drive SetNames using SetMap minor 9.
 fn receive_xkb_names_denied() {
-    assert_single_xkb_notification_denied(
+    check_xkb_single_notify_case(
+        "XKB NamesNotify denial keeps the other recipient",
         XKB_NAMES_SELECT,
         SET_NAMES_SEQUENCE,
         XKB_SET_NAMES,
-        request_opcodes(XKB_MAJOR_OPCODE, 18),
-        XKB_NAMES_NOTIFY_TYPE,
+        18,
         &XKB_SET_NAMES_BODY,
-        XkbSetEvent::Names(names_notify()),
+        XKB_NAMES_NOTIFY_TYPE,
+        || XkbSetEvent::Names(names_notify()),
         |sequence| literal_xkb_names_notify(sequence, names_notify()),
     );
 }
 
-// Mutation: leave K5 (CompatMapNotify) unchecked; its target's literal stream
-// and the Receive count must fail.
 #[test]
-fn receive_xkb_compat_map_denied() {
-    assert_single_xkb_notification_denied(
-        XKB_COMPAT_MAP_SELECT,
-        SET_COMPAT_SEQUENCE,
-        XKB_SET_COMPAT_MAP,
-        request_opcodes(XKB_MAJOR_OPCODE, 11),
-        XKB_COMPAT_MAP_NOTIFY_TYPE,
-        &XKB_SET_COMPAT_BODY,
-        XkbSetEvent::CompatMap(compat_map_notify()),
-        |sequence| literal_xkb_compat_map_notify(sequence, compat_map_notify()),
-    );
-}
-
-// Mutations: leave K7 unchecked (the combined subscriber's denied K7 copy
-// leaks), or add a NamesNotify requirement to K7's subscription predicate (the
-// extension-only recipient loses its K7 check). Both fail this test.
-#[test]
+// Mutation B32: skip K7 Receive; the denied ExtensionDeviceNotify must disappear.
+// Mutation B33: require NamesNotify interest for the K7 extension-only recipient.
 fn receive_xkb_indicator_names_denied() {
+    use super::access_notify_support::{
+        CallOrder, CaseExpect, ExpectedReceive, ReceiveCase, Stream, check_receive_case,
+    };
+
     let selections = [
         (
             NOTIFY_RECEIVER_DENIED,
@@ -2826,182 +2552,234 @@ fn receive_xkb_indicator_names_denied() {
         ),
         (NOTIFY_RECEIVER_ALLOWED, XKB_EXTENSION_DEVICE_SELECT),
     ];
-    let mut denied = indicator_fixture(&selections);
-    seed_request_xkb_snapshots(&mut denied);
-    let combined_subscriber_checks = Arc::new(AtomicUsize::new(0));
-    let calls = denied.install_policy({
-        let combined_subscriber_checks = Arc::clone(&combined_subscriber_checks);
-        move |_, check| {
-            if check.hook == ExtensionHook::Receive
-                && check.client == NOTIFY_RECEIVER_DENIED
-                && check.receive == Some(EventSubject::Device(1))
-                && recorded_xkb_type(
-                    check,
-                    &[XKB_NAMES_NOTIFY_TYPE, XKB_EXTENSION_DEVICE_NOTIFY_TYPE],
-                )
-                && combined_subscriber_checks.fetch_add(1, Ordering::Relaxed) == 1
-            {
-                Decision::Deny(DENY)
-            } else {
-                Decision::Allow
-            }
-        }
+    let build = || {
+        let mut fixture = indicator_fixture(&selections);
+        seed_request_xkb_snapshots(&mut fixture);
+        (fixture, ())
+    };
+    let act = |fixture: &mut NotifyFixture, _: &()| {
+        drive_scripted_xkb_set(
+            fixture,
+            SET_NAMES_SEQUENCE,
+            XKB_SET_NAMES,
+            &XKB_SET_NAMES_BODY,
+            vec![XkbSetEvent::Names(names_notify()), indicator_names_change()],
+        );
+    };
+    let expect = |_: &()| {
+        let receive = |client, xkb_type| ExpectedReceive {
+            client,
+            request: request_opcodes(XKB_MAJOR_OPCODE, 18),
+            subject: EventSubject::Device(1),
+            events: vec![xkb_event_description_for_test(xkb_type)],
+        };
+        let denied_names = receive(NOTIFY_RECEIVER_DENIED, XKB_NAMES_NOTIFY_TYPE);
+        let denied_extension = receive(NOTIFY_RECEIVER_DENIED, XKB_EXTENSION_DEVICE_NOTIFY_TYPE);
+        let allowed_extension = receive(NOTIFY_RECEIVER_ALLOWED, XKB_EXTENSION_DEVICE_NOTIFY_TYPE);
+        let mut expectations = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: literal_xkb_names_set_stream(0x1234),
+                    denied: Some(literal_xkb_names_notify(0x1234, names_notify())),
+                },
+                Stream::unchanged(
+                    NOTIFY_RECEIVER_ALLOWED,
+                    literal_xkb_extension_device_notify(0x5678, names_extension_device_notify()),
+                ),
+            ],
+            vec![denied_names, denied_extension.clone(), allowed_extension],
+            CallOrder::Total,
+            vec![denied_extension],
+        );
+        expectations.deny_before_allow = true;
+        expectations.trace_before_deny_streams = true;
+        expectations.no_policy_last = true;
+        expectations.after_deny = Some(Box::new(|allow, denied| {
+            assert_xkb_notification_effects_match(denied, allow)
+        }));
+        expectations
+    };
+    check_receive_case(&ReceiveCase {
+        name: "XKB indicator names denial preserves per-client recipients",
+        build: &build,
+        act: &act,
+        expect: &expect,
     });
-    drive_scripted_xkb_set(
-        &mut denied,
-        SET_NAMES_SEQUENCE,
-        XKB_SET_NAMES,
-        &XKB_SET_NAMES_BODY,
-        vec![XkbSetEvent::Names(names_notify()), indicator_names_change()],
-    );
-    assert_receive_calls_with_requests(
-        &receive_log(&calls),
-        &[
-            NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_ALLOWED,
-        ],
-        &[request_opcodes(XKB_MAJOR_OPCODE, 18); 3],
-        EventSubject::Device(1),
-        &[
-            XKB_NAMES_NOTIFY_TYPE,
-            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
-            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
-        ],
-    );
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_DENIED),
-        literal_xkb_names_notify(0x1234, names_notify())
-    );
-    assert_eq!(
-        denied.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_xkb_extension_device_notify(0x5678, names_extension_device_notify())
-    );
-
-    let mut allowed = indicator_fixture(&selections);
-    seed_request_xkb_snapshots(&mut allowed);
-    let allow_calls = allowed.install_policy(|_, _| Decision::Allow);
-    drive_scripted_xkb_set(
-        &mut allowed,
-        SET_NAMES_SEQUENCE,
-        XKB_SET_NAMES,
-        &XKB_SET_NAMES_BODY,
-        vec![XkbSetEvent::Names(names_notify()), indicator_names_change()],
-    );
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_DENIED),
-        literal_xkb_names_set_stream(0x1234)
-    );
-    assert_eq!(
-        allowed.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_xkb_extension_device_notify(0x5678, names_extension_device_notify())
-    );
-    assert_receive_calls_with_requests(
-        &receive_log(&allow_calls),
-        &[
-            NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_DENIED,
-            NOTIFY_RECEIVER_ALLOWED,
-        ],
-        &[request_opcodes(XKB_MAJOR_OPCODE, 18); 3],
-        EventSubject::Device(1),
-        &[
-            XKB_NAMES_NOTIFY_TYPE,
-            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
-            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
-        ],
-    );
-    assert_xkb_notification_effects_match(&denied, &allowed);
-    assert_no_writer_failures(&denied);
-    assert_no_writer_failures(&allowed);
 }
 
-// Mutations: leave K5 unchecked, or drive every scripted Set* outcome through
-// XkbSetMap (minor 9); this Allow control pins all six events and request contexts.
 #[test]
-fn receive_xkb_indicators_allow_control() {
+// Mutation B25: make the Map/State Receive subtype differ from the writer's xkbType.
+// Mutation B26: reuse one recipient's K8 decision for every recipient.
+fn receive_xkb_indicator_maps_denies_one_kind() {
+    use super::access_notify_support::{
+        CallOrder, CaseExpect, ExpectedReceive, ReceiveCase, Stream, check_receive_case,
+    };
+
     let selections = [
-        (NOTIFY_RECEIVER_DENIED, XKB_INDICATOR_EVENTS_SELECT),
-        (NOTIFY_RECEIVER_ALLOWED, XKB_INDICATOR_EVENTS_SELECT),
+        (
+            NOTIFY_RECEIVER_DENIED,
+            XKB_INDICATOR_MAP_SELECT | XKB_INDICATOR_STATE_SELECT | XKB_EXTENSION_DEVICE_SELECT,
+        ),
+        (NOTIFY_RECEIVER_ALLOWED, XKB_EXTENSION_DEVICE_SELECT),
     ];
-    let mut fixture = indicator_fixture(&selections);
-    let calls = fixture.install_policy(|_, _| Decision::Allow);
-    seed_request_xkb_snapshots(&mut fixture);
-    drive_scripted_xkb_set(
-        &mut fixture,
-        SET_COMPAT_SEQUENCE,
-        XKB_SET_COMPAT_MAP,
-        &XKB_SET_COMPAT_BODY,
-        vec![XkbSetEvent::CompatMap(compat_map_notify())],
-    );
-    drive_scripted_xkb_set(
-        &mut fixture,
-        SET_NAMES_SEQUENCE,
-        XKB_SET_NAMES,
-        &XKB_SET_NAMES_BODY,
-        vec![XkbSetEvent::Names(names_notify()), indicator_names_change()],
-    );
-    drive_scripted_xkb_set(
-        &mut fixture,
-        SET_INDICATOR_MAP_SEQUENCE,
-        XKB_SET_INDICATOR_MAP,
-        &XKB_SET_INDICATOR_MAP_BODY,
-        vec![XkbSetEvent::IndicatorMaps(indicator_maps_change())],
-    );
-    assert_eq!(
-        fixture.drain(NOTIFY_RECEIVER_DENIED),
-        literal_xkb_indicator_set_stream(0x1234)
-    );
-    assert_eq!(
-        fixture.drain(NOTIFY_RECEIVER_ALLOWED),
-        literal_xkb_indicator_set_stream(0x5678)
-    );
-    let clients = [
-        NOTIFY_RECEIVER_DENIED,
-        NOTIFY_RECEIVER_ALLOWED,
-        NOTIFY_RECEIVER_DENIED,
-        NOTIFY_RECEIVER_ALLOWED,
-        NOTIFY_RECEIVER_DENIED,
-        NOTIFY_RECEIVER_ALLOWED,
-        NOTIFY_RECEIVER_DENIED,
-        NOTIFY_RECEIVER_ALLOWED,
-        NOTIFY_RECEIVER_DENIED,
-        NOTIFY_RECEIVER_ALLOWED,
-        NOTIFY_RECEIVER_DENIED,
-        NOTIFY_RECEIVER_ALLOWED,
+    let build = || {
+        let mut fixture = indicator_fixture(&selections);
+        seed_request_xkb_snapshots(&mut fixture);
+        (fixture, ())
+    };
+    let act = |fixture: &mut NotifyFixture, _: &()| {
+        drive_scripted_xkb_set(
+            fixture,
+            SET_INDICATOR_MAP_SEQUENCE,
+            XKB_SET_INDICATOR_MAP,
+            &XKB_SET_INDICATOR_MAP_BODY,
+            vec![XkbSetEvent::IndicatorMaps(indicator_maps_change())],
+        );
+    };
+    let expect = |_: &()| {
+        let receive = |client, xkb_type| ExpectedReceive {
+            client,
+            request: request_opcodes(XKB_MAJOR_OPCODE, 14),
+            subject: EventSubject::Device(1),
+            events: vec![xkb_event_description_for_test(xkb_type)],
+        };
+        let denied_map = receive(NOTIFY_RECEIVER_DENIED, XKB_INDICATOR_MAP_NOTIFY_TYPE);
+        let denied_state = receive(NOTIFY_RECEIVER_DENIED, XKB_INDICATOR_STATE_NOTIFY_TYPE);
+        let denied_extension = receive(NOTIFY_RECEIVER_DENIED, XKB_EXTENSION_DEVICE_NOTIFY_TYPE);
+        let allowed_extension = receive(NOTIFY_RECEIVER_ALLOWED, XKB_EXTENSION_DEVICE_NOTIFY_TYPE);
+        let denied_bytes = [
+            literal_xkb_indicator_notify(
+                0x1234,
+                yserver_protocol::x11::XkbIndicatorNotifyKind::Map,
+                0x20,
+                0x02,
+            ),
+            literal_xkb_extension_device_notify(0x1234, maps_extension_device_notify()),
+        ]
+        .concat();
+        let mut expectations = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: literal_xkb_indicator_maps_stream(0x1234),
+                    denied: Some(denied_bytes),
+                },
+                Stream::unchanged(
+                    NOTIFY_RECEIVER_ALLOWED,
+                    literal_xkb_extension_device_notify(0x5678, maps_extension_device_notify()),
+                ),
+            ],
+            vec![
+                denied_map,
+                denied_state.clone(),
+                denied_extension,
+                allowed_extension,
+            ],
+            CallOrder::Total,
+            vec![denied_state],
+        );
+        expectations.deny_before_allow = true;
+        expectations.trace_before_deny_streams = true;
+        expectations.after_deny = Some(Box::new(|allow, denied| {
+            assert_xkb_notification_effects_match(denied, allow)
+        }));
+        expectations
+    };
+    check_receive_case(&ReceiveCase {
+        name: "XKB IndicatorMap/State denial checks each xkbType and recipient",
+        build: &build,
+        act: &act,
+        expect: &expect,
+    });
+}
+
+#[test]
+// Mutation B27: skip K10 Receive on IndicatorStateNotify.
+// Mutation B28: return early from announce_xkb_state whenever a policy is installed.
+fn receive_xkb_state_indicator_followups() {
+    use super::access_notify_support::{
+        CallOrder, CaseExpect, ExpectedReceive, ReceiveCase, Stream, check_receive_case,
+    };
+
+    let selections = [
+        (NOTIFY_RECEIVER_DENIED, XKB_INDICATOR_FOLLOWUPS_SELECT),
+        (NOTIFY_RECEIVER_ALLOWED, XKB_INDICATOR_FOLLOWUPS_SELECT),
     ];
-    assert_receive_calls_with_requests(
-        &receive_log(&calls),
-        &clients,
-        &[
-            request_opcodes(XKB_MAJOR_OPCODE, 11),
-            request_opcodes(XKB_MAJOR_OPCODE, 11),
-            request_opcodes(XKB_MAJOR_OPCODE, 18),
-            request_opcodes(XKB_MAJOR_OPCODE, 18),
-            request_opcodes(XKB_MAJOR_OPCODE, 18),
-            request_opcodes(XKB_MAJOR_OPCODE, 18),
-            request_opcodes(XKB_MAJOR_OPCODE, 14),
-            request_opcodes(XKB_MAJOR_OPCODE, 14),
-            request_opcodes(XKB_MAJOR_OPCODE, 14),
-            request_opcodes(XKB_MAJOR_OPCODE, 14),
-            request_opcodes(XKB_MAJOR_OPCODE, 14),
-            request_opcodes(XKB_MAJOR_OPCODE, 14),
-        ],
-        EventSubject::Device(1),
-        &[
-            XKB_COMPAT_MAP_NOTIFY_TYPE,
-            XKB_COMPAT_MAP_NOTIFY_TYPE,
-            XKB_NAMES_NOTIFY_TYPE,
-            XKB_NAMES_NOTIFY_TYPE,
-            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
-            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
-            XKB_INDICATOR_MAP_NOTIFY_TYPE,
-            XKB_INDICATOR_MAP_NOTIFY_TYPE,
-            XKB_INDICATOR_STATE_NOTIFY_TYPE,
-            XKB_INDICATOR_STATE_NOTIFY_TYPE,
-            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
-            XKB_EXTENSION_DEVICE_NOTIFY_TYPE,
-        ],
-    );
-    assert_no_writer_failures(&fixture);
+    let build = || {
+        let mut fixture = indicator_fixture(&selections);
+        fixture.backend.xkb_mods = (0x40, 0x40, 0, 0);
+        fixture.backend.xkb_indicators_result = (0x20, 0x3f);
+        (fixture, ())
+    };
+    let act = |fixture: &mut NotifyFixture, _: &()| {
+        let dropped = key_event_fanout_to_state(
+            &mut fixture.state,
+            &mut fixture.backend,
+            HostKeyEvent {
+                origin: InputOrigin::NestedHost,
+                pressed: true,
+                keycode: 38,
+                time: 0x5678,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            },
+        );
+        assert!(dropped.is_empty());
+        assert_eq!(fixture.state.xkb_announced, (0, (0x40, 0x40, 0, 0)));
+    };
+    let expect = |_: &()| {
+        let receive = |client, xkb_type| ExpectedReceive {
+            client,
+            request: None,
+            subject: EventSubject::Device(1),
+            events: vec![xkb_event_description_for_test(xkb_type)],
+        };
+        let denied_state = receive(NOTIFY_RECEIVER_DENIED, XKB_STATE_NOTIFY_TYPE);
+        let allowed_state = receive(NOTIFY_RECEIVER_ALLOWED, XKB_STATE_NOTIFY_TYPE);
+        let denied_followup = literal_xkb_key_indicator_stream(0x1234, false);
+        let allowed_followup = literal_xkb_key_indicator_stream(0x5678, false);
+        let mut expectations = CaseExpect::new(
+            vec![
+                Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                Stream {
+                    client: NOTIFY_RECEIVER_DENIED,
+                    bytes: literal_xkb_key_indicator_stream(0x1234, true),
+                    denied: Some(denied_followup),
+                },
+                Stream {
+                    client: NOTIFY_RECEIVER_ALLOWED,
+                    bytes: literal_xkb_key_indicator_stream(0x5678, true),
+                    denied: Some(allowed_followup),
+                },
+            ],
+            vec![
+                denied_state.clone(),
+                allowed_state.clone(),
+                receive(NOTIFY_RECEIVER_DENIED, XKB_INDICATOR_STATE_NOTIFY_TYPE),
+                receive(NOTIFY_RECEIVER_ALLOWED, XKB_INDICATOR_STATE_NOTIFY_TYPE),
+                receive(NOTIFY_RECEIVER_DENIED, XKB_EXTENSION_DEVICE_NOTIFY_TYPE),
+                receive(NOTIFY_RECEIVER_ALLOWED, XKB_EXTENSION_DEVICE_NOTIFY_TYPE),
+            ],
+            CallOrder::Total,
+            vec![denied_state, allowed_state],
+        );
+        expectations.deny_before_allow = true;
+        expectations.after_deny = Some(Box::new(|allow, denied| {
+            assert_xkb_notification_effects_match(denied, allow);
+            assert_eq!(denied.state.xkb_announced_indicators, 0x20);
+        }));
+        expectations
+    };
+    check_receive_case(&ReceiveCase {
+        name: "XKB denied StateNotify keeps indicator follow-ups",
+        build: &build,
+        act: &act,
+        expect: &expect,
+    });
 }
