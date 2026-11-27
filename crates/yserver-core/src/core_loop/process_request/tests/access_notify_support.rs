@@ -52,6 +52,18 @@ pub(super) fn finish_literal_event(mut event: Vec<u8>) -> Vec<u8> {
     event
 }
 
+pub(super) fn literal_mapping_notify(
+    sequence: u16,
+    request: u8,
+    first_keycode: u8,
+    count: u8,
+    order: ClientByteOrder,
+) -> Vec<u8> {
+    let mut event = literal_event_header(34, 0, sequence, order);
+    event.extend_from_slice(&[request, first_keycode, count]);
+    finish_literal_event(event)
+}
+
 pub(super) struct NotifyFixture {
     pub state: ServerState,
     pub backend: RecordingBackend,
@@ -247,10 +259,14 @@ pub(super) enum CallOrder {
 
 pub(super) struct ReceiveCase<'a, C> {
     pub(super) name: &'static str,
+    /// Build a fresh fixture with no access policy installed and all setup
+    /// output drained from every client before returning it.
     pub(super) build: &'a dyn Fn() -> (NotifyFixture, C),
-    pub(super) act: &'a dyn Fn(&mut NotifyFixture, &C),
+    pub(super) act: &'a dyn Fn(&mut NotifyFixture, &C, &DeniedReceiveLog),
     pub(super) expect: &'a dyn Fn(&C) -> CaseExpect,
 }
+
+pub(super) type DeniedReceiveLog = Mutex<Vec<ExpectedReceive>>;
 
 pub(super) type AfterDeny = Box<dyn Fn(&NotifyFixture, &NotifyFixture)>;
 
@@ -260,6 +276,9 @@ pub(super) struct CaseExpect {
     pub(super) deny_receives: Option<Vec<ExpectedReceive>>,
     pub(super) order: CallOrder,
     pub(super) denied_calls: Vec<ExpectedReceive>,
+    /// Clients explicitly allowed to keep identical streams after a verified
+    /// denial. Every denied client absent from this list must lose bytes.
+    pub(super) unchanged_after_denial: Vec<ClientId>,
     pub(super) deny_first_only: bool,
     // Keep the policy target independent of request context when that context is under test.
     pub(super) deny_match_ignores_request: bool,
@@ -287,6 +306,7 @@ impl CaseExpect {
             deny_receives: None,
             order,
             denied_calls,
+            unchanged_after_denial: Vec::new(),
             deny_first_only: false,
             deny_match_ignores_request: false,
             deny_before_allow: false,
@@ -326,7 +346,11 @@ pub(super) fn receive_checks(
         .collect()
 }
 
-fn receive_trace(name: &str, mode: &str, calls: &[RecordedExtensionCheck]) -> Vec<ExpectedReceive> {
+pub(super) fn receive_trace(
+    name: &str,
+    mode: &str,
+    calls: &[RecordedExtensionCheck],
+) -> Vec<ExpectedReceive> {
     calls
         .iter()
         .filter(|call| call.hook == ExtensionHook::Receive)
@@ -401,6 +425,18 @@ fn assert_receive_traces(
         receive_traces_equal(expected, actual, &order),
         "{name} [{mode}]: {label} differ; expected {expected:?}, got {actual:?}"
     );
+}
+
+pub(super) fn assert_receive_trace(
+    name: &str,
+    mode: &str,
+    order: CallOrder,
+    expected: &[ExpectedReceive],
+    calls: &[RecordedExtensionCheck],
+    label: &str,
+) {
+    let actual = receive_trace(name, mode, calls);
+    assert_receive_traces(name, mode, order, expected, &actual, label);
 }
 
 fn expected_receive_matches(expected: &ExpectedReceive, call: &RecordedExtensionCheck) -> bool {
@@ -503,7 +539,7 @@ fn assert_healthy_fixture(name: &str, mode: &str, fixture: &NotifyFixture) {
     );
 }
 
-fn assert_forbidden_hooks(
+pub(super) fn assert_forbidden_hooks(
     name: &str,
     mode: &str,
     calls: &[RecordedExtensionCheck],
@@ -526,27 +562,68 @@ fn assert_allow_case(
 ) {
     assert_healthy_fixture(name, "allow-all", fixture);
     assert_streams(name, "allow-all", &expectations.streams, streams, false);
-    let receives = receive_trace(name, "allow-all", calls);
-    assert_receive_traces(
+    assert_receive_trace(
         name,
         "allow-all",
         expectations.order,
         &expectations.receives,
-        &receives,
+        calls,
         "Receive trace",
     );
     assert_forbidden_hooks(name, "allow-all", calls, expectations.forbidden_hooks);
 }
 
-pub(super) fn run_with_context(name: &str, mode: &str, action: impl FnOnce()) {
-    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)) {
-        let message = payload
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| payload.downcast_ref::<&str>().copied())
-            .unwrap_or("action panicked with a non-string payload");
-        panic!("{name} [{mode}]: {message}");
+pub(super) fn run_with_context<T>(name: &str, mode: &str, action: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("action panicked with a non-string payload");
+            panic!("{name} [{mode}]: {message}");
+        }
     }
+}
+
+fn assert_denied_stream_change(
+    name: &str,
+    unchanged_after_denial: &[ClientId],
+    client: ClientId,
+    allow_bytes: Option<&[u8]>,
+    deny_bytes: Option<&[u8]>,
+) {
+    let bytes_match = allow_bytes == deny_bytes;
+    let expected = unchanged_after_denial.contains(&client);
+    assert_case(
+        name,
+        "deny",
+        allow_bytes.is_some() && deny_bytes.is_some() && bytes_match == expected,
+        if expected {
+            "an explicitly unchanged denied recipient must keep identical bytes"
+        } else {
+            "denied client's bytes unchanged"
+        },
+    );
+}
+
+fn assert_builder_contract(name: &str, mode: &str, fixture: &mut NotifyFixture) {
+    let clients = fixture
+        .peers
+        .keys()
+        .copied()
+        .map(ClientId)
+        .collect::<Vec<_>>();
+    let setup_output_drained = clients
+        .into_iter()
+        .all(|client| fixture.drain(client).is_empty());
+    assert_case(
+        name,
+        mode,
+        !fixture.state.policies_installed() && setup_output_drained,
+        "ReceiveCase builder must return a policy-free fixture with setup output drained",
+    );
 }
 
 pub(super) fn check_receive_case<C>(case: &ReceiveCase<'_, C>) {
@@ -554,12 +631,17 @@ pub(super) fn check_receive_case<C>(case: &ReceiveCase<'_, C>) {
 }
 
 fn check_receive_case_with_deny<C>(case: &ReceiveCase<'_, C>, test_deny: Option<ExpectedReceive>) {
-    let (mut no_policy, no_policy_context) = (case.build)();
-    let no_policy_expect = (case.expect)(&no_policy_context);
+    let no_denied_calls = Mutex::new(Vec::new());
+    let (mut no_policy, no_policy_context) =
+        run_with_context(case.name, "no policy builder", || (case.build)());
+    assert_builder_contract(case.name, "no policy builder", &mut no_policy);
+    let no_policy_expect = run_with_context(case.name, "no policy expectation", || {
+        (case.expect)(&no_policy_context)
+    });
     let no_policy_last = no_policy_expect.no_policy_last;
     let mut check_no_policy = || {
         run_with_context(case.name, "no policy", || {
-            (case.act)(&mut no_policy, &no_policy_context);
+            (case.act)(&mut no_policy, &no_policy_context, &no_denied_calls);
         });
         assert_healthy_fixture(case.name, "no policy", &no_policy);
         let no_policy_streams = collect_streams(
@@ -580,13 +662,17 @@ fn check_receive_case_with_deny<C>(case: &ReceiveCase<'_, C>, test_deny: Option<
         check_no_policy();
     }
 
-    let (mut allow_all, allow_context) = (case.build)();
-    let allow_expect = (case.expect)(&allow_context);
+    let (mut allow_all, allow_context) =
+        run_with_context(case.name, "allow-all builder", || (case.build)());
+    assert_builder_contract(case.name, "allow-all builder", &mut allow_all);
+    let allow_expect = run_with_context(case.name, "allow-all expectation", || {
+        (case.expect)(&allow_context)
+    });
     let allow_calls = allow_all.install_policy(|_, _| Decision::Allow);
     let mut allow_streams = None;
     if !allow_expect.deny_before_allow {
         run_with_context(case.name, "allow-all", || {
-            (case.act)(&mut allow_all, &allow_context);
+            (case.act)(&mut allow_all, &allow_context, &no_denied_calls);
         });
         allow_streams = Some(collect_streams(
             case.name,
@@ -606,13 +692,27 @@ fn check_receive_case_with_deny<C>(case: &ReceiveCase<'_, C>, test_deny: Option<
         );
     }
 
-    let (mut denied, deny_context) = (case.build)();
-    let deny_expect = (case.expect)(&deny_context);
+    let (mut denied, deny_context) = run_with_context(case.name, "deny builder", || (case.build)());
+    assert_builder_contract(case.name, "deny builder", &mut denied);
+    let deny_expect = run_with_context(case.name, "deny expectation", || {
+        (case.expect)(&deny_context)
+    });
     assert_case(
         case.name,
         "deny",
         !deny_expect.denied_calls.is_empty(),
         "a denial row must name at least one Receive call",
+    );
+    assert_case(
+        case.name,
+        "deny",
+        deny_expect.unchanged_after_denial.iter().all(|client| {
+            deny_expect
+                .denied_calls
+                .iter()
+                .any(|denied_call| denied_call.client == *client)
+        }),
+        "unchanged-after-denial clients must name a verified denied recipient",
     );
     let denied_actual = Arc::new(Mutex::new(Vec::<ExpectedReceive>::new()));
     let denied_actual_for_policy = Arc::clone(&denied_actual);
@@ -649,14 +749,13 @@ fn check_receive_case_with_deny<C>(case: &ReceiveCase<'_, C>, test_deny: Option<
         })
     });
     run_with_context(case.name, "deny", || {
-        (case.act)(&mut denied, &deny_context);
+        (case.act)(&mut denied, &deny_context, denied_actual.as_ref());
     });
     assert_healthy_fixture(case.name, "deny", &denied);
     let deny_log = deny_log.lock().unwrap().clone();
     let actual_denied = denied_actual.lock().unwrap().clone();
     let check_receive_trace = || {
-        let deny_receives = receive_trace(case.name, "deny", &deny_log);
-        assert_receive_traces(
+        assert_receive_trace(
             case.name,
             "deny",
             deny_expect.order,
@@ -664,7 +763,7 @@ fn check_receive_case_with_deny<C>(case: &ReceiveCase<'_, C>, test_deny: Option<
                 .deny_receives
                 .as_deref()
                 .unwrap_or(&deny_expect.receives),
-            &deny_receives,
+            &deny_log,
             "Receive trace",
         );
         assert_forbidden_hooks(case.name, "deny", &deny_log, deny_expect.forbidden_hooks);
@@ -700,7 +799,7 @@ fn check_receive_case_with_deny<C>(case: &ReceiveCase<'_, C>, test_deny: Option<
 
     if allow_streams.is_none() {
         run_with_context(case.name, "allow-all", || {
-            (case.act)(&mut allow_all, &allow_context);
+            (case.act)(&mut allow_all, &allow_context, &no_denied_calls);
         });
         allow_streams = Some(collect_streams(
             case.name,
@@ -724,16 +823,17 @@ fn check_receive_case_with_deny<C>(case: &ReceiveCase<'_, C>, test_deny: Option<
         let allow_bytes = allow_streams
             .iter()
             .find(|(client, _)| *client == denied_call.client)
-            .map(|(_, bytes)| bytes);
+            .map(|(_, bytes)| bytes.as_slice());
         let deny_bytes = deny_streams
             .iter()
             .find(|(client, _)| *client == denied_call.client)
-            .map(|(_, bytes)| bytes);
-        assert_case(
+            .map(|(_, bytes)| bytes.as_slice());
+        assert_denied_stream_change(
             case.name,
-            "deny",
-            allow_bytes.is_some() && deny_bytes.is_some() && allow_bytes != deny_bytes,
-            "each denied recipient must lose bytes compared with allow-all",
+            &deny_expect.unchanged_after_denial,
+            denied_call.client,
+            allow_bytes,
+            deny_bytes,
         );
     }
     if let Some(after_deny) = deny_expect.after_deny {
@@ -748,6 +848,95 @@ fn check_receive_case_with_deny<C>(case: &ReceiveCase<'_, C>, test_deny: Option<
 mod receive_case_tests {
     use super::*;
 
+    fn equal_byte_hierarchy_case(allow_unchanged_after_denial: bool) {
+        let root = ExpectedReceive {
+            client: NOTIFY_RECEIVER_DENIED,
+            request: request_opcodes(137, 57),
+            subject: crate::access::EventSubject::Window(crate::resources::ROOT_WINDOW),
+            events: vec![crate::access::EventDescription::extension(35, 137, 11)],
+        };
+        let build = || {
+            let (mut fixture, device_id) = super::super::access_xi_notify::hotplug_fixture();
+            super::super::access_xi_notify::select_hierarchy_on_root_and_child(
+                &mut fixture,
+                NOTIFY_RECEIVER_DENIED,
+            );
+            (fixture, device_id)
+        };
+        let act = |fixture: &mut NotifyFixture,
+                   device_id: &u16,
+                   denied_calls: &Mutex<Vec<ExpectedReceive>>| {
+            super::super::access_xi_notify::disable_device(fixture, *device_id);
+            if denied_calls.lock().unwrap().contains(&root) {
+                // This test-side literal restores the root copy dropped by the real
+                // Receive denial, making the runner capture equal client streams.
+                let frame = super::super::access_xi_notify::literal_hierarchy_disabled(4);
+                let client = fixture
+                    .state
+                    .clients
+                    .get_mut(&NOTIFY_RECEIVER_DENIED.0)
+                    .expect("denied hierarchy recipient");
+                assert_eq!(
+                    crate::core_loop::client_io::write_or_buffer(client, &frame)
+                        .expect("append the dropped literal hierarchy frame"),
+                    crate::core_loop::client_io::WriteOutcome::Done,
+                    "test-side hierarchy frame is written to the denied client's stream"
+                );
+            }
+        };
+        let expect = |_: &u16| {
+            let child = ExpectedReceive {
+                subject: crate::access::EventSubject::Window(
+                    super::super::access_xi_notify::CHILD_WINDOW,
+                ),
+                ..root.clone()
+            };
+            let frame = super::super::access_xi_notify::literal_hierarchy_disabled(4);
+            let equal_wire_stream = [frame.clone(), frame].concat();
+            let mut expectations = CaseExpect::new(
+                vec![
+                    Stream::unchanged(NOTIFY_SENDER, Vec::new()),
+                    Stream {
+                        client: NOTIFY_RECEIVER_DENIED,
+                        bytes: equal_wire_stream,
+                        denied: None,
+                    },
+                    Stream::unchanged(NOTIFY_RECEIVER_ALLOWED, Vec::new()),
+                ],
+                vec![root.clone(), child],
+                CallOrder::Multiset,
+                vec![root.clone()],
+            );
+            if allow_unchanged_after_denial {
+                expectations
+                    .unchanged_after_denial
+                    .push(NOTIFY_RECEIVER_DENIED);
+            }
+            expectations
+        };
+        let case = ReceiveCase {
+            name: "equal-byte hierarchy runner self-test",
+            build: &build,
+            act: &act,
+            expect: &expect,
+        };
+
+        check_receive_case(&case);
+    }
+
+    #[test]
+    #[should_panic(expected = "denied client's bytes unchanged")]
+    fn receive_case_rejects_equal_captured_denial_bytes_by_default() {
+        // Mutation: disable the runner's guard against unchanged denied-client bytes.
+        equal_byte_hierarchy_case(false);
+    }
+
+    #[test]
+    fn receive_case_allows_equal_captured_denial_bytes_for_opted_out_client() {
+        // Mutation: ignore the row's unchanged_after_denial client opt-out.
+        equal_byte_hierarchy_case(true);
+    }
+
     #[test]
     #[should_panic(expected = "deny policy matched no Receive call")]
     fn receive_case_rejects_a_deny_that_matches_nothing() {
@@ -760,7 +949,9 @@ mod receive_case_tests {
             );
             (fixture, device_id)
         };
-        let act = |fixture: &mut NotifyFixture, device_id: &u16| {
+        let act = |fixture: &mut NotifyFixture,
+                   device_id: &u16,
+                   _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
             super::super::access_xi_notify::disable_device(fixture, *device_id);
         };
         let expect = |_: &u16| {
@@ -839,7 +1030,9 @@ mod receive_case_tests {
             );
             (fixture, device_id)
         };
-        let act = |fixture: &mut NotifyFixture, device_id: &u16| {
+        let act = |fixture: &mut NotifyFixture,
+                   device_id: &u16,
+                   _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
             super::super::access_xi_notify::disable_device(fixture, *device_id);
         };
         let expect = |_: &u16| {

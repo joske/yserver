@@ -1,13 +1,14 @@
 use super::{
     access_notify_support::{
-        NOTIFY_RECEIVER_ALLOWED, NOTIFY_RECEIVER_DENIED, NOTIFY_SENDER, NotifyFixture,
-        append_event_u16, append_event_u32, finish_literal_event, property_change_body,
+        CallOrder, ExpectedReceive, NOTIFY_RECEIVER_ALLOWED, NOTIFY_RECEIVER_DENIED, NOTIFY_SENDER,
+        NotifyFixture, append_event_u16, append_event_u32, assert_forbidden_hooks,
+        assert_receive_trace, finish_literal_event, literal_mapping_notify, property_change_body,
         request_opcodes,
     },
     extensions::{ExtensionHook, RecordedExtensionCheck},
 };
 use crate::{
-    access::{Decision, DenyError, EventDescription, EventSubject, RequestOpcodes},
+    access::{Decision, DenyError, EventDescription, EventSubject},
     backend::{KeyboardMappingChange, XkbNewKeyboardInfo, XkbSetEvent, XkbSetOutcome},
     core_loop::{
         InputOrigin, key_fanout::key_event_fanout_to_state, process_request::RequestOutcome,
@@ -200,19 +201,6 @@ fn drive_xkb_set_map(fixture: &mut NotifyFixture, sequence: u16, body: &[u8]) ->
     xkb_request(fixture, NOTIFY_SENDER, sequence, 9, body)
 }
 
-fn literal_mapping_notify(
-    sequence: u16,
-    order: yserver_protocol::x11::ClientByteOrder,
-    request: u8,
-    first_keycode: u8,
-    count: u8,
-) -> Vec<u8> {
-    let mut event = vec![34, 0]; // MappingNotify, detail
-    append_event_u16(&mut event, order, sequence);
-    event.extend_from_slice(&[request, first_keycode, count]);
-    finish_literal_event(event)
-}
-
 fn literal_xkb_new_keyboard_notify(
     sequence: u16,
     order: yserver_protocol::x11::ClientByteOrder,
@@ -268,8 +256,8 @@ fn literal_xkb_map_notify(
 
 fn literal_mapping_pair(sequence: u16, order: yserver_protocol::x11::ClientByteOrder) -> Vec<u8> {
     [
-        literal_mapping_notify(sequence, order, 1, 8, 248),
-        literal_mapping_notify(sequence, order, 0, 0, 0),
+        literal_mapping_notify(sequence, 1, 8, 248, order),
+        literal_mapping_notify(sequence, 0, 0, 0, order),
     ]
     .concat()
 }
@@ -318,7 +306,7 @@ fn literal_map_change_stream(
 ) -> Vec<u8> {
     [
         literal_xkb_map_notify(sequence, order, 1, 0x0002, 0, 8, 1, 0, 0),
-        literal_mapping_notify(sequence, order, 1, 8, 1),
+        literal_mapping_notify(sequence, 1, 8, 1, order),
     ]
     .concat()
 }
@@ -596,39 +584,6 @@ fn assert_no_writer_failures(fixture: &NotifyFixture) {
 
 fn receive_log(calls: &Arc<Mutex<Vec<RecordedExtensionCheck>>>) -> Vec<RecordedExtensionCheck> {
     calls.lock().expect("policy call log").clone()
-}
-
-fn assert_receive_calls_with_requests(
-    calls: &[RecordedExtensionCheck],
-    clients: &[ClientId],
-    requests: &[Option<RequestOpcodes>],
-    subject: EventSubject,
-    xkb_types: &[u8],
-) {
-    let receives: Vec<_> = calls
-        .iter()
-        .filter(|call| call.hook == ExtensionHook::Receive)
-        .collect();
-    assert_eq!(receives.len(), clients.len(), "whole-log Receive count");
-    assert_eq!(requests.len(), clients.len(), "expected request contexts");
-    assert_eq!(xkb_types.len(), clients.len(), "expected per-event xkbType");
-    assert!(
-        calls.iter().all(|call| call.hook != ExtensionHook::Send),
-        "server-generated notifications run Receive without Send"
-    );
-    for (((call, client), request), xkb_type) in
-        receives.iter().zip(clients).zip(requests).zip(xkb_types)
-    {
-        assert_eq!(call.client, *client);
-        assert_eq!(call.receive, Some(subject));
-        // Mutation: make xkb_event_description ignore xkbType and return 0;
-        // every nonzero per-event expectation here must fail.
-        assert_eq!(
-            call.events,
-            Some(vec![xkb_event_description_for_test(*xkb_type)])
-        );
-        assert_eq!(call.request, *request);
-    }
 }
 
 const XKB_INDICATOR_STATE_SELECT: u16 = 1 << 4;
@@ -1123,7 +1078,7 @@ fn receive_xkb_state_pipeline_denies_latch_copy() {
     };
 
     let build = || (notify_fixture(STATE_DETAILS, 0), ());
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         drive_latch_lock(fixture);
     };
     let expect = |_: &()| {
@@ -1180,7 +1135,7 @@ fn receive_xkb_state_denied_snapshot_advances() {
     };
 
     let build = || (notify_fixture(STATE_DETAILS, 0), ());
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         drive_latch_lock(fixture);
     };
     let expect = |_: &()| {
@@ -1234,7 +1189,7 @@ fn receive_xkb_controls_denied_one_recipient() {
     };
 
     let build = || (notify_fixture(0, REPEAT_KEYS_MASK), ());
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         drive_set_controls(fixture);
         assert_eq!(
             (
@@ -1306,7 +1261,7 @@ fn receive_xkb_per_key_repeat_denied() {
     };
 
     let build = || (notify_fixture(0, PER_KEY_REPEAT_MASK), ());
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         drive_set_per_key_repeat(fixture);
         let repeat_bit = 1u8 << (REPEAT_KEYCODE & 7);
         let repeat_byte = usize::from(REPEAT_KEYCODE >> 3);
@@ -1373,7 +1328,7 @@ fn receive_xkb_physical_key_state_has_no_request() {
     };
 
     let build = || (notify_fixture(STATE_DETAILS, 0), ());
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         fixture.backend.xkb_mods = (0x40, 0x40, 0, 0);
         let dropped = key_event_fanout_to_state(
             &mut fixture.state,
@@ -1446,7 +1401,7 @@ fn receive_xkb_state_allow_control() {
             (),
         )
     };
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         drive_latch_lock(fixture);
         drive_set_controls(fixture);
         drive_set_per_key_repeat(fixture);
@@ -1541,7 +1496,7 @@ fn receive_xkb_rules_change_denies_new_keyboard_and_map() {
         fixture.state.keymap_overrides.insert(38, vec![0x0071]);
         (fixture, ())
     };
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         assert!(matches!(
             drive_rules_names_change(fixture, REQUEST_SEQUENCE, b"evdev\0pc105\0de\0\0\0"),
             RequestOutcome::Handled
@@ -1646,7 +1601,9 @@ fn receive_xkb_kbd_by_name_all_clients() {
             .collect::<Vec<_>>();
         (fixture, client_map_order)
     };
-    let act = |fixture: &mut NotifyFixture, _: &Vec<ClientId>| {
+    let act = |fixture: &mut NotifyFixture,
+               _: &Vec<ClientId>,
+               _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         assert!(matches!(
             xkb_request(fixture, NOTIFY_SENDER, KBD_BY_NAME_SEQUENCE, 23, &[]),
             RequestOutcome::Handled
@@ -1728,7 +1685,7 @@ fn receive_xkb_set_new_keyboard_denied() {
         fixture.state.keyboard_control.auto_repeats[repeat_byte] &= !repeat_bit;
         (fixture, ())
     };
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         script_xkb_set_outcome(
             fixture,
             XkbSetOutcome {
@@ -1816,7 +1773,7 @@ fn receive_xkb_map_denied_keeps_legacy_filter() {
 
     let map_clients = [(NOTIFY_RECEIVER_DENIED, 0x0002)];
     let build = || (xkb_event_fixture(&[], &map_clients, true), ());
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         script_xkb_set_outcome(
             fixture,
             XkbSetOutcome {
@@ -1854,7 +1811,7 @@ fn receive_xkb_map_denied_keeps_legacy_filter() {
             events: vec![xkb_event_description_for_test(XKB_MAP_NOTIFY_TYPE)],
         };
         let legacy =
-            |sequence| literal_mapping_notify(sequence, ClientByteOrder::LittleEndian, 1, 8, 1);
+            |sequence| literal_mapping_notify(sequence, 1, 8, 1, ClientByteOrder::LittleEndian);
         let mut expectations = CaseExpect::new(
             vec![
                 Stream::unchanged(NOTIFY_SENDER, Vec::new()),
@@ -2041,7 +1998,7 @@ fn receive_xkb_new_keyboard_no_policy_checkpoints() {
     .into_iter()
     .chain([(
         NON_XKB_CLIENT,
-        literal_mapping_notify(0x6a2f, ClientByteOrder::LittleEndian, 1, 8, 1),
+        literal_mapping_notify(0x6a2f, 1, 8, 1, ClientByteOrder::LittleEndian),
     )])
     .collect::<Vec<_>>();
     check_clients(&mut fixture, &keysym_streams);
@@ -2167,26 +2124,47 @@ fn receive_xkb_new_keyboard_allow_control() {
     let mut receive_requests = vec![request_opcodes(18, 0); 6];
     receive_requests.extend([request_opcodes(XKB_MAJOR_OPCODE, 23); 3]);
     receive_requests.extend([request_opcodes(XKB_MAJOR_OPCODE, 9); 3]);
+    let receive_types = [
+        XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+        XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+        XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+        XKB_MAP_NOTIFY_TYPE,
+        XKB_MAP_NOTIFY_TYPE,
+        XKB_MAP_NOTIFY_TYPE,
+        XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+        XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+        XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+        XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+        XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+        XKB_NEW_KEYBOARD_NOTIFY_TYPE,
+    ];
+    assert_eq!(receive_clients.len(), receive_requests.len());
+    assert_eq!(receive_clients.len(), receive_types.len());
+    let expected_receives = receive_clients
+        .into_iter()
+        .zip(receive_requests)
+        .zip(receive_types)
+        .map(|((client, request), xkb_type)| ExpectedReceive {
+            client,
+            request,
+            subject: EventSubject::Device(1),
+            events: vec![xkb_event_description_for_test(xkb_type)],
+        })
+        .collect::<Vec<_>>();
     let log = receive_log(&calls);
-    assert_receive_calls_with_requests(
+    assert_receive_trace(
+        "XKB explicit allow control",
+        "allow-all",
+        CallOrder::Total,
+        &expected_receives,
         &log,
-        &receive_clients,
-        &receive_requests,
-        EventSubject::Device(1),
-        &[
-            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
-            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
-            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
-            XKB_MAP_NOTIFY_TYPE,
-            XKB_MAP_NOTIFY_TYPE,
-            XKB_MAP_NOTIFY_TYPE,
-            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
-            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
-            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
-            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
-            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
-            XKB_NEW_KEYBOARD_NOTIFY_TYPE,
-        ],
+        "Receive trace",
+    );
+    assert_forbidden_hooks(
+        "XKB explicit allow control",
+        "allow-all",
+        &log,
+        &[ExtensionHook::Send],
     );
 }
 
@@ -2261,12 +2239,33 @@ fn receive_xkb_map_payload_device_subject() {
         )
     );
     let log = receive_log(&calls);
-    assert_receive_calls_with_requests(
+    let expected_receives = [
+        ExpectedReceive {
+            client: NOTIFY_RECEIVER_DENIED,
+            request: None,
+            subject: EventSubject::Device(3),
+            events: vec![xkb_event_description_for_test(XKB_MAP_NOTIFY_TYPE)],
+        },
+        ExpectedReceive {
+            client: NOTIFY_RECEIVER_ALLOWED,
+            request: None,
+            subject: EventSubject::Device(3),
+            events: vec![xkb_event_description_for_test(XKB_MAP_NOTIFY_TYPE)],
+        },
+    ];
+    assert_receive_trace(
+        "XKB MapNotify payload device subject",
+        "deny one client",
+        CallOrder::Total,
+        &expected_receives,
         &log,
-        &[NOTIFY_RECEIVER_DENIED, NOTIFY_RECEIVER_ALLOWED],
-        &[None; 2],
-        EventSubject::Device(3),
-        &[XKB_MAP_NOTIFY_TYPE; 2],
+        "Receive trace",
+    );
+    assert_forbidden_hooks(
+        "XKB MapNotify payload device subject",
+        "deny one client",
+        &log,
+        &[ExtensionHook::Send],
     );
     assert_no_writer_failures(&fixture);
 }
@@ -2298,7 +2297,7 @@ fn check_xkb_single_notify_case<Event, EventBytes>(
         seed_request_xkb_snapshots(&mut fixture);
         (fixture, ())
     };
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         drive_scripted_xkb_set(
             fixture,
             sequence,
@@ -2420,7 +2419,7 @@ fn receive_xkb_indicator_set_allow_control() {
         seed_request_xkb_snapshots(&mut fixture);
         (fixture, ())
     };
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         drive_scripted_xkb_set(
             fixture,
             SET_COMPAT_SEQUENCE,
@@ -2557,7 +2556,7 @@ fn receive_xkb_indicator_names_denied() {
         seed_request_xkb_snapshots(&mut fixture);
         (fixture, ())
     };
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         drive_scripted_xkb_set(
             fixture,
             SET_NAMES_SEQUENCE,
@@ -2629,7 +2628,7 @@ fn receive_xkb_indicator_maps_denies_one_kind() {
         seed_request_xkb_snapshots(&mut fixture);
         (fixture, ())
     };
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         drive_scripted_xkb_set(
             fixture,
             SET_INDICATOR_MAP_SEQUENCE,
@@ -2714,7 +2713,7 @@ fn receive_xkb_state_indicator_followups() {
         fixture.backend.xkb_indicators_result = (0x20, 0x3f);
         (fixture, ())
     };
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         let dropped = key_event_fanout_to_state(
             &mut fixture.state,
             &mut fixture.backend,

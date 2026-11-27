@@ -2,7 +2,8 @@ use super::{
     access_notify_support::{
         CallOrder, CaseExpect, ExpectedReceive, NOTIFY_RECEIVER_ALLOWED, NOTIFY_RECEIVER_DENIED,
         NOTIFY_SENDER, NotifyFixture, ReceiveCase, Stream, check_receive_case,
-        finish_literal_event, literal_event_header, receive_checks, request_opcodes,
+        finish_literal_event, literal_event_header, literal_mapping_notify, receive_checks,
+        request_opcodes,
     },
     xi_hotplug::{
         xi_hotplug_create_child, xi_hotplug_select_hierarchy, xi_hotplug_select_presence,
@@ -166,7 +167,9 @@ fn receive_xi_hierarchy_subject_is_selected_window() {
         select_hierarchy_on_root_and_child(&mut fixture, NOTIFY_RECEIVER_DENIED);
         (fixture, device_id)
     };
-    let act = |fixture: &mut NotifyFixture, device_id: &u16| {
+    let act = |fixture: &mut NotifyFixture,
+               device_id: &u16,
+               _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         disable_device(fixture, *device_id);
         let device = fixture.state.xi_devices.device(*device_id).unwrap();
         assert!(
@@ -247,7 +250,9 @@ fn receive_xi_presence_denial_keeps_other_client() {
         );
         (fixture, device_id)
     };
-    let act = |fixture: &mut NotifyFixture, device_id: &u16| {
+    let act = |fixture: &mut NotifyFixture,
+               device_id: &u16,
+               _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         disable_device(fixture, *device_id);
         let device = fixture.state.xi_devices.device(*device_id).unwrap();
         assert!(
@@ -727,7 +732,9 @@ fn receive_xi_device_changed_denial_per_window() {
         );
         (fixture, device_id)
     };
-    let act = |fixture: &mut NotifyFixture, device_id: &u16| {
+    let act = |fixture: &mut NotifyFixture,
+               device_id: &u16,
+               _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         assert!(
             crate::xinput::hotplug::announce_xi2_slave_switch(
                 &mut fixture.state,
@@ -809,7 +816,9 @@ fn receive_xi_bootstrap_denies_one_master_only() {
         let (fixture, pointer_id, keyboard_id) = bootstrap_device_changed_fixture();
         (fixture, (pointer_id, keyboard_id))
     };
-    let act = |fixture: &mut NotifyFixture, _: &(u16, u16)| {
+    let act = |fixture: &mut NotifyFixture,
+               _: &(u16, u16),
+               _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         select_device_changed(fixture, NOTIFY_RECEIVER_DENIED, 20, ROOT_WINDOW, 0);
         assert_eq!(
             fixture.state.clients[&NOTIFY_RECEIVER_DENIED.0]
@@ -822,11 +831,18 @@ fn receive_xi_bootstrap_denies_one_master_only() {
     // This explicit-Allow execution preserves the original mode of the
     // Handled-result probe before the runner's no-policy pass.
     let (mut explicit_allow, explicit_allow_context) = build();
+    let no_denied_calls = std::sync::Mutex::new(Vec::<ExpectedReceive>::new());
     explicit_allow.install_policy(|_, _| Decision::Allow);
     super::access_notify_support::run_with_context(
         "XISelectEvents bootstrap result",
         "explicit allow-all",
-        || act(&mut explicit_allow, &explicit_allow_context),
+        || {
+            act(
+                &mut explicit_allow,
+                &explicit_allow_context,
+                &no_denied_calls,
+            )
+        },
     );
 
     for (name, denied_count, deny_first_only) in [
@@ -1053,7 +1069,7 @@ fn receive_xtest_device_changed_checks_root_selectors() {
         select_root_recipients(&mut fixture);
         (fixture, ())
     };
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         assert!(
             crate::core_loop::fanout::emit_xi2_device_changed_slave_pointer(
                 &mut fixture.state,
@@ -1304,18 +1320,6 @@ fn issue_xi_mapping_request(fixture: &mut NotifyFixture, request: XiMappingReque
     }
 }
 
-fn literal_mapping_notify(
-    sequence: u16,
-    request: u8,
-    first_keycode: u8,
-    count: u8,
-    order: ClientByteOrder,
-) -> Vec<u8> {
-    let mut event = literal_event_header(34, 0, sequence, order);
-    event.extend_from_slice(&[request, first_keycode, count]);
-    finish_literal_event(event)
-}
-
 fn literal_xi1_mapping_notify(
     sequence: u16,
     device_id: u16,
@@ -1474,7 +1478,7 @@ fn receive_xi_mapping_fanout_device_subject() {
     // mutation: use EventSubject::Global in X5
     let request = XiMappingRequest::ChangeDeviceKeyMapping;
     let build = || (xi_mapping_fixture(request, false), ());
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         issue_xi_mapping_request(fixture, request);
         assert_eq!(
             fixture.state.keymap_overrides.get(&8).map(Vec::as_slice),
@@ -1559,23 +1563,24 @@ fn receive_xi_mapping_originator_denial_keeps_reply_order() {
             XiMappingRequest::ChangeKeyboardDevice => unreachable!(),
         };
         let build = || (xi_mapping_fixture(request, true), ());
-        let act = |fixture: &mut NotifyFixture, _: &()| {
-            issue_xi_mapping_request(fixture, request);
-            match request {
-                XiMappingRequest::ChangeDeviceKeyMapping => assert_eq!(
-                    fixture.state.keymap_overrides.get(&8).map(Vec::as_slice),
-                    Some([0x61].as_slice())
-                ),
-                XiMappingRequest::SetDeviceModifierMapping => assert_eq!(
-                    fixture.state.xi1_modifier_map[&mapping_device(request)].0,
-                    1
-                ),
-                XiMappingRequest::SetDeviceButtonMapping => {
-                    assert_eq!(fixture.state.xi1_button_map[&mapping_device(request)][0], 2)
+        let act =
+            |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
+                issue_xi_mapping_request(fixture, request);
+                match request {
+                    XiMappingRequest::ChangeDeviceKeyMapping => assert_eq!(
+                        fixture.state.keymap_overrides.get(&8).map(Vec::as_slice),
+                        Some([0x61].as_slice())
+                    ),
+                    XiMappingRequest::SetDeviceModifierMapping => assert_eq!(
+                        fixture.state.xi1_modifier_map[&mapping_device(request)].0,
+                        1
+                    ),
+                    XiMappingRequest::SetDeviceButtonMapping => {
+                        assert_eq!(fixture.state.xi1_button_map[&mapping_device(request)][0], 2)
+                    }
+                    XiMappingRequest::ChangeKeyboardDevice => unreachable!(),
                 }
-                XiMappingRequest::ChangeKeyboardDevice => unreachable!(),
-            }
-        };
+            };
         let expect = |_: &()| {
             let opcodes = request_opcodes(137, minor);
             let streams = MAPPING_CLIENTS
@@ -1668,7 +1673,9 @@ fn receive_change_device_notify_originator_denial_keeps_core_mapping() {
         let before = mapping_device_state(&fixture.state);
         (fixture, before)
     };
-    let act = |fixture: &mut NotifyFixture, _: &Vec<(u16, Option<u16>, bool)>| {
+    let act = |fixture: &mut NotifyFixture,
+               _: &Vec<(u16, Option<u16>, bool)>,
+               _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         issue_xi_mapping_request(fixture, request);
     };
     let expect = |before: &Vec<(u16, Option<u16>, bool)>| {
@@ -1751,7 +1758,7 @@ fn receive_xi_mapping_after_xkb_change() {
     // mutation: leave X5 on the unchecked fanout
     let request = XiMappingRequest::ChangeDeviceKeyMapping;
     let build = || (xi_mapping_fixture(request, false), ());
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         let keymap_before = fixture.state.keymap_overrides.clone();
         crate::core_loop::xkb_select::send_legacy_map_notify(
             &mut fixture.state,
@@ -2045,7 +2052,9 @@ fn receive_xi_property_forms_checked_independently() {
         ("XI1 DevicePropertyNotify denial", 1_usize),
     ] {
         let build = || xi_property_notification_fixture(true);
-        let act = |fixture: &mut NotifyFixture, property: &AtomId| {
+        let act = |fixture: &mut NotifyFixture,
+                   property: &AtomId,
+                   _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
             issue_xi_property_change(fixture, *property);
         };
         let expect = |property: &AtomId| {
@@ -2131,7 +2140,9 @@ fn receive_xi_property_denial_is_not_disconnect() {
         );
         (fixture, property)
     };
-    let act = |fixture: &mut NotifyFixture, property: &AtomId| {
+    let act = |fixture: &mut NotifyFixture,
+               property: &AtomId,
+               _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         let disconnected = crate::core_loop::process_request::props::emit_property_change(
             &mut fixture.state,
             XI_PROPERTY_DEVICE_ID,

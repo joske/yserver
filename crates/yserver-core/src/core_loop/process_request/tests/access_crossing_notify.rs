@@ -2,9 +2,10 @@ use super::{
     access_notify_support::{
         CallOrder, CaseExpect, ExpectedReceive, NOTIFY_RECEIVER_ALLOWED, NOTIFY_RECEIVER_DENIED,
         NOTIFY_SENDER, NotifyFixture, ReceiveCase, Stream, append_event_u16, append_event_u32,
-        check_receive_case, finish_literal_event, literal_event_header, request_opcodes,
+        assert_forbidden_hooks, assert_receive_trace, check_receive_case, finish_literal_event,
+        literal_event_header, receive_trace, request_opcodes,
     },
-    extensions::{ExtensionHook, RecordedExtensionCheck},
+    extensions::ExtensionHook,
     *,
 };
 use crate::{
@@ -32,13 +33,6 @@ const DENY: DenyError = DenyError {
     code: x11::error::BAD_ACCESS,
     value: 0,
 };
-
-fn receive_calls(calls: &[RecordedExtensionCheck]) -> Vec<&RecordedExtensionCheck> {
-    calls
-        .iter()
-        .filter(|call| call.hook == ExtensionHook::Receive)
-        .collect()
-}
 
 fn literal_configure_notify(
     order: ClientByteOrder,
@@ -226,7 +220,7 @@ fn run_screen_resize_receive_case(
     no_policy_last: bool,
 ) {
     let build = || (resize_fixture(), ());
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         assert!(matches!(resize(fixture), RequestOutcome::Handled));
         assert_resized(fixture);
         assert!(fixture.drain(NOTIFY_SENDER).is_empty());
@@ -444,7 +438,7 @@ fn receive_screen_resize_root_denial() {
 #[test]
 fn receive_root_config_notify_denial() {
     let build = || (monitor_fixture(), ());
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         let expected_name = fixture.state.atoms.intern("PR4C_CONFIGURE_NOTIFY", false).0;
         assert!(matches!(monitor_request(fixture), RequestOutcome::Handled));
         assert_eq!(fixture.state.randr_client_monitors.len(), 1);
@@ -847,38 +841,6 @@ fn assert_no_writer_failures(fixture: &NotifyFixture) {
     );
 }
 
-fn assert_core_receive_calls(
-    calls: &[RecordedExtensionCheck],
-    expected: &[(
-        ClientId,
-        ResourceId,
-        u8,
-        Option<crate::access::RequestOpcodes>,
-    )],
-) {
-    let rows = receive_calls(calls);
-    assert_eq!(
-        rows.len(),
-        expected.len(),
-        "one Receive check per selected copy"
-    );
-    for (client, window, evtype, request) in expected {
-        assert_eq!(
-            rows.iter()
-                .filter(|call| {
-                    call.client == *client
-                        && call.receive == Some(EventSubject::Window(*window))
-                        && call.events == Some(vec![EventDescription::core(*evtype)])
-                        && call.request == *request
-                })
-                .count(),
-            1,
-            "one matching Receive call for client {client:?}, W({window:?}), core({evtype})"
-        );
-    }
-    assert!(calls.iter().all(|call| call.hook != ExtensionHook::Send));
-}
-
 // Kept focused: this case checkpoints explicit crossings, GrabPointer, and UngrabPointer streams.
 // mutation: reverse C2's chain order (C05)
 #[test]
@@ -1079,7 +1041,9 @@ fn receive_core_crossing_chain_denies_one_window() {
         let (fixture, xid_map) = core_crossing_fixture();
         (fixture, xid_map)
     };
-    let act = |fixture: &mut NotifyFixture, xid_map: &HostXidMap| {
+    let act = |fixture: &mut NotifyFixture,
+               xid_map: &HostXidMap,
+               _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         run_explicit_parent_child_crossings(fixture, xid_map);
         assert_eq!(fixture.state.master_sprite_root, (CROSS_X, CROSS_Y));
         assert_eq!(fixture.state.pointer_root, (CROSS_X, CROSS_Y));
@@ -1243,10 +1207,28 @@ fn receive_core_grabbed_crossing_owner_denied() {
         "allow control delivers the crossing to the grab owner on its selected child"
     );
     assert!(allowed.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
-    assert_core_receive_calls(
-        &allow_calls.lock().unwrap(),
-        &[(NOTIFY_RECEIVER_DENIED, CROSS_CHILD, 7, None)],
+    let allow_log = allow_calls.lock().unwrap();
+    let expected_crossing = [ExpectedReceive {
+        client: NOTIFY_RECEIVER_DENIED,
+        request: None,
+        subject: EventSubject::Window(CROSS_CHILD),
+        events: vec![EventDescription::core(7)],
+    }];
+    assert_receive_trace(
+        "core grabbed crossing owner allow control",
+        "allow-all",
+        CallOrder::Multiset,
+        &expected_crossing,
+        &allow_log,
+        "Receive trace",
     );
+    assert_forbidden_hooks(
+        "core grabbed crossing owner allow control",
+        "allow-all",
+        &allow_log,
+        &[ExtensionHook::Send],
+    );
+    drop(allow_log);
     feed_core_pointer_event(
         &mut allowed,
         &allowed_xid_map,
@@ -1279,7 +1261,12 @@ fn receive_core_grabbed_crossing_owner_denied() {
         "allow-control button leaves the grab active"
     );
     assert_eq!(
-        receive_calls(&allow_calls.lock().unwrap()).len(),
+        receive_trace(
+            "core grabbed crossing owner allow control",
+            "allow-all",
+            &allow_calls.lock().unwrap(),
+        )
+        .len(),
         1,
         "allow-control cooked button adds no Receive call"
     );
@@ -1319,10 +1306,22 @@ fn receive_core_grabbed_crossing_owner_denied() {
         denied.state.active_pointer_grab.is_some(),
         "grab remains active"
     );
-    assert_core_receive_calls(
-        &calls.lock().unwrap(),
-        &[(NOTIFY_RECEIVER_DENIED, CROSS_CHILD, 7, None)],
+    let deny_log = calls.lock().unwrap();
+    assert_receive_trace(
+        "core grabbed crossing owner denial",
+        "deny",
+        CallOrder::Multiset,
+        &expected_crossing,
+        &deny_log,
+        "Receive trace",
     );
+    assert_forbidden_hooks(
+        "core grabbed crossing owner denial",
+        "deny",
+        &deny_log,
+        &[ExtensionHook::Send],
+    );
+    drop(deny_log);
 
     feed_core_pointer_event(
         &mut denied,
@@ -1356,7 +1355,12 @@ fn receive_core_grabbed_crossing_owner_denied() {
         "button does not end grab"
     );
     assert_eq!(
-        receive_calls(&calls.lock().unwrap()).len(),
+        receive_trace(
+            "core grabbed crossing owner denial",
+            "deny",
+            &calls.lock().unwrap(),
+        )
+        .len(),
         1,
         "cooked button path adds no Receive call"
     );
@@ -1394,7 +1398,7 @@ fn receive_core_grab_chain_denial() {
         fixture.state.master_sprite_root = (CROSS_X, CROSS_Y);
         (fixture, ())
     };
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         assert!(matches!(
             grab_pointer(
                 fixture,
@@ -1736,57 +1740,6 @@ fn literal_xi2_ungrab_pointer_chain(order: ClientByteOrder, sequence: u16, mode:
         .as_slice(),
     ]
     .concat()
-}
-
-fn assert_xi2_receive_calls(
-    calls: &[RecordedExtensionCheck],
-    expected: &[(
-        ClientId,
-        ResourceId,
-        u16,
-        Option<crate::access::RequestOpcodes>,
-    )],
-) {
-    let rows = receive_calls(calls);
-    assert_eq!(rows.len(), expected.len(), "one Receive check per XI2 copy");
-    for (client, window, evtype, request) in expected {
-        assert_eq!(
-            rows.iter()
-                .filter(|call| {
-                    call.client == *client
-                        && call.receive == Some(EventSubject::Window(*window))
-                        && call.events == Some(vec![EventDescription::extension(35, 137, *evtype)])
-                        && call.request == *request
-                })
-                .count(),
-            1,
-            "one matching Receive call for client {client:?}, W({window:?}), XI2({evtype})"
-        );
-    }
-    assert!(calls.iter().all(|call| call.hook != ExtensionHook::Send));
-}
-
-fn assert_xi2_receive_call_order(
-    calls: &[RecordedExtensionCheck],
-    expected: &[(
-        ClientId,
-        ResourceId,
-        u16,
-        Option<crate::access::RequestOpcodes>,
-    )],
-) {
-    let rows = receive_calls(calls);
-    assert_eq!(rows.len(), expected.len(), "ordered Receive call count");
-    for (call, (client, window, evtype, request)) in rows.into_iter().zip(expected) {
-        assert_eq!(call.client, *client);
-        assert_eq!(call.receive, Some(EventSubject::Window(*window)));
-        assert_eq!(
-            call.events,
-            Some(vec![EventDescription::extension(35, 137, *evtype)])
-        );
-        assert_eq!(call.request, *request);
-    }
-    assert!(calls.iter().all(|call| call.hook != ExtensionHook::Send));
 }
 
 fn xi2_grab_fixture() -> NotifyFixture {
@@ -2368,7 +2321,9 @@ fn receive_xi2_crossing_denial_keeps_core_dedup() {
         }
         (fixture, xid_map)
     };
-    let act = |fixture: &mut NotifyFixture, xid_map: &HostXidMap| {
+    let act = |fixture: &mut NotifyFixture,
+               xid_map: &HostXidMap,
+               _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         feed_core_pointer_event(
             fixture,
             xid_map,
@@ -2692,8 +2647,45 @@ fn receive_xi2_grab_chain_denial() {
             request_opcodes(27, 0),
         ),
     ];
-    assert_xi2_receive_calls(&calls.lock().unwrap(), &expected_calls);
-    assert_xi2_receive_calls(&allowed_calls.lock().unwrap(), &expected_calls);
+    let expected_receives = expected_calls
+        .iter()
+        .map(|(client, window, evtype, request)| ExpectedReceive {
+            client: *client,
+            request: *request,
+            subject: EventSubject::Window(*window),
+            events: vec![EventDescription::extension(35, 137, *evtype)],
+        })
+        .collect::<Vec<_>>();
+    let deny_log = calls.lock().unwrap();
+    assert_receive_trace(
+        "XI2 grab-chain denial",
+        "deny",
+        CallOrder::Multiset,
+        &expected_receives,
+        &deny_log,
+        "Receive trace",
+    );
+    assert_forbidden_hooks(
+        "XI2 grab-chain denial",
+        "deny",
+        &deny_log,
+        &[ExtensionHook::Send],
+    );
+    let allow_log = allowed_calls.lock().unwrap();
+    assert_receive_trace(
+        "XI2 grab-chain denial",
+        "allow-all",
+        CallOrder::Multiset,
+        &expected_receives,
+        &allow_log,
+        "Receive trace",
+    );
+    assert_forbidden_hooks(
+        "XI2 grab-chain denial",
+        "allow-all",
+        &allow_log,
+        &[ExtensionHook::Send],
+    );
     assert_no_writer_failures(&denied);
 }
 
@@ -3071,8 +3063,45 @@ fn receive_xi_grab_device_synthetic_denial() {
         );
         assert!(denied.drain(NOTIFY_SENDER).is_empty());
         assert!(denied.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
-        assert_xi2_receive_call_order(&calls.lock().unwrap(), &expected_calls);
-        assert_xi2_receive_call_order(&allow_calls.lock().unwrap(), &expected_calls);
+        let expected_receives = expected_calls
+            .iter()
+            .map(|(client, window, evtype, request)| ExpectedReceive {
+                client: *client,
+                request: *request,
+                subject: EventSubject::Window(*window),
+                events: vec![EventDescription::extension(35, 137, *evtype)],
+            })
+            .collect::<Vec<_>>();
+        let deny_log = calls.lock().unwrap();
+        assert_receive_trace(
+            "XI grab-device synthetic denial",
+            "deny",
+            CallOrder::Total,
+            &expected_receives,
+            &deny_log,
+            "Receive trace",
+        );
+        assert_forbidden_hooks(
+            "XI grab-device synthetic denial",
+            "deny",
+            &deny_log,
+            &[ExtensionHook::Send],
+        );
+        let allow_log = allow_calls.lock().unwrap();
+        assert_receive_trace(
+            "XI grab-device synthetic denial",
+            "allow-all",
+            CallOrder::Total,
+            &expected_receives,
+            &allow_log,
+            "Receive trace",
+        );
+        assert_forbidden_hooks(
+            "XI grab-device synthetic denial",
+            "allow-all",
+            &allow_log,
+            &[ExtensionHook::Send],
+        );
         assert_no_writer_failures(&denied);
     };
     run_case(crate::xinput::DEVICEID_MASTER_POINTER);
@@ -3156,7 +3185,7 @@ fn receive_core_cooked_pointer_unchecked() {
         ),
         "XI2 cooked ButtonPress remains unchecked"
     );
-    assert!(receive_calls(&calls.lock().unwrap()).is_empty());
+    assert!(receive_trace("cooked core pointer", "deny", &calls.lock().unwrap()).is_empty());
     assert_eq!(fixture.state.master_sprite_root, (CROSS_X, CROSS_Y));
     assert_no_writer_failures(&fixture);
 }
@@ -3598,7 +3627,7 @@ fn receive_focus_baseline_frames() {
 #[test]
 fn receive_xi2_focus_denial() {
     let build = || focus_notify_fixture();
-    let act = |fixture: &mut NotifyFixture, _: &u16| {
+    let act = |fixture: &mut NotifyFixture, _: &u16, _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         assert!(matches!(
             request_core_focus(fixture),
             RequestOutcome::Handled
@@ -3700,27 +3729,28 @@ fn receive_xi2_focus_denial() {
 
 fn run_xi1_focus_receive_case(is_keyboard: bool, deny_focus: bool, name: &'static str) {
     let build = || focus_notify_fixture();
-    let act = |fixture: &mut NotifyFixture, pointer: &u16| {
-        let device = if is_keyboard {
-            crate::xinput::DEVICEID_XTEST_KEYBOARD
-        } else {
-            *pointer
+    let act =
+        |fixture: &mut NotifyFixture, pointer: &u16, _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
+            let device = if is_keyboard {
+                crate::xinput::DEVICEID_XTEST_KEYBOARD
+            } else {
+                *pointer
+            };
+            assert!(matches!(
+                request_xi1_device_focus(fixture, 61, device),
+                RequestOutcome::Handled
+            ));
+            assert_eq!(
+                crate::core_loop::xi1_focus::device_focus(&fixture.state, device).focus,
+                FOCUS_WINDOW.0,
+                "Receive denial does not prevent XI1 focus movement"
+            );
+            assert!(
+                fixture.drain(NOTIFY_SENDER).is_empty(),
+                "SetDeviceFocus is void"
+            );
+            assert_no_writer_failures(fixture);
         };
-        assert!(matches!(
-            request_xi1_device_focus(fixture, 61, device),
-            RequestOutcome::Handled
-        ));
-        assert_eq!(
-            crate::core_loop::xi1_focus::device_focus(&fixture.state, device).focus,
-            FOCUS_WINDOW.0,
-            "Receive denial does not prevent XI1 focus movement"
-        );
-        assert!(
-            fixture.drain(NOTIFY_SENDER).is_empty(),
-            "SetDeviceFocus is void"
-        );
-        assert_no_writer_failures(fixture);
-    };
     let expect = |pointer: &u16| {
         let device = if is_keyboard {
             crate::xinput::DEVICEID_XTEST_KEYBOARD
@@ -3790,7 +3820,6 @@ fn run_xi1_focus_receive_case(is_keyboard: bool, deny_focus: bool, name: &'stati
             vec![denied],
         );
         expectation.deny_before_allow = true;
-        expectation.trace_before_deny_streams = deny_focus;
         let focus_device = if is_keyboard {
             crate::xinput::DEVICEID_XTEST_KEYBOARD
         } else {
@@ -3912,9 +3941,26 @@ fn receive_barrier_grab_owner_denial() {
         );
         assert!(fixture.drain(NOTIFY_RECEIVER_DENIED).is_empty());
         assert!(fixture.drain(NOTIFY_RECEIVER_ALLOWED).is_empty());
-        assert_xi2_receive_call_order(
-            &calls.lock().unwrap(),
-            &[(NOTIFY_SENDER, BARRIER_WINDOW, 25, None)],
+        let expected_receives = [ExpectedReceive {
+            client: NOTIFY_SENDER,
+            request: None,
+            subject: EventSubject::Window(BARRIER_WINDOW),
+            events: vec![EventDescription::extension(35, 137, 25)],
+        }];
+        let receive_log = calls.lock().unwrap();
+        assert_receive_trace(
+            "grabbed barrier owner denial",
+            "deny",
+            CallOrder::Total,
+            &expected_receives,
+            &receive_log,
+            "Receive trace",
+        );
+        assert_forbidden_hooks(
+            "grabbed barrier owner denial",
+            "deny",
+            &receive_log,
+            &[ExtensionHook::Send],
         );
         assert_no_writer_failures(&fixture);
         (
@@ -4230,7 +4276,7 @@ fn receive_barrier_baseline_frames() {
 #[test]
 fn receive_barrier_selector_denial() {
     let build = || (barrier_fixture(), ());
-    let act = |fixture: &mut NotifyFixture, _: &()| {
+    let act = |fixture: &mut NotifyFixture, _: &(), _: &std::sync::Mutex<Vec<ExpectedReceive>>| {
         feed_barrier_motion(fixture, 90, 95, 50);
         assert_eq!(fixture.state.pointer_root, (95, 50));
         feed_barrier_motion(fixture, 100, 110, 50);
