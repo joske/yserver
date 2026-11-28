@@ -54,27 +54,35 @@ between every scene walk (all outputs, all ticks, and the non-tick callers of
 
 ## Design
 
-1. **Lazy cache type, in the render crate.** It holds a `std::cell::OnceCell` with the
-   index and a build counter.
-   - `get(&windows)` returns the cached index, or builds it with the existing
-     `children_index` builder and counts one build. The ordering is unchanged: children
-     bottom-to-top by `stack_rank`.
-   - `invalidate(&mut self)` empties the cell.
-2. **Owner.** `TrackedWindows` holds one cache. `DerefMut` invalidates it, in the same
-   place that bumps `generation`.
-3. **Input.** `SceneInput` carries a reference to the cache, not a built index, so
-   `scene_input()` does no work.
-   - `build_scene_with` calls `get` where it calls `children_index` today, inside the
-     existing `build_scene` timer. That keeps the before/after timing comparable: a miss
-     after the change is timed exactly as every call is today.
+1. **One owner for the map and its index, in the render crate.** A new type holds the
+   `WindowsMap`, a `std::cell::OnceCell` with the index, and a build counter.
+   - Read access derefs to the `WindowsMap`, so existing readers are unchanged.
+   - `children()` returns the cached index. On a miss it builds it from the map it owns,
+     with the existing `children_index` builder, and counts one build. The ordering is
+     unchanged: children bottom-to-top by `stack_rank`.
+   - The only write access is a mutable accessor that empties the cell first.
+   - The index can come only from the map stored beside it, so no API can pair a cache
+     with a different map.
+2. **Owner in the backend.** `TrackedWindows` stores this type in place of its bare
+   `WindowsMap`. Its `DerefMut` keeps bumping `generation` and goes through the
+   invalidating accessor.
+3. **Input.** `SceneInput::windows` becomes a reference to the owning type, not to a bare
+   map, so `scene_input()` does no work and the walk takes map and index from one place.
+   - `build_scene_with` calls `children()` where it calls `children_index` today, inside
+     the existing `build_scene` timer. That keeps the before/after timing comparable: a
+     miss after the change is timed exactly as every call is today.
    - Callers that return before walking never build.
-   - The render crate's own test inputs (`scene/tests/mod.rs:1019`) use a fresh cache.
+   - The render crate's own test inputs (`scene/tests/mod.rs:1019`) wrap their maps in
+     the same type.
 4. **Counter.** The per-second telemetry line reports the index builds per second next
    to `build_scene_calls/s`.
-   - Builds happen only inside `build_scene_with`, so builds ≤ walks.
-   - During a run without readbacks (no GetImage of the root), `builds/s` against
-     `build_scene_calls/s` is the miss rate. Samueru can show it on his own setup, and it
-     is the measurement step before option B.
+   - Builds happen only inside a scene build. Root readbacks (root `GetImage` and root
+     `CopyArea`, `portable/readback.rs`) also build scenes but are not in
+     `build_scene_calls/s`.
+   - So `builds/s` against `build_scene_calls/s` is the miss rate only for a run with no
+     root readback, which is to say with zero builds outside the tick path. Samueru can
+     show it on his own setup under that condition, and it is the measurement step
+     before option B.
 
 ## Tests (rules A/B/C: real paths, through the KMS backend's production entry points)
 
