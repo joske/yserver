@@ -149,8 +149,9 @@ owner. A telemetry counter reports how many builds happen.
       built once.
     - Assert on each later tick: at least one output walked (walk delta ≥ 1) and there
       were 0 builds.
-    - Assert also: `scene_draw_rects_for_tests()` (output 0) is identical to the list
-      after the first tick. Read it after the counters.
+    - Assert also, on each tick that submitted output 0: output 0's emitted draw list is
+      identical to the first tick's. Read it after the counters, from the same
+      last-submitted-scene accessor.
     - Mutation that must fail: `children()` rebuilding on every call.
   - `children_index_follows_tree_changes`:
     - Action: after a first tick, apply in turn, each one visible on output 0:
@@ -163,8 +164,11 @@ owner. A telemetry counter reports how many builds happen.
     - Assert, for each step, that output 0's draw list changed from the previous step,
       so the step is observable.
     - Assert right after each tick: walk delta ≥ 1 and exactly 1 build.
-    - Then compare `scene_draw_rects_for_tests()` with a reference list from a new
-      `#[doc(hidden)]` accessor. The accessor builds a fresh
+    - Then compare output 0's draw list as the tick emitted it with a reference list
+      from a new `#[doc(hidden)]` accessor. "As emitted" means the scene the tick
+      submitted, read from what the recording fixture captured. If the fixture does not
+      expose it yet, add a test accessor for the last submitted scene's draw rects on an
+      output. Do not use a new walk. The accessor builds a fresh
       `IndexedWindows::from(map.clone())` of the current map and calls `scene_draw_rects`
       with it, so the cache under test is never consulted.
     - Mutation that must fail: `map_mut()` not emptying the cell.
@@ -207,41 +211,49 @@ git commit -S -m "perf(scene): build the children index once per window-map chan
 ### Task 2: Telemetry counter
 
 **Files:**
-- Modify: `crates/yserver-render/src/kms/render/telemetry.rs:165-175, 540-620, 1140`
-- Modify: `crates/yserver-render/src/kms/render/scene/tick.rs:766-779`
+- Modify: `crates/yserver-render/src/kms/render/telemetry.rs:165-175, 520-620`
+- Modify: every backend call site of `Telemetry::maybe_emit` in `crates/yserver/src`
+  (`portable/compose.rs`, and any other `git grep -n "maybe_emit("` finds)
 
 **Interfaces:**
 - Consumes: `IndexedWindows::children_index_builds()` from Task 1.
-- Produces: `Telemetry::record_children_index_builds(&mut self, n: u64)`, bucket and
-  lifetime, the same shape as `record_build_scene_ns`. The per-second line prints
-  `children_index_builds/s=<n>` right after `build_scene_calls/s`.
+- Produces:
+  - `Telemetry::observe_children_index_builds(&mut self, total: u64)`. It adds
+    `total - last_total` to the bucket and the lifetime counters, then stores `total`.
+    `last_total` lives in `Telemetry`.
+  - The per-second line prints `children_index_builds/s=<n>` right after
+    `build_scene_calls/s`.
+  - A lifetime accessor for tests, the same shape as the existing lifetime fields.
+- Each backend call site runs
+  `telemetry.observe_children_index_builds(self.windows.indexed().children_index_builds())`
+  immediately before `maybe_emit`. Every build lands in the bucket that emits next,
+  whatever path built it (tick, root readback, transform priming), including when no
+  walk follows.
 
-- [ ] **Step 1: Write the failing test**
-  `telemetry_counts_every_children_index_build`, in the same file and with the same
-  fixture and conventions as Task 1:
-  - Action: tick (1 build); three damage-only ticks (0 builds); a restack, then a root
-    readback through its production entry (`get_image` of the root window, 1 build
-    outside the tick), then a tick (0 builds, cache hit).
-  - Assert: the lifetime telemetry counter is 2, while `build_scene_calls` ≥ 5.
+- [ ] **Step 1: Write the failing test** `telemetry_counts_every_children_index_build`,
+  in the same file and with the same fixture and conventions as Task 1:
+  - tick: assert a build delta of 1 (via `b.windows.indexed().children_index_builds()`);
+  - three damage-only ticks: assert a delta of 0 each;
+  - a restack, then a root readback through its production entry (`get_image` of the
+    root window): assert a delta of exactly 1 across the readback call itself, so the
+    readback really took the composed path;
+  - a tick: assert walk delta ≥ 1 and build delta 0;
+  - then the backend's telemetry observe-and-emit step: assert the lifetime telemetry
+    counter is 2, while `build_scene_calls` ≥ 5.
   - Mutations that must fail:
-    - recording only the delta across `build_scene_with` (misses the readback build, so
-      the counter reads 1);
-    - recording 1 per walk.
+    - observing only around `build_scene_with` in the tick (it misses the readback
+      build and reads 1);
+    - not calling observe before `maybe_emit` (reads 0).
 
 - [ ] **Step 2: Run it to verify it fails.** Expected: the method is not found.
 
-- [ ] **Step 3: Implement.**
-  - `SceneCompositor` keeps the last cumulative value it reported.
-  - In `tick_one_output`, right after `build_scene_with`, it records
-    `input.windows.children_index_builds() - last` next to `record_build_scene_ns`, then
-    stores the new value.
-  - Builds from root readback and transform priming between ticks are therefore counted
-    at the next tick. Per spec, `children_index_builds/s` counts every build, and the
-    miss-rate reading is valid when none happen outside the tick path.
+- [ ] **Step 3: Implement** as in Interfaces. Per spec, `children_index_builds/s` counts
+  every build. The miss-rate reading against `build_scene_calls/s` is valid when none
+  happen outside the tick path.
 
 - [ ] **Step 4: Run it.** Expected: PASS, with no `SKIP`, under the live-Vulkan rules.
   - Then the Task 1 tests still pass.
-  - Run the named mutation; it must fail at its assertion.
+  - Run the named mutations; each must fail at its assertion.
   - Run the Gate below before the commit.
 
 - [ ] **Step 5: Commit**
@@ -257,7 +269,13 @@ git commit -S -am "perf(telemetry): report children index builds per second (#38
   `cargo clippy --workspace --all-targets --features xdmcp -- -D warnings`.
 - `cargo test --workspace --features xdmcp`.
 - Each integration test file in `crates/yserver/tests/` by its own command, except
-  `render_acceptance`.
+  `render_acceptance`:
+  - first without `--ignored`;
+  - then, for the files whose tests are all ignored (`dri3_fd_leak`, `glx_tfp_export`),
+    under `lvp-env.sh` with `-- --ignored --nocapture`.
+
+  Report the passed count per file. A file reporting 0 tests run is a failure of the
+  gate.
 - The lavapipe suite:
   `. /data/Projects/claude-scratch/issue-388/walk/lvp-env.sh && cargo test --workspace --features xdmcp --no-fail-fast -- --ignored --nocapture > <log> 2>&1`,
   run after the capability check above. The log must contain zero
