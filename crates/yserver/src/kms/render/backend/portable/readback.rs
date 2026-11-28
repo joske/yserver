@@ -160,7 +160,7 @@ impl<P: Platform> XBackend<P> {
         let hw_cursor_suppressed = P::tearing_cursor_suppression_mask(self, outputs.len());
         let input = crate::kms::render::backend::scene_input(
             &self.core,
-            &self.windows,
+            self.windows.indexed(),
             &outputs,
             self.platform.fb_size(),
             &hw_cursor_suppressed,
@@ -210,7 +210,7 @@ impl<P: Platform> XBackend<P> {
         let hw_cursor_suppressed = P::tearing_cursor_suppression_mask(self, outputs.len());
         let input = crate::kms::render::backend::scene_input(
             &self.core,
-            &self.windows,
+            self.windows.indexed(),
             &outputs,
             self.platform.fb_size(),
             &hw_cursor_suppressed,

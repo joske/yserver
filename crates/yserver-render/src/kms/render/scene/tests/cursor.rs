@@ -916,7 +916,7 @@ fn cursor_hidden_in_dead_zone_is_assigned_to_reentered_output() {
     let dead_zone_assignments: Vec<_> = (0..outputs.len())
         .map(|output_idx| {
             scene.cursor_assignment_for_tests(
-                &core.input(&windows, &outputs),
+                &core.input(&IndexedWindows::from(windows.clone()), &outputs),
                 &mut store,
                 &sink,
                 output_idx,
@@ -932,7 +932,8 @@ fn cursor_hidden_in_dead_zone_is_assigned_to_reentered_output() {
     // and build_scene must assign that sprite in output-local coordinates.
     core.cursor_x = 950.0;
     core.cursor_y = 350.0;
-    let input = core.input(&windows, &outputs);
+    let indexed_windows = IndexedWindows::from(windows.clone());
+    let input = core.input(&indexed_windows, &outputs);
     assert_eq!(
         scene.cursor_assignment_for_tests(&input, &mut store, &sink, 0,),
         CursorAssignment::Hidden,

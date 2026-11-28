@@ -147,7 +147,7 @@ impl KmsBackend {
         crate::kms::render::scene::scene_participant_places(
             &crate::kms::render::backend::scene_input(
                 &self.core,
-                &self.windows,
+                self.windows.indexed(),
                 &outputs,
                 self.platform.fb_dimensions(),
                 &hw_cursor_suppressed,
@@ -179,7 +179,33 @@ impl KmsBackend {
         crate::kms::render::scene::scene_draw_rects(
             &crate::kms::render::backend::scene_input(
                 &self.core,
-                &self.windows,
+                self.windows.indexed(),
+                &outputs,
+                self.platform.fb_dimensions(),
+                &hw_cursor_suppressed,
+            ),
+            &mut self.store,
+            0,
+            &self.platform,
+        )
+        .into_iter()
+        .map(|r| (r.offset.x, r.offset.y, r.extent.width, r.extent.height))
+        .collect()
+    }
+
+    /// Reference scene draw list using a newly built children index.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn scene_draw_rects_with_fresh_index_for_tests(&mut self) -> Vec<(i32, i32, u32, u32)> {
+        let windows = crate::kms::render::window_geometry::IndexedWindows::from(
+            std::ops::Deref::deref(self.windows.indexed()).clone(),
+        );
+        let outputs = self.platform.scene_output_layouts();
+        let hw_cursor_suppressed = self.tearing_cursor_suppression_mask();
+        crate::kms::render::scene::scene_draw_rects(
+            &crate::kms::render::backend::scene_input(
+                &self.core,
+                &windows,
                 &outputs,
                 self.platform.fb_dimensions(),
                 &hw_cursor_suppressed,

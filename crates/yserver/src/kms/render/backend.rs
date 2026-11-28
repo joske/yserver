@@ -109,13 +109,17 @@ pub(crate) struct InputOnlyPointerHost {
 /// it can tell it is still current ([`KmsBackend::subwindow_mode_clip`]).
 #[derive(Debug, Default)]
 pub(crate) struct TrackedWindows {
-    map: WindowsMap,
+    map: crate::kms::render::window_geometry::IndexedWindows,
     generation: u64,
 }
 
 impl TrackedWindows {
     pub(crate) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub(crate) fn indexed(&self) -> &crate::kms::render::window_geometry::IndexedWindows {
+        &self.map
     }
 }
 
@@ -137,7 +141,7 @@ impl<'a> IntoIterator for &'a TrackedWindows {
 impl std::ops::DerefMut for TrackedWindows {
     fn deref_mut(&mut self) -> &mut WindowsMap {
         self.generation = self.generation.wrapping_add(1);
-        &mut self.map
+        self.map.map_mut()
     }
 }
 
@@ -145,7 +149,7 @@ impl std::ops::DerefMut for TrackedWindows {
 /// fields, so it can be held across `&mut self.platform` / `&mut self.store`.
 pub(super) fn scene_input<'a>(
     core: &'a crate::kms::core::KmsCore,
-    windows: &'a WindowsMap,
+    windows: &'a crate::kms::render::window_geometry::IndexedWindows,
     outputs: &'a [crate::kms::render::scene::OutputLayout],
     fb_size: (u16, u16),
     hw_cursor_suppressed: &'a [bool],

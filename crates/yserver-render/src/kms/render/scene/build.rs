@@ -8,7 +8,7 @@ use crate::kms::{
             damage::{clip_rect_to_output_extent, project_onto_output},
             repaint::draw_dst_rect_inward,
             tick::tick_skip_log_enabled,
-            walk::{children_index, visit_window_subtree},
+            walk::visit_window_subtree,
         },
         scene_diff::{ParticipantId, PresenceSignature, SceneRole, presence_from_place},
         store::{DrawableKind, DrawableStore, RegionSet},
@@ -390,7 +390,7 @@ pub(super) fn build_scene_with(
             log::debug!("{msg}");
         }
     }
-    let children = children_index(input.windows);
+    let children = input.windows.children();
     // Step 1 — the universe for the root's children is the output: X11 clips
     // top-levels to the screen. Under `Off` the region is never read.
     let mut universe = match mode {
@@ -415,7 +415,7 @@ pub(super) fn build_scene_with(
             0,
             store,
             input.windows,
-            &children,
+            children,
             input.shape_bounding,
             input.shape_clip,
             layout_x0,

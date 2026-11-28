@@ -28,7 +28,7 @@ impl WalkStats {
     }
 }
 
-pub(super) fn children_index(
+pub(crate) fn children_index(
     windows: &crate::kms::render::window_geometry::WindowsMap,
 ) -> ChildrenIndex {
     let mut by_parent: HashMap<u32, Vec<(u32, u64)>> = HashMap::new();

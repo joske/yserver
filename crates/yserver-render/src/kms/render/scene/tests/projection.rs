@@ -14,9 +14,10 @@ fn build_with_elsewhere(
     elsewhere: &std::collections::HashSet<crate::kms::render::store::DrawableId>,
 ) -> SceneBuild {
     let outputs = [layout_at(layout)];
+    let windows = IndexedWindows::from(windows.clone());
     let sink = TestSink::new();
     build_scene_with(
-        &core.input(windows, &outputs),
+        &core.input(&windows, &outputs),
         store,
         0,
         &sink,
@@ -991,6 +992,7 @@ fn e16_like_fixture() -> (
 #[ignore = "bench: prints µs per walk, run in release with --nocapture"]
 fn walk_bench() {
     let (core, mut store, windows) = e16_like_fixture();
+    let windows = IndexedWindows::from(windows);
     let layout = (0, 0, 2560u32, 1440u32);
     let outputs = [layout_at(layout)];
     let sink = TestSink::new();

@@ -426,7 +426,7 @@ impl KmsBackend {
         let hw_cursor_suppressed = self.tearing_cursor_suppression_mask();
         let input = crate::kms::render::backend::scene_input(
             &self.core,
-            &self.windows,
+            self.windows.indexed(),
             &outputs,
             self.platform.fb_dimensions(),
             &hw_cursor_suppressed,

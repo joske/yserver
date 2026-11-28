@@ -42,7 +42,7 @@ mod root_readback;
 mod sink;
 mod tick;
 mod transform;
-mod walk;
+pub(crate) mod walk;
 
 pub use build::*;
 #[cfg(test)]
@@ -123,7 +123,7 @@ pub struct SceneInput<'a> {
     pub shape_clip: &'a HashMap<u32, Vec<yserver_protocol::x11::xfixes::RegionRect>>,
     pub cursor_x: f32,
     pub cursor_y: f32,
-    pub windows: &'a crate::kms::render::window_geometry::WindowsMap,
+    pub windows: &'a crate::kms::render::window_geometry::IndexedWindows,
     pub outputs: &'a [OutputLayout],
     /// The logical screen size.
     pub fb_size: (u16, u16),
@@ -1079,7 +1079,7 @@ struct Emitted {
 /// `Vec` for every node it visited — O(N²) on a busy desktop (e16 emits ~2265
 /// draws per compose). Step 1's visibility walk needs the same index, so it is
 /// built here first, changing nothing about what is emitted.
-type ChildrenIndex = HashMap<u32, Vec<u32>>;
+pub type ChildrenIndex = HashMap<u32, Vec<u32>>;
 
 /// What the store says about a node, captured once so the trace lines and the
 /// emission decision read the same snapshot.

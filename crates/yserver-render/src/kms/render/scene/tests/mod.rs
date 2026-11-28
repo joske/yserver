@@ -10,6 +10,7 @@ use crate::kms::render::{
     gpu::GpuCore,
     scene_diff::{ParticipantId, SceneRole},
     store::DrawableStore,
+    window_geometry::IndexedWindows,
 };
 use std::{collections::HashSet, io};
 use yserver_protocol::x11::xfixes;
@@ -1013,7 +1014,7 @@ impl TestCore {
     /// (`default_outputs`).
     fn input<'a>(
         &'a self,
-        windows: &'a crate::kms::render::window_geometry::WindowsMap,
+        windows: &'a IndexedWindows,
         outputs: &'a [OutputLayout],
     ) -> SceneInput<'a> {
         SceneInput {
@@ -1059,9 +1060,10 @@ fn build_with(
     cow_host_xid: Option<u32>,
 ) -> SceneBuild {
     let outputs = [layout_at(layout)];
+    let windows = IndexedWindows::from(windows.clone());
     let sink = TestSink::new();
     build_scene(
-        &core.input(windows, &outputs),
+        &core.input(&windows, &outputs),
         store,
         0,
         &sink,

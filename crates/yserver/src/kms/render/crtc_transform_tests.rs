@@ -86,7 +86,7 @@ fn compose_right(b: &mut KmsBackend) -> Vec<u8> {
     let hw_cursor_suppressed = b.tearing_cursor_suppression_mask();
     let input = scene_input(
         &b.core,
-        &b.windows,
+        b.windows.indexed(),
         &outputs,
         b.platform.fb_dimensions(),
         &hw_cursor_suppressed,
@@ -404,7 +404,7 @@ fn the_cursor_is_software_on_every_output_and_scales_with_the_content() {
         let hw_cursor_suppressed = b.tearing_cursor_suppression_mask();
         let input = scene_input(
             &b.core,
-            &b.windows,
+            b.windows.indexed(),
             &outputs,
             b.platform.fb_dimensions(),
             &hw_cursor_suppressed,
@@ -472,7 +472,7 @@ fn root_reads_never_see_the_software_cursor() {
     let hw_cursor_suppressed = b.tearing_cursor_suppression_mask();
     let input = scene_input(
         &b.core,
-        &b.windows,
+        b.windows.indexed(),
         &outputs,
         b.platform.fb_dimensions(),
         &hw_cursor_suppressed,

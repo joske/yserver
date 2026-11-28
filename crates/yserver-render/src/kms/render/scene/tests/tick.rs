@@ -355,7 +355,7 @@ fn stub_scene_is_not_live_and_declines_tick() {
     let skip_outputs = vec![false; outputs.len()];
     let err = scene
         .tick(
-            &core.input(&windows, &outputs),
+            &core.input(&IndexedWindows::from(windows.clone()), &outputs),
             &mut store,
             &mut sink,
             &mut telemetry,

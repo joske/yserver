@@ -1,6 +1,10 @@
 //! The backend's per-window geometry, as the scene reads it.
 
-use std::collections::HashMap;
+use std::{
+    cell::{Cell, OnceCell},
+    collections::HashMap,
+    ops::Deref,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct WindowGeometry {
@@ -44,3 +48,53 @@ pub struct WindowGeometry {
 }
 
 pub type WindowsMap = HashMap<u32, WindowGeometry>;
+
+/// Owns the window map and its lazily built parent-to-children index.
+/// Mutable map access invalidates the index before returning the map.
+#[derive(Debug, Default)]
+pub struct IndexedWindows {
+    map: WindowsMap,
+    children: OnceCell<crate::kms::render::scene::ChildrenIndex>,
+    children_index_builds: Cell<u64>,
+}
+
+impl From<WindowsMap> for IndexedWindows {
+    fn from(map: WindowsMap) -> Self {
+        Self {
+            map,
+            children: OnceCell::new(),
+            children_index_builds: Cell::new(0),
+        }
+    }
+}
+
+impl Deref for IndexedWindows {
+    type Target = WindowsMap;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl IndexedWindows {
+    /// Return mutable access to the map after discarding its derived index.
+    pub fn map_mut(&mut self) -> &mut WindowsMap {
+        self.children.take();
+        &mut self.map
+    }
+
+    /// Return the cached parent-to-children index, building it on first use
+    /// after the latest mutable map access.
+    pub fn children(&self) -> &crate::kms::render::scene::ChildrenIndex {
+        self.children.get_or_init(|| {
+            self.children_index_builds
+                .set(self.children_index_builds.get().wrapping_add(1));
+            crate::kms::render::scene::walk::children_index(&self.map)
+        })
+    }
+
+    /// Cumulative number of child-index builds for this map owner.
+    pub fn children_index_builds(&self) -> u64 {
+        self.children_index_builds.get()
+    }
+}

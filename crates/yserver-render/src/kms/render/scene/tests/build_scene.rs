@@ -44,7 +44,7 @@ fn build_scene_recurses_into_mapped_children() {
     );
 
     let built = build_scene(
-        &core.input(&windows, &default_outputs()),
+        &core.input(&IndexedWindows::from(windows.clone()), &default_outputs()),
         &mut store,
         0,
         &sink,
@@ -117,7 +117,7 @@ fn build_scene_clips_child_to_parent_bounds() {
     );
 
     let built = build_scene(
-        &core.input(&windows, &default_outputs()),
+        &core.input(&IndexedWindows::from(windows.clone()), &default_outputs()),
         &mut store,
         0,
         &sink,
@@ -203,7 +203,7 @@ fn build_scene_clips_window_to_shape_bounding() {
     );
 
     let built = build_scene(
-        &core.input(&windows, &default_outputs()),
+        &core.input(&IndexedWindows::from(windows.clone()), &default_outputs()),
         &mut store,
         0,
         &sink,
@@ -278,7 +278,7 @@ fn build_scene_empty_bounding_emits_no_draw() {
     core.shape_bounding.insert(0x100, Vec::new());
 
     let built = build_scene(
-        &core.input(&windows, &default_outputs()),
+        &core.input(&IndexedWindows::from(windows.clone()), &default_outputs()),
         &mut store,
         0,
         &sink,
@@ -318,7 +318,7 @@ fn build_scene_absent_bounding_emits_full_window() {
     // No shape_bounding entry at all (absent) → full-window draw.
 
     let built = build_scene(
-        &core.input(&windows, &default_outputs()),
+        &core.input(&IndexedWindows::from(windows.clone()), &default_outputs()),
         &mut store,
         0,
         &sink,
@@ -379,7 +379,7 @@ fn build_scene_unmapped_parent_hides_subtree() {
     );
 
     let scene = build_scene(
-        &core.input(&windows, &default_outputs()),
+        &core.input(&IndexedWindows::from(windows.clone()), &default_outputs()),
         &mut store,
         0,
         &sink,
@@ -441,7 +441,7 @@ fn build_scene_appends_cursor_draw_at_top_of_z() {
     };
 
     let scene = build_scene(
-        &core.input(&windows, &default_outputs()),
+        &core.input(&IndexedWindows::from(windows.clone()), &default_outputs()),
         &mut store,
         0,
         &sink,
@@ -548,7 +548,7 @@ fn build_scene_automatic_redirect_keeps_window_via_backing_storage() {
     store.set_redirected_target(w_id, Some(b_id));
 
     let built = build_scene(
-        &core.input(&windows, &default_outputs()),
+        &core.input(&IndexedWindows::from(windows.clone()), &default_outputs()),
         &mut store,
         0,
         &sink,
@@ -662,7 +662,7 @@ fn build_scene_skips_manual_redirected_window() {
     );
 
     let built = build_scene(
-        &core.input(&windows, &default_outputs()),
+        &core.input(&IndexedWindows::from(windows.clone()), &default_outputs()),
         &mut store,
         0,
         &sink,
@@ -805,7 +805,7 @@ fn build_scene_prunes_descendants_of_manual_redirected_ancestor() {
     );
 
     let built = build_scene(
-        &core.input(&windows, &default_outputs()),
+        &core.input(&IndexedWindows::from(windows.clone()), &default_outputs()),
         &mut store,
         0,
         &sink,
@@ -953,7 +953,7 @@ fn build_scene_emits_automatic_descendant_under_manual_ancestor() {
     );
 
     let built = build_scene(
-        &core.input(&windows, &default_outputs()),
+        &core.input(&IndexedWindows::from(windows.clone()), &default_outputs()),
         &mut store,
         0,
         &sink,
@@ -1026,7 +1026,7 @@ fn build_scene_cow_none_emits_top_levels() {
     core.top_level_order.push(0x101);
 
     let built = build_scene(
-        &core.input(&windows, &default_outputs()),
+        &core.input(&IndexedWindows::from(windows.clone()), &default_outputs()),
         &mut store,
         0,
         &sink,
@@ -1122,7 +1122,7 @@ fn build_scene_cow_none_cursor_at_top() {
     };
 
     let built = build_scene(
-        &core.input(&windows, &default_outputs()),
+        &core.input(&IndexedWindows::from(windows.clone()), &default_outputs()),
         &mut store,
         0,
         &sink,
@@ -1201,7 +1201,7 @@ fn cow_subtree_draws_inherit_alpha_passthrough_true() {
     );
 
     let built = build_scene(
-        &core.input(&windows, &default_outputs()),
+        &core.input(&IndexedWindows::from(windows.clone()), &default_outputs()),
         &mut store,
         0,
         &sink,
@@ -1271,7 +1271,7 @@ fn build_scene_does_not_append_cow_after_top_level_walk() {
     core.top_level_order.push(cow_xid);
 
     let built = build_scene(
-        &core.input(&windows, &default_outputs()),
+        &core.input(&IndexedWindows::from(windows.clone()), &default_outputs()),
         &mut store,
         0,
         &sink,
@@ -1351,7 +1351,7 @@ fn manual_redirected_top_level_skips_emit_unconditional() {
         }
 
         let built = build_scene(
-            &core.input(&windows, &default_outputs()),
+            &core.input(&IndexedWindows::from(windows.clone()), &default_outputs()),
             &mut store,
             0,
             &sink,
@@ -1423,7 +1423,7 @@ fn offscreen_helper_above_fullscreen_still_suppresses_cow() {
     core.top_level_order.push(cow);
 
     let built = build_scene(
-        &core.input(&windows, &default_outputs()),
+        &core.input(&IndexedWindows::from(windows.clone()), &default_outputs()),
         &mut store,
         0,
         &sink,
@@ -1487,7 +1487,7 @@ fn on_output_non_covering_window_above_fullscreen_keeps_cow() {
     core.top_level_order.push(cow);
 
     let built = build_scene(
-        &core.input(&windows, &default_outputs()),
+        &core.input(&IndexedWindows::from(windows.clone()), &default_outputs()),
         &mut store,
         0,
         &sink,
@@ -1536,7 +1536,7 @@ fn automatic_redirected_top_level_still_emits() {
     core.top_level_order.push(w);
 
     let built = build_scene(
-        &core.input(&windows, &default_outputs()),
+        &core.input(&IndexedWindows::from(windows.clone()), &default_outputs()),
         &mut store,
         0,
         &sink,
@@ -1650,7 +1650,7 @@ fn compositor_stage_under_cow_emits_via_recursion_and_manual_siblings_skip() {
     );
 
     let built = build_scene(
-        &core.input(&windows, &default_outputs()),
+        &core.input(&IndexedWindows::from(windows.clone()), &default_outputs()),
         &mut store,
         0,
         &sink,
