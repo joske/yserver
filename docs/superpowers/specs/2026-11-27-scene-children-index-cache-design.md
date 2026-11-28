@@ -69,8 +69,9 @@ between every scene walk (all outputs, all ticks, and the non-tick callers of
 3. **Input.** `SceneInput::windows` becomes a reference to the owning type, not to a bare
    map, so `scene_input()` does no work and the walk takes map and index from one place.
    - `build_scene_with` calls `children()` where it calls `children_index` today, inside
-     the existing `build_scene` timer. That keeps the before/after timing comparable: a
-     miss after the change is timed exactly as every call is today.
+     the existing `build_scene` timer, so a miss is timed as every build is today. The
+     index is now freed in `DerefMut`, outside the timer. `avg_build_scene_ns` therefore
+     measures walk latency, and the total CPU saving is measured by the perf rerun.
    - Callers that return before walking never build.
    - The render crate's own test inputs (`scene/tests/mod.rs:1019`) wrap their maps in
      the same type.
@@ -79,8 +80,11 @@ between every scene walk (all outputs, all ticks, and the non-tick callers of
    - Builds happen only inside a scene build. Root readbacks (root `GetImage` and root
      `CopyArea`, `portable/readback.rs`) also build scenes but are not in
      `build_scene_calls/s`.
-   - So `builds/s` against `build_scene_calls/s` is the miss rate only for a run with no
-     root readback, which is to say with zero builds outside the tick path. Samueru can
+   - The damage audit's second walk (`damage_audit.rs`) reads the same cache and is not
+     counted either.
+   - So `builds/s` against `build_scene_calls/s` is the miss rate of the timed tick walks,
+     valid when every build happens there: no root readback, which is to say zero builds
+     outside the tick path. Samueru can
      show it on his own setup under that condition, and it is the measurement step
      before option B.
 
