@@ -8,16 +8,15 @@ fn build_with_elsewhere(
     mode: Visibility,
     core: &TestCore,
     store: &mut DrawableStore,
-    windows: &crate::kms::render::window_geometry::WindowsMap,
+    windows: &IndexedWindows,
     layout: (i32, i32, u32, u32),
     cow_host_xid: Option<u32>,
     elsewhere: &std::collections::HashSet<crate::kms::render::store::DrawableId>,
 ) -> SceneBuild {
     let outputs = [layout_at(layout)];
-    let windows = IndexedWindows::from(windows.clone());
     let sink = TestSink::new();
     build_scene_with(
-        &core.input(&windows, &outputs),
+        &core.input(windows, &outputs),
         store,
         0,
         &sink,
@@ -322,7 +321,7 @@ fn uncovering_a_window_surfaces_its_accumulated_hidden_paint() {
     // Not acked (no compose happened): a second hidden paint accumulates.
     store.damage(lower, rect(30, 30, 10, 10));
     // Frame 2: A moves off W.
-    let a = windows.get_mut(&0x200).expect("A");
+    let a = windows.map_mut().get_mut(&0x200).expect("A");
     a.x = 400;
     a.y = 400;
     let frame2 = build_with(

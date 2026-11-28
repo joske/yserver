@@ -1073,12 +1073,13 @@ struct Emitted {
     signature: Option<PresenceSignature>,
 }
 
-/// Bottom-to-top child order per parent, built once per `build_scene`.
+/// Bottom-to-top child order per parent, cached until the next mutable borrow
+/// of its owning window map.
 ///
 /// `emit_window_subtree` used to scan the whole `WindowsMap` and sort a fresh
 /// `Vec` for every node it visited — O(N²) on a busy desktop (e16 emits ~2265
-/// draws per compose). Step 1's visibility walk needs the same index, so it is
-/// built here first, changing nothing about what is emitted.
+/// draws per compose). The cache lets the scene walk reuse this index across
+/// outputs and repeated walks while preserving what is emitted.
 pub type ChildrenIndex = HashMap<u32, Vec<u32>>;
 
 /// What the store says about a node, captured once so the trace lines and the

@@ -1,13 +1,10 @@
 use super::{commit_identity::recording_scene::RecordingSceneFixture, *};
-use crate::drm::atomic::tests_support::{AtomicCommitRecord, ScriptedResult};
+use crate::drm::atomic::tests_support::AtomicCommitRecord;
 use std::{collections::HashMap, os::fd::RawFd, time::Duration};
 use yserver_core::{
     backend::Backend, core_loop::process_request, resources::ROOT_WINDOW, server::ServerState,
 };
-use yserver_protocol::x11::{
-    ClientId, ConfigureWindowRequest, ReparentWindowRequest, RequestHeader, ResourceId,
-    SequenceNumber,
-};
+use yserver_protocol::x11::{ClientId, RequestHeader, ResourceId, SequenceNumber};
 
 const ROOT_A: ResourceId = ResourceId(0x0040_0100);
 const CHILD_A: ResourceId = ResourceId(0x0040_0101);
@@ -66,13 +63,7 @@ fn accepted_records_since(
                 .skip(offsets[&fd])
                 .filter(move |record| {
                     record.device_fd == fd
-                        && record.result == ScriptedResult::Ok
-                        && record
-                            .flags
-                            .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT)
-                        && !record
-                            .flags
-                            .contains(::drm::control::AtomicCommitFlags::TEST_ONLY)
+                        && super::commit_identity::accepted_event_id(record).is_some()
                         && !record.events.is_empty()
                 })
                 .map(move |record| (fd, record))
@@ -224,7 +215,7 @@ fn children_index_built_once_across_damage_only_ticks() {
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 fn children_index_follows_tree_changes() {
     let mut fixture = live_fixture().cleanup_guard();
-    let (_, child_a, child_b, _span_a, _span_b) = create_scene_windows(&mut fixture);
+    let (_, _, _, _span_a, _span_b) = create_scene_windows(&mut fixture);
 
     let before = tick_counts(&fixture);
     let root = fixture.events.backend.core.window_id;
@@ -238,29 +229,13 @@ fn children_index_follows_tree_changes() {
     for (step, mutation) in mutations.into_iter().enumerate() {
         match step {
             0 => {
-                state_configure_child_above(&mut fixture, CHILD_A, CHILD_B, child_a, child_b);
+                state_configure_child_above(&mut fixture, CHILD_A, CHILD_B);
             }
             1 => {
                 let events = fixture.events_mut();
                 let state = &mut events.state;
                 let backend = &mut events.backend;
-                state
-                    .resources
-                    .reparent_window(ReparentWindowRequest {
-                        window: CHILD_A,
-                        parent: SPAN_A,
-                        x: 30,
-                        y: 20,
-                    })
-                    .expect("reparent a live child through core resources");
-                let parent = state
-                    .resources
-                    .window(SPAN_A)
-                    .and_then(|window| window.host_xid)
-                    .expect("mapped destination parent has a host xid");
-                Backend::reparent_subwindow(backend, None, child_a, parent.as_raw(), 30, 20)
-                    .expect("reparent live child through Backend");
-                Backend::sync_top_level_order(backend, state);
+                super::dispatch_reparent_window(state, backend, CHILD_A, SPAN_A, 30, 20);
             }
             2 => {
                 let events = fixture.events_mut();
@@ -310,22 +285,28 @@ fn state_configure_child_above(
     fixture: &mut RecordingSceneFixture,
     child: ResourceId,
     sibling: ResourceId,
-    child_host: u32,
-    sibling_host: u32,
 ) {
     let state = &mut fixture.events.state;
     let backend = &mut fixture.events.backend;
-    state.resources.configure_window(ConfigureWindowRequest {
-        window: child,
-        value_mask: 0,
-        x: None,
-        y: None,
-        width: None,
-        height: None,
-        border_width: None,
-        sibling: Some(sibling),
-        stack_mode: Some(0), // Above
-    });
-    backend.restack_subwindow(child_host, 0, Some(sibling_host));
-    Backend::sync_top_level_order(backend, state);
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&child.0.to_le_bytes());
+    let value_mask = (1u16 << 5) | (1u16 << 6);
+    body.extend_from_slice(&value_mask.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&sibling.0.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // Above
+    process_request::process_request(
+        state,
+        backend as &mut dyn Backend,
+        ClientId(14),
+        SequenceNumber(1),
+        RequestHeader {
+            opcode: 12, // ConfigureWindow
+            data: 0,
+            length_units: 5,
+        },
+        &body,
+        None,
+    )
+    .expect("ConfigureWindow must forward a sibling restack through Backend");
 }

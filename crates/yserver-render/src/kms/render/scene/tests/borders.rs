@@ -96,6 +96,7 @@ fn a_bordered_node_samples_its_whole_outer_extent() {
         true,
     );
     core.top_level_order = vec![0x100];
+    let windows = IndexedWindows::from(windows);
     let off = build_with(
         Visibility::Off,
         &core,
@@ -160,6 +161,7 @@ fn a_bordered_parents_child_is_placed_from_the_content_origin() {
     set_rank(&mut windows, 0x100, 1);
     set_rank(&mut windows, 0x101, 2);
     core.top_level_order = vec![0x100];
+    let windows = IndexedWindows::from(windows);
     let off = build_with(
         Visibility::Off,
         &core,
@@ -213,6 +215,7 @@ fn a_child_cannot_overlap_its_parents_border() {
     set_rank(&mut windows, 0x100, 1);
     set_rank(&mut windows, 0x101, 2);
     core.top_level_order = vec![0x100];
+    let windows = IndexedWindows::from(windows);
     let on = assert_oracle(
         &core,
         &mut store,
@@ -280,6 +283,7 @@ fn a_bordered_shaped_windows_mask_is_read_in_content_coordinates() {
             height: 50,
         }],
     );
+    let windows = IndexedWindows::from(windows);
     let off = build_with(
         Visibility::Off,
         &core,
@@ -330,6 +334,7 @@ fn a_clip_shape_narrows_the_child_clip_but_not_the_nodes_own_place() {
             height: 100,
         }],
     );
+    let windows = IndexedWindows::from(windows);
     let on = build_with(
         Visibility::On,
         &core,
@@ -410,6 +415,7 @@ fn a_redirected_window_is_not_clipped_to_its_parent_and_neither_are_its_children
         let g_id = store.lookup(0x102).expect("grandchild present");
         let g_backing = alloc_backing(&mut store, 0xB102, 100, 50);
         store.set_redirected_target(g_id, Some(g_backing));
+        let windows = IndexedWindows::from(windows);
         let off = build_with(
             Visibility::Off,
             &core,
@@ -510,6 +516,7 @@ fn a_bordered_child_under_a_redirected_ancestor_is_not_displaced() {
         let g_id = store.lookup(0x102).expect("grandchild present");
         let g_backing = alloc_backing(&mut store, 0xB102, 20, 10);
         store.set_redirected_target(g_id, Some(g_backing));
+        let windows = IndexedWindows::from(windows);
         let off = build_with(
             Visibility::Off,
             &core,
@@ -678,6 +685,7 @@ fn the_awesome_two_tile_layout_rings_all_four_sides() {
         set_rank(&mut windows, child, (2 * i + 2) as u64);
     }
     core.top_level_order = vec![0x100, 0x200];
+    let windows = IndexedWindows::from(windows);
     let on = assert_oracle(
         &core,
         &mut store,
@@ -947,20 +955,21 @@ fn a_grow_damages_the_full_new_outer_rect() {
     set_rank(&mut windows, 0x102, 3);
     core.top_level_order = vec![0x100];
 
+    let mut windows = IndexedWindows::from(windows);
     let layout = (0, 0, 800u32, 600u32);
     let before = build_with(Visibility::On, &core, &mut store, &windows, layout, None);
 
     // The grow, in the trace's order: frame, client, then the GL child.
     resize_stub_window_bordered(
         &mut store,
-        &mut windows,
+        windows.map_mut(),
         0x100,
         big.0,
         big.1 + TITLE as u16,
         BW,
     );
-    resize_stub_window_bordered(&mut store, &mut windows, 0x101, big.0, big.1, 0);
-    resize_stub_window_bordered(&mut store, &mut windows, 0x102, big.0, big.1, 0);
+    resize_stub_window_bordered(&mut store, windows.map_mut(), 0x101, big.0, big.1, 0);
+    resize_stub_window_bordered(&mut store, windows.map_mut(), 0x102, big.0, big.1, 0);
 
     let after = build_with(Visibility::On, &core, &mut store, &windows, layout, None);
     let damage = structural_damage(&before.participants, &after.participants);
@@ -1096,6 +1105,7 @@ fn the_bee_tree_with_a_higher_wibar_sibling_matches_the_unclipped_scene() {
     // The wibar is stacked ABOVE the frame, so it claims first.
     core.top_level_order = vec![0x100, 0x010];
 
+    let windows = IndexedWindows::from(windows);
     let layout = (0, 0, 2560u32, 1440u32);
     let on = build_with(Visibility::On, &core, &mut store, &windows, layout, None);
     let off = build_with(Visibility::Off, &core, &mut store, &windows, layout, None);

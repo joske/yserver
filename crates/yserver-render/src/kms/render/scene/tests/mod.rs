@@ -1055,15 +1055,14 @@ fn build_with(
     mode: Visibility,
     core: &TestCore,
     store: &mut DrawableStore,
-    windows: &crate::kms::render::window_geometry::WindowsMap,
+    windows: &IndexedWindows,
     layout: (i32, i32, u32, u32),
     cow_host_xid: Option<u32>,
 ) -> SceneBuild {
     let outputs = [layout_at(layout)];
-    let windows = IndexedWindows::from(windows.clone());
     let sink = TestSink::new();
     build_scene(
-        &core.input(&windows, &outputs),
+        &core.input(windows, &outputs),
         store,
         0,
         &sink,
@@ -1097,7 +1096,7 @@ fn walk_with(
     legacy: bool,
     core: &TestCore,
     store: &mut DrawableStore,
-    windows: &crate::kms::render::window_geometry::WindowsMap,
+    windows: &IndexedWindows,
     layout: (i32, i32, u32, u32),
     cow_host_xid: Option<u32>,
 ) -> WalkOut {
@@ -1170,11 +1169,7 @@ fn alloc_backing(
 
 /// The tree every differential case runs on. Ranks are all distinct so
 /// sibling order does not depend on `HashMap` iteration.
-fn differential_fixture() -> (
-    TestCore,
-    DrawableStore,
-    crate::kms::render::window_geometry::WindowsMap,
-) {
+fn differential_fixture() -> (TestCore, DrawableStore, IndexedWindows) {
     let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
     let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
@@ -1474,7 +1469,7 @@ fn differential_fixture() -> (
     core.top_level_order = vec![
         0x100, 0x200, 0x201, 0x300, 0x400, 0x500, 0x501, 0x600, 0x700, 0x900, 0x800,
     ];
-    (core, store, windows)
+    (core, store, IndexedWindows::from(windows))
 }
 
 // ── Step 1 stage B: the visibility walk ──────────────────────────────
@@ -1527,7 +1522,7 @@ fn stacks_equal(a: &PixelStack, b: &PixelStack) -> bool {
 fn assert_oracle(
     core: &TestCore,
     store: &mut DrawableStore,
-    windows: &crate::kms::render::window_geometry::WindowsMap,
+    windows: &IndexedWindows,
     layout: (i32, i32, u32, u32),
     cow: Option<u32>,
     label: &str,
@@ -1594,11 +1589,7 @@ impl WalkOut {
 fn two_windows(
     lower: (i16, i16, u16, u16),
     upper: (i16, i16, u16, u16),
-) -> (
-    TestCore,
-    DrawableStore,
-    crate::kms::render::window_geometry::WindowsMap,
-) {
+) -> (TestCore, DrawableStore, IndexedWindows) {
     let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
     let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
@@ -1628,7 +1619,7 @@ fn two_windows(
     set_rank(&mut windows, 0x100, 1);
     set_rank(&mut windows, 0x200, 2);
     core.top_level_order = vec![0x100, 0x200];
-    (core, store, windows)
+    (core, store, IndexedWindows::from(windows))
 }
 
 // ── dormancy across outputs that did not walk ────────────────────────

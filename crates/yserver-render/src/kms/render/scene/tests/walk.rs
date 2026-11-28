@@ -348,6 +348,7 @@ fn an_empty_parent_shape_suppresses_its_children() {
     );
     core.top_level_order = vec![0x100];
     core.shape_bounding.insert(0x100, Vec::new());
+    let windows = IndexedWindows::from(windows);
     let on = build_with(
         Visibility::On,
         &core,
@@ -407,6 +408,7 @@ fn a_partial_parent_shape_clips_its_children() {
             height: 200,
         }],
     );
+    let windows = IndexedWindows::from(windows);
     let on = build_with(
         Visibility::On,
         &core,
@@ -479,6 +481,7 @@ fn a_parent_shape_past_the_region_cap_clips_its_children() {
         .map(|r| u64::from(r.width) * u64::from(r.height))
         .sum();
     core.shape_bounding.insert(0x100, shape);
+    let windows = IndexedWindows::from(windows);
     let on = build_with(
         Visibility::On,
         &core,
@@ -597,6 +600,7 @@ fn intersecting_parent_and_child_shapes_keep_the_gaps() {
     core.top_level_order = vec![0x100];
     core.shape_bounding.insert(0x100, stripes(65, 129, true));
     core.shape_bounding.insert(0x101, stripes(65, 129, false));
+    let windows = IndexedWindows::from(windows);
     let on = build_with(
         Visibility::On,
         &core,
@@ -682,6 +686,7 @@ fn a_grandchild_is_clipped_to_every_shaped_ancestor() {
     core.top_level_order = vec![0x100];
     core.shape_bounding.insert(0x100, stripes(65, 129, true));
     core.shape_bounding.insert(0x101, stripes(65, 129, false));
+    let windows = IndexedWindows::from(windows);
     let on = build_with(
         Visibility::On,
         &core,
@@ -774,6 +779,7 @@ fn disjoint_or_empty_ancestor_shapes_hide_the_subtree() {
     core.shape_bounding.insert(0x100, half(0));
     core.shape_bounding.insert(0x101, half(100));
     core.shape_bounding.insert(0x200, Vec::new());
+    let windows = IndexedWindows::from(windows);
     let on = build_with(
         Visibility::On,
         &core,
@@ -825,6 +831,7 @@ fn a_cow_subtree_claims_nothing() {
     set_rank(&mut windows, 0x100, 1);
     set_rank(&mut windows, 0x800, 2);
     core.top_level_order = vec![0x100, 0x800];
+    let windows = IndexedWindows::from(windows);
     let on = assert_oracle(
         &core,
         &mut store,
@@ -885,6 +892,7 @@ fn an_opaque_automatic_child_claims_through_a_manual_parent() {
     let a_backing = alloc_backing(&mut store, 0xB601, 60, 40);
     store.set_redirected_target(a_id, Some(a_backing));
     core.top_level_order = vec![0x600];
+    let windows = IndexedWindows::from(windows);
     let on = assert_oracle(
         &core,
         &mut store,
@@ -991,6 +999,7 @@ fn a_redirected_backing_larger_than_its_host_is_sampled_unstretched() {
     let backing = alloc_backing(&mut store, 0xB700, 160, 120); // 2× the host
     store.set_redirected_target(r_id, Some(backing));
     core.top_level_order = vec![0x700];
+    let windows = IndexedWindows::from(windows);
     let on = build_with(
         Visibility::On,
         &core,
@@ -1050,6 +1059,7 @@ fn a_collapsed_universe_over_emits_but_shows_the_same_pixels() {
             core.top_level_order.push(xid);
         }
     }
+    let windows = IndexedWindows::from(windows);
     let on = assert_oracle(
         &core,
         &mut store,
@@ -1133,8 +1143,8 @@ fn swapping_two_overlapping_top_levels_damages_only_their_overlap() {
     );
     let (mut core2, mut store2, mut windows2) = two_windows(lower, upper);
     // Swap the stacking: 0x200 now below 0x100.
-    set_rank(&mut windows2, 0x100, 2);
-    set_rank(&mut windows2, 0x200, 1);
+    set_rank(windows2.map_mut(), 0x100, 2);
+    set_rank(windows2.map_mut(), 0x200, 1);
     core2.top_level_order = vec![0x200, 0x100];
     let after = build_with(
         Visibility::On,
