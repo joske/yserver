@@ -149,9 +149,6 @@ owner. A telemetry counter reports how many builds happen.
       built once.
     - Assert on each later tick: at least one output walked (walk delta ≥ 1) and there
       were 0 builds.
-    - Assert also, on each tick that submitted output 0: output 0's emitted draw list is
-      identical to the first tick's. Read it after the counters, from the same
-      last-submitted-scene accessor.
     - Mutation that must fail: `children()` rebuilding on every call.
   - `children_index_follows_tree_changes`:
     - Action: after a first tick, apply in turn, each one visible on output 0:
@@ -164,11 +161,14 @@ owner. A telemetry counter reports how many builds happen.
     - Assert, for each step, that output 0's draw list changed from the previous step,
       so the step is observable.
     - Assert right after each tick: walk delta ≥ 1 and exactly 1 build.
-    - Then compare output 0's draw list as the tick emitted it with a reference list
-      from a new `#[doc(hidden)]` accessor. "As emitted" means the scene the tick
-      submitted, read from what the recording fixture captured. If the fixture does not
-      expose it yet, add a test accessor for the last submitted scene's draw rects on an
-      output. Do not use a new walk. The accessor builds a fresh
+    - Then, after the counters, compare `scene_draw_rects_for_tests()` with a reference
+      list from a new `#[doc(hidden)]` accessor. The accessor builds a fresh
+      `IndexedWindows::from(map.clone())` and calls `scene_draw_rects`.
+      - Both are full walk lists, the same stage of rendering, so a frame clipped to a
+        repaint region does not matter.
+      - The helper walk reads the same cache the tick just filled. The counters were
+        already asserted, so the helper's walk cannot hide a missing rebuild.
+      - A stale cache gives the helper a different list from the fresh reference. The accessor builds a fresh
       `IndexedWindows::from(map.clone())` of the current map and calls `scene_draw_rects`
       with it, so the cache under test is never consulted.
     - Mutation that must fail: `map_mut()` not emptying the cell.
@@ -237,12 +237,12 @@ git commit -S -m "perf(scene): build the children index once per window-map chan
   - a restack, then a root readback through its production entry (`get_image` of the
     root window): assert a delta of exactly 1 across the readback call itself, so the
     readback really took the composed path;
-  - a tick: assert walk delta ≥ 1 and build delta 0;
-  - then the backend's telemetry observe-and-emit step: assert the lifetime telemetry
-    counter is 2, while `build_scene_calls` ≥ 5.
+  - immediately `Backend::before_block` (it reaches `maybe_emit` through
+    `portable/compose.rs`): assert the lifetime telemetry counter is 2 and that
+    `build_scene_calls` did not change across this call (no walk);
+  - then a tick: assert walk delta ≥ 1, build delta 0, and the lifetime counter still 2.
   - Mutations that must fail:
-    - observing only around `build_scene_with` in the tick (it misses the readback
-      build and reads 1);
+    - observing only inside the tick (the counter reads 1 after `before_block`);
     - not calling observe before `maybe_emit` (reads 0).
 
 - [ ] **Step 2: Run it to verify it fails.** Expected: the method is not found.
@@ -270,12 +270,11 @@ git commit -S -am "perf(telemetry): report children index builds per second (#38
 - `cargo test --workspace --features xdmcp`.
 - Each integration test file in `crates/yserver/tests/` by its own command, except
   `render_acceptance`:
-  - first without `--ignored`;
-  - then, for the files whose tests are all ignored (`dri3_fd_leak`, `glx_tfp_export`),
-    under `lvp-env.sh` with `-- --ignored --nocapture`.
+  - The files whose tests are all `#[ignore]` (`dri3_fd_leak`, `glx_tfp_export`) run
+    only under `lvp-env.sh` with `-- --ignored --nocapture`.
+  - Every other file runs without `--ignored`.
 
-  Report the passed count per file. A file reporting 0 tests run is a failure of the
-  gate.
+  Report the passed count per run. Any run reporting 0 tests is a failure of the gate.
 - The lavapipe suite:
   `. /data/Projects/claude-scratch/issue-388/walk/lvp-env.sh && cargo test --workspace --features xdmcp --no-fail-fast -- --ignored --nocapture > <log> 2>&1`,
   run after the capability check above. The log must contain zero
