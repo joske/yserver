@@ -150,6 +150,8 @@ impl<P: Platform> XBackend<P> {
         // Phase B.1 Task 21: drain frame-builder close events into telemetry.
         self.drain_frame_builder_telemetry();
         // Per-second telemetry summary emission.
+        self.telemetry
+            .observe_children_index_builds(self.windows.indexed().children_index_builds());
         self.telemetry.maybe_emit(self.engine.pending_count());
     }
 

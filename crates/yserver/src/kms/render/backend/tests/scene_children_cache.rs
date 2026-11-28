@@ -281,6 +281,101 @@ fn children_index_follows_tree_changes() {
     fixture.finish_after_normal_drain();
 }
 
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+fn telemetry_counts_every_children_index_build() {
+    let mut fixture = live_fixture().cleanup_guard();
+    let (_, child_a, _, _, _) = create_scene_windows(&mut fixture);
+
+    let root = fixture.events.backend.core.window_id;
+    let before = tick_counts(&fixture);
+    let initial_records = tick_with_damage(&mut fixture, root, None);
+    let after = tick_counts(&fixture);
+    assert_tick_counts(before, after, 2..=2, 1, "first two-output tick");
+    retire_accepted(&mut fixture, &initial_records);
+    let initial_draws = draw_rects(&mut fixture);
+
+    for tick in 1..=3 {
+        let before = tick_counts(&fixture);
+        let records = tick_with_damage(&mut fixture, child_a, Some((1, 1, 20, 20)));
+        let after = tick_counts(&fixture);
+        assert_tick_counts(
+            before,
+            after,
+            1..=u64::MAX,
+            0,
+            &format!("damage-only tick {tick}"),
+        );
+        retire_accepted(&mut fixture, &records);
+    }
+
+    state_configure_child_above(&mut fixture, CHILD_A, CHILD_B);
+    let before_readback = tick_counts(&fixture);
+    let root_image = Backend::get_image(&mut fixture.events.backend, None, root, 2, 0, 0, 1, 1, !0)
+        .expect("root GetImage through Backend must succeed")
+        .expect("root GetImage must return a reply");
+    assert!(root_image.len() > 32, "root GetImage includes pixel bytes");
+    let after_readback = tick_counts(&fixture);
+    assert_eq!(
+        after_readback.1 - before_readback.1,
+        1,
+        "root GetImage readback composes the restacked scene exactly once"
+    );
+
+    let walks_before_block = fixture.events.backend.telemetry.lifetime.build_scene_calls;
+    Backend::before_block(&mut fixture.events.backend);
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .telemetry
+            .lifetime
+            .children_index_builds,
+        2,
+        "before_block observes the readback build even though no tick follows it"
+    );
+    assert_eq!(
+        fixture.events.backend.telemetry.lifetime.build_scene_calls, walks_before_block,
+        "before_block emits telemetry without walking the scene"
+    );
+
+    let before_final_tick = tick_counts(&fixture);
+    let final_records = tick_with_damage(&mut fixture, root, None);
+    let after_final_tick = tick_counts(&fixture);
+    assert_tick_counts(
+        before_final_tick,
+        after_final_tick,
+        1..=u64::MAX,
+        0,
+        "tick after root readback",
+    );
+    retire_accepted(&mut fixture, &final_records);
+    let final_draws = draw_rects(&mut fixture);
+    let fresh_draws = fixture
+        .events
+        .backend
+        .scene_draw_rects_with_fresh_index_for_tests();
+    assert_eq!(
+        final_draws, fresh_draws,
+        "the final emitted draw order matches a fresh scene build"
+    );
+    assert_ne!(
+        final_draws, initial_draws,
+        "the final draw order reflects the restack"
+    );
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .telemetry
+            .lifetime
+            .children_index_builds,
+        2,
+        "the final telemetry lifetime count includes tick and root readback builds"
+    );
+    fixture.finish_after_normal_drain();
+}
+
 fn state_configure_child_above(
     fixture: &mut RecordingSceneFixture,
     child: ResourceId,

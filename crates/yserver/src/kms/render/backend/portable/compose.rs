@@ -193,6 +193,8 @@ impl<P: Platform> XBackend<P> {
         // watching (project_reclamation_starvation_leak). Without this,
         // the only other maybe_emit caller is on the compose path, which
         // is gated off when dark, so telemetry went silent in the window.
+        self.telemetry
+            .observe_children_index_builds(self.windows.indexed().children_index_builds());
         self.telemetry.maybe_emit(self.engine.pending_count());
     }
 

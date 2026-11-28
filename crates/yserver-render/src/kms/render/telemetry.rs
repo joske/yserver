@@ -171,6 +171,8 @@ pub struct Bucket {
     /// then skip on empty damage, so dividing by composes would overstate it.
     pub build_scene_ns: u64,
     pub build_scene_calls: u64,
+    /// Number of children-index builds observed in this telemetry window.
+    pub children_index_builds: u64,
     /// Step 1 — times a region the visibility walk holds hit the 32-box cap
     /// and became its bounding box (a superset: safe, but a scene that
     /// collapses every frame is one where the pass buys nothing), and nodes
@@ -429,6 +431,8 @@ pub struct Telemetry {
     enabled: bool,
     last_emit: Instant,
     bucket: Bucket,
+    /// Total children-index builds last observed from `IndexedWindows`.
+    last_children_index_builds: u64,
     /// Lifetime-aggregate counts (not reset per-emit). Useful
     /// for the acceptance harness which compares totals after
     /// driving a test sequence.
@@ -465,6 +469,7 @@ impl Telemetry {
             enabled,
             last_emit: Instant::now(),
             bucket: Bucket::default(),
+            last_children_index_builds: 0,
             lifetime: Bucket::default(),
             submit_trace: SubmitTrace::from_env(),
             frame_id: 0,
@@ -490,6 +495,15 @@ impl Telemetry {
     /// also carries id N.
     pub fn advance_frame(&mut self) {
         self.frame_id = self.frame_id.wrapping_add(1);
+    }
+
+    /// Add newly observed children-index builds to the current telemetry
+    /// window and lifetime total.
+    pub fn observe_children_index_builds(&mut self, total: u64) {
+        let delta = total - self.last_children_index_builds;
+        self.bucket.children_index_builds += delta;
+        self.lifetime.children_index_builds += delta;
+        self.last_children_index_builds = total;
     }
 
     /// Current frame_id. Mainly exposed for tests + diagnostic
@@ -614,6 +628,7 @@ impl Telemetry {
              avg_gpu_render_ns={avg_gpu_render_ns} \
              avg_compose_cb_record_ns={avg_compose_cb_ns} \
              avg_build_scene_ns={avg_build_scene_ns} build_scene_calls/s={} \
+             children_index_builds/s={} \
              submit_group_flushes/s={} submit_group_aborts/s={} \
              submit_group_size_avg={group_avg:.2} \
              submit_group_size_max_in_window={} \
@@ -710,6 +725,7 @@ impl Telemetry {
             b.render_batches_flushed,
             b.render_composites_coalesced,
             b.build_scene_calls,
+            b.children_index_builds,
             b.submit_group_flushes,
             b.submit_group_aborts,
             b.submit_group_size_max_in_window,

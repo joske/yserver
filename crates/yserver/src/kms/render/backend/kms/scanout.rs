@@ -4634,6 +4634,8 @@ impl KmsBackend {
             // Root direct ownership still holds the complete output set, while
             // per-output owners leave unrelated CRTCs available above.
             self.drain_render_telemetry();
+            self.telemetry
+                .observe_children_index_builds(self.windows.indexed().children_index_builds());
             self.telemetry.maybe_emit(self.engine.pending_count());
             self.drain_paint_submit_telemetry();
             return Ok(());
