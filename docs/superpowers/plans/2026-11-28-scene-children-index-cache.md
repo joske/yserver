@@ -32,10 +32,13 @@ owner. A telemetry counter reports how many builds happen.
 
 - **A (end state):** each scenario test asserts the final state (the emitted draw order
   and the build count), not only intermediate calls.
-- **B (real paths):** windows are created, mapped, restacked, reparented and destroyed
-  through the `KmsBackend` production entries that core calls (`create_subwindow`,
-  `map_subwindow`/`map_window_for_tests`, the configure/restack and reparent entries,
-  `destroy_subwindow`). Ticks run through the existing two-output recording fixture
+- **B (real paths):** windows live in a core `ServerState` and in the backend together,
+  as in `stacking.rs:222` (`seed_state_window`, `state.resources.map_window` /
+  `configure_window`, then `b.sync_top_level_order(&state)`, which is where the walk's
+  `top_level_order` comes from). Mapping uses `map_window_for_tests`, which realizes
+  storage; bare `map_subwindow` leaves a window without storage. Restack, reparent and
+  destroy go through the core resource call and then the matching backend entry, and
+  `sync_top_level_order` runs after each. Ticks run through the existing two-output recording fixture
   (`RecordingSceneFixture::new(2)`, `backend/tests/commit_identity/recording_scene.rs:116`),
   with accepted flips retired between ticks the way that fixture's existing tests do.
   No direct writes to the index, and no direct `windows.insert` in the new tests.
@@ -43,11 +46,18 @@ owner. A telemetry counter reports how many builds happen.
   tests (`#[ignore]`, run with `-- --ignored` and `YSERVER_ALLOW_SOFTWARE_VULKAN=1`).
   - A fixture skip is not a pass. `skip_unless_vulkan_fed_scanout` prints
     `SKIP recording_scene`.
-  - Before the targeted, mutation and loaded runs, check the lavapipe capabilities the
-    same way `ci.yml:153-165` does (`VK_KHR_external_semaphore_fd`,
+  - Every live-Vulkan command (the capability check, the targeted runs, the mutation
+    runs and the loaded runs) first sources
+    `/data/Projects/claude-scratch/issue-388/walk/lvp-env.sh`. That pins the lavapipe
+    ICD; system Mesa has no lavapipe.
+  - Check the capabilities with `vulkaninfo` under that env, the same way
+    `ci.yml:153-165` does (`VK_KHR_external_semaphore_fd`,
     `VK_EXT_image_drm_format_modifier`).
-  - Each run's output must show the named tests passing with no `SKIP recording_scene`
+  - The test commands add `--nocapture`, because libtest hides the skip line otherwise.
+    Unmutated runs must show the named tests passing with no `SKIP recording_scene`
     line. If the fixture skips, report BLOCKED.
+  - Mutation runs are the opposite: each one must FAIL at the assertion its test names
+    for it, still with no `SKIP` line. Record that assertion message in the report.
 - **F (load):** run the new tests plus `stacking` and `window_tree` 5× under `nproc`
   busy loops, with zero failures.
 
@@ -100,8 +110,6 @@ owner. A telemetry counter reports how many builds happen.
   - `pub fn children(&self) -> &ChildrenIndex`, which builds on a miss and adds 1 to the
     counter;
   - `pub fn children_index_builds(&self) -> u64`, cumulative;
-  - `impl<'a> IntoIterator for &'a IndexedWindows`, matching the existing
-    `TrackedWindows` impl.
 - Produces: `SceneInput::windows: &'a IndexedWindows`.
 - `TrackedWindows`:
   - Its inner field becomes `IndexedWindows`.
@@ -123,7 +131,8 @@ owner. A telemetry counter reports how many builds happen.
   `build_scene_calls` telemetry delta) and how many index builds it caused. Draw rects
   are read only after that.
   - `children_index_built_once_across_damage_only_ticks`:
-    - Setup: three mapped top-levels spanning both outputs, one with a mapped child.
+    - Setup: on output 0, a top-level with two overlapping mapped child siblings. Also
+      two top-levels that span both outputs.
     - Action: tick once, then five times add damage to the child only (a
       `poly_fill_rectangle` or `copy_area` into it), retire the accepted flips, and
       tick.
@@ -131,11 +140,19 @@ owner. A telemetry counter reports how many builds happen.
       built once.
     - Assert on each later tick: at least one output walked (walk delta ≥ 1) and there
       were 0 builds.
+    - Assert also: `scene_draw_rects_for_tests()` (output 0) is identical to the list
+      after the first tick. Read it after the counters.
     - Mutation that must fail: `children()` rebuilding on every call.
   - `children_index_follows_tree_changes`:
-    - Action: after a first tick, apply in turn: restack a sibling above another,
-      reparent the child to another top-level, create and map a new child, destroy one
-      top-level. Retire flips and tick after each.
+    - Action: after a first tick, apply in turn, each one visible on output 0:
+      - restack the lower of the two overlapping sibling children above the other;
+      - reparent one child to the other top-level on output 0;
+      - create and map a new child there;
+      - destroy one top-level that has a visible part on output 0.
+
+      Retire flips and tick after each.
+    - Assert, for each step, that output 0's draw list changed from the previous step,
+      so the step is observable.
     - Assert right after each tick: walk delta ≥ 1 and exactly 1 build.
     - Then compare `scene_draw_rects_for_tests()` with a reference list from a new
       `#[doc(hidden)]` accessor. The accessor builds a fresh
@@ -157,14 +174,22 @@ owner. A telemetry counter reports how many builds happen.
 
 - [ ] **Step 4: Run the new tests and the scene suites**
 
-  Run: `YSERVER_ALLOW_SOFTWARE_VULKAN=1 cargo test -p yserver --lib scene_children_cache -- --ignored`
+  Run: `. /data/Projects/claude-scratch/issue-388/walk/lvp-env.sh && cargo test -p yserver --lib scene_children_cache -- --ignored --nocapture`
   → 2 passed, with no `SKIP recording_scene`. Then each by its own command:
   `cargo test -p yserver-render --lib scene`, `cargo test -p yserver --lib stacking`,
   `cargo test -p yserver --lib window_tree`, `cargo test -p yserver --lib crtc_transform`
-  → all pass. No existing test is modified except for type plumbing.
+  → all pass.
+  - No existing test is modified except for type plumbing.
+  - Render-crate migration: `TestCore` owns no map. Its callers pass local `WindowsMap`s
+    and helper parameters (`scene/tests/mod.rs:989-1030`, `build_scene.rs`,
+    `projection.rs`, and the others). Wrap each map with `IndexedWindows::from` before
+    it is borrowed into `SceneInput`.
+  - Change helper signatures where the map is threaded through.
 
-- [ ] **Step 5: Run the mutations listed in Step 1.** Each must fail its named test.
-  Record the output in the report. Then revert.
+- [ ] **Step 5: Run the mutations listed in Step 1** under the live-Vulkan rules.
+  - Each must fail its named test at the named assertion, with no `SKIP`.
+  - Record the output in the report, then revert.
+  - Run the Gate below before the commit.
 
 - [ ] **Step 6: Commit**
 
@@ -204,7 +229,10 @@ git commit -S -m "perf(scene): build the children index once per window-map chan
   Only tick walks count, so root readbacks and the damage audit's second walk stay out
   of the numerator (spec, Counter).
 
-- [ ] **Step 4: Run it.** Expected: PASS. Then the Task 1 tests still pass.
+- [ ] **Step 4: Run it.** Expected: PASS, with no `SKIP`, under the live-Vulkan rules.
+  - Then the Task 1 tests still pass.
+  - Run the named mutation; it must fail at its assertion.
+  - Run the Gate below before the commit.
 
 - [ ] **Step 5: Commit**
 
@@ -212,7 +240,7 @@ git commit -S -m "perf(scene): build the children index once per window-map chan
 git commit -S -am "perf(telemetry): report children index builds per second (#388)"
 ```
 
-## Gate (implementer, after each task)
+## Gate (implementer, in each task before its commit)
 
 - `cargo +nightly fmt` first, then `cargo +nightly fmt -- --check`.
 - `cargo clippy --all-targets -- -D warnings` (as CI and AGENTS.md require), and also
@@ -220,8 +248,9 @@ git commit -S -am "perf(telemetry): report children index builds per second (#38
 - `cargo test --workspace --features xdmcp`.
 - Each integration test file in `crates/yserver/tests/` by its own command, except
   `render_acceptance`.
-- The lavapipe suite: `YSERVER_ALLOW_SOFTWARE_VULKAN=1 cargo test --workspace --features xdmcp --no-fail-fast -- --ignored`,
-  with the lavapipe ICD env, after the capability check above.
+- The lavapipe suite:
+  `. /data/Projects/claude-scratch/issue-388/walk/lvp-env.sh && cargo test --workspace --features xdmcp --no-fail-fast -- --ignored`,
+  run after the capability check above.
 - `just man`.
 - Rule F: the new tests plus `stacking` and `window_tree`, 5× under `nproc` busy loops,
   with zero failures.
@@ -230,8 +259,9 @@ git commit -S -am "perf(telemetry): report children index builds per second (#38
 
 ## Measurement and handoff (coordinator, after Task 2)
 
-- Use the existing dual-output software KMS harness, `tools/vng-shot.sh`: vng with vkms,
-  two outputs. `--headless` creates no outputs and does not apply.
+- Use the existing harness `tools/vng-shot.sh` with `--gpu none --outputs 2 --env YSERVER_LOOP_TELEMETRY=1`,
+  which gives software rendering on two outputs and the telemetry line. `--headless`
+  creates no outputs and does not apply.
 - Run the same scene at master `d45fdcff` and at the branch head: ~10 mapped windows,
   one client damaging a window at ~50 Hz, 30 s each.
 - Report `avg_build_scene_ns` and `build_scene_calls/s`, plus `children_index_builds/s`
