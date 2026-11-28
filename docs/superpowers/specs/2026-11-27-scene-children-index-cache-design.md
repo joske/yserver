@@ -8,8 +8,8 @@ presents ~44/s and the compositor repaints ~49 times a second, so the scene is w
 at ~49 Hz on every output that has something to show.
 
 Samueru's frame-pointer profile (`/data/Projects/claude-scratch/issue-388/samueru-3/x/`)
-puts `build_scene_with` at 16.9% of yserver's user samples. 4.7% of that is
-`children_index` (`scene/walk.rs:31`): every walk of every output rebuilds a
+puts `build_scene_with` at 16.9% of yserver's user samples, and `children_index` at
+4.7% of all user samples (about 28% of the scene build) (`scene/walk.rs:31`): every walk of every output rebuilds a
 `HashMap<parent, Vec<child>>` over the whole `WindowsMap` and sorts each list by
 `stack_rank`. Between wallpaper frames the window tree does not change, so the result
 is the same every time.
@@ -28,7 +28,10 @@ between every scene walk (all outputs, all ticks, and the non-tick callers of
 - Changing the other whole-map child scans (`portable/inferiors.rs`,
   `portable/redirect.rs`, `portable/windows.rs`), hasher choice, or the `cow_diag`
   message.
-- Rootless, macOS and Windows backends. They do not use the KMS scene walk.
+- Platform-specific code. `TrackedWindows` and `scene_input()` belong to the shared
+  `XBackend<P>`, so the macOS and Windows nested backends (`XBackend<SurfacePlatform>`,
+  `surface/server.rs`) get the cache too, through the same path. Nothing in the design is
+  per-platform, and nothing is added for them.
 - No new `YSERVER_*` environment variables.
 
 ## Approaches
@@ -51,20 +54,27 @@ between every scene walk (all outputs, all ticks, and the non-tick callers of
 
 ## Design
 
-1. **Cache.** `TrackedWindows` keeps the index in a `std::cell::OnceCell`.
-   - It is built on first read by the existing `children_index` builder, so the
-     ordering is the same: children bottom-to-top by `stack_rank`.
-   - `DerefMut` clears it, in the same place that bumps `generation`.
-   - The builder and `ChildrenIndex` become visible to the `yserver` crate (`pub`).
-     Their behaviour does not change.
-2. **Input.** `SceneInput` gains a field holding the index (for example
-   `children: &'a ChildrenIndex`). `scene_input()` fills it from `TrackedWindows`.
-   - `build_scene_with` uses the field instead of calling `children_index` itself.
-   - The render crate's own test inputs (`scene/tests/mod.rs:1019`) build it with the
-     same builder.
-3. **Counter.** `TrackedWindows` counts the index builds, and the per-second telemetry
-   line reports it next to `build_scene_calls/s`. With this counter Samueru can show the
-   hit rate on his own setup. This is the measurement step before option B.
+1. **Lazy cache type, in the render crate.** It holds a `std::cell::OnceCell` with the
+   index and a build counter.
+   - `get(&windows)` returns the cached index, or builds it with the existing
+     `children_index` builder and counts one build. The ordering is unchanged: children
+     bottom-to-top by `stack_rank`.
+   - `invalidate(&mut self)` empties the cell.
+2. **Owner.** `TrackedWindows` holds one cache. `DerefMut` invalidates it, in the same
+   place that bumps `generation`.
+3. **Input.** `SceneInput` carries a reference to the cache, not a built index, so
+   `scene_input()` does no work.
+   - `build_scene_with` calls `get` where it calls `children_index` today, inside the
+     existing `build_scene` timer. That keeps the before/after timing comparable: a miss
+     after the change is timed exactly as every call is today.
+   - Callers that return before walking never build.
+   - The render crate's own test inputs (`scene/tests/mod.rs:1019`) use a fresh cache.
+4. **Counter.** The per-second telemetry line reports the index builds per second next
+   to `build_scene_calls/s`.
+   - Builds happen only inside `build_scene_with`, so builds ≤ walks.
+   - During a run without readbacks (no GetImage of the root), `builds/s` against
+     `build_scene_calls/s` is the miss rate. Samueru can show it on his own setup, and it
+     is the measurement step before option B.
 
 ## Tests (rules A/B/C: real paths, through the KMS backend's production entry points)
 
